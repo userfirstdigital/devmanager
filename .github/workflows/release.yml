@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build
+
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NSIS_SIG=$(cat "src-tauri/target/release/bundle/nsis/DevManager_${VERSION}_x64-setup.exe.sig")
+          MSI_SIG=$(cat "src-tauri/target/release/bundle/msi/DevManager_${VERSION}_x64_en-US.msi.sig")
+          REPO="${GITHUB_REPOSITORY}"
+
+          cat > latest.json << EOF
+          {
+            "version": "${VERSION}",
+            "notes": "See the release notes on GitHub for details.",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "${NSIS_SIG}",
+                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/DevManager_${VERSION}_x64-setup.exe"
+              }
+            }
+          }
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: |
+            src-tauri/target/release/bundle/nsis/DevManager_*_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/DevManager_*_x64-setup.exe.sig
+            src-tauri/target/release/bundle/msi/DevManager_*_x64_en-US.msi
+            src-tauri/target/release/bundle/msi/DevManager_*_x64_en-US.msi.sig
+            latest.json

@@ -1,0 +1,150 @@
+import { useState } from 'react';
+import { X } from 'lucide-react';
+import { useAppStore } from '../../stores/appStore';
+import { ImportExport } from './ImportExport';
+import type { DefaultTerminal } from '../../types/config';
+
+export function SettingsDialog({ onClose }: { onClose: () => void }) {
+  const config = useAppStore(s => s.config);
+  const updateSettings = useAppStore(s => s.updateSettings);
+  const [showImportExport, setShowImportExport] = useState(false);
+
+  if (!config) return null;
+  const settings = config.settings;
+
+  const toggle = (key: 'confirmOnClose' | 'minimizeToTray' | 'restoreSessionOnStart') => {
+    updateSettings({ ...settings, [key]: !settings[key] });
+  };
+
+  const handleLogBufferChange = (value: string) => {
+    const num = parseInt(value, 10);
+    if (!isNaN(num) && num >= 100 && num <= 100000) {
+      updateSettings({ ...settings, logBufferSize: num });
+    }
+  };
+
+  const handleTerminalChange = (value: string) => {
+    updateSettings({ ...settings, defaultTerminal: value as DefaultTerminal });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="bg-zinc-800 rounded-lg border border-zinc-700 shadow-xl w-[450px] max-h-[80vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between p-4 border-b border-zinc-700">
+          <h2 className="text-sm font-semibold text-zinc-100">Settings</h2>
+          <button onClick={onClose} className="p-1 hover:bg-zinc-700 rounded text-zinc-400">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <ToggleRow
+            label="Confirm on close"
+            description="Show confirmation dialog when closing with running servers"
+            checked={settings.confirmOnClose}
+            onChange={() => toggle('confirmOnClose')}
+          />
+
+          <ToggleRow
+            label="Minimize to tray"
+            description="Minimize to system tray instead of closing"
+            checked={settings.minimizeToTray}
+            onChange={() => toggle('minimizeToTray')}
+          />
+
+          <ToggleRow
+            label="Resume previous session on startup"
+            description="Restore open tabs and sidebar state on launch"
+            checked={settings.restoreSessionOnStart !== false}
+            onChange={() => toggle('restoreSessionOnStart')}
+          />
+
+          <div className="space-y-1">
+            <label className="text-xs text-zinc-200 font-medium">Log buffer size</label>
+            <p className="text-[10px] text-zinc-500">Maximum number of log lines to keep per command (100 - 100,000)</p>
+            <input
+              type="number"
+              value={settings.logBufferSize}
+              onChange={e => handleLogBufferChange(e.target.value)}
+              min={100}
+              max={100000}
+              step={1000}
+              className="w-32 px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
+            />
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-zinc-200 font-medium">Default terminal</label>
+            <p className="text-[10px] text-zinc-500">Shell used for Claude Code and interactive terminals</p>
+            <select
+              value={settings.defaultTerminal || 'bash'}
+              onChange={e => handleTerminalChange(e.target.value)}
+              className="w-48 px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
+            >
+              <option value="bash">Bash (Git Bash)</option>
+              <option value="powershell">PowerShell</option>
+              <option value="cmd">CMD</option>
+            </select>
+          </div>
+
+          <div className="border-t border-zinc-700 pt-4">
+            <label className="text-xs text-zinc-200 font-medium block mb-2">Data</label>
+            <button
+              onClick={() => setShowImportExport(true)}
+              className="px-4 py-1.5 bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-xs rounded"
+            >
+              Import / Export Configuration
+            </button>
+          </div>
+        </div>
+
+        <div className="flex justify-end p-4 border-t border-zinc-700">
+          <button
+            onClick={onClose}
+            className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded"
+          >
+            Done
+          </button>
+        </div>
+      </div>
+
+      {showImportExport && <ImportExport onClose={() => setShowImportExport(false)} />}
+    </div>
+  );
+}
+
+function ToggleRow({
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  label: string;
+  description: string;
+  checked: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-4">
+      <div>
+        <div className="text-xs text-zinc-200 font-medium">{label}</div>
+        <div className="text-[10px] text-zinc-500">{description}</div>
+      </div>
+      <button
+        onClick={onChange}
+        className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors ${
+          checked ? 'bg-indigo-600' : 'bg-zinc-600'
+        }`}
+      >
+        <div
+          className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+            checked ? 'translate-x-4' : 'translate-x-0.5'
+          }`}
+        />
+      </button>
+    </div>
+  );
+}

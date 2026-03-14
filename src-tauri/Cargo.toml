@@ -1,0 +1,30 @@
+[package]
+name = "devmanager"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "devmanager_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+regex = "1"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+tauri-plugin-updater = "2"
+sysinfo = "0.32"
+portable-pty = "0.8"
+base64 = "0.22"
+tauri-plugin-window-state = "2.4.1"
