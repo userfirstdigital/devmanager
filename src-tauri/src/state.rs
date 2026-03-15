@@ -48,6 +48,11 @@ impl PtyOutputBuffer {
     pub fn drain(&mut self) -> Vec<u8> {
         self.data.drain(..).collect()
     }
+
+    /// Return a copy of all buffered data without clearing.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.data.iter().copied().collect()
+    }
 }
 
 /// Entry for the unified resource monitoring loop.

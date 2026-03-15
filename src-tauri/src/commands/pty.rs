@@ -438,6 +438,26 @@ pub async fn drain_pty_buffer(
     }
 }
 
+/// Non-destructive read of the ring buffer — returns all buffered output as base64
+/// without clearing. Used on terminal mount so screen content survives webview refresh.
+#[tauri::command]
+pub async fn snapshot_pty_buffer(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let buffers = state.pty_buffers.lock().unwrap();
+    if let Some(buffer) = buffers.get(&id) {
+        let data = buffer.lock().unwrap().snapshot();
+        if data.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+        }
+    } else {
+        Ok(String::new())
+    }
+}
+
 /// Check if a PTY session exists (session in HashMap = alive)
 #[tauri::command]
 pub async fn check_pty_session(

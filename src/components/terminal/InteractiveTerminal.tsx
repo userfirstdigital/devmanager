@@ -80,10 +80,11 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, l
     const buf = ensureSessionBuffer(sessionId, onExit, showActivity);
 
     // Fetch backlog from Rust ring buffer and replay to terminal.
+    // Uses snapshot (non-destructive read) so buffer content survives webview refresh.
     // While the async fetch is in-flight, live events are captured in pendingQueue
     // to guarantee correct ordering: backlog first, then live data.
     buf.pendingQueue = [];
-    invoke<string>('drain_pty_buffer', { id: sessionId }).then(data => {
+    invoke<string>('snapshot_pty_buffer', { id: sessionId }).then(data => {
       if (data) {
         const bytes = Uint8Array.from(atob(data), c => c.charCodeAt(0));
         terminal.write(bytes);

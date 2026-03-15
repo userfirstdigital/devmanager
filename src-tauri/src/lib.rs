@@ -68,6 +68,7 @@ pub fn run() {
             commands::pty::close_pty,
             commands::pty::check_pty_session,
             commands::pty::drain_pty_buffer,
+            commands::pty::snapshot_pty_buffer,
             commands::pty::create_server_session,
             commands::pty::restore_sessions,
             commands::scanner::scan_root,
