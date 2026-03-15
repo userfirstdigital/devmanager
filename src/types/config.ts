@@ -13,6 +13,7 @@ export interface Project {
   color?: string;
   pinned?: boolean;
   notes?: string;
+  saveLogFiles?: boolean;  // save server output to .log files in project root (default: true)
   createdAt: string;
   updatedAt: string;
 }
@@ -56,9 +57,12 @@ export interface Settings {
   minimizeToTray: boolean;
   restoreSessionOnStart?: boolean;
   defaultTerminal: DefaultTerminal;
+  claudeCommand?: string;
+  codexCommand?: string;
+  notificationSound?: string;
 }
 
-export type TabType = 'server' | 'claude' | 'ssh';
+export type TabType = 'server' | 'claude' | 'codex' | 'ssh';
 
 export interface SessionState {
   openTabs: SessionTab[];
@@ -71,6 +75,7 @@ export interface SessionTab {
   type: TabType;
   projectId: string;
   commandId?: string;
+  ptySessionId?: string;
   label?: string;
   sshConnectionId?: string;
 }

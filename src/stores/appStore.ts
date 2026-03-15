@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import type { AppConfig, Project, Settings, SessionState, TabType, SSHConnection } from '../types/config';
-import { cleanupSessionBuffer } from '../components/terminal/InteractiveTerminal';
+import { cleanupSessionBuffer } from '../utils/terminalBuffers';
 import { useProcessStore } from './processStore';
 
 export interface TabInfo {
@@ -79,8 +79,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   addProject: async (project: Project) => {
     try {
-      await invoke('add_project', { project });
-      const config = await invoke<AppConfig>('get_config');
+      const config = await invoke<AppConfig>('add_project', { project });
       set({ config });
     } catch (err) {
       console.error('Failed to add project:', err);
@@ -89,8 +88,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   updateProject: async (project: Project) => {
     try {
-      await invoke('update_project', { project });
-      const config = await invoke<AppConfig>('get_config');
+      const config = await invoke<AppConfig>('update_project', { project });
       set({ config });
     } catch (err) {
       console.error('Failed to update project:', err);
@@ -99,14 +97,34 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   removeProject: async (projectId: string) => {
     try {
-      await invoke('remove_project', { projectId });
-      const config = await invoke<AppConfig>('get_config');
+      // Close PTY sessions for claude/ssh tabs belonging to this project
+      const removedTabs = get().openTabs.filter(t => t.projectId === projectId);
+      for (const tab of removedTabs) {
+        if (tab.ptySessionId && (tab.type === 'claude' || tab.type === 'codex' || tab.type === 'ssh')) {
+          useProcessStore.getState().setProcessState(tab.ptySessionId, { status: 'stopped', pid: null });
+          invoke('close_pty', { id: tab.ptySessionId }).catch(() => {});
+          invoke('unregister_process', { key: tab.ptySessionId }).catch(() => {});
+          invoke('stop_resource_monitor', { commandId: tab.ptySessionId }).catch(() => {});
+          cleanupSessionBuffer(tab.ptySessionId);
+        }
+      }
+
+      const config = await invoke<AppConfig>('remove_project', { projectId });
       // Close tabs for removed project
       const openTabs = get().openTabs.filter(t => t.projectId !== projectId);
       const activeTabId = openTabs.find(t => t.id === get().activeTabId)
         ? get().activeTabId
         : openTabs[0]?.id ?? null;
       set({ config, openTabs, activeTabId });
+
+      // Reinitialize git watcher without the removed project's folders
+      const folderPaths: string[] = [];
+      for (const project of config.projects) {
+        for (const folder of project.folders) {
+          folderPaths.push(folder.folderPath);
+        }
+      }
+      invoke('watch_git_branches', { folderPaths }).catch(() => {});
     } catch (err) {
       console.error('Failed to remove project:', err);
     }
@@ -128,8 +146,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   updateSettings: async (settings: Settings) => {
     try {
-      await invoke('update_settings', { settings });
-      const config = await invoke<AppConfig>('get_config');
+      const config = await invoke<AppConfig>('update_settings', { settings });
       set({ config });
     } catch (err) {
       console.error('Failed to update settings:', err);
@@ -152,6 +169,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     const config = get().config;
     if (!config) return;
     const newConfig = { ...config, sshConnections: config.sshConnections.filter(c => c.id !== connId) };
+    // Close PTY sessions for SSH tabs belonging to this connection
+    const removedTabs = get().openTabs.filter(t => t.sshConnectionId === connId);
+    for (const tab of removedTabs) {
+      if (tab.ptySessionId) {
+        useProcessStore.getState().setProcessState(tab.ptySessionId, { status: 'stopped', pid: null });
+        invoke('close_pty', { id: tab.ptySessionId }).catch(() => {});
+        invoke('unregister_process', { key: tab.ptySessionId }).catch(() => {});
+        invoke('stop_resource_monitor', { commandId: tab.ptySessionId }).catch(() => {});
+        cleanupSessionBuffer(tab.ptySessionId);
+      }
+    }
     // Close tabs for this SSH connection
     const openTabs = get().openTabs.filter(t => t.sshConnectionId !== connId);
     const activeTabId = openTabs.find(t => t.id === get().activeTabId)
@@ -214,8 +242,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { openTabs, activeTabId } = get();
     const tab = openTabs.find(t => t.id === tabId);
 
-    // Kill PTY session for claude/ssh tabs
-    if (tab?.ptySessionId && (tab.type === 'claude' || tab.type === 'ssh')) {
+    // Kill PTY session for claude/codex/ssh tabs
+    if (tab?.ptySessionId && (tab.type === 'claude' || tab.type === 'codex' || tab.type === 'ssh')) {
       const sessionId = tab.ptySessionId;
       // Set stopped immediately so the running count updates
       useProcessStore.getState().setProcessState(sessionId, { status: 'stopped', pid: null });
@@ -249,7 +277,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           type: st.type,
           projectId: st.projectId,
           commandId: st.commandId,
-          ptySessionId: st.type === 'server' ? st.commandId : undefined,
+          ptySessionId: st.ptySessionId ?? (st.type === 'server' ? st.commandId : undefined),
           label: st.label,
           sshConnectionId: st.sshConnectionId,
         }));
@@ -272,6 +300,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         type: t.type,
         projectId: t.projectId,
         commandId: t.commandId,
+        ptySessionId: t.ptySessionId,
         label: t.label,
         sshConnectionId: t.sshConnectionId,
       })),

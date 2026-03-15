@@ -49,6 +49,11 @@ pub fn untrack_pid(pid: u32) {
     write_pids(&pids);
 }
 
+/// Clear all tracked PIDs (called on graceful shutdown)
+pub fn clear_all() {
+    write_pids(&HashSet::new());
+}
+
 /// Kill any orphaned processes from a previous session and clear the file.
 /// Called once at app startup.
 pub fn cleanup_orphaned_processes() {
@@ -56,12 +61,22 @@ pub fn cleanup_orphaned_processes() {
     if pids.is_empty() {
         return;
     }
-    eprintln!("[DevManager] Cleaning up {} orphaned process(es) from previous session", pids.len());
+    eprintln!("[DevManager] Checking {} tracked PID(s) from previous session", pids.len());
     for pid in &pids {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
             .output();
+        match output {
+            Ok(out) if String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()) => {
+                eprintln!("[DevManager] Killing orphaned PID {}", pid);
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .output();
+            }
+            _ => {
+                eprintln!("[DevManager] PID {} already dead, skipping", pid);
+            }
+        }
     }
-    // Clear the file
     write_pids(&HashSet::new());
 }

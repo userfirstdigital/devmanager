@@ -1,7 +1,15 @@
 use crate::models::config::{ScanResult, DependencyStatus, RootScanEntry, ScannedScript, ScannedPort};
 use crate::services::scanner_service;
+use crate::state::AppState;
 use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
+use tauri::{AppHandle, Emitter, State};
+
+/// Lazily compiled regex for matching port variables in .env files
+static PORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)").unwrap()
+});
 
 #[tauri::command]
 pub fn scan_project(folder_path: String) -> Result<ScanResult, String> {
@@ -50,17 +58,136 @@ pub fn check_dependencies(folder_path: String) -> Result<DependencyStatus, Strin
 
 #[tauri::command]
 pub fn get_git_branch(folder_path: String) -> Result<Option<String>, String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", &folder_path, "rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .map_err(|e| format!("Failed to run git: {}", e))?;
+    read_git_branch(&folder_path)
+}
 
-    if output.status.success() {
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(Some(branch))
-    } else {
-        Ok(None)
+/// Read git branch by directly reading .git/HEAD (no subprocess)
+pub fn read_git_branch(folder_path: &str) -> Result<Option<String>, String> {
+    let git_head = Path::new(folder_path).join(".git").join("HEAD");
+    match std::fs::read_to_string(&git_head) {
+        Ok(content) => {
+            let content = content.trim();
+            if let Some(branch) = content.strip_prefix("ref: refs/heads/") {
+                Ok(Some(branch.to_string()))
+            } else {
+                // Detached HEAD — return short hash
+                Ok(Some(content.chars().take(8).collect()))
+            }
+        }
+        Err(_) => Ok(None),
     }
+}
+
+#[tauri::command]
+pub fn watch_git_branches(
+    folder_paths: Vec<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use notify::{Watcher, RecursiveMode, Config, EventKind, event::ModifyKind};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    // Stop existing watcher
+    {
+        let mut watcher_guard = state.git_watcher.lock().map_err(|e| e.to_string())?;
+        *watcher_guard = None;
+    }
+
+    if folder_paths.is_empty() {
+        return Ok(());
+    }
+
+    // Build map of .git/HEAD path -> folder_path, and read initial branches
+    let head_to_folder: Arc<Mutex<HashMap<std::path::PathBuf, String>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let last_branches: Arc<Mutex<HashMap<String, Option<String>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let mut paths_to_watch = Vec::new();
+
+    for folder_path in &folder_paths {
+        let git_dir = Path::new(folder_path).join(".git");
+        if git_dir.is_dir() {
+            let head_path = git_dir.join("HEAD");
+            head_to_folder.lock().unwrap().insert(head_path, folder_path.clone());
+            paths_to_watch.push(git_dir);
+
+            // Read initial branch
+            let branch = read_git_branch(folder_path).unwrap_or(None);
+            last_branches.lock().unwrap().insert(folder_path.clone(), branch);
+        }
+    }
+
+    if paths_to_watch.is_empty() {
+        return Ok(());
+    }
+
+    let h2f = head_to_folder.clone();
+    let lb = last_branches.clone();
+    let app_clone = app.clone();
+
+    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(event) = res {
+            // Only care about data modifications
+            match event.kind {
+                EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) => {}
+                _ => return,
+            }
+
+            let map = h2f.lock().unwrap();
+            for path in &event.paths {
+                // Match on the HEAD file itself
+                let head_path = if path.ends_with("HEAD") {
+                    path.clone()
+                } else {
+                    continue;
+                };
+
+                if let Some(folder_path) = map.get(&head_path) {
+                    let new_branch = read_git_branch(folder_path).unwrap_or(None);
+                    let mut branches = lb.lock().unwrap();
+                    let old_branch = branches.get(folder_path).cloned().flatten();
+
+                    if new_branch != old_branch {
+                        branches.insert(folder_path.clone(), new_branch.clone());
+                        drop(branches);
+
+                        #[derive(Clone, serde::Serialize)]
+                        struct GitBranchChanged {
+                            folder_path: String,
+                            branch: Option<String>,
+                        }
+
+                        let _ = app_clone.emit("git-branch-changed", GitBranchChanged {
+                            folder_path: folder_path.clone(),
+                            branch: new_branch,
+                        });
+                    }
+                }
+            }
+        }
+    }).map_err(|e| format!("Failed to create file watcher: {}", e))?;
+
+    watcher.configure(Config::default()).map_err(|e| format!("Failed to configure watcher: {}", e))?;
+
+    for git_dir in &paths_to_watch {
+        watcher.watch(git_dir, RecursiveMode::NonRecursive)
+            .map_err(|e| format!("Failed to watch {}: {}", git_dir.display(), e))?;
+    }
+
+    // Store watcher to keep it alive
+    let mut watcher_guard = state.git_watcher.lock().map_err(|e| e.to_string())?;
+    *watcher_guard = Some(watcher);
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn unwatch_git_branches(state: State<'_, AppState>) -> Result<(), String> {
+    let mut watcher_guard = state.git_watcher.lock().map_err(|e| e.to_string())?;
+    *watcher_guard = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -129,17 +256,13 @@ fn scan_dir_recursive(
 
 fn scan_env_ports(dir: &Path) -> Vec<ScannedPort> {
     let env_files = [".env", ".env.local", ".env.development"];
-    let port_regex = match Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)") {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
     let mut ports = Vec::new();
 
     for env_file in &env_files {
         let env_path = dir.join(env_file);
         if let Ok(contents) = std::fs::read_to_string(&env_path) {
             for line in contents.lines() {
-                if let Some(captures) = port_regex.captures(line) {
+                if let Some(captures) = PORT_REGEX.captures(line) {
                     if let (Some(var_match), Some(port_match)) = (captures.get(1), captures.get(2)) {
                         if let Ok(port) = port_match.as_str().parse::<u16>() {
                             ports.push(ScannedPort {

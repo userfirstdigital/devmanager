@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { ProcessTreeInfo } from '../types/config';
-import { playReadyChime } from '../utils/notificationSound';
+import { playNotificationSound } from '../utils/notificationSound';
 
 export type ProcessStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'crashed';
 export type TerminalActivity = 'thinking' | 'idle';
@@ -37,7 +37,7 @@ interface ProcessStore {
 
   // Terminal activity
   setTerminalTitle: (id: string, title: string) => void;
-  setTerminalActivity: (id: string, activity: TerminalActivity, activeSessionId?: string | null) => void;
+  setTerminalActivity: (id: string, activity: TerminalActivity, activeSessionId?: string | null, notificationSound?: string) => void;
   clearUnseenReady: (id: string) => void;
 
   // Getters
@@ -166,7 +166,7 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
     }));
   },
 
-  setTerminalActivity: (id, activity, activeSessionId) => {
+  setTerminalActivity: (id, activity, activeSessionId, notificationSound) => {
     const prev = get().terminalActivity[id];
     const now = Date.now();
 
@@ -182,14 +182,23 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
     // Transition from thinking → idle: check if it was long enough for a notification
     if (activity === 'idle' && prev === 'thinking') {
       const startedAt = get().thinkingStartedAt[id];
-      const wasLongThinking = startedAt && (now - startedAt >= 60_000);
+      const wasLongThinking = startedAt && (now - startedAt >= 30_000);
       const isBackground = activeSessionId !== id;
 
+      const wasVeryLongThinking = startedAt && (now - startedAt >= 60_000);
+
       if (wasLongThinking && isBackground) {
-        playReadyChime();
+        // Background tab, 30s+ thinking: sound + badge
+        playNotificationSound(notificationSound || 'glass');
         set(state => ({
           terminalActivity: { ...state.terminalActivity, [id]: activity },
           unseenReady: { ...state.unseenReady, [id]: true },
+        }));
+      } else if (wasVeryLongThinking && !isBackground) {
+        // Active tab, 60s+ thinking: sound only, no badge
+        playNotificationSound(notificationSound || 'glass');
+        set(state => ({
+          terminalActivity: { ...state.terminalActivity, [id]: activity },
         }));
       } else {
         set(state => ({

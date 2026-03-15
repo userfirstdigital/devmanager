@@ -1,6 +1,6 @@
 import { useAppStore } from '../../stores/appStore';
 import { useProcessStore } from '../../stores/processStore';
-import { X, Sparkles, Terminal } from 'lucide-react';
+import { X, Sparkles, Bot, Terminal } from 'lucide-react';
 
 export function ServerTabBar() {
   const { openTabs, activeTabId, setActiveTab, closeTab, config } = useAppStore();
@@ -106,6 +106,43 @@ export function ServerTabBar() {
               <div className="min-w-0 flex-1">
                 <div className="text-[11px] text-zinc-500 truncate">{projectName}</div>
                 <div className="text-xs text-zinc-200 truncate">{tab.label || 'Claude'}</div>
+              </div>
+              {memoryStr && (
+                <span className="text-[10px] text-zinc-500 flex-shrink-0">{memoryStr}</span>
+              )}
+              <button
+                onClick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
+                className="p-0.5 rounded hover:bg-zinc-600 text-zinc-500 hover:text-zinc-200 opacity-0 group-hover:opacity-100 flex-shrink-0"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          );
+        }
+
+        if (tab.type === 'codex') {
+          const { projectName, projectColor } = getProjectInfo(tab.projectId);
+          const activity = terminalActivity[tab.ptySessionId || ''];
+          const res = resources[tab.ptySessionId || ''];
+          const memoryStr = res ? `${Math.round(res.total_memory_mb)} MB` : '';
+
+          return (
+            <div
+              key={tab.id}
+              className={`group flex items-center gap-1.5 px-3 py-2 cursor-pointer border-r border-zinc-700 min-w-0 max-w-48 ${
+                isActive ? 'bg-zinc-900' : 'bg-zinc-800 hover:bg-zinc-750'
+              }`}
+              style={{ borderBottom: isActive ? `2px solid ${projectColor}` : '2px solid transparent' }}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              <Bot size={12} className={
+                activity === 'thinking'
+                  ? 'text-amber-400 animate-pulse flex-shrink-0'
+                  : 'text-emerald-400 flex-shrink-0'
+              } />
+              <div className="min-w-0 flex-1">
+                <div className="text-[11px] text-zinc-500 truncate">{projectName}</div>
+                <div className="text-xs text-zinc-200 truncate">{tab.label || 'Codex'}</div>
               </div>
               {memoryStr && (
                 <span className="text-[10px] text-zinc-500 flex-shrink-0">{memoryStr}</span>

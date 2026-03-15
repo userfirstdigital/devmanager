@@ -1,42 +1,27 @@
-// Gentle notification chime using Web Audio API — no audio file needed
-let audioCtx: AudioContext | null = null;
+export const NOTIFICATION_SOUNDS = [
+  { id: 'glass', label: 'Glass' },
+  { id: 'chord', label: 'Chord' },
+  { id: 'glisten', label: 'Glisten' },
+  { id: 'polite', label: 'Polite' },
+  { id: 'calm', label: 'Calm' },
+  { id: 'sharp', label: 'Sharp' },
+  { id: 'jinja', label: 'Jinja' },
+  { id: 'cloud', label: 'Cloud' },
+  { id: 'none', label: 'None (silent)' },
+];
 
-function getAudioContext(): AudioContext {
-  if (!audioCtx) {
-    audioCtx = new AudioContext();
+// Cache Audio objects for instant playback
+const audioCache = new Map<string, HTMLAudioElement>();
+
+export function playNotificationSound(soundId: string) {
+  if (soundId === 'none') return;
+  const src = `/sounds/${soundId}.wav`;
+  let audio = audioCache.get(soundId);
+  if (!audio) {
+    audio = new Audio(src);
+    audioCache.set(soundId, audio);
   }
-  return audioCtx;
-}
-
-/** Play a soft two-tone chime to signal Claude is ready */
-export function playReadyChime() {
-  try {
-    const ctx = getAudioContext();
-    const now = ctx.currentTime;
-
-    // Two gentle sine tones: C5 then E5
-    const frequencies = [523.25, 659.25];
-    const duration = 0.15;
-    const gap = 0.1;
-
-    for (let i = 0; i < frequencies.length; i++) {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-
-      osc.type = 'sine';
-      osc.frequency.value = frequencies[i];
-
-      const start = now + i * (duration + gap);
-      gain.gain.setValueAtTime(0, start);
-      gain.gain.linearRampToValueAtTime(0.08, start + 0.02);  // soft attack
-      gain.gain.linearRampToValueAtTime(0, start + duration);  // fade out
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(start);
-      osc.stop(start + duration);
-    }
-  } catch {
-    // Audio not available — silent fallback
-  }
+  const clone = audio.cloneNode() as HTMLAudioElement;
+  clone.volume = 0.5;
+  clone.play().catch(() => {});
 }

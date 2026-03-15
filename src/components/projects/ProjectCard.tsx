@@ -1,13 +1,14 @@
 import { useState, useRef, useEffect } from 'react';
-import { Play, Square, Terminal, Pin, PinOff, Trash2, MoreVertical, GitBranch, ChevronDown, ChevronRight, AlertTriangle, FileText, FileCode, Download, FolderPlus, Folder, Pencil, ArrowUp, ArrowDown, Sparkles, X } from 'lucide-react';
+import { Play, Square, Terminal, Pin, PinOff, Trash2, MoreVertical, GitBranch, ChevronDown, ChevronRight, AlertTriangle, FileText, FileCode, Download, FolderPlus, Folder, Pencil, ArrowUp, ArrowDown, Sparkles, Bot, X } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import type { Project, ProjectFolder, DependencyStatus, Settings } from '../../types/config';
 import { useAppStore, TabInfo } from '../../stores/appStore';
 import { useProcessStore } from '../../stores/processStore';
 import { useProcess } from '../../hooks/useProcess';
 import { useConfig } from '../../hooks/useConfig';
 import { usePty } from '../../hooks/usePty';
-import { ensureSessionBuffer } from '../terminal/InteractiveTerminal';
+import { ensureSessionBuffer } from '../../utils/terminalBuffers';
 import { ProjectNotes } from './ProjectNotes';
 import { EnvEditor } from './EnvEditor';
 import { AddFolderDialog } from './AddFolderDialog';
@@ -44,10 +45,13 @@ function FolderSection({ project, folder }: { project: Project; folder: ProjectF
   useEffect(() => {
     getGitBranch(folder.folderPath).then(b => setGitBranch(b)).catch(() => {});
     checkDependencies(folder.folderPath).then(s => setDepStatus(s)).catch(() => {});
-    const interval = setInterval(() => {
-      getGitBranch(folder.folderPath).then(b => setGitBranch(b)).catch(() => {});
-    }, 10000);
-    return () => clearInterval(interval);
+    // Listen for git branch changes from Rust file watcher (instant, no polling)
+    const unlisten = listen<{ folder_path: string; branch: string | null }>('git-branch-changed', (event) => {
+      if (event.payload.folder_path === folder.folderPath) {
+        setGitBranch(event.payload.branch);
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
   }, [folder.folderPath]);
 
   // Re-check dependencies when npm install finishes
@@ -282,7 +286,17 @@ function FolderSection({ project, folder }: { project: Project; folder: ProjectF
   );
 }
 
-function ClaudeTerminalList({ project }: { project: Project }) {
+const DEFAULT_CLAUDE_CMD = 'npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions';
+const DEFAULT_CODEX_CMD = 'npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox';
+
+function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }: {
+  project: Project;
+  tabType: 'claude' | 'codex';
+  label: string;
+  icon: React.ReactNode;
+  iconColor: string;
+  getCommand: () => string;
+}) {
   const openTabs = useAppStore(s => s.openTabs);
   const activeTabId = useAppStore(s => s.activeTabId);
   const { setActiveTab, closeTab } = useAppStore();
@@ -294,9 +308,9 @@ function ClaudeTerminalList({ project }: { project: Project }) {
   const config = useAppStore(s => s.config);
   const openTab = useAppStore(s => s.openTab);
 
-  const claudeTabs = openTabs.filter(t => t.type === 'claude' && t.projectId === project.id);
+  const aiTabs = openTabs.filter(t => t.type === tabType && t.projectId === project.id);
 
-  const launchClaudeSession = async (sessionId: string) => {
+  const launchAISession = async (sessionId: string) => {
     const defaultTerminal = config?.settings.defaultTerminal || 'bash';
     const shell = resolveShellCommand(defaultTerminal);
     const cwd = project.rootPath;
@@ -306,44 +320,25 @@ function ClaudeTerminalList({ project }: { project: Project }) {
 
     await createSession(sessionId, cwd, shell.command, shell.args);
 
-    // Write Claude Code startup command after short delay for shell init
+    // Write AI startup command after short delay for shell init
+    const aiCmd = getCommand();
     setTimeout(async () => {
       try {
-        await invoke('write_pty', { id: sessionId, data: 'npx @anthropic-ai/claude-code --dangerously-skip-permissions\r\n' });
+        await invoke('write_pty', { id: sessionId, data: aiCmd + '\r\n' });
       } catch {
         // Session may have closed
       }
     }, 500);
   };
 
-  const handleLaunchClaude = async () => {
-    const nextNum = claudeTabs.length + 1;
-    const sessionId = crypto.randomUUID();
-    const label = `Claude ${nextNum}`;
-
-    try {
-      await launchClaudeSession(sessionId);
-
-      openTab({
-        id: sessionId,
-        type: 'claude',
-        projectId: project.id,
-        ptySessionId: sessionId,
-        label,
-      });
-    } catch (err) {
-      console.error('Failed to launch Claude Code:', err);
-    }
-  };
-
-  const handleClickClaude = async (tab: TabInfo) => {
+  const handleClick = async (tab: TabInfo) => {
     const proc = processes[tab.ptySessionId || ''];
     const isAlive = proc?.status === 'running' || proc?.status === 'starting';
     if (!isAlive) {
       // Stopped — relaunch a fresh session
       const newSessionId = crypto.randomUUID();
       try {
-        await launchClaudeSession(newSessionId);
+        await launchAISession(newSessionId);
 
         // Update tab with new session ID
         openTab({
@@ -351,7 +346,7 @@ function ClaudeTerminalList({ project }: { project: Project }) {
           ptySessionId: newSessionId,
         });
       } catch (err) {
-        console.error('Failed to relaunch Claude Code:', err);
+        console.error(`Failed to relaunch ${label}:`, err);
       }
     } else {
       // Clear "ready" indicator when visiting
@@ -361,8 +356,8 @@ function ClaudeTerminalList({ project }: { project: Project }) {
   };
 
   return (
-    <div className="space-y-0.5">
-      {claudeTabs.map(tab => {
+    <>
+      {aiTabs.map(tab => {
         const sessionId = tab.ptySessionId || '';
         const activity = terminalActivity[sessionId];
         const proc = processes[sessionId];
@@ -372,19 +367,19 @@ function ClaudeTerminalList({ project }: { project: Project }) {
         return (
           <div
             key={tab.id}
-            className={`group/claude flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer text-xs ${
+            className={`group/ai flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer text-xs ${
               activeTabId === tab.id ? 'bg-zinc-700/50' : 'hover:bg-zinc-700/30'
             }`}
-            onClick={() => handleClickClaude(tab)}
+            onClick={() => handleClick(tab)}
           >
-            <Sparkles size={11} className={
+            <span className={
               isReady
                 ? 'text-emerald-400'
                 : activity === 'thinking'
                 ? 'text-amber-400 animate-pulse'
-                : 'text-purple-400'
-            } />
-            <span className="flex-1 text-zinc-400 truncate">{tab.label || 'Claude'}</span>
+                : iconColor
+            }>{icon}</span>
+            <span className="flex-1 text-zinc-400 truncate">{tab.label || label}</span>
             {isReady && (
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
             )}
@@ -397,20 +392,91 @@ function ClaudeTerminalList({ project }: { project: Project }) {
             </span>
             <button
               onClick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
-              className="p-0.5 rounded hover:bg-zinc-600 text-zinc-500 hover:text-zinc-300 opacity-0 group-hover/claude:opacity-100"
+              className="p-0.5 rounded hover:bg-zinc-600 text-zinc-500 hover:text-zinc-300 opacity-0 group-hover/ai:opacity-100"
             >
               <X size={10} />
             </button>
           </div>
         );
       })}
-      <button
-        onClick={handleLaunchClaude}
-        className="flex items-center gap-1.5 px-2 py-1 rounded hover:bg-zinc-700/30 text-xs text-purple-400 hover:text-purple-300 w-full"
-      >
-        <Sparkles size={11} />
-        <span>+ Claude</span>
-      </button>
+    </>
+  );
+}
+
+function AILaunchButton({ icon, iconColor, label, onClick }: {
+  icon: React.ReactNode;
+  iconColor: string;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-1 px-2 py-1 rounded hover:bg-zinc-700/30 text-xs ${iconColor} hover:opacity-80`}
+    >
+      {icon}
+      <span>+ {label}</span>
+    </button>
+  );
+}
+
+function useAILauncher(project: Project, tabType: 'claude' | 'codex', label: string, getCommand: () => string) {
+  const openTabs = useAppStore(s => s.openTabs);
+  const config = useAppStore(s => s.config);
+  const openTab = useAppStore(s => s.openTab);
+  const { createSession } = usePty();
+
+  const aiTabs = openTabs.filter(t => t.type === tabType && t.projectId === project.id);
+
+  const launchAISession = async (sessionId: string) => {
+    const defaultTerminal = config?.settings.defaultTerminal || 'bash';
+    const shell = resolveShellCommand(defaultTerminal);
+    const cwd = project.rootPath;
+
+    ensureSessionBuffer(sessionId, undefined, true);
+    await createSession(sessionId, cwd, shell.command, shell.args);
+
+    const aiCmd = getCommand();
+    setTimeout(async () => {
+      try {
+        await invoke('write_pty', { id: sessionId, data: aiCmd + '\r\n' });
+      } catch {}
+    }, 500);
+  };
+
+  const handleLaunch = async () => {
+    const nextNum = aiTabs.length + 1;
+    const sessionId = crypto.randomUUID();
+    const tabLabel = `${label} ${nextNum}`;
+
+    try {
+      await launchAISession(sessionId);
+      openTab({
+        id: sessionId,
+        type: tabType,
+        projectId: project.id,
+        ptySessionId: sessionId,
+        label: tabLabel,
+      });
+    } catch (err) {
+      console.error(`Failed to launch ${label}:`, err);
+    }
+  };
+
+  return handleLaunch;
+}
+
+function AILaunchButtons({ project }: { project: Project }) {
+  const config = useAppStore(s => s.config);
+  const launchClaude = useAILauncher(project, 'claude', 'Claude',
+    () => config?.settings.claudeCommand || DEFAULT_CLAUDE_CMD);
+  const launchCodex = useAILauncher(project, 'codex', 'Codex',
+    () => config?.settings.codexCommand || DEFAULT_CODEX_CMD);
+
+  return (
+    <div className="flex items-center gap-0.5">
+      <AILaunchButton icon={<Sparkles size={11} />} iconColor="text-purple-400" label="Claude" onClick={launchClaude} />
+      <AILaunchButton icon={<Bot size={11} />} iconColor="text-emerald-400" label="Codex" onClick={launchCodex} />
     </div>
   );
 }
@@ -553,7 +619,13 @@ export function ProjectCard({ project }: { project: Project }) {
           {visibleFolders.map(folder => (
             <FolderSection key={folder.id} project={project} folder={folder} />
           ))}
-          <ClaudeTerminalList project={project} />
+          <AITerminalList project={project} tabType="claude" label="Claude"
+            icon={<Sparkles size={11} />} iconColor="text-purple-400"
+            getCommand={() => config?.settings.claudeCommand || DEFAULT_CLAUDE_CMD} />
+          <AITerminalList project={project} tabType="codex" label="Codex"
+            icon={<Bot size={11} />} iconColor="text-emerald-400"
+            getCommand={() => config?.settings.codexCommand || DEFAULT_CODEX_CMD} />
+          <AILaunchButtons project={project} />
         </div>
       )}
 

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useProcessStore } from '../stores/processStore';
-import { cleanupSessionBuffer } from '../components/terminal/InteractiveTerminal';
+import { cleanupSessionBuffer } from '../utils/terminalBuffers';
 
 export function usePty() {
   const createSession = async (
@@ -12,7 +12,8 @@ export function usePty() {
     cols = 80,
     rows = 24,
   ): Promise<number> => {
-    const pid = await invoke<number>('create_pty_session', {
+    // Single IPC call: create PTY + register process + start resource monitor
+    const result = await invoke<{ pid: number; command_id: string }>('create_server_session', {
       id,
       cwd,
       command,
@@ -20,28 +21,18 @@ export function usePty() {
       env,
       cols,
       rows,
-    });
-
-    // Register process for resource monitoring
-    await invoke('register_process', {
-      key: id,
-      pid,
       commandId: id,
       projectId: id,
-    });
-    await invoke('start_resource_monitor', {
-      commandId: id,
-      pid,
     });
 
     const processStore = useProcessStore.getState();
     processStore.setProcessState(id, {
       status: 'running',
-      pid,
+      pid: result.pid,
       startedAt: Date.now(),
     });
 
-    return pid;
+    return result.pid;
   };
 
   const closeSession = async (id: string) => {

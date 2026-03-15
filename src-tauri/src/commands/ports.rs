@@ -117,7 +117,7 @@ pub fn kill_port(port: u16) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_port_conflicts(state: State<'_, AppState>) -> Result<Vec<PortConflict>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let config = state.config.read().map_err(|e| e.to_string())?;
     let cfg = match config.as_ref() {
         Some(c) => c,
         None => return Ok(Vec::new()),

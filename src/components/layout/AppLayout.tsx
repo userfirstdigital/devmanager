@@ -13,9 +13,9 @@ export function AppLayout() {
 
   const activeTab = openTabs.find(t => t.id === activeTabId);
 
-  // Clear "ready" indicator when user visits a Claude tab
+  // Clear "ready" indicator when user visits a Claude/Codex tab
   useEffect(() => {
-    if (activeTab?.type === 'claude' && activeTab.ptySessionId) {
+    if ((activeTab?.type === 'claude' || activeTab?.type === 'codex') && activeTab.ptySessionId) {
       useProcessStore.getState().clearUnseenReady(activeTab.ptySessionId);
     }
   }, [activeTabId]);
@@ -43,6 +43,10 @@ export function AppLayout() {
 
     if (tab.type === 'claude') {
       return `${projectName} — ${tab.label || 'Claude'}`;
+    }
+
+    if (tab.type === 'codex') {
+      return `${projectName} — ${tab.label || 'Codex'}`;
     }
 
     if (tab.type === 'ssh') {
@@ -89,7 +93,7 @@ export function AppLayout() {
                   sessionId={tab.ptySessionId!}
                   label={getTabLabel(tab)}
                   isActive={tab.id === activeTabId}
-                  showActivity={tab.type === 'claude'}
+                  showActivity={tab.type === 'claude' || tab.type === 'codex'}
                   onExit={() => handlePtyExit(tab.ptySessionId!)}
                 />
               )}

@@ -1,6 +1,12 @@
 use crate::models::config::{ScanResult, ScannedScript, ScannedPort};
 use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// Lazily compiled regex for matching port variables in .env files
+static PORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)").unwrap()
+});
 
 /// Scan a project directory for scripts, ports, and configuration
 pub fn scan_directory(folder_path: &str) -> Result<ScanResult, String> {
@@ -34,9 +40,6 @@ pub fn scan_directory(folder_path: &str) -> Result<ScanResult, String> {
     let mut ports = Vec::new();
     let mut has_env_file = false;
 
-    let port_regex = Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)")
-        .map_err(|e| format!("Failed to compile regex: {}", e))?;
-
     for env_file in &env_files {
         let env_path = base.join(env_file);
         if env_path.exists() {
@@ -45,7 +48,7 @@ pub fn scan_directory(folder_path: &str) -> Result<ScanResult, String> {
                 .map_err(|e| format!("Failed to read {}: {}", env_file, e))?;
 
             for line in contents.lines() {
-                if let Some(captures) = port_regex.captures(line) {
+                if let Some(captures) = PORT_REGEX.captures(line) {
                     if let (Some(var_match), Some(port_match)) = (captures.get(1), captures.get(2)) {
                         let variable = var_match.as_str().to_string();
                         if let Ok(port) = port_match.as_str().parse::<u16>() {

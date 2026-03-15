@@ -4,7 +4,7 @@ mod services;
 mod state;
 
 use state::AppState;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use tauri::Manager;
 use tauri::tray::{TrayIconBuilder, MouseButton, MouseButtonState, TrayIconEvent};
@@ -13,10 +13,12 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState {
-        config: Mutex::new(None),
+        config: RwLock::new(None),
         processes: Mutex::new(HashMap::new()),
-        resource_monitors: Mutex::new(HashMap::new()),
+        monitored_processes: Mutex::new(HashMap::new()),
         pty_sessions: Mutex::new(HashMap::new()),
+        pty_buffers: Mutex::new(HashMap::new()),
+        git_watcher: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -64,7 +66,13 @@ pub fn run() {
             commands::pty::write_pty,
             commands::pty::resize_pty,
             commands::pty::close_pty,
+            commands::pty::check_pty_session,
+            commands::pty::drain_pty_buffer,
+            commands::pty::create_server_session,
+            commands::pty::restore_sessions,
             commands::scanner::scan_root,
+            commands::scanner::watch_git_branches,
+            commands::scanner::unwatch_git_branches,
         ])
         .setup(|app| {
             // Kill any orphaned processes from a previous crash
@@ -112,6 +120,7 @@ pub fn run() {
                                     .output();
                             }
                             drop(processes);
+                            services::pid_file::clear_all();
                             app.exit(0);
                         }
                         _ => {}
@@ -128,6 +137,10 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Spawn unified resource monitoring loop
+            let app_handle = app.handle().clone();
+            spawn_resource_monitor_loop(app_handle);
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -135,15 +148,23 @@ pub fn run() {
                 let app_handle = window.app_handle();
                 let state = app_handle.state::<AppState>();
 
-                // Check minimize_to_tray setting
-                let config = state.config.lock().unwrap();
+                // Check settings (RwLock read)
+                let config = state.config.read().unwrap();
                 let minimize = config.as_ref().map(|c| c.settings.minimize_to_tray).unwrap_or(false);
+                let confirm = config.as_ref().map(|c| c.settings.confirm_on_close).unwrap_or(true);
                 drop(config);
 
                 if minimize {
                     api.prevent_close();
                     let _ = window.hide();
+                } else if confirm {
+                    // Let the frontend handle the confirmation dialog.
+                    // It will call stopAll() + window.destroy() if the user confirms,
+                    // or do nothing and allow close if no processes are running.
+                    // We must NOT kill anything here — that causes a crash when
+                    // React subsequently prevents the close and shows the dialog.
                 } else {
+                    // No confirmation — kill everything and close
                     let processes = state.processes.lock().unwrap();
                     for (_, info) in processes.iter() {
                         let _ = std::process::Command::new("taskkill")
@@ -156,9 +177,101 @@ pub fn run() {
                     for (_, mut session) in pty_sessions.drain() {
                         let _ = session.child.kill();
                     }
+                    drop(pty_sessions);
+                    services::pid_file::clear_all();
                 }
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Collect process tree resource info for a given root PID using a shared sysinfo::System.
+fn collect_process_tree(
+    sys: &sysinfo::System,
+    command_id: &str,
+    root_pid: sysinfo::Pid,
+) -> Option<models::config::ProcessTreeInfo> {
+    // Check if root process still exists
+    if sys.process(root_pid).is_none() {
+        return None;
+    }
+
+    let mut tree_pids: Vec<sysinfo::Pid> = vec![root_pid];
+
+    for (proc_pid, process) in sys.processes() {
+        if *proc_pid == root_pid {
+            continue;
+        }
+        let mut current_pid = process.parent();
+        while let Some(parent_pid) = current_pid {
+            if parent_pid == root_pid {
+                tree_pids.push(*proc_pid);
+                break;
+            }
+            match sys.process(parent_pid) {
+                Some(parent_proc) => current_pid = parent_proc.parent(),
+                None => break,
+            }
+        }
+    }
+
+    let mut processes = Vec::new();
+    let mut total_memory_mb = 0.0;
+    let mut total_cpu_percent: f32 = 0.0;
+
+    for proc_pid in &tree_pids {
+        if let Some(process) = sys.process(*proc_pid) {
+            let memory_mb = process.memory() as f64 / (1024.0 * 1024.0);
+            let cpu_percent = process.cpu_usage();
+            total_memory_mb += memory_mb;
+            total_cpu_percent += cpu_percent;
+            processes.push(models::config::ChildProcessInfo {
+                pid: proc_pid.as_u32(),
+                name: process.name().to_string_lossy().to_string(),
+                memory_mb,
+                cpu_percent,
+            });
+        }
+    }
+
+    Some(models::config::ProcessTreeInfo {
+        command_id: command_id.to_string(),
+        processes,
+        total_memory_mb,
+        total_cpu_percent,
+    })
+}
+
+/// Single background loop that refreshes sysinfo once per tick and emits
+/// resource-update events for all monitored processes.
+fn spawn_resource_monitor_loop(app: tauri::AppHandle) {
+    use tauri::Emitter;
+
+    tauri::async_runtime::spawn(async move {
+        let mut sys = sysinfo::System::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // Refresh all processes once
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+            let state = app.state::<AppState>();
+
+            // Snapshot current monitors
+            let monitors: Vec<(String, u32)> = {
+                let m = state.monitored_processes.lock().unwrap();
+                m.values().map(|e| (e.command_id.clone(), e.pid)).collect()
+            };
+
+            for (command_id, pid) in &monitors {
+                let root_pid = sysinfo::Pid::from_u32(*pid);
+                if let Some(info) = collect_process_tree(&sys, command_id, root_pid) {
+                    let _ = app.emit("resource-update", &info);
+                }
+                // Dead root? Just skip this tick. User will stop monitoring when they close the tab.
+            }
+
+        }
+    });
 }

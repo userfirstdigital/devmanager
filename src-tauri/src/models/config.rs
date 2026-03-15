@@ -19,6 +19,8 @@ pub struct Project {
     pub color: Option<String>,
     pub pinned: Option<bool>,
     pub notes: Option<String>,
+    #[serde(rename = "saveLogFiles")]
+    pub save_log_files: Option<bool>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
@@ -76,6 +78,12 @@ pub struct Settings {
     pub restore_session_on_start: Option<bool>,
     #[serde(rename = "defaultTerminal")]
     pub default_terminal: String,
+    #[serde(rename = "claudeCommand")]
+    pub claude_command: Option<String>,
+    #[serde(rename = "codexCommand")]
+    pub codex_command: Option<String>,
+    #[serde(rename = "notificationSound")]
+    pub notification_sound: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -98,6 +106,9 @@ impl Default for Settings {
             minimize_to_tray: false,
             restore_session_on_start: Some(true),
             default_terminal: "bash".to_string(),
+            claude_command: None,
+            codex_command: None,
+            notification_sound: None,
         }
     }
 }
@@ -121,6 +132,8 @@ pub struct SessionTab {
     pub project_id: String,
     #[serde(rename = "commandId")]
     pub command_id: Option<String>,
+    #[serde(rename = "ptySessionId")]
+    pub pty_session_id: Option<String>,
     #[serde(rename = "label")]
     pub label: Option<String>,
     #[serde(rename = "sshConnectionId")]

@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { X } from 'lucide-react';
+import { X, Volume2 } from 'lucide-react';
 import { useAppStore } from '../../stores/appStore';
 import { ImportExport } from './ImportExport';
 import type { DefaultTerminal } from '../../types/config';
+import { NOTIFICATION_SOUNDS, playNotificationSound } from '../../utils/notificationSound';
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const config = useAppStore(s => s.config);
@@ -88,6 +89,53 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               <option value="powershell">PowerShell</option>
               <option value="cmd">CMD</option>
             </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-zinc-200 font-medium">Notification sound</label>
+            <p className="text-[10px] text-zinc-500">Sound played when an AI terminal finishes a long task</p>
+            <div className="flex items-center gap-2">
+              <select
+                value={settings.notificationSound || 'glass'}
+                onChange={e => updateSettings({ ...settings, notificationSound: e.target.value })}
+                className="w-40 px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
+              >
+                {NOTIFICATION_SOUNDS.map(s => (
+                  <option key={s.id} value={s.id}>{s.label}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => playNotificationSound(settings.notificationSound || 'glass')}
+                className="p-1.5 rounded hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200"
+                title="Preview sound"
+              >
+                <Volume2 size={14} />
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-zinc-200 font-medium">Claude command</label>
+            <p className="text-[10px] text-zinc-500">Command launched when opening a Claude terminal</p>
+            <input
+              type="text"
+              value={settings.claudeCommand || ''}
+              onChange={e => updateSettings({ ...settings, claudeCommand: e.target.value || undefined })}
+              placeholder="npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions"
+              className="w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-200 focus:outline-none focus:border-indigo-500 placeholder:text-zinc-600"
+            />
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-zinc-200 font-medium">Codex command</label>
+            <p className="text-[10px] text-zinc-500">Command launched when opening a Codex terminal</p>
+            <input
+              type="text"
+              value={settings.codexCommand || ''}
+              onChange={e => updateSettings({ ...settings, codexCommand: e.target.value || undefined })}
+              placeholder="npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox"
+              className="w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-200 focus:outline-none focus:border-indigo-500 placeholder:text-zinc-600"
+            />
           </div>
 
           <div className="border-t border-zinc-700 pt-4">

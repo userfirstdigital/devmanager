@@ -5,7 +5,7 @@ import { useAppStore } from '../stores/appStore';
 import { useProcessStore } from '../stores/processStore';
 import type { RunCommand, ProjectFolder, EnvEntry } from '../types/config';
 import { getAllCommands } from '../utils/projectHelpers';
-import { ensureSessionBuffer, writeToSessionTerminal, resetSessionForRestart } from '../components/terminal/InteractiveTerminal';
+import { ensureSessionBuffer, writeToSessionTerminal, resetSessionForRestart } from '../utils/terminalBuffers';
 
 // Track auto-restart backoff per command
 const restartBackoffs = new Map<string, { delay: number; lastCrash: number }>();
@@ -78,8 +78,19 @@ export function useProcess() {
         Object.assign(env, command.env);
       }
 
-      // Spawn via PTY so the process gets a real terminal (proper output, colors, no buffering)
-      const pid = await invoke<number>('create_pty_session', {
+      // Build log file path if the project has logging enabled (default: true)
+      let logFile: string | null = null;
+      if (project && project.saveLogFiles !== false) {
+        const folderName = folder.folderPath.replace(/\\/g, '/').split('/').filter(Boolean).pop() || 'unknown';
+        const logFileName = `${folderName}-${command.label}`
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-|-$/g, '') + '.log';
+        logFile = `${project.rootPath}/${logFileName}`;
+      }
+
+      // Spawn PTY + register process + start monitor in one IPC call
+      const result = await invoke<{ pid: number; command_id: string }>('create_server_session', {
         id: commandId,
         cwd: folder.folderPath,
         command: 'cmd',
@@ -87,7 +98,12 @@ export function useProcess() {
         env: Object.keys(env).length > 0 ? env : null,
         cols: 120,
         rows: 30,
+        logFile,
+        commandId,
+        projectId,
       });
+
+      const pid = result.pid;
 
       processStore.setProcessState(commandId, {
         status: 'running',
@@ -102,15 +118,6 @@ export function useProcess() {
           restartBackoffs.delete(commandId);
         }
       }, 60000);
-
-      // Register with Rust backend for resource monitoring
-      await invoke('register_process', {
-        key: commandId,
-        pid,
-        commandId,
-        projectId,
-      });
-      await invoke('start_resource_monitor', { commandId, pid });
 
       // Listen for process exit
       const unlisten = await listen<string>(`pty-exit-${commandId}`, () => {
@@ -181,18 +188,20 @@ export function useProcess() {
   const stopProcess = async (commandId: string) => {
     const processStore = useProcessStore.getState();
     const proc = processStore.getProcess(commandId);
-    if (!proc?.pid) return;
+    if (!proc || proc.status === 'stopped' || proc.status === 'crashed') return;
 
     processStore.setProcessState(commandId, { status: 'stopping' });
 
     try {
       await invoke('close_pty', { id: commandId });
     } catch {
-      // Fallback: kill process tree directly
-      try {
-        await invoke('kill_process_tree', { pid: proc.pid });
-      } catch (err) {
-        console.error('Failed to stop process:', err);
+      // Fallback: kill process tree directly (only if we have a pid)
+      if (proc.pid) {
+        try {
+          await invoke('kill_process_tree', { pid: proc.pid });
+        } catch (err) {
+          console.error('Failed to stop process:', err);
+        }
       }
     }
   };
