@@ -9,9 +9,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::state::{AppState, PtySession, PtyOutputBuffer, ProcessInfo, MonitorEntry};
 use crate::services::pid_file;
 
-/// Per-session ring buffer cap: 5 MB. Generous for native memory,
-/// prevents any single session from growing unbounded.
-const PTY_BUFFER_MAX_BYTES: usize = 5 * 1024 * 1024;
+/// Per-session ring buffer cap: 4 MB.
+/// ~35-50k lines of terminal output. Pre-allocated upfront to avoid VecDeque doubling cascades.
+const PTY_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Inner helper that creates a PTY session and returns the PID.
 /// Does not touch processes or monitors — the caller handles that.
@@ -440,6 +440,7 @@ pub async fn drain_pty_buffer(
 
 /// Non-destructive read of the ring buffer — returns all buffered output as base64
 /// without clearing. Used on terminal mount so screen content survives webview refresh.
+/// Encodes directly from VecDeque slices to avoid allocating a full copy of the buffer.
 #[tauri::command]
 pub async fn snapshot_pty_buffer(
     state: State<'_, AppState>,
@@ -447,11 +448,18 @@ pub async fn snapshot_pty_buffer(
 ) -> Result<String, String> {
     let buffers = state.pty_buffers.lock().unwrap();
     if let Some(buffer) = buffers.get(&id) {
-        let data = buffer.lock().unwrap().snapshot();
-        if data.is_empty() {
+        let buf = buffer.lock().unwrap();
+        if buf.is_empty() {
             Ok(String::new())
         } else {
-            Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+            let (a, b) = buf.slices();
+            // Encode directly from the two contiguous slices — no intermediate Vec.
+            let mut encoder = base64::write::EncoderStringWriter::new(
+                &base64::engine::general_purpose::STANDARD,
+            );
+            std::io::Write::write_all(&mut encoder, a).unwrap();
+            std::io::Write::write_all(&mut encoder, b).unwrap();
+            Ok(encoder.into_inner())
         }
     } else {
         Ok(String::new())

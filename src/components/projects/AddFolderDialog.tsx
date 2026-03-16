@@ -26,7 +26,7 @@ export function AddFolderDialog({ projectId, onClose }: { projectId: string; onC
         setScanResult(result);
         const autoSelect = new Set<string>();
         result.scripts.forEach(s => {
-          if (['dev', 'start', 'serve'].includes(s.name)) autoSelect.add(s.name);
+          if (['dev', 'start', 'serve', 'cargo run', 'tauri dev'].includes(s.name)) autoSelect.add(s.name);
         });
         setSelectedScripts(autoSelect);
         if (result.ports.length === 1) {
@@ -52,11 +52,12 @@ export function AddFolderDialog({ projectId, onClose }: { projectId: string; onC
     selectedScripts.forEach(scriptName => {
       const script = scanResult?.scripts.find(s => s.name === scriptName);
       if (script) {
+        const isCargo = script.command.startsWith('cargo ');
         commands.push({
           id: crypto.randomUUID(),
           label: scriptName,
-          command: 'npm',
-          args: ['run', scriptName],
+          command: isCargo ? 'cargo' : 'npm',
+          args: isCargo ? script.command.split(' ').slice(1) : ['run', ...scriptName.split(' ')],
           port: selectedPort?.port || undefined,
           autoRestart: false,
           clearLogsOnRestart: true,
@@ -115,7 +116,9 @@ export function AddFolderDialog({ projectId, onClose }: { projectId: string; onC
 
           {scanResult && (
             <div>
-              <label className="text-xs text-zinc-400 mb-1 block">npm Scripts ({scanResult.scripts.length} found)</label>
+              <label className="text-xs text-zinc-400 mb-1 block">
+                {scanResult.has_cargo_toml && !scanResult.has_package_json ? 'Cargo Commands' : scanResult.has_cargo_toml ? 'Scripts & Commands' : 'npm Scripts'} ({scanResult.scripts.length} found)
+              </label>
               <div className="space-y-1 max-h-48 overflow-y-auto">
                 {scanResult.scripts.map(script => (
                   <div
@@ -169,9 +172,9 @@ export function AddFolderDialog({ projectId, onClose }: { projectId: string; onC
             </div>
           )}
 
-          {scanResult && !scanResult.has_package_json && (
+          {scanResult && !scanResult.has_package_json && !scanResult.has_cargo_toml && (
             <div className="text-xs text-amber-400 bg-amber-400/10 px-3 py-2 rounded">
-              No package.json found in this folder
+              No package.json or Cargo.toml found in this folder
             </div>
           )}
         </div>

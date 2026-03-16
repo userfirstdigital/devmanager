@@ -40,7 +40,7 @@ export function AddProjectDialog({ onClose }: { onClose: () => void }) {
         for (const entry of entries) {
           const auto = new Set<string>();
           entry.scripts.forEach(s => {
-            if (['dev', 'start', 'serve'].includes(s.name)) auto.add(s.name);
+            if (['dev', 'start', 'serve', 'cargo run', 'tauri dev'].includes(s.name)) auto.add(s.name);
           });
           scripts[entry.path] = auto;
         }
@@ -92,11 +92,12 @@ export function AddProjectDialog({ onClose }: { onClose: () => void }) {
       scripts.forEach(scriptName => {
         const script = entry.scripts.find(s => s.name === scriptName);
         if (script) {
+          const isCargo = script.command.startsWith('cargo ');
           commands.push({
             id: crypto.randomUUID(),
             label: scriptName,
-            command: 'npm',
-            args: ['run', scriptName],
+            command: isCargo ? 'cargo' : 'npm',
+            args: isCargo ? script.command.split(' ').slice(1) : ['run', ...scriptName.split(' ')],
             port: selectedPort?.port || undefined,
             autoRestart: false,
             clearLogsOnRestart: true,
@@ -185,7 +186,7 @@ export function AddProjectDialog({ onClose }: { onClose: () => void }) {
                   {rootPath || 'Select root folder...'}
                 </button>
                 <p className="text-[10px] text-zinc-500 mt-1">
-                  Sub-folders with package.json will be discovered automatically
+                  Sub-folders with package.json or Cargo.toml will be discovered automatically
                 </p>
               </div>
 
@@ -214,6 +215,8 @@ export function AddProjectDialog({ onClose }: { onClose: () => void }) {
                           {selectedFolders.has(entry.path) && <Check size={12} className="text-white" />}
                         </div>
                         <span className="text-xs text-zinc-200 font-mono">{entry.name}</span>
+                        {entry.projectType === 'rust' && <span className="text-[10px] text-orange-400 font-medium">[Rust]</span>}
+                        {entry.projectType === 'both' && <span className="text-[10px] text-orange-400 font-medium">[Node + Rust]</span>}
                         <span className="text-[10px] text-zinc-500 ml-auto">
                           {entry.scripts.length} scripts{entry.hasEnv ? ' + .env' : ''}
                         </span>
@@ -225,7 +228,7 @@ export function AddProjectDialog({ onClose }: { onClose: () => void }) {
 
               {rootPath && !scanning && scanEntries.length === 0 && (
                 <div className="text-xs text-amber-400 bg-amber-400/10 px-3 py-2 rounded">
-                  No sub-folders with package.json found. You can still add folders manually after creating the project.
+                  No sub-folders with package.json or Cargo.toml found. You can still add folders manually after creating the project.
                 </div>
               )}
             </>

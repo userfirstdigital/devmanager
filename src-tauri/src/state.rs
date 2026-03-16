@@ -30,7 +30,9 @@ pub struct PtyOutputBuffer {
 impl PtyOutputBuffer {
     pub fn new(max_bytes: usize) -> Self {
         Self {
-            data: VecDeque::with_capacity(max_bytes.min(65536)),
+            // Pre-allocate full capacity upfront to avoid repeated VecDeque doublings
+            // (64K→128K→…) which cause allocation failures on Windows debug builds.
+            data: VecDeque::with_capacity(max_bytes),
             max_bytes,
         }
     }
@@ -49,9 +51,15 @@ impl PtyOutputBuffer {
         self.data.drain(..).collect()
     }
 
-    /// Return a copy of all buffered data without clearing.
-    pub fn snapshot(&self) -> Vec<u8> {
-        self.data.iter().copied().collect()
+    /// Return the two contiguous slices of the ring buffer for zero-copy access.
+    /// VecDeque stores data in at most two slices; callers can encode directly
+    /// without allocating an intermediate Vec.
+    pub fn slices(&self) -> (&[u8], &[u8]) {
+        self.data.as_slices()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }
 

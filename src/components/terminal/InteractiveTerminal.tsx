@@ -64,7 +64,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, l
       cursorStyle: 'bar',
       cursorBlink: true,
       convertEol: false,
-      smoothScrollDuration: 80,
+      smoothScrollDuration: 0,
     });
 
     const fitAddon = new FitAddon();
@@ -97,6 +97,8 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, l
       }
       buf.pendingQueue = null;
       buf.terminal = terminal;
+      // Ensure viewport starts at the bottom after replaying snapshot
+      terminal.scrollToBottom();
       if (buf.exited) {
         terminal.writeln('\r\n\x1b[90m--- Session ended ---\x1b[0m');
       }
@@ -184,17 +186,30 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, l
     // (e.g., ResourceMonitor toggling between states)
     let resizeRaf = 0;
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastCols = terminal.cols;
+    let lastRows = terminal.rows;
     const observer = new ResizeObserver(() => {
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         cancelAnimationFrame(resizeRaf);
         resizeRaf = requestAnimationFrame(() => {
           try {
+            // Check proposed dimensions BEFORE fitting — fitAddon.fit()
+            // itself causes a reflow that shifts the viewport, so we must
+            // skip it entirely when cols/rows haven't changed.
+            const dims = fitAddon.proposeDimensions();
+            if (dims && dims.cols === lastCols && dims.rows === lastRows) {
+              return;
+            }
+
             // Remember if user was following output at the bottom
             const buf_active = terminal.buffer.active;
             const wasAtBottom = buf_active.viewportY >= buf_active.baseY;
 
             fitAddon.fit();
+            lastCols = terminal.cols;
+            lastRows = terminal.rows;
+
             handleResize(terminal.cols, terminal.rows);
 
             // Restore scroll position — keep user at bottom if they were there
@@ -239,7 +254,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, l
 
   return (
     <div className="h-full flex flex-col">
-      <div className="flex items-center gap-3 px-3 py-1.5 bg-zinc-800/50 border-b border-zinc-700/50">
+      <div className="flex items-center gap-3 px-3 h-8 shrink-0 bg-zinc-800/50 border-b border-zinc-700/50 overflow-hidden">
         {label && <span className="text-xs font-medium text-zinc-400 truncate">{label}</span>}
         <ResourceMonitor commandId={sessionId} />
       </div>

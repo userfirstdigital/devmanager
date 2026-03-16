@@ -84,6 +84,7 @@ export interface ScanResult {
   scripts: ScannedScript[];
   ports: ScannedPort[];
   has_package_json: boolean;
+  has_cargo_toml: boolean;
   has_env_file: boolean;
 }
 
@@ -102,6 +103,7 @@ export interface RootScanEntry {
   path: string;
   name: string;
   hasEnv: boolean;
+  projectType: string;
   scripts: ScannedScript[];
   ports: ScannedPort[];
 }

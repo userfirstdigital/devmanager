@@ -8,6 +8,55 @@ static PORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)").unwrap()
 });
 
+/// Read cargo scripts from a Cargo.toml file
+pub fn read_cargo_scripts(cargo_toml: &Path) -> Vec<ScannedScript> {
+    let content = match std::fs::read_to_string(cargo_toml) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let parsed: toml::Value = match content.parse() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut scripts = vec![
+        ScannedScript { name: "cargo run".to_string(), command: "cargo run".to_string() },
+        ScannedScript { name: "cargo build".to_string(), command: "cargo build".to_string() },
+        ScannedScript { name: "cargo test".to_string(), command: "cargo test".to_string() },
+        ScannedScript { name: "cargo check".to_string(), command: "cargo check".to_string() },
+    ];
+
+    // If the crate has [[bin]] targets, add them as cargo run --bin <name>
+    if let Some(bins) = parsed.get("bin").and_then(|b| b.as_array()) {
+        for bin in bins {
+            if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
+                scripts.push(ScannedScript {
+                    name: format!("cargo run --bin {}", name),
+                    command: format!("cargo run --bin {}", name),
+                });
+            }
+        }
+    }
+
+    scripts
+}
+
+/// Expand a bare "tauri" npm script into "tauri dev" and "tauri build" entries
+pub fn expand_tauri_scripts(scripts: &mut Vec<ScannedScript>) {
+    if let Some(idx) = scripts.iter().position(|s| s.name == "tauri") {
+        let tauri_cmd = scripts[idx].command.clone();
+        scripts.remove(idx);
+        scripts.insert(idx, ScannedScript {
+            name: "tauri dev".to_string(),
+            command: format!("{} dev", tauri_cmd),
+        });
+        scripts.insert(idx + 1, ScannedScript {
+            name: "tauri build".to_string(),
+            command: format!("{} build", tauri_cmd),
+        });
+    }
+}
+
 /// Scan a project directory for scripts, ports, and configuration
 pub fn scan_directory(folder_path: &str) -> Result<ScanResult, String> {
     let base = Path::new(folder_path);
@@ -33,6 +82,18 @@ pub fn scan_directory(folder_path: &str) -> Result<ScanResult, String> {
                 }
             }
         }
+
+        // Expand bare "tauri" script into "tauri dev" and "tauri build"
+        expand_tauri_scripts(&mut scripts);
+    }
+
+    // Check for Cargo.toml and extract cargo scripts
+    let cargo_toml_path = base.join("Cargo.toml");
+    let has_cargo_toml = cargo_toml_path.exists();
+
+    if has_cargo_toml {
+        let cargo_scripts = read_cargo_scripts(&cargo_toml_path);
+        scripts.extend(cargo_scripts);
     }
 
     // Scan .env files for port variables
@@ -68,6 +129,7 @@ pub fn scan_directory(folder_path: &str) -> Result<ScanResult, String> {
         scripts,
         ports,
         has_package_json,
+        has_cargo_toml,
         has_env_file,
     })
 }

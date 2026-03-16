@@ -217,21 +217,38 @@ fn scan_dir_recursive(
         return;
     }
 
-    // Check if this directory has a package.json
+    // Check if this directory has a package.json or Cargo.toml
     let package_json = dir.join("package.json");
-    if package_json.exists() && dir != root {
+    let cargo_toml = dir.join("Cargo.toml");
+    let has_pkg = package_json.exists();
+    let has_cargo = cargo_toml.exists();
+
+    if (has_pkg || has_cargo) && dir != root {
         let has_env = dir.join(".env").exists();
-        let scripts = read_package_scripts(&package_json);
+        let mut scripts = if has_pkg {
+            read_package_scripts(&package_json)
+        } else {
+            Vec::new()
+        };
+        if has_cargo {
+            scripts.extend(scanner_service::read_cargo_scripts(&cargo_toml));
+        }
         let ports = scan_env_ports(dir);
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let project_type = match (has_pkg, has_cargo) {
+            (true, true) => "both",
+            (false, true) => "rust",
+            _ => "node",
+        }.to_string();
 
         entries.push(RootScanEntry {
             path: dir.to_string_lossy().to_string(),
             name,
             has_env,
+            project_type,
             scripts,
             ports,
         });
@@ -293,11 +310,16 @@ fn read_package_scripts(package_json: &Path) -> Vec<ScannedScript> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    scripts
+    let mut result: Vec<ScannedScript> = scripts
         .iter()
         .map(|(name, cmd)| ScannedScript {
             name: name.clone(),
             command: cmd.as_str().unwrap_or("").to_string(),
         })
-        .collect()
+        .collect();
+
+    // Expand bare "tauri" script into "tauri dev" and "tauri build"
+    scanner_service::expand_tauri_scripts(&mut result);
+
+    result
 }

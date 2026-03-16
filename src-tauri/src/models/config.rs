@@ -156,6 +156,7 @@ pub struct ScanResult {
     pub scripts: Vec<ScannedScript>,
     pub ports: Vec<ScannedPort>,
     pub has_package_json: bool,
+    pub has_cargo_toml: bool,
     pub has_env_file: bool,
 }
 
@@ -185,6 +186,8 @@ pub struct RootScanEntry {
     pub name: String,
     #[serde(rename = "hasEnv")]
     pub has_env: bool,
+    #[serde(rename = "projectType")]
+    pub project_type: String,
     pub scripts: Vec<ScannedScript>,
     pub ports: Vec<ScannedPort>,
 }

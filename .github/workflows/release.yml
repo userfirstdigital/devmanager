@@ -2,17 +2,37 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - master
 
 jobs:
   build:
+    # Skip if the push was from the auto-bump commit
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: windows-latest
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump patch version
+        id: bump
+        shell: bash
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          PATCH=$((PATCH + 1))
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${CURRENT} → ${VERSION}"
+
+          # Update version in all config files
+          sed -i "s/\"version\": \"${CURRENT}\"/\"version\": \"${VERSION}\"/" package.json
+          sed -i "s/\"version\": \"${CURRENT}\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
+          sed -i "s/^version = \"${CURRENT}\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -40,9 +60,8 @@ jobs:
       - name: Generate latest.json
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.bump.outputs.version }}"
           NSIS_SIG=$(cat "src-tauri/target/release/bundle/nsis/DevManager_${VERSION}_x64-setup.exe.sig")
-          MSI_SIG=$(cat "src-tauri/target/release/bundle/msi/DevManager_${VERSION}_x64_en-US.msi.sig")
           REPO="${GITHUB_REPOSITORY}"
 
           cat > latest.json << EOF
@@ -62,6 +81,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.bump.outputs.version }}
           draft: false
           generate_release_notes: true
           files: |
@@ -70,3 +90,13 @@ jobs:
             src-tauri/target/release/bundle/msi/DevManager_*_x64_en-US.msi
             src-tauri/target/release/bundle/msi/DevManager_*_x64_en-US.msi.sig
             latest.json
+
+      - name: Push version bump back to repo
+        shell: bash
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          git commit -m "release: v${VERSION} [skip ci]"
+          git push origin master

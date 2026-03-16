@@ -14,6 +14,22 @@ src-tauri/target/
 Thumbs.db
 
 # Env
-.env
-.env.local
+.env*
 /src-tauri/keys
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Credentials
+.npmrc
+credentials.json
+serviceAccountKey.json
+
+# Logs and editor junk
+*.log
+*.swp
+*.bak
+*~

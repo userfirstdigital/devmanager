@@ -30,3 +30,4 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"] }
 tauri-plugin-window-state = "2.4.1"
 notify = "7"
+toml = "0.8"
