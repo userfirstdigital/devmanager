@@ -8,6 +8,7 @@ import { useAppStore } from '../../stores/appStore';
 import { ServerControls } from '../servers/ServerControls';
 import { ResourceMonitor } from '../servers/ResourceMonitor';
 import { FontSizeSlider } from '../terminal/FontSizeSlider';
+import { isAtBottom } from '../../utils/terminalSize';
 
 export function LogViewer({ commandId }: { commandId: string }) {
   const termRef = useRef<HTMLDivElement>(null);
@@ -15,7 +16,6 @@ export function LogViewer({ commandId }: { commandId: string }) {
   const fitAddonRef = useRef<FitAddon | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
   const lastLogIndexRef = useRef<number>(0);
-  const autoScrollRef = useRef(true);
 
   const defaultFontSize = useAppStore(s => s.config?.settings.terminalFontSize ?? 13);
   const [fontSize, setFontSize] = useState(defaultFontSize);
@@ -90,16 +90,18 @@ export function LogViewer({ commandId }: { commandId: string }) {
     searchAddonRef.current = searchAddon;
     lastLogIndexRef.current = 0;
 
-    // Handle user scroll (disable auto-scroll when scrolled up)
-    terminal.onScroll(() => {
-      const buffer = terminal.buffer.active;
-      const atBottom = buffer.baseY + terminal.rows >= buffer.length;
-      autoScrollRef.current = atBottom;
-    });
-
-    // Resize observer
+    // Resize observer with hidden-container guard and dimension check
+    let lastCols = terminal.cols;
+    let lastRows = terminal.rows;
     const observer = new ResizeObserver(() => {
-      try { fitAddon.fit(); } catch {}
+      try {
+        if (!termRef.current || termRef.current.clientWidth === 0) return;
+        const dims = fitAddon.proposeDimensions();
+        if (dims && dims.cols === lastCols && dims.rows === lastRows) return;
+        fitAddon.fit();
+        lastCols = terminal.cols;
+        lastRows = terminal.rows;
+      } catch {}
     });
     observer.observe(termRef.current);
 
@@ -113,30 +115,27 @@ export function LogViewer({ commandId }: { commandId: string }) {
     };
   }, [commandId, fontSize]);
 
-  // Write new logs to terminal
+  // Write new logs to terminal — batched into a single write per effect
   useEffect(() => {
     const terminal = xtermRef.current;
     if (!terminal) return;
-
-    const startIdx = lastLogIndexRef.current;
-    if (startIdx < logs.length) {
-      for (let i = startIdx; i < logs.length; i++) {
-        terminal.writeln(logs[i]);
-      }
-      lastLogIndexRef.current = logs.length;
-
-      if (autoScrollRef.current) {
-        terminal.scrollToBottom();
-      }
-    }
 
     // Handle log clear (when logs array is shorter than what we've written)
     if (logs.length < lastLogIndexRef.current) {
       terminal.clear();
       lastLogIndexRef.current = 0;
-      for (let i = 0; i < logs.length; i++) {
-        terminal.writeln(logs[i]);
-      }
+    }
+
+    const startIdx = lastLogIndexRef.current;
+    if (startIdx < logs.length) {
+      // Batch all new lines into a single write
+      const newLines = logs.slice(startIdx);
+      const batch = newLines.join('\r\n') + '\r\n';
+      terminal.write(batch, () => {
+        if (isAtBottom(terminal)) {
+          terminal.scrollToBottom();
+        }
+      });
       lastLogIndexRef.current = logs.length;
     }
   }, [logs]);

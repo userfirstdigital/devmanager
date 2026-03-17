@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../stores/appStore';
 import { useProcessStore } from '../stores/processStore';
 import { ensureSessionBuffer } from '../utils/terminalBuffers';
+import { getPreferredPtySize } from '../utils/terminalSize';
 
 const DEFAULT_CLAUDE_CMD = 'npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions';
 const DEFAULT_CODEX_CMD = 'npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox';
@@ -77,8 +78,8 @@ export function useSessionRestore() {
                 cwd: project.rootPath,
                 command: shell.command,
                 args: shell.args,
-                cols: 80,
-                rows: 24,
+                cols: getPreferredPtySize().cols,
+                rows: getPreferredPtySize().rows,
                 projectId: tab.projectId,
                 checkAlive: true,
               });
@@ -104,8 +105,8 @@ export function useSessionRestore() {
                 cwd: '.',
                 command: 'ssh',
                 args: sshArgs,
-                cols: 80,
-                rows: 24,
+                cols: getPreferredPtySize().cols,
+                rows: getPreferredPtySize().rows,
                 projectId: '',
                 checkAlive: true,
               });

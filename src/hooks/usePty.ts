@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useProcessStore } from '../stores/processStore';
 import { cleanupSessionBuffer } from '../utils/terminalBuffers';
+import { getPreferredPtySize } from '../utils/terminalSize';
 
 export function usePty() {
   const createSession = async (
@@ -9,9 +10,12 @@ export function usePty() {
     command: string,
     args: string[] = [],
     env?: Record<string, string>,
-    cols = 80,
-    rows = 24,
+    cols?: number,
+    rows?: number,
   ): Promise<number> => {
+    const preferred = getPreferredPtySize();
+    cols = cols ?? preferred.cols;
+    rows = rows ?? preferred.rows;
     // Single IPC call: create PTY + register process + start resource monitor
     const result = await invoke<{ pid: number; command_id: string }>('create_server_session', {
       id,

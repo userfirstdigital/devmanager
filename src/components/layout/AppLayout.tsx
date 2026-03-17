@@ -94,6 +94,7 @@ export function AppLayout() {
                   label={getTabLabel(tab)}
                   isActive={tab.id === activeTabId}
                   showActivity={tab.type === 'claude' || tab.type === 'codex'}
+                  hideCursor={tab.type === 'claude' || tab.type === 'codex'}
                   onExit={() => handlePtyExit(tab.ptySessionId!)}
                 />
               )}

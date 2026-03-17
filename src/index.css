@@ -36,3 +36,26 @@ body {
 .xterm {
   padding: 4px;
 }
+
+/* Hide the xterm cursor in AI terminals (claude/codex) without hiding the
+   underlying glyph — xterm renders the character and cursor decoration in
+   the same span, so we neutralise every cursor *style* rather than hiding
+   the element itself. */
+[data-hide-cursor] .xterm-cursor-block {
+  background-color: transparent !important;
+  color: inherit !important;
+}
+[data-hide-cursor] .xterm-cursor-bar {
+  box-shadow: none !important;
+}
+[data-hide-cursor] .xterm-cursor-underline {
+  border-bottom-color: transparent !important;
+}
+/* Inactive (unfocused) outline cursor */
+[data-hide-cursor] .xterm-cursor-outline {
+  outline: none !important;
+}
+/* Kill the blink animation so there is zero visual movement */
+[data-hide-cursor] .xterm-cursor-blink {
+  animation: none !important;
+}

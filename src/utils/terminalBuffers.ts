@@ -29,8 +29,7 @@ export interface SessionBuffer {
   idleTimer: ReturnType<typeof setTimeout> | null;
   recentDataTimestamps: number[];
   suppressActivityUntil: number;
-  onDataWritten?: () => void;  // called after data is written to mounted terminal
-  pendingFrame: Uint8Array[] | null;  // chunks accumulated for the current animation frame
+  pendingFrame: Uint8Array[] | null;  // chunks accumulated for rAF write batching
   writeRaf: number;                   // rAF handle for batched writes (0 = none pending)
 }
 
@@ -58,9 +57,10 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
     dataUnlisten: listen<string>(`pty-data-${sessionId}`, (event) => {
       const bytes = Uint8Array.from(atob(event.payload), c => c.charCodeAt(0));
       if (entry.terminal) {
-        // Terminal is mounted — batch writes to once per animation frame.
-        // This prevents scrollbar breathing and viewport stutter from hundreds
-        // of tiny writes during rapid output.
+        // Batch writes per animation frame. All PTY events arriving within a
+        // frame are merged into a single terminal.write() so xterm processes
+        // cursor-positioning escape sequences atomically — the cursor appears
+        // only at its final position, not at intermediate TUI update positions.
         if (!entry.pendingFrame) entry.pendingFrame = [];
         entry.pendingFrame.push(bytes);
         if (!entry.writeRaf) {
@@ -72,9 +72,7 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
             const merged = new Uint8Array(total);
             let off = 0;
             for (const c of chunks) { merged.set(c, off); off += c.length; }
-            entry.terminal?.write(merged, () => {
-              entry.onDataWritten?.();
-            });
+            entry.terminal?.write(merged);
           });
         }
       } else if (entry.pendingQueue) {

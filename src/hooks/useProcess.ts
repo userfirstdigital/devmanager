@@ -6,6 +6,7 @@ import { useProcessStore } from '../stores/processStore';
 import type { RunCommand, ProjectFolder, EnvEntry } from '../types/config';
 import { getAllCommands } from '../utils/projectHelpers';
 import { ensureSessionBuffer, writeToSessionTerminal, resetSessionForRestart } from '../utils/terminalBuffers';
+import { getPreferredPtySize } from '../utils/terminalSize';
 
 // Track auto-restart backoff per command
 const restartBackoffs = new Map<string, { delay: number; lastCrash: number }>();
@@ -96,8 +97,8 @@ export function useProcess() {
         command: 'cmd',
         args: ['/C', command.command, ...command.args],
         env: Object.keys(env).length > 0 ? env : null,
-        cols: 120,
-        rows: 30,
+        cols: getPreferredPtySize().cols,
+        rows: getPreferredPtySize().rows,
         logFile,
         commandId,
         projectId,
