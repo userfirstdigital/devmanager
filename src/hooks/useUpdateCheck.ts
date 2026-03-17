@@ -17,8 +17,8 @@ export function useUpdateCheck() {
             })
           );
         }
-      } catch {
-        // Update check is non-critical
+      } catch (err) {
+        console.warn('[update-check]', err);
       }
     };
 
