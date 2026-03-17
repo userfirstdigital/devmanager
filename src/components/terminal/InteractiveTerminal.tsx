@@ -40,7 +40,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, l
     const terminal = new Terminal({
       theme: {
         background: '#09090b',
-        foreground: '#e4e4e7',
+        foreground: '#c8c8cd',
         cursor: '#e4e4e7',
         selectionBackground: '#3f3f46',
         black: '#18181b',
