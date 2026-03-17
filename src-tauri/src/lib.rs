@@ -3,17 +3,19 @@ mod models;
 mod services;
 mod state;
 
+use services::platform;
 use state::AppState;
-use std::sync::{Mutex, RwLock};
 use std::collections::HashMap;
-use tauri::Manager;
-use tauri::tray::{TrayIconBuilder, MouseButton, MouseButtonState, TrayIconEvent};
+use std::sync::{Mutex, RwLock};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppState {
         config: RwLock::new(None),
+        runtime_platform: platform::detect_runtime_platform(),
         processes: Mutex::new(HashMap::new()),
         monitored_processes: Mutex::new(HashMap::new()),
         pty_sessions: Mutex::new(HashMap::new()),
@@ -74,6 +76,8 @@ pub fn run() {
             commands::scanner::scan_root,
             commands::scanner::watch_git_branches,
             commands::scanner::unwatch_git_branches,
+            commands::runtime::get_runtime_info,
+            commands::runtime::quit_app,
         ])
         .setup(|app| {
             // Kill any orphaned processes from a previous crash
@@ -95,40 +99,31 @@ pub fn run() {
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .tooltip("DevManager")
-                .on_menu_event(move |app, event| {
-                    match event.id().as_ref() {
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
+                .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
                         }
-                        "stop_all" => {
-                            let state = app.state::<AppState>();
-                            let processes = state.processes.lock().unwrap();
-                            for (_, info) in processes.iter() {
-                                let _ = std::process::Command::new("taskkill")
-                                    .args(["/T", "/F", "/PID", &info.pid.to_string()])
-                                    .output();
-                            }
-                        }
-                        "quit" => {
-                            let state = app.state::<AppState>();
-                            let processes = state.processes.lock().unwrap();
-                            for (_, info) in processes.iter() {
-                                let _ = std::process::Command::new("taskkill")
-                                    .args(["/T", "/F", "/PID", &info.pid.to_string()])
-                                    .output();
-                            }
-                            drop(processes);
-                            services::pid_file::clear_all();
-                            app.exit(0);
-                        }
-                        _ => {}
                     }
+                    "stop_all" => {
+                        let state = app.state::<AppState>();
+                        platform::stop_all_tracked_processes(&state);
+                    }
+                    "quit" => {
+                        let state = app.state::<AppState>();
+                        platform::shutdown_managed_processes(&state);
+                        app.exit(0);
+                    }
+                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         let app = tray.app_handle();
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
@@ -151,8 +146,14 @@ pub fn run() {
 
                 // Check settings (RwLock read)
                 let config = state.config.read().unwrap();
-                let minimize = config.as_ref().map(|c| c.settings.minimize_to_tray).unwrap_or(false);
-                let confirm = config.as_ref().map(|c| c.settings.confirm_on_close).unwrap_or(true);
+                let minimize = config
+                    .as_ref()
+                    .map(|c| c.settings.minimize_to_tray)
+                    .unwrap_or(false);
+                let confirm = config
+                    .as_ref()
+                    .map(|c| c.settings.confirm_on_close)
+                    .unwrap_or(true);
                 drop(config);
 
                 if minimize {
@@ -166,20 +167,17 @@ pub fn run() {
                     // React subsequently prevents the close and shows the dialog.
                 } else {
                     // No confirmation — kill everything and close
-                    let processes = state.processes.lock().unwrap();
-                    for (_, info) in processes.iter() {
-                        let _ = std::process::Command::new("taskkill")
-                            .args(["/T", "/F", "/PID", &info.pid.to_string()])
-                            .output();
+                    #[cfg(target_os = "macos")]
+                    {
+                        api.prevent_close();
+                        platform::shutdown_managed_processes(&state);
+                        app_handle.exit(0);
                     }
-                    drop(processes);
-                    // Kill PTY sessions
-                    let mut pty_sessions = state.pty_sessions.lock().unwrap();
-                    for (_, mut session) in pty_sessions.drain() {
-                        let _ = session.child.kill();
+
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        platform::shutdown_managed_processes(&state);
                     }
-                    drop(pty_sessions);
-                    services::pid_file::clear_all();
                 }
             }
         })
@@ -272,7 +270,6 @@ fn spawn_resource_monitor_loop(app: tauri::AppHandle) {
                 }
                 // Dead root? Just skip this tick. User will stop monitoring when they close the tab.
             }
-
         }
     });
 }

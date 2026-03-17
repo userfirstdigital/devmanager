@@ -5,6 +5,7 @@ import { useAppStore } from '../stores/appStore';
 import { useProcessStore } from '../stores/processStore';
 import { ensureSessionBuffer } from '../utils/terminalBuffers';
 import { getPreferredPtySize } from '../utils/terminalSize';
+import { resolveInteractiveShellCommand } from '../utils/runtimePlatform';
 
 const DEFAULT_CLAUDE_CMD = 'npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions';
 const DEFAULT_CODEX_CMD = 'npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox';
@@ -28,18 +29,6 @@ interface RestoreResult {
   error: string | null;
 }
 
-function resolveShellCommand(defaultTerminal: string): { command: string; args: string[] } {
-  switch (defaultTerminal) {
-    case 'powershell':
-      return { command: 'powershell.exe', args: [] };
-    case 'cmd':
-      return { command: 'cmd.exe', args: [] };
-    case 'bash':
-    default:
-      return { command: 'C:/Program Files/Git/bin/bash.exe', args: ['--login'] };
-  }
-}
-
 export function useSessionRestore() {
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const openTabs = useAppStore(s => s.openTabs);
@@ -55,12 +44,21 @@ export function useSessionRestore() {
     const init = async () => {
       await loadConfig();
       const cfg = useAppStore.getState().config;
-      if (cfg?.settings.restoreSessionOnStart !== false) {
+      const settings = cfg?.settings ?? {
+        theme: 'dark',
+        logBufferSize: 10000,
+        confirmOnClose: true,
+        minimizeToTray: false,
+        restoreSessionOnStart: true,
+        defaultTerminal: 'bash' as const,
+        macTerminalProfile: 'system' as const,
+      };
+      if (settings.restoreSessionOnStart !== false) {
         await loadSession();
 
         const tabs = useAppStore.getState().openTabs;
-        const defaultTerminal = cfg?.settings.defaultTerminal || 'bash';
-        const shell = resolveShellCommand(defaultTerminal);
+        const runtimeInfo = useAppStore.getState().runtimeInfo;
+        const shell = resolveInteractiveShellCommand(runtimeInfo, settings);
 
         // Build batch restore requests for claude, codex, and ssh tabs
         const restoreRequests: RestoreRequest[] = [];

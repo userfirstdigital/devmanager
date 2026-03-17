@@ -5,34 +5,93 @@ on:
     branches:
       - master
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    # Skip if the push was from the auto-bump commit
+  prepare:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
-    runs-on: windows-latest
-    permissions:
-      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      current_version: ${{ steps.bump.outputs.current_version }}
+      version: ${{ steps.bump.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: Bump patch version
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Calculate release version
         id: bump
         shell: bash
         run: |
           CURRENT=$(node -p "require('./package.json').version")
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          LATEST_TAG=$(git tag --list 'v*' --sort=-version:refname | head -n 1 | sed 's/^v//')
+          BASE_VERSION="$CURRENT"
+
+          if [[ -n "${LATEST_TAG}" ]]; then
+            BASE_VERSION=$(printf '%s\n%s\n' "${CURRENT}" "${LATEST_TAG}" | sort -V | tail -n 1)
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
           PATCH=$((PATCH + 1))
           VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Bumping ${CURRENT} → ${VERSION}"
 
-          # Update version in all config files
-          sed -i "s/\"version\": \"${CURRENT}\"/\"version\": \"${VERSION}\"/" package.json
-          sed -i "s/\"version\": \"${CURRENT}\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
-          sed -i "s/^version = \"${CURRENT}\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
+          echo "current_version=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${BASE_VERSION} -> ${VERSION}"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows-x86_64
+          - runner: macos-15
+            platform: darwin-aarch64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply release version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["VERSION"]
+
+          for path_str in ("package.json", "src-tauri/tauri.conf.json"):
+              path = pathlib.Path(path_str)
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["version"] = version
+              path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+          cargo_toml = pathlib.Path("src-tauri/Cargo.toml")
+          updated = re.sub(
+              r'^version = "[^"]+"$',
+              f'version = "{version}"',
+              cargo_toml.read_text(encoding="utf-8"),
+              count=1,
+              flags=re.MULTILINE,
+          )
+          cargo_toml.write_text(updated, encoding="utf-8")
+          PY
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -48,30 +107,86 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Regenerate Cargo.lock
+        run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
+
       - name: Install frontend dependencies
         run: npm ci
 
       - name: Build Tauri app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build
 
-      - name: Generate latest.json
+      - name: Collect release artifacts
+        env:
+          PLATFORM: ${{ matrix.platform }}
         shell: bash
         run: |
-          VERSION="${{ steps.bump.outputs.version }}"
-          NSIS_SIG=$(cat "src-tauri/target/release/bundle/nsis/DevManager_${VERSION}_x64-setup.exe.sig")
-          REPO="${GITHUB_REPOSITORY}"
+          set -euo pipefail
+          mkdir -p "release-artifacts/${PLATFORM}"
 
-          cat > latest.json << EOF
+          if [[ "${PLATFORM}" == "windows-x86_64" ]]; then
+            cp src-tauri/target/release/bundle/nsis/*.exe "release-artifacts/${PLATFORM}/"
+            cp src-tauri/target/release/bundle/nsis/*.exe.sig "release-artifacts/${PLATFORM}/"
+            cp src-tauri/target/release/bundle/msi/*.msi "release-artifacts/${PLATFORM}/"
+            cp src-tauri/target/release/bundle/msi/*.msi.sig "release-artifacts/${PLATFORM}/"
+          else
+            cp src-tauri/target/release/bundle/dmg/*.dmg "release-artifacts/${PLATFORM}/"
+            cp src-tauri/target/release/bundle/macos/*.app.tar.gz "release-artifacts/${PLATFORM}/"
+            cp src-tauri/target/release/bundle/macos/*.app.tar.gz.sig "release-artifacts/${PLATFORM}/"
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: release-artifacts/${{ matrix.platform }}
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Generate latest.json
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WINDOWS_DIR="release-artifacts/windows-x86_64"
+          MAC_DIR="release-artifacts/darwin-aarch64"
+
+          WINDOWS_EXE=$(basename "$(find "${WINDOWS_DIR}" -maxdepth 1 -name '*-setup.exe' | head -n 1)")
+          WINDOWS_SIG=$(tr -d '\r\n' < "${WINDOWS_DIR}/${WINDOWS_EXE}.sig")
+
+          MAC_UPDATER=$(basename "$(find "${MAC_DIR}" -maxdepth 1 -name '*.app.tar.gz' | head -n 1)")
+          MAC_SIG=$(tr -d '\r\n' < "${MAC_DIR}/${MAC_UPDATER}.sig")
+
+          cat > latest.json <<EOF
           {
             "version": "${VERSION}",
             "notes": "See the release notes on GitHub for details.",
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
               "windows-x86_64": {
-                "signature": "${NSIS_SIG}",
-                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/DevManager_${VERSION}_x64-setup.exe"
+                "signature": "${WINDOWS_SIG}",
+                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${WINDOWS_EXE}"
+              },
+              "darwin-aarch64": {
+                "signature": "${MAC_SIG}",
+                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${MAC_UPDATER}"
               }
             }
           }
@@ -80,22 +195,73 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.bump.outputs.version }}
+          tag_name: v${{ needs.prepare.outputs.version }}
           draft: false
           generate_release_notes: true
           files: |
-            src-tauri/target/release/bundle/nsis/DevManager_*_x64-setup.exe
-            src-tauri/target/release/bundle/nsis/DevManager_*_x64-setup.exe.sig
-            src-tauri/target/release/bundle/msi/DevManager_*_x64_en-US.msi
-            src-tauri/target/release/bundle/msi/DevManager_*_x64_en-US.msi.sig
+            release-artifacts/windows-x86_64/*
+            release-artifacts/darwin-aarch64/*
             latest.json
 
-      - name: Push version bump back to repo
+  push-version-bump:
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply release version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         shell: bash
         run: |
-          VERSION="${{ steps.bump.outputs.version }}"
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["VERSION"]
+
+          for path_str in ("package.json", "src-tauri/tauri.conf.json"):
+              path = pathlib.Path(path_str)
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["version"] = version
+              path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+          cargo_toml = pathlib.Path("src-tauri/Cargo.toml")
+          updated = re.sub(
+              r'^version = "[^"]+"$',
+              f'version = "{version}"',
+              cargo_toml.read_text(encoding="utf-8"),
+              count=1,
+              flags=re.MULTILINE,
+          )
+          cargo_toml.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Regenerate Cargo.lock
+        run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
+
+      - name: Commit and push version bump
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
           git commit -m "release: v${VERSION} [skip ci]"
           git push origin master

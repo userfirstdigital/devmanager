@@ -3,9 +3,11 @@ use std::path::PathBuf;
 
 /// Get the config file path
 pub fn get_config_path() -> Result<PathBuf, String> {
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| "Could not determine config directory".to_string())?;
-    Ok(config_dir.join("com.userfirst.devmanager").join("config.json"))
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| "Could not determine config directory".to_string())?;
+    Ok(config_dir
+        .join("com.userfirst.devmanager")
+        .join("config.json"))
 }
 
 /// Load config from disk. If the file is corrupt or from an old schema, delete it and start fresh.
@@ -14,8 +16,8 @@ pub fn load_config() -> Result<AppConfig, String> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read config file: {}", e))?;
+    let contents =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read config file: {}", e))?;
 
     match serde_json::from_str::<AppConfig>(&contents) {
         Ok(config) => Ok(config),

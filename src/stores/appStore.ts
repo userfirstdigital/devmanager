@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
-import type { AppConfig, Project, Settings, SessionState, TabType, SSHConnection } from '../types/config';
+import type { AppConfig, Project, Settings, SessionState, TabType, SSHConnection, RuntimePlatformInfo } from '../types/config';
 import { cleanupSessionBuffer } from '../utils/terminalBuffers';
 import { useProcessStore } from './processStore';
 
@@ -16,6 +16,7 @@ export interface TabInfo {
 
 interface AppState {
   config: AppConfig | null;
+  runtimeInfo: RuntimePlatformInfo | null;
   activeTabId: string | null;
   openTabs: TabInfo[];
   sidebarCollapsed: boolean;
@@ -53,6 +54,7 @@ interface AppState {
 
 export const useAppStore = create<AppState>((set, get) => ({
   config: null,
+  runtimeInfo: null,
   activeTabId: null,
   openTabs: [],
   sidebarCollapsed: false,
@@ -60,8 +62,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   loadConfig: async () => {
     try {
-      const config = await invoke<AppConfig>('get_config');
-      set({ config, loading: false });
+      const [config, runtimeInfo] = await Promise.all([
+        invoke<AppConfig>('get_config'),
+        invoke<RuntimePlatformInfo>('get_runtime_info').catch(err => {
+          console.warn('Failed to load runtime info:', err);
+          return null;
+        }),
+      ]);
+      set({ config, runtimeInfo, loading: false });
     } catch (err) {
       console.error('Failed to load config:', err);
       set({ loading: false });

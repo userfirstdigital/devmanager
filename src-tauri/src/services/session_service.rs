@@ -3,9 +3,11 @@ use std::path::PathBuf;
 
 /// Get the session file path
 pub fn get_session_path() -> Result<PathBuf, String> {
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| "Could not determine config directory".to_string())?;
-    Ok(config_dir.join("com.userfirst.devmanager").join("session.json"))
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| "Could not determine config directory".to_string())?;
+    Ok(config_dir
+        .join("com.userfirst.devmanager")
+        .join("session.json"))
 }
 
 /// Load session state from disk. If the file is corrupt or from an old schema, delete it and start fresh.

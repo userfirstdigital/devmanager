@@ -1,7 +1,8 @@
-use tauri::State;
-use crate::state::{AppState, ProcessInfo};
 use crate::services::pid_file;
+use crate::services::platform;
+use crate::state::{AppState, ProcessInfo};
 use std::collections::HashMap;
+use tauri::State;
 
 #[tauri::command]
 pub fn register_process(
@@ -12,11 +13,14 @@ pub fn register_process(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut processes = state.processes.lock().map_err(|e| e.to_string())?;
-    processes.insert(key, ProcessInfo {
-        pid,
-        command_id,
-        project_id,
-    });
+    processes.insert(
+        key,
+        ProcessInfo {
+            pid,
+            command_id,
+            project_id,
+        },
+    );
     pid_file::track_pid(pid);
     Ok(())
 }
@@ -32,11 +36,7 @@ pub fn unregister_process(key: String, state: State<'_, AppState>) -> Result<(),
 
 #[tauri::command]
 pub fn kill_process_tree(pid: u32) -> Result<(), String> {
-    std::process::Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .output()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    platform::kill_process_tree(pid)
 }
 
 #[tauri::command]

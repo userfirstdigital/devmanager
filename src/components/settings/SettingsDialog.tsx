@@ -2,16 +2,25 @@ import { useState } from 'react';
 import { X, Volume2 } from 'lucide-react';
 import { useAppStore } from '../../stores/appStore';
 import { ImportExport } from './ImportExport';
-import type { DefaultTerminal } from '../../types/config';
+import type { DefaultTerminal, MacTerminalProfile } from '../../types/config';
 import { NOTIFICATION_SOUNDS, playNotificationSound } from '../../utils/notificationSound';
+import { isMacPlatform } from '../../utils/runtimePlatform';
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const config = useAppStore(s => s.config);
+  const runtimeInfo = useAppStore(s => s.runtimeInfo);
   const updateSettings = useAppStore(s => s.updateSettings);
   const [showImportExport, setShowImportExport] = useState(false);
 
   if (!config) return null;
   const settings = config.settings;
+  const isMac = isMacPlatform(runtimeInfo);
+  const terminalValue = isMac ? (settings.macTerminalProfile || 'system') : (settings.defaultTerminal || 'bash');
+  const terminalLabel = isMac ? 'Default terminal shell' : 'Default terminal';
+  const terminalDescription = isMac
+    ? 'Shell used for Claude Code and interactive terminals on macOS'
+    : 'Shell used for Claude Code and interactive terminals';
+  const systemShellLabel = runtimeInfo?.userShellName ? `User shell (${runtimeInfo.userShellName})` : 'User shell';
 
   const toggle = (key: 'confirmOnClose' | 'minimizeToTray' | 'restoreSessionOnStart') => {
     updateSettings({ ...settings, [key]: !settings[key] });
@@ -25,6 +34,11 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   };
 
   const handleTerminalChange = (value: string) => {
+    if (isMac) {
+      updateSettings({ ...settings, macTerminalProfile: value as MacTerminalProfile });
+      return;
+    }
+
     updateSettings({ ...settings, defaultTerminal: value as DefaultTerminal });
   };
 
@@ -78,16 +92,26 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-zinc-200 font-medium">Default terminal</label>
-            <p className="text-[10px] text-zinc-500">Shell used for Claude Code and interactive terminals</p>
+            <label className="text-xs text-zinc-200 font-medium">{terminalLabel}</label>
+            <p className="text-[10px] text-zinc-500">{terminalDescription}</p>
             <select
-              value={settings.defaultTerminal || 'bash'}
+              value={terminalValue}
               onChange={e => handleTerminalChange(e.target.value)}
               className="w-48 px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
             >
-              <option value="bash">Bash (Git Bash)</option>
-              <option value="powershell">PowerShell</option>
-              <option value="cmd">CMD</option>
+              {isMac ? (
+                <>
+                  <option value="system">{systemShellLabel}</option>
+                  <option value="zsh">zsh</option>
+                  <option value="bash">bash</option>
+                </>
+              ) : (
+                <>
+                  <option value="bash">Bash (Git Bash)</option>
+                  <option value="powershell">PowerShell</option>
+                  <option value="cmd">CMD</option>
+                </>
+              )}
             </select>
           </div>
 

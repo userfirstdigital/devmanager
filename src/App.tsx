@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { AppLayout } from './components/layout/AppLayout';
 import { useSessionRestore } from './hooks/useSessionRestore';
@@ -6,17 +7,22 @@ import { useAppStore } from './stores/appStore';
 import { useProcessStore } from './stores/processStore';
 import { useProcess } from './hooks/useProcess';
 import { useUpdateCheck } from './hooks/useUpdateCheck';
+import { isMacPlatform } from './utils/runtimePlatform';
 
 export default function App() {
   useSessionRestore();
   useUpdateCheck();
   const loading = useAppStore(s => s.loading);
+  const runtimeInfo = useAppStore(s => s.runtimeInfo);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const { stopAll } = useProcess();
 
   useEffect(() => {
     const unlisten = getCurrentWindow().onCloseRequested(async (event) => {
       const config = useAppStore.getState().config;
+      const runtimeInfo = useAppStore.getState().runtimeInfo;
+      const isMac = isMacPlatform(runtimeInfo);
+      const confirmOnClose = config?.settings.confirmOnClose ?? true;
 
       // If minimize to tray is on, let Rust hide the window — no confirmation needed
       if (config?.settings.minimizeToTray) return;
@@ -24,9 +30,15 @@ export default function App() {
       const processes = useProcessStore.getState().processes;
       const hasRunning = Object.values(processes).some(p => p.status === 'running');
 
-      if (hasRunning && config?.settings.confirmOnClose) {
+      if (hasRunning && confirmOnClose) {
         event.preventDefault();
         setShowCloseConfirm(true);
+        return;
+      }
+
+      if (isMac && confirmOnClose) {
+        event.preventDefault();
+        await invoke('quit_app');
       }
     });
     return () => { unlisten.then(fn => fn()); };
@@ -35,6 +47,10 @@ export default function App() {
   const handleConfirmClose = async () => {
     await stopAll();
     setShowCloseConfirm(false);
+    if (isMacPlatform(runtimeInfo)) {
+      await invoke('quit_app');
+      return;
+    }
     await getCurrentWindow().destroy();
   };
 

@@ -7,6 +7,7 @@ import type { RunCommand, ProjectFolder, EnvEntry } from '../types/config';
 import { getAllCommands } from '../utils/projectHelpers';
 import { ensureSessionBuffer, writeToSessionTerminal, resetSessionForRestart } from '../utils/terminalBuffers';
 import { getPreferredPtySize } from '../utils/terminalSize';
+import { buildServerLaunchCommand } from '../utils/runtimePlatform';
 
 // Track auto-restart backoff per command
 const restartBackoffs = new Map<string, { delay: number; lastCrash: number }>();
@@ -41,6 +42,16 @@ export function useProcess() {
     // Find project name for notifications
     const project = appStore.config?.projects.find(p => p.id === projectId);
     const projectName = project?.name ?? 'Unknown';
+    const runtimeInfo = appStore.runtimeInfo;
+    const settings = appStore.config?.settings ?? {
+      theme: 'dark',
+      logBufferSize: 10000,
+      confirmOnClose: true,
+      minimizeToTray: false,
+      restoreSessionOnStart: true,
+      defaultTerminal: 'bash' as const,
+      macTerminalProfile: 'system' as const,
+    };
 
     // Ensure session buffer exists before PTY starts so no data is lost
     ensureSessionBuffer(commandId);
@@ -91,11 +102,12 @@ export function useProcess() {
       }
 
       // Spawn PTY + register process + start monitor in one IPC call
+      const launch = buildServerLaunchCommand(runtimeInfo, settings, command);
       const result = await invoke<{ pid: number; command_id: string }>('create_server_session', {
         id: commandId,
         cwd: folder.folderPath,
-        command: 'cmd',
-        args: ['/C', command.command, ...command.args],
+        command: launch.command,
+        args: launch.args,
         env: Object.keys(env).length > 0 ? env : null,
         cols: getPreferredPtySize().cols,
         rows: getPreferredPtySize().rows,

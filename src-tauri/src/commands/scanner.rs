@@ -1,4 +1,6 @@
-use crate::models::config::{ScanResult, DependencyStatus, RootScanEntry, ScannedScript, ScannedPort};
+use crate::models::config::{
+    DependencyStatus, RootScanEntry, ScanResult, ScannedPort, ScannedScript,
+};
 use crate::services::scanner_service;
 use crate::state::AppState;
 use regex::Regex;
@@ -7,9 +9,8 @@ use std::sync::LazyLock;
 use tauri::{AppHandle, Emitter, State};
 
 /// Lazily compiled regex for matching port variables in .env files
-static PORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)").unwrap()
-});
+static PORT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)").unwrap());
 
 #[tauri::command]
 pub fn scan_project(folder_path: String) -> Result<ScanResult, String> {
@@ -45,7 +46,8 @@ pub fn check_dependencies(folder_path: String) -> Result<DependencyStatus, Strin
         if pkg_modified > lock_modified {
             return Ok(DependencyStatus {
                 status: "outdated".to_string(),
-                message: "package.json has been modified since last install. Run npm install.".to_string(),
+                message: "package.json has been modified since last install. Run npm install."
+                    .to_string(),
             });
         }
     }
@@ -84,7 +86,7 @@ pub fn watch_git_branches(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    use notify::{Watcher, RecursiveMode, Config, EventKind, event::ModifyKind};
+    use notify::{event::ModifyKind, Config, EventKind, RecursiveMode, Watcher};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -110,12 +112,18 @@ pub fn watch_git_branches(
         let git_dir = Path::new(folder_path).join(".git");
         if git_dir.is_dir() {
             let head_path = git_dir.join("HEAD");
-            head_to_folder.lock().unwrap().insert(head_path, folder_path.clone());
+            head_to_folder
+                .lock()
+                .unwrap()
+                .insert(head_path, folder_path.clone());
             paths_to_watch.push(git_dir);
 
             // Read initial branch
             let branch = read_git_branch(folder_path).unwrap_or(None);
-            last_branches.lock().unwrap().insert(folder_path.clone(), branch);
+            last_branches
+                .lock()
+                .unwrap()
+                .insert(folder_path.clone(), branch);
         }
     }
 
@@ -127,52 +135,61 @@ pub fn watch_git_branches(
     let lb = last_branches.clone();
     let app_clone = app.clone();
 
-    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res {
-            // Only care about data modifications
-            match event.kind {
-                EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) => {}
-                _ => return,
-            }
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                // Only care about data modifications
+                match event.kind {
+                    EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) => {
+                    }
+                    _ => return,
+                }
 
-            let map = h2f.lock().unwrap();
-            for path in &event.paths {
-                // Match on the HEAD file itself
-                let head_path = if path.ends_with("HEAD") {
-                    path.clone()
-                } else {
-                    continue;
-                };
+                let map = h2f.lock().unwrap();
+                for path in &event.paths {
+                    // Match on the HEAD file itself
+                    let head_path = if path.ends_with("HEAD") {
+                        path.clone()
+                    } else {
+                        continue;
+                    };
 
-                if let Some(folder_path) = map.get(&head_path) {
-                    let new_branch = read_git_branch(folder_path).unwrap_or(None);
-                    let mut branches = lb.lock().unwrap();
-                    let old_branch = branches.get(folder_path).cloned().flatten();
+                    if let Some(folder_path) = map.get(&head_path) {
+                        let new_branch = read_git_branch(folder_path).unwrap_or(None);
+                        let mut branches = lb.lock().unwrap();
+                        let old_branch = branches.get(folder_path).cloned().flatten();
 
-                    if new_branch != old_branch {
-                        branches.insert(folder_path.clone(), new_branch.clone());
-                        drop(branches);
+                        if new_branch != old_branch {
+                            branches.insert(folder_path.clone(), new_branch.clone());
+                            drop(branches);
 
-                        #[derive(Clone, serde::Serialize)]
-                        struct GitBranchChanged {
-                            folder_path: String,
-                            branch: Option<String>,
+                            #[derive(Clone, serde::Serialize)]
+                            struct GitBranchChanged {
+                                folder_path: String,
+                                branch: Option<String>,
+                            }
+
+                            let _ = app_clone.emit(
+                                "git-branch-changed",
+                                GitBranchChanged {
+                                    folder_path: folder_path.clone(),
+                                    branch: new_branch,
+                                },
+                            );
                         }
-
-                        let _ = app_clone.emit("git-branch-changed", GitBranchChanged {
-                            folder_path: folder_path.clone(),
-                            branch: new_branch,
-                        });
                     }
                 }
             }
-        }
-    }).map_err(|e| format!("Failed to create file watcher: {}", e))?;
+        })
+        .map_err(|e| format!("Failed to create file watcher: {}", e))?;
 
-    watcher.configure(Config::default()).map_err(|e| format!("Failed to configure watcher: {}", e))?;
+    watcher
+        .configure(Config::default())
+        .map_err(|e| format!("Failed to configure watcher: {}", e))?;
 
     for git_dir in &paths_to_watch {
-        watcher.watch(git_dir, RecursiveMode::NonRecursive)
+        watcher
+            .watch(git_dir, RecursiveMode::NonRecursive)
             .map_err(|e| format!("Failed to watch {}: {}", git_dir.display(), e))?;
     }
 
@@ -197,7 +214,15 @@ pub fn scan_root(root_path: String) -> Result<Vec<RootScanEntry>, String> {
         return Err("Root path is not a directory".to_string());
     }
 
-    let skip_dirs = ["node_modules", ".git", "dist", "build", "target", ".next", ".nuxt"];
+    let skip_dirs = [
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "target",
+        ".next",
+        ".nuxt",
+    ];
     let mut entries = Vec::new();
 
     scan_dir_recursive(root, root, 0, 3, &skip_dirs, &mut entries);
@@ -242,7 +267,8 @@ fn scan_dir_recursive(
             (true, true) => "both",
             (false, true) => "rust",
             _ => "node",
-        }.to_string();
+        }
+        .to_string();
 
         entries.push(RootScanEntry {
             path: dir.to_string_lossy().to_string(),
@@ -280,7 +306,8 @@ fn scan_env_ports(dir: &Path) -> Vec<ScannedPort> {
         if let Ok(contents) = std::fs::read_to_string(&env_path) {
             for line in contents.lines() {
                 if let Some(captures) = PORT_REGEX.captures(line) {
-                    if let (Some(var_match), Some(port_match)) = (captures.get(1), captures.get(2)) {
+                    if let (Some(var_match), Some(port_match)) = (captures.get(1), captures.get(2))
+                    {
                         if let Ok(port) = port_match.as_str().parse::<u16>() {
                             ports.push(ScannedPort {
                                 variable: var_match.as_str().to_string(),

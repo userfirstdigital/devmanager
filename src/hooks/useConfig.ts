@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { ScanResult, DependencyStatus, PortStatus, PortConflict, EnvEntry } from '../types/config';
+import { useAppStore } from '../stores/appStore';
+import { resolveExternalTerminalShellPath } from '../utils/runtimePlatform';
 
 export function useConfig() {
   const scanProject = async (folderPath: string): Promise<ScanResult> => {
@@ -39,7 +41,11 @@ export function useConfig() {
   };
 
   const openTerminal = async (folderPath: string): Promise<void> => {
-    return invoke('open_terminal', { folderPath });
+    const { config, runtimeInfo } = useAppStore.getState();
+    const shellPath = config
+      ? resolveExternalTerminalShellPath(runtimeInfo, config.settings)
+      : null;
+    return invoke('open_terminal', { folderPath, shellPath });
   };
 
   return {

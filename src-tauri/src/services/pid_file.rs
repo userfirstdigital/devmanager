@@ -1,11 +1,14 @@
+use crate::services::platform;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Get the PID file path (alongside config)
 fn get_pid_file_path() -> Result<PathBuf, String> {
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| "Could not determine config directory".to_string())?;
-    Ok(config_dir.join("com.userfirst.devmanager").join("running-pids.json"))
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| "Could not determine config directory".to_string())?;
+    Ok(config_dir
+        .join("com.userfirst.devmanager")
+        .join("running-pids.json"))
 }
 
 /// Read all tracked PIDs from disk
@@ -61,21 +64,16 @@ pub fn cleanup_orphaned_processes() {
     if pids.is_empty() {
         return;
     }
-    eprintln!("[DevManager] Checking {} tracked PID(s) from previous session", pids.len());
+    eprintln!(
+        "[DevManager] Checking {} tracked PID(s) from previous session",
+        pids.len()
+    );
     for pid in &pids {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
-            .output();
-        match output {
-            Ok(out) if String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()) => {
-                eprintln!("[DevManager] Killing orphaned PID {}", pid);
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/T", "/F", "/PID", &pid.to_string()])
-                    .output();
-            }
-            _ => {
-                eprintln!("[DevManager] PID {} already dead, skipping", pid);
-            }
+        if platform::is_pid_running(*pid) {
+            eprintln!("[DevManager] Killing orphaned PID {}", pid);
+            let _ = platform::kill_process_tree(*pid);
+        } else {
+            eprintln!("[DevManager] PID {} already dead, skipping", pid);
         }
     }
     write_pids(&HashSet::new());

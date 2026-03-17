@@ -1,4 +1,4 @@
-use crate::models::config::{ProcessTreeInfo, ChildProcessInfo};
+use crate::models::config::{ChildProcessInfo, ProcessTreeInfo};
 use sysinfo::{Pid, System};
 
 /// Get resource usage for a process tree

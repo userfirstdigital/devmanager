@@ -78,6 +78,8 @@ pub struct Settings {
     pub restore_session_on_start: Option<bool>,
     #[serde(rename = "defaultTerminal")]
     pub default_terminal: String,
+    #[serde(rename = "macTerminalProfile")]
+    pub mac_terminal_profile: Option<String>,
     #[serde(rename = "claudeCommand")]
     pub claude_command: Option<String>,
     #[serde(rename = "codexCommand")]
@@ -108,6 +110,7 @@ impl Default for Settings {
             minimize_to_tray: false,
             restore_session_on_start: Some(true),
             default_terminal: "bash".to_string(),
+            mac_terminal_profile: Some("system".to_string()),
             claude_command: None,
             codex_command: None,
             notification_sound: None,

@@ -1,9 +1,10 @@
+use crate::models::config::AppConfig;
+use crate::services::platform::RuntimePlatformState;
+use portable_pty::MasterPty;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex, RwLock};
-use portable_pty::MasterPty;
-use crate::models::config::AppConfig;
 
 #[allow(dead_code)]
 pub struct ProcessInfo {
@@ -72,6 +73,7 @@ pub struct MonitorEntry {
 pub struct AppState {
     /// RwLock: config is read far more than written
     pub config: RwLock<Option<AppConfig>>,
+    pub runtime_platform: RuntimePlatformState,
     pub processes: Mutex<HashMap<String, ProcessInfo>>,
     /// Unified monitoring: one loop reads this map each tick
     pub monitored_processes: Mutex<HashMap<String, MonitorEntry>>,

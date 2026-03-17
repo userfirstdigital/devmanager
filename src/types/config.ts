@@ -49,6 +49,7 @@ export interface SSHConnection {
 }
 
 export type DefaultTerminal = 'bash' | 'powershell' | 'cmd';
+export type MacTerminalProfile = 'system' | 'zsh' | 'bash';
 
 export interface Settings {
   theme: string;
@@ -57,10 +58,18 @@ export interface Settings {
   minimizeToTray: boolean;
   restoreSessionOnStart?: boolean;
   defaultTerminal: DefaultTerminal;
+  macTerminalProfile?: MacTerminalProfile;
   claudeCommand?: string;
   codexCommand?: string;
   notificationSound?: string;
   terminalFontSize?: number;
+}
+
+export interface RuntimePlatformInfo {
+  os: 'windows' | 'macos' | 'linux';
+  userShellPath?: string | null;
+  userShellName?: string | null;
+  gitBashPath?: string | null;
 }
 
 export type TabType = 'server' | 'claude' | 'codex' | 'ssh';

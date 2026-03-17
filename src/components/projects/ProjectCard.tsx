@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Play, Square, Terminal, Pin, PinOff, Trash2, MoreVertical, GitBranch, ChevronDown, ChevronRight, AlertTriangle, FileText, FileCode, Download, FolderPlus, Folder, Pencil, ArrowUp, ArrowDown, Sparkles, Bot, X } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { Project, ProjectFolder, DependencyStatus, Settings } from '../../types/config';
+import type { Project, ProjectFolder, DependencyStatus } from '../../types/config';
 import { useAppStore, TabInfo } from '../../stores/appStore';
 import { useProcessStore } from '../../stores/processStore';
 import { useProcess } from '../../hooks/useProcess';
@@ -15,18 +15,7 @@ import { AddFolderDialog } from './AddFolderDialog';
 import { EditProjectDialog } from './EditProjectDialog';
 import { EditFolderDialog } from './EditFolderDialog';
 import { getAllCommands } from '../../utils/projectHelpers';
-
-function resolveShellCommand(defaultTerminal: Settings['defaultTerminal']): { command: string; args: string[] } {
-  switch (defaultTerminal) {
-    case 'powershell':
-      return { command: 'powershell.exe', args: [] };
-    case 'cmd':
-      return { command: 'cmd.exe', args: [] };
-    case 'bash':
-    default:
-      return { command: 'C:/Program Files/Git/bin/bash.exe', args: ['--login'] };
-  }
-}
+import { resolveInteractiveShellCommand } from '../../utils/runtimePlatform';
 
 function FolderSection({ project, folder }: { project: Project; folder: ProjectFolder }) {
   const [expanded, setExpanded] = useState(true);
@@ -306,13 +295,21 @@ function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }
   const processes = useProcessStore(s => s.processes);
   const { createSession } = usePty();
   const config = useAppStore(s => s.config);
+  const runtimeInfo = useAppStore(s => s.runtimeInfo);
   const openTab = useAppStore(s => s.openTab);
 
   const aiTabs = openTabs.filter(t => t.type === tabType && t.projectId === project.id);
 
   const launchAISession = async (sessionId: string) => {
-    const defaultTerminal = config?.settings.defaultTerminal || 'bash';
-    const shell = resolveShellCommand(defaultTerminal);
+    const shell = resolveInteractiveShellCommand(runtimeInfo, config?.settings ?? {
+      theme: 'dark',
+      logBufferSize: 10000,
+      confirmOnClose: true,
+      minimizeToTray: false,
+      restoreSessionOnStart: true,
+      defaultTerminal: 'bash',
+      macTerminalProfile: 'system',
+    });
     const cwd = project.rootPath;
 
     // Pre-create session buffer with activity tracking so spinner detection starts immediately
@@ -423,14 +420,22 @@ function AILaunchButton({ icon, iconColor, label, onClick }: {
 function useAILauncher(project: Project, tabType: 'claude' | 'codex', label: string, getCommand: () => string) {
   const openTabs = useAppStore(s => s.openTabs);
   const config = useAppStore(s => s.config);
+  const runtimeInfo = useAppStore(s => s.runtimeInfo);
   const openTab = useAppStore(s => s.openTab);
   const { createSession } = usePty();
 
   const aiTabs = openTabs.filter(t => t.type === tabType && t.projectId === project.id);
 
   const launchAISession = async (sessionId: string) => {
-    const defaultTerminal = config?.settings.defaultTerminal || 'bash';
-    const shell = resolveShellCommand(defaultTerminal);
+    const shell = resolveInteractiveShellCommand(runtimeInfo, config?.settings ?? {
+      theme: 'dark',
+      logBufferSize: 10000,
+      confirmOnClose: true,
+      minimizeToTray: false,
+      restoreSessionOnStart: true,
+      defaultTerminal: 'bash',
+      macTerminalProfile: 'system',
+    });
     const cwd = project.rootPath;
 
     ensureSessionBuffer(sessionId, undefined, true);

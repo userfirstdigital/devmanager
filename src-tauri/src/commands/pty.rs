@@ -1,13 +1,13 @@
+use crate::services::{pid_file, platform};
+use crate::state::{AppState, MonitorEntry, ProcessInfo, PtyOutputBuffer, PtySession};
+use base64::Engine;
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::sync::{Arc, Mutex};
-use base64::Engine;
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
-use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
-use crate::state::{AppState, PtySession, PtyOutputBuffer, ProcessInfo, MonitorEntry};
-use crate::services::pid_file;
 
 /// Per-session ring buffer cap: 4 MB.
 /// ~35-50k lines of terminal output. Pre-allocated upfront to avoid VecDeque doubling cascades.
@@ -42,11 +42,7 @@ fn create_pty_session_inner(
     cmd.args(args);
     cmd.cwd(cwd);
 
-    if let Some(env_vars) = env {
-        for (key, value) in env_vars {
-            cmd.env(key, value);
-        }
-    }
+    platform::apply_runtime_env(&mut cmd, &state.runtime_platform, env);
 
     let child = pair
         .slave
@@ -85,8 +81,7 @@ fn create_pty_session_inner(
     };
     // Kill outside the lock to avoid deadlocking other PTY operations
     if let Some(mut old) = old_session {
-        let _ = old.child.kill();
-        let _ = old.child.wait();
+        platform::kill_pty_session(&mut old);
     }
 
     // Create ring buffer for this session
@@ -96,7 +91,13 @@ fn create_pty_session_inner(
         buffers.insert(id.to_string(), buffer.clone());
     }
 
-    start_pty_read_loop(app.clone(), reader, id.to_string(), buffer, log_file.map(|s| s.to_string()));
+    start_pty_read_loop(
+        app.clone(),
+        reader,
+        id.to_string(),
+        buffer,
+        log_file.map(|s| s.to_string()),
+    );
 
     Ok(pid)
 }
@@ -167,21 +168,30 @@ pub async fn create_server_session(
     // Register process
     {
         let mut processes = state.processes.lock().map_err(|e| e.to_string())?;
-        processes.insert(id.clone(), ProcessInfo {
-            pid,
-            command_id: command_id.clone(),
-            project_id,
-        });
+        processes.insert(
+            id.clone(),
+            ProcessInfo {
+                pid,
+                command_id: command_id.clone(),
+                project_id,
+            },
+        );
     }
     pid_file::track_pid(pid);
 
     // Start resource monitor (just insert into the map — the unified loop picks it up)
     {
-        let mut monitors = state.monitored_processes.lock().map_err(|e| e.to_string())?;
-        monitors.insert(command_id.clone(), MonitorEntry {
-            command_id: command_id.clone(),
-            pid,
-        });
+        let mut monitors = state
+            .monitored_processes
+            .lock()
+            .map_err(|e| e.to_string())?;
+        monitors.insert(
+            command_id.clone(),
+            MonitorEntry {
+                command_id: command_id.clone(),
+                pid,
+            },
+        );
     }
 
     Ok(ServerSessionResult { pid, command_id })
@@ -255,19 +265,25 @@ pub async fn restore_sessions(
                 // Register process + monitor
                 {
                     let mut processes = state.processes.lock().unwrap();
-                    processes.insert(req.id.clone(), ProcessInfo {
-                        pid,
-                        command_id: req.id.clone(),
-                        project_id: req.project_id,
-                    });
+                    processes.insert(
+                        req.id.clone(),
+                        ProcessInfo {
+                            pid,
+                            command_id: req.id.clone(),
+                            project_id: req.project_id,
+                        },
+                    );
                 }
                 pid_file::track_pid(pid);
                 {
                     let mut monitors = state.monitored_processes.lock().unwrap();
-                    monitors.insert(req.id.clone(), MonitorEntry {
-                        command_id: req.id.clone(),
-                        pid,
-                    });
+                    monitors.insert(
+                        req.id.clone(),
+                        MonitorEntry {
+                            command_id: req.id.clone(),
+                            pid,
+                        },
+                    );
                 }
 
                 results.push(RestoreResult {
@@ -304,8 +320,9 @@ impl LogWriter {
             writer: BufWriter::new(file),
             line_buf: Vec::new(),
             ansi_re: regex::Regex::new(
-                r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-Z]|\x0f"
-            ).unwrap(),
+                r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-Z]|\x0f",
+            )
+            .unwrap(),
         }
     }
 
@@ -352,18 +369,20 @@ fn start_pty_read_loop(
 
     tauri::async_runtime::spawn_blocking(move || {
         // Open log file if configured (truncates existing file on fresh start)
-        let mut log_writer: Option<LogWriter> = log_file.and_then(|path| {
-            match File::create(&path) {
+        let mut log_writer: Option<LogWriter> =
+            log_file.and_then(|path| match File::create(&path) {
                 Ok(f) => {
                     eprintln!("[PTY {}] Writing logs to {}", session_id, path);
                     Some(LogWriter::new(f))
                 }
                 Err(e) => {
-                    eprintln!("[PTY {}] Failed to create log file {}: {}", session_id, path, e);
+                    eprintln!(
+                        "[PTY {}] Failed to create log file {}: {}",
+                        session_id, path, e
+                    );
                     None
                 }
-            }
-        });
+            });
 
         let mut buf = [0u8; 4096];
         let mut backoff_secs: u64 = 1;
@@ -374,7 +393,10 @@ fn start_pty_read_loop(
                     let state = app.state::<AppState>();
                     let sessions = state.pty_sessions.lock().unwrap();
                     if !sessions.contains_key(&session_id) {
-                        eprintln!("[PTY {}] Session removed (user closed), exiting", session_id);
+                        eprintln!(
+                            "[PTY {}] Session removed (user closed), exiting",
+                            session_id
+                        );
                         break;
                     }
                     drop(sessions);
@@ -400,7 +422,10 @@ fn start_pty_read_loop(
                     let state = app.state::<AppState>();
                     let sessions = state.pty_sessions.lock().unwrap();
                     if !sessions.contains_key(&session_id) {
-                        eprintln!("[PTY {}] Session removed (user closed), exiting", session_id);
+                        eprintln!(
+                            "[PTY {}] Session removed (user closed), exiting",
+                            session_id
+                        );
                         break;
                     }
                     drop(sessions);
@@ -421,10 +446,7 @@ fn start_pty_read_loop(
 /// Drain the ring buffer for a session, returning all buffered output as base64.
 /// Called by the frontend when a terminal component mounts to restore recent history.
 #[tauri::command]
-pub async fn drain_pty_buffer(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<String, String> {
+pub async fn drain_pty_buffer(state: State<'_, AppState>, id: String) -> Result<String, String> {
     let buffers = state.pty_buffers.lock().unwrap();
     if let Some(buffer) = buffers.get(&id) {
         let data = buffer.lock().unwrap().drain();
@@ -442,10 +464,7 @@ pub async fn drain_pty_buffer(
 /// without clearing. Used on terminal mount so screen content survives webview refresh.
 /// Encodes directly from VecDeque slices to avoid allocating a full copy of the buffer.
 #[tauri::command]
-pub async fn snapshot_pty_buffer(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<String, String> {
+pub async fn snapshot_pty_buffer(state: State<'_, AppState>, id: String) -> Result<String, String> {
     let buffers = state.pty_buffers.lock().unwrap();
     if let Some(buffer) = buffers.get(&id) {
         let buf = buffer.lock().unwrap();
@@ -454,9 +473,8 @@ pub async fn snapshot_pty_buffer(
         } else {
             let (a, b) = buf.slices();
             // Encode directly from the two contiguous slices — no intermediate Vec.
-            let mut encoder = base64::write::EncoderStringWriter::new(
-                &base64::engine::general_purpose::STANDARD,
-            );
+            let mut encoder =
+                base64::write::EncoderStringWriter::new(&base64::engine::general_purpose::STANDARD);
             std::io::Write::write_all(&mut encoder, a).unwrap();
             std::io::Write::write_all(&mut encoder, b).unwrap();
             Ok(encoder.into_inner())
@@ -468,20 +486,13 @@ pub async fn snapshot_pty_buffer(
 
 /// Check if a PTY session exists (session in HashMap = alive)
 #[tauri::command]
-pub async fn check_pty_session(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<bool, String> {
+pub async fn check_pty_session(state: State<'_, AppState>, id: String) -> Result<bool, String> {
     let sessions = state.pty_sessions.lock().unwrap();
     Ok(sessions.contains_key(&id))
 }
 
 #[tauri::command]
-pub async fn write_pty(
-    state: State<'_, AppState>,
-    id: String,
-    data: String,
-) -> Result<(), String> {
+pub async fn write_pty(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
     let sessions = state.pty_sessions.lock().unwrap();
     let session = sessions
         .get(&id)
@@ -524,10 +535,7 @@ pub async fn resize_pty(
 }
 
 #[tauri::command]
-pub async fn close_pty(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn close_pty(state: State<'_, AppState>, id: String) -> Result<(), String> {
     // Remove session and buffer from maps first
     let session = {
         let mut sessions = state.pty_sessions.lock().unwrap();
@@ -539,8 +547,7 @@ pub async fn close_pty(
     }
     // Kill outside the lock to avoid deadlocking other PTY operations
     if let Some(mut session) = session {
-        let _ = session.child.kill();
-        let _ = session.child.wait();
+        platform::kill_pty_session(&mut session);
     }
     Ok(())
 }

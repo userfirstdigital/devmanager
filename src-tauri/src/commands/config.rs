@@ -1,7 +1,7 @@
-use tauri::State;
-use crate::state::AppState;
 use crate::models::config::{AppConfig, Project, Settings};
 use crate::services::config_service;
+use crate::state::AppState;
+use tauri::State;
 
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
@@ -65,7 +65,10 @@ pub fn remove_project(project_id: String, state: State<'_, AppState>) -> Result<
 }
 
 #[tauri::command]
-pub fn update_settings(settings: Settings, state: State<'_, AppState>) -> Result<AppConfig, String> {
+pub fn update_settings(
+    settings: Settings,
+    state: State<'_, AppState>,
+) -> Result<AppConfig, String> {
     let mut config = state.config.write().map_err(|e| e.to_string())?;
     let mut cfg = config.clone().unwrap_or_default();
     cfg.settings = settings;

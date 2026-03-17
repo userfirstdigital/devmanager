@@ -65,8 +65,20 @@ pub fn write_env_file(file_path: String, entries: Vec<EnvEntry>) -> Result<(), S
         }
     }
 
-    // Use \r\n on Windows to preserve native line endings
-    let contents = lines.join("\r\n");
+    let existing_bytes = std::fs::read(&file_path).ok();
+    let line_ending = if existing_bytes
+        .as_deref()
+        .map(|bytes| bytes.windows(2).any(|window| window == b"\r\n"))
+        .unwrap_or(false)
+    {
+        "\r\n"
+    } else if cfg!(windows) {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let contents = lines.join(line_ending);
 
     // Atomic write
     let path = std::path::Path::new(&file_path);

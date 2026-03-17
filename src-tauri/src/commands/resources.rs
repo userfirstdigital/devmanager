@@ -14,23 +14,20 @@ pub fn start_resource_monitor(
     pid: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut monitors = state.monitored_processes.lock().map_err(|e| e.to_string())?;
-    monitors.insert(
-        command_id.clone(),
-        MonitorEntry {
-            command_id,
-            pid,
-        },
-    );
+    let mut monitors = state
+        .monitored_processes
+        .lock()
+        .map_err(|e| e.to_string())?;
+    monitors.insert(command_id.clone(), MonitorEntry { command_id, pid });
     Ok(())
 }
 
 #[tauri::command]
-pub fn stop_resource_monitor(
-    command_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let mut monitors = state.monitored_processes.lock().map_err(|e| e.to_string())?;
+pub fn stop_resource_monitor(command_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut monitors = state
+        .monitored_processes
+        .lock()
+        .map_err(|e| e.to_string())?;
     monitors.remove(&command_id);
     Ok(())
 }

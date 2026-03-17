@@ -1,12 +1,11 @@
-use crate::models::config::{ScanResult, ScannedScript, ScannedPort};
+use crate::models::config::{ScanResult, ScannedPort, ScannedScript};
 use regex::Regex;
 use std::path::Path;
 use std::sync::LazyLock;
 
 /// Lazily compiled regex for matching port variables in .env files
-static PORT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)").unwrap()
-});
+static PORT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(PORT|.*_PORT)\s*=\s*(\d+)").unwrap());
 
 /// Read cargo scripts from a Cargo.toml file
 pub fn read_cargo_scripts(cargo_toml: &Path) -> Vec<ScannedScript> {
@@ -20,10 +19,22 @@ pub fn read_cargo_scripts(cargo_toml: &Path) -> Vec<ScannedScript> {
     };
 
     let mut scripts = vec![
-        ScannedScript { name: "cargo run".to_string(), command: "cargo run".to_string() },
-        ScannedScript { name: "cargo build".to_string(), command: "cargo build".to_string() },
-        ScannedScript { name: "cargo test".to_string(), command: "cargo test".to_string() },
-        ScannedScript { name: "cargo check".to_string(), command: "cargo check".to_string() },
+        ScannedScript {
+            name: "cargo run".to_string(),
+            command: "cargo run".to_string(),
+        },
+        ScannedScript {
+            name: "cargo build".to_string(),
+            command: "cargo build".to_string(),
+        },
+        ScannedScript {
+            name: "cargo test".to_string(),
+            command: "cargo test".to_string(),
+        },
+        ScannedScript {
+            name: "cargo check".to_string(),
+            command: "cargo check".to_string(),
+        },
     ];
 
     // If the crate has [[bin]] targets, add them as cargo run --bin <name>
@@ -46,14 +57,20 @@ pub fn expand_tauri_scripts(scripts: &mut Vec<ScannedScript>) {
     if let Some(idx) = scripts.iter().position(|s| s.name == "tauri") {
         let tauri_cmd = scripts[idx].command.clone();
         scripts.remove(idx);
-        scripts.insert(idx, ScannedScript {
-            name: "tauri dev".to_string(),
-            command: format!("{} dev", tauri_cmd),
-        });
-        scripts.insert(idx + 1, ScannedScript {
-            name: "tauri build".to_string(),
-            command: format!("{} build", tauri_cmd),
-        });
+        scripts.insert(
+            idx,
+            ScannedScript {
+                name: "tauri dev".to_string(),
+                command: format!("{} dev", tauri_cmd),
+            },
+        );
+        scripts.insert(
+            idx + 1,
+            ScannedScript {
+                name: "tauri build".to_string(),
+                command: format!("{} build", tauri_cmd),
+            },
+        );
     }
 }
 
@@ -110,7 +127,8 @@ pub fn scan_directory(folder_path: &str) -> Result<ScanResult, String> {
 
             for line in contents.lines() {
                 if let Some(captures) = PORT_REGEX.captures(line) {
-                    if let (Some(var_match), Some(port_match)) = (captures.get(1), captures.get(2)) {
+                    if let (Some(var_match), Some(port_match)) = (captures.get(1), captures.get(2))
+                    {
                         let variable = var_match.as_str().to_string();
                         if let Ok(port) = port_match.as_str().parse::<u16>() {
                             ports.push(ScannedPort {
