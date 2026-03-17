@@ -1,11 +1,13 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
 import { useProcessStore } from '../../stores/processStore';
+import { useAppStore } from '../../stores/appStore';
 import { ServerControls } from '../servers/ServerControls';
 import { ResourceMonitor } from '../servers/ResourceMonitor';
+import { FontSizeSlider } from '../terminal/FontSizeSlider';
 
 export function LogViewer({ commandId }: { commandId: string }) {
   const termRef = useRef<HTMLDivElement>(null);
@@ -15,6 +17,8 @@ export function LogViewer({ commandId }: { commandId: string }) {
   const lastLogIndexRef = useRef<number>(0);
   const autoScrollRef = useRef(true);
 
+  const defaultFontSize = useAppStore(s => s.config?.settings.terminalFontSize ?? 13);
+  const [fontSize, setFontSize] = useState(defaultFontSize);
   const proc = useProcessStore(s => s.processes[commandId]);
   const logs = proc?.logs ?? [];
   const resetUnseenErrors = useProcessStore(s => s.resetUnseenErrors);
@@ -52,7 +56,7 @@ export function LogViewer({ commandId }: { commandId: string }) {
         brightWhite: '#fafafa',
       },
       fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace',
-      fontSize: 13,
+      fontSize,
       lineHeight: 1.3,
       scrollback: 10000,
       disableStdin: true,
@@ -107,7 +111,7 @@ export function LogViewer({ commandId }: { commandId: string }) {
       searchAddonRef.current = null;
       lastLogIndexRef.current = 0;
     };
-  }, [commandId]);
+  }, [commandId, fontSize]);
 
   // Write new logs to terminal
   useEffect(() => {
@@ -150,6 +154,7 @@ export function LogViewer({ commandId }: { commandId: string }) {
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-800/50 border-b border-zinc-700/50">
         <ResourceMonitor commandId={commandId} />
+        <FontSizeSlider value={fontSize} onChange={setFontSize} />
         <ServerControls commandId={commandId} />
       </div>
       <div ref={termRef} className="flex-1 bg-[#09090b] px-1" />

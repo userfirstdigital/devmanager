@@ -115,6 +115,22 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           </div>
 
           <div className="space-y-1">
+            <label className="text-xs text-zinc-200 font-medium">
+              Terminal font size <span className="text-zinc-400 font-normal ml-1">{settings.terminalFontSize ?? 13}px</span>
+            </label>
+            <p className="text-[10px] text-zinc-500">Default text size for all terminals</p>
+            <input
+              type="range"
+              min={8}
+              max={24}
+              step={1}
+              value={settings.terminalFontSize ?? 13}
+              onChange={e => updateSettings({ ...settings, terminalFontSize: parseInt(e.target.value, 10) })}
+              className="w-48 h-1.5 accent-indigo-500"
+            />
+          </div>
+
+          <div className="space-y-1">
             <label className="text-xs text-zinc-200 font-medium">Claude command</label>
             <p className="text-[10px] text-zinc-500">Command launched when opening a Claude terminal</p>
             <input

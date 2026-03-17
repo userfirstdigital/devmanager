@@ -60,6 +60,7 @@ export interface Settings {
   claudeCommand?: string;
   codexCommand?: string;
   notificationSound?: string;
+  terminalFontSize?: number;
 }
 
 export type TabType = 'server' | 'claude' | 'codex' | 'ssh';

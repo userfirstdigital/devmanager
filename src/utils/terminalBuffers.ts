@@ -29,6 +29,9 @@ export interface SessionBuffer {
   idleTimer: ReturnType<typeof setTimeout> | null;
   recentDataTimestamps: number[];
   suppressActivityUntil: number;
+  onDataWritten?: () => void;  // called after data is written to mounted terminal
+  pendingFrame: Uint8Array[] | null;  // chunks accumulated for the current animation frame
+  writeRaf: number;                   // rAF handle for batched writes (0 = none pending)
 }
 
 export const sessionBuffers = new Map<string, SessionBuffer>();
@@ -50,11 +53,30 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
     idleTimer: null,
     recentDataTimestamps: [],
     suppressActivityUntil: 0,
+    pendingFrame: null,
+    writeRaf: 0,
     dataUnlisten: listen<string>(`pty-data-${sessionId}`, (event) => {
       const bytes = Uint8Array.from(atob(event.payload), c => c.charCodeAt(0));
       if (entry.terminal) {
-        // Terminal is mounted — write directly
-        entry.terminal.write(bytes);
+        // Terminal is mounted — batch writes to once per animation frame.
+        // This prevents scrollbar breathing and viewport stutter from hundreds
+        // of tiny writes during rapid output.
+        if (!entry.pendingFrame) entry.pendingFrame = [];
+        entry.pendingFrame.push(bytes);
+        if (!entry.writeRaf) {
+          entry.writeRaf = requestAnimationFrame(() => {
+            entry.writeRaf = 0;
+            const chunks = entry.pendingFrame!;
+            entry.pendingFrame = null;
+            const total = chunks.reduce((s, c) => s + c.length, 0);
+            const merged = new Uint8Array(total);
+            let off = 0;
+            for (const c of chunks) { merged.set(c, off); off += c.length; }
+            entry.terminal?.write(merged, () => {
+              entry.onDataWritten?.();
+            });
+          });
+        }
       } else if (entry.pendingQueue) {
         // Terminal is mounting, waiting for Rust backlog — queue temporarily
         entry.pendingQueue.push(bytes);
@@ -99,6 +121,8 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
 export function cleanupSessionBuffer(sessionId: string) {
   const buf = sessionBuffers.get(sessionId);
   if (buf) {
+    if (buf.writeRaf) cancelAnimationFrame(buf.writeRaf);
+    buf.pendingFrame = null;
     if (buf.idleTimer) clearTimeout(buf.idleTimer);
     if (buf.trackActivity) {
       const store = useProcessStore.getState();

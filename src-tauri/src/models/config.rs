@@ -84,6 +84,8 @@ pub struct Settings {
     pub codex_command: Option<String>,
     #[serde(rename = "notificationSound")]
     pub notification_sound: Option<String>,
+    #[serde(rename = "terminalFontSize")]
+    pub terminal_font_size: Option<u16>,
 }
 
 impl Default for AppConfig {
@@ -109,6 +111,7 @@ impl Default for Settings {
             claude_command: None,
             codex_command: None,
             notification_sound: None,
+            terminal_font_size: None,
         }
     }
 }
