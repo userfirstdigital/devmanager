@@ -43,6 +43,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "process:default",
+    "updater:default",
     "notification:default",
     "notification:allow-notify",
     "notification:allow-is-permission-granted",
