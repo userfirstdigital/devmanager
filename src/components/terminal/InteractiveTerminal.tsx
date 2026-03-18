@@ -8,7 +8,12 @@ import { useAppStore } from '../../stores/appStore';
 import { ResourceMonitor } from '../servers/ResourceMonitor';
 import { FontSizeSlider } from './FontSizeSlider';
 import { ensureSessionBuffer } from '../../utils/terminalBuffers';
-import { setPreferredPtySize, isAtBottom } from '../../utils/terminalSize';
+import {
+  isAtBottom,
+  restoreTerminalScrollState,
+  setPreferredPtySize,
+  snapshotTerminalScrollState,
+} from '../../utils/terminalSize';
 
 interface InteractiveTerminalProps {
   sessionId: string;
@@ -90,34 +95,25 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
 
     // Register with persistent session buffer
     const buf = ensureSessionBuffer(sessionId, onExit, showActivity);
+    const viewportElement = termRef.current.querySelector<HTMLElement>('.xterm-viewport');
+    const mountScrollState = {
+      pinnedToBottom: buf.pinnedToBottom,
+      viewportY: buf.viewportY,
+    };
 
-    // --- Backlog replay (chunked) ---
-    // Fetch snapshot from Rust ring buffer. While the async fetch is in-flight,
-    // live events are captured in pendingQueue to preserve ordering.
-    buf.pendingQueue = [];
+    buf.viewportElement = viewportElement;
+
     let replayAborted = false;
+    let syncScrollLocked = true;
+    let mountCompleted = false;
 
-    const replayChunked = (data: Uint8Array, onDone: () => void) => {
-      let offset = 0;
-      const writeNext = () => {
-        if (replayAborted) return;
-        if (offset >= data.length) {
-          onDone();
-          return;
-        }
-        const end = Math.min(offset + REPLAY_CHUNK_SIZE, data.length);
-        const chunk = data.subarray(offset, end);
-        offset = end;
-        if (offset >= data.length) {
-          // Final chunk — scroll after xterm processes it
-          terminal.write(chunk, onDone);
-        } else {
-          terminal.write(chunk, () => {
-            requestAnimationFrame(writeNext);
-          });
-        }
-      };
-      writeNext();
+    const syncScrollState = () => {
+      buf.pinnedToBottom = isAtBottom(terminal);
+      buf.viewportY = terminal.buffer.active.viewportY;
+    };
+
+    const restoreScrollState = (state = mountScrollState) => {
+      restoreTerminalScrollState(terminal, viewportElement, state);
     };
 
     const finishMount = () => {
@@ -139,6 +135,62 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
       }).catch(() => {});
     };
 
+    const completeMount = (state = mountScrollState) => {
+      restoreScrollState(state);
+      syncScrollLocked = false;
+      syncScrollState();
+      mountCompleted = true;
+      finishMount();
+    };
+
+    const scrollDisposable = terminal.onScroll(() => {
+      if (!syncScrollLocked) {
+        syncScrollState();
+      }
+    });
+
+    terminal.attachCustomWheelEventHandler((ev) => {
+      if (ev.deltaY > 0 && terminal.buffer.active.baseY > 0 && isAtBottom(terminal)) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        restoreTerminalScrollState(terminal, viewportElement, {
+          pinnedToBottom: true,
+          viewportY: terminal.buffer.active.baseY,
+        });
+        syncScrollState();
+        return false;
+      }
+      return true;
+    });
+
+    // --- Backlog replay (chunked) ---
+    // Fetch snapshot from Rust ring buffer. While the async fetch is in-flight,
+    // live events are captured in pendingQueue to preserve ordering.
+    buf.pendingQueue = [];
+
+    const replayChunked = (data: Uint8Array, onDone: () => void) => {
+      let offset = 0;
+      const writeNext = () => {
+        if (replayAborted) return;
+        if (offset >= data.length) {
+          onDone();
+          return;
+        }
+        const end = Math.min(offset + REPLAY_CHUNK_SIZE, data.length);
+        const chunk = data.subarray(offset, end);
+        offset = end;
+        if (offset >= data.length) {
+          // Final chunk - restore scroll state after xterm processes it.
+          terminal.write(chunk, onDone);
+        } else {
+          terminal.write(chunk, () => {
+            requestAnimationFrame(writeNext);
+          });
+        }
+      };
+      writeNext();
+    };
+
     invoke<string>('snapshot_pty_buffer', { id: sessionId }).then(data => {
       // Collect all data: snapshot + any queued live events
       const parts: Uint8Array[] = [];
@@ -155,16 +207,18 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
         const total = parts.reduce((s, c) => s + c.length, 0);
         const merged = new Uint8Array(total);
         let off = 0;
-        for (const c of parts) { merged.set(c, off); off += c.length; }
+        for (const c of parts) {
+          merged.set(c, off);
+          off += c.length;
+        }
         replayChunked(merged, () => {
-          if (isAtBottom(terminal)) terminal.scrollToBottom();
-          finishMount();
+          completeMount();
         });
       } else {
-        finishMount();
+        completeMount();
       }
     }).catch(() => {
-      // Buffer fetch failed — go live immediately
+      // Buffer fetch failed - go live immediately
       const queued = buf.pendingQueue ?? [];
       buf.pendingQueue = null;
       buf.terminal = terminal;
@@ -173,20 +227,17 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
         const total = queued.reduce((s, c) => s + c.length, 0);
         const merged = new Uint8Array(total);
         let off = 0;
-        for (const c of queued) { merged.set(c, off); off += c.length; }
+        for (const c of queued) {
+          merged.set(c, off);
+          off += c.length;
+        }
         replayChunked(merged, () => {
-          if (isAtBottom(terminal)) terminal.scrollToBottom();
-          finishMount();
+          completeMount();
         });
       } else {
-        finishMount();
+        completeMount();
       }
     });
-
-    // No scrollToBottom during live output — xterm's built-in auto-scroll
-    // keeps the viewport pinned when viewportY === baseY at write time.
-    // External scrollToBottom calls race with scroll events and cause
-    // the viewport to snap back when the user tries to scroll up.
 
     // Send keystrokes to PTY
     terminal.onData(async (data) => {
@@ -221,7 +272,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
       return true;
     });
 
-    // Ctrl+Enter → newline (DOM capture fires before xterm sees the event)
+    // Ctrl+Enter -> newline (DOM capture fires before xterm sees the event)
     const handleCtrlEnter = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === 'Enter') {
         e.preventDefault();
@@ -231,7 +282,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
     };
     termRef.current.addEventListener('keydown', handleCtrlEnter, true);
 
-    // Debounced resize observer — prevents scroll jitter from rapid layout changes
+    // Debounced resize observer - prevents scroll jitter from rapid layout changes
     let resizeRaf = 0;
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     let lastCols = terminal.cols;
@@ -250,8 +301,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
               return;
             }
 
-            // Snapshot scroll position before fit() reflows content
-            const wasAtBottom = isAtBottom(terminal);
+            const scrollState = snapshotTerminalScrollState(terminal, buf.pinnedToBottom);
 
             fitAddon.fit();
             lastCols = terminal.cols;
@@ -261,10 +311,8 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
             setPreferredPtySize(terminal.cols, terminal.rows);
 
             handleResize(terminal.cols, terminal.rows);
-
-            if (wasAtBottom) {
-              terminal.scrollToBottom();
-            }
+            restoreScrollState(scrollState);
+            syncScrollState();
 
             // Suppress activity detection for 2s after resize
             buf.suppressActivityUntil = Date.now() + 2000;
@@ -284,9 +332,17 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
       observer.disconnect();
       if (resizeTimer) clearTimeout(resizeTimer);
       cancelAnimationFrame(resizeRaf);
+      scrollDisposable.dispose();
       termRef.current?.removeEventListener('keydown', handleCtrlEnter, true);
-      // Detach terminal from buffer — Rust ring buffer continues capturing output
+      if (mountCompleted) {
+        syncScrollState();
+      } else {
+        buf.pinnedToBottom = mountScrollState.pinnedToBottom;
+        buf.viewportY = mountScrollState.viewportY;
+      }
+      // Detach terminal from buffer - Rust ring buffer continues capturing output
       buf.terminal = null;
+      buf.viewportElement = null;
       buf.pendingQueue = null;
       terminal.dispose();
       xtermRef.current = null;

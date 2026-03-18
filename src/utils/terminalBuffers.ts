@@ -3,6 +3,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { Terminal } from '@xterm/xterm';
 import { useProcessStore } from '../stores/processStore';
 import { useAppStore } from '../stores/appStore';
+import {
+  isAtBottom,
+  restoreTerminalScrollState,
+  snapshotTerminalScrollState,
+} from './terminalSize';
 
 /** Get the pty session ID of the currently active tab */
 function getActivePtySessionId(): string | null {
@@ -23,6 +28,7 @@ export interface SessionBuffer {
   dataUnlisten: Promise<UnlistenFn>;
   exitUnlisten: Promise<UnlistenFn>;
   terminal: Terminal | null;     // current mounted terminal (null when unmounted)
+  viewportElement: HTMLElement | null;
   pendingQueue: Uint8Array[] | null;  // temporary queue while fetching Rust backlog on mount
   onExit?: () => void;
   trackActivity: boolean;        // whether to monitor for thinking/idle
@@ -31,9 +37,31 @@ export interface SessionBuffer {
   suppressActivityUntil: number;
   pendingFrame: Uint8Array[] | null;  // chunks accumulated for rAF write batching
   writeRaf: number;                   // rAF handle for batched writes (0 = none pending)
+  pinnedToBottom: boolean;
+  viewportY: number;
 }
 
 export const sessionBuffers = new Map<string, SessionBuffer>();
+
+function syncSessionScrollState(entry: SessionBuffer, terminal = entry.terminal) {
+  if (!terminal) return;
+  entry.pinnedToBottom = isAtBottom(terminal);
+  entry.viewportY = terminal.buffer.active.viewportY;
+}
+
+function writeToMountedTerminal(entry: SessionBuffer, data: string | Uint8Array) {
+  const terminal = entry.terminal;
+  if (!terminal) return;
+
+  const scrollState = snapshotTerminalScrollState(terminal, entry.pinnedToBottom);
+  terminal.write(data, () => {
+    if (entry.terminal !== terminal) return;
+    if (scrollState.pinnedToBottom) {
+      restoreTerminalScrollState(terminal, entry.viewportElement, scrollState);
+    }
+    syncSessionScrollState(entry, terminal);
+  });
+}
 
 export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trackActivity = false): SessionBuffer {
   let buf = sessionBuffers.get(sessionId);
@@ -46,6 +74,7 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
   const entry: SessionBuffer = {
     exited: false,
     terminal: null,
+    viewportElement: null,
     pendingQueue: null,
     onExit,
     trackActivity,
@@ -54,6 +83,8 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
     suppressActivityUntil: 0,
     pendingFrame: null,
     writeRaf: 0,
+    pinnedToBottom: true,
+    viewportY: 0,
     dataUnlisten: listen<string>(`pty-data-${sessionId}`, (event) => {
       const bytes = Uint8Array.from(atob(event.payload), c => c.charCodeAt(0));
       if (entry.terminal) {
@@ -72,7 +103,7 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
             const merged = new Uint8Array(total);
             let off = 0;
             for (const c of chunks) { merged.set(c, off); off += c.length; }
-            entry.terminal?.write(merged);
+            writeToMountedTerminal(entry, merged);
           });
         }
       } else if (entry.pendingQueue) {
@@ -106,7 +137,7 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
         useProcessStore.getState().setTerminalActivity(sessionId, 'idle', getActivePtySessionId(), getNotificationSound());
       }
       if (entry.terminal) {
-        entry.terminal.writeln('\r\n\x1b[90m--- Session ended ---\x1b[0m');
+        writeToMountedTerminal(entry, '\r\n\x1b[90m--- Session ended ---\x1b[0m\r\n');
       }
       entry.onExit?.();
     }),
@@ -121,6 +152,7 @@ export function cleanupSessionBuffer(sessionId: string) {
   if (buf) {
     if (buf.writeRaf) cancelAnimationFrame(buf.writeRaf);
     buf.pendingFrame = null;
+    buf.viewportElement = null;
     if (buf.idleTimer) clearTimeout(buf.idleTimer);
     if (buf.trackActivity) {
       const store = useProcessStore.getState();
@@ -138,7 +170,7 @@ export function cleanupSessionBuffer(sessionId: string) {
 export function writeToSessionTerminal(sessionId: string, text: string) {
   const buf = sessionBuffers.get(sessionId);
   if (buf?.terminal) {
-    buf.terminal.write(text);
+    writeToMountedTerminal(buf, text);
   }
 }
 

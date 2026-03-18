@@ -32,11 +32,6 @@ body {
   background: #52525b;
 }
 
-/* xterm.js overrides */
-.xterm {
-  padding: 4px;
-}
-
 /* Hide the xterm cursor in AI terminals (claude/codex) without hiding the
    underlying glyph — xterm renders the character and cursor decoration in
    the same span, so we neutralise every cursor *style* rather than hiding
