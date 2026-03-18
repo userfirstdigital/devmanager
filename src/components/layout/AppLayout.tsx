@@ -3,8 +3,9 @@ import { Sidebar } from './Sidebar';
 import { StatusBar } from './StatusBar';
 import { InteractiveTerminal } from '../terminal/InteractiveTerminal';
 import { SSHToolbar } from '../ssh/SSHToolbar';
-import { useAppStore, TabInfo } from '../../stores/appStore';
+import { useAppStore } from '../../stores/appStore';
 import { useProcessStore } from '../../stores/processStore';
+import { getTerminalHeaderLabel } from '../../utils/tabTitles';
 
 export function AppLayout() {
   const activeTabId = useAppStore(s => s.activeTabId);
@@ -13,12 +14,12 @@ export function AppLayout() {
 
   const activeTab = openTabs.find(t => t.id === activeTabId);
 
-  // Clear "ready" indicator when user visits a Claude/Codex tab
+  // Clear "ready" indicator when user visits a Claude/Codex tab.
   useEffect(() => {
     if ((activeTab?.type === 'claude' || activeTab?.type === 'codex') && activeTab.ptySessionId) {
       useProcessStore.getState().clearUnseenReady(activeTab.ptySessionId);
     }
-  }, [activeTabId]);
+  }, [activeTab]);
 
   const handlePtyExit = (sessionId: string) => {
     useProcessStore.getState().setProcessState(sessionId, {
@@ -27,36 +28,7 @@ export function AppLayout() {
     });
   };
 
-  const getTabLabel = (tab: TabInfo): string => {
-    const project = config?.projects.find(p => p.id === tab.projectId);
-    const projectName = project?.name || '';
-
-    if (tab.type === 'server' && tab.commandId && project) {
-      for (const folder of project.folders) {
-        const cmd = folder.commands.find(c => c.id === tab.commandId);
-        if (cmd) {
-          const folderPrefix = project.folders.length > 1 ? `${folder.name} / ` : '';
-          return `${projectName} — ${folderPrefix}${cmd.label}`;
-        }
-      }
-    }
-
-    if (tab.type === 'claude') {
-      return `${projectName} — ${tab.label || 'Claude'}`;
-    }
-
-    if (tab.type === 'codex') {
-      return `${projectName} — ${tab.label || 'Codex'}`;
-    }
-
-    if (tab.type === 'ssh') {
-      return tab.label || 'SSH';
-    }
-
-    return projectName;
-  };
-
-  // All tabs with PTY sessions — keep mounted, CSS show/hide so xterm stays alive
+  // All tabs with PTY sessions: keep mounted, CSS show/hide so xterm stays alive.
   const ptyTabs = openTabs.filter(t => t.ptySessionId);
 
   return (
@@ -64,7 +36,7 @@ export function AppLayout() {
       <Sidebar />
       <div className="flex flex-col flex-1 min-w-0">
         <div className="flex-1 min-h-0 flex flex-col relative">
-          {/* All PTY tabs: always mounted, toggle visibility via CSS */}
+          {/* All PTY tabs: always mounted, toggle visibility via CSS. */}
           {ptyTabs.map(tab => (
             <div
               key={tab.id}
@@ -78,7 +50,7 @@ export function AppLayout() {
                   <div className="flex-1 min-h-0">
                     <InteractiveTerminal
                       sessionId={tab.ptySessionId!}
-                      label={getTabLabel(tab)}
+                      label={getTerminalHeaderLabel(tab, config)}
                       isActive={tab.id === activeTabId}
                       onExit={() => handlePtyExit(tab.ptySessionId!)}
                     />
@@ -91,7 +63,7 @@ export function AppLayout() {
               ) : (
                 <InteractiveTerminal
                   sessionId={tab.ptySessionId!}
-                  label={getTabLabel(tab)}
+                  label={getTerminalHeaderLabel(tab, config)}
                   isActive={tab.id === activeTabId}
                   showActivity={tab.type === 'claude' || tab.type === 'codex'}
                   hideCursor={tab.type === 'claude' || tab.type === 'codex'}
@@ -101,7 +73,6 @@ export function AppLayout() {
             </div>
           ))}
 
-          {/* Empty state */}
           {!activeTab && (
             <div className="flex-1 flex items-center justify-center text-zinc-500">
               <div className="text-center">

@@ -16,6 +16,7 @@ import { EditProjectDialog } from './EditProjectDialog';
 import { EditFolderDialog } from './EditFolderDialog';
 import { getAllCommands } from '../../utils/projectHelpers';
 import { resolveInteractiveShellCommand } from '../../utils/runtimePlatform';
+import { getSidebarTerminalLabel } from '../../utils/tabTitles';
 
 function FolderSection({ project, folder }: { project: Project; folder: ProjectFolder }) {
   const [expanded, setExpanded] = useState(true);
@@ -290,6 +291,7 @@ function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }
   const activeTabId = useAppStore(s => s.activeTabId);
   const { setActiveTab, closeTab } = useAppStore();
   const terminalActivity = useProcessStore(s => s.terminalActivity);
+  const terminalTitles = useProcessStore(s => s.terminalTitles);
   const unseenReady = useProcessStore(s => s.unseenReady);
   const clearUnseenReady = useProcessStore(s => s.clearUnseenReady);
   const processes = useProcessStore(s => s.processes);
@@ -360,6 +362,7 @@ function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }
         const proc = processes[sessionId];
         const isRunning = proc?.status === 'running';
         const isReady = unseenReady[sessionId];
+        const displayLabel = getSidebarTerminalLabel(tab, config, terminalTitles);
 
         return (
           <div
@@ -376,7 +379,7 @@ function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }
                 ? 'text-amber-400 animate-pulse'
                 : iconColor
             }>{icon}</span>
-            <span className="flex-1 text-zinc-400 truncate">{tab.label || label}</span>
+            <span className="flex-1 text-zinc-400 truncate">{displayLabel}</span>
             {isReady && (
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
             )}

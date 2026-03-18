@@ -37,6 +37,7 @@ interface ProcessStore {
 
   // Terminal activity
   setTerminalTitle: (id: string, title: string) => void;
+  clearTerminalTitle: (id: string) => void;
   setTerminalActivity: (id: string, activity: TerminalActivity, activeSessionId?: string | null, notificationSound?: string) => void;
   clearUnseenReady: (id: string) => void;
 
@@ -164,6 +165,13 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
     set(state => ({
       terminalTitles: { ...state.terminalTitles, [id]: title },
     }));
+  },
+
+  clearTerminalTitle: (id) => {
+    set(state => {
+      const { [id]: _, ...rest } = state.terminalTitles;
+      return { terminalTitles: rest };
+    });
   },
 
   setTerminalActivity: (id, activity, activeSessionId, notificationSound) => {

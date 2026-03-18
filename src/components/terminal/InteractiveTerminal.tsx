@@ -14,6 +14,7 @@ import {
   setPreferredPtySize,
   snapshotTerminalScrollState,
 } from '../../utils/terminalSize';
+import { normalizeTerminalTitle } from '../../utils/tabTitles';
 
 interface InteractiveTerminalProps {
   sessionId: string;
@@ -34,6 +35,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
   const defaultFontSize = useAppStore(s => s.config?.settings.terminalFontSize ?? 13);
   const [fontSize, setFontSize] = useState(defaultFontSize);
   const setTerminalTitle = useProcessStore(s => s.setTerminalTitle);
+  const clearTerminalTitle = useProcessStore(s => s.clearTerminalTitle);
 
   const handleResize = useCallback(async (cols: number, rows: number) => {
     try {
@@ -248,12 +250,15 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
       }
     });
 
-    // Track title changes for display purposes
-    if (showActivity) {
-      terminal.onTitleChange((title) => {
-        setTerminalTitle(sessionId, title);
-      });
-    }
+    // Track title changes for display purposes.
+    terminal.onTitleChange((title) => {
+      const normalizedTitle = normalizeTerminalTitle(title);
+      if (normalizedTitle) {
+        setTerminalTitle(sessionId, normalizedTitle);
+      } else {
+        clearTerminalTitle(sessionId);
+      }
+    });
 
     // Key handler: Ctrl+C (copy selection), Ctrl+V (paste)
     terminal.attachCustomKeyEventHandler((e) => {
@@ -348,7 +353,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
       xtermRef.current = null;
       fitAddonRef.current = null;
     };
-  }, [sessionId, fontSize]);
+  }, [sessionId, fontSize, onExit, showActivity, setTerminalTitle, clearTerminalTitle]);
 
   // Auto-focus terminal when this tab becomes active
   useEffect(() => {

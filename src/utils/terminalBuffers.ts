@@ -133,6 +133,7 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
     exitUnlisten: listen<string>(`pty-exit-${sessionId}`, () => {
       entry.exited = true;
       if (entry.idleTimer) clearTimeout(entry.idleTimer);
+      useProcessStore.getState().clearTerminalTitle(sessionId);
       if (entry.trackActivity) {
         useProcessStore.getState().setTerminalActivity(sessionId, 'idle', getActivePtySessionId(), getNotificationSound());
       }
@@ -154,11 +155,11 @@ export function cleanupSessionBuffer(sessionId: string) {
     buf.pendingFrame = null;
     buf.viewportElement = null;
     if (buf.idleTimer) clearTimeout(buf.idleTimer);
+    useProcessStore.getState().clearTerminalTitle(sessionId);
     if (buf.trackActivity) {
       const store = useProcessStore.getState();
-      const { [sessionId]: _t, ...restTitles } = store.terminalTitles;
       const { [sessionId]: _a, ...restActivity } = store.terminalActivity;
-      useProcessStore.setState({ terminalTitles: restTitles, terminalActivity: restActivity });
+      useProcessStore.setState({ terminalActivity: restActivity });
     }
     buf.dataUnlisten.then(fn => fn());
     buf.exitUnlisten.then(fn => fn());
@@ -180,6 +181,7 @@ export function resetSessionForRestart(sessionId: string) {
   if (buf) {
     buf.exited = false;
   }
+  useProcessStore.getState().clearTerminalTitle(sessionId);
   // Clear Rust-side ring buffer so stale output isn't replayed on remount
   invoke('drain_pty_buffer', { id: sessionId }).catch(() => {});
 }
