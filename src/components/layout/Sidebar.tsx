@@ -47,7 +47,10 @@ export function Sidebar() {
     <>
       <div className="w-60 bg-zinc-800 border-r border-zinc-700 flex flex-col">
         <div className="flex items-center justify-between p-3 border-b border-zinc-700">
-          <h1 className="text-sm font-bold text-zinc-100 tracking-wide uppercase">DevManager</h1>
+          <div className="flex items-baseline gap-2 min-w-0">
+            <h1 className="text-sm font-bold text-zinc-100 tracking-wide uppercase">DevManager</h1>
+            <span className="text-[10px] font-medium text-zinc-500 shrink-0">v{__APP_VERSION__}</span>
+          </div>
           <button
             onClick={toggleSidebar}
             className="p-1 hover:bg-zinc-700 rounded text-zinc-400 hover:text-zinc-100"

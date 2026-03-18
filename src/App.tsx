@@ -6,12 +6,10 @@ import { useSessionRestore } from './hooks/useSessionRestore';
 import { useAppStore } from './stores/appStore';
 import { useProcessStore } from './stores/processStore';
 import { useProcess } from './hooks/useProcess';
-import { useUpdateCheck } from './hooks/useUpdateCheck';
 import { isMacPlatform } from './utils/runtimePlatform';
 
 export default function App() {
   useSessionRestore();
-  useUpdateCheck();
   const loading = useAppStore(s => s.loading);
   const runtimeInfo = useAppStore(s => s.runtimeInfo);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);

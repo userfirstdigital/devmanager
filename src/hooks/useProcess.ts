@@ -281,6 +281,27 @@ export function useProcess() {
     await Promise.all(promises);
   };
 
+  const stopAllAndWait = async () => {
+    const processStore = useProcessStore.getState();
+    const managedIds = Object.entries(processStore.processes)
+      .filter(([_, process]) => process.status === 'running' || process.status === 'stopping')
+      .map(([id]) => id);
+
+    await stopAll();
+
+    if (managedIds.length === 0) return;
+
+    await invoke('wait_for_managed_shutdown', { timeoutMs: 15000 });
+
+    for (const id of managedIds) {
+      processStore.setProcessState(id, {
+        status: 'stopped',
+        pid: null,
+        exitCode: 0,
+      });
+    }
+  };
+
   return {
     startProcess,
     stopProcess,
@@ -288,5 +309,6 @@ export function useProcess() {
     stopAllForProject,
     startAllForProject,
     stopAll,
+    stopAllAndWait,
   };
 }

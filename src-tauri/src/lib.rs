@@ -52,6 +52,7 @@ pub fn run() {
             commands::process::unregister_process,
             commands::process::kill_process_tree,
             commands::process::get_running_processes,
+            commands::process::wait_for_managed_shutdown,
             commands::ports::check_port_in_use,
             commands::ports::kill_port,
             commands::ports::get_port_conflicts,
