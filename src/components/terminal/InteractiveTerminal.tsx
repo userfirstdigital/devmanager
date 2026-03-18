@@ -353,7 +353,7 @@ export function InteractiveTerminal({ sessionId, onExit, showActivity = false, h
       xtermRef.current = null;
       fitAddonRef.current = null;
     };
-  }, [sessionId, fontSize, onExit, showActivity, setTerminalTitle, clearTerminalTitle]);
+  }, [sessionId, fontSize]);
 
   // Auto-focus terminal when this tab becomes active
   useEffect(() => {
