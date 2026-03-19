@@ -3,6 +3,7 @@ import { Sidebar } from './Sidebar';
 import { StatusBar } from './StatusBar';
 import { InteractiveTerminal } from '../terminal/InteractiveTerminal';
 import { SSHToolbar } from '../ssh/SSHToolbar';
+import { ServerControls } from '../servers/ServerControls';
 import { useAppStore } from '../../stores/appStore';
 import { useProcessStore } from '../../stores/processStore';
 import { getTerminalHeaderLabel } from '../../utils/tabTitles';
@@ -13,6 +14,7 @@ export function AppLayout() {
   const config = useAppStore(s => s.config);
 
   const activeTab = openTabs.find(t => t.id === activeTabId);
+  const activePtyTab = activeTab?.ptySessionId ? activeTab : null;
 
   // Clear "ready" indicator when user visits a Claude/Codex tab.
   useEffect(() => {
@@ -28,52 +30,45 @@ export function AppLayout() {
     });
   };
 
-  // All tabs with PTY sessions: keep mounted, CSS show/hide so xterm stays alive.
-  const ptyTabs = openTabs.filter(t => t.ptySessionId);
-
   return (
     <div className="flex h-screen bg-zinc-900 text-zinc-100 overflow-hidden">
       <Sidebar />
       <div className="flex flex-col flex-1 min-w-0">
         <div className="flex-1 min-h-0 flex flex-col relative">
-          {/* All PTY tabs: always mounted, toggle visibility via CSS. */}
-          {ptyTabs.map(tab => (
-            <div
-              key={tab.id}
-              className={tab.id === activeTabId
-                ? 'absolute inset-0 flex flex-col z-10'
-                : 'hidden'
-              }
-            >
-              {tab.type === 'ssh' ? (
+          {activePtyTab && (
+            <div key={activePtyTab.id} className="absolute inset-0 flex flex-col z-10">
+              {activePtyTab.type === 'ssh' ? (
                 <>
                   <div className="flex-1 min-h-0">
                     <InteractiveTerminal
-                      sessionId={tab.ptySessionId!}
-                      label={getTerminalHeaderLabel(tab, config)}
-                      isActive={tab.id === activeTabId}
-                      onExit={() => handlePtyExit(tab.ptySessionId!)}
+                      sessionId={activePtyTab.ptySessionId!}
+                      label={getTerminalHeaderLabel(activePtyTab, config)}
+                      isActive
+                      onExit={() => handlePtyExit(activePtyTab.ptySessionId!)}
                     />
                   </div>
                   <SSHToolbar
-                    sshConnectionId={tab.sshConnectionId}
-                    ptySessionId={tab.ptySessionId!}
+                    sshConnectionId={activePtyTab.sshConnectionId}
+                    ptySessionId={activePtyTab.ptySessionId!}
                   />
                 </>
               ) : (
                 <InteractiveTerminal
-                  sessionId={tab.ptySessionId!}
-                  label={getTerminalHeaderLabel(tab, config)}
-                  isActive={tab.id === activeTabId}
-                  showActivity={tab.type === 'claude' || tab.type === 'codex'}
-                  hideCursor={tab.type === 'claude' || tab.type === 'codex'}
-                  onExit={() => handlePtyExit(tab.ptySessionId!)}
+                  sessionId={activePtyTab.ptySessionId!}
+                  label={getTerminalHeaderLabel(activePtyTab, config)}
+                  isActive
+                  showActivity={activePtyTab.type === 'claude' || activePtyTab.type === 'codex'}
+                  hideCursor={activePtyTab.type === 'claude' || activePtyTab.type === 'codex'}
+                  headerActions={activePtyTab.type === 'server'
+                    ? <ServerControls commandId={activePtyTab.commandId!} />
+                    : undefined}
+                  onExit={() => handlePtyExit(activePtyTab.ptySessionId!)}
                 />
               )}
             </div>
-          ))}
+          )}
 
-          {!activeTab && (
+          {!activePtyTab && (
             <div className="flex-1 flex items-center justify-center text-zinc-500">
               <div className="text-center">
                 <p className="text-2xl font-semibold mb-2">No server selected</p>

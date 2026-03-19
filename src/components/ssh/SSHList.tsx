@@ -1,12 +1,12 @@
 import { useState, useRef, useEffect } from 'react';
 import { Terminal, Plus, MoreVertical, Trash2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { useAppStore, TabInfo } from '../../stores/appStore';
 import { useProcessStore } from '../../stores/processStore';
 import { usePty } from '../../hooks/usePty';
 import { AddSSHDialog } from './AddSSHDialog';
 import type { SSHConnection } from '../../types/config';
+import { listenWithAutoCleanup } from '../../utils/tauriListeners';
 
 export function SSHList() {
   const config = useAppStore(s => s.config);
@@ -53,7 +53,7 @@ export function SSHList() {
       // Auto-password: watch for password prompt and enter it
       if (conn.password) {
         let passwordSent = false;
-        const unlisten = await listen<string>(`pty-data-${sessionId}`, async (event) => {
+        const unlisten = await listenWithAutoCleanup<string>(`pty-data-${sessionId}`, async (event) => {
           if (passwordSent) return;
           const bytes = Uint8Array.from(atob(event.payload), c => c.charCodeAt(0));
           const text = new TextDecoder().decode(bytes);

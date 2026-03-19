@@ -219,6 +219,9 @@ fn collect_process_tree(
     let mut processes = Vec::new();
     let mut total_memory_mb = 0.0;
     let mut total_cpu_percent: f32 = 0.0;
+    let cpu_count = std::thread::available_parallelism()
+        .map(|count| count.get() as f32)
+        .unwrap_or(1.0);
 
     for proc_pid in &tree_pids {
         if let Some(process) = sys.process(*proc_pid) {
@@ -234,6 +237,11 @@ fn collect_process_tree(
             });
         }
     }
+
+    // sysinfo reports per-process CPU as "cores worth of usage", so a process
+    // fully saturating two logical CPUs can read as ~200%. Normalize to whole-
+    // machine percent for the UI.
+    total_cpu_percent /= cpu_count;
 
     Some(models::config::ProcessTreeInfo {
         command_id: command_id.to_string(),

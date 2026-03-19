@@ -1,27 +1,30 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { useShallow } from 'zustand/react/shallow';
 import { AppLayout } from './components/layout/AppLayout';
 import { useSessionRestore } from './hooks/useSessionRestore';
 import { useAppStore } from './stores/appStore';
 import { useProcessStore } from './stores/processStore';
 import { useProcess } from './hooks/useProcess';
 import { isMacPlatform } from './utils/runtimePlatform';
-import { APP_WINDOW_TITLE, getWindowTitle } from './utils/tabTitles';
+import { APP_WINDOW_TITLE, getWindowTitleWithLiveTitle } from './utils/tabTitles';
 
 export default function App() {
   useSessionRestore();
-  const loading = useAppStore(s => s.loading);
-  const config = useAppStore(s => s.config);
-  const runtimeInfo = useAppStore(s => s.runtimeInfo);
-  const activeTabId = useAppStore(s => s.activeTabId);
-  const openTabs = useAppStore(s => s.openTabs);
-  const terminalTitles = useProcessStore(s => s.terminalTitles);
+  const { activeTab, config, loading, runtimeInfo } = useAppStore(useShallow(state => ({
+    activeTab: state.openTabs.find(tab => tab.id === state.activeTabId),
+    config: state.config,
+    loading: state.loading,
+    runtimeInfo: state.runtimeInfo,
+  })));
+  const activeTerminalTitle = useProcessStore(s => (
+    activeTab?.ptySessionId ? s.terminalTitles[activeTab.ptySessionId] ?? null : null
+  ));
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const { stopAll } = useProcess();
 
-  const activeTab = openTabs.find(tab => tab.id === activeTabId);
-  const windowTitle = getWindowTitle(activeTab, config, terminalTitles);
+  const windowTitle = getWindowTitleWithLiveTitle(activeTab, config, activeTerminalTitle);
 
   useEffect(() => {
     document.title = windowTitle || APP_WINDOW_TITLE;

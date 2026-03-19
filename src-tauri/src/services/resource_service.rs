@@ -41,6 +41,9 @@ pub fn get_process_tree_resources(command_id: &str, pid: u32) -> Result<ProcessT
     let mut processes = Vec::new();
     let mut total_memory_mb = 0.0;
     let mut total_cpu_percent: f32 = 0.0;
+    let cpu_count = std::thread::available_parallelism()
+        .map(|count| count.get() as f32)
+        .unwrap_or(1.0);
 
     for proc_pid in &tree_pids {
         if let Some(process) = sys.process(*proc_pid) {
@@ -58,6 +61,8 @@ pub fn get_process_tree_resources(command_id: &str, pid: u32) -> Result<ProcessT
             });
         }
     }
+
+    total_cpu_percent /= cpu_count;
 
     Ok(ProcessTreeInfo {
         command_id: command_id.to_string(),

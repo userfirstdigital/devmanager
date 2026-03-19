@@ -1,8 +1,9 @@
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { Terminal } from '@xterm/xterm';
 import { useProcessStore } from '../stores/processStore';
 import { useAppStore } from '../stores/appStore';
+import { listenWithAutoCleanup } from './tauriListeners';
 import {
   isAtBottom,
   restoreTerminalScrollState,
@@ -53,10 +54,12 @@ function writeToMountedTerminal(entry: SessionBuffer, data: string | Uint8Array)
   const terminal = entry.terminal;
   if (!terminal) return;
 
-  const scrollState = snapshotTerminalScrollState(terminal, entry.pinnedToBottom);
+  const shouldFollowOutput = entry.pinnedToBottom && isAtBottom(terminal);
+  const scrollState = snapshotTerminalScrollState(terminal, shouldFollowOutput);
   terminal.write(data, () => {
     if (entry.terminal !== terminal) return;
-    if (scrollState.pinnedToBottom) {
+    // Respect a user scroll-up that happened while xterm was processing the write.
+    if (scrollState.pinnedToBottom && entry.pinnedToBottom) {
       restoreTerminalScrollState(terminal, entry.viewportElement, scrollState);
     }
     syncSessionScrollState(entry, terminal);
@@ -85,7 +88,7 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
     writeRaf: 0,
     pinnedToBottom: true,
     viewportY: 0,
-    dataUnlisten: listen<string>(`pty-data-${sessionId}`, (event) => {
+    dataUnlisten: listenWithAutoCleanup<string>(`pty-data-${sessionId}`, (event) => {
       const bytes = Uint8Array.from(atob(event.payload), c => c.charCodeAt(0));
       if (entry.terminal) {
         // Batch writes per animation frame. All PTY events arriving within a
@@ -130,7 +133,7 @@ export function ensureSessionBuffer(sessionId: string, onExit?: () => void, trac
         }, 3000);
       }
     }),
-    exitUnlisten: listen<string>(`pty-exit-${sessionId}`, () => {
+    exitUnlisten: listenWithAutoCleanup<string>(`pty-exit-${sessionId}`, () => {
       entry.exited = true;
       if (entry.idleTimer) clearTimeout(entry.idleTimer);
       useProcessStore.getState().clearTerminalTitle(sessionId);

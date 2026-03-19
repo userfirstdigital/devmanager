@@ -70,7 +70,15 @@ export function getTabFallbackTerminalLabel(tab: TabInfo, config: AppConfig | nu
 }
 
 export function getSidebarTerminalLabel(tab: TabInfo, config: AppConfig | null, terminalTitles: TerminalTitleMap): string {
-  return getLiveTerminalTitle(tab, terminalTitles) || getTabFallbackTerminalLabel(tab, config);
+  return getSidebarTerminalLabelWithLiveTitle(tab, config, getLiveTerminalTitle(tab, terminalTitles));
+}
+
+export function getSidebarTerminalLabelWithLiveTitle(
+  tab: TabInfo,
+  config: AppConfig | null,
+  liveTitle: string | null | undefined,
+): string {
+  return liveTitle || getTabFallbackTerminalLabel(tab, config);
 }
 
 export function getTerminalHeaderLabel(tab: TabInfo, config: AppConfig | null): string {
@@ -81,13 +89,21 @@ export function getTerminalHeaderLabel(tab: TabInfo, config: AppConfig | null): 
 }
 
 export function getWindowTitle(tab: TabInfo | undefined, config: AppConfig | null, terminalTitles: TerminalTitleMap): string {
+  return getWindowTitleWithLiveTitle(tab, config, tab ? getLiveTerminalTitle(tab, terminalTitles) : null);
+}
+
+export function getWindowTitleWithLiveTitle(
+  tab: TabInfo | undefined,
+  config: AppConfig | null,
+  liveTitle: string | null | undefined,
+): string {
   if (!tab) {
     return APP_WINDOW_TITLE;
   }
 
   const segments = [
     getTabProjectName(tab, config),
-    getLiveTerminalTitle(tab, terminalTitles) || getTabFallbackTerminalLabel(tab, config),
+    liveTitle || getTabFallbackTerminalLabel(tab, config),
     APP_WINDOW_TITLE,
   ].filter((segment): segment is string => Boolean(segment));
 

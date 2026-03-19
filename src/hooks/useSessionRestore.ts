@@ -1,11 +1,11 @@
 import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { useAppStore } from '../stores/appStore';
+import { useAppStore, type TabInfo } from '../stores/appStore';
 import { useProcessStore } from '../stores/processStore';
 import { ensureSessionBuffer } from '../utils/terminalBuffers';
 import { getPreferredPtySize } from '../utils/terminalSize';
 import { resolveInteractiveShellCommand } from '../utils/runtimePlatform';
+import { listenWithAutoCleanup } from '../utils/tauriListeners';
 
 const DEFAULT_CLAUDE_CMD = 'npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions';
 const DEFAULT_CODEX_CMD = 'npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox';
@@ -18,7 +18,7 @@ interface RestoreRequest {
   env?: Record<string, string>;
   cols?: number;
   rows?: number;
-  projectId: string;
+  project_id: string;
   checkAlive: boolean;
 }
 
@@ -28,6 +28,8 @@ interface RestoreResult {
   alive: boolean;
   error: string | null;
 }
+
+type RunningProcessMap = Record<string, number>;
 
 export function useSessionRestore() {
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -71,16 +73,16 @@ export function useSessionRestore() {
             const project = cfg?.projects.find(p => p.id === tab.projectId);
             if (project) {
               tabIndexMap.push({ tabIndex: i, reqIndex: restoreRequests.length, type: tab.type });
-              restoreRequests.push({
-                id: tab.ptySessionId,
-                cwd: project.rootPath,
-                command: shell.command,
-                args: shell.args,
-                cols: getPreferredPtySize().cols,
-                rows: getPreferredPtySize().rows,
-                projectId: tab.projectId,
-                checkAlive: true,
-              });
+                restoreRequests.push({
+                  id: tab.ptySessionId,
+                  cwd: project.rootPath,
+                  command: shell.command,
+                  args: shell.args,
+                  cols: getPreferredPtySize().cols,
+                  rows: getPreferredPtySize().rows,
+                  project_id: tab.projectId,
+                  checkAlive: true,
+                });
             }
           }
 
@@ -105,7 +107,7 @@ export function useSessionRestore() {
                 args: sshArgs,
                 cols: getPreferredPtySize().cols,
                 rows: getPreferredPtySize().rows,
-                projectId: '',
+                project_id: '',
                 checkAlive: true,
               });
             }
@@ -161,7 +163,7 @@ export function useSessionRestore() {
                   const sessionId = tab.ptySessionId;
                   const password = entry.sshPassword;
                   let passwordSent = false;
-                  const unlisten = await listen<string>(`pty-data-${sessionId}`, async (event) => {
+                  const unlisten = await listenWithAutoCleanup<string>(`pty-data-${sessionId}`, async (event) => {
                     if (passwordSent) return;
                     const bytes = Uint8Array.from(atob(event.payload), c => c.charCodeAt(0));
                     const text = new TextDecoder().decode(bytes);
@@ -184,20 +186,69 @@ export function useSessionRestore() {
           }
         }
 
-        // Reconnect server tabs to alive backend sessions
-        const serverTabs = tabs.filter(t => t.type === 'server' && t.ptySessionId);
-        for (const tab of serverTabs) {
-          try {
-            const alive = await invoke<boolean>('check_pty_session', { id: tab.ptySessionId });
-            if (alive) {
-              ensureSessionBuffer(tab.ptySessionId!);
-              useProcessStore.getState().setProcessState(tab.ptySessionId!, {
+        // Reconcile server sessions against the backend source of truth so a
+        // frontend refresh cannot orphan a still-running managed server.
+        let runningProcesses: RunningProcessMap = {};
+        try {
+          runningProcesses = await invoke<RunningProcessMap>('get_running_processes');
+        } catch (err) {
+          console.warn('Failed to query running managed processes:', err);
+        }
+
+        const existingTabIds = new Set(useAppStore.getState().openTabs.map(tab => tab.id));
+        const recoveredTabs: TabInfo[] = [];
+
+        for (const project of cfg?.projects ?? []) {
+          for (const folder of project.folders) {
+            for (const command of folder.commands) {
+              const pid = runningProcesses[command.id];
+              if (typeof pid !== 'number') {
+                continue;
+              }
+
+              const current = useProcessStore.getState().getProcess(command.id);
+              useProcessStore.getState().setProcessState(command.id, {
                 status: 'running',
-                pid: null,
-                startedAt: Date.now(),
+                pid,
+                startedAt: current?.startedAt ?? Date.now(),
+                exitCode: null,
               });
+
+              invoke('start_resource_monitor', { commandId: command.id, pid }).catch(() => {});
+
+              try {
+                const alive = await invoke<boolean>('check_pty_session', { id: command.id });
+                if (!alive) {
+                  continue;
+                }
+
+                ensureSessionBuffer(command.id);
+
+                if (!existingTabIds.has(command.id)) {
+                  existingTabIds.add(command.id);
+                  recoveredTabs.push({
+                    id: command.id,
+                    type: 'server',
+                    projectId: project.id,
+                    commandId: command.id,
+                    ptySessionId: command.id,
+                  });
+                }
+              } catch {}
             }
-          } catch {}
+          }
+        }
+
+        if (recoveredTabs.length > 0) {
+          useAppStore.setState(state => {
+            const openTabs = [...state.openTabs, ...recoveredTabs];
+            const hasActiveTab = state.activeTabId != null && openTabs.some(tab => tab.id === state.activeTabId);
+
+            return {
+              openTabs,
+              activeTabId: hasActiveTab ? state.activeTabId : recoveredTabs[0].id,
+            };
+          });
         }
       }
 

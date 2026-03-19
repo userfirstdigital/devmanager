@@ -162,13 +162,23 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
   },
 
   setTerminalTitle: (id, title) => {
-    set(state => ({
-      terminalTitles: { ...state.terminalTitles, [id]: title },
-    }));
+    set(state => {
+      if (state.terminalTitles[id] === title) {
+        return state;
+      }
+
+      return {
+        terminalTitles: { ...state.terminalTitles, [id]: title },
+      };
+    });
   },
 
   clearTerminalTitle: (id) => {
     set(state => {
+      if (!(id in state.terminalTitles)) {
+        return state;
+      }
+
       const { [id]: _, ...rest } = state.terminalTitles;
       return { terminalTitles: rest };
     });
@@ -177,6 +187,10 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
   setTerminalActivity: (id, activity, activeSessionId, notificationSound) => {
     const prev = get().terminalActivity[id];
     const now = Date.now();
+
+    if (prev === activity) {
+      return;
+    }
 
     // Track when thinking started
     if (activity === 'thinking' && prev !== 'thinking') {
@@ -223,6 +237,10 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
 
   clearUnseenReady: (id) => {
     set(state => {
+      if (!(id in state.unseenReady)) {
+        return state;
+      }
+
       const { [id]: _, ...rest } = state.unseenReady;
       return { unseenReady: rest };
     });

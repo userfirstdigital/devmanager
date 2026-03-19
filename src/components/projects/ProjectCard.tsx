@@ -16,7 +16,7 @@ import { EditProjectDialog } from './EditProjectDialog';
 import { EditFolderDialog } from './EditFolderDialog';
 import { getAllCommands } from '../../utils/projectHelpers';
 import { resolveInteractiveShellCommand } from '../../utils/runtimePlatform';
-import { getSidebarTerminalLabel } from '../../utils/tabTitles';
+import { getSidebarTerminalLabelWithLiveTitle } from '../../utils/tabTitles';
 
 function FolderSection({ project, folder }: { project: Project; folder: ProjectFolder }) {
   const [expanded, setExpanded] = useState(true);
@@ -289,17 +289,12 @@ function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }
 }) {
   const openTabs = useAppStore(s => s.openTabs);
   const activeTabId = useAppStore(s => s.activeTabId);
-  const { setActiveTab, closeTab } = useAppStore();
-  const terminalActivity = useProcessStore(s => s.terminalActivity);
-  const terminalTitles = useProcessStore(s => s.terminalTitles);
-  const unseenReady = useProcessStore(s => s.unseenReady);
-  const clearUnseenReady = useProcessStore(s => s.clearUnseenReady);
-  const processes = useProcessStore(s => s.processes);
-  const { createSession } = usePty();
   const config = useAppStore(s => s.config);
   const runtimeInfo = useAppStore(s => s.runtimeInfo);
+  const setActiveTab = useAppStore(s => s.setActiveTab);
+  const closeTab = useAppStore(s => s.closeTab);
   const openTab = useAppStore(s => s.openTab);
-
+  const { createSession } = usePty();
   const aiTabs = openTabs.filter(t => t.type === tabType && t.projectId === project.id);
 
   const launchAISession = async (sessionId: string) => {
@@ -331,7 +326,7 @@ function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }
   };
 
   const handleClick = async (tab: TabInfo) => {
-    const proc = processes[tab.ptySessionId || ''];
+    const proc = useProcessStore.getState().getProcess(tab.ptySessionId || '');
     const isAlive = proc?.status === 'running' || proc?.status === 'starting';
     if (!isAlive) {
       // Stopped — relaunch a fresh session
@@ -348,58 +343,87 @@ function AITerminalList({ project, tabType, label, icon, iconColor, getCommand }
         console.error(`Failed to relaunch ${label}:`, err);
       }
     } else {
-      // Clear "ready" indicator when visiting
-      if (tab.ptySessionId) clearUnseenReady(tab.ptySessionId);
+      if (tab.ptySessionId) {
+        useProcessStore.getState().clearUnseenReady(tab.ptySessionId);
+      }
       setActiveTab(tab.id);
     }
   };
 
   return (
     <>
-      {aiTabs.map(tab => {
-        const sessionId = tab.ptySessionId || '';
-        const activity = terminalActivity[sessionId];
-        const proc = processes[sessionId];
-        const isRunning = proc?.status === 'running';
-        const isReady = unseenReady[sessionId];
-        const displayLabel = getSidebarTerminalLabel(tab, config, terminalTitles);
-
-        return (
-          <div
-            key={tab.id}
-            className={`group/ai flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer text-xs ${
-              activeTabId === tab.id ? 'bg-zinc-700/50' : 'hover:bg-zinc-700/30'
-            }`}
-            onClick={() => handleClick(tab)}
-          >
-            <span className={
-              isReady
-                ? 'text-emerald-400'
-                : activity === 'thinking'
-                ? 'text-amber-400 animate-pulse'
-                : iconColor
-            }>{icon}</span>
-            <span className="flex-1 text-zinc-400 truncate">{displayLabel}</span>
-            {isReady && (
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
-            )}
-            <span className={`text-[10px] ${
-              isReady ? 'text-emerald-400' :
-              activity === 'thinking' ? 'text-amber-400' :
-              isRunning ? 'text-zinc-500' : 'text-zinc-600'
-            }`}>
-              {isReady ? 'ready' : activity === 'thinking' ? 'thinking' : isRunning ? 'idle' : 'stopped'}
-            </span>
-            <button
-              onClick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
-              className="p-0.5 rounded hover:bg-zinc-600 text-zinc-500 hover:text-zinc-300 opacity-0 group-hover/ai:opacity-100"
-            >
-              <X size={10} />
-            </button>
-          </div>
-        );
-      })}
+      {aiTabs.map(tab => (
+        <AITerminalRow
+          key={tab.id}
+          tab={tab}
+          config={config}
+          icon={icon}
+          iconColor={iconColor}
+          isActive={activeTabId === tab.id}
+          onClick={handleClick}
+          onClose={closeTab}
+        />
+      ))}
     </>
+  );
+}
+
+function AITerminalRow({
+  tab,
+  config,
+  icon,
+  iconColor,
+  isActive,
+  onClick,
+  onClose,
+}: {
+  tab: TabInfo;
+  config: ReturnType<typeof useAppStore.getState>['config'];
+  icon: React.ReactNode;
+  iconColor: string;
+  isActive: boolean;
+  onClick: (tab: TabInfo) => void;
+  onClose: (tabId: string) => void;
+}) {
+  const sessionId = tab.ptySessionId || '';
+  const activity = useProcessStore(s => s.terminalActivity[sessionId]);
+  const liveTitle = useProcessStore(s => s.terminalTitles[sessionId]);
+  const isReady = useProcessStore(s => Boolean(s.unseenReady[sessionId]));
+  const isRunning = useProcessStore(s => s.processes[sessionId]?.status === 'running');
+  const displayLabel = getSidebarTerminalLabelWithLiveTitle(tab, config, liveTitle);
+
+  return (
+    <div
+      className={`group/ai flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer text-xs ${
+        isActive ? 'bg-zinc-700/50' : 'hover:bg-zinc-700/30'
+      }`}
+      onClick={() => onClick(tab)}
+    >
+      <span className={
+        isReady
+          ? 'text-emerald-400'
+          : activity === 'thinking'
+          ? 'text-amber-400 animate-pulse'
+          : iconColor
+      }>{icon}</span>
+      <span className="flex-1 text-zinc-400 truncate">{displayLabel}</span>
+      {isReady && (
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+      )}
+      <span className={`text-[10px] ${
+        isReady ? 'text-emerald-400' :
+        activity === 'thinking' ? 'text-amber-400' :
+        isRunning ? 'text-zinc-500' : 'text-zinc-600'
+      }`}>
+        {isReady ? 'ready' : activity === 'thinking' ? 'thinking' : isRunning ? 'idle' : 'stopped'}
+      </span>
+      <button
+        onClick={(e) => { e.stopPropagation(); onClose(tab.id); }}
+        className="p-0.5 rounded hover:bg-zinc-600 text-zinc-500 hover:text-zinc-300 opacity-0 group-hover/ai:opacity-100"
+      >
+        <X size={10} />
+      </button>
+    </div>
   );
 }
 

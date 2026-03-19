@@ -155,7 +155,11 @@ pub fn kill_pty_session(session: &mut PtySession) {
 
     #[cfg(windows)]
     {
-        let _ = session.child.kill();
+        if let Some(pid) = session.child.process_id() {
+            let _ = kill_process_tree(pid);
+        } else {
+            let _ = session.child.kill();
+        }
         let _ = session.child.wait();
     }
 }

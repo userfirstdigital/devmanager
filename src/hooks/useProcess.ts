@@ -1,5 +1,4 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
 import { useAppStore } from '../stores/appStore';
 import { useProcessStore } from '../stores/processStore';
@@ -8,12 +7,51 @@ import { getAllCommands } from '../utils/projectHelpers';
 import { ensureSessionBuffer, writeToSessionTerminal, resetSessionForRestart } from '../utils/terminalBuffers';
 import { getPreferredPtySize } from '../utils/terminalSize';
 import { buildServerLaunchCommand } from '../utils/runtimePlatform';
+import { listenWithAutoCleanup } from '../utils/tauriListeners';
 
 // Track auto-restart backoff per command
 const restartBackoffs = new Map<string, { delay: number; lastCrash: number }>();
 
 // Track pty-exit listeners so we can unlisten on re-start
 const exitUnlisteners = new Map<string, () => void>();
+const stopWaiters = new Map<string, Array<() => void>>();
+
+function resolveStopWaiters(commandId: string) {
+  const waiters = stopWaiters.get(commandId);
+  if (!waiters) return;
+  stopWaiters.delete(commandId);
+  for (const resolve of waiters) {
+    resolve();
+  }
+}
+
+function waitForStopSignal(commandId: string, timeoutMs: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const current = useProcessStore.getState().getProcess(commandId);
+    if (!current || current.status === 'stopped' || current.status === 'crashed') {
+      resolve(true);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      const remaining = stopWaiters.get(commandId) ?? [];
+      stopWaiters.set(
+        commandId,
+        remaining.filter(entry => entry !== done),
+      );
+      resolve(false);
+    }, timeoutMs);
+
+    const done = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+
+    const waiters = stopWaiters.get(commandId) ?? [];
+    waiters.push(done);
+    stopWaiters.set(commandId, waiters);
+  });
+}
 
 export function useProcess() {
   const startProcess = async (folder: ProjectFolder, command: RunCommand, projectId: string) => {
@@ -133,12 +171,12 @@ export function useProcess() {
       }, 60000);
 
       // Listen for process exit
-      const unlisten = await listen<string>(`pty-exit-${commandId}`, () => {
+      const unlisten = await listenWithAutoCleanup<string>(`pty-exit-${commandId}`, () => {
         unlisten();
         exitUnlisteners.delete(commandId);
 
         const proc = useProcessStore.getState().getProcess(commandId);
-        if (proc?.status === 'stopping') {
+        if (proc?.status === 'stopping' || proc?.status === 'stopped') {
           processStore.setProcessState(commandId, {
             status: 'stopped',
             pid: null,
@@ -185,6 +223,7 @@ export function useProcess() {
         // Unregister process from Rust backend
         invoke('unregister_process', { key: commandId }).catch(console.error);
         invoke('stop_resource_monitor', { commandId }).catch(console.error);
+        resolveStopWaiters(commandId);
       });
 
       exitUnlisteners.set(commandId, unlisten);
@@ -219,20 +258,36 @@ export function useProcess() {
     }
   };
 
-  const restartProcess = async (folder: ProjectFolder, command: RunCommand, projectId: string) => {
+  const stopProcessAndWait = async (commandId: string, timeoutMs = 5000) => {
     const processStore = useProcessStore.getState();
-    const proc = processStore.getProcess(command.id);
-
-    if (proc?.pid) {
-      processStore.setProcessState(command.id, { status: 'stopping' });
-      try {
-        await invoke('close_pty', { id: command.id });
-      } catch {
-        try { await invoke('kill_process_tree', { pid: proc.pid }); } catch {}
-      }
-      // Wait for process to fully terminate
-      await new Promise(resolve => setTimeout(resolve, 1000));
+    const proc = processStore.getProcess(commandId);
+    if (!proc || proc.status === 'stopped' || proc.status === 'crashed') {
+      processStore.setProcessState(commandId, {
+        status: 'stopped',
+        pid: null,
+      });
+      return true;
     }
+
+    const waitForExit = waitForStopSignal(commandId, timeoutMs);
+    await stopProcess(commandId);
+    const stopped = await waitForExit;
+
+    if (!stopped) {
+      const latest = useProcessStore.getState().getProcess(commandId);
+      if (latest?.status !== 'stopped' && latest?.status !== 'crashed') {
+        useProcessStore.getState().setProcessState(commandId, {
+          status: 'stopped',
+          pid: null,
+        });
+      }
+    }
+
+    return stopped;
+  };
+
+  const restartProcess = async (folder: ProjectFolder, command: RunCommand, projectId: string) => {
+    await stopProcessAndWait(command.id);
 
     writeToSessionTerminal(command.id, '\r\n\x1b[33m--- Restarting... ---\x1b[0m\r\n');
     await startProcess(folder, command, projectId);
@@ -305,6 +360,7 @@ export function useProcess() {
   return {
     startProcess,
     stopProcess,
+    stopProcessAndWait,
     restartProcess,
     stopAllForProject,
     startAllForProject,
