@@ -201,3 +201,96 @@ pub struct SessionTab {
     pub label: Option<String>,
     pub ssh_connection_id: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScanResult {
+    pub scripts: Vec<ScannedScript>,
+    pub ports: Vec<ScannedPort>,
+    pub has_package_json: bool,
+    pub has_cargo_toml: bool,
+    pub has_env_file: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScannedScript {
+    pub name: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScannedPort {
+    pub variable: String,
+    pub port: u16,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RootScanEntry {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "hasEnv")]
+    pub has_env: bool,
+    #[serde(rename = "projectType")]
+    pub project_type: String,
+    pub scripts: Vec<ScannedScript>,
+    pub ports: Vec<ScannedPort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DependencyStatus {
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PortConflict {
+    pub port: u16,
+    pub commands: Vec<PortConflictEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PortConflictEntry {
+    pub project_name: String,
+    pub command_label: String,
+    pub command_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PortStatus {
+    pub port: u16,
+    pub in_use: bool,
+    pub pid: Option<u32>,
+    pub process_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvEntryType {
+    Variable,
+    Comment,
+    Blank,
+}
+
+impl Default for EnvEntryType {
+    fn default() -> Self {
+        Self::Blank
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EnvEntry {
+    #[serde(rename = "type")]
+    pub entry_type: EnvEntryType,
+    pub key: Option<String>,
+    pub value: Option<String>,
+    pub raw: String,
+}

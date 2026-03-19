@@ -1,10 +1,13 @@
-use crate::models::DefaultTerminal;
+use crate::models::{
+    DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult,
+};
 use crate::theme;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use gpui::{
     div, px, rgb, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, Styled, Window,
 };
+use std::collections::{BTreeSet, HashMap};
 
 const EDITOR_TITLE_HEIGHT_PX: f32 = 46.0;
 
@@ -108,6 +111,12 @@ impl EditorPanel {
 
     pub fn text_value(&self, field: EditorField) -> Option<&String> {
         match (self, field) {
+            (Self::Settings(draft), EditorField::Settings(SettingsField::Theme)) => {
+                Some(&draft.theme)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::LogBufferSize)) => {
+                Some(&draft.log_buffer_size)
+            }
             (Self::Settings(draft), EditorField::Settings(SettingsField::ClaudeCommand)) => {
                 Some(&draft.claude_command)
             }
@@ -133,6 +142,9 @@ impl EditorPanel {
             (Self::Folder(draft), EditorField::Folder(FolderField::PortVariable)) => {
                 Some(&draft.port_variable)
             }
+            (Self::Folder(draft), EditorField::Folder(FolderField::EnvContents)) => {
+                Some(&draft.env_file_contents)
+            }
             (Self::Command(draft), EditorField::Command(CommandField::Label)) => Some(&draft.label),
             (Self::Command(draft), EditorField::Command(CommandField::Command)) => {
                 Some(&draft.command)
@@ -157,6 +169,12 @@ impl EditorPanel {
 
     pub fn text_value_mut(&mut self, field: EditorField) -> Option<&mut String> {
         match (self, field) {
+            (Self::Settings(draft), EditorField::Settings(SettingsField::Theme)) => {
+                Some(&mut draft.theme)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::LogBufferSize)) => {
+                Some(&mut draft.log_buffer_size)
+            }
             (Self::Settings(draft), EditorField::Settings(SettingsField::ClaudeCommand)) => {
                 Some(&mut draft.claude_command)
             }
@@ -188,6 +206,9 @@ impl EditorPanel {
             (Self::Folder(draft), EditorField::Folder(FolderField::PortVariable)) => {
                 Some(&mut draft.port_variable)
             }
+            (Self::Folder(draft), EditorField::Folder(FolderField::EnvContents)) => {
+                Some(&mut draft.env_file_contents)
+            }
             (Self::Command(draft), EditorField::Command(CommandField::Label)) => {
                 Some(&mut draft.label)
             }
@@ -216,6 +237,9 @@ impl EditorPanel {
 #[derive(Debug, Clone)]
 pub struct SettingsDraft {
     pub default_terminal: DefaultTerminal,
+    pub mac_terminal_profile: MacTerminalProfile,
+    pub theme: String,
+    pub log_buffer_size: String,
     pub claude_command: String,
     pub codex_command: String,
     pub notification_sound: String,
@@ -232,7 +256,14 @@ pub struct ProjectDraft {
     pub root_path: String,
     pub color: String,
     pub pinned: bool,
+    pub save_log_files: bool,
     pub notes: String,
+    pub scan_entries: Vec<RootScanEntry>,
+    pub selected_folder_paths: BTreeSet<String>,
+    pub selected_scripts: HashMap<String, BTreeSet<String>>,
+    pub selected_port_variables: HashMap<String, Option<String>>,
+    pub scan_message: Option<String>,
+    pub is_scanning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -242,8 +273,17 @@ pub struct FolderDraft {
     pub name: String,
     pub folder_path: String,
     pub env_file_path: String,
+    pub env_file_contents: String,
+    pub env_file_loaded: bool,
     pub port_variable: String,
     pub hidden: bool,
+    pub git_branch: Option<String>,
+    pub dependency_status: Option<DependencyStatus>,
+    pub scan_result: Option<ScanResult>,
+    pub selected_scanned_scripts: BTreeSet<String>,
+    pub selected_scanned_port_variable: Option<String>,
+    pub scan_message: Option<String>,
+    pub is_scanning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -285,13 +325,16 @@ impl EditorField {
     }
 
     pub fn allows_newlines(self) -> bool {
-        matches!(self, Self::Project(ProjectField::Notes))
+        matches!(
+            self,
+            Self::Project(ProjectField::Notes) | Self::Folder(FolderField::EnvContents)
+        )
     }
 
     pub fn is_numeric(self) -> bool {
         matches!(
             self,
-            Self::Settings(SettingsField::TerminalFontSize)
+            Self::Settings(SettingsField::LogBufferSize | SettingsField::TerminalFontSize)
                 | Self::Command(CommandField::Port)
                 | Self::Ssh(SshField::Port)
         )
@@ -300,6 +343,8 @@ impl EditorField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsField {
+    Theme,
+    LogBufferSize,
     ClaudeCommand,
     CodexCommand,
     TerminalFontSize,
@@ -310,6 +355,7 @@ pub enum ProjectField {
     Name,
     RootPath,
     Color,
+    SaveLogFiles,
     Notes,
 }
 
@@ -318,6 +364,7 @@ pub enum FolderField {
     Name,
     FolderPath,
     EnvFilePath,
+    EnvContents,
     PortVariable,
 }
 
@@ -354,6 +401,23 @@ pub enum EditorAction {
     Save,
     Delete,
     Close,
+    PickProjectRoot,
+    ScanProjectRoot,
+    ToggleProjectScanFolder(String),
+    ToggleProjectScanScript {
+        folder_path: String,
+        script_name: String,
+    },
+    SelectProjectPortVariable {
+        folder_path: String,
+        variable: Option<String>,
+    },
+    PickFolderPath,
+    ScanFolderPath,
+    ToggleFolderScanScript(String),
+    SelectFolderPortVariable(Option<String>),
+    LoadFolderEnvFile,
+    OpenFolderExternalTerminal,
     ExportConfig,
     ImportConfigMerge,
     ImportConfigReplace,
@@ -361,11 +425,13 @@ pub enum EditorAction {
     DownloadUpdate,
     InstallUpdate,
     CycleDefaultTerminal,
+    CycleMacTerminalProfile,
     CycleNotificationSound,
     ToggleConfirmOnClose,
     ToggleMinimizeToTray,
     ToggleRestoreSession,
     ToggleProjectPinned,
+    ToggleProjectSaveLogs,
     ToggleFolderHidden,
     ToggleCommandAutoRestart,
     ToggleCommandClearLogs,
@@ -546,6 +612,22 @@ pub fn default_terminal_label(value: DefaultTerminal) -> &'static str {
     }
 }
 
+pub fn next_mac_terminal_profile(current: MacTerminalProfile) -> MacTerminalProfile {
+    match current {
+        MacTerminalProfile::System => MacTerminalProfile::Zsh,
+        MacTerminalProfile::Zsh => MacTerminalProfile::Bash,
+        MacTerminalProfile::Bash => MacTerminalProfile::System,
+    }
+}
+
+pub fn mac_terminal_profile_label(value: MacTerminalProfile) -> &'static str {
+    match value {
+        MacTerminalProfile::System => "system",
+        MacTerminalProfile::Zsh => "zsh",
+        MacTerminalProfile::Bash => "bash",
+    }
+}
+
 pub fn notification_sound_options() -> &'static [&'static str] {
     &[
         "glass", "chord", "glisten", "polite", "calm", "sharp", "jinja", "cloud", "none",
@@ -571,6 +653,7 @@ fn render_settings_panel(
     let on_import_replace = (actions.on_action)(EditorAction::ImportConfigReplace);
     let on_check_updates = (actions.on_action)(EditorAction::CheckForUpdates);
     let on_cycle_terminal = (actions.on_action)(EditorAction::CycleDefaultTerminal);
+    let on_cycle_mac_profile = (actions.on_action)(EditorAction::CycleMacTerminalProfile);
     let on_cycle_sound = (actions.on_action)(EditorAction::CycleNotificationSound);
     let on_download_update = matches!(model.updater.stage, UpdaterStage::UpdateAvailable)
         .then(|| (actions.on_action)(EditorAction::DownloadUpdate));
@@ -589,6 +672,28 @@ fn render_settings_panel(
             default_terminal_label(draft.default_terminal.clone()),
             Some("Cycles through bash, powershell, and cmd"),
             on_cycle_terminal,
+        ))
+        .child(render_choice_row(
+            "macOS terminal profile",
+            mac_terminal_profile_label(draft.mac_terminal_profile.clone()),
+            Some("Cycles through system, zsh, and bash for macOS shell launch"),
+            on_cycle_mac_profile,
+        ))
+        .child(render_text_field(
+            "Theme",
+            "Persisted config theme id. The native shell currently uses the dark palette.",
+            draft.theme.as_str(),
+            EditorField::Settings(SettingsField::Theme),
+            model,
+            actions,
+        ))
+        .child(render_text_field(
+            "Log buffer size",
+            "Numeric terminal scrollback history size",
+            draft.log_buffer_size.as_str(),
+            EditorField::Settings(SettingsField::LogBufferSize),
+            model,
+            actions,
         ))
         .child(render_text_field(
             "Claude command",
@@ -667,6 +772,9 @@ fn render_project_panel(
     actions: &EditorActions<'_>,
 ) -> impl IntoElement {
     let on_toggle_pinned = (actions.on_action)(EditorAction::ToggleProjectPinned);
+    let on_toggle_save_logs = (actions.on_action)(EditorAction::ToggleProjectSaveLogs);
+    let on_pick_root = (actions.on_action)(EditorAction::PickProjectRoot);
+    let on_scan_root = (actions.on_action)(EditorAction::ScanProjectRoot);
 
     div()
         .flex()
@@ -688,6 +796,44 @@ fn render_project_panel(
             model,
             actions,
         ))
+        .children(draft.existing_id.is_none().then(|| {
+            render_choice_row(
+                "Pick root folder",
+                if draft.root_path.is_empty() {
+                    "Choose directory"
+                } else {
+                    draft.root_path.as_str()
+                },
+                Some("Opens the native folder picker for scanner-driven onboarding"),
+                on_pick_root,
+            )
+            .into_any_element()
+        }))
+        .children(draft.existing_id.is_none().then(|| {
+            render_choice_row(
+                "Scan root folder",
+                if draft.is_scanning {
+                    "Scanning..."
+                } else {
+                    "Discover folders, scripts, and env ports"
+                },
+                Some(
+                    "Scans up to three levels deep, skipping node_modules, target, dist, and .git",
+                ),
+                on_scan_root,
+            )
+            .into_any_element()
+        }))
+        .children(
+            draft
+                .scan_message
+                .as_ref()
+                .map(|message| render_notice_row(message.as_str()).into_any_element()),
+        )
+        .children(
+            (draft.existing_id.is_none() && !draft.scan_entries.is_empty())
+                .then(|| render_project_scan_panel(draft, actions).into_any_element()),
+        )
         .child(render_text_field(
             "Color",
             "Optional hex accent like #6366f1",
@@ -704,6 +850,11 @@ fn render_project_panel(
             model,
             actions,
         ))
+        .child(render_toggle_row(
+            "Save log files",
+            draft.save_log_files,
+            on_toggle_save_logs,
+        ))
         .child(render_toggle_row("Pinned", draft.pinned, on_toggle_pinned))
 }
 
@@ -713,6 +864,10 @@ fn render_folder_panel(
     actions: &EditorActions<'_>,
 ) -> impl IntoElement {
     let on_toggle_hidden = (actions.on_action)(EditorAction::ToggleFolderHidden);
+    let on_pick_folder = (actions.on_action)(EditorAction::PickFolderPath);
+    let on_scan_folder = (actions.on_action)(EditorAction::ScanFolderPath);
+    let on_load_env = (actions.on_action)(EditorAction::LoadFolderEnvFile);
+    let on_open_terminal = (actions.on_action)(EditorAction::OpenFolderExternalTerminal);
 
     div()
         .flex()
@@ -734,6 +889,58 @@ fn render_folder_panel(
             model,
             actions,
         ))
+        .child(render_choice_row(
+            "Pick folder",
+            if draft.folder_path.is_empty() {
+                "Choose directory"
+            } else {
+                draft.folder_path.as_str()
+            },
+            Some("Opens the native folder picker and updates the folder path"),
+            on_pick_folder,
+        ))
+        .child(render_choice_row(
+            "Scan folder",
+            if draft.is_scanning {
+                "Scanning..."
+            } else {
+                "Discover scripts and env ports"
+            },
+            Some("Imports package.json/Cargo.toml commands and .env port variables"),
+            on_scan_folder,
+        ))
+        .child(render_choice_row(
+            "Open external terminal",
+            if draft.folder_path.is_empty() {
+                "Pick a folder first"
+            } else {
+                "Open terminal"
+            },
+            Some("Matches the archived app's helper for opening the current folder in a system terminal."),
+            on_open_terminal,
+        ))
+        .children(
+            draft
+                .git_branch
+                .as_ref()
+                .map(|branch| render_info_row("Git branch", branch.as_str(), Some("Read directly from .git/HEAD"))),
+        )
+        .children(draft.dependency_status.as_ref().map(|status| {
+            render_info_row(
+                "Dependencies",
+                status.status.as_str(),
+                Some(status.message.as_str()),
+            )
+        }))
+        .children(
+            draft
+                .scan_message
+                .as_ref()
+                .map(|message| render_notice_row(message.as_str()).into_any_element()),
+        )
+        .children(draft.scan_result.as_ref().map(|scan_result| {
+            render_folder_scan_panel(draft, scan_result, actions).into_any_element()
+        }))
         .child(render_text_field(
             "Env file path",
             "Optional relative .env path",
@@ -742,6 +949,27 @@ fn render_folder_panel(
             model,
             actions,
         ))
+        .child(render_choice_row(
+            "Load env file",
+            if draft.env_file_loaded {
+                "Reload env contents"
+            } else {
+                "Load env contents"
+            },
+            Some("Reads the configured env file so you can edit and save it inline."),
+            on_load_env,
+        ))
+        .children((draft.env_file_loaded || !draft.env_file_contents.is_empty()).then(|| {
+            render_multiline_field(
+                "Env file contents",
+                "Raw .env editor. Comments and blank lines are preserved on save.",
+                draft.env_file_contents.as_str(),
+                EditorField::Folder(FolderField::EnvContents),
+                model,
+                actions,
+            )
+            .into_any_element()
+        }))
         .child(render_text_field(
             "Port variable",
             "Optional env var used to derive a server port",
@@ -1041,6 +1269,298 @@ fn render_toggle_row(
         Some("Click to toggle"),
         on_click,
     )
+}
+
+fn render_notice_row(message: &str) -> impl IntoElement {
+    div()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(rgb(theme::AGENT_ROW_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .text_sm()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(SharedString::from(message.to_string()))
+}
+
+fn render_project_scan_panel(
+    draft: &ProjectDraft,
+    actions: &EditorActions<'_>,
+) -> impl IntoElement {
+    let summary = format!("{} discovered folder(s)", draft.scan_entries.len());
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(render_info_row(
+            "Discovered folders",
+            summary.as_str(),
+            Some(
+                "Toggle folders to include them in the new project. Selected scripts become commands and selected env ports seed folder defaults.",
+            ),
+        ))
+        .children(
+            draft
+                .scan_entries
+                .iter()
+                .map(|entry| render_project_scan_entry(entry, draft, actions).into_any_element()),
+        )
+}
+
+fn render_project_scan_entry(
+    entry: &RootScanEntry,
+    draft: &ProjectDraft,
+    actions: &EditorActions<'_>,
+) -> impl IntoElement {
+    let selected = draft.selected_folder_paths.contains(&entry.path);
+    let selected_scripts = draft.selected_scripts.get(&entry.path);
+    let selected_script_count = selected_scripts.map(|scripts| scripts.len()).unwrap_or(0);
+    let selected_port_variable = draft
+        .selected_port_variables
+        .get(&entry.path)
+        .cloned()
+        .flatten();
+    let detail = format!(
+        "{} | {} script(s) | {} port var(s){}",
+        project_type_label(&entry.project_type),
+        entry.scripts.len(),
+        entry.ports.len(),
+        if entry.has_env { " | env file" } else { "" }
+    );
+    let on_toggle_folder =
+        (actions.on_action)(EditorAction::ToggleProjectScanFolder(entry.path.clone()));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_2()
+        .rounded_md()
+        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SECONDARY))
+        .child(render_selection_row(
+            entry.name.clone(),
+            Some(detail),
+            selected,
+            on_toggle_folder,
+        ))
+        .children((!entry.scripts.is_empty()).then(|| {
+            let script_summary = format!("{selected_script_count} selected");
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(SharedString::from(format!("Scripts ({script_summary})"))),
+                )
+                .children(entry.scripts.iter().map(|script| {
+                    let is_selected = selected_scripts
+                        .map(|scripts| scripts.contains(&script.name))
+                        .unwrap_or(false);
+                    let on_toggle_script =
+                        (actions.on_action)(EditorAction::ToggleProjectScanScript {
+                            folder_path: entry.path.clone(),
+                            script_name: script.name.clone(),
+                        });
+                    render_selection_row(
+                        script.name.clone(),
+                        Some(script.command.clone()),
+                        is_selected,
+                        on_toggle_script,
+                    )
+                    .into_any_element()
+                }))
+                .into_any_element()
+        }))
+        .children((!entry.ports.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child("Port variable"),
+                )
+                .child(render_selection_row(
+                    "None".to_string(),
+                    Some("Leave the folder without a default port variable".to_string()),
+                    selected_port_variable.is_none(),
+                    (actions.on_action)(EditorAction::SelectProjectPortVariable {
+                        folder_path: entry.path.clone(),
+                        variable: None,
+                    }),
+                ))
+                .children(entry.ports.iter().map(|port| {
+                    let on_select_port =
+                        (actions.on_action)(EditorAction::SelectProjectPortVariable {
+                            folder_path: entry.path.clone(),
+                            variable: Some(port.variable.clone()),
+                        });
+                    render_selection_row(
+                        format!("{} = {}", port.variable, port.port),
+                        Some(port.source.clone()),
+                        selected_port_variable.as_deref() == Some(port.variable.as_str()),
+                        on_select_port,
+                    )
+                    .into_any_element()
+                }))
+                .into_any_element()
+        }))
+}
+
+fn render_folder_scan_panel(
+    draft: &FolderDraft,
+    scan_result: &ScanResult,
+    actions: &EditorActions<'_>,
+) -> impl IntoElement {
+    let script_summary = format!(
+        "{} discovered script(s), {} selected",
+        scan_result.scripts.len(),
+        draft.selected_scanned_scripts.len()
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(render_info_row(
+            "Scan results",
+            script_summary.as_str(),
+            Some("Selected scripts will be created for new folders and merged into existing folders when they are not already present."),
+        ))
+        .children((!scan_result.scripts.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child("Scripts"),
+                )
+                .children(scan_result.scripts.iter().map(|script| {
+                    let on_toggle_script =
+                        (actions.on_action)(EditorAction::ToggleFolderScanScript(script.name.clone()));
+                    render_selection_row(
+                        script.name.clone(),
+                        Some(script.command.clone()),
+                        draft.selected_scanned_scripts.contains(&script.name),
+                        on_toggle_script,
+                    )
+                    .into_any_element()
+                }))
+                .into_any_element()
+        }))
+        .children((!scan_result.ports.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child("Port variable"),
+                )
+                .child(render_selection_row(
+                    "None".to_string(),
+                    Some("Do not bind a default port variable".to_string()),
+                    draft.selected_scanned_port_variable.is_none(),
+                    (actions.on_action)(EditorAction::SelectFolderPortVariable(None)),
+                ))
+                .children(scan_result.ports.iter().map(|port| {
+                    let on_select_port =
+                        (actions.on_action)(EditorAction::SelectFolderPortVariable(Some(
+                            port.variable.clone(),
+                        )));
+                    render_selection_row(
+                        format!("{} = {}", port.variable, port.port),
+                        Some(port.source.clone()),
+                        draft.selected_scanned_port_variable.as_deref()
+                            == Some(port.variable.as_str()),
+                        on_select_port,
+                    )
+                    .into_any_element()
+                }))
+                .into_any_element()
+        }))
+}
+
+fn render_selection_row(
+    label: String,
+    detail: Option<String>,
+    selected: bool,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(rgb(if selected {
+            theme::PROJECT_ROW_BG
+        } else {
+            theme::PANEL_BG
+        }))
+        .border_1()
+        .border_color(rgb(if selected {
+            theme::AI_DOT
+        } else {
+            theme::BORDER_SECONDARY
+        }))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(label)),
+                        )
+                        .children(detail.map(|detail| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(detail))
+                        })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if selected {
+                            theme::AI_DOT
+                        } else {
+                            theme::TEXT_MUTED
+                        }))
+                        .child(if selected { "selected" } else { "available" }),
+                ),
+        )
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn project_type_label(value: &str) -> &'static str {
+    match value {
+        "rust" => "Rust",
+        "both" => "Node + Rust",
+        _ => "Node",
+    }
 }
 
 fn render_updater_panel(

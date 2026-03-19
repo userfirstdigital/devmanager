@@ -365,7 +365,7 @@ fn session_status_label(session: &TerminalSessionView) -> &'static str {
 
     match session.runtime.status {
         SessionStatus::Starting => "starting",
-        SessionStatus::Running => "running",
+        SessionStatus::Running => "Live Terminal",
         SessionStatus::Stopping => "stopping",
         SessionStatus::Crashed => "crashed",
         SessionStatus::Exited => "exited",
@@ -383,7 +383,7 @@ fn session_status_color(session: &TerminalSessionView) -> u32 {
     }
 
     match session.runtime.status {
-        SessionStatus::Running => theme::SUCCESS_TEXT,
+        SessionStatus::Running => theme::TEXT_SUBTLE,
         SessionStatus::Starting | SessionStatus::Stopping => theme::WARNING_TEXT,
         SessionStatus::Crashed | SessionStatus::Failed => theme::DANGER_TEXT,
         _ => theme::TEXT_MUTED,

@@ -107,6 +107,7 @@ pub struct ServerLaunchSpec {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub auto_restart: bool,
+    pub log_file_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

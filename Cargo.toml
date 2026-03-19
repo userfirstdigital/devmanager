@@ -11,11 +11,13 @@ cargo-packager-updater = "0.2.3"
 dirs = "6.0.0"
 gpui = "0.2.2"
 portable-pty = "0.9.0"
+regex = "1.12.3"
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sysinfo = "0.38.4"
 time = { version = "0.3.47", features = ["formatting", "local-offset"] }
+toml = "1.0.7"
 
 [package.metadata.packager]
 product-name = "DevManager"

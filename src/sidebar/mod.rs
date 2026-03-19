@@ -1,13 +1,13 @@
 use crate::models::SessionTab;
 use crate::state::{AppState, RuntimeState, SessionRuntimeState, SessionStatus};
-use crate::theme;
+use crate::{icons, theme};
 use gpui::{
     div, px, rgb, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, Styled, Window,
 };
 
-const SIDEBAR_WIDTH_PX: f32 = 124.0;
-const SIDEBAR_COLLAPSED_WIDTH_PX: f32 = 34.0;
+const SIDEBAR_WIDTH_PX: f32 = 220.0;
+const SIDEBAR_COLLAPSED_WIDTH_PX: f32 = 40.0;
 
 pub struct SidebarActions<'a> {
     pub on_open_settings: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -252,6 +252,7 @@ fn render_project_group(
                         .flex()
                         .items_center()
                         .gap(px(5.0))
+                        .child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child("▾"))
                         .child(div().size(px(6.0)).rounded_full().bg(rgb(project_accent)))
                         .child(
                             div()
@@ -282,12 +283,16 @@ fn render_project_group(
                 .gap(px(5.0))
                 .pl_4()
                 .text_xs()
-                .child(accent_text_action(
+                .child(icon_text_action(
+                    icons::SPARKLES,
+                    10.0,
                     "+ Claude",
                     theme::AI_DOT,
                     (actions.on_launch_claude)(project.id.clone()),
                 ))
-                .child(accent_text_action(
+                .child(icon_text_action(
+                    icons::BOT,
+                    10.0,
                     "+ Codex",
                     theme::SUCCESS_TEXT,
                     (actions.on_launch_codex)(project.id.clone()),
@@ -345,7 +350,19 @@ fn render_ai_row(
                     MouseButton::Left,
                     (actions.on_select_ai_tab)(tab.id.clone()),
                 )
-                .child(div().size(px(6.0)).rounded_full().bg(rgb(status_color)))
+                .child(match tab.tab_type {
+                    crate::models::TabType::Claude => {
+                        icons::app_icon(icons::SPARKLES, 10.0, status_color).into_any_element()
+                    }
+                    crate::models::TabType::Codex => {
+                        icons::app_icon(icons::BOT, 10.0, status_color).into_any_element()
+                    }
+                    _ => div()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(rgb(status_color))
+                        .into_any_element(),
+                })
                 .child(
                     div()
                         .text_xs()
@@ -383,7 +400,19 @@ fn render_folder_group(
     project: &crate::models::Project,
     folder: &crate::models::ProjectFolder,
     actions: &SidebarActions<'_>,
-) -> impl IntoElement {
+) -> AnyElement {
+    if folder.commands.len() == 1 {
+        return render_single_command_folder_row(
+            state,
+            runtime,
+            project,
+            folder,
+            &folder.commands[0],
+            actions,
+        )
+        .into_any_element();
+    }
+
     let command_rows = folder
         .commands
         .iter()
@@ -404,9 +433,16 @@ fn render_folder_group(
                 .py(px(3.0))
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(SharedString::from(folder.name.clone())),
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(icons::app_icon(icons::FOLDER, 10.0, theme::TEXT_SUBTLE))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(SharedString::from(folder.name.clone())),
+                        ),
                 )
                 .child(
                     div()
@@ -430,6 +466,85 @@ fn render_folder_group(
                 .then(|| empty_state_with_indent("No commands configured.", 12.0)),
         )
         .children(command_rows)
+        .into_any_element()
+}
+
+fn render_single_command_folder_row(
+    state: &AppState,
+    runtime: &RuntimeState,
+    project: &crate::models::Project,
+    folder: &crate::models::ProjectFolder,
+    command: &crate::models::RunCommand,
+    actions: &SidebarActions<'_>,
+) -> impl IntoElement {
+    let session = runtime.sessions.get(&command.id);
+    let status = session
+        .map(|session| session.status)
+        .unwrap_or(SessionStatus::Stopped);
+    let is_active = state.active_tab_id.as_deref() == Some(command.id.as_str());
+
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(4.0))
+        .pl_4()
+        .pr_2()
+        .py(px(2.0))
+        .bg(rgb(if is_active {
+            theme::PROJECT_ROW_BG
+        } else {
+            theme::SIDEBAR_BG
+        }))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    (actions.on_select_server_tab)(command.id.clone()),
+                )
+                .child(icons::app_icon(icons::FOLDER, 10.0, theme::TEXT_SUBTLE))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(SharedString::from(folder.name.clone())),
+                )
+                .children(command.port.map(|port| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_DIM))
+                        .child(SharedString::from(format!(":{port}")))
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(status_color(status)))
+                        .child(status_label(status)),
+                )
+                .children(
+                    (!status.is_live()).then(|| {
+                        row_icon_action("▶", (actions.on_start_server)(command.id.clone()))
+                    }),
+                )
+                .children(
+                    status.is_live().then(|| {
+                        row_icon_action("■", (actions.on_stop_server)(command.id.clone()))
+                    }),
+                )
+                .child(row_icon_action(
+                    "⋯",
+                    (actions.on_edit_folder)(project.id.clone(), folder.id.clone()),
+                )),
+        )
 }
 
 fn render_command_row(
@@ -577,7 +692,7 @@ fn render_ssh_row(
                     MouseButton::Left,
                     (actions.on_open_ssh_tab)(connection.id.clone()),
                 )
-                .child(div().size(px(6.0)).rounded_full().bg(rgb(color)))
+                .child(icons::app_icon(icons::TERMINAL, 10.0, color))
                 .child(
                     div()
                         .flex()
@@ -669,6 +784,27 @@ fn accent_text_action(
         .on_mouse_down(MouseButton::Left, on_click)
 }
 
+fn icon_text_action(
+    icon_path: &'static str,
+    icon_size_px: f32,
+    label: &str,
+    color: u32,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(3.0))
+        .child(icons::app_icon(icon_path, icon_size_px, color))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(color))
+                .child(SharedString::from(label.to_string())),
+        )
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
 fn primary_button(
     label: &str,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -709,14 +845,6 @@ fn empty_state_with_indent(message: &str, indent_px: f32) -> impl IntoElement {
         .text_xs()
         .text_color(rgb(theme::TEXT_SUBTLE))
         .child(SharedString::from(message.to_string()))
-}
-
-fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
 }
 
 fn status_label(status: SessionStatus) -> &'static str {

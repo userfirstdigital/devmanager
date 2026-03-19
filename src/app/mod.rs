@@ -1,7 +1,13 @@
 mod chrome;
 
-use crate::models::{AppConfig, Project, ProjectFolder, RunCommand, SSHConnection, TabType};
-use crate::services::{pid_file, ConfigImportMode, ProcessManager, SessionManager};
+use crate::assets::AppAssets;
+use crate::models::{
+    AppConfig, DependencyStatus, Project, ProjectFolder, RunCommand, SSHConnection, TabType,
+};
+use crate::services::{
+    env_service, pid_file, platform_service, scanner_service, ConfigImportMode, ProcessManager,
+    SessionManager,
+};
 use crate::sidebar;
 use crate::state::{AppState, SessionDimensions};
 use crate::terminal::view;
@@ -17,6 +23,7 @@ use gpui::{
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Window,
     WindowBounds, WindowOptions,
 };
+use rfd::FileDialog;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -33,22 +40,24 @@ const FOOTER_HEIGHT_PX: f32 = 0.0;
 static EDITOR_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub fn run() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1440.0), px(920.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("DevManager".into()),
+    Application::new()
+        .with_assets(AppAssets::new())
+        .run(|cx: &mut App| {
+            let bounds = Bounds::centered(None, size(px(1440.0), px(920.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("DevManager".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(NativeShell::new),
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+                },
+                |_, cx| cx.new(NativeShell::new),
+            )
+            .unwrap();
+            cx.activate(true);
+        });
 }
 
 struct NativeShell {
@@ -112,6 +121,7 @@ impl NativeShell {
         };
         let process_manager = ProcessManager::new();
         process_manager.set_notification_sound(state.config.settings.notification_sound.clone());
+        process_manager.set_log_buffer_size(state.config.settings.log_buffer_size as usize);
         let updater = UpdaterService::new();
         let mut terminal_notice = None;
         let restore_enabled = state
@@ -127,12 +137,17 @@ impl NativeShell {
             state.active_tab_id = None;
         } else {
             let recovered = process_manager.reconcile_saved_server_tabs(&mut state);
+            let restored_servers =
+                process_manager.restore_saved_server_tabs(&mut state, SessionDimensions::default());
             let ai_restore =
                 process_manager.restore_ai_tabs(&mut state, SessionDimensions::default());
             let ssh_restore = process_manager.restore_ssh_tabs(&mut state);
             let mut restore_notes = Vec::new();
             if recovered > 0 {
                 restore_notes.push(format!("recovered {recovered} server tab(s)"));
+            }
+            if restored_servers > 0 {
+                restore_notes.push(format!("restarted {restored_servers} server tab(s)"));
             }
             if ai_restore.relaunched > 0 {
                 restore_notes.push(format!("relaunched {} AI tab(s)", ai_restore.relaunched));
@@ -252,6 +267,8 @@ impl NativeShell {
         } else {
             self.process_manager
                 .set_notification_sound(self.state.config.settings.notification_sound.clone());
+            self.process_manager
+                .set_log_buffer_size(self.state.config.settings.log_buffer_size as usize);
         }
     }
 
@@ -591,6 +608,9 @@ impl NativeShell {
         self.open_editor(
             EditorPanel::Settings(SettingsDraft {
                 default_terminal: settings.default_terminal,
+                mac_terminal_profile: settings.mac_terminal_profile.unwrap_or_default(),
+                theme: settings.theme,
+                log_buffer_size: settings.log_buffer_size.to_string(),
                 claude_command: settings.claude_command.unwrap_or_default(),
                 codex_command: settings.codex_command.unwrap_or_default(),
                 notification_sound: settings
@@ -616,7 +636,14 @@ impl NativeShell {
                 root_path: String::new(),
                 color: String::new(),
                 pinned: false,
+                save_log_files: true,
                 notes: String::new(),
+                scan_entries: Vec::new(),
+                selected_folder_paths: Default::default(),
+                selected_scripts: Default::default(),
+                selected_port_variables: Default::default(),
+                scan_message: None,
+                is_scanning: false,
             }),
             cx,
         );
@@ -631,7 +658,14 @@ impl NativeShell {
                     root_path: project.root_path,
                     color: project.color.unwrap_or_default(),
                     pinned: project.pinned.unwrap_or(false),
+                    save_log_files: project.save_log_files.unwrap_or(true),
                     notes: project.notes.unwrap_or_default(),
+                    scan_entries: Vec::new(),
+                    selected_folder_paths: Default::default(),
+                    selected_scripts: Default::default(),
+                    selected_port_variables: Default::default(),
+                    scan_message: None,
+                    is_scanning: false,
                 }),
                 cx,
             );
@@ -650,7 +684,14 @@ impl NativeShell {
                     root_path: project.root_path,
                     color: project.color.unwrap_or_default(),
                     pinned: project.pinned.unwrap_or(false),
+                    save_log_files: project.save_log_files.unwrap_or(true),
                     notes: project.notes.unwrap_or_default(),
+                    scan_entries: Vec::new(),
+                    selected_folder_paths: Default::default(),
+                    selected_scripts: Default::default(),
+                    selected_port_variables: Default::default(),
+                    scan_message: None,
+                    is_scanning: false,
                 }),
                 EditorField::Project(workspace::ProjectField::Notes),
                 cx,
@@ -667,15 +708,34 @@ impl NativeShell {
             .find_project(project_id)
             .map(|project| project.root_path.clone())
             .unwrap_or_default();
+        let default_env_file_path =
+            scanner_service::default_env_file_for_dir(std::path::Path::new(&root_path))
+                .unwrap_or_default();
+        let env_file_contents = if default_env_file_path.is_empty() {
+            None
+        } else {
+            load_folder_env_contents(&root_path, &default_env_file_path)
+        };
+        let env_file_loaded = env_file_contents.is_some();
+        let (git_branch, dependency_status) = inspect_folder_runtime_metadata(&root_path);
         self.open_editor(
             EditorPanel::Folder(FolderDraft {
                 project_id: project_id.to_string(),
                 existing_id: None,
                 name: String::new(),
                 folder_path: root_path,
-                env_file_path: String::new(),
+                env_file_path: default_env_file_path,
+                env_file_contents: env_file_contents.unwrap_or_default(),
+                env_file_loaded,
                 port_variable: String::new(),
                 hidden: false,
+                git_branch,
+                dependency_status,
+                scan_result: None,
+                selected_scanned_scripts: Default::default(),
+                selected_scanned_port_variable: None,
+                scan_message: None,
+                is_scanning: false,
             }),
             cx,
         );
@@ -688,20 +748,391 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         if let Some(lookup) = self.state.find_folder(project_id, folder_id) {
+            let env_file_path = lookup.folder.env_file_path.clone().unwrap_or_default();
+            let env_file_contents = if env_file_path.is_empty() {
+                None
+            } else {
+                load_folder_env_contents(&lookup.folder.folder_path, &env_file_path)
+            };
+            let (git_branch, dependency_status) =
+                inspect_folder_runtime_metadata(&lookup.folder.folder_path);
             self.open_editor(
                 EditorPanel::Folder(FolderDraft {
                     project_id: lookup.project.id.clone(),
                     existing_id: Some(lookup.folder.id.clone()),
                     name: lookup.folder.name.clone(),
                     folder_path: lookup.folder.folder_path.clone(),
-                    env_file_path: lookup.folder.env_file_path.clone().unwrap_or_default(),
+                    env_file_path,
+                    env_file_contents: env_file_contents.clone().unwrap_or_default(),
+                    env_file_loaded: env_file_contents.is_some(),
                     port_variable: lookup.folder.port_variable.clone().unwrap_or_default(),
                     hidden: lookup.folder.hidden.unwrap_or(false),
+                    git_branch,
+                    dependency_status,
+                    scan_result: None,
+                    selected_scanned_scripts: Default::default(),
+                    selected_scanned_port_variable: lookup.folder.port_variable.clone(),
+                    scan_message: None,
+                    is_scanning: false,
                 }),
                 cx,
             );
         } else {
             self.editor_notice = Some(format!("Unknown folder `{folder_id}`"));
+            cx.notify();
+        }
+    }
+
+    fn pick_project_root_action(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = FileDialog::new().pick_folder() else {
+            return;
+        };
+        let root_path = path.to_string_lossy().to_string();
+        let default_name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
+            draft.root_path = root_path.clone();
+            if draft.name.trim().is_empty() {
+                draft.name = default_name;
+            }
+            draft.scan_message = Some(format!("Picked root folder `{root_path}`"));
+            cx.notify();
+        }
+    }
+
+    fn scan_project_root_action(&mut self, cx: &mut Context<Self>) {
+        let root_path = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Project(draft)) if !draft.root_path.trim().is_empty() => {
+                draft.root_path.trim().to_string()
+            }
+            _ => {
+                self.editor_notice =
+                    Some("Choose a project root path before scanning.".to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
+            draft.is_scanning = true;
+            draft.scan_message = Some(format!("Scanning `{root_path}`..."));
+        }
+        cx.notify();
+
+        let scan_result = scanner_service::scan_root(&root_path);
+        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
+            draft.is_scanning = false;
+            match scan_result {
+                Ok(entries) => {
+                    let mut selected_folder_paths = std::collections::BTreeSet::new();
+                    let mut selected_scripts = HashMap::new();
+                    let mut selected_port_variables = HashMap::new();
+
+                    for entry in &entries {
+                        selected_folder_paths.insert(entry.path.clone());
+                        selected_scripts.insert(
+                            entry.path.clone(),
+                            scanner_service::auto_selected_script_names(&entry.scripts)
+                                .into_iter()
+                                .collect(),
+                        );
+                        selected_port_variables.insert(
+                            entry.path.clone(),
+                            scanner_service::auto_selected_port_variable(&entry.ports),
+                        );
+                    }
+
+                    let count = entries.len();
+                    draft.scan_entries = entries;
+                    draft.selected_folder_paths = selected_folder_paths;
+                    draft.selected_scripts = selected_scripts;
+                    draft.selected_port_variables = selected_port_variables;
+                    draft.scan_message = Some(if count == 0 {
+                        "No sub-folders with package.json or Cargo.toml were found. You can still create the project and add folders manually.".to_string()
+                    } else {
+                        format!(
+                            "Discovered {count} folder(s). Default dev/start/serve scripts were pre-selected."
+                        )
+                    });
+                }
+                Err(error) => {
+                    draft.scan_entries.clear();
+                    draft.selected_folder_paths.clear();
+                    draft.selected_scripts.clear();
+                    draft.selected_port_variables.clear();
+                    draft.scan_message = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_project_scan_folder_action(&mut self, folder_path: &str, cx: &mut Context<Self>) {
+        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
+            if draft.selected_folder_paths.contains(folder_path) {
+                draft.selected_folder_paths.remove(folder_path);
+            } else {
+                draft.selected_folder_paths.insert(folder_path.to_string());
+            }
+            cx.notify();
+        }
+    }
+
+    fn toggle_project_scan_script_action(
+        &mut self,
+        folder_path: &str,
+        script_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
+            let entry = draft
+                .selected_scripts
+                .entry(folder_path.to_string())
+                .or_default();
+            if entry.contains(script_name) {
+                entry.remove(script_name);
+            } else {
+                entry.insert(script_name.to_string());
+            }
+            cx.notify();
+        }
+    }
+
+    fn select_project_port_variable_action(
+        &mut self,
+        folder_path: &str,
+        variable: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
+            draft
+                .selected_port_variables
+                .insert(folder_path.to_string(), variable);
+            cx.notify();
+        }
+    }
+
+    fn pick_folder_path_action(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = FileDialog::new().pick_folder() else {
+            return;
+        };
+        let folder_path = path.to_string_lossy().to_string();
+        let default_name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+            draft.folder_path = folder_path.clone();
+            if draft.name.trim().is_empty() {
+                draft.name = default_name;
+            }
+            if draft.env_file_path.trim().is_empty() {
+                draft.env_file_path =
+                    scanner_service::default_env_file_for_dir(std::path::Path::new(&folder_path))
+                        .unwrap_or_default();
+            }
+            let (git_branch, dependency_status) = inspect_folder_runtime_metadata(&folder_path);
+            draft.git_branch = git_branch;
+            draft.dependency_status = dependency_status;
+            if !draft.env_file_path.trim().is_empty() {
+                draft.env_file_contents =
+                    load_folder_env_contents(&folder_path, &draft.env_file_path)
+                        .unwrap_or_default();
+                draft.env_file_loaded = true;
+            } else {
+                draft.env_file_contents.clear();
+                draft.env_file_loaded = false;
+            }
+            draft.scan_message = Some(format!("Picked folder `{folder_path}`"));
+            cx.notify();
+        }
+    }
+
+    fn scan_folder_path_action(&mut self, cx: &mut Context<Self>) {
+        let (project_id, existing_id, folder_path) = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Folder(draft)) if !draft.folder_path.trim().is_empty() => (
+                draft.project_id.clone(),
+                draft.existing_id.clone(),
+                draft.folder_path.trim().to_string(),
+            ),
+            _ => {
+                self.editor_notice = Some("Choose a folder path before scanning.".to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+            draft.is_scanning = true;
+            draft.scan_message = Some(format!("Scanning `{folder_path}`..."));
+        }
+        cx.notify();
+
+        let existing_labels: std::collections::BTreeSet<String> = existing_id
+            .as_deref()
+            .and_then(|folder_id| self.state.find_folder(&project_id, folder_id))
+            .map(|lookup| {
+                lookup
+                    .folder
+                    .commands
+                    .iter()
+                    .map(|command| command.label.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let scan_result = scanner_service::scan_project(&folder_path);
+        if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+            draft.is_scanning = false;
+            let (git_branch, dependency_status) = inspect_folder_runtime_metadata(&folder_path);
+            draft.git_branch = git_branch;
+            draft.dependency_status = dependency_status;
+            match scan_result {
+                Ok(scan) => {
+                    let selected_scripts: std::collections::BTreeSet<String> =
+                        scanner_service::auto_selected_script_names(&scan.scripts)
+                            .into_iter()
+                            .filter(|name| !existing_labels.contains(name))
+                            .collect();
+                    let selected_port_variable =
+                        scanner_service::auto_selected_port_variable(&scan.ports);
+                    if draft.env_file_path.trim().is_empty() {
+                        draft.env_file_path = scanner_service::default_env_file_for_dir(
+                            std::path::Path::new(&folder_path),
+                        )
+                        .unwrap_or_default();
+                    }
+                    if !draft.env_file_path.trim().is_empty() {
+                        draft.env_file_contents =
+                            load_folder_env_contents(&folder_path, &draft.env_file_path)
+                                .unwrap_or_default();
+                        draft.env_file_loaded = true;
+                    }
+                    if let Some(variable) = selected_port_variable.clone() {
+                        draft.port_variable = variable.clone();
+                    }
+
+                    let scan_message = if scan.scripts.is_empty()
+                        && !scan.has_package_json
+                        && !scan.has_cargo_toml
+                    {
+                        "No package.json or Cargo.toml was found in this folder.".to_string()
+                    } else {
+                        format!(
+                            "Discovered {} script(s) and {} env port variable(s).",
+                            scan.scripts.len(),
+                            scan.ports.len()
+                        )
+                    };
+
+                    draft.scan_result = Some(scan);
+                    draft.selected_scanned_scripts = selected_scripts;
+                    draft.selected_scanned_port_variable = selected_port_variable;
+                    draft.scan_message = Some(scan_message);
+                }
+                Err(error) => {
+                    draft.scan_result = None;
+                    draft.selected_scanned_scripts.clear();
+                    draft.selected_scanned_port_variable = None;
+                    draft.scan_message = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn load_folder_env_file_action(&mut self, cx: &mut Context<Self>) {
+        let (folder_path, env_file_path) = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Folder(draft))
+                if !draft.folder_path.trim().is_empty()
+                    && !draft.env_file_path.trim().is_empty() =>
+            {
+                (
+                    draft.folder_path.trim().to_string(),
+                    draft.env_file_path.trim().to_string(),
+                )
+            }
+            _ => {
+                self.editor_notice = Some(
+                    "Set both folder path and env file path before loading env contents."
+                        .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        };
+
+        match load_folder_env_contents(&folder_path, &env_file_path) {
+            Some(contents) => {
+                if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+                    draft.env_file_contents = contents;
+                    draft.env_file_loaded = true;
+                    draft.scan_message = Some("Loaded env file contents.".to_string());
+                }
+            }
+            None => {
+                if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+                    draft.env_file_contents.clear();
+                    draft.env_file_loaded = true;
+                    draft.scan_message = Some(
+                        "Env file does not exist yet. Saving the folder will create it."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_folder_external_terminal_action(&mut self, cx: &mut Context<Self>) {
+        let folder_path = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Folder(draft)) if !draft.folder_path.trim().is_empty() => {
+                draft.folder_path.trim().to_string()
+            }
+            _ => {
+                self.editor_notice =
+                    Some("Set a folder path before opening a terminal.".to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        match platform_service::open_terminal(&folder_path, None) {
+            Ok(()) => {
+                self.editor_notice = Some("Opened external terminal.".to_string());
+            }
+            Err(error) => {
+                self.editor_notice = Some(error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_folder_scan_script_action(&mut self, script_name: &str, cx: &mut Context<Self>) {
+        if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+            if draft.selected_scanned_scripts.contains(script_name) {
+                draft.selected_scanned_scripts.remove(script_name);
+            } else {
+                draft
+                    .selected_scanned_scripts
+                    .insert(script_name.to_string());
+            }
+            cx.notify();
+        }
+    }
+
+    fn select_folder_port_variable_action(
+        &mut self,
+        variable: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+            draft.port_variable = variable.clone().unwrap_or_default();
+            draft.selected_scanned_port_variable = variable;
             cx.notify();
         }
     }
@@ -796,6 +1227,20 @@ impl NativeShell {
 
         let mut settings = self.state.settings().clone();
         settings.default_terminal = draft.default_terminal.clone();
+        settings.mac_terminal_profile = Some(draft.mac_terminal_profile.clone());
+        settings.theme = if draft.theme.trim().is_empty() {
+            "dark".to_string()
+        } else {
+            draft.theme.trim().to_string()
+        };
+        settings.log_buffer_size = match parse_optional_u32(&draft.log_buffer_size) {
+            Ok(value) => value.unwrap_or(10_000),
+            Err(error) => {
+                self.editor_notice = Some(error);
+                cx.notify();
+                return;
+            }
+        };
         settings.claude_command = normalize_optional_string(&draft.claude_command);
         settings.codex_command = normalize_optional_string(&draft.codex_command);
         settings.notification_sound = Some(if draft.notification_sound.trim().is_empty() {
@@ -816,6 +1261,8 @@ impl NativeShell {
         };
 
         self.state.update_settings(settings);
+        self.process_manager
+            .set_log_buffer_size(self.state.settings().log_buffer_size as usize);
         self.save_config_state();
         self.last_dimensions = None;
         self.editor_notice = Some("Settings saved".to_string());
@@ -859,11 +1306,11 @@ impl NativeShell {
                     folders: existing
                         .as_ref()
                         .map(|project| project.folders.clone())
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| build_project_folders_from_scan(&draft)),
                     color: normalize_optional_string(&draft.color),
                     pinned: Some(draft.pinned),
                     notes: normalize_optional_string(&draft.notes),
-                    save_log_files: existing.as_ref().and_then(|project| project.save_log_files),
+                    save_log_files: Some(draft.save_log_files),
                     created_at: existing
                         .as_ref()
                         .map(|project| project.created_at.clone())
@@ -892,6 +1339,17 @@ impl NativeShell {
                     .as_deref()
                     .and_then(|folder_id| self.state.find_folder(&draft.project_id, folder_id))
                     .map(|lookup| lookup.folder.clone());
+                if draft.env_file_loaded && !draft.env_file_path.trim().is_empty() {
+                    let env_file_path = std::path::Path::new(draft.folder_path.trim())
+                        .join(draft.env_file_path.trim());
+                    if let Err(error) =
+                        env_service::write_env_text(&env_file_path, &draft.env_file_contents)
+                    {
+                        self.editor_notice = Some(error);
+                        cx.notify();
+                        return;
+                    }
+                }
                 let folder = ProjectFolder {
                     id: draft
                         .existing_id
@@ -899,10 +1357,7 @@ impl NativeShell {
                         .unwrap_or_else(|| next_entity_id("folder")),
                     name: draft.name.trim().to_string(),
                     folder_path: draft.folder_path.trim().to_string(),
-                    commands: existing
-                        .as_ref()
-                        .map(|folder| folder.commands.clone())
-                        .unwrap_or_default(),
+                    commands: build_folder_commands_from_scan(&draft, existing.as_ref()),
                     env_file_path: normalize_optional_string(&draft.env_file_path),
                     port_variable: normalize_optional_string(&draft.port_variable),
                     hidden: Some(draft.hidden),
@@ -1239,6 +1694,31 @@ impl NativeShell {
             EditorAction::Save => self.save_editor_action(cx),
             EditorAction::Delete => self.delete_editor_action(cx),
             EditorAction::Close => self.close_editor(cx),
+            EditorAction::PickProjectRoot => self.pick_project_root_action(cx),
+            EditorAction::ScanProjectRoot => self.scan_project_root_action(cx),
+            EditorAction::ToggleProjectScanFolder(folder_path) => {
+                self.toggle_project_scan_folder_action(&folder_path, cx)
+            }
+            EditorAction::ToggleProjectScanScript {
+                folder_path,
+                script_name,
+            } => self.toggle_project_scan_script_action(&folder_path, &script_name, cx),
+            EditorAction::SelectProjectPortVariable {
+                folder_path,
+                variable,
+            } => self.select_project_port_variable_action(&folder_path, variable, cx),
+            EditorAction::PickFolderPath => self.pick_folder_path_action(cx),
+            EditorAction::ScanFolderPath => self.scan_folder_path_action(cx),
+            EditorAction::ToggleFolderScanScript(script_name) => {
+                self.toggle_folder_scan_script_action(&script_name, cx)
+            }
+            EditorAction::SelectFolderPortVariable(variable) => {
+                self.select_folder_port_variable_action(variable, cx)
+            }
+            EditorAction::LoadFolderEnvFile => self.load_folder_env_file_action(cx),
+            EditorAction::OpenFolderExternalTerminal => {
+                self.open_folder_external_terminal_action(cx)
+            }
             EditorAction::ExportConfig => self.export_config_action(cx),
             EditorAction::ImportConfigMerge => {
                 self.import_config_action(ConfigImportMode::Merge, cx)
@@ -1253,6 +1733,13 @@ impl NativeShell {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.default_terminal =
                         workspace::next_default_terminal(draft.default_terminal.clone());
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::CycleMacTerminalProfile => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.mac_terminal_profile =
+                        workspace::next_mac_terminal_profile(draft.mac_terminal_profile.clone());
                     self.apply_settings_draft(cx);
                 }
             }
@@ -1284,6 +1771,12 @@ impl NativeShell {
             EditorAction::ToggleProjectPinned => {
                 if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
                     draft.pinned = !draft.pinned;
+                    cx.notify();
+                }
+            }
+            EditorAction::ToggleProjectSaveLogs => {
+                if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
+                    draft.save_log_files = !draft.save_log_files;
                     cx.notify();
                 }
             }
@@ -2580,6 +3073,18 @@ fn parse_optional_u16(value: &str) -> Result<Option<u16>, String> {
         .map_err(|_| format!("`{trimmed}` is not a valid number"))
 }
 
+fn parse_optional_u32(value: &str) -> Result<Option<u32>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("`{trimmed}` is not a valid number"))
+}
+
 fn parse_args_text(value: &str) -> Vec<String> {
     value
         .split_whitespace()
@@ -2635,6 +3140,120 @@ fn next_entity_id(prefix: &str) -> String {
         .as_millis();
     let counter = EDITOR_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{millis:x}-{counter:x}")
+}
+
+fn build_project_folders_from_scan(draft: &ProjectDraft) -> Vec<ProjectFolder> {
+    draft
+        .scan_entries
+        .iter()
+        .map(|entry| {
+            let selected_names = draft
+                .selected_scripts
+                .get(&entry.path)
+                .cloned()
+                .unwrap_or_default();
+            let selected_port_variable = draft
+                .selected_port_variables
+                .get(&entry.path)
+                .cloned()
+                .flatten();
+            let selected_port =
+                scanner_service::port_for_variable(&entry.ports, selected_port_variable.as_deref());
+            let commands = entry
+                .scripts
+                .iter()
+                .filter(|script| selected_names.contains(&script.name))
+                .map(|script| {
+                    scanner_service::build_run_command_from_scanned_script(
+                        script,
+                        next_entity_id("command"),
+                        selected_port,
+                    )
+                })
+                .collect();
+
+            ProjectFolder {
+                id: next_entity_id("folder"),
+                name: entry.name.clone(),
+                folder_path: entry.path.clone(),
+                commands,
+                env_file_path: scanner_service::default_env_file_for_dir(std::path::Path::new(
+                    &entry.path,
+                )),
+                port_variable: selected_port_variable,
+                hidden: Some(!draft.selected_folder_paths.contains(&entry.path)),
+            }
+        })
+        .collect()
+}
+
+fn build_folder_commands_from_scan(
+    draft: &FolderDraft,
+    existing: Option<&ProjectFolder>,
+) -> Vec<RunCommand> {
+    let mut commands = existing
+        .map(|folder| folder.commands.clone())
+        .unwrap_or_default();
+    let existing_labels: std::collections::BTreeSet<String> = commands
+        .iter()
+        .map(|command| command.label.clone())
+        .collect();
+
+    let Some(scan_result) = draft.scan_result.as_ref() else {
+        return commands;
+    };
+
+    let selected_port = scanner_service::port_for_variable(
+        &scan_result.ports,
+        draft.selected_scanned_port_variable.as_deref().or_else(|| {
+            (!draft.port_variable.trim().is_empty()).then_some(draft.port_variable.trim())
+        }),
+    );
+
+    for selected_name in &draft.selected_scanned_scripts {
+        if existing_labels.contains(selected_name) {
+            continue;
+        }
+        let Some(script) = scan_result
+            .scripts
+            .iter()
+            .find(|script| &script.name == selected_name)
+        else {
+            continue;
+        };
+        commands.push(scanner_service::build_run_command_from_scanned_script(
+            script,
+            next_entity_id("command"),
+            selected_port,
+        ));
+    }
+
+    commands
+}
+
+fn inspect_folder_runtime_metadata(
+    folder_path: &str,
+) -> (Option<String>, Option<DependencyStatus>) {
+    if folder_path.trim().is_empty() {
+        return (None, None);
+    }
+
+    let git_branch = scanner_service::read_git_branch(folder_path).ok().flatten();
+    let dependency_status = scanner_service::check_dependencies(folder_path).ok();
+    (git_branch, dependency_status)
+}
+
+fn load_folder_env_contents(folder_path: &str, env_file_path: &str) -> Option<String> {
+    if folder_path.trim().is_empty() || env_file_path.trim().is_empty() {
+        return None;
+    }
+
+    let path = std::path::Path::new(folder_path).join(env_file_path);
+    if !path.exists() {
+        return None;
+    }
+
+    env_service::read_env_text(&path).ok()
 }
 
 fn apply_text_key_to_string(

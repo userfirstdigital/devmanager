@@ -8,6 +8,7 @@ use alacritty_terminal::term::{point_to_viewport, Config as TermConfig, Term, Te
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, StdSyncHandler};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -198,6 +199,7 @@ impl TerminalSession {
         cwd: PathBuf,
         dimensions: SessionDimensions,
         preferred_terminal: Option<DefaultTerminal>,
+        scrolling_history: usize,
         runtime_state: Arc<RwLock<RuntimeState>>,
         debug_enabled: bool,
     ) -> Result<Self, String> {
@@ -215,6 +217,8 @@ impl TerminalSession {
                 candidate.program.to_string(),
                 candidate.args.clone(),
                 HashMap::new(),
+                scrolling_history,
+                None,
                 runtime_state.clone(),
                 debug_enabled,
                 backend,
@@ -235,6 +239,8 @@ impl TerminalSession {
         program: String,
         args: Vec<String>,
         env: HashMap<String, String>,
+        scrolling_history: usize,
+        log_file_path: Option<PathBuf>,
         runtime_state: Arc<RwLock<RuntimeState>>,
         debug_enabled: bool,
     ) -> Result<Self, String> {
@@ -246,6 +252,8 @@ impl TerminalSession {
             program,
             args,
             env,
+            scrolling_history,
+            log_file_path,
             runtime_state,
             debug_enabled,
             TerminalBackend::PortablePtyFeedingAlacritty,
@@ -526,9 +534,9 @@ fn renderable_char(cell: &Cell) -> char {
     }
 }
 
-fn configured_term() -> TermConfig {
+fn configured_term(scrolling_history: usize) -> TermConfig {
     TermConfig {
-        scrolling_history: 10_000,
+        scrolling_history,
         ..Default::default()
     }
 }
@@ -576,6 +584,7 @@ fn spawn_reader_thread(
     session_id: String,
     mut reader: Box<dyn Read + Send>,
     term: Arc<Mutex<Term<SessionEventProxy>>>,
+    mut log_file: Option<std::fs::File>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     debug_enabled: bool,
 ) {
@@ -598,6 +607,11 @@ fn spawn_reader_thread(
                             Err(error) => error.into_inner(),
                         };
                         parser.advance(&mut *term, &buffer[..bytes_read]);
+                    }
+
+                    if let Some(log_file) = log_file.as_mut() {
+                        let _ = log_file.write_all(&buffer[..bytes_read]);
+                        let _ = log_file.flush();
                     }
 
                     if let Ok(mut runtime) = runtime_state.write() {
@@ -700,6 +714,8 @@ fn spawn_with_command(
     program: String,
     args: Vec<String>,
     env: HashMap<String, String>,
+    scrolling_history: usize,
+    log_file_path: Option<PathBuf>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     debug_enabled: bool,
     backend: TerminalBackend,
@@ -740,6 +756,25 @@ fn spawn_with_command(
         .master
         .try_clone_reader()
         .map_err(|error| format!("Failed to clone PTY reader: {error}"))?;
+    let log_file = if let Some(log_file_path) = log_file_path {
+        if let Some(parent) = log_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file_path)
+                .map_err(|error| {
+                    format!(
+                        "Failed to open log file {}: {error}",
+                        log_file_path.display()
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
 
     let writer = Arc::new(Mutex::new(writer));
     let master = Arc::new(Mutex::new(pair.master));
@@ -754,7 +789,7 @@ fn spawn_with_command(
     };
 
     let term = Arc::new(Mutex::new(Term::new(
-        configured_term(),
+        configured_term(scrolling_history),
         &TerminalSize::new(dimensions.cols as usize, dimensions.rows as usize),
         event_proxy.clone(),
     )));
@@ -773,6 +808,7 @@ fn spawn_with_command(
         session_id.to_string(),
         reader,
         term.clone(),
+        log_file,
         runtime_state.clone(),
         debug_enabled,
     );

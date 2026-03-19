@@ -18,6 +18,30 @@ cargo run
 
 The updater is disabled by default for ad-hoc local runs unless you provide updater env vars at runtime or compile them into the build.
 
+## Hot Watch
+
+For local UI iteration on Windows, use the included watcher instead of running the executable directly from Cargo's output directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\dev-watch.ps1
+```
+
+Or use the wrapper:
+
+```bat
+watch.bat
+```
+
+The watcher listens to `src/`, `assets/`, `Cargo.toml`, and `Cargo.lock`.
+Each successful rebuild goes to `target-watch/`, then the script copies the fresh binary to `target-live/` and relaunches from there.
+That split avoids Windows locking the compiler output while the app is running, and a failed build leaves the last good app window untouched.
+
+If you only want a single rebuild-and-launch cycle, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\dev-watch.ps1 -Once
+```
+
 ## Local Packaging
 
 Install the packager CLI once:

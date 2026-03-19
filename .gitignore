@@ -37,4 +37,5 @@ serviceAccountKey.json
 *~
 /target-check
 /target-live
+/target-watch
 /target-test

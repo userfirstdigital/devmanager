@@ -2,6 +2,7 @@ use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
 use crate::notifications;
+use crate::services::env_service;
 use crate::state::AppState;
 use crate::state::{
     AiIdleTransition, AiLaunchSpec, ResourceSnapshot, RuntimeState, ServerLaunchSpec,
@@ -30,6 +31,7 @@ struct ProcessManagerInner {
     debug_enabled: bool,
     restart_backoffs: Mutex<HashMap<String, RestartBackoff>>,
     notification_sound: RwLock<Option<String>>,
+    scrollback_lines: RwLock<usize>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -79,6 +81,7 @@ impl ProcessManager {
             debug_enabled,
             restart_backoffs: Mutex::new(HashMap::new()),
             notification_sound: RwLock::new(None),
+            scrollback_lines: RwLock::new(10_000),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
         });
@@ -117,6 +120,20 @@ impl ProcessManager {
         if let Ok(mut notification_sound) = self.inner.notification_sound.write() {
             *notification_sound = sound_id;
         }
+    }
+
+    pub fn set_log_buffer_size(&self, lines: usize) {
+        if let Ok(mut scrollback_lines) = self.inner.scrollback_lines.write() {
+            *scrollback_lines = lines.max(500);
+        }
+    }
+
+    fn log_buffer_size(&self) -> usize {
+        self.inner
+            .scrollback_lines
+            .read()
+            .map(|lines| *lines)
+            .unwrap_or(10_000)
     }
 
     pub fn set_active_session(&self, session_id: impl Into<String>) {
@@ -159,6 +176,7 @@ impl ProcessManager {
             cwd.to_path_buf(),
             dimensions,
             default_terminal,
+            self.log_buffer_size(),
             self.inner.runtime_state.clone(),
             self.inner.debug_enabled,
         ) {
@@ -727,6 +745,11 @@ impl ProcessManager {
             args: args.clone(),
             env: env.clone(),
             auto_restart: command_auto_restart,
+            log_file_path: build_server_log_file_path(
+                lookup.project,
+                lookup.folder,
+                lookup.command,
+            ),
         };
 
         app_state.open_server_tab(&project_id, &command_id, Some(command_label.clone()));
@@ -907,6 +930,45 @@ impl ProcessManager {
         app_state.merge_recovered_server_tabs(recovered)
     }
 
+    pub fn restore_saved_server_tabs(
+        &self,
+        app_state: &mut AppState,
+        dimensions: SessionDimensions,
+    ) -> usize {
+        let active_tab_id = app_state.active_tab_id.clone();
+        let command_ids: Vec<String> = app_state
+            .open_tabs
+            .iter()
+            .filter(|tab| matches!(tab.tab_type, TabType::Server))
+            .filter_map(|tab| tab.command_id.clone())
+            .collect();
+
+        let mut restored = 0;
+        for command_id in command_ids {
+            let already_live = self
+                .runtime_state()
+                .sessions
+                .get(&command_id)
+                .map(|session| session.status.is_live())
+                .unwrap_or(false);
+            if already_live {
+                continue;
+            }
+            if self
+                .start_server(app_state, &command_id, dimensions)
+                .is_ok()
+            {
+                restored += 1;
+            }
+        }
+
+        app_state.active_tab_id = active_tab_id
+            .filter(|tab_id| app_state.find_tab(tab_id).is_some())
+            .or_else(|| app_state.open_tabs.first().map(|tab| tab.id.clone()));
+
+        restored
+    }
+
     fn session_exists(&self, session_id: &str) -> bool {
         self.inner
             .runtime_state
@@ -1007,6 +1069,8 @@ impl ProcessManager {
             launch.shell_program.clone(),
             launch.shell_args.clone(),
             HashMap::new(),
+            self.log_buffer_size(),
+            None,
             self.inner.runtime_state.clone(),
             self.inner.debug_enabled,
         )
@@ -1059,6 +1123,8 @@ impl ProcessManager {
             launch.program.clone(),
             launch.args.clone(),
             HashMap::new(),
+            self.log_buffer_size(),
+            None,
             self.inner.runtime_state.clone(),
             self.inner.debug_enabled,
         )
@@ -1326,7 +1392,7 @@ fn build_command_env(folder: &ProjectFolder, command: &RunCommand) -> HashMap<St
 
     if let Some(env_file_path) = folder.env_file_path.as_deref() {
         let env_path = PathBuf::from(&folder.folder_path).join(env_file_path);
-        if let Ok(file_env) = read_env_file(&env_path) {
+        if let Ok(file_env) = env_service::read_env_map(&env_path) {
             env.extend(file_env);
         }
     }
@@ -1340,29 +1406,45 @@ fn build_command_env(folder: &ProjectFolder, command: &RunCommand) -> HashMap<St
     env
 }
 
-fn read_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
-    let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let mut env = HashMap::new();
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_string();
-        let mut value = value.trim().to_string();
-        if (value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('\'') && value.ends_with('\''))
-        {
-            value = value[1..value.len() - 1].to_string();
-        }
-        env.insert(key, value);
+fn build_server_log_file_path(
+    project: &Project,
+    folder: &ProjectFolder,
+    command: &RunCommand,
+) -> Option<PathBuf> {
+    if project.save_log_files == Some(false) {
+        return None;
     }
 
-    Ok(env)
+    let root = PathBuf::from(&project.root_path);
+    if !root.is_dir() {
+        return None;
+    }
+
+    let folder_name = Path::new(&folder.folder_path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "server".to_string());
+    let slug = format!("{folder_name}-{}", command.label)
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+
+    let file_name = if slug.is_empty() {
+        "server.log".to_string()
+    } else {
+        format!("{slug}.log")
+    };
+    Some(root.join(file_name))
 }
 
 fn build_server_launch_command(settings: &Settings, command: &RunCommand) -> (String, Vec<String>) {
@@ -1565,6 +1647,12 @@ fn spawn_server_session_with_inner(
         launch.program.clone(),
         launch.args.clone(),
         launch.env.clone(),
+        inner
+            .scrollback_lines
+            .read()
+            .map(|lines| *lines)
+            .unwrap_or(10_000),
+        launch.log_file_path.clone(),
         inner.runtime_state.clone(),
         inner.debug_enabled,
     )?;
