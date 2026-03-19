@@ -1,0 +1,11 @@
+pub mod app;
+pub mod models;
+pub mod notifications;
+pub mod persistence;
+pub mod services;
+pub mod sidebar;
+pub mod state;
+pub mod terminal;
+pub mod theme;
+pub mod updater;
+pub mod workspace;

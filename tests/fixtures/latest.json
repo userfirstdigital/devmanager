@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0-dev.42",
+  "notes": "Release notes live on GitHub.",
+  "pub_date": "2026-03-19T12:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "format": "nsis",
+      "signature": "windows-signature-placeholder",
+      "url": "https://github.com/example/devmanager/releases/download/v0.2.0-dev.42/DevManager_0.2.0-dev.42_x64-setup.exe"
+    },
+    "darwin-aarch64": {
+      "format": "app",
+      "signature": "mac-signature-placeholder",
+      "url": "https://github.com/example/devmanager/releases/download/v0.2.0-dev.42/DevManager_0.2.0-dev.42_aarch64.app.tar.gz"
+    }
+  }
+}

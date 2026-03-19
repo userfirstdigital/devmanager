@@ -35,3 +35,6 @@ serviceAccountKey.json
 *.swp
 *.bak
 *~
+/target-check
+/target-live
+/target-test

@@ -7,15 +7,30 @@ license = "Apache-2.0"
 
 [dependencies]
 alacritty_terminal = "0.25.1"
+cargo-packager-updater = "0.2.3"
 dirs = "6.0.0"
 gpui = "0.2.2"
 portable-pty = "0.9.0"
+rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sysinfo = "0.38.4"
+time = { version = "0.3.47", features = ["formatting", "local-offset"] }
 
 [package.metadata.packager]
 product-name = "DevManager"
 identifier = "com.userfirst.devmanager"
 before-packaging-command = "cargo build --release"
-out-dir = "packager"
+authors = ["UserFirst"]
+copyright = "Copyright (c) UserFirst"
+description = "Native GPUI workspace and terminal manager for projects, servers, AI sessions, and SSH."
+icons = [
+    "packaging/icons/devmanager-32.png",
+    "packaging/icons/devmanager-128.png",
+    "packaging/icons/devmanager-256.png",
+    "packaging/icons/devmanager-512.png",
+    "packaging/icons/devmanager.ico",
+]
+long-description = "DevManager is the native GPUI rewrite of the archived Tauri app. It keeps local project orchestration, server tabs, AI terminals, SSH sessions, config import/export, and a signed update path in a single desktop shell."
+out-dir = "dist/packager"
 publisher = "UserFirst"

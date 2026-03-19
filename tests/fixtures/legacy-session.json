@@ -1,0 +1,26 @@
+{
+  "openTabs": [
+    {
+      "id": "cmd-dev",
+      "type": "server",
+      "projectId": "project-userfirst",
+      "commandId": "cmd-dev"
+    },
+    {
+      "id": "claude-1",
+      "type": "claude",
+      "projectId": "project-userfirst",
+      "ptySessionId": "claude-1",
+      "label": "Claude 1"
+    },
+    {
+      "id": "ssh-prod-tab",
+      "type": "ssh",
+      "projectId": "project-userfirst",
+      "ptySessionId": "ssh-prod-tab",
+      "label": "Prod",
+      "sshConnectionId": "ssh-prod"
+    }
+  ],
+  "activeTabId": "claude-1"
+}
