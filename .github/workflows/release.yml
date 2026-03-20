@@ -53,6 +53,7 @@ jobs:
               return tuple(int(group) for group in match.groups())
 
           latest_tag = ""
+          latest_tag_version = None
           for raw_tag in subprocess.check_output(
               ["git", "tag", "--list", "v*", "--sort=-v:refname"],
               text=True,
@@ -60,33 +61,66 @@ jobs:
               tag = raw_tag.strip()
               if stable_semver.fullmatch(tag):
                   latest_tag = tag
+                  latest_tag_version = parse_version(tag)
                   break
 
-          seed_version = latest_tag or base_version
-          major, minor, patch = parse_version(seed_version)
-          release_version = f"{major}.{minor}.{patch + 1}"
+          base_tuple = parse_version(base_version)
+          if latest_tag_version is None:
+              release_version = base_version
+          elif base_tuple > latest_tag_version:
+              release_version = base_version
+          else:
+              major, minor, patch = latest_tag_version
+              release_version = f"{major}.{minor}.{patch + 1}"
 
-          cargo_contents = cargo_toml.read_text(encoding="utf-8")
-          cargo_updated = re.sub(
-              r'(?ms)^\[package\]\s+(?:.*?\n)*?version = "[^"]+"',
-              lambda match: match.group(0).rsplit('"', 2)[0] + f'"{release_version}"',
-              cargo_contents,
-              count=1,
-          )
-          if cargo_contents == cargo_updated:
+          cargo_lines = cargo_toml.read_text(encoding="utf-8").splitlines(keepends=True)
+          in_package = False
+          cargo_updated = False
+          for index, line in enumerate(cargo_lines):
+              stripped = line.strip()
+              if stripped == "[package]":
+                  in_package = True
+                  continue
+              if in_package and stripped.startswith("[") and stripped != "[package]":
+                  in_package = False
+              if in_package and stripped.startswith('version = "') and not cargo_updated:
+                  cargo_lines[index] = re.sub(
+                      r'version = "[^"]+"',
+                      f'version = "{release_version}"',
+                      line,
+                      count=1,
+                  )
+                  cargo_updated = True
+                  break
+          if not cargo_updated:
               raise SystemExit("Failed to update package version in Cargo.toml.")
-          cargo_toml.write_text(cargo_updated, encoding="utf-8")
+          cargo_toml.write_text("".join(cargo_lines), encoding="utf-8")
 
-          lock_contents = cargo_lock.read_text(encoding="utf-8")
-          lock_updated = re.sub(
-              r'(?ms)^\[\[package\]\]\nname = "devmanager"\nversion = "[^"]+"',
-              lambda match: match.group(0).rsplit('"', 2)[0] + f'"{release_version}"',
-              lock_contents,
-              count=1,
-          )
-          if lock_contents == lock_updated:
+          lock_lines = cargo_lock.read_text(encoding="utf-8").splitlines(keepends=True)
+          in_package = False
+          target_package = False
+          lock_updated = False
+          for index, line in enumerate(lock_lines):
+              stripped = line.strip()
+              if stripped == "[[package]]":
+                  in_package = True
+                  target_package = False
+                  continue
+              if in_package and stripped.startswith('name = "'):
+                  target_package = stripped == 'name = "devmanager"'
+                  continue
+              if in_package and target_package and stripped.startswith('version = "') and not lock_updated:
+                  lock_lines[index] = re.sub(
+                      r'version = "[^"]+"',
+                      f'version = "{release_version}"',
+                      line,
+                      count=1,
+                  )
+                  lock_updated = True
+                  break
+          if not lock_updated:
               raise SystemExit("Failed to update the root package version in Cargo.lock.")
-          cargo_lock.write_text(lock_updated, encoding="utf-8")
+          cargo_lock.write_text("".join(lock_lines), encoding="utf-8")
 
           output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
           with output.open("a", encoding="utf-8") as handle:
