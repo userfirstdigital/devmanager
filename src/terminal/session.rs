@@ -12,14 +12,16 @@ use alacritty_terminal::term::{point_to_viewport, Config as TermConfig, Term, Te
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
+use arboard::Clipboard;
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+
+const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalBackend {
@@ -249,8 +251,16 @@ impl EventListener for SessionEventProxy {
                 let response = formatter(color);
                 self.write_to_pty(&response);
             }
-            Event::ClipboardLoad(_, _) | Event::ClipboardStore(_, _) => {
-                self.debug_log("ignored optional terminal event");
+            Event::ClipboardStore(_, data) => {
+                let clipped = truncate_utf8_boundary(&data, MAX_TERMINAL_CLIPBOARD_BYTES).to_string();
+                if let Err(error) = write_system_clipboard_text(&clipped) {
+                    self.debug_log(format!("clipboard store failed: {error}"));
+                }
+            }
+            Event::ClipboardLoad(_, formatter) => {
+                let text = read_system_clipboard_text().unwrap_or_default();
+                let response = formatter(&text);
+                self.write_to_pty(&response);
             }
         }
     }
@@ -372,11 +382,13 @@ impl TerminalSession {
             term.mode().contains(TermMode::BRACKETED_PASTE)
         };
 
-        let normalized = text.replace("\r\n", "\n").replace('\n', "\r");
         if bracketed_paste {
-            self.write_text(&format!("\u{1b}[200~{normalized}\u{1b}[201~"))
+            self.write_text(&format!(
+                "\u{1b}[200~{}\u{1b}[201~",
+                sanitize_bracketed_paste_text(text)
+            ))
         } else {
-            self.write_text(&normalized)
+            self.write_text(&normalize_plain_paste_text(text))
         }
     }
 
@@ -510,13 +522,7 @@ impl TerminalSession {
                 return Err(format!("Failed to clone PTY reader: {error}"));
             }
         };
-        let log_file = match open_log_file(log_file_path) {
-            Ok(log_file) => log_file,
-            Err(error) => {
-                cleanup_failed_spawn(&mut cleanup_killer);
-                return Err(error);
-            }
-        };
+        let log_writer = open_log_writer(log_file_path);
 
         {
             let mut writer_slot = match self.writer.lock() {
@@ -595,7 +601,7 @@ impl TerminalSession {
             self.session_id.clone(),
             reader,
             self.term.clone(),
-            log_file,
+            log_writer,
             self.runtime_state.clone(),
             self.event_proxy.debug_enabled,
         );
@@ -907,6 +913,41 @@ fn with_terminal_env_defaults(mut env: HashMap<String, String>) -> HashMap<Strin
     env
 }
 
+fn sanitize_bracketed_paste_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| *ch != '\u{1b}' && *ch != '\u{9b}')
+        .collect()
+}
+
+fn normalize_plain_paste_text(text: &str) -> String {
+    text.replace("\r\n", "\r").replace('\n', "\r")
+}
+
+fn truncate_utf8_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    &text[..end]
+}
+
+fn read_system_clipboard_text() -> Option<String> {
+    let mut clipboard = Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    Some(truncate_utf8_boundary(&text, MAX_TERMINAL_CLIPBOARD_BYTES).to_string())
+}
+
+fn write_system_clipboard_text(text: &str) -> Result<(), String> {
+    let mut clipboard = Clipboard::new().map_err(|error| format!("Failed to open clipboard: {error}"))?;
+    clipboard
+        .set_text(truncate_utf8_boundary(text, MAX_TERMINAL_CLIPBOARD_BYTES).to_string())
+        .map_err(|error| format!("Failed to write clipboard: {error}"))
+}
+
 fn pty_size(dimensions: SessionDimensions) -> PtySize {
     PtySize {
         rows: dimensions.rows,
@@ -1005,7 +1046,7 @@ fn spawn_reader_thread(
     session_id: String,
     mut reader: Box<dyn Read + Send>,
     term: Arc<Mutex<Term<SessionEventProxy>>>,
-    mut log_file: Option<std::fs::File>,
+    mut log_writer: Option<LogWriter>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     debug_enabled: bool,
 ) {
@@ -1030,9 +1071,8 @@ fn spawn_reader_thread(
                         parser.advance(&mut *term, &buffer[..bytes_read]);
                     }
 
-                    if let Some(log_file) = log_file.as_mut() {
-                        let _ = log_file.write_all(&buffer[..bytes_read]);
-                        let _ = log_file.flush();
+                    if let Some(writer) = log_writer.as_mut() {
+                        writer.write_chunk(&buffer[..bytes_read]);
                     }
 
                     if let Ok(mut runtime) = runtime_state.write() {
@@ -1062,6 +1102,10 @@ fn spawn_reader_thread(
                     break;
                 }
             }
+        }
+
+        if let Some(writer) = log_writer.as_mut() {
+            writer.flush_remaining();
         }
     });
 }
@@ -1178,13 +1222,7 @@ fn spawn_with_command(
             return Err(format!("Failed to clone PTY reader: {error}"));
         }
     };
-    let log_file = match open_log_file(log_file_path) {
-        Ok(log_file) => log_file,
-        Err(error) => {
-            cleanup_failed_spawn(&mut cleanup_killer);
-            return Err(error);
-        }
-    };
+    let log_writer = open_log_writer(log_file_path);
 
     let writer = Arc::new(Mutex::new(writer));
     let master = Arc::new(Mutex::new(pair.master));
@@ -1226,7 +1264,7 @@ fn spawn_with_command(
         session_id.to_string(),
         reader,
         term.clone(),
-        log_file,
+        log_writer,
         runtime_state.clone(),
         debug_enabled,
     );
@@ -1255,26 +1293,83 @@ fn spawn_with_command(
     })
 }
 
-fn open_log_file(log_file_path: Option<PathBuf>) -> Result<Option<std::fs::File>, String> {
-    if let Some(log_file_path) = log_file_path {
-        if let Some(parent) = log_file_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+fn open_log_writer(log_file_path: Option<PathBuf>) -> Option<LogWriter> {
+    let path = log_file_path?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::File::create(&path) {
+        Ok(file) => Some(LogWriter::new(file)),
+        Err(_) => None,
+    }
+}
+
+struct LogWriter {
+    writer: std::io::BufWriter<std::fs::File>,
+    line_buf: Vec<u8>,
+    ansi_re: regex::Regex,
+}
+
+impl LogWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            writer: std::io::BufWriter::new(file),
+            line_buf: Vec::new(),
+            ansi_re: regex::Regex::new(
+                r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-Z]|\x0f",
+            )
+            .unwrap(),
         }
-        return Ok(Some(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_file_path)
-                .map_err(|error| {
-                    format!(
-                        "Failed to open log file {}: {error}",
-                        log_file_path.display()
-                    )
-                })?,
-        ));
     }
 
-    Ok(None)
+    fn write_chunk(&mut self, chunk: &[u8]) {
+        let text = String::from_utf8_lossy(chunk);
+        let clean = self.ansi_re.replace_all(&text, "");
+        for ch in clean.bytes() {
+            match ch {
+                b'\n' => {
+                    let ts = time::OffsetDateTime::now_local()
+                        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+                    let line = String::from_utf8_lossy(&self.line_buf);
+                    let _ = write!(
+                        self.writer,
+                        "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}\n",
+                        ts.year(),
+                        ts.month() as u8,
+                        ts.day(),
+                        ts.hour(),
+                        ts.minute(),
+                        ts.second(),
+                        line.trim_end()
+                    );
+                    self.line_buf.clear();
+                }
+                b'\r' => {}
+                _ => self.line_buf.push(ch),
+            }
+        }
+    }
+
+    fn flush_remaining(&mut self) {
+        if !self.line_buf.is_empty() {
+            let ts = time::OffsetDateTime::now_local()
+                .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            let line = String::from_utf8_lossy(&self.line_buf);
+            let _ = write!(
+                self.writer,
+                "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}\n",
+                ts.year(),
+                ts.month() as u8,
+                ts.day(),
+                ts.hour(),
+                ts.minute(),
+                ts.second(),
+                line.trim_end()
+            );
+            self.line_buf.clear();
+        }
+        let _ = self.writer.flush();
+    }
 }
 
 fn renderable_cell_snapshot(cell: &Cell, colors: &Colors) -> TerminalCellSnapshot {
@@ -1498,5 +1593,27 @@ mod tests {
         assert_eq!(env.get("CLICOLOR").map(String::as_str), Some("1"));
         assert_eq!(env.get("CLICOLOR_FORCE").map(String::as_str), Some("1"));
         assert_eq!(env.get("FORCE_COLOR").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn bracketed_paste_strips_escape_bytes() {
+        let sanitized = sanitize_bracketed_paste_text("hello\u{1b}[31mworld\u{9b}200~");
+
+        assert_eq!(sanitized, "hello[31mworld200~");
+    }
+
+    #[test]
+    fn plain_paste_normalizes_newlines_to_carriage_returns() {
+        let normalized = normalize_plain_paste_text("one\r\ntwo\nthree");
+
+        assert_eq!(normalized, "one\rtwo\rthree");
+    }
+
+    #[test]
+    fn truncate_utf8_boundary_does_not_split_multibyte_chars() {
+        let text = "a😀b";
+
+        assert_eq!(truncate_utf8_boundary(text, 2), "a");
+        assert_eq!(truncate_utf8_boundary(text, 5), "a😀");
     }
 }

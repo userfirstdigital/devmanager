@@ -6,9 +6,10 @@ use cargo_packager_updater::{
     WindowsConfig as PackagerWindowsConfig, WindowsUpdateInstallMode,
 };
 use serde::Deserialize;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc, RwLock,
 };
 use std::thread;
@@ -32,7 +33,7 @@ pub enum UpdaterStage {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdaterSnapshot {
     pub configured: bool,
     pub current_version: String,
@@ -132,10 +133,27 @@ struct UpdaterInner {
     state: RwLock<UpdaterState>,
 }
 
+struct DownloadedUpdate {
+    update: PackagerUpdate,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckPlan {
+    Fresh,
+    PreserveReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoDownloadAction {
+    Start,
+    KeepReady,
+}
+
 struct UpdaterState {
     snapshot: UpdaterSnapshot,
     pending_update: Option<PackagerUpdate>,
-    downloaded_bytes: Option<Vec<u8>>,
+    ready_update: Option<DownloadedUpdate>,
 }
 
 impl UpdaterService {
@@ -222,7 +240,7 @@ impl UpdaterService {
                 state: RwLock::new(UpdaterState {
                     snapshot,
                     pending_update: None,
-                    downloaded_bytes: None,
+                    ready_update: None,
                 }),
             }),
         }
@@ -258,7 +276,7 @@ impl UpdaterService {
         if self
             .inner
             .background_checks_started
-            .swap(true, Ordering::SeqCst)
+            .swap(true, AtomicOrdering::SeqCst)
         {
             return;
         }
@@ -280,24 +298,31 @@ impl UpdaterService {
             .clone()
             .ok_or_else(|| self.snapshot().detail)?;
 
-        self.inner.set_checking()?;
+        let check_plan = self.inner.prepare_check()?;
         let inner = self.inner.clone();
         let current_version = self.inner.current_version.clone();
         thread::spawn(move || {
             match cargo_packager_updater::check_update(current_version, config) {
-                Ok(Some(update)) => {
-                    inner.set_update_available(update.clone());
-                    if let Err(error) = inner.prepare_auto_download(&update) {
-                        inner.set_error(format!(
-                            "Version {} is available, but the background download could not start: {error}",
-                            update.version
-                        ));
-                    } else {
+                Ok(Some(update)) => match inner.prepare_auto_download(&update) {
+                    Ok(AutoDownloadAction::Start) => {
                         Self::spawn_download_thread(inner, update);
                     }
-                }
-                Ok(None) => inner.set_up_to_date(),
-                Err(error) => inner.set_error(format!("Update check failed: {error}")),
+                    Ok(AutoDownloadAction::KeepReady) => {
+                        inner.finish_check_without_update(check_plan);
+                    }
+                    Err(error) => inner.finish_check_error(
+                        check_plan,
+                        format!(
+                            "Version {} is available, but the background download could not start: {error}",
+                            update.version
+                        ),
+                    ),
+                },
+                Ok(None) => inner.finish_check_without_update(check_plan),
+                Err(error) => inner.finish_check_error(
+                    check_plan,
+                    format!("Update check failed: {error}"),
+                ),
             }
         });
         Ok(())
@@ -310,8 +335,9 @@ impl UpdaterService {
     }
 
     pub fn install_update(&self) -> Result<String, String> {
-        let (update, bytes, version) = self.inner.prepare_install()?;
-        match update.install(bytes) {
+        let ready_update = self.inner.prepare_install()?;
+        let version = ready_update.update.version.clone();
+        match ready_update.update.install(ready_update.bytes) {
             Ok(()) => Ok(version),
             Err(error) => {
                 self.inner
@@ -340,14 +366,16 @@ impl UpdaterService {
                 || {},
             ) {
                 Ok(bytes) => inner.set_ready_to_install(update, bytes),
-                Err(error) => inner.set_error(format!("Download failed for {version}: {error}")),
+                Err(error) => inner.restore_ready_after_failed_download(format!(
+                    "Download failed for {version}: {error}"
+                )),
             }
         });
     }
 }
 
 impl UpdaterInner {
-    fn set_checking(&self) -> Result<(), String> {
+    fn prepare_check(&self) -> Result<CheckPlan, String> {
         let mut state = self
             .state
             .write()
@@ -358,52 +386,41 @@ impl UpdaterInner {
         if !state.snapshot.configured {
             return Err(state.snapshot.detail.clone());
         }
-        if matches!(state.snapshot.stage, UpdaterStage::ReadyToInstall)
-            || state.downloaded_bytes.is_some()
-        {
-            return Err(match state.snapshot.target_version.as_deref() {
-                Some(version) => {
-                    format!("Version {version} is already downloaded. Restart DevManager to install it.")
-                }
-                None => {
-                    "An update is already downloaded. Restart DevManager to install it.".to_string()
-                }
-            });
-        }
-        if matches!(state.snapshot.stage, UpdaterStage::UpdateAvailable)
-            && state.pending_update.is_some()
-        {
-            return Err(match state.snapshot.target_version.as_deref() {
-                Some(version) => {
-                    format!("Version {version} is already queued. Wait for its download to begin.")
-                }
-                None => "An update is already queued. Wait for its download to begin.".to_string(),
-            });
+        if state.ready_update.is_some() {
+            return Ok(CheckPlan::PreserveReady);
         }
         state.pending_update = None;
-        state.downloaded_bytes = None;
+        state.ready_update = None;
+        clear_update_metadata(&mut state.snapshot);
         state.snapshot.stage = UpdaterStage::Checking;
-        state.snapshot.target_version = None;
-        state.snapshot.release_notes = None;
         state.snapshot.detail = format!(
             "Checking {} for a newer release...",
             summarize_endpoint(state.snapshot.endpoints.first())
         );
-        state.snapshot.downloaded_bytes = 0;
-        state.snapshot.total_bytes = None;
-        Ok(())
+        Ok(CheckPlan::Fresh)
+    }
+
+    fn finish_check_without_update(&self, plan: CheckPlan) {
+        match plan {
+            CheckPlan::Fresh => self.set_up_to_date(),
+            CheckPlan::PreserveReady => self.restore_ready_snapshot(None),
+        }
+    }
+
+    fn finish_check_error(&self, plan: CheckPlan, message: String) {
+        match plan {
+            CheckPlan::Fresh => self.set_error(message),
+            CheckPlan::PreserveReady => self.restore_ready_snapshot(None),
+        }
     }
 
     fn set_up_to_date(&self) {
         if let Ok(mut state) = self.state.write() {
             state.pending_update = None;
-            state.downloaded_bytes = None;
+            state.ready_update = None;
             state.snapshot.stage = UpdaterStage::UpToDate;
-            state.snapshot.target_version = None;
-            state.snapshot.release_notes = None;
             state.snapshot.last_checked_at = Some(SystemTime::now());
-            state.snapshot.downloaded_bytes = 0;
-            state.snapshot.total_bytes = None;
+            clear_update_metadata(&mut state.snapshot);
             state.snapshot.detail = format!(
                 "DevManager {} is up to date.",
                 state.snapshot.current_version
@@ -411,24 +428,7 @@ impl UpdaterInner {
         }
     }
 
-    fn set_update_available(&self, update: PackagerUpdate) {
-        if let Ok(mut state) = self.state.write() {
-            state.downloaded_bytes = None;
-            state.pending_update = Some(update.clone());
-            state.snapshot.stage = UpdaterStage::UpdateAvailable;
-            state.snapshot.target_version = Some(update.version.clone());
-            state.snapshot.release_notes = update.body.clone();
-            state.snapshot.last_checked_at = Some(SystemTime::now());
-            state.snapshot.downloaded_bytes = 0;
-            state.snapshot.total_bytes = None;
-            state.snapshot.detail = format!(
-                "Version {} is available. Downloading it in the background...",
-                update.version
-            );
-        }
-    }
-
-    fn prepare_auto_download(&self, update: &PackagerUpdate) -> Result<(), String> {
+    fn prepare_auto_download(&self, update: &PackagerUpdate) -> Result<AutoDownloadAction, String> {
         let mut state = self
             .state
             .write()
@@ -436,29 +436,23 @@ impl UpdaterInner {
         if state.snapshot.is_busy() {
             return Err("Updater is busy. Wait for the current action to finish.".to_string());
         }
-        if matches!(state.snapshot.stage, UpdaterStage::ReadyToInstall)
-            || state.downloaded_bytes.is_some()
-        {
-            return Err(match state.snapshot.target_version.as_deref() {
-                Some(version) => {
-                    format!("Version {version} is already downloaded. Restart DevManager to install it.")
-                }
-                None => {
-                    "An update is already downloaded. Restart DevManager to install it.".to_string()
-                }
-            });
+        if let Some(ready_update) = state.ready_update.as_ref() {
+            match compare_versions(&update.version, &ready_update.update.version)? {
+                Ordering::Greater => {}
+                Ordering::Equal | Ordering::Less => return Ok(AutoDownloadAction::KeepReady),
+            }
         }
         state.pending_update = Some(update.clone());
-        state.downloaded_bytes = None;
         state.snapshot.stage = UpdaterStage::Downloading;
         state.snapshot.target_version = Some(update.version.clone());
+        state.snapshot.release_notes = update.body.clone();
         state.snapshot.downloaded_bytes = 0;
         state.snapshot.total_bytes = None;
         state.snapshot.detail = format!(
             "Version {} is available. Downloading it in the background...",
             update.version
         );
-        Ok(())
+        Ok(AutoDownloadAction::Start)
     }
 
     fn prepare_download(&self) -> Result<PackagerUpdate, String> {
@@ -469,25 +463,21 @@ impl UpdaterInner {
         if state.snapshot.is_busy() {
             return Err("Updater is busy. Wait for the current action to finish.".to_string());
         }
-        if matches!(state.snapshot.stage, UpdaterStage::ReadyToInstall)
-            || state.downloaded_bytes.is_some()
-        {
-            return Err(match state.snapshot.target_version.as_deref() {
-                Some(version) => {
-                    format!("Version {version} is already downloaded. Restart DevManager to install it.")
-                }
-                None => {
-                    "An update is already downloaded. Restart DevManager to install it.".to_string()
-                }
-            });
-        }
-        let update = state
-            .pending_update
-            .clone()
-            .ok_or_else(|| "Check for an available update first.".to_string())?;
-        state.downloaded_bytes = None;
+        let update = state.pending_update.clone().ok_or_else(|| {
+            state
+                .ready_update
+                .as_ref()
+                .map(|ready_update| {
+                    format!(
+                        "Version {} is already downloaded. Restart DevManager to install it.",
+                        ready_update.update.version
+                    )
+                })
+                .unwrap_or_else(|| "Check for an available update first.".to_string())
+        })?;
         state.snapshot.stage = UpdaterStage::Downloading;
         state.snapshot.target_version = Some(update.version.clone());
+        state.snapshot.release_notes = update.body.clone();
         state.snapshot.downloaded_bytes = 0;
         state.snapshot.total_bytes = None;
         state.snapshot.detail = format!("Downloading version {}...", update.version);
@@ -516,23 +506,37 @@ impl UpdaterInner {
     }
 
     fn set_ready_to_install(&self, update: PackagerUpdate, bytes: Vec<u8>) {
-        let size = bytes.len() as u64;
         if let Ok(mut state) = self.state.write() {
-            state.pending_update = Some(update.clone());
-            state.downloaded_bytes = Some(bytes);
-            state.snapshot.stage = UpdaterStage::ReadyToInstall;
-            state.snapshot.target_version = Some(update.version.clone());
-            state.snapshot.last_checked_at = Some(SystemTime::now());
-            state.snapshot.downloaded_bytes = size;
-            state.snapshot.total_bytes = Some(size);
-            state.snapshot.detail = format!(
-                "Version {} is downloaded. Restart DevManager to install it.",
-                update.version
-            );
+            state.pending_update = None;
+            state.ready_update = Some(DownloadedUpdate { update, bytes });
+            restore_ready_snapshot_locked(&mut state, None);
         }
     }
 
-    fn prepare_install(&self) -> Result<(PackagerUpdate, Vec<u8>, String), String> {
+    fn restore_ready_after_failed_download(&self, message: String) {
+        if let Ok(mut state) = self.state.write() {
+            state.pending_update = None;
+            if state.ready_update.is_some() {
+                restore_ready_snapshot_locked(&mut state, None);
+            } else {
+                state.snapshot.stage = UpdaterStage::Error;
+                state.snapshot.last_checked_at = Some(SystemTime::now());
+                clear_update_metadata(&mut state.snapshot);
+                state.snapshot.detail = message;
+            }
+        }
+    }
+
+    fn restore_ready_snapshot(&self, detail_override: Option<String>) {
+        if let Ok(mut state) = self.state.write() {
+            if state.ready_update.is_some() {
+                state.pending_update = None;
+                restore_ready_snapshot_locked(&mut state, detail_override);
+            }
+        }
+    }
+
+    fn prepare_install(&self) -> Result<DownloadedUpdate, String> {
         let mut state = self
             .state
             .write()
@@ -540,27 +544,30 @@ impl UpdaterInner {
         if state.snapshot.is_busy() {
             return Err("Updater is busy. Wait for the current action to finish.".to_string());
         }
-        let update = state
-            .pending_update
-            .clone()
-            .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
-        let bytes = state
-            .downloaded_bytes
+        let ready_update = state
+            .ready_update
             .take()
-            .ok_or_else(|| "Download the update before installing it.".to_string())?;
-        let version = update.version.clone();
+            .ok_or_else(|| "No downloaded update is ready to install.".to_string())?;
+        let version = ready_update.update.version.clone();
+        let size = ready_update.bytes.len() as u64;
+        state.pending_update = None;
         state.snapshot.stage = UpdaterStage::Installing;
+        state.snapshot.target_version = Some(version.clone());
+        state.snapshot.release_notes = ready_update.update.body.clone();
+        state.snapshot.downloaded_bytes = size;
+        state.snapshot.total_bytes = Some(size);
         state.snapshot.detail = format!("Launching installer for version {version}...");
-        Ok((update, bytes, version))
+        Ok(ready_update)
     }
 
     fn set_error(&self, message: String) {
         if let Ok(mut state) = self.state.write() {
-            state.downloaded_bytes = None;
+            state.pending_update = None;
+            state.ready_update = None;
             state.snapshot.stage = UpdaterStage::Error;
             state.snapshot.last_checked_at = Some(SystemTime::now());
+            clear_update_metadata(&mut state.snapshot);
             state.snapshot.detail = message;
-            state.snapshot.total_bytes = None;
         }
     }
 }
@@ -629,6 +636,33 @@ pub fn github_release_manifest_endpoint(repository: &str) -> String {
     format!("https://github.com/{repository}/releases/latest/download/latest.json")
 }
 
+fn clear_update_metadata(snapshot: &mut UpdaterSnapshot) {
+    snapshot.target_version = None;
+    snapshot.release_notes = None;
+    snapshot.downloaded_bytes = 0;
+    snapshot.total_bytes = None;
+}
+
+fn restore_ready_snapshot_locked(state: &mut UpdaterState, detail_override: Option<String>) {
+    let Some(ready_update) = state.ready_update.as_ref() else {
+        clear_update_metadata(&mut state.snapshot);
+        return;
+    };
+    let size = ready_update.bytes.len() as u64;
+    state.snapshot.stage = UpdaterStage::ReadyToInstall;
+    state.snapshot.target_version = Some(ready_update.update.version.clone());
+    state.snapshot.release_notes = ready_update.update.body.clone();
+    state.snapshot.last_checked_at = Some(SystemTime::now());
+    state.snapshot.downloaded_bytes = size;
+    state.snapshot.total_bytes = Some(size);
+    state.snapshot.detail = detail_override.unwrap_or_else(|| {
+        format!(
+            "Version {} is downloaded. Restart DevManager to install it.",
+            ready_update.update.version
+        )
+    });
+}
+
 fn parse_windows_install_mode(value: Option<&str>) -> Result<UpdaterWindowsInstallMode, String> {
     match value.unwrap_or("passive").trim() {
         "" | "passive" | "Passive" => Ok(UpdaterWindowsInstallMode::Passive),
@@ -648,6 +682,12 @@ fn split_config_list(value: Option<String>) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn compare_versions(left: &str, right: &str) -> Result<Ordering, String> {
+    let left = parse_version(left)?;
+    let right = parse_version(right)?;
+    Ok(left.cmp(&right))
 }
 
 fn parse_version(value: &str) -> Result<Version, String> {
@@ -694,5 +734,116 @@ fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", value / KB)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cargo_packager_updater::UpdateFormat;
+    use std::path::PathBuf;
+
+    fn test_update(version: &str, body: Option<&str>) -> PackagerUpdate {
+        PackagerUpdate {
+            config: PackagerUpdaterConfig {
+                endpoints: vec![Url::parse("https://example.com/latest.json").unwrap()],
+                pubkey: "public-key".to_string(),
+                windows: None,
+            },
+            body: body.map(ToOwned::to_owned),
+            current_version: "0.2.0".to_string(),
+            version: version.to_string(),
+            date: None,
+            target: "windows-x86_64".to_string(),
+            extract_path: PathBuf::from("."),
+            download_url: Url::parse("https://example.com/devmanager.exe").unwrap(),
+            signature: "signature".to_string(),
+            timeout: None,
+            headers: Default::default(),
+            format: UpdateFormat::Nsis,
+        }
+    }
+
+    fn test_inner() -> UpdaterInner {
+        UpdaterInner {
+            current_version: Version::new(0, 2, 0),
+            config: None,
+            background_checks_started: AtomicBool::new(false),
+            state: RwLock::new(UpdaterState {
+                snapshot: UpdaterSnapshot {
+                    configured: true,
+                    current_version: "0.2.0".to_string(),
+                    endpoints: vec!["https://example.com/latest.json".to_string()],
+                    stage: UpdaterStage::Idle,
+                    target_version: None,
+                    detail: "Ready to check https://example.com/latest.json for updates."
+                        .to_string(),
+                    release_notes: None,
+                    last_checked_at: None,
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                },
+                pending_update: None,
+                ready_update: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn newer_release_supersedes_downloaded_ready_update() {
+        let inner = test_inner();
+        let ready_update = test_update("0.2.1", Some("old release"));
+        let newer_update = test_update("0.2.2", Some("new release"));
+
+        inner.set_ready_to_install(ready_update.clone(), vec![1, 2, 3]);
+        assert_eq!(inner.prepare_check().unwrap(), CheckPlan::PreserveReady);
+        assert_eq!(
+            inner.prepare_auto_download(&newer_update).unwrap(),
+            AutoDownloadAction::Start
+        );
+
+        let state = inner.state.read().unwrap();
+        assert_eq!(state.snapshot.stage, UpdaterStage::Downloading);
+        assert_eq!(state.snapshot.target_version.as_deref(), Some("0.2.2"));
+        assert_eq!(
+            state
+                .ready_update
+                .as_ref()
+                .map(|update| update.update.version.as_str()),
+            Some("0.2.1")
+        );
+    }
+
+    #[test]
+    fn failed_replacement_download_keeps_existing_ready_update() {
+        let inner = test_inner();
+        let ready_update = test_update("0.2.1", Some("old release"));
+
+        inner.set_ready_to_install(ready_update, vec![1, 2, 3]);
+        inner.restore_ready_after_failed_download("Download failed".to_string());
+
+        let state = inner.state.read().unwrap();
+        assert_eq!(state.snapshot.stage, UpdaterStage::ReadyToInstall);
+        assert_eq!(state.snapshot.target_version.as_deref(), Some("0.2.1"));
+        assert_eq!(state.snapshot.release_notes.as_deref(), Some("old release"));
+        assert_eq!(state.snapshot.downloaded_bytes, 3);
+    }
+
+    #[test]
+    fn set_error_clears_stale_update_metadata() {
+        let inner = test_inner();
+        let update = test_update("0.2.1", Some("release notes"));
+
+        inner.prepare_auto_download(&update).unwrap();
+        inner.set_error("boom".to_string());
+
+        let state = inner.state.read().unwrap();
+        assert_eq!(state.snapshot.stage, UpdaterStage::Error);
+        assert!(state.pending_update.is_none());
+        assert!(state.ready_update.is_none());
+        assert!(state.snapshot.target_version.is_none());
+        assert!(state.snapshot.release_notes.is_none());
+        assert_eq!(state.snapshot.downloaded_bytes, 0);
+        assert!(state.snapshot.total_bytes.is_none());
     }
 }

@@ -26,6 +26,9 @@ fn loads_legacy_config_fixture_with_migration_defaults() {
     );
     assert_eq!(config.settings.default_terminal, DefaultTerminal::Bash);
     assert_eq!(config.settings.restore_session_on_start, Some(true));
+    assert!(!config.settings.option_as_meta);
+    assert!(!config.settings.copy_on_select);
+    assert!(config.settings.keep_selection_on_copy);
     assert_eq!(config.ssh_connections.len(), 1);
 }
 

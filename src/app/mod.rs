@@ -20,10 +20,10 @@ use crate::workspace::{
     ProjectDraft, SettingsDraft, SshDraft,
 };
 use gpui::{
-    div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardItem, Context,
-    FocusHandle, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, TouchPhase,
-    Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
+    ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    Render, ScrollWheelEvent, Styled, TouchPhase, Window, WindowBounds, WindowOptions,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::HashMap;
@@ -265,6 +265,9 @@ impl NativeShell {
 
         let _ = session_manager.save_session(&persisted_session_state(&state));
         updater.start_background_checks();
+        if updater.is_configured() {
+            Self::spawn_updater_refresh_task(updater.clone(), cx);
+        }
 
         Self {
             state,
@@ -293,6 +296,32 @@ impl NativeShell {
             add_project_wizard: None,
             last_window_title: None,
         }
+    }
+
+    fn spawn_updater_refresh_task(updater: UpdaterService, cx: &mut Context<Self>) {
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let background_executor = cx.background_executor().clone();
+                let mut async_cx = cx.clone();
+                async move {
+                    let mut previous_snapshot = updater.snapshot();
+                    loop {
+                        background_executor.timer(Duration::from_millis(500)).await;
+                        let next_snapshot = updater.snapshot();
+                        if next_snapshot != previous_snapshot {
+                            previous_snapshot = next_snapshot;
+                            if this
+                                .update(&mut async_cx, |_, cx: &mut Context<'_, Self>| cx.notify())
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
     }
 
     fn save_session_state(&mut self) {
@@ -713,6 +742,10 @@ impl NativeShell {
     }
 
     fn open_settings_action(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.editor_panel, Some(EditorPanel::Settings(_))) {
+            self.close_editor(cx);
+            return;
+        }
         let settings = self.state.settings().clone();
         self.open_editor(
             EditorPanel::Settings(SettingsDraft {
@@ -732,6 +765,9 @@ impl NativeShell {
                     .terminal_font_size
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
+                option_as_meta: settings.option_as_meta,
+                copy_on_select: settings.copy_on_select,
+                keep_selection_on_copy: settings.keep_selection_on_copy,
                 open_picker: None,
             }),
             cx,
@@ -1427,6 +1463,9 @@ impl NativeShell {
                 return;
             }
         };
+        settings.option_as_meta = draft.option_as_meta;
+        settings.copy_on_select = draft.copy_on_select;
+        settings.keep_selection_on_copy = draft.keep_selection_on_copy;
 
         self.state.update_settings(settings);
         self.process_manager
@@ -1981,6 +2020,27 @@ impl NativeShell {
                     self.apply_settings_draft(cx);
                 }
             }
+            EditorAction::ToggleOptionAsMeta => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.option_as_meta = !draft.option_as_meta;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::ToggleCopyOnSelect => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.copy_on_select = !draft.copy_on_select;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::ToggleKeepSelectionOnCopy => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.keep_selection_on_copy = !draft.keep_selection_on_copy;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
             EditorAction::ToggleProjectPinned => {
                 if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
                     draft.pinned = !draft.pinned;
@@ -2020,6 +2080,9 @@ impl NativeShell {
         window: &mut Window,
         _: &mut Context<Self>,
     ) {
+        if self.add_project_wizard.is_some() {
+            return;
+        }
         self.focus_editor(window);
     }
 
@@ -2078,6 +2141,7 @@ impl NativeShell {
             false,
         );
         if changed {
+            wizard.name_focused = true;
             cx.notify();
             window.prevent_default();
         }
@@ -2949,6 +3013,9 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.add_project_wizard.is_some() {
+            return;
+        }
         self.focus_terminal(window);
         self.terminal_scroll_px = px(0.0);
 
@@ -3159,6 +3226,9 @@ impl NativeShell {
                 cx.notify();
             }
         }
+        if self.state.settings().copy_on_select {
+            let _ = self.copy_terminal_selection_to_clipboard(cx);
+        }
         self.is_selecting_terminal = false;
         self.last_terminal_mouse_report = None;
         window.prevent_default();
@@ -3175,23 +3245,25 @@ impl NativeShell {
         }
         let session_id = self.state.active_terminal_spec().session_id;
         let active_session = self.process_manager.active_session();
-        let mode = active_session.as_ref().map(|session| session.screen.mode);
+        let mode = active_session
+            .as_ref()
+            .map(|session| session.screen.mode)
+            .unwrap_or_default();
+        let binding_context = TerminalBindingContext {
+            has_selection: active_session
+                .as_ref()
+                .and_then(|session| self.selection_snapshot(session.screen.cols))
+                .is_some(),
+            bracketed_paste: mode.bracketed_paste,
+        };
+        let input_context = TerminalInputContext {
+            mode,
+            option_as_meta: self.state.settings().option_as_meta,
+        };
 
-        let key = event.keystroke.key.to_ascii_lowercase();
-        let modifiers = event.keystroke.modifiers;
-        let secondary = modifiers.control || modifiers.platform;
-        if secondary && key == "c" {
-            if let Some(text) = self.selected_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                window.prevent_default();
-                return;
-            }
-        }
-
-        let action = translate_key_event(event, mode);
+        let action = translate_key_event(event, binding_context);
 
         match action {
-            TerminalKeyAction::Ignore => {}
             TerminalKeyAction::CloseSession => {
                 if let Some(tab) = self.state.active_tab().cloned() {
                     self.close_tab_action(&tab.id, cx);
@@ -3201,20 +3273,29 @@ impl NativeShell {
                 window.prevent_default();
             }
             TerminalKeyAction::CopySelection => {
-                if let Some(text) = self.selected_text() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if self.copy_terminal_selection_to_clipboard(cx) {
                     window.prevent_default();
                 }
             }
             TerminalKeyAction::Paste => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    let _ = self.process_manager.paste_to_session(&session_id, &text);
+                if let Some(clipboard) = cx.read_from_clipboard() {
+                    match terminal_clipboard_payload(&clipboard) {
+                        Some(TerminalClipboardPayload::Text(text)) => {
+                            let _ = self.process_manager.paste_to_session(&session_id, &text);
+                        }
+                        Some(TerminalClipboardPayload::RawBytes(bytes)) => {
+                            let _ = self.process_manager.write_bytes_to_session(&session_id, &bytes);
+                        }
+                        None => {}
+                    }
                 }
                 window.prevent_default();
             }
-            TerminalKeyAction::Write(text) => {
-                let _ = self.process_manager.write_to_session(&session_id, &text);
-                window.prevent_default();
+            TerminalKeyAction::SendInput(input) => {
+                if let Some(text) = resolve_terminal_input_text(&input, input_context) {
+                    let _ = self.process_manager.write_to_session(&session_id, &text);
+                    window.prevent_default();
+                }
             }
         }
     }
@@ -3442,6 +3523,19 @@ impl NativeShell {
         Some(lines.join("\n"))
     }
 
+    fn copy_terminal_selection_to_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
+
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if !self.state.settings().keep_selection_on_copy {
+            self.terminal_selection = None;
+            cx.notify();
+        }
+        true
+    }
+
     fn sync_window_title(&mut self, window: &mut Window, runtime: &crate::state::RuntimeState) {
         let next_title = current_window_title(&self.state, runtime);
         if self.last_window_title.as_deref() == Some(next_title.as_str()) {
@@ -3513,6 +3607,14 @@ impl Render for NativeShell {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     this.sidebar_context_menu = None;
                     this.delete_project_action(&project_id, cx);
+                }))
+            };
+        let make_toggle_project_collapse_handler =
+            |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.state.toggle_project_collapsed(&project_id);
+                    this.save_session_state();
+                    cx.notify();
                 }))
             };
         let make_move_project_up_handler =
@@ -3751,6 +3853,13 @@ impl Render for NativeShell {
                             cx.notify();
                         }
                     }
+                    workspace::WizardAction::ClickName => {
+                        if let Some(wizard) = this.add_project_wizard.as_mut() {
+                            wizard.name_focused = true;
+                            wizard.cursor = wizard.name.len();
+                            cx.notify();
+                        }
+                    }
                     workspace::WizardAction::Configure => {
                         if let Some(wizard) = this.add_project_wizard.as_mut() {
                             // Populate defaults for step 2
@@ -3852,6 +3961,14 @@ impl Render for NativeShell {
         if updater_snapshot.is_busy() {
             window.request_animation_frame();
         }
+        if runtime_snapshot.sessions.values().any(|s| {
+            matches!(
+                s.ai_activity,
+                Some(crate::state::AiActivity::Thinking)
+            )
+        }) {
+            window.request_animation_frame();
+        }
 
         let terminal_actions = terminal_model.as_ref().and_then(|model| {
             model.runtime_controls.as_ref().map(|controls| {
@@ -3917,6 +4034,7 @@ impl Render for NativeShell {
                     on_select_ai_tab: &make_select_ai_handler,
                     on_restart_ai_tab: &make_restart_ai_handler,
                     on_close_ai_tab: &make_close_ai_handler,
+                    on_toggle_project_collapse: &make_toggle_project_collapse_handler,
                     on_move_project_up: &make_move_project_up_handler,
                     on_move_project_down: &make_move_project_down_handler,
                     on_toggle_context_menu: &make_toggle_context_menu_handler,
@@ -3927,6 +4045,7 @@ impl Render for NativeShell {
             .child(
                 div()
                     .flex_1()
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .child(if let Some(model) = editor_model.as_ref() {
@@ -3936,6 +4055,7 @@ impl Render for NativeShell {
 
                         div()
                             .flex_1()
+                            .overflow_hidden()
                             .track_focus(&self.editor_focus)
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -4014,12 +4134,60 @@ impl Render for NativeShell {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalKeyAction {
-    Ignore,
-    Write(String),
+    SendInput(TerminalInputAction),
     Paste,
     CopySelection,
     CloseSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalInputAction {
+    SendText(String),
+    SendKeystroke(Keystroke),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalClipboardPayload {
+    Text(String),
+    RawBytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct TerminalBindingContext {
+    has_selection: bool,
+    bracketed_paste: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalInputContext {
+    mode: crate::terminal::session::TerminalModeSnapshot,
+    option_as_meta: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalBindingSpec {
+    key: &'static str,
+    shortcut: TerminalShortcut,
+    selection: Option<bool>,
+    bracketed_paste: Option<bool>,
+    action: TerminalBindingOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalShortcut {
+    Secondary { shift: bool },
+    Control { shift: bool },
+    ShiftOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalBindingOutcome {
+    CloseSession,
+    CopySelection,
+    Paste,
+    SendText(&'static str),
 }
 
 fn ordered_selection(
@@ -4259,60 +4427,199 @@ fn terminal_endpoint_for_mouse(
 
 fn translate_key_event(
     event: &KeyDownEvent,
-    mode: Option<crate::terminal::session::TerminalModeSnapshot>,
+    context: TerminalBindingContext,
 ) -> TerminalKeyAction {
-    let key = event.keystroke.key.to_ascii_lowercase();
-    let modifiers = event.keystroke.modifiers;
-    let mode = mode.unwrap_or_default();
+    if let Some(action) = terminal_binding_action(&event.keystroke, context) {
+        return action;
+    }
 
+    TerminalKeyAction::SendInput(TerminalInputAction::SendKeystroke(event.keystroke.clone()))
+}
+
+// Keep terminal-specific raw text overrides separate from keystroke translation,
+// following the same SendText/SendKeystroke split Zed uses.
+fn terminal_binding_action(
+    keystroke: &Keystroke,
+    context: TerminalBindingContext,
+) -> Option<TerminalKeyAction> {
+    let key = keystroke.key.to_ascii_lowercase();
+
+    for binding in terminal_binding_specs() {
+        if binding.key != key {
+            continue;
+        }
+        if binding
+            .selection
+            .is_some_and(|required| required != context.has_selection)
+        {
+            continue;
+        }
+        if binding
+            .bracketed_paste
+            .is_some_and(|required| required != context.bracketed_paste)
+        {
+            continue;
+        }
+        if !binding.shortcut.matches(keystroke.modifiers) {
+            continue;
+        }
+
+        return Some(match binding.action {
+            TerminalBindingOutcome::CloseSession => TerminalKeyAction::CloseSession,
+            TerminalBindingOutcome::CopySelection => TerminalKeyAction::CopySelection,
+            TerminalBindingOutcome::Paste => TerminalKeyAction::Paste,
+            TerminalBindingOutcome::SendText(text) => {
+                TerminalKeyAction::SendInput(TerminalInputAction::SendText(text.to_string()))
+            }
+        });
+    }
+
+    None
+}
+
+fn resolve_terminal_input_text(
+    input: &TerminalInputAction,
+    context: TerminalInputContext,
+) -> Option<String> {
+    match input {
+        TerminalInputAction::SendText(text) => Some(text.clone()),
+        TerminalInputAction::SendKeystroke(keystroke) => {
+            translate_terminal_keystroke(keystroke, context)
+        }
+    }
+}
+
+fn terminal_clipboard_payload(clipboard: &ClipboardItem) -> Option<TerminalClipboardPayload> {
+    match clipboard.entries().first() {
+        Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
+            Some(TerminalClipboardPayload::RawBytes(vec![0x16]))
+        }
+        _ => clipboard.text().map(TerminalClipboardPayload::Text),
+    }
+}
+
+fn translate_terminal_keystroke(
+    keystroke: &Keystroke,
+    context: TerminalInputContext,
+) -> Option<String> {
+    let key = keystroke.key.to_ascii_lowercase();
+    let modifiers = keystroke.modifiers;
     let secondary = modifiers.control || modifiers.platform;
-    if secondary && modifiers.shift && key == "w" {
-        return TerminalKeyAction::CloseSession;
-    }
-    if secondary && modifiers.shift && key == "c" {
-        return TerminalKeyAction::CopySelection;
-    }
-    if secondary && key == "v" {
-        return TerminalKeyAction::Paste;
-    }
+    let alt_as_meta = terminal_option_as_meta_enabled(context.option_as_meta);
+    let alt_modifier = modifiers.alt && alt_as_meta;
 
     if modifiers.control && !modifiers.alt && !modifiers.platform {
         if let Some(control_char) = control_character(&key) {
-            return TerminalKeyAction::Write(control_char.to_string());
+            return Some(control_char.to_string());
         }
         if let Some(control_sequence) = control_symbol_sequence(&key) {
-            return TerminalKeyAction::Write(control_sequence);
+            return Some(control_sequence);
         }
     }
 
     if let Some(sequence) =
-        special_key_sequence(&key, modifiers.shift, modifiers.alt, secondary, mode)
+        special_key_sequence(&key, modifiers.shift, alt_modifier, secondary, context.mode)
     {
-        return TerminalKeyAction::Write(sequence);
+        return Some(sequence);
     }
 
     if key == "space" {
         if modifiers.control && !modifiers.alt && !modifiers.platform {
-            return TerminalKeyAction::Write("\u{0}".to_string());
+            return Some("\u{0}".to_string());
         }
-        if modifiers.alt && !secondary {
-            return TerminalKeyAction::Write("\u{1b} ".to_string());
+        if alt_modifier && !secondary {
+            return Some("\u{1b} ".to_string());
         }
-        if !secondary && !modifiers.alt {
-            return TerminalKeyAction::Write(" ".to_string());
+        if !secondary && !alt_modifier {
+            return Some(" ".to_string());
         }
     }
 
-    if let Some(text) = event.keystroke.key_char.clone() {
-        if modifiers.alt && !secondary {
-            return TerminalKeyAction::Write(format!("\u{1b}{text}"));
+    if let Some(text) = keystroke.key_char.clone() {
+        if alt_modifier && !secondary {
+            return Some(format!("\u{1b}{text}"));
         }
         if !secondary || modifiers.shift {
-            return TerminalKeyAction::Write(text);
+            return Some(text);
         }
     }
 
-    TerminalKeyAction::Ignore
+    None
+}
+
+fn terminal_binding_specs() -> &'static [TerminalBindingSpec] {
+    &[
+        TerminalBindingSpec {
+            key: "w",
+            shortcut: TerminalShortcut::Secondary { shift: true },
+            selection: None,
+            bracketed_paste: None,
+            action: TerminalBindingOutcome::CloseSession,
+        },
+        TerminalBindingSpec {
+            key: "c",
+            shortcut: TerminalShortcut::Secondary { shift: true },
+            selection: None,
+            bracketed_paste: None,
+            action: TerminalBindingOutcome::CopySelection,
+        },
+        TerminalBindingSpec {
+            key: "c",
+            shortcut: TerminalShortcut::Secondary { shift: false },
+            selection: Some(true),
+            bracketed_paste: None,
+            action: TerminalBindingOutcome::CopySelection,
+        },
+        TerminalBindingSpec {
+            key: "v",
+            shortcut: TerminalShortcut::Secondary { shift: false },
+            selection: None,
+            bracketed_paste: None,
+            action: TerminalBindingOutcome::Paste,
+        },
+        TerminalBindingSpec {
+            key: "enter",
+            shortcut: TerminalShortcut::Control { shift: false },
+            selection: None,
+            bracketed_paste: None,
+            action: TerminalBindingOutcome::SendText("\n"),
+        },
+        TerminalBindingSpec {
+            key: "enter",
+            shortcut: TerminalShortcut::ShiftOnly,
+            selection: None,
+            bracketed_paste: None,
+            action: TerminalBindingOutcome::SendText("\n"),
+        },
+    ]
+}
+
+impl TerminalShortcut {
+    fn matches(self, modifiers: Modifiers) -> bool {
+        match self {
+            Self::Secondary { shift } => {
+                (modifiers.control || modifiers.platform)
+                    && modifiers.shift == shift
+                    && !modifiers.alt
+            }
+            Self::Control { shift } => {
+                modifiers.control
+                    && !modifiers.platform
+                    && modifiers.shift == shift
+                    && !modifiers.alt
+            }
+            Self::ShiftOnly => {
+                modifiers.shift
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.alt
+            }
+        }
+    }
+}
+
+fn terminal_option_as_meta_enabled(option_as_meta: bool) -> bool {
+    !cfg!(target_os = "macos") || option_as_meta
 }
 
 fn control_character(key: &str) -> Option<char> {
@@ -4656,6 +4963,21 @@ fn active_tab_live_title(tab: &SessionTab, runtime: &crate::state::RuntimeState)
         .and_then(|session_id| runtime.sessions.get(session_id))
         .and_then(|session| session.title.as_deref())
         .and_then(normalize_optional_string)
+        .filter(|title| is_meaningful_title(title))
+}
+
+fn is_meaningful_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains("\\system32\\") || t.contains("/bin/") || t.contains("/usr/") {
+        return false;
+    }
+    if t.ends_with(".exe") && (t.contains('\\') || t.contains('/')) {
+        return false;
+    }
+    true
 }
 
 fn window_title_fallback_label(tab: &SessionTab, state: &AppState) -> String {
@@ -4680,15 +5002,7 @@ fn server_window_fallback_label(tab: &SessionTab, state: &AppState) -> String {
     let Some(lookup) = state.find_command(command_id) else {
         return command_id.to_string();
     };
-
-    let folder_prefix = if lookup.project.folders.len() > 1 {
-        format!("{} / ", lookup.folder.name)
-    } else {
-        String::new()
-    };
-    let command_label =
-        normalize_optional_string(&lookup.command.label).unwrap_or_else(|| command_id.to_string());
-    format!("{folder_prefix}{command_label}")
+    lookup.folder.name.clone()
 }
 
 fn dedupe_adjacent_segments(segments: Vec<String>) -> Vec<String> {
@@ -5462,5 +5776,127 @@ mod tests {
     fn alternate_scroll_uses_ss3_arrow_bytes() {
         assert_eq!(alt_scroll_bytes(-2), b"\x1bOA\x1bOA".to_vec());
         assert_eq!(alt_scroll_bytes(2), b"\x1bOB\x1bOB".to_vec());
+    }
+
+    fn key_down_event(source: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke::parse(source).expect("valid keystroke"),
+            is_held: false,
+        }
+    }
+
+    #[test]
+    fn ctrl_enter_binding_sends_raw_newline_text() {
+        let action = translate_key_event(&key_down_event("ctrl-enter"), TerminalBindingContext::default());
+
+        assert_eq!(
+            action,
+            TerminalKeyAction::SendInput(TerminalInputAction::SendText("\n".to_string()))
+        );
+    }
+
+    #[test]
+    fn plain_enter_uses_keystroke_path_and_stays_carriage_return() {
+        let action = translate_key_event(&key_down_event("enter"), TerminalBindingContext::default());
+
+        assert_eq!(
+            action,
+            TerminalKeyAction::SendInput(TerminalInputAction::SendKeystroke(
+                Keystroke::parse("enter").expect("enter keystroke"),
+            ))
+        );
+        assert_eq!(
+            resolve_terminal_input_text(
+                &TerminalInputAction::SendKeystroke(
+                    Keystroke::parse("enter").expect("enter keystroke"),
+                ),
+                TerminalInputContext {
+                    mode: Default::default(),
+                    option_as_meta: false,
+                },
+            ),
+            Some("\r".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_shortcuts_still_preserve_non_newline_actions() {
+        assert_eq!(
+            translate_key_event(&key_down_event("ctrl-v"), TerminalBindingContext::default()),
+            TerminalKeyAction::Paste
+        );
+        assert_eq!(
+            translate_key_event(&key_down_event("ctrl-shift-c"), TerminalBindingContext::default()),
+            TerminalKeyAction::CopySelection
+        );
+    }
+
+    #[test]
+    fn image_clipboard_payload_forwards_raw_ctrl_v() {
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3]);
+        let clipboard = ClipboardItem::new_image(&image);
+
+        assert_eq!(
+            terminal_clipboard_payload(&clipboard),
+            Some(TerminalClipboardPayload::RawBytes(vec![0x16]))
+        );
+    }
+
+    #[test]
+    fn shift_enter_binding_sends_raw_newline_text() {
+        let action =
+            translate_key_event(&key_down_event("shift-enter"), TerminalBindingContext::default());
+
+        assert_eq!(
+            action,
+            TerminalKeyAction::SendInput(TerminalInputAction::SendText("\n".to_string()))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_only_copies_when_selection_exists() {
+        assert_eq!(
+            translate_key_event(
+                &key_down_event("ctrl-c"),
+                TerminalBindingContext {
+                    has_selection: true,
+                    bracketed_paste: false,
+                },
+            ),
+            TerminalKeyAction::CopySelection
+        );
+        assert_eq!(
+            translate_key_event(&key_down_event("ctrl-c"), TerminalBindingContext::default()),
+            TerminalKeyAction::SendInput(TerminalInputAction::SendKeystroke(
+                Keystroke::parse("ctrl-c").expect("ctrl-c keystroke"),
+            ))
+        );
+    }
+
+    #[test]
+    fn option_as_meta_matches_zed_platform_behavior() {
+        let input = TerminalInputAction::SendKeystroke(Keystroke {
+            modifiers: Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            key: "a".to_string(),
+            key_char: Some("a".to_string()),
+        });
+
+        assert_eq!(
+            resolve_terminal_input_text(
+                &input,
+                TerminalInputContext {
+                    mode: Default::default(),
+                    option_as_meta: false,
+                },
+            ),
+            Some(if cfg!(target_os = "macos") {
+                "a".to_string()
+            } else {
+                "\u{1b}a".to_string()
+            })
+        );
     }
 }

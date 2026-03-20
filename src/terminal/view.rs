@@ -86,7 +86,7 @@ pub fn render_terminal_surface(
         .session
         .as_ref()
         .map(|s| session_status_label(s, is_ai_tab))
-        .unwrap_or("saved");
+        .unwrap_or(if is_ai_tab { "saved" } else { "" });
     let status_color = model
         .session
         .as_ref()
@@ -96,6 +96,7 @@ pub fn render_terminal_surface(
         .session
         .as_ref()
         .and_then(|session| session.runtime.title.clone())
+        .filter(|title| is_meaningful_title(title))
         .unwrap_or_else(|| model.session_label.clone());
     let header_title = if model.active_project.is_empty() || session_title == model.active_project {
         session_title
@@ -301,7 +302,7 @@ fn render_empty_body(message: String) -> impl IntoElement {
 fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
     let session = model.session.as_ref()?;
 
-    if let Some(_) = session.runtime.resources.last_sample_at {
+    if session.runtime.status.is_live() && session.runtime.resources.last_sample_at.is_some() {
         let mem_mb = session.runtime.resources.memory_bytes / 1024 / 1024;
         let cpu = session.runtime.resources.cpu_percent;
         let procs = session.runtime.resources.process_count;
@@ -882,6 +883,20 @@ fn line_selection_range(
     };
 
     (start < end).then_some((start, end))
+}
+
+fn is_meaningful_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains("\\system32\\") || t.contains("/bin/") || t.contains("/usr/") {
+        return false;
+    }
+    if t.ends_with(".exe") && (t.contains('\\') || t.contains('/')) {
+        return false;
+    }
+    true
 }
 
 fn session_status_label(session: &TerminalSessionView, is_ai_tab: bool) -> &'static str {

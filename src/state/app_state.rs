@@ -3,6 +3,7 @@ use crate::models::{
     Settings, TabType,
 };
 use crate::persistence::WorkspaceSnapshot;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,7 @@ pub struct AppState {
     pub open_tabs: Vec<SessionTab>,
     pub active_tab_id: Option<String>,
     pub sidebar_collapsed: bool,
+    pub collapsed_projects: BTreeSet<String>,
 }
 
 impl Default for AppState {
@@ -48,6 +50,7 @@ impl AppState {
             open_tabs: session.open_tabs,
             active_tab_id: session.active_tab_id,
             sidebar_collapsed: session.sidebar_collapsed,
+            collapsed_projects: session.collapsed_projects.into_iter().collect(),
         }
     }
 
@@ -56,7 +59,18 @@ impl AppState {
             open_tabs: self.open_tabs.clone(),
             active_tab_id: self.active_tab_id.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
+            collapsed_projects: self.collapsed_projects.iter().cloned().collect(),
         }
+    }
+
+    pub fn toggle_project_collapsed(&mut self, project_id: &str) {
+        if !self.collapsed_projects.remove(project_id) {
+            self.collapsed_projects.insert(project_id.to_string());
+        }
+    }
+
+    pub fn is_project_collapsed(&self, project_id: &str) -> bool {
+        self.collapsed_projects.contains(project_id)
     }
 
     pub fn projects(&self) -> &[Project] {
@@ -657,7 +671,7 @@ impl AppState {
                     return ActiveTerminalSpec {
                         session_id: command_id.to_string(),
                         cwd,
-                        display_label: lookup.command.label.clone(),
+                        display_label: lookup.folder.name.clone(),
                     };
                 }
             }

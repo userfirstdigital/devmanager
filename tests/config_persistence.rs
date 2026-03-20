@@ -42,6 +42,9 @@ fn native_config_edits_round_trip_through_disk() {
     settings.notification_sound = Some("chord".to_string());
     settings.restore_session_on_start = Some(false);
     settings.terminal_font_size = Some(16);
+    settings.option_as_meta = true;
+    settings.copy_on_select = true;
+    settings.keep_selection_on_copy = false;
     state.update_settings(settings);
 
     state.upsert_project(Project {
@@ -118,6 +121,9 @@ fn native_config_edits_round_trip_through_disk() {
     );
     assert_eq!(reloaded.settings.restore_session_on_start, Some(false));
     assert_eq!(reloaded.settings.terminal_font_size, Some(16));
+    assert!(reloaded.settings.option_as_meta);
+    assert!(reloaded.settings.copy_on_select);
+    assert!(!reloaded.settings.keep_selection_on_copy);
 
     let project = reloaded
         .projects

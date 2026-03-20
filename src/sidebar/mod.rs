@@ -71,6 +71,8 @@ pub struct SidebarActions<'a> {
     pub on_restart_ai_tab:
         &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_close_ai_tab: &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_toggle_project_collapse:
+        &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_move_project_up:
         &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_move_project_down:
@@ -190,7 +192,7 @@ fn render_expanded_sidebar(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(1.0))
+                        .gap(px(4.0))
                         .children(
                             state
                                 .projects()
@@ -201,6 +203,7 @@ fn render_expanded_sidebar(
                 )
                 .child(
                     div()
+                        .pt(px(6.0))
                         .flex()
                         .flex_col()
                         .gap(px(1.0))
@@ -247,12 +250,13 @@ fn render_project_group(
         .active_project()
         .map(|active| active.id == project.id)
         .unwrap_or(false);
+    let collapsed = state.is_project_collapsed(&project.id);
     let claude_rows = state
         .ai_tabs_for_project(&project.id, crate::models::TabType::Claude)
-        .map(|tab| render_ai_row(state, runtime, tab, actions));
+        .map(|tab| render_ai_row(state, runtime, tab, project_accent, actions));
     let codex_rows = state
         .ai_tabs_for_project(&project.id, crate::models::TabType::Codex)
-        .map(|tab| render_ai_row(state, runtime, tab, actions));
+        .map(|tab| render_ai_row(state, runtime, tab, project_accent, actions));
     let has_visible_folders = project
         .folders
         .iter()
@@ -261,7 +265,7 @@ fn render_project_group(
         .folders
         .iter()
         .filter(|folder| !folder.hidden.unwrap_or(false))
-        .map(|folder| render_folder_group(state, runtime, project, folder, actions));
+        .map(|folder| render_folder_group(state, runtime, project, folder, project_accent, actions));
     let ai_launch_row = div()
         .flex()
         .items_center()
@@ -288,11 +292,16 @@ fn render_project_group(
         Some(SidebarContextMenu::Project { ref project_id }) if *project_id == project.id
     );
 
-    div()
+    let chevron_icon = if collapsed {
+        icons::CHEVRON_RIGHT
+    } else {
+        icons::CHEVRON_DOWN
+    };
+
+    let mut group = div()
         .flex()
         .flex_col()
         .gap(px(1.0))
-        .pb(px(4.0))
         .child(
             div()
                 .group("project-row")
@@ -301,7 +310,7 @@ fn render_project_group(
                 .justify_between()
                 .gap(px(4.0))
                 .px_2()
-                .py(px(4.0))
+                .py(px(5.0))
                 .rounded_sm()
                 .cursor_pointer()
                 .bg(rgb(if is_active_project {
@@ -310,12 +319,16 @@ fn render_project_group(
                     theme::SIDEBAR_BG
                 }))
                 .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    (actions.on_toggle_project_collapse)(project.id.clone()),
+                )
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(5.0))
-                        .child(icons::app_icon(icons::CHEVRON_DOWN, 10.0, theme::TEXT_DIM))
+                        .child(icons::app_icon(chevron_icon, 10.0, theme::TEXT_DIM))
                         .child(div().size(px(6.0)).rounded_full().bg(rgb(project_accent)))
                         .child(
                             div()
@@ -388,20 +401,28 @@ fn render_project_group(
                 .into_any_element(),
             );
             context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
-        }))
-        .children(
-            (!has_visible_folders).then(|| empty_state_with_indent("No folders configured.", 14.0)),
-        )
-        .children(folder_rows)
-        .children(claude_rows)
-        .children(codex_rows)
-        .child(ai_launch_row)
+        }));
+
+    if !collapsed {
+        group = group
+            .children(
+                (!has_visible_folders)
+                    .then(|| empty_state_with_indent("No folders configured.", 14.0)),
+            )
+            .children(folder_rows)
+            .children(claude_rows)
+            .children(codex_rows)
+            .child(ai_launch_row);
+    }
+
+    group
 }
 
 fn render_ai_row(
     state: &AppState,
     runtime: &RuntimeState,
     tab: &SessionTab,
+    project_accent: u32,
     actions: &SidebarActions<'_>,
 ) -> impl IntoElement {
     let session = tab
@@ -409,11 +430,28 @@ fn render_ai_row(
         .as_deref()
         .and_then(|session_id| runtime.sessions.get(session_id));
     let is_active = state.active_tab_id.as_deref() == Some(tab.id.as_str());
-    let label = state.tab_label(tab);
+    let label = session
+        .and_then(|s| s.title.clone())
+        .filter(|t| is_meaningful_title(t))
+        .map(|t| truncate_label(&t, 20))
+        .unwrap_or_else(|| state.tab_label(tab));
     let status_label = ai_status_label(session);
     let status_color = ai_status_color(session, tab);
+    let show_ready_light = ai_ready_light_visible(session);
+    let is_thinking = session.is_some_and(|s| {
+        matches!(s.ai_activity, Some(crate::state::AiActivity::Thinking))
+    });
+    let icon_opacity = if is_thinking {
+        let elapsed_ms = session
+            .and_then(|s| s.thinking_since)
+            .map(|since| since.elapsed().as_millis() as f32)
+            .unwrap_or(0.0);
+        0.35 + 0.65 * (elapsed_ms / 800.0 * std::f32::consts::PI).sin().abs()
+    } else {
+        1.0
+    };
 
-    div()
+    let mut row = div()
         .group("ai-row")
         .flex()
         .items_center()
@@ -429,7 +467,13 @@ fn render_ai_row(
         } else {
             theme::SIDEBAR_BG
         }))
-        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)));
+
+    if is_active {
+        row = row.border_l_2().border_color(rgb(project_accent));
+    }
+
+    row
         .child(
             div()
                 .flex()
@@ -439,19 +483,21 @@ fn render_ai_row(
                     MouseButton::Left,
                     (actions.on_select_ai_tab)(tab.id.clone()),
                 )
-                .child(match tab.tab_type {
-                    crate::models::TabType::Claude => {
-                        icons::app_icon(icons::SPARKLES, 10.0, status_color).into_any_element()
-                    }
-                    crate::models::TabType::Codex => {
-                        icons::app_icon(icons::BOT, 10.0, status_color).into_any_element()
-                    }
-                    _ => div()
-                        .size(px(6.0))
-                        .rounded_full()
-                        .bg(rgb(status_color))
-                        .into_any_element(),
-                })
+                .child(
+                    div().opacity(icon_opacity).child(match tab.tab_type {
+                        crate::models::TabType::Claude => {
+                            icons::app_icon(icons::SPARKLES, 10.0, status_color).into_any_element()
+                        }
+                        crate::models::TabType::Codex => {
+                            icons::app_icon(icons::BOT, 10.0, status_color).into_any_element()
+                        }
+                        _ => div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(status_color))
+                            .into_any_element(),
+                    }),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -467,6 +513,13 @@ fn render_ai_row(
                 .flex()
                 .items_center()
                 .gap(px(4.0))
+                .children(show_ready_light.then(|| {
+                    div()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(rgb(theme::SUCCESS_TEXT))
+                        .into_any_element()
+                }))
                 .child(
                     div()
                         .text_xs()
@@ -498,6 +551,7 @@ fn render_folder_group(
     runtime: &RuntimeState,
     project: &crate::models::Project,
     folder: &crate::models::ProjectFolder,
+    project_accent: u32,
     actions: &SidebarActions<'_>,
 ) -> AnyElement {
     if folder.commands.len() == 1 {
@@ -507,6 +561,7 @@ fn render_folder_group(
             project,
             folder,
             &folder.commands[0],
+            project_accent,
             actions,
         )
         .into_any_element();
@@ -515,7 +570,7 @@ fn render_folder_group(
     let command_rows = folder
         .commands
         .iter()
-        .map(|command| render_command_row(state, runtime, project, folder, command, actions));
+        .map(|command| render_command_row(state, runtime, project, folder, command, project_accent, actions));
 
     let menu_open = matches!(
         actions.open_context_menu,
@@ -609,6 +664,7 @@ fn render_single_command_folder_row(
     project: &crate::models::Project,
     folder: &crate::models::ProjectFolder,
     command: &crate::models::RunCommand,
+    project_accent: u32,
     actions: &SidebarActions<'_>,
 ) -> impl IntoElement {
     let session = runtime.sessions.get(&command.id);
@@ -622,27 +678,33 @@ fn render_single_command_folder_row(
             if *project_id == project.id && *folder_id == folder.id && *command_id == command.id
     );
 
+    let mut inner_row = div()
+        .group("folder-row")
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(4.0))
+        .pr_2()
+        .py(px(2.0))
+        .rounded_sm()
+        .cursor_pointer()
+        .bg(rgb(if is_active {
+            theme::PROJECT_ROW_BG
+        } else {
+            theme::SIDEBAR_BG
+        }))
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)));
+
+    if is_active {
+        inner_row = inner_row.border_l_2().border_color(rgb(project_accent));
+    }
+
     div()
         .flex()
         .flex_col()
         .pl_4()
         .child(
-            div()
-                .group("folder-row")
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(4.0))
-                .pr_2()
-                .py(px(2.0))
-                .rounded_sm()
-                .cursor_pointer()
-                .bg(rgb(if is_active {
-                    theme::PROJECT_ROW_BG
-                } else {
-                    theme::SIDEBAR_BG
-                }))
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+            inner_row
                 .child(
                     div()
                         .flex()
@@ -755,6 +817,7 @@ fn render_command_row(
     _project: &crate::models::Project,
     _folder: &crate::models::ProjectFolder,
     command: &crate::models::RunCommand,
+    project_accent: u32,
     actions: &SidebarActions<'_>,
 ) -> impl IntoElement {
     let session = runtime.sessions.get(&command.id);
@@ -776,27 +839,33 @@ fn render_command_row(
         Some(SidebarContextMenu::Command { ref command_id }) if *command_id == command.id
     );
 
+    let mut cmd_row = div()
+        .group("command-row")
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(4.0))
+        .pl_5()
+        .pr_2()
+        .py(px(2.0))
+        .rounded_sm()
+        .cursor_pointer()
+        .bg(rgb(if is_active {
+            theme::PROJECT_ROW_BG
+        } else {
+            theme::SIDEBAR_BG
+        }))
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)));
+
+    if is_active {
+        cmd_row = cmd_row.border_l_2().border_color(rgb(project_accent));
+    }
+
     div()
         .flex()
         .flex_col()
         .child(
-            div()
-                .group("command-row")
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(4.0))
-                .pl_5()
-                .pr_2()
-                .py(px(2.0))
-                .rounded_sm()
-                .cursor_pointer()
-                .bg(rgb(if is_active {
-                    theme::PROJECT_ROW_BG
-                } else {
-                    theme::SIDEBAR_BG
-                }))
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+            cmd_row
                 .child(
                     div()
                         .flex()
@@ -1235,6 +1304,10 @@ fn ai_status_color(session: Option<&SessionRuntimeState>, tab: &SessionTab) -> u
     }
 }
 
+fn ai_ready_light_visible(session: Option<&SessionRuntimeState>) -> bool {
+    session.is_some_and(|session| session.unseen_ready)
+}
+
 fn ssh_status_label(
     tab: Option<&SessionTab>,
     session: Option<&SessionRuntimeState>,
@@ -1248,6 +1321,30 @@ fn ssh_status_label(
         SessionStatus::Stopped | SessionStatus::Exited => "disconnected",
         status => status_label(status),
     }
+}
+
+fn truncate_label(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        text.to_string()
+    } else {
+        format!("{}\u{2026}", chars[..max].iter().collect::<String>())
+    }
+}
+
+fn is_meaningful_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Filter out raw shell paths like "C:\WINDOWS\system32\cmd.exe" or "/bin/bash"
+    if t.contains("\\system32\\") || t.contains("/bin/") || t.contains("/usr/") {
+        return false;
+    }
+    if t.ends_with(".exe") && (t.contains('\\') || t.contains('/')) {
+        return false;
+    }
+    true
 }
 
 fn ssh_status_color(tab: Option<&SessionTab>, session: Option<&SessionRuntimeState>) -> u32 {
@@ -1330,4 +1427,60 @@ fn context_menu_panel(
             ),
     )
     .with_priority(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::TabType;
+    use crate::state::{AiActivity, SessionKind};
+    use crate::terminal::session::TerminalBackend;
+    use std::path::PathBuf;
+
+    fn ai_tab() -> SessionTab {
+        SessionTab {
+            id: "tab-1".to_string(),
+            tab_type: TabType::Claude,
+            project_id: "project-1".to_string(),
+            command_id: None,
+            pty_session_id: Some("session-1".to_string()),
+            label: Some("Claude".to_string()),
+            ssh_connection_id: None,
+        }
+    }
+
+    fn ai_session() -> SessionRuntimeState {
+        let mut session = SessionRuntimeState::new(
+            "session-1",
+            PathBuf::from("."),
+            crate::state::SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.session_kind = SessionKind::Claude;
+        session.status = SessionStatus::Running;
+        session.ai_activity = Some(AiActivity::Idle);
+        session
+    }
+
+    #[test]
+    fn ready_ai_rows_show_ready_dot_and_success_label() {
+        let mut session = ai_session();
+        let tab = ai_tab();
+        session.unseen_ready = true;
+
+        assert_eq!(ai_status_label(Some(&session)), "ready");
+        assert_eq!(ai_status_color(Some(&session), &tab), theme::SUCCESS_TEXT);
+        assert!(ai_ready_light_visible(Some(&session)));
+    }
+
+    #[test]
+    fn thinking_ai_rows_keep_warning_color_without_ready_dot() {
+        let mut session = ai_session();
+        let tab = ai_tab();
+        session.ai_activity = Some(AiActivity::Thinking);
+
+        assert_eq!(ai_status_label(Some(&session)), "thinking");
+        assert_eq!(ai_status_color(Some(&session), &tab), theme::WARNING_TEXT);
+        assert!(!ai_ready_light_visible(Some(&session)));
+    }
 }

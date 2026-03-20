@@ -1683,24 +1683,18 @@ fn build_server_log_file_path(
         .map(|value| value.to_string_lossy().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "server".to_string());
-    let slug = format!("{folder_name}-{}", command.label)
+    let slug = folder_name
         .to_lowercase()
         .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>()
         .trim_matches('-')
         .to_string();
 
     let file_name = if slug.is_empty() {
-        "server.log".to_string()
+        "log-server.log".to_string()
     } else {
-        format!("{slug}.log")
+        format!("log-{slug}.log")
     };
     Some(root.join(file_name))
 }
@@ -2145,6 +2139,7 @@ mod tests {
             open_tabs: Vec::new(),
             active_tab_id: None,
             sidebar_collapsed: false,
+            collapsed_projects: std::collections::BTreeSet::new(),
         }
     }
 

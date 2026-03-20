@@ -3,6 +3,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+const AI_ACTIVITY_BURST_WINDOW: Duration = Duration::from_secs(1);
+const AI_ACTIVITY_MIN_BURST_EVENTS: u8 = 3;
+const AI_IDLE_GRACE_PERIOD: Duration = Duration::from_secs(3);
+const AI_BACKGROUND_READY_THRESHOLD: Duration = Duration::from_secs(30);
+const AI_FOREGROUND_READY_THRESHOLD: Duration = Duration::from_secs(60);
+const AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionStatus {
     #[default]
@@ -198,6 +205,7 @@ pub struct SessionRuntimeState {
     pub last_output_at: Option<Instant>,
     pub thinking_since: Option<Instant>,
     pub unseen_ready: bool,
+    suppress_activity_until: Option<Instant>,
     last_output_event_at: Option<Instant>,
     output_burst_count: u8,
 }
@@ -240,6 +248,7 @@ impl SessionRuntimeState {
             last_output_at: None,
             thinking_since: None,
             unseen_ready: false,
+            suppress_activity_until: None,
             last_output_event_at: None,
             output_burst_count: 0,
         }
@@ -268,21 +277,30 @@ impl SessionRuntimeState {
     }
 
     pub fn note_output_activity(&mut self) {
+        self.note_output_activity_at(Instant::now());
+    }
+
+    fn note_output_activity_at(&mut self, now: Instant) {
         if !self.session_kind.is_ai() {
             return;
         }
 
-        let now = Instant::now();
+        if self.ai_activity_is_suppressed(now) {
+            return;
+        }
+
         self.last_output_at = Some(now);
         self.output_burst_count = match self.last_output_event_at {
-            Some(previous) if now.duration_since(previous) <= Duration::from_secs(1) => {
+            Some(previous) if now.duration_since(previous) <= AI_ACTIVITY_BURST_WINDOW => {
                 self.output_burst_count.saturating_add(1)
             }
             _ => 1,
         };
         self.last_output_event_at = Some(now);
 
-        if self.output_burst_count >= 3 && self.ai_activity != Some(AiActivity::Thinking) {
+        if self.output_burst_count >= AI_ACTIVITY_MIN_BURST_EVENTS
+            && self.ai_activity != Some(AiActivity::Thinking)
+        {
             self.ai_activity = Some(AiActivity::Thinking);
             self.thinking_since = Some(now);
             self.mark_dirty();
@@ -312,6 +330,9 @@ impl SessionRuntimeState {
     pub fn note_resize(&mut self, dimensions: SessionDimensions) {
         self.dimensions = dimensions;
         self.metrics.resize_events = self.metrics.resize_events.saturating_add(1);
+        if self.session_kind.is_ai() {
+            self.suppress_ai_activity_for(AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE);
+        }
         self.mark_dirty();
     }
 
@@ -341,6 +362,7 @@ impl SessionRuntimeState {
         if self.session_kind.is_ai() {
             self.ai_activity = Some(AiActivity::Idle);
             self.thinking_since = None;
+            self.suppress_activity_until = None;
             self.last_output_event_at = None;
             self.output_burst_count = 0;
         }
@@ -348,9 +370,10 @@ impl SessionRuntimeState {
     }
 
     pub fn note_start(&mut self, pid: Option<u32>) {
+        let now = Instant::now();
         self.pid = pid;
         self.status = SessionStatus::Running;
-        self.started_at = Some(Instant::now());
+        self.started_at = Some(now);
         self.exit = None;
         self.exit_code = None;
         self.resources = ResourceSnapshot::default();
@@ -361,6 +384,9 @@ impl SessionRuntimeState {
             self.ai_activity = Some(AiActivity::Idle);
             self.thinking_since = None;
             self.unseen_ready = false;
+            self.suppress_ai_activity_until(now + AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE);
+        } else {
+            self.suppress_activity_until = None;
         }
         self.mark_dirty();
     }
@@ -381,6 +407,7 @@ impl SessionRuntimeState {
         self.ai_activity = None;
         self.tab_id = None;
         self.unseen_ready = false;
+        self.suppress_activity_until = None;
         self.mark_dirty();
     }
 
@@ -397,6 +424,7 @@ impl SessionRuntimeState {
         self.last_output_at = None;
         self.thinking_since = None;
         self.unseen_ready = false;
+        self.suppress_activity_until = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
         self.mark_dirty();
@@ -415,6 +443,7 @@ impl SessionRuntimeState {
         self.last_output_at = None;
         self.thinking_since = None;
         self.unseen_ready = false;
+        self.suppress_activity_until = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
         self.mark_dirty();
@@ -440,7 +469,7 @@ impl SessionRuntimeState {
             return AiIdleTransition::NoChange;
         };
 
-        if now.duration_since(last_output_at) < Duration::from_secs(3) {
+        if now.duration_since(last_output_at) < AI_IDLE_GRACE_PERIOD {
             return AiIdleTransition::NoChange;
         }
 
@@ -455,17 +484,40 @@ impl SessionRuntimeState {
         self.last_output_event_at = None;
         self.output_burst_count = 0;
 
-        if is_background && thinking_duration >= Duration::from_secs(30) {
+        if is_background && thinking_duration >= AI_BACKGROUND_READY_THRESHOLD {
             self.unseen_ready = true;
             self.mark_dirty();
             return AiIdleTransition::BackgroundReady;
         }
 
         self.mark_dirty();
-        if !is_background && thinking_duration >= Duration::from_secs(60) {
+        if !is_background && thinking_duration >= AI_FOREGROUND_READY_THRESHOLD {
             AiIdleTransition::ForegroundReady
         } else {
             AiIdleTransition::NoChange
+        }
+    }
+
+    fn ai_activity_is_suppressed(&mut self, now: Instant) -> bool {
+        match self.suppress_activity_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.suppress_activity_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn suppress_ai_activity_for(&mut self, duration: Duration) {
+        self.suppress_ai_activity_until(Instant::now() + duration);
+    }
+
+    fn suppress_ai_activity_until(&mut self, until: Instant) {
+        if self.session_kind.is_ai() {
+            self.suppress_activity_until = Some(until);
+        } else {
+            self.suppress_activity_until = None;
         }
     }
 }
@@ -501,6 +553,26 @@ pub use SessionStatus as ProcessStatus;
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn test_ai_session() -> SessionRuntimeState {
+        let mut session = SessionRuntimeState::new(
+            "session-1",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.configure_ai(AiLaunchSpec {
+            tab_id: "tab-1".to_string(),
+            project_id: "project-1".to_string(),
+            tool: SessionKind::Claude,
+            cwd: PathBuf::from("."),
+            shell_program: "bash".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        });
+        session.status = SessionStatus::Running;
+        session
+    }
 
     #[test]
     fn note_start_and_exit_clear_stale_resource_metrics() {
@@ -545,5 +617,66 @@ mod tests {
         assert_eq!(session.resources.process_count, 0);
         assert!(session.resources.process_ids.is_empty());
         assert!(session.resources.last_sample_at.is_none());
+    }
+
+    #[test]
+    fn resize_suppression_blocks_ai_activity_until_window_expires() {
+        let mut session = test_ai_session();
+        let base = Instant::now();
+
+        session.suppress_ai_activity_until(base + AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE);
+        session.note_output_activity_at(base + Duration::from_millis(100));
+        session.note_output_activity_at(base + Duration::from_millis(200));
+        session.note_output_activity_at(base + Duration::from_millis(300));
+
+        assert_eq!(session.ai_activity, Some(AiActivity::Idle));
+        assert!(session.last_output_at.is_none());
+
+        let resume_at = base + AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE;
+        session.note_output_activity_at(resume_at + Duration::from_millis(10));
+        session.note_output_activity_at(resume_at + Duration::from_millis(20));
+        session.note_output_activity_at(resume_at + Duration::from_millis(30));
+
+        assert_eq!(session.ai_activity, Some(AiActivity::Thinking));
+        assert!(session.last_output_at.is_some());
+    }
+
+    #[test]
+    fn background_ready_transition_sets_badge_after_long_thinking() {
+        let mut session = test_ai_session();
+        let base = Instant::now();
+
+        session.note_output_activity_at(base + Duration::from_millis(100));
+        session.note_output_activity_at(base + Duration::from_millis(200));
+        session.note_output_activity_at(base + Duration::from_millis(300));
+
+        let transition = session.reconcile_ai_idle(
+            Some("different-session"),
+            base + AI_BACKGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD,
+        );
+
+        assert_eq!(transition, AiIdleTransition::BackgroundReady);
+        assert_eq!(session.ai_activity, Some(AiActivity::Idle));
+        assert!(session.unseen_ready);
+    }
+
+    #[test]
+    fn foreground_ready_transition_plays_sound_without_badge() {
+        let mut session = test_ai_session();
+        let base = Instant::now();
+        let session_id = session.session_id.clone();
+
+        session.note_output_activity_at(base + Duration::from_millis(100));
+        session.note_output_activity_at(base + Duration::from_millis(200));
+        session.note_output_activity_at(base + Duration::from_millis(300));
+
+        let transition = session.reconcile_ai_idle(
+            Some(session_id.as_str()),
+            base + AI_FOREGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD,
+        );
+
+        assert_eq!(transition, AiIdleTransition::ForegroundReady);
+        assert_eq!(session.ai_activity, Some(AiActivity::Idle));
+        assert!(!session.unseen_ready);
     }
 }

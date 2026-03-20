@@ -102,11 +102,12 @@ The GitHub-hosted updater flow assumes public release assets. If releases are pr
 
 `.github/workflows/release.yml` now packages the native crate directly and publishes GitHub Releases on every push to `native`.
 
-- The root crate version in `Cargo.toml` is the source of truth.
-- Each push derives a CI release version like `0.2.0-dev.<run_number>` from that base version without committing a version bump back to the repo.
+- The workflow looks at the latest stable `vX.Y.Z` tag (or falls back to `Cargo.toml` when there is no tag yet) and releases the next patch version.
+- The prepare job writes that release version back into `Cargo.toml` and `Cargo.lock`, then commits the bump back to `native` with `[skip ci]` before the platform builds run.
 - Windows builds publish signed `nsis` installers.
 - macOS builds publish signed updater bundles (`app`) plus `dmg` artifacts.
 - The workflow uploads packaged artifacts and a generated `latest.json` manifest to the GitHub Release for the current push.
+- The first push to `native` can create a real public release immediately if the required secrets and variables are already configured.
 
 ## Required GitHub Secrets And Variables
 
@@ -116,6 +117,8 @@ Set these before relying on the release workflow or the packaged updater:
 - Secret: `CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD`
 - Variable: `DEVMANAGER_UPDATE_PUBKEY`
 
+Also make sure the `native` branch allows the workflow bot to push the automated version-bump commit back to the branch.
+
 Generate the signing pair with the packager signer:
 
 ```powershell
@@ -123,6 +126,16 @@ cargo packager signer generate
 ```
 
 Use the generated private key for release signing and embed the public key into packaged builds via `DEVMANAGER_UPDATE_PUBKEY`.
+
+## First Release Smoke Check
+
+After the first push to `native`, verify:
+
+- a new `vX.Y.Z` tag was created at the workflow-produced version
+- the GitHub Release contains Windows installer assets, macOS updater assets, and `latest.json`
+- the updater-ready assets each have matching `.sig` files
+- `latest.json` points at the uploaded asset names and includes the expected platform entries
+- the app detects the release, downloads it, and shows the restart/install prompt
 
 ## Notes
 

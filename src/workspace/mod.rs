@@ -29,6 +29,7 @@ pub struct AddProjectWizard {
     pub color: String,
     pub root_path: String,
     pub cursor: usize,
+    pub name_focused: bool,
     pub step: u8,
     pub scan_entries: Vec<RootScanEntry>,
     pub selected_folders: std::collections::BTreeSet<String>,
@@ -43,6 +44,7 @@ impl Default for AddProjectWizard {
             color: PROJECT_COLOR_PRESETS[0].1.to_string(),
             root_path: String::new(),
             cursor: 0,
+            name_focused: false,
             step: 1,
             scan_entries: Vec::new(),
             selected_folders: Default::default(),
@@ -58,6 +60,7 @@ pub enum WizardAction {
     Create,
     Configure,
     Back,
+    ClickName,
     SelectColor(String),
     PickRootFolder,
     ToggleFolder(String),
@@ -89,20 +92,20 @@ fn render_wizard_step1(wizard: &AddProjectWizard, actions: WizardActions<'_>) ->
     let on_cancel = (actions.on_action)(WizardAction::Cancel);
     let on_configure = (actions.on_action)(WizardAction::Configure);
     let on_pick_root = (actions.on_action)(WizardAction::PickRootFolder);
+    let on_click_name = (actions.on_action)(WizardAction::ClickName);
 
-    let display_name = display_text_with_cursor(
-        if wizard.name.is_empty() {
-            "My App"
+    let focused = wizard.name_focused;
+    let display_name = if focused || !wizard.name.is_empty() {
+        let text = if wizard.name.is_empty() {
+            ""
         } else {
             &wizard.name
-        },
-        if wizard.name.is_empty() {
-            6
-        } else {
-            wizard.cursor
-        },
-    );
-    let name_is_placeholder = wizard.name.is_empty();
+        };
+        display_text_with_cursor(text, wizard.cursor)
+    } else {
+        "My App".to_string()
+    };
+    let name_is_placeholder = wizard.name.is_empty() && !focused;
 
     deferred(
         anchored()
@@ -183,14 +186,20 @@ fn render_wizard_step1(wizard: &AddProjectWizard, actions: WizardActions<'_>) ->
                                                     .rounded_sm()
                                                     .bg(rgb(theme::APP_BG))
                                                     .border_1()
-                                                    .border_color(rgb(theme::PRIMARY))
+                                                    .border_color(rgb(if focused {
+                                                        theme::PRIMARY
+                                                    } else {
+                                                        theme::BORDER_SECONDARY
+                                                    }))
                                                     .text_sm()
                                                     .text_color(rgb(if name_is_placeholder {
                                                         theme::TEXT_SUBTLE
                                                     } else {
                                                         theme::TEXT_PRIMARY
                                                     }))
-                                                    .child(SharedString::from(display_name)),
+                                                    .cursor_text()
+                                                    .child(SharedString::from(display_name))
+                                                    .on_mouse_down(MouseButton::Left, on_click_name),
                                             ),
                                     )
                                     // Color picker
@@ -1024,6 +1033,9 @@ pub struct SettingsDraft {
     pub minimize_to_tray: bool,
     pub restore_session_on_start: bool,
     pub terminal_font_size: String,
+    pub option_as_meta: bool,
+    pub copy_on_select: bool,
+    pub keep_selection_on_copy: bool,
     pub open_picker: Option<SettingsPicker>,
 }
 
@@ -1221,6 +1233,9 @@ pub enum EditorAction {
     ToggleConfirmOnClose,
     ToggleMinimizeToTray,
     ToggleRestoreSession,
+    ToggleOptionAsMeta,
+    ToggleCopyOnSelect,
+    ToggleKeepSelectionOnCopy,
     ToggleProjectPinned,
     ToggleProjectSaveLogs,
     ToggleFolderHidden,
@@ -1620,6 +1635,24 @@ fn render_settings_panel(
                     terminal_options,
                 ))
                 .child(render_settings_font_size_row(draft, actions))
+                .child(render_settings_toggle_row(
+                    "Option acts as Meta",
+                    "On macOS, treat Option as terminal Meta/Alt instead of character input",
+                    draft.option_as_meta,
+                    (actions.on_action)(EditorAction::ToggleOptionAsMeta),
+                ))
+                .child(render_settings_toggle_row(
+                    "Copy on select",
+                    "Copy terminal selections to the clipboard when you release the mouse",
+                    draft.copy_on_select,
+                    (actions.on_action)(EditorAction::ToggleCopyOnSelect),
+                ))
+                .child(render_settings_toggle_row(
+                    "Keep selection after copy",
+                    "Preserve the current terminal selection after a copy action",
+                    draft.keep_selection_on_copy,
+                    (actions.on_action)(EditorAction::ToggleKeepSelectionOnCopy),
+                ))
                 .child(render_settings_select_row(
                     "Notification sound",
                     "Sound played when an AI terminal finishes a long task",

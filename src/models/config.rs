@@ -126,6 +126,9 @@ pub struct Settings {
     pub codex_command: Option<String>,
     pub notification_sound: Option<String>,
     pub terminal_font_size: Option<u16>,
+    pub option_as_meta: bool,
+    pub copy_on_select: bool,
+    pub keep_selection_on_copy: bool,
 }
 
 impl Default for Settings {
@@ -142,6 +145,9 @@ impl Default for Settings {
             codex_command: None,
             notification_sound: None,
             terminal_font_size: None,
+            option_as_meta: false,
+            copy_on_select: false,
+            keep_selection_on_copy: true,
         }
     }
 }
@@ -167,6 +173,7 @@ pub struct SessionState {
     pub open_tabs: Vec<SessionTab>,
     pub active_tab_id: Option<String>,
     pub sidebar_collapsed: bool,
+    pub collapsed_projects: Vec<String>,
 }
 
 impl SessionState {

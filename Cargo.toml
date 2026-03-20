@@ -7,6 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 alacritty_terminal = "0.25.1"
+arboard = "3.6.1"
 cargo-packager-updater = "0.2.3"
 dirs = "6.0.0"
 gpui = "0.2.2"
