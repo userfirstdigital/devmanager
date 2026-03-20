@@ -36,6 +36,8 @@ const META_TEXT_HEIGHT_PX: f32 = 0.0;
 const NOTICE_HEIGHT_PX: f32 = 26.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const APP_WINDOW_TITLE: &str = "DevManager";
+const WINDOW_TITLE_SEPARATOR: &str = " • ";
 
 static EDITOR_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -54,7 +56,7 @@ pub fn run() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("DevManager".into()),
+                        title: Some(APP_WINDOW_TITLE.into()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -99,6 +101,7 @@ struct NativeShell {
     editor_cursor: usize,
     sidebar_context_menu: Option<sidebar::SidebarContextMenu>,
     add_project_wizard: Option<workspace::AddProjectWizard>,
+    last_window_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -261,9 +264,7 @@ impl NativeShell {
         };
 
         let _ = session_manager.save_session(&persisted_session_state(&state));
-        if updater.is_configured() {
-            let _ = updater.check_for_updates();
-        }
+        updater.start_background_checks();
 
         Self {
             state,
@@ -290,6 +291,7 @@ impl NativeShell {
             editor_cursor: 0,
             sidebar_context_menu: None,
             add_project_wizard: None,
+            last_window_title: None,
         }
     }
 
@@ -782,8 +784,7 @@ impl NativeShell {
             .unwrap_or_default();
 
         // Auto-scan the picked folder
-        let scan_entries = scanner_service::scan_root(&root_path)
-            .unwrap_or_default();
+        let scan_entries = scanner_service::scan_root(&root_path).unwrap_or_default();
         let selected_folders: std::collections::BTreeSet<String> = scan_entries
             .iter()
             .map(|entry| entry.path.clone())
@@ -3440,12 +3441,22 @@ impl NativeShell {
 
         Some(lines.join("\n"))
     }
+
+    fn sync_window_title(&mut self, window: &mut Window, runtime: &crate::state::RuntimeState) {
+        let next_title = current_window_title(&self.state, runtime);
+        if self.last_window_title.as_deref() == Some(next_title.as_str()) {
+            return;
+        }
+        window.set_window_title(&next_title);
+        self.last_window_title = Some(next_title);
+    }
 }
 
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
         let runtime_snapshot = self.process_manager.runtime_state();
+        self.sync_window_title(window, &runtime_snapshot);
         let updater_snapshot = self.updater.snapshot();
         let editor_model = self.editor_panel.clone().map(|panel| EditorPaneModel {
             panel,
@@ -3711,87 +3722,106 @@ impl Render for NativeShell {
                     }
                 }))
             };
-        let make_wizard_action_handler =
-            |action: workspace::WizardAction| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
-                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                    match &action {
-                        workspace::WizardAction::Cancel => {
-                            this.add_project_wizard = None;
+        let make_wizard_action_handler = |action: workspace::WizardAction| -> Box<
+            dyn Fn(&MouseDownEvent, &mut Window, &mut App),
+        > {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                match &action {
+                    workspace::WizardAction::Cancel => {
+                        this.add_project_wizard = None;
+                        cx.notify();
+                    }
+                    workspace::WizardAction::Create => {
+                        this.wizard_create_action(cx);
+                    }
+                    workspace::WizardAction::SelectColor(color) => {
+                        if let Some(wizard) = this.add_project_wizard.as_mut() {
+                            wizard.color = color.clone();
                             cx.notify();
                         }
-                        workspace::WizardAction::Create => {
-                            this.wizard_create_action(cx);
-                        }
-                        workspace::WizardAction::SelectColor(color) => {
-                            if let Some(wizard) = this.add_project_wizard.as_mut() {
-                                wizard.color = color.clone();
-                                cx.notify();
+                    }
+                    workspace::WizardAction::PickRootFolder => {
+                        this.wizard_pick_root_folder(cx);
+                    }
+                    workspace::WizardAction::ToggleFolder(path) => {
+                        if let Some(wizard) = this.add_project_wizard.as_mut() {
+                            if !wizard.selected_folders.insert(path.clone()) {
+                                wizard.selected_folders.remove(path);
                             }
-                        }
-                        workspace::WizardAction::PickRootFolder => {
-                            this.wizard_pick_root_folder(cx);
-                        }
-                        workspace::WizardAction::ToggleFolder(path) => {
-                            if let Some(wizard) = this.add_project_wizard.as_mut() {
-                                if !wizard.selected_folders.insert(path.clone()) {
-                                    wizard.selected_folders.remove(path);
-                                }
-                                cx.notify();
-                            }
-                        }
-                        workspace::WizardAction::Configure => {
-                            if let Some(wizard) = this.add_project_wizard.as_mut() {
-                                // Populate defaults for step 2
-                                for entry in &wizard.scan_entries {
-                                    if wizard.selected_folders.contains(&entry.path) {
-                                        wizard.selected_scripts
-                                            .entry(entry.path.clone())
-                                            .or_insert_with(|| {
-                                                scanner_service::auto_selected_script_names(&entry.scripts)
-                                                    .into_iter()
-                                                    .collect()
-                                            });
-                                        wizard.selected_port_variables
-                                            .entry(entry.path.clone())
-                                            .or_insert_with(|| {
-                                                scanner_service::auto_selected_port_variable(&entry.ports)
-                                            });
-                                    }
-                                }
-                                // Prune deselected folders
-                                wizard.selected_scripts.retain(|p, _| wizard.selected_folders.contains(p));
-                                wizard.selected_port_variables.retain(|p, _| wizard.selected_folders.contains(p));
-                                wizard.step = 2;
-                                cx.notify();
-                            }
-                        }
-                        workspace::WizardAction::Back => {
-                            if let Some(wizard) = this.add_project_wizard.as_mut() {
-                                wizard.step = 1;
-                                cx.notify();
-                            }
-                        }
-                        workspace::WizardAction::ToggleScript { folder_path, script_name } => {
-                            if let Some(wizard) = this.add_project_wizard.as_mut() {
-                                let scripts = wizard.selected_scripts
-                                    .entry(folder_path.clone())
-                                    .or_default();
-                                if !scripts.insert(script_name.clone()) {
-                                    scripts.remove(script_name);
-                                }
-                                cx.notify();
-                            }
-                        }
-                        workspace::WizardAction::SelectPortVariable { folder_path, variable } => {
-                            if let Some(wizard) = this.add_project_wizard.as_mut() {
-                                wizard.selected_port_variables
-                                    .insert(folder_path.clone(), variable.clone());
-                                cx.notify();
-                            }
+                            cx.notify();
                         }
                     }
-                }))
-            };
+                    workspace::WizardAction::Configure => {
+                        if let Some(wizard) = this.add_project_wizard.as_mut() {
+                            // Populate defaults for step 2
+                            for entry in &wizard.scan_entries {
+                                if wizard.selected_folders.contains(&entry.path) {
+                                    wizard
+                                        .selected_scripts
+                                        .entry(entry.path.clone())
+                                        .or_insert_with(|| {
+                                            scanner_service::auto_selected_script_names(
+                                                &entry.scripts,
+                                            )
+                                            .into_iter()
+                                            .collect()
+                                        });
+                                    wizard
+                                        .selected_port_variables
+                                        .entry(entry.path.clone())
+                                        .or_insert_with(|| {
+                                            scanner_service::auto_selected_port_variable(
+                                                &entry.ports,
+                                            )
+                                        });
+                                }
+                            }
+                            // Prune deselected folders
+                            wizard
+                                .selected_scripts
+                                .retain(|p, _| wizard.selected_folders.contains(p));
+                            wizard
+                                .selected_port_variables
+                                .retain(|p, _| wizard.selected_folders.contains(p));
+                            wizard.step = 2;
+                            cx.notify();
+                        }
+                    }
+                    workspace::WizardAction::Back => {
+                        if let Some(wizard) = this.add_project_wizard.as_mut() {
+                            wizard.step = 1;
+                            cx.notify();
+                        }
+                    }
+                    workspace::WizardAction::ToggleScript {
+                        folder_path,
+                        script_name,
+                    } => {
+                        if let Some(wizard) = this.add_project_wizard.as_mut() {
+                            let scripts = wizard
+                                .selected_scripts
+                                .entry(folder_path.clone())
+                                .or_default();
+                            if !scripts.insert(script_name.clone()) {
+                                scripts.remove(script_name);
+                            }
+                            cx.notify();
+                        }
+                    }
+                    workspace::WizardAction::SelectPortVariable {
+                        folder_path,
+                        variable,
+                    } => {
+                        if let Some(wizard) = this.add_project_wizard.as_mut() {
+                            wizard
+                                .selected_port_variables
+                                .insert(folder_path.clone(), variable.clone());
+                            cx.notify();
+                        }
+                    }
+                }
+            }))
+        };
         let make_install_update_handler =
             || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -4591,6 +4621,88 @@ fn normalize_optional_string(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn current_window_title(state: &AppState, runtime: &crate::state::RuntimeState) -> String {
+    let Some(tab) = state.active_tab() else {
+        return APP_WINDOW_TITLE.to_string();
+    };
+
+    let segments = [
+        window_title_project_name(tab, state),
+        active_tab_live_title(tab, runtime)
+            .or_else(|| Some(window_title_fallback_label(tab, state))),
+        Some(APP_WINDOW_TITLE.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    dedupe_adjacent_segments(segments).join(WINDOW_TITLE_SEPARATOR)
+}
+
+fn window_title_project_name(tab: &SessionTab, state: &AppState) -> Option<String> {
+    if matches!(tab.tab_type, TabType::Ssh) {
+        Some("SSH".to_string())
+    } else {
+        state
+            .find_project(&tab.project_id)
+            .map(|project| project.name.clone())
+    }
+}
+
+fn active_tab_live_title(tab: &SessionTab, runtime: &crate::state::RuntimeState) -> Option<String> {
+    tab.pty_session_id
+        .as_deref()
+        .or(tab.command_id.as_deref())
+        .and_then(|session_id| runtime.sessions.get(session_id))
+        .and_then(|session| session.title.as_deref())
+        .and_then(normalize_optional_string)
+}
+
+fn window_title_fallback_label(tab: &SessionTab, state: &AppState) -> String {
+    match tab.tab_type {
+        TabType::Server => server_window_fallback_label(tab, state),
+        TabType::Claude => tab.label.clone().unwrap_or_else(|| "Claude".to_string()),
+        TabType::Codex => tab.label.clone().unwrap_or_else(|| "Codex".to_string()),
+        TabType::Ssh => tab
+            .ssh_connection_id
+            .as_deref()
+            .and_then(|connection_id| state.find_ssh_connection(connection_id))
+            .map(|connection| connection.label.clone())
+            .or_else(|| tab.label.clone())
+            .unwrap_or_else(|| "SSH".to_string()),
+    }
+}
+
+fn server_window_fallback_label(tab: &SessionTab, state: &AppState) -> String {
+    let Some(command_id) = tab.command_id.as_deref() else {
+        return "Server".to_string();
+    };
+    let Some(lookup) = state.find_command(command_id) else {
+        return command_id.to_string();
+    };
+
+    let folder_prefix = if lookup.project.folders.len() > 1 {
+        format!("{} / ", lookup.folder.name)
+    } else {
+        String::new()
+    };
+    let command_label =
+        normalize_optional_string(&lookup.command.label).unwrap_or_else(|| command_id.to_string());
+    format!("{folder_prefix}{command_label}")
+}
+
+fn dedupe_adjacent_segments(segments: Vec<String>) -> Vec<String> {
+    segments
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .fold(Vec::new(), |mut deduped, segment| {
+            if deduped.last() != Some(&segment) {
+                deduped.push(segment);
+            }
+            deduped
+        })
+}
+
 fn is_startup_restorable_tab(tab: &SessionTab) -> bool {
     matches!(tab.tab_type, TabType::Server | TabType::Ssh)
 }
@@ -5007,10 +5119,12 @@ fn config_has_ssh_connection(config: &AppConfig, connection_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{SessionTab, Settings};
+    use crate::models::{Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings};
     use crate::services::ProcessManager;
+    use crate::state::{RuntimeState, SessionRuntimeState};
     use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
     use gpui::point;
+    use std::path::PathBuf;
 
     fn sample_ai_tab() -> SessionTab {
         SessionTab {
@@ -5045,6 +5159,50 @@ mod tests {
             pty_session_id: Some("ssh-session".to_string()),
             label: Some("SSH".to_string()),
             ssh_connection_id: Some("ssh-1".to_string()),
+        }
+    }
+
+    fn sample_project() -> Project {
+        Project {
+            id: "project-1".to_string(),
+            name: "Househunter".to_string(),
+            root_path: ".".to_string(),
+            folders: vec![
+                ProjectFolder {
+                    id: "folder-1".to_string(),
+                    name: "api".to_string(),
+                    folder_path: ".".to_string(),
+                    commands: vec![RunCommand {
+                        id: "server-cmd".to_string(),
+                        label: "API Dev".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ProjectFolder {
+                    id: "folder-2".to_string(),
+                    name: "web".to_string(),
+                    folder_path: ".".to_string(),
+                    commands: vec![RunCommand {
+                        id: "web-cmd".to_string(),
+                        label: "Web Dev".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn sample_ssh_connection(label: &str) -> SSHConnection {
+        SSHConnection {
+            id: "ssh-1".to_string(),
+            label: label.to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "dev".to_string(),
+            password: None,
         }
     }
 
@@ -5156,6 +5314,67 @@ mod tests {
         assert_eq!(state.open_tabs.len(), 1);
         assert_eq!(state.open_tabs[0].id, "server-tab");
         assert_eq!(state.active_tab_id.as_deref(), Some("server-tab"));
+    }
+
+    #[test]
+    fn current_window_title_defaults_to_app_name_without_active_tab() {
+        let state = AppState::default();
+        let runtime = RuntimeState::new(false);
+
+        assert_eq!(current_window_title(&state, &runtime), APP_WINDOW_TITLE);
+    }
+
+    #[test]
+    fn current_window_title_prefers_live_terminal_title() {
+        let mut state = AppState::default();
+        state.config.projects.push(sample_project());
+        state.open_tabs.push(sample_server_tab());
+        state.active_tab_id = Some("server-tab".to_string());
+
+        let mut runtime = RuntimeState::new(false);
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.note_title(Some("npm run dev".to_string()));
+        runtime.sessions.insert("server-cmd".to_string(), session);
+
+        assert_eq!(
+            current_window_title(&state, &runtime),
+            "Househunter • npm run dev • DevManager"
+        );
+    }
+
+    #[test]
+    fn current_window_title_uses_server_folder_and_command_label_fallback() {
+        let mut state = AppState::default();
+        state.config.projects.push(sample_project());
+        state.open_tabs.push(sample_server_tab());
+        state.active_tab_id = Some("server-tab".to_string());
+
+        let runtime = RuntimeState::new(false);
+
+        assert_eq!(
+            current_window_title(&state, &runtime),
+            "Househunter • api / API Dev • DevManager"
+        );
+    }
+
+    #[test]
+    fn current_window_title_dedupes_adjacent_ssh_segments() {
+        let mut state = AppState::default();
+        state
+            .config
+            .ssh_connections
+            .push(sample_ssh_connection("SSH"));
+        state.open_tabs.push(sample_ssh_tab());
+        state.active_tab_id = Some("ssh-tab".to_string());
+
+        let runtime = RuntimeState::new(false);
+
+        assert_eq!(current_window_title(&state, &runtime), "SSH • DevManager");
     }
 
     #[test]

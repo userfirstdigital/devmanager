@@ -583,7 +583,8 @@ impl TerminalSession {
         );
 
         if track_pid {
-            if let Err(error) = track_managed_process(&self.runtime_state, &self.session_id, pid, &program)
+            if let Err(error) =
+                track_managed_process(&self.runtime_state, &self.session_id, pid, &program)
             {
                 cleanup_failed_spawn(&mut cleanup_killer);
                 return Err(error);
@@ -970,9 +971,7 @@ fn track_managed_process(
     })
 }
 
-fn cleanup_failed_spawn(
-    cleanup_killer: &mut Box<dyn ChildKiller + Send + Sync>,
-) {
+fn cleanup_failed_spawn(cleanup_killer: &mut Box<dyn ChildKiller + Send + Sync>) {
     let _ = cleanup_killer.kill();
 }
 

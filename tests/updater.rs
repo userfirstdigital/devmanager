@@ -1,6 +1,6 @@
 use devmanager::updater::{
-    is_remote_version_newer, parse_release_manifest, resolve_updater_config,
-    UpdaterWindowsInstallMode,
+    github_release_manifest_endpoint, is_remote_version_newer, next_patch_release_version,
+    parse_release_manifest, resolve_updater_config, UpdaterWindowsInstallMode,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -55,11 +55,35 @@ fn updater_config_parses_multiple_endpoints_and_install_mode() {
 }
 
 #[test]
+fn next_patch_release_version_uses_latest_release_when_available() {
+    assert_eq!(
+        next_patch_release_version(Some("v0.2.4"), "0.2.0").expect("next version"),
+        "0.2.5"
+    );
+}
+
+#[test]
+fn next_patch_release_version_falls_back_to_cargo_version_without_tags() {
+    assert_eq!(
+        next_patch_release_version(None, "0.2.0").expect("next version"),
+        "0.2.1"
+    );
+}
+
+#[test]
+fn github_release_endpoint_matches_workflow_location() {
+    assert_eq!(
+        github_release_manifest_endpoint("example/devmanager"),
+        "https://github.com/example/devmanager/releases/latest/download/latest.json"
+    );
+}
+
+#[test]
 fn manifest_fixture_parses_expected_platform_assets() {
     let manifest_text = fs::read_to_string(fixture_path("latest.json")).expect("manifest fixture");
     let manifest = parse_release_manifest(&manifest_text).expect("parse manifest fixture");
 
-    assert_eq!(manifest.version, "0.2.0-dev.42");
+    assert_eq!(manifest.version, "0.2.2");
     assert_eq!(
         manifest.notes.as_deref(),
         Some("Release notes live on GitHub.")
@@ -84,6 +108,6 @@ fn manifest_fixture_parses_expected_platform_assets() {
 
 #[test]
 fn version_compare_accepts_prefixed_manifest_versions() {
-    assert!(is_remote_version_newer("0.2.0-dev.1", "v0.2.0-dev.2").expect("compare versions"));
-    assert!(!is_remote_version_newer("0.2.0-dev.2", "0.2.0-dev.2").expect("compare equal versions"));
+    assert!(is_remote_version_newer("0.2.2", "v0.2.3").expect("compare versions"));
+    assert!(!is_remote_version_newer("0.2.3", "0.2.3").expect("compare equal versions"));
 }

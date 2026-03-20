@@ -1420,10 +1420,11 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
 
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
-    let tracked_processes: HashMap<String, pid_file::ManagedProcessRecord> = pid_file::tracked_processes()
-        .into_iter()
-        .map(|entry| (entry.session_id.clone(), entry))
-        .collect();
+    let tracked_processes: HashMap<String, pid_file::ManagedProcessRecord> =
+        pid_file::tracked_processes()
+            .into_iter()
+            .map(|entry| (entry.session_id.clone(), entry))
+            .collect();
     let sampled_at = Instant::now();
     let mut snapshots = Vec::with_capacity(sessions.len());
 

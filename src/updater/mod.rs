@@ -1,16 +1,23 @@
 use cargo_packager_updater::{
-    self, semver::Version, url::Url, Config as PackagerUpdaterConfig, Update as PackagerUpdate,
+    self,
+    semver::{BuildMetadata, Prerelease, Version},
+    url::Url,
+    Config as PackagerUpdaterConfig, Update as PackagerUpdate,
     WindowsConfig as PackagerWindowsConfig, WindowsUpdateInstallMode,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const UPDATE_ENDPOINTS_VAR: &str = "DEVMANAGER_UPDATE_ENDPOINTS";
 const UPDATE_PUBKEY_VAR: &str = "DEVMANAGER_UPDATE_PUBKEY";
 const UPDATE_WINDOWS_INSTALL_MODE_VAR: &str = "DEVMANAGER_UPDATE_WINDOWS_INSTALL_MODE";
+const BACKGROUND_UPDATE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdaterStage {
@@ -121,6 +128,7 @@ pub struct UpdaterService {
 struct UpdaterInner {
     current_version: Version,
     config: Option<PackagerUpdaterConfig>,
+    background_checks_started: AtomicBool,
     state: RwLock<UpdaterState>,
 }
 
@@ -210,6 +218,7 @@ impl UpdaterService {
             inner: Arc::new(UpdaterInner {
                 current_version,
                 config,
+                background_checks_started: AtomicBool::new(false),
                 state: RwLock::new(UpdaterState {
                     snapshot,
                     pending_update: None,
@@ -242,6 +251,28 @@ impl UpdaterService {
         self.snapshot().configured
     }
 
+    pub fn start_background_checks(&self) {
+        if !self.is_configured() {
+            return;
+        }
+        if self
+            .inner
+            .background_checks_started
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let updater = self.clone();
+        thread::spawn(move || {
+            let _ = updater.check_for_updates();
+            loop {
+                thread::sleep(BACKGROUND_UPDATE_INTERVAL);
+                let _ = updater.check_for_updates();
+            }
+        });
+    }
+
     pub fn check_for_updates(&self) -> Result<(), String> {
         let config = self
             .inner
@@ -254,7 +285,17 @@ impl UpdaterService {
         let current_version = self.inner.current_version.clone();
         thread::spawn(move || {
             match cargo_packager_updater::check_update(current_version, config) {
-                Ok(Some(update)) => inner.set_update_available(update),
+                Ok(Some(update)) => {
+                    inner.set_update_available(update.clone());
+                    if let Err(error) = inner.prepare_auto_download(&update) {
+                        inner.set_error(format!(
+                            "Version {} is available, but the background download could not start: {error}",
+                            update.version
+                        ));
+                    } else {
+                        Self::spawn_download_thread(inner, update);
+                    }
+                }
                 Ok(None) => inner.set_up_to_date(),
                 Err(error) => inner.set_error(format!("Update check failed: {error}")),
             }
@@ -264,20 +305,7 @@ impl UpdaterService {
 
     pub fn download_update(&self) -> Result<(), String> {
         let update = self.inner.prepare_download()?;
-        let version = update.version.clone();
-        let inner = self.inner.clone();
-        thread::spawn(move || {
-            let progress_inner = inner.clone();
-            match update.download_extended(
-                move |chunk_size, total| {
-                    progress_inner.record_download_progress(chunk_size as u64, total);
-                },
-                || {},
-            ) {
-                Ok(bytes) => inner.set_ready_to_install(update, bytes),
-                Err(error) => inner.set_error(format!("Download failed for {version}: {error}")),
-            }
-        });
+        Self::spawn_download_thread(self.inner.clone(), update);
         Ok(())
     }
 
@@ -300,6 +328,24 @@ impl Default for UpdaterService {
     }
 }
 
+impl UpdaterService {
+    fn spawn_download_thread(inner: Arc<UpdaterInner>, update: PackagerUpdate) {
+        let version = update.version.clone();
+        thread::spawn(move || {
+            let progress_inner = inner.clone();
+            match update.download_extended(
+                move |chunk_size, total| {
+                    progress_inner.record_download_progress(chunk_size as u64, total);
+                },
+                || {},
+            ) {
+                Ok(bytes) => inner.set_ready_to_install(update, bytes),
+                Err(error) => inner.set_error(format!("Download failed for {version}: {error}")),
+            }
+        });
+    }
+}
+
 impl UpdaterInner {
     fn set_checking(&self) -> Result<(), String> {
         let mut state = self
@@ -311,6 +357,28 @@ impl UpdaterInner {
         }
         if !state.snapshot.configured {
             return Err(state.snapshot.detail.clone());
+        }
+        if matches!(state.snapshot.stage, UpdaterStage::ReadyToInstall)
+            || state.downloaded_bytes.is_some()
+        {
+            return Err(match state.snapshot.target_version.as_deref() {
+                Some(version) => {
+                    format!("Version {version} is already downloaded. Restart DevManager to install it.")
+                }
+                None => {
+                    "An update is already downloaded. Restart DevManager to install it.".to_string()
+                }
+            });
+        }
+        if matches!(state.snapshot.stage, UpdaterStage::UpdateAvailable)
+            && state.pending_update.is_some()
+        {
+            return Err(match state.snapshot.target_version.as_deref() {
+                Some(version) => {
+                    format!("Version {version} is already queued. Wait for its download to begin.")
+                }
+                None => "An update is already queued. Wait for its download to begin.".to_string(),
+            });
         }
         state.pending_update = None;
         state.downloaded_bytes = None;
@@ -354,10 +422,43 @@ impl UpdaterInner {
             state.snapshot.downloaded_bytes = 0;
             state.snapshot.total_bytes = None;
             state.snapshot.detail = format!(
-                "Version {} is available. Download it when you are ready.",
+                "Version {} is available. Downloading it in the background...",
                 update.version
             );
         }
+    }
+
+    fn prepare_auto_download(&self, update: &PackagerUpdate) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "Updater state is unavailable.".to_string())?;
+        if state.snapshot.is_busy() {
+            return Err("Updater is busy. Wait for the current action to finish.".to_string());
+        }
+        if matches!(state.snapshot.stage, UpdaterStage::ReadyToInstall)
+            || state.downloaded_bytes.is_some()
+        {
+            return Err(match state.snapshot.target_version.as_deref() {
+                Some(version) => {
+                    format!("Version {version} is already downloaded. Restart DevManager to install it.")
+                }
+                None => {
+                    "An update is already downloaded. Restart DevManager to install it.".to_string()
+                }
+            });
+        }
+        state.pending_update = Some(update.clone());
+        state.downloaded_bytes = None;
+        state.snapshot.stage = UpdaterStage::Downloading;
+        state.snapshot.target_version = Some(update.version.clone());
+        state.snapshot.downloaded_bytes = 0;
+        state.snapshot.total_bytes = None;
+        state.snapshot.detail = format!(
+            "Version {} is available. Downloading it in the background...",
+            update.version
+        );
+        Ok(())
     }
 
     fn prepare_download(&self) -> Result<PackagerUpdate, String> {
@@ -367,6 +468,18 @@ impl UpdaterInner {
             .map_err(|_| "Updater state is unavailable.".to_string())?;
         if state.snapshot.is_busy() {
             return Err("Updater is busy. Wait for the current action to finish.".to_string());
+        }
+        if matches!(state.snapshot.stage, UpdaterStage::ReadyToInstall)
+            || state.downloaded_bytes.is_some()
+        {
+            return Err(match state.snapshot.target_version.as_deref() {
+                Some(version) => {
+                    format!("Version {version} is already downloaded. Restart DevManager to install it.")
+                }
+                None => {
+                    "An update is already downloaded. Restart DevManager to install it.".to_string()
+                }
+            });
         }
         let update = state
             .pending_update
@@ -498,6 +611,22 @@ pub fn is_remote_version_newer(
     let current = parse_version(current_version)?;
     let remote = parse_version(remote_version)?;
     Ok(remote > current)
+}
+
+pub fn next_patch_release_version(
+    latest_release: Option<&str>,
+    cargo_version: &str,
+) -> Result<String, String> {
+    let mut version = parse_version(latest_release.unwrap_or(cargo_version))?;
+    version.patch = version.patch.saturating_add(1);
+    version.pre = Prerelease::EMPTY;
+    version.build = BuildMetadata::EMPTY;
+    Ok(version.to_string())
+}
+
+pub fn github_release_manifest_endpoint(repository: &str) -> String {
+    let repository = repository.trim().trim_matches('/');
+    format!("https://github.com/{repository}/releases/latest/download/latest.json")
 }
 
 fn parse_windows_install_mode(value: Option<&str>) -> Result<UpdaterWindowsInstallMode, String> {

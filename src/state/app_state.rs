@@ -434,12 +434,7 @@ impl AppState {
     }
 
     pub fn move_project(&mut self, project_id: &str, direction: i32) -> bool {
-        let Some(index) = self
-            .config
-            .projects
-            .iter()
-            .position(|p| p.id == project_id)
-        else {
+        let Some(index) = self.config.projects.iter().position(|p| p.id == project_id) else {
             return false;
         };
         let new_index = index as i32 + direction;

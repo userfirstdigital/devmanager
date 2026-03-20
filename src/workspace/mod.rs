@@ -4,9 +4,9 @@ use crate::models::{
 use crate::theme;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use gpui::{
-    anchored, deferred, div, px, rgb, AnyElement, App, Corner, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    anchored, deferred, div, px, rgb, AnyElement, App, Corner, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    Window,
 };
 use std::collections::{BTreeSet, HashMap};
 
@@ -85,17 +85,22 @@ pub fn render_add_project_wizard(
     }
 }
 
-fn render_wizard_step1(
-    wizard: &AddProjectWizard,
-    actions: WizardActions<'_>,
-) -> impl IntoElement {
+fn render_wizard_step1(wizard: &AddProjectWizard, actions: WizardActions<'_>) -> impl IntoElement {
     let on_cancel = (actions.on_action)(WizardAction::Cancel);
     let on_configure = (actions.on_action)(WizardAction::Configure);
     let on_pick_root = (actions.on_action)(WizardAction::PickRootFolder);
 
     let display_name = display_text_with_cursor(
-        if wizard.name.is_empty() { "My App" } else { &wizard.name },
-        if wizard.name.is_empty() { 6 } else { wizard.cursor },
+        if wizard.name.is_empty() {
+            "My App"
+        } else {
+            &wizard.name
+        },
+        if wizard.name.is_empty() {
+            6
+        } else {
+            wizard.cursor
+        },
     );
     let name_is_placeholder = wizard.name.is_empty();
 
@@ -454,10 +459,7 @@ fn wizard_scan_detail(entry: &RootScanEntry) -> String {
     }
 }
 
-fn render_wizard_step2(
-    wizard: &AddProjectWizard,
-    actions: WizardActions<'_>,
-) -> impl IntoElement {
+fn render_wizard_step2(wizard: &AddProjectWizard, actions: WizardActions<'_>) -> impl IntoElement {
     let on_cancel = (actions.on_action)(WizardAction::Cancel);
     let on_back = (actions.on_action)(WizardAction::Back);
     let on_create = (actions.on_action)(WizardAction::Create);
@@ -469,143 +471,132 @@ fn render_wizard_step2(
         .collect();
 
     deferred(
-        anchored()
-            .snap_to_window()
-            .anchor(Corner::TopLeft)
-            .child(
-                div()
-                    .id("wizard-step2-backdrop")
-                    .occlude()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w(px(520.0))
-                            .max_h(px(600.0))
-                            .rounded_md()
-                            .bg(rgb(theme::PANEL_HEADER_BG))
-                            .border_1()
-                            .border_color(rgb(theme::BORDER_PRIMARY))
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            // Header
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px(px(16.0))
-                                    .py(px(12.0))
-                                    .border_b_1()
-                                    .border_color(rgb(theme::BORDER_PRIMARY))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(rgb(theme::TEXT_PRIMARY))
-                                            .child(
-                                                "Add Project \u{2014} Configure Folders",
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .cursor_pointer()
-                                            .hover(|s| {
-                                                s.text_color(rgb(theme::TEXT_PRIMARY))
-                                            })
-                                            .child("\u{2715}")
-                                            .on_mouse_down(MouseButton::Left, on_cancel),
-                                    ),
-                            )
-                            // Body (scrollable)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .id("wizard-step2-scroll")
-                                    .overflow_y_scroll()
-                                    .scrollbar_width(px(6.0))
-                                    .child(
-                                        div()
-                                            .px(px(16.0))
-                                            .py(px(16.0))
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(20.0))
-                                            .children(selected_entries.iter().map(|entry| {
-                                                render_wizard_folder_config(
-                                                    entry, wizard, &actions,
-                                                )
+        anchored().snap_to_window().anchor(Corner::TopLeft).child(
+            div()
+                .id("wizard-step2-backdrop")
+                .occlude()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(520.0))
+                        .max_h(px(600.0))
+                        .rounded_md()
+                        .bg(rgb(theme::PANEL_HEADER_BG))
+                        .border_1()
+                        .border_color(rgb(theme::BORDER_PRIMARY))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        // Header
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .border_b_1()
+                                .border_color(rgb(theme::BORDER_PRIMARY))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(theme::TEXT_PRIMARY))
+                                        .child("Add Project \u{2014} Configure Folders"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_MUTED))
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)))
+                                        .child("\u{2715}")
+                                        .on_mouse_down(MouseButton::Left, on_cancel),
+                                ),
+                        )
+                        // Body (scrollable)
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("wizard-step2-scroll")
+                                .overflow_y_scroll()
+                                .scrollbar_width(px(6.0))
+                                .child(
+                                    div()
+                                        .px(px(16.0))
+                                        .py(px(16.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(20.0))
+                                        .children(selected_entries.iter().map(|entry| {
+                                            render_wizard_folder_config(entry, wizard, &actions)
                                                 .into_any_element()
-                                            })),
-                                    ),
-                            )
-                            // Footer
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px(px(16.0))
-                                    .py(px(12.0))
-                                    .border_t_1()
-                                    .border_color(rgb(theme::BORDER_PRIMARY))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .cursor_pointer()
-                                            .hover(|s| {
-                                                s.text_color(rgb(theme::TEXT_PRIMARY))
-                                            })
-                                            .child("\u{2190} Back")
-                                            .on_mouse_down(MouseButton::Left, on_back),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(
-                                                div()
-                                                    .px(px(12.0))
-                                                    .py(px(6.0))
-                                                    .rounded_sm()
-                                                    .text_xs()
-                                                    .text_color(rgb(theme::TEXT_MUTED))
-                                                    .cursor_pointer()
-                                                    .hover(|s| {
-                                                        s.text_color(rgb(theme::TEXT_PRIMARY))
-                                                            .bg(rgb(theme::ROW_HOVER_BG))
-                                                    })
-                                                    .child("Cancel")
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        (actions.on_action)(WizardAction::Cancel),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px(px(14.0))
-                                                    .py(px(6.0))
-                                                    .rounded_sm()
-                                                    .bg(rgb(theme::PRIMARY))
-                                                    .text_xs()
-                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(theme::SELECTION_TEXT))
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
-                                                    .child("Create Project")
-                                                    .on_mouse_down(MouseButton::Left, on_create),
-                                            ),
-                                    ),
-                            ),
-                    ),
-            ),
+                                        })),
+                                ),
+                        )
+                        // Footer
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .border_t_1()
+                                .border_color(rgb(theme::BORDER_PRIMARY))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_MUTED))
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)))
+                                        .child("\u{2190} Back")
+                                        .on_mouse_down(MouseButton::Left, on_back),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .px(px(12.0))
+                                                .py(px(6.0))
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .text_color(rgb(theme::TEXT_MUTED))
+                                                .cursor_pointer()
+                                                .hover(|s| {
+                                                    s.text_color(rgb(theme::TEXT_PRIMARY))
+                                                        .bg(rgb(theme::ROW_HOVER_BG))
+                                                })
+                                                .child("Cancel")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    (actions.on_action)(WizardAction::Cancel),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(14.0))
+                                                .py(px(6.0))
+                                                .rounded_sm()
+                                                .bg(rgb(theme::PRIMARY))
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(rgb(theme::SELECTION_TEXT))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
+                                                .child("Create Project")
+                                                .on_mouse_down(MouseButton::Left, on_create),
+                                        ),
+                                ),
+                        ),
+                ),
+        ),
     )
     .with_priority(2)
 }
@@ -656,11 +647,10 @@ fn render_wizard_folder_config(
                     let is_selected = selected_scripts
                         .map(|s| s.contains(&script.name))
                         .unwrap_or(false);
-                    let on_toggle =
-                        (actions.on_action)(WizardAction::ToggleScript {
-                            folder_path: entry.path.clone(),
-                            script_name: script.name.clone(),
-                        });
+                    let on_toggle = (actions.on_action)(WizardAction::ToggleScript {
+                        folder_path: entry.path.clone(),
+                        script_name: script.name.clone(),
+                    });
                     div()
                         .flex()
                         .items_center()
@@ -692,20 +682,14 @@ fn render_wizard_folder_config(
                                             div()
                                                 .text_xs()
                                                 .text_color(rgb(0xffffff))
-                                                .child(if is_selected {
-                                                    "\u{2713}"
-                                                } else {
-                                                    ""
-                                                }),
+                                                .child(if is_selected { "\u{2713}" } else { "" }),
                                         ),
                                 )
                                 .child(
                                     div()
                                         .text_sm()
                                         .text_color(rgb(theme::TEXT_PRIMARY))
-                                        .child(SharedString::from(
-                                            script.name.clone(),
-                                        )),
+                                        .child(SharedString::from(script.name.clone())),
                                 ),
                         )
                         .child(
@@ -734,11 +718,10 @@ fn render_wizard_folder_config(
                 )
                 .children(entry.ports.iter().map(|port| {
                     let is_selected = selected_port.as_deref() == Some(port.variable.as_str());
-                    let on_select =
-                        (actions.on_action)(WizardAction::SelectPortVariable {
-                            folder_path: entry.path.clone(),
-                            variable: Some(port.variable.clone()),
-                        });
+                    let on_select = (actions.on_action)(WizardAction::SelectPortVariable {
+                        folder_path: entry.path.clone(),
+                        variable: Some(port.variable.clone()),
+                    });
                     div()
                         .flex()
                         .items_center()
@@ -785,14 +768,12 @@ fn render_wizard_folder_config(
                                                 .bg(rgb(theme::PRIMARY))
                                         })),
                                 )
-                                .child(
-                                    div().text_sm().text_color(rgb(theme::TEXT_PRIMARY)).child(
-                                        SharedString::from(format!(
-                                            "{}  = {}",
-                                            port.variable, port.port
-                                        )),
-                                    ),
-                                ),
+                                .child(div().text_sm().text_color(rgb(theme::TEXT_PRIMARY)).child(
+                                    SharedString::from(format!(
+                                        "{}  = {}",
+                                        port.variable, port.port
+                                    )),
+                                )),
                         )
                         .child(
                             div()
@@ -1507,6 +1488,9 @@ fn render_settings_panel(
     let on_export = (actions.on_action)(EditorAction::ExportConfig);
     let on_import_merge = (actions.on_action)(EditorAction::ImportConfigMerge);
     let on_import_replace = (actions.on_action)(EditorAction::ImportConfigReplace);
+    let on_check_updates = (actions.on_action)(EditorAction::CheckForUpdates);
+    let on_install_update = matches!(model.updater.stage, UpdaterStage::ReadyToInstall)
+        .then(|| (actions.on_action)(EditorAction::InstallUpdate));
     let on_toggle_data_picker = (actions.on_action)(EditorAction::ToggleSettingsPicker(
         SettingsPicker::DataActions,
     ));
@@ -1675,6 +1659,11 @@ fn render_settings_panel(
                     None,
                     "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
                 ))
+                .into_any_element(),
+        ))
+        .child(render_settings_section(
+            "Updates",
+            render_updater_panel(&model.updater, on_check_updates, None, on_install_update)
                 .into_any_element(),
         ))
         // — Data section
@@ -2946,7 +2935,6 @@ fn project_type_label(value: &str) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 fn render_updater_panel(
     updater: &UpdaterSnapshot,
     on_check: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -3046,14 +3034,13 @@ fn render_info_row(label: &str, value: &str, hint: Option<&str>) -> impl IntoEle
         )
 }
 
-#[allow(dead_code)]
 fn updater_stage_label(stage: &UpdaterStage) -> &'static str {
     match stage {
         UpdaterStage::Disabled => "disabled",
         UpdaterStage::Idle => "idle",
         UpdaterStage::Checking => "checking",
         UpdaterStage::UpToDate => "up to date",
-        UpdaterStage::UpdateAvailable => "update available",
+        UpdaterStage::UpdateAvailable => "update found",
         UpdaterStage::Downloading => "downloading",
         UpdaterStage::ReadyToInstall => "ready to install",
         UpdaterStage::Installing => "installing",

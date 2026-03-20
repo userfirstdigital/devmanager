@@ -157,10 +157,12 @@ fn write_ledger_to_path(path: &Path, ledger: &ManagedProcessLedgerFile) -> Resul
         .map_err(|error| format!("Failed to write PID ledger temp file: {error}"))?;
     if let Err(error) = std::fs::rename(&temp_path, path) {
         if path.exists() {
-            std::fs::remove_file(path)
-                .map_err(|remove_error| format!("Failed to replace PID ledger file: {remove_error}"))?;
-            std::fs::rename(&temp_path, path)
-                .map_err(|rename_error| format!("Failed to replace PID ledger file: {rename_error}"))?;
+            std::fs::remove_file(path).map_err(|remove_error| {
+                format!("Failed to replace PID ledger file: {remove_error}")
+            })?;
+            std::fs::rename(&temp_path, path).map_err(|rename_error| {
+                format!("Failed to replace PID ledger file: {rename_error}")
+            })?;
         } else {
             return Err(format!("Failed to replace PID ledger file: {error}"));
         }
@@ -179,9 +181,7 @@ fn read_ledger() -> ManagedProcessLedgerFile {
     read_ledger_from_path(&path)
 }
 
-fn mutate_ledger<R>(
-    f: impl FnOnce(&mut ManagedProcessLedgerFile) -> R,
-) -> Result<R, String> {
+fn mutate_ledger<R>(f: impl FnOnce(&mut ManagedProcessLedgerFile) -> R) -> Result<R, String> {
     let path = pid_file_path()?;
     let _guard = PID_FILE_ACCESS_LOCK
         .lock()
@@ -453,7 +453,9 @@ mod tests {
         let mut killed = Vec::new();
         cleanup_orphaned_processes_with_path(
             &path,
-            |entry| tracked_process_state_with(entry, &mut |pid| running.borrow().get(&pid).cloned()),
+            |entry| {
+                tracked_process_state_with(entry, &mut |pid| running.borrow().get(&pid).cloned())
+            },
             |pid| {
                 killed.push(pid);
                 running.borrow_mut().remove(&pid);
@@ -539,15 +541,19 @@ mod tests {
         });
         active.sort_by(|left, right| left.pid.cmp(&right.pid));
 
-        assert_eq!(active.into_iter().map(|entry| entry.pid).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(
+            active
+                .into_iter()
+                .map(|entry| entry.pid)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
     }
 
     #[test]
     fn untrack_session_process_ignores_stale_wait_threads() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "devmanager-pid-race-tests-{}",
-            std::process::id()
-        ));
+        let temp_dir =
+            std::env::temp_dir().join(format!("devmanager-pid-race-tests-{}", std::process::id()));
         let path = temp_dir.join("running-pids.json");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();

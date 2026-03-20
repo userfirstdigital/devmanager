@@ -85,53 +85,97 @@ fn render_updater_status(
 ) -> impl IntoElement {
     match updater.stage {
         UpdaterStage::Downloading => {
-            let label = if let Some(total) = updater.total_bytes {
-                let percent = if total == 0 {
-                    0
-                } else {
-                    ((updater.downloaded_bytes as f64 / total as f64) * 100.0).round() as u64
-                };
-                format!("Downloading update {percent}%")
-            } else {
-                "Downloading update...".to_string()
-            };
+            let label = updater_status_label(updater)
+                .unwrap_or_else(|| "Downloading update...".to_string());
             div()
                 .text_xs()
                 .text_color(rgb(theme::AI_DOT))
                 .child(SharedString::from(label))
         }
         UpdaterStage::ReadyToInstall => {
-            let version = updater.target_version.as_deref().unwrap_or("new");
+            let label =
+                updater_status_label(updater).unwrap_or_else(|| "Restart to update".to_string());
             div()
                 .text_xs()
                 .text_color(rgb(theme::PROJECT_DOT))
                 .cursor_pointer()
                 .hover(|s| s.text_color(rgb(theme::PRIMARY_HOVER)))
-                .child(SharedString::from(format!("⊞ Restart to update {version}")))
+                .child(SharedString::from(label))
                 .on_mouse_down(MouseButton::Left, (actions.on_install_update)())
         }
         UpdaterStage::UpdateAvailable => {
             div()
                 .text_xs()
                 .text_color(rgb(theme::PROJECT_DOT))
-                .child(SharedString::from(format!(
-                    "Update {} ready in Settings",
-                    updater.target_version.as_deref().unwrap_or("ready")
-                )))
+                .child(SharedString::from(
+                    updater_status_label(updater)
+                        .unwrap_or_else(|| "Update found. Starting download...".to_string()),
+                ))
         }
-        UpdaterStage::Checking => div()
-            .text_xs()
-            .text_color(rgb(theme::TEXT_SUBTLE))
-            .child("Checking for updates"),
-        UpdaterStage::Error => div()
-            .text_xs()
-            .text_color(rgb(theme::DANGER_TEXT))
-            .child("Update failed"),
-        UpdaterStage::UpToDate => div()
-            .text_xs()
-            .text_color(rgb(theme::TEXT_SUBTLE))
-            .child(SharedString::from(format!("v{}", updater.current_version))),
+        UpdaterStage::Checking => {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(
+                    updater_status_label(updater)
+                        .unwrap_or_else(|| "Checking for updates".to_string()),
+                ))
+        }
+        UpdaterStage::Error => {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::DANGER_TEXT))
+                .child(SharedString::from(
+                    updater_status_label(updater).unwrap_or_else(|| "Update failed".to_string()),
+                ))
+        }
+        UpdaterStage::Installing => {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(
+                    updater_status_label(updater)
+                        .unwrap_or_else(|| "Installing update...".to_string()),
+                ))
+        }
+        UpdaterStage::UpToDate => {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(
+                    updater_status_label(updater)
+                        .unwrap_or_else(|| format!("v{}", updater.current_version)),
+                ))
+        }
         _ => div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(""),
+    }
+}
+
+fn updater_status_label(updater: &UpdaterSnapshot) -> Option<String> {
+    match updater.stage {
+        UpdaterStage::Checking => Some("Checking for updates".to_string()),
+        UpdaterStage::UpdateAvailable => Some(format!(
+            "Update {} found. Starting download...",
+            updater.target_version.as_deref().unwrap_or("ready")
+        )),
+        UpdaterStage::Downloading => Some(if let Some(total) = updater.total_bytes {
+            let percent = if total == 0 {
+                0
+            } else {
+                ((updater.downloaded_bytes as f64 / total as f64) * 100.0).round() as u64
+            };
+            format!("Downloading update {percent}%")
+        } else {
+            "Downloading update...".to_string()
+        }),
+        UpdaterStage::ReadyToInstall => Some(format!(
+            "Restart to update {}",
+            updater.target_version.as_deref().unwrap_or("new")
+        )),
+        UpdaterStage::Installing => Some("Installing update...".to_string()),
+        UpdaterStage::Error => Some("Update failed".to_string()),
+        UpdaterStage::UpToDate => Some(format!("v{}", updater.current_version)),
+        UpdaterStage::Disabled | UpdaterStage::Idle => None,
     }
 }
 
@@ -159,8 +203,10 @@ fn format_memory(bytes: u64) -> String {
 
 fn current_time_label() -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    let format = format_description::parse("[hour]:[minute]").expect("valid time format");
-    now.format(&format).unwrap_or_else(|_| "00:00".to_string())
+    let format = format_description::parse("[hour repr:12]:[minute] [period case:lower]")
+        .expect("valid time format");
+    now.format(&format)
+        .unwrap_or_else(|_| "12:00 am".to_string())
 }
 
 fn plural(count: usize) -> &'static str {
@@ -173,14 +219,16 @@ fn plural(count: usize) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::running_terminal_metrics;
+    use super::{running_terminal_metrics, updater_status_label};
     use crate::state::{
         ResourceSnapshot, RuntimeState, ServerLaunchSpec, SessionDimensions, SessionRuntimeState,
         SessionStatus,
     };
     use crate::terminal::session::TerminalBackend;
+    use crate::updater::{UpdaterSnapshot, UpdaterStage};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::time::SystemTime;
 
     #[test]
     fn running_terminal_metrics_counts_all_live_sessions() {
@@ -237,5 +285,32 @@ mod tests {
         runtime.sessions.insert(stopped.session_id.clone(), stopped);
 
         assert_eq!(running_terminal_metrics(&runtime), (2, 96));
+    }
+
+    #[test]
+    fn updater_status_label_matches_background_download_flow() {
+        let mut snapshot = UpdaterSnapshot {
+            configured: true,
+            current_version: "0.2.1".to_string(),
+            endpoints: vec!["https://example.com/latest.json".to_string()],
+            stage: UpdaterStage::UpdateAvailable,
+            target_version: Some("0.2.2".to_string()),
+            detail: String::new(),
+            release_notes: None,
+            last_checked_at: Some(SystemTime::now()),
+            downloaded_bytes: 0,
+            total_bytes: None,
+        };
+
+        assert_eq!(
+            updater_status_label(&snapshot).as_deref(),
+            Some("Update 0.2.2 found. Starting download...")
+        );
+
+        snapshot.stage = UpdaterStage::ReadyToInstall;
+        assert_eq!(
+            updater_status_label(&snapshot).as_deref(),
+            Some("Restart to update 0.2.2")
+        );
     }
 }

@@ -95,10 +95,7 @@ pub fn capture_process_identity(pid: u32) -> Option<ProcessIdentity> {
     process_identity_with_system(&system, pid)
 }
 
-pub fn process_identity_with_system(
-    system: &sysinfo::System,
-    pid: u32,
-) -> Option<ProcessIdentity> {
+pub fn process_identity_with_system(system: &sysinfo::System, pid: u32) -> Option<ProcessIdentity> {
     let process = system.process(sysinfo::Pid::from_u32(pid))?;
     Some(ProcessIdentity {
         pid,

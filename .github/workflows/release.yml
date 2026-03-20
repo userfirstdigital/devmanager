@@ -12,44 +12,112 @@ concurrency:
 
 jobs:
   prepare:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       base_version: ${{ steps.version.outputs.base_version }}
       release_version: ${{ steps.version.outputs.release_version }}
       tag_name: ${{ steps.version.outputs.tag_name }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Derive release version from Cargo.toml
+      - name: Compute next patch release version
         id: version
         shell: bash
-        env:
-          RUN_NUMBER: ${{ github.run_number }}
         run: |
           python - <<'PY'
           import os
           import pathlib
+          import re
+          import subprocess
           import tomllib
 
           cargo_toml = pathlib.Path("Cargo.toml")
-          data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
-          base_version = data["package"]["version"]
-          run_number = os.environ["RUN_NUMBER"]
-          if "-" in base_version:
-              release_version = f"{base_version}.{run_number}"
-          else:
-              release_version = f"{base_version}-dev.{run_number}"
+          cargo_lock = pathlib.Path("Cargo.lock")
+          cargo_data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+          base_version = cargo_data["package"]["version"].strip()
+          stable_semver = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+          def parse_version(value: str) -> tuple[int, int, int]:
+              match = stable_semver.fullmatch(value.strip())
+              if not match:
+                  raise SystemExit(
+                      f"Expected a stable version like 0.2.1 or v0.2.1, got `{value}`."
+                  )
+              return tuple(int(group) for group in match.groups())
+
+          latest_tag = ""
+          for raw_tag in subprocess.check_output(
+              ["git", "tag", "--list", "v*", "--sort=-v:refname"],
+              text=True,
+          ).splitlines():
+              tag = raw_tag.strip()
+              if stable_semver.fullmatch(tag):
+                  latest_tag = tag
+                  break
+
+          seed_version = latest_tag or base_version
+          major, minor, patch = parse_version(seed_version)
+          release_version = f"{major}.{minor}.{patch + 1}"
+
+          cargo_contents = cargo_toml.read_text(encoding="utf-8")
+          cargo_updated = re.sub(
+              r'(?ms)^\[package\]\s+(?:.*?\n)*?version = "[^"]+"',
+              lambda match: match.group(0).rsplit('"', 2)[0] + f'"{release_version}"',
+              cargo_contents,
+              count=1,
+          )
+          if cargo_contents == cargo_updated:
+              raise SystemExit("Failed to update package version in Cargo.toml.")
+          cargo_toml.write_text(cargo_updated, encoding="utf-8")
+
+          lock_contents = cargo_lock.read_text(encoding="utf-8")
+          lock_updated = re.sub(
+              r'(?ms)^\[\[package\]\]\nname = "devmanager"\nversion = "[^"]+"',
+              lambda match: match.group(0).rsplit('"', 2)[0] + f'"{release_version}"',
+              lock_contents,
+              count=1,
+          )
+          if lock_contents == lock_updated:
+              raise SystemExit("Failed to update the root package version in Cargo.lock.")
+          cargo_lock.write_text(lock_updated, encoding="utf-8")
 
           output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
           with output.open("a", encoding="utf-8") as handle:
               handle.write(f"base_version={base_version}\n")
               handle.write(f"release_version={release_version}\n")
               handle.write(f"tag_name=v{release_version}\n")
-          print(f"Base version: {base_version}")
-          print(f"Release version: {release_version}")
+
+          print(f"Current branch version: {base_version}")
+          print(f"Latest existing tag: {latest_tag or 'none'}")
+          print(f"Next release version: {release_version}")
           PY
+
+      - name: Commit version bump back to branch
+        id: commit
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git \
+            -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "[skip ci] chore(release): bump version to ${VERSION}"
+          git push origin "HEAD:${TARGET_BRANCH}"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -67,28 +135,25 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.commit_sha }}
 
-      - name: Apply CI release version
+      - name: Validate release signing configuration
         shell: bash
         env:
-          VERSION: ${{ needs.prepare.outputs.release_version }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          DEVMANAGER_UPDATE_PUBKEY: ${{ vars.DEVMANAGER_UPDATE_PUBKEY }}
         run: |
-          python - <<'PY'
-          import os
-          import pathlib
-          import re
-
-          version = os.environ["VERSION"]
-          cargo_toml = pathlib.Path("Cargo.toml")
-          contents = cargo_toml.read_text(encoding="utf-8")
-          updated = re.sub(
-              r'(?ms)^\\[package\\]\\s+(?:.*?\\n)*?version = "[^"]+"',
-              lambda match: match.group(0).rsplit('"', 2)[0] + f'"{version}"',
-              contents,
-              count=1,
-          )
-          cargo_toml.write_text(updated, encoding="utf-8")
-          PY
+          set -euo pipefail
+          if [ -z "${CARGO_PACKAGER_SIGN_PRIVATE_KEY:-}" ]; then
+            echo "Missing secret: CARGO_PACKAGER_SIGN_PRIVATE_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${DEVMANAGER_UPDATE_PUBKEY:-}" ]; then
+            echo "Missing repository variable: DEVMANAGER_UPDATE_PUBKEY" >&2
+            exit 1
+          fi
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -155,48 +220,51 @@ jobs:
           import json
           import os
           import pathlib
-          import sys
 
           root = pathlib.Path("release-artifacts")
           repo = os.environ["REPO"]
           version = os.environ["VERSION"]
           tag_name = os.environ["TAG_NAME"]
+          required_platforms = {
+              "windows-x86_64": {
+                  "pattern": "*_x64-setup.exe",
+                  "format": "nsis",
+              },
+              "darwin-aarch64": {
+                  "pattern": "*.app.tar.gz",
+                  "format": "app",
+              },
+          }
 
-          def pick_asset(directory: pathlib.Path, pattern: str) -> pathlib.Path:
+          def pick_single_asset(directory: pathlib.Path, pattern: str, label: str) -> pathlib.Path:
               matches = sorted(directory.glob(pattern))
-              if not matches:
-                  raise SystemExit(f"Missing asset matching {pattern!r} in {directory}")
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"Expected exactly one {label} matching {pattern!r} in {directory}, "
+                      f"found {len(matches)}."
+                  )
               return matches[0]
 
           def read_signature(path: pathlib.Path) -> str:
-              return path.read_text(encoding="utf-8").strip()
+              if not path.is_file():
+                  raise SystemExit(f"Missing updater signature: {path}")
+              signature = path.read_text(encoding="utf-8").strip()
+              if not signature:
+                  raise SystemExit(f"Updater signature is empty: {path}")
+              return signature
 
           platforms = {}
-
-          windows_dir = root / "windows-x86_64"
-          if windows_dir.exists():
-              installer = pick_asset(windows_dir, "*.exe")
-              signature_path = pathlib.Path(f"{installer}.sig")
-              if signature_path.exists():
-                  platforms["windows-x86_64"] = {
-                      "format": "nsis",
-                      "signature": read_signature(signature_path),
-                      "url": f"https://github.com/{repo}/releases/download/{tag_name}/{installer.name}",
-                  }
-
-          mac_dir = root / "darwin-aarch64"
-          if mac_dir.exists():
-              updater_bundle = pick_asset(mac_dir, "*.app.tar.gz")
-              signature_path = pathlib.Path(f"{updater_bundle}.sig")
-              if signature_path.exists():
-                  platforms["darwin-aarch64"] = {
-                      "format": "app",
-                      "signature": read_signature(signature_path),
-                      "url": f"https://github.com/{repo}/releases/download/{tag_name}/{updater_bundle.name}",
-                  }
-
-          if not platforms:
-              raise SystemExit("No updater-ready artifacts were found.")
+          for platform, metadata in required_platforms.items():
+              directory = root / platform
+              if not directory.is_dir():
+                  raise SystemExit(f"Missing packaged artifacts for {platform}: {directory}")
+              asset = pick_single_asset(directory, metadata["pattern"], f"{platform} updater asset")
+              signature = read_signature(pathlib.Path(f"{asset}.sig"))
+              platforms[platform] = {
+                  "format": metadata["format"],
+                  "signature": signature,
+                  "url": f"https://github.com/{repo}/releases/download/{tag_name}/{asset.name}",
+              }
 
           manifest = {
               "version": version,

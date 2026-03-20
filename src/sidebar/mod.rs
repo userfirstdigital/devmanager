@@ -132,11 +132,9 @@ fn render_expanded_sidebar(
     actions: SidebarActions<'_>,
 ) -> AnyElement {
     let project_count = state.projects().len();
-    let project_rows = state
-        .projects()
-        .iter()
-        .enumerate()
-        .map(|(index, project)| render_project_group(state, runtime, project, index, project_count, &actions));
+    let project_rows = state.projects().iter().enumerate().map(|(index, project)| {
+        render_project_group(state, runtime, project, index, project_count, &actions)
+    });
     let ssh_rows = state
         .ssh_connections()
         .iter()
@@ -264,27 +262,26 @@ fn render_project_group(
         .iter()
         .filter(|folder| !folder.hidden.unwrap_or(false))
         .map(|folder| render_folder_group(state, runtime, project, folder, actions));
-    let ai_launch_row =
-        div()
-            .flex()
-            .items_center()
-            .gap(px(5.0))
-            .pl_4()
-            .text_xs()
-            .child(icon_text_action(
-                icons::SPARKLES,
-                10.0,
-                "+ Claude",
-                theme::TEXT_SUBTLE,
-                (actions.on_launch_claude)(project.id.clone()),
-            ))
-            .child(icon_text_action(
-                icons::BOT,
-                10.0,
-                "+ Codex",
-                theme::TEXT_SUBTLE,
-                (actions.on_launch_codex)(project.id.clone()),
-            ));
+    let ai_launch_row = div()
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .pl_4()
+        .text_xs()
+        .child(icon_text_action(
+            icons::SPARKLES,
+            10.0,
+            "+ Claude",
+            theme::TEXT_SUBTLE,
+            (actions.on_launch_claude)(project.id.clone()),
+        ))
+        .child(icon_text_action(
+            icons::BOT,
+            10.0,
+            "+ Codex",
+            theme::TEXT_SUBTLE,
+            (actions.on_launch_codex)(project.id.clone()),
+        ));
 
     let menu_open = matches!(
         actions.open_context_menu,
@@ -412,9 +409,7 @@ fn render_ai_row(
         .as_deref()
         .and_then(|session_id| runtime.sessions.get(session_id));
     let is_active = state.active_tab_id.as_deref() == Some(tab.id.as_str());
-    let label = session
-        .and_then(|session| session.title.clone())
-        .unwrap_or_else(|| state.tab_label(tab));
+    let label = state.tab_label(tab);
     let status_label = ai_status_label(session);
     let status_color = ai_status_color(session, tab);
 
@@ -461,11 +456,14 @@ fn render_ai_row(
                     div()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_PRIMARY))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
                         .child(SharedString::from(label)),
                 ),
         )
         .child(
             div()
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .gap(px(4.0))
