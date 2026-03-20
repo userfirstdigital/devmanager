@@ -23,11 +23,12 @@ use gpui::{
     div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
     ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollWheelEvent, Styled, TouchPhase, Window, WindowBounds, WindowOptions,
+    Render, RenderImage, ScrollWheelEvent, Styled, TouchPhase, Window, WindowBounds, WindowOptions,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TERMINAL_TOPBAR_HEIGHT_PX: f32 = 22.0;
@@ -125,6 +126,8 @@ struct NativeShell {
     sidebar_context_menu: Option<sidebar::SidebarContextMenu>,
     add_project_wizard: Option<workspace::AddProjectWizard>,
     last_window_title: Option<String>,
+    splash_image: Option<Arc<RenderImage>>,
+    splash_fetch_in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -248,7 +251,7 @@ impl NativeShell {
             Self::spawn_updater_refresh_task(updater.clone(), cx);
         }
 
-        Self {
+        let shell = Self {
             state,
             session_manager,
             process_manager,
@@ -274,6 +277,41 @@ impl NativeShell {
             sidebar_context_menu: None,
             add_project_wizard: None,
             last_window_title: None,
+            splash_image: None,
+            splash_fetch_in_flight: false,
+        };
+
+        Self::spawn_splash_image_fetch(cx);
+
+        shell
+    }
+
+    fn spawn_splash_image_fetch(cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let image = executor
+                        .spawn(async move { fetch_splash_image() })
+                        .await;
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        shell.splash_fetch_in_flight = false;
+                        if let Some(image) = image {
+                            shell.splash_image = Some(image);
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn ensure_splash_image(&mut self, cx: &mut Context<Self>) {
+        if self.splash_image.is_none() && !self.splash_fetch_in_flight {
+            self.splash_fetch_in_flight = true;
+            Self::spawn_splash_image_fetch(cx);
         }
     }
 
@@ -2201,6 +2239,10 @@ impl NativeShell {
         let active_tab_type = active_tab.as_ref().map(|tab| tab.tab_type.clone());
         let mut active_session = None;
 
+        if active_tab_type.is_some() {
+            self.splash_image = None;
+        }
+
         match active_tab_type {
             Some(TabType::Server) => {
                 self.process_manager
@@ -2343,7 +2385,8 @@ impl NativeShell {
                 }
             }
             _ if !self.state.open_tabs.is_empty() => {
-                // Tabs exist but none is selected — show empty terminal pane.
+                // Tabs exist but none is selected — show splash image.
+                self.ensure_splash_image(cx);
             }
             _ => {
                 self.process_manager
@@ -2395,13 +2438,21 @@ impl NativeShell {
         );
         let terminal_metrics = self.terminal_render_metrics(window);
 
+        let has_active_tab = active_tab_type.is_some();
         view::TerminalPaneModel {
-            active_project: self
-                .state
-                .active_project()
-                .map(|project| project.name.clone())
-                .unwrap_or_else(|| "No project selected".to_string()),
-            session_label: active_spec.display_label,
+            active_project: if has_active_tab {
+                self.state
+                    .active_project()
+                    .map(|project| project.name.clone())
+                    .unwrap_or_else(|| "No project selected".to_string())
+            } else {
+                String::new()
+            },
+            session_label: if has_active_tab {
+                active_spec.display_label
+            } else {
+                String::new()
+            },
             active_tab_type,
             session: active_session,
             startup_notice: self
@@ -2414,6 +2465,7 @@ impl NativeShell {
             line_height: terminal_metrics.line_height,
             selection,
             runtime_controls,
+            splash_image: self.splash_image.clone(),
         }
     }
 
@@ -2982,8 +3034,9 @@ impl NativeShell {
         {
             self.terminal_notice = Some(format!("Failed to close AI tab: {error}"));
         } else {
+            self.synced_session_id = None;
+            self.last_dimensions = None;
             self.save_session_state();
-            self.synced_session_id = self.state.active_terminal_spec().session_id.into();
         }
         cx.notify();
     }
@@ -5133,6 +5186,24 @@ fn dedupe_adjacent_segments(segments: Vec<String>) -> Vec<String> {
 
 fn is_startup_restorable_tab(tab: &SessionTab) -> bool {
     matches!(tab.tab_type, TabType::Server | TabType::Ssh)
+}
+
+fn fetch_splash_image() -> Option<Arc<RenderImage>> {
+    let bytes = ureq::get("https://picsum.photos/1920/1080")
+        .call()
+        .ok()?
+        .into_body()
+        .read_to_vec()
+        .ok()?;
+    let format = image::guess_format(&bytes).ok()?;
+    let mut rgba = image::load_from_memory_with_format(&bytes, format)
+        .ok()?
+        .into_rgba8();
+    // GPUI expects BGRA pixel order.
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
 }
 
 fn retain_startup_restorable_tabs(

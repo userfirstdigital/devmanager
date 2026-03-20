@@ -6,9 +6,9 @@ use crate::terminal::session::{
 use crate::theme;
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-    canvas, div, fill, point, px, rgb, size, AnyElement, App, Bounds, Hsla, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString, StrikethroughStyle,
-    Styled, TextRun, UnderlineStyle, Window,
+    canvas, div, fill, img, point, px, rgb, size, AnyElement, App, Bounds, Hsla, ImageSource,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement,
+    SharedString, StrikethroughStyle, Styled, StyledImage, TextRun, UnderlineStyle, Window,
 };
 
 pub const TERMINAL_FONT_SIZE: f32 = 13.0;
@@ -39,6 +39,7 @@ pub struct TerminalPaneModel {
     pub line_height: f32,
     pub selection: Option<TerminalSelectionSnapshot>,
     pub runtime_controls: Option<TerminalRuntimeControlsModel>,
+    pub splash_image: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
 pub struct TerminalPaneActions {
@@ -139,7 +140,7 @@ pub fn render_terminal_surface(
         )
         .into_any_element()
     } else {
-        render_empty_body(empty_surface_message(model)).into_any_element()
+        render_empty_body(empty_surface_message(model), model.splash_image.clone()).into_any_element()
     };
 
     div()
@@ -282,13 +283,22 @@ fn render_grid(
         )
 }
 
-fn render_empty_body(message: String) -> impl IntoElement {
+fn render_empty_body(
+    message: String,
+    splash_image: Option<std::sync::Arc<gpui::RenderImage>>,
+) -> impl IntoElement {
     div()
         .flex_1()
         .bg(rgb(theme::TERMINAL_BG))
         .flex()
-        .items_start()
-        .justify_start()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .children(splash_image.map(|image| {
+            img(ImageSource::Render(image))
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+        }))
         .children((!message.is_empty()).then(|| {
             div()
                 .px(px(10.0))
@@ -353,7 +363,7 @@ fn empty_surface_message(model: &TerminalPaneModel) -> String {
         Some(TabType::Server) => String::new(),
         Some(TabType::Claude) | Some(TabType::Codex) => String::new(),
         Some(TabType::Ssh) => String::new(),
-        None => "Select a command in the sidebar.".to_string(),
+        None => String::new(),
     }
 }
 

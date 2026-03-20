@@ -157,9 +157,7 @@ impl AppState {
     }
 
     pub fn active_project(&self) -> Option<&Project> {
-        let Some(project_id) = self.active_tab().map(|tab| tab.project_id.as_str()) else {
-            return self.config.projects.first();
-        };
+        let project_id = self.active_tab().map(|tab| tab.project_id.as_str())?;
 
         self.config
             .projects
@@ -354,7 +352,7 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|active| active == tab_id)
         {
-            self.active_tab_id = self.open_tabs.first().map(|tab| tab.id.clone());
+            self.active_tab_id = None;
         }
         removed
     }

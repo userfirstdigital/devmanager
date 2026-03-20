@@ -276,14 +276,14 @@ fn render_project_group(
             icons::SPARKLES,
             10.0,
             "+ Claude",
-            theme::TEXT_SUBTLE,
+            0xb07d3a, // muted amber, subtle
             (actions.on_launch_claude)(project.id.clone()),
         ))
         .child(icon_text_action(
             icons::BOT,
             10.0,
             "+ Codex",
-            theme::TEXT_SUBTLE,
+            0x6a9c89, // muted teal, subtle
             (actions.on_launch_codex)(project.id.clone()),
         ));
 
