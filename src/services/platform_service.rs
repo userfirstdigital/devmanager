@@ -7,11 +7,17 @@ use std::thread;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
     #[cfg(windows)]
     {
         let output = Command::new("netstat")
             .args(["-ano", "-p", "tcp"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|error| format!("Failed to run netstat: {error}"))?;
         if !output.status.success() {
@@ -179,6 +185,7 @@ pub fn get_process_name(pid: u32) -> Result<Option<String>, String> {
     {
         let output = Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|error| format!("Failed to run tasklist: {error}"))?;
         if !output.status.success() {
@@ -330,6 +337,7 @@ fn applescript_quote(value: &str) -> String {
 fn run_taskkill(pid: u32, include_tree: bool) -> Result<(), String> {
     let mut command = Command::new("taskkill");
     command.args(["/PID", &pid.to_string(), "/F"]);
+    command.creation_flags(CREATE_NO_WINDOW);
     if include_tree {
         command.arg("/T");
     }

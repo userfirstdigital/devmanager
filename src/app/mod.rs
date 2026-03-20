@@ -238,54 +238,9 @@ impl NativeShell {
                 restore_saved_tabs(&process_manager, &mut state, SessionDimensions::default());
         }
 
-        let active_spec = state.active_terminal_spec();
-        let active_tab_type = state.active_tab().map(|tab| tab.tab_type.clone());
-
-        let synced_session_id = match active_tab_type {
-            Some(TabType::Server) => {
-                process_manager.set_active_session(active_spec.session_id.clone());
-                Some(active_spec.session_id)
-            }
-            Some(TabType::Claude) | Some(TabType::Codex) => {
-                process_manager.set_active_session(active_spec.session_id.clone());
-                Some(active_spec.session_id)
-            }
-            Some(TabType::Ssh) => {
-                let runtime = process_manager.runtime_state();
-                let live_session = state
-                    .active_tab()
-                    .and_then(|tab| tab.pty_session_id.as_deref())
-                    .and_then(|session_id| runtime.sessions.get(session_id))
-                    .map(|session| {
-                        session.status.is_live()
-                            && matches!(session.session_kind, crate::state::SessionKind::Ssh)
-                    })
-                    .unwrap_or(false);
-                if live_session {
-                    process_manager.set_active_session(active_spec.session_id.clone());
-                    Some(active_spec.session_id)
-                } else {
-                    terminal_notice = terminal_notice.or_else(|| {
-                        Some("SSH session is disconnected. Connect from the sidebar.".to_string())
-                    });
-                    None
-                }
-            }
-            _ => {
-                if let Err(error) = process_manager.spawn_shell_session(
-                    active_spec.session_id.clone(),
-                    &active_spec.cwd,
-                    SessionDimensions::default(),
-                    Some(state.settings().default_terminal.clone()),
-                ) {
-                    terminal_notice =
-                        Some(format!("Failed to start initial shell session: {error}"));
-                } else {
-                    process_manager.set_active_session(active_spec.session_id.clone());
-                }
-                Some(active_spec.session_id)
-            }
-        };
+        // Start with no terminal loaded — the user picks a tab from the sidebar.
+        state.active_tab_id = None;
+        let synced_session_id: Option<String> = None;
 
         let _ = session_manager.save_session(&persisted_session_state(&state));
         updater.start_background_checks();
@@ -2386,6 +2341,9 @@ impl NativeShell {
                         );
                     }
                 }
+            }
+            _ if !self.state.open_tabs.is_empty() => {
+                // Tabs exist but none is selected — show empty terminal pane.
             }
             _ => {
                 self.process_manager
@@ -5833,7 +5791,7 @@ mod tests {
 
         assert_eq!(
             current_window_title(&state, &runtime),
-            "Househunter • api / API Dev • DevManager"
+            "Househunter • api • DevManager"
         );
     }
 

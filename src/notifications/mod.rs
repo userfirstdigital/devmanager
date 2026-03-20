@@ -33,15 +33,23 @@ fn sound_file_path(sound_id: &str) -> PathBuf {
 }
 
 fn play_wav_file(path: &str) {
-    if cfg!(target_os = "windows") {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
         let escaped = path.replace('\'', "''");
-        let script = format!("$p = New-Object System.Media.SoundPlayer '{escaped}'; $p.PlaySync()");
+        let script =
+            format!("$p = New-Object System.Media.SoundPlayer '{escaped}'; $p.PlaySync()");
         let _ = Command::new("powershell")
             .args(["-NoProfile", "-Command", &script])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output();
-    } else if cfg!(target_os = "macos") {
+    }
+    #[cfg(target_os = "macos")]
+    {
         let _ = Command::new("afplay").arg(path).output();
-    } else {
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
         let _ = Command::new("aplay").arg("-q").arg(path).output();
     }
 }
