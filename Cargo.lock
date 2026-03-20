@@ -777,6 +777,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargo-packager-resource-resolver"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c54b2cc2601d3f8d89a8d2e0edd4ef9e2685b29f6cc810964e7454c04e474ba2"
+dependencies = [
+ "cargo-packager-utils",
+ "heck 0.5.0",
+ "log",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cargo-packager-updater"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1366,6 +1378,7 @@ version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
+ "cargo-packager-resource-resolver",
  "cargo-packager-updater",
  "dirs 6.0.0",
  "gpui",

@@ -1635,12 +1635,14 @@ fn render_settings_panel(
                     terminal_options,
                 ))
                 .child(render_settings_font_size_row(draft, actions))
-                .child(render_settings_toggle_row(
-                    "Option acts as Meta",
-                    "On macOS, treat Option as terminal Meta/Alt instead of character input",
-                    draft.option_as_meta,
-                    (actions.on_action)(EditorAction::ToggleOptionAsMeta),
-                ))
+                .children(is_mac.then(|| {
+                    render_settings_toggle_row(
+                        "Option acts as Meta",
+                        "On macOS, treat Option as terminal Meta/Alt instead of character input",
+                        draft.option_as_meta,
+                        (actions.on_action)(EditorAction::ToggleOptionAsMeta),
+                    )
+                }))
                 .child(render_settings_toggle_row(
                     "Copy on select",
                     "Copy terminal selections to the clipboard when you release the mouse",
@@ -2978,13 +2980,6 @@ fn render_updater_panel(
         .flex()
         .flex_col()
         .gap_3()
-        .child(render_info_row(
-            "App version",
-            updater.current_version.as_str(),
-            Some(
-                "Packaged builds compiled with updater metadata can check GitHub-hosted releases.",
-            ),
-        ))
         .child(render_info_row(
             "Updater status",
             updater_stage_label(&updater.stage),

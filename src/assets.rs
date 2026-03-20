@@ -1,7 +1,11 @@
+use cargo_packager_resource_resolver::{resources_dir, PackageFormat};
 use gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static ASSETS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub struct AppAssets {
     base: PathBuf,
@@ -9,10 +13,53 @@ pub struct AppAssets {
 
 impl AppAssets {
     pub fn new() -> Self {
-        Self {
-            base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        Self { base: assets_dir() }
+    }
+}
+
+pub fn assets_dir() -> PathBuf {
+    ASSETS_DIR.get_or_init(resolve_assets_dir).clone()
+}
+
+pub fn asset_path(path: impl AsRef<Path>) -> PathBuf {
+    assets_dir().join(path)
+}
+
+fn resolve_assets_dir() -> PathBuf {
+    asset_dir_candidates()
+        .into_iter()
+        .find(|candidate| candidate.join("icons").is_dir())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"))
+}
+
+fn asset_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for format in PackageFormat::platform_all() {
+        if let Ok(resource_root) = resources_dir(*format) {
+            candidates.push(resource_root.join("assets"));
+            candidates.push(resource_root);
         }
     }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("assets"));
+            candidates.push(exe_dir.join("resources").join("assets"));
+
+            if let Some(parent) = exe_dir.parent() {
+                candidates.push(parent.join("Resources").join("assets"));
+                candidates.push(parent.join("resources").join("assets"));
+
+                if let Some(grandparent) = parent.parent() {
+                    candidates.push(grandparent.join("Resources").join("assets"));
+                    candidates.push(grandparent.join("resources").join("assets"));
+                }
+            }
+        }
+    }
+
+    candidates
 }
 
 impl AssetSource for AppAssets {
@@ -35,5 +82,17 @@ impl AssetSource for AppAssets {
                     .collect()
             })
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assets_dir;
+
+    #[test]
+    fn resolves_existing_assets_directory() {
+        let base = assets_dir();
+        assert!(base.join("icons").is_dir());
+        assert!(base.join("icons/settings.svg").is_file());
     }
 }

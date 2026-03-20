@@ -161,7 +161,7 @@ jobs:
         include:
           - runner: windows-latest
             platform: windows-x86_64
-            formats: nsis
+            formats: nsis,wix
           - runner: macos-15
             platform: darwin-aarch64
             formats: app,dmg
@@ -204,6 +204,32 @@ jobs:
         shell: powershell
         run: choco install nsis -y --no-progress
 
+      - name: Ensure WiX Toolset
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $requiredTools = @("candle.exe", "light.exe")
+          $missing = $requiredTools | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+          if ($missing.Count -gt 0) {
+            choco install wixtoolset -y --no-progress
+            $wixRoot = Get-ChildItem "${env:ProgramFiles(x86)}" -Directory -Filter "WiX Toolset*" |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+            if ($wixRoot) {
+              $wixBin = Join-Path $wixRoot.FullName "bin"
+              if (Test-Path $wixBin) {
+                $env:Path = "$wixBin;$env:Path"
+                $wixBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              }
+            }
+          }
+
+          foreach ($tool in $requiredTools) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "Missing WiX tool after setup: $tool"
+            }
+          }
+
       - name: Package app
         shell: bash
         env:
@@ -224,7 +250,7 @@ jobs:
           cp -R dist/packager/. "release-artifacts/${PLATFORM}/"
 
       - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform }}
           path: release-artifacts/${{ matrix.platform }}
@@ -238,7 +264,7 @@ jobs:
 
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: release-artifacts
 

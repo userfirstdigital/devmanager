@@ -1,3 +1,4 @@
+use crate::assets::asset_path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -28,10 +29,7 @@ fn sound_file_path(sound_id: &str) -> PathBuf {
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join("sounds")
-        .join(format!("{sanitized}.wav"))
+    asset_path(format!("sounds/{sanitized}.wav"))
 }
 
 fn play_wav_file(path: &str) {
