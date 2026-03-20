@@ -33,6 +33,16 @@ pub struct ManagedProcessRecord {
     pub command_id: Option<String>,
     #[serde(default)]
     pub tab_id: Option<String>,
+    #[serde(default)]
+    pub descendant_processes: Vec<TrackedProcessIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedProcessIdentity {
+    pub pid: u32,
+    pub started_at_unix_secs: u64,
+    #[serde(default)]
+    pub process_name: Option<String>,
 }
 
 impl ManagedProcessRecord {
@@ -47,6 +57,7 @@ impl ManagedProcessRecord {
             project_id: None,
             command_id: None,
             tab_id: None,
+            descendant_processes: Vec::new(),
         }
     }
 }
@@ -192,25 +203,40 @@ fn mutate_ledger<R>(f: impl FnOnce(&mut ManagedProcessLedgerFile) -> R) -> Resul
     Ok(result)
 }
 
-fn tracked_process_state_with<F>(
-    entry: &ManagedProcessRecord,
+fn mutate_ledger_if_changed(
+    f: impl FnOnce(&mut ManagedProcessLedgerFile) -> bool,
+) -> Result<bool, String> {
+    let path = pid_file_path()?;
+    let _guard = PID_FILE_ACCESS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut ledger = read_ledger_from_path(&path);
+    let changed = f(&mut ledger);
+    if changed {
+        write_ledger_to_path(&path, &ledger)?;
+    }
+    Ok(changed)
+}
+
+fn tracked_process_identity_state_with<F>(
+    identity: &TrackedProcessIdentity,
     identify_process: &mut F,
 ) -> TrackedProcessState
 where
     F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
 {
-    let Some(identity) = identify_process(entry.pid) else {
+    let Some(actual_identity) = identify_process(identity.pid) else {
         return TrackedProcessState::Missing;
     };
-    if entry.started_at_unix_secs == 0 {
+    if identity.started_at_unix_secs == 0 {
         return TrackedProcessState::ReusedPid;
     }
-    if identity.started_at_unix_secs != entry.started_at_unix_secs {
+    if actual_identity.started_at_unix_secs != identity.started_at_unix_secs {
         return TrackedProcessState::ReusedPid;
     }
-    match entry.process_name.as_deref() {
+    match identity.process_name.as_deref() {
         Some(expected_name)
-            if identity
+            if actual_identity
                 .process_name
                 .as_deref()
                 .map(|actual_name| !actual_name.eq_ignore_ascii_case(expected_name))
@@ -222,25 +248,133 @@ where
     }
 }
 
-fn active_processes_with<F>(path: &Path, mut classify: F) -> Vec<ManagedProcessRecord>
+fn root_process_identity(entry: &ManagedProcessRecord) -> TrackedProcessIdentity {
+    TrackedProcessIdentity {
+        pid: entry.pid,
+        started_at_unix_secs: entry.started_at_unix_secs,
+        process_name: entry.process_name.clone(),
+    }
+}
+
+fn normalize_descendant_processes(
+    root_pid: u32,
+    descendants: Vec<platform_service::ProcessIdentity>,
+) -> Vec<TrackedProcessIdentity> {
+    let mut descendants: Vec<_> = descendants
+        .into_iter()
+        .filter(|identity| identity.pid != root_pid)
+        .map(|identity| TrackedProcessIdentity {
+            pid: identity.pid,
+            started_at_unix_secs: identity.started_at_unix_secs,
+            process_name: identity.process_name,
+        })
+        .collect();
+    descendants.sort_by_key(|identity| identity.pid);
+    descendants.dedup_by(|left, right| left.pid == right.pid);
+    descendants
+}
+
+fn active_processes_in_record_with<F>(
+    entry: &ManagedProcessRecord,
+    identify_process: &mut F,
+) -> Option<ManagedProcessRecord>
 where
-    F: FnMut(&ManagedProcessRecord) -> TrackedProcessState,
+    F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
+{
+    let root_live = tracked_process_identity_state_with(&root_process_identity(entry), identify_process)
+        == TrackedProcessState::VerifiedRunning;
+    let live_descendants = entry
+        .descendant_processes
+        .iter()
+        .filter(|identity| {
+            tracked_process_identity_state_with(identity, identify_process)
+                == TrackedProcessState::VerifiedRunning
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if root_live || !live_descendants.is_empty() {
+        let mut entry = entry.clone();
+        entry.descendant_processes = live_descendants;
+        Some(entry)
+    } else {
+        None
+    }
+}
+
+fn active_pids_in_record_with<F>(
+    entry: &ManagedProcessRecord,
+    identify_process: &mut F,
+) -> Vec<u32>
+where
+    F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
+{
+    let mut pids = Vec::new();
+    if tracked_process_identity_state_with(&root_process_identity(entry), identify_process)
+        == TrackedProcessState::VerifiedRunning
+    {
+        pids.push(entry.pid);
+    }
+    pids.extend(
+        entry.descendant_processes
+            .iter()
+            .filter(|identity| {
+                tracked_process_identity_state_with(identity, identify_process)
+                    == TrackedProcessState::VerifiedRunning
+            })
+            .map(|identity| identity.pid),
+    );
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn tracked_pids_for_record(entry: &ManagedProcessRecord) -> Vec<u32> {
+    let mut pids = Vec::with_capacity(entry.descendant_processes.len() + 1);
+    pids.push(entry.pid);
+    pids.extend(entry.descendant_processes.iter().map(|identity| identity.pid));
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn active_processes_with<F>(path: &Path, mut identify_process: F) -> Vec<ManagedProcessRecord>
+where
+    F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
 {
     read_ledger_from_path(path)
         .sessions
         .into_values()
-        .filter(|entry| classify(entry) == TrackedProcessState::VerifiedRunning)
+        .filter_map(|entry| active_processes_in_record_with(&entry, &mut identify_process))
         .collect()
 }
 
-fn prune_inactive_entries_with_path<F>(path: &Path, mut classify: F) -> Result<usize, String>
+fn active_pids_with<F>(path: &Path, mut identify_process: F) -> Vec<u32>
 where
-    F: FnMut(&ManagedProcessRecord) -> TrackedProcessState,
+    F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
+{
+    let mut pids: Vec<u32> = read_ledger_from_path(path)
+        .sessions
+        .into_values()
+        .flat_map(|entry| active_pids_in_record_with(&entry, &mut identify_process))
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn prune_inactive_entries_with_path<F>(path: &Path, mut identify_process: F) -> Result<usize, String>
+where
+    F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
 {
     let mut ledger = read_ledger_from_path(path);
-    ledger
+    ledger.sessions = ledger
         .sessions
-        .retain(|_, entry| classify(entry) == TrackedProcessState::VerifiedRunning);
+        .into_iter()
+        .filter_map(|(session_id, entry)| {
+            active_processes_in_record_with(&entry, &mut identify_process)
+                .map(|entry| (session_id, entry))
+        })
+        .collect();
     let remaining = ledger.sessions.len();
     write_ledger_to_path(path, &ledger)?;
     Ok(remaining)
@@ -248,10 +382,10 @@ where
 
 fn cleanup_orphaned_processes_with_path<F, G>(
     path: &Path,
-    mut classify: F,
+    mut identify_process: F,
     mut kill_process_tree: G,
 ) where
-    F: FnMut(&ManagedProcessRecord) -> TrackedProcessState,
+    F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
     G: FnMut(u32) -> Result<(), String>,
 {
     let mut ledger = read_ledger_from_path(path);
@@ -261,21 +395,25 @@ fn cleanup_orphaned_processes_with_path<F, G>(
 
     let mut retained = BTreeMap::new();
     for (session_id, entry) in ledger.sessions {
-        match classify(&entry) {
-            TrackedProcessState::Missing | TrackedProcessState::ReusedPid => {}
-            TrackedProcessState::VerifiedRunning => {
-                let kill_result = kill_process_tree(entry.pid);
-                match classify(&entry) {
-                    TrackedProcessState::VerifiedRunning => {
-                        if kill_result.is_err() {
-                            retained.insert(session_id, entry);
-                        } else {
-                            retained.insert(session_id, entry);
-                        }
-                    }
-                    TrackedProcessState::Missing | TrackedProcessState::ReusedPid => {}
-                }
+        let root_live =
+            tracked_process_identity_state_with(&root_process_identity(&entry), &mut identify_process)
+                == TrackedProcessState::VerifiedRunning;
+        let Some(active_entry) = active_processes_in_record_with(&entry, &mut identify_process) else {
+            continue;
+        };
+
+        if root_live {
+            let _ = kill_process_tree(entry.pid);
+        } else {
+            for descendant in &active_entry.descendant_processes {
+                let _ = kill_process_tree(descendant.pid);
             }
+        }
+
+        if let Some(active_after_kill) =
+            active_processes_in_record_with(&entry, &mut identify_process)
+        {
+            retained.insert(session_id, active_after_kill);
         }
     }
 
@@ -287,6 +425,48 @@ pub fn track_session_process(record: ManagedProcessRecord) -> Result<(), String>
     mutate_ledger(|ledger| {
         ledger.version = LEDGER_VERSION;
         ledger.sessions.insert(record.session_id.clone(), record);
+    })
+    .map(|_| ())
+}
+
+pub fn sync_session_descendant_processes(
+    session_id: &str,
+    root_pid: u32,
+    descendants: Vec<platform_service::ProcessIdentity>,
+) -> Result<(), String> {
+    let normalized = normalize_descendant_processes(root_pid, descendants);
+    mutate_ledger_if_changed(|ledger| {
+        let Some(entry) = ledger.sessions.get_mut(session_id) else {
+            return false;
+        };
+        if entry.pid != root_pid || entry.descendant_processes == normalized {
+            return false;
+        }
+        entry.descendant_processes = normalized;
+        true
+    })
+    .map(|_| ())
+}
+
+pub fn release_session_root(
+    session_id: &str,
+    root_pid: u32,
+    surviving_descendants: Vec<platform_service::ProcessIdentity>,
+) -> Result<(), String> {
+    let normalized = normalize_descendant_processes(root_pid, surviving_descendants);
+    mutate_ledger_if_changed(|ledger| {
+        let Some(entry) = ledger.sessions.get(session_id) else {
+            return false;
+        };
+        if entry.pid != root_pid {
+            return false;
+        }
+        if normalized.is_empty() {
+            ledger.sessions.remove(session_id);
+        } else if let Some(entry) = ledger.sessions.get_mut(session_id) {
+            entry.descendant_processes = normalized;
+        }
+        true
     })
     .map(|_| ())
 }
@@ -316,13 +496,13 @@ pub fn tracked_processes() -> Vec<ManagedProcessRecord> {
 pub fn tracked_process_for_pid(pid: u32) -> Option<ManagedProcessRecord> {
     tracked_processes()
         .into_iter()
-        .find(|entry| entry.pid == pid)
+        .find(|entry| tracked_pids_for_record(entry).contains(&pid))
 }
 
 pub fn tracked_pids() -> HashSet<u32> {
     tracked_processes()
         .into_iter()
-        .map(|entry| entry.pid)
+        .flat_map(|entry| tracked_pids_for_record(&entry))
         .collect()
 }
 
@@ -331,16 +511,31 @@ pub fn active_tracked_processes() -> Vec<ManagedProcessRecord> {
         Ok(path) => path,
         Err(_) => return Vec::new(),
     };
-    active_processes_with(&path, |entry| {
-        tracked_process_state_with(entry, &mut platform_service::capture_process_identity)
-    })
+    active_processes_with(&path, platform_service::capture_process_identity)
 }
 
 pub fn active_tracked_pids() -> Vec<u32> {
-    active_tracked_processes()
-        .into_iter()
-        .map(|entry| entry.pid)
-        .collect()
+    let path = match pid_file_path() {
+        Ok(path) => path,
+        Err(_) => return Vec::new(),
+    };
+    active_pids_with(&path, platform_service::capture_process_identity)
+}
+
+pub fn active_tracked_pids_for_session(session_id: &str) -> Vec<u32> {
+    let path = match pid_file_path() {
+        Ok(path) => path,
+        Err(_) => return Vec::new(),
+    };
+    let mut pids: Vec<u32> = read_ledger_from_path(&path)
+        .sessions
+        .into_values()
+        .filter(|entry| entry.session_id == session_id)
+        .flat_map(|entry| active_pids_in_record_with(&entry, &mut platform_service::capture_process_identity))
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 pub fn wait_for_tracked_processes_to_exit(timeout: Duration) -> Vec<ManagedProcessRecord> {
@@ -355,10 +550,14 @@ pub fn wait_for_tracked_processes_to_exit(timeout: Duration) -> Vec<ManagedProce
 }
 
 pub fn wait_for_tracked_pids_to_exit(timeout: Duration) -> Vec<u32> {
-    wait_for_tracked_processes_to_exit(timeout)
-        .into_iter()
-        .map(|entry| entry.pid)
-        .collect()
+    let started_at = Instant::now();
+    loop {
+        let active = active_tracked_pids();
+        if active.is_empty() || started_at.elapsed() >= timeout {
+            return active;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn prune_inactive_entries() -> Result<usize, String> {
@@ -366,9 +565,7 @@ pub fn prune_inactive_entries() -> Result<usize, String> {
     let _guard = PID_FILE_ACCESS_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    prune_inactive_entries_with_path(&path, |entry| {
-        tracked_process_state_with(entry, &mut platform_service::capture_process_identity)
-    })
+    prune_inactive_entries_with_path(&path, platform_service::capture_process_identity)
 }
 
 pub fn cleanup_orphaned_processes() {
@@ -381,7 +578,7 @@ pub fn cleanup_orphaned_processes() {
         .unwrap_or_else(|error| error.into_inner());
     cleanup_orphaned_processes_with_path(
         &path,
-        |entry| tracked_process_state_with(entry, &mut platform_service::capture_process_identity),
+        platform_service::capture_process_identity,
         platform_service::kill_process_tree,
     );
 }
@@ -403,6 +600,15 @@ mod tests {
             project_id: Some("project-1".to_string()),
             command_id: Some(session_id.to_string()),
             tab_id: None,
+            descendant_processes: Vec::new(),
+        }
+    }
+
+    fn identity(pid: u32, started_at_unix_secs: u64) -> platform_service::ProcessIdentity {
+        platform_service::ProcessIdentity {
+            pid,
+            started_at_unix_secs,
+            process_name: Some(format!("proc-{pid}")),
         }
     }
 
@@ -453,9 +659,7 @@ mod tests {
         let mut killed = Vec::new();
         cleanup_orphaned_processes_with_path(
             &path,
-            |entry| {
-                tracked_process_state_with(entry, &mut |pid| running.borrow().get(&pid).cloned())
-            },
+            |pid| running.borrow().get(&pid).cloned(),
             |pid| {
                 killed.push(pid);
                 running.borrow_mut().remove(&pid);
@@ -491,7 +695,7 @@ mod tests {
         };
         cleanup_orphaned_processes_with_path(
             &path,
-            |entry| tracked_process_state_with(entry, &mut |_| Some(running.clone())),
+            |_| Some(running.clone()),
             |_| Err("still running".to_string()),
         );
 
@@ -523,21 +727,19 @@ mod tests {
         };
         write_ledger_to_path(&path, &ledger).unwrap();
 
-        let mut active = active_processes_with(&path, |entry| {
-            tracked_process_state_with(entry, &mut |pid| match pid {
-                5 => Some(platform_service::ProcessIdentity {
-                    pid,
-                    started_at_unix_secs: 55,
-                    process_name: Some("proc-5".to_string()),
-                }),
-                6 => None,
-                7 => Some(platform_service::ProcessIdentity {
-                    pid,
-                    started_at_unix_secs: 999,
-                    process_name: Some("proc-7".to_string()),
-                }),
-                _ => None,
-            })
+        let mut active = active_processes_with(&path, |pid| match pid {
+            5 => Some(platform_service::ProcessIdentity {
+                pid,
+                started_at_unix_secs: 55,
+                process_name: Some("proc-5".to_string()),
+            }),
+            6 => None,
+            7 => Some(platform_service::ProcessIdentity {
+                pid,
+                started_at_unix_secs: 999,
+                process_name: Some("proc-7".to_string()),
+            }),
+            _ => None,
         });
         active.sort_by(|left, right| left.pid.cmp(&right.pid));
 
@@ -566,5 +768,126 @@ mod tests {
         let remaining = tracked_processes();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].pid, 11);
+    }
+
+    #[test]
+    fn release_session_root_keeps_surviving_descendants_tracked() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "devmanager-pid-release-tests-{}",
+            std::process::id()
+        ));
+        let path = temp_dir.join("running-pids.json");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let _guard = use_test_pid_file(path);
+
+        track_session_process(record("server-cmd", 10, 100)).unwrap();
+        release_session_root("server-cmd", 10, vec![identity(21, 210), identity(22, 220)]).unwrap();
+
+        let remaining = tracked_processes();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].pid, 10);
+        assert_eq!(
+            remaining[0]
+                .descendant_processes
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![21, 22]
+        );
+    }
+
+    #[test]
+    fn cleanup_orphaned_processes_kills_surviving_descendants_when_root_is_gone() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "devmanager-pid-descendant-cleanup-tests-{}",
+            std::process::id()
+        ));
+        let path = temp_dir.join("running-pids.json");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut entry = record("server-11", 11, 111);
+        entry.descendant_processes = vec![
+            TrackedProcessIdentity {
+                pid: 21,
+                started_at_unix_secs: 210,
+                process_name: Some("proc-21".to_string()),
+            },
+            TrackedProcessIdentity {
+                pid: 22,
+                started_at_unix_secs: 220,
+                process_name: Some("proc-22".to_string()),
+            },
+        ];
+        let ledger = ManagedProcessLedgerFile {
+            version: LEDGER_VERSION,
+            sessions: BTreeMap::from([("server-11".to_string(), entry)]),
+        };
+        write_ledger_to_path(&path, &ledger).unwrap();
+
+        let running = RefCell::new(BTreeMap::from([(21, identity(21, 210)), (22, identity(22, 220))]));
+        let mut killed = Vec::new();
+        cleanup_orphaned_processes_with_path(
+            &path,
+            |pid| running.borrow().get(&pid).cloned(),
+            |pid| {
+                killed.push(pid);
+                running.borrow_mut().remove(&pid);
+                Ok(())
+            },
+        );
+
+        killed.sort_unstable();
+        assert_eq!(killed, vec![21, 22]);
+        assert!(read_ledger_from_path(&path).sessions.is_empty());
+    }
+
+    #[test]
+    fn active_processes_with_keeps_records_with_live_descendants() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "devmanager-pid-descendant-active-tests-{}",
+            std::process::id()
+        ));
+        let path = temp_dir.join("running-pids.json");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut entry = record("server-11", 11, 111);
+        entry.descendant_processes = vec![
+            TrackedProcessIdentity {
+                pid: 21,
+                started_at_unix_secs: 210,
+                process_name: Some("proc-21".to_string()),
+            },
+            TrackedProcessIdentity {
+                pid: 22,
+                started_at_unix_secs: 220,
+                process_name: Some("proc-22".to_string()),
+            },
+        ];
+        let ledger = ManagedProcessLedgerFile {
+            version: LEDGER_VERSION,
+            sessions: BTreeMap::from([("server-11".to_string(), entry)]),
+        };
+        write_ledger_to_path(&path, &ledger).unwrap();
+
+        let active = active_processes_with(&path, |pid| match pid {
+            11 => None,
+            21 => Some(identity(21, 210)),
+            22 => Some(identity(22, 999)),
+            _ => None,
+        });
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].pid, 11);
+        assert_eq!(
+            active[0]
+                .descendant_processes
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![21]
+        );
     }
 }

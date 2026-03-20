@@ -1009,6 +1009,7 @@ fn track_managed_process(
         project_id: session.project_id.clone(),
         command_id: session.command_id.clone(),
         tab_id: session.tab_id.clone(),
+        descendant_processes: Vec::new(),
     })
 }
 
@@ -1122,6 +1123,9 @@ fn spawn_wait_thread(
             if debug_enabled {
                 eprintln!("[terminal:{session_id}] child exit -> {status}");
             }
+            let surviving_descendants = pid
+                .map(platform_service::collect_descendant_process_identities)
+                .unwrap_or_default();
             if let Ok(mut runtime) = runtime_state.write() {
                 if let Some(session) = runtime.sessions.get_mut(&session_id) {
                     let closed_by_user = session
@@ -1145,13 +1149,16 @@ fn spawn_wait_thread(
                 }
             }
             if let Some(pid) = pid {
-                let _ = pid_file::untrack_session_process(&session_id, pid);
+                let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
             }
         }
         Err(error) => {
             if debug_enabled {
                 eprintln!("[terminal:{session_id}] wait error: {error}");
             }
+            let surviving_descendants = pid
+                .map(platform_service::collect_descendant_process_identities)
+                .unwrap_or_default();
             if let Ok(mut runtime) = runtime_state.write() {
                 if let Some(session) = runtime.sessions.get_mut(&session_id) {
                     session.note_exit(
@@ -1166,7 +1173,7 @@ fn spawn_wait_thread(
                 }
             }
             if let Some(pid) = pid {
-                let _ = pid_file::untrack_session_process(&session_id, pid);
+                let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
             }
         }
     });

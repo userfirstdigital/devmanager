@@ -167,13 +167,36 @@ impl Default for TabType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SessionState {
     pub open_tabs: Vec<SessionTab>,
     pub active_tab_id: Option<String>,
     pub sidebar_collapsed: bool,
     pub collapsed_projects: Vec<String>,
+    pub window_bounds: Option<WindowBoundsState>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WindowBoundsState {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+}
+
+impl Default for WindowBoundsState {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 920.0,
+            maximized: false,
+        }
+    }
 }
 
 impl SessionState {

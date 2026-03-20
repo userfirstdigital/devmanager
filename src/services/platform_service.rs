@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 #[cfg(not(windows))]
@@ -137,6 +138,40 @@ pub fn process_matches_identity_with_system(
             .unwrap_or(false),
         None => true,
     }
+}
+
+pub fn collect_descendant_process_identities(root_pid: u32) -> Vec<ProcessIdentity> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    collect_descendant_process_identities_with_system(&system, root_pid)
+}
+
+pub fn collect_descendant_process_identities_with_system(
+    system: &sysinfo::System,
+    root_pid: u32,
+) -> Vec<ProcessIdentity> {
+    let root_pid = sysinfo::Pid::from_u32(root_pid);
+    let mut queue = vec![root_pid];
+    let mut visited = HashSet::from([root_pid]);
+    let mut descendants = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < queue.len() {
+        let parent_pid = queue[cursor];
+        cursor += 1;
+
+        for (candidate_pid, process) in system.processes() {
+            if process.parent() == Some(parent_pid) && visited.insert(*candidate_pid) {
+                queue.push(*candidate_pid);
+                if let Some(identity) = process_identity_with_system(system, candidate_pid.as_u32()) {
+                    descendants.push(identity);
+                }
+            }
+        }
+    }
+
+    descendants.sort_by_key(|identity| identity.pid);
+    descendants
 }
 
 pub fn get_process_name(pid: u32) -> Result<Option<String>, String> {

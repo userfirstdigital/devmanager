@@ -822,24 +822,45 @@ impl ProcessManager {
 
     pub fn stop_server_and_wait(&self, command_id: &str, timeout: Duration) -> bool {
         let _ = self.stop_server(command_id);
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            if let Some(session) = self.runtime_state().sessions.get(command_id) {
-                if !session.status.is_live() {
-                    return true;
-                }
-            } else {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(100));
+        if self.wait_for_session_shutdown(command_id, timeout) {
+            return true;
         }
-        self.update_session_state(command_id, |state| {
-            if state.status.is_live() {
+
+        let _ = self.force_kill_session_processes(command_id);
+        if self.wait_for_session_shutdown(command_id, Duration::from_secs(2)) {
+            self.update_session_state(command_id, |state| {
                 state.status = SessionStatus::Stopped;
                 state.pid = None;
                 state.resources = ResourceSnapshot::default();
                 state.mark_dirty();
-            }
+            });
+            return true;
+        }
+
+        let remaining_tracked_pids = pid_file::active_tracked_pids_for_session(command_id);
+        self.update_session_state(command_id, |state| {
+            state.status = SessionStatus::Failed;
+            state.pid = None;
+            state.resources = ResourceSnapshot {
+                process_count: remaining_tracked_pids.len() as u32,
+                process_ids: remaining_tracked_pids.clone(),
+                last_sample_at: Some(Instant::now()),
+                ..ResourceSnapshot::default()
+            };
+            state.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user: true,
+                summary: if remaining_tracked_pids.is_empty() {
+                    "Managed process did not stop cleanly.".to_string()
+                } else {
+                    format!(
+                        "Managed process left {} tracked child process(es) running.",
+                        remaining_tracked_pids.len()
+                    )
+                },
+            });
+            state.mark_dirty();
         });
         false
     }
@@ -893,7 +914,9 @@ impl ProcessManager {
             ),
         };
 
-        let _ = self.stop_server_and_wait(&command_id, Duration::from_secs(5));
+        if !self.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
+            return Err(format!("Managed process `{command_id}` did not stop cleanly."));
+        }
         self.set_active_session(command_id.clone());
         app_state.open_server_tab(&project_id, &command_id, Some(command_label));
         self.update_session_state(&command_id, |state| {
@@ -1024,7 +1047,7 @@ impl ProcessManager {
         let mut forced_kill_pids = 0;
         if self.live_session_count() > 0 || !active_tracked_processes.is_empty() {
             let mut pids_to_kill = self.live_session_pids();
-            pids_to_kill.extend(active_tracked_processes.iter().map(|entry| entry.pid));
+            pids_to_kill.extend(pid_file::active_tracked_pids());
             pids_to_kill.sort_unstable();
             pids_to_kill.dedup();
 
@@ -1057,7 +1080,7 @@ impl ProcessManager {
             requested_sessions: session_ids.len(),
             forced_kill_pids,
             remaining_live_sessions: self.live_session_count(),
-            remaining_tracked_pids: pid_file::active_tracked_processes().len(),
+            remaining_tracked_pids: pid_file::active_tracked_pids().len(),
         };
         if report.remaining_live_sessions == 0 && report.remaining_tracked_pids == 0 {
             pid_file::clear_all();
@@ -1197,6 +1220,61 @@ impl ProcessManager {
             .filter(|session| session.status.is_live())
             .filter_map(|session| session.pid)
             .collect()
+    }
+
+    fn tracked_session_pids(&self, session_id: &str) -> Vec<u32> {
+        let runtime = self.runtime_state();
+        let mut pids = runtime
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                let mut pids = session.resources.process_ids.clone();
+                if let Some(pid) = session.pid {
+                    pids.push(pid);
+                }
+                pids
+            })
+            .unwrap_or_default();
+        pids.extend(pid_file::active_tracked_pids_for_session(session_id));
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    fn wait_for_session_shutdown(&self, session_id: &str, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            let session_live = self
+                .runtime_state()
+                .sessions
+                .get(session_id)
+                .map(|session| session.status.is_live())
+                .unwrap_or(false);
+            let tracked_pids = pid_file::active_tracked_pids_for_session(session_id);
+            if !session_live && tracked_pids.is_empty() {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn force_kill_session_processes(&self, session_id: &str) -> usize {
+        let mut forced_kill_pids = 0;
+        for pid in self.tracked_session_pids(session_id) {
+            if !platform_service::is_pid_running(pid) {
+                continue;
+            }
+            if platform_service::kill_process_tree(pid).is_ok()
+                || !platform_service::is_pid_running(pid)
+            {
+                forced_kill_pids += 1;
+            }
+        }
+        let _ = pid_file::prune_inactive_entries();
+        forced_kill_pids
     }
 
     fn update_session_state(&self, session_id: &str, f: impl FnOnce(&mut SessionRuntimeState)) {
@@ -1444,6 +1522,18 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                 let root_pid = sysinfo::Pid::from_u32(entry.pid);
                 let _root_process = system.process(root_pid)?;
                 let process_tree_ids = collect_process_tree_ids(system, root_pid);
+                let descendant_processes = process_tree_ids
+                    .iter()
+                    .skip(1)
+                    .filter_map(|pid| {
+                        platform_service::process_identity_with_system(system, pid.as_u32())
+                    })
+                    .collect::<Vec<_>>();
+                let _ = pid_file::sync_session_descendant_processes(
+                    session_id.as_str(),
+                    entry.pid,
+                    descendant_processes,
+                );
                 let mut cpu_percent = 0.0;
                 let mut memory_bytes = 0;
 
@@ -1667,7 +1757,7 @@ fn build_command_env(folder: &ProjectFolder, command: &RunCommand) -> HashMap<St
 fn build_server_log_file_path(
     project: &Project,
     folder: &ProjectFolder,
-    command: &RunCommand,
+    _command: &RunCommand,
 ) -> Option<PathBuf> {
     if project.save_log_files == Some(false) {
         return None;
@@ -2066,9 +2156,12 @@ mod tests {
         wait_for_tracked_process(session_id);
 
         let tracked = pid_file::tracked_processes();
-        assert_eq!(tracked.len(), 1);
-        assert_eq!(tracked[0].session_id, session_id);
-        assert_eq!(tracked[0].session_kind, "shell");
+        let shell_entry = tracked
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .expect("shell session was not tracked");
+        assert_eq!(shell_entry.session_kind, "shell");
+        assert!(pid_file::tracked_pids().contains(&shell_entry.pid));
 
         let _ = manager.close_session(session_id);
     }
@@ -2140,6 +2233,7 @@ mod tests {
             active_tab_id: None,
             sidebar_collapsed: false,
             collapsed_projects: std::collections::BTreeSet::new(),
+            window_bounds: None,
         }
     }
 

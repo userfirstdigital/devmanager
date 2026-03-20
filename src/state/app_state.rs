@@ -1,6 +1,6 @@
 use crate::models::{
     AppConfig, Project, ProjectFolder, RunCommand, SSHConnection, SessionState, SessionTab,
-    Settings, TabType,
+    Settings, TabType, WindowBoundsState,
 };
 use crate::persistence::WorkspaceSnapshot;
 use std::collections::BTreeSet;
@@ -33,6 +33,7 @@ pub struct AppState {
     pub active_tab_id: Option<String>,
     pub sidebar_collapsed: bool,
     pub collapsed_projects: BTreeSet<String>,
+    pub window_bounds: Option<WindowBoundsState>,
 }
 
 impl Default for AppState {
@@ -51,6 +52,7 @@ impl AppState {
             active_tab_id: session.active_tab_id,
             sidebar_collapsed: session.sidebar_collapsed,
             collapsed_projects: session.collapsed_projects.into_iter().collect(),
+            window_bounds: session.window_bounds,
         }
     }
 
@@ -60,6 +62,7 @@ impl AppState {
             active_tab_id: self.active_tab_id.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
             collapsed_projects: self.collapsed_projects.iter().cloned().collect(),
+            window_bounds: self.window_bounds,
         }
     }
 
