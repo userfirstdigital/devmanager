@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches:
-      - native
+      - master
   workflow_dispatch:
 
 concurrency:
@@ -23,7 +23,7 @@ jobs:
       commit_sha: ${{ steps.commit.outputs.commit_sha }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -134,7 +134,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.commit_sha }}
@@ -170,7 +170,7 @@ jobs:
         shell: powershell
         run: choco install nsis -y --no-progress
 
-      - name: Package native app
+      - name: Package app
         shell: bash
         env:
           CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}

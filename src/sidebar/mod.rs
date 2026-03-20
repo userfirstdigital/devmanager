@@ -319,15 +319,16 @@ fn render_project_group(
                     theme::SIDEBAR_BG
                 }))
                 .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    (actions.on_toggle_project_collapse)(project.id.clone()),
-                )
                 .child(
                     div()
+                        .flex_1()
                         .flex()
                         .items_center()
                         .gap(px(5.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            (actions.on_toggle_project_collapse)(project.id.clone()),
+                        )
                         .child(icons::app_icon(chevron_icon, 10.0, theme::TEXT_DIM))
                         .child(div().size(px(6.0)).rounded_full().bg(rgb(project_accent)))
                         .child(
