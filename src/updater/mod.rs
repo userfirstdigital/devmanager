@@ -433,7 +433,10 @@ impl UpdaterInner {
             .state
             .write()
             .map_err(|_| "Updater state is unavailable.".to_string())?;
-        if state.snapshot.is_busy() {
+        if matches!(
+            state.snapshot.stage,
+            UpdaterStage::Downloading | UpdaterStage::Installing
+        ) {
             return Err("Updater is busy. Wait for the current action to finish.".to_string());
         }
         if let Some(ready_update) = state.ready_update.as_ref() {
