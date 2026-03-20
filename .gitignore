@@ -4,6 +4,8 @@ node_modules/
 # Build output
 dist/
 src-tauri/target/
+target/
+packager/
 
 # IDE
 .vscode/
@@ -33,3 +35,7 @@ serviceAccountKey.json
 *.swp
 *.bak
 *~
+/target-check
+/target-live
+/target-watch
+/target-test

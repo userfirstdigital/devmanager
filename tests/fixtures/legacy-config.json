@@ -1,0 +1,66 @@
+{
+  "projects": [
+    {
+      "id": "project-userfirst",
+      "name": "UserFirst",
+      "rootPath": "C:/Code/userfirst",
+      "folders": [
+        {
+          "id": "folder-web",
+          "name": "web",
+          "folderPath": "C:/Code/userfirst/web",
+          "commands": [
+            {
+              "id": "cmd-dev",
+              "label": "dev",
+              "command": "npm",
+              "args": ["run", "dev"],
+              "env": {
+                "NODE_ENV": "development"
+              },
+              "port": 3000,
+              "autoRestart": true
+            }
+          ]
+        },
+        {
+          "id": "folder-api",
+          "name": "api",
+          "folderPath": "C:/Code/userfirst/api",
+          "commands": [
+            {
+              "id": "cmd-api",
+              "label": "api",
+              "command": "cargo",
+              "args": ["run"]
+            }
+          ],
+          "hidden": false
+        }
+      ],
+      "notes": "Legacy notes fixture",
+      "createdAt": "2026-03-19T00:00:00Z",
+      "updatedAt": "2026-03-19T00:00:00Z"
+    }
+  ],
+  "settings": {
+    "theme": "dark",
+    "logBufferSize": 10000,
+    "confirmOnClose": true,
+    "minimizeToTray": false,
+    "defaultTerminal": "bash",
+    "claudeCommand": "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
+    "codexCommand": "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+    "notificationSound": "glass",
+    "terminalFontSize": 13
+  },
+  "sshConnections": [
+    {
+      "id": "ssh-prod",
+      "label": "Prod",
+      "host": "prod.example.com",
+      "port": 22,
+      "username": "deploy"
+    }
+  ]
+}
