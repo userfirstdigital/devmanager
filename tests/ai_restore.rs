@@ -1,3 +1,4 @@
+use devmanager::models::TabType;
 use devmanager::persistence::{load_config_from_str, load_session_from_str, WorkspaceSnapshot};
 use devmanager::services::ProcessManager;
 use devmanager::state::{
@@ -162,4 +163,82 @@ fn set_active_session_clears_unseen_ready() {
         .get("claude-live")
         .expect("runtime session");
     assert!(!session.unseen_ready);
+}
+
+#[test]
+fn new_ai_launches_use_configured_claude_and_codex_commands() {
+    let mut state = state_with_temp_paths();
+    state.open_ai_tab(
+        "project-userfirst",
+        TabType::Codex,
+        "codex-1".to_string(),
+        "codex-pending".to_string(),
+        Some("Codex 1".to_string()),
+    );
+    let manager = ProcessManager::new();
+
+    let claude_session_id = manager
+        .ensure_ai_session_for_tab(
+            &mut state,
+            "claude-1",
+            SessionDimensions::default(),
+            true,
+            true,
+        )
+        .expect("launch claude tab");
+    wait_for_ai_startup_command(&manager, &claude_session_id, "echo claude-ready");
+
+    let codex_session_id = manager
+        .ensure_ai_session_for_tab(
+            &mut state,
+            "codex-1",
+            SessionDimensions::default(),
+            true,
+            true,
+        )
+        .expect("launch codex tab");
+    wait_for_ai_startup_command(&manager, &codex_session_id, "echo codex-ready");
+
+    manager
+        .close_ai_session(&mut state, "claude-1")
+        .expect("close claude tab");
+    manager
+        .close_ai_session(&mut state, "codex-1")
+        .expect("close codex tab");
+}
+
+#[test]
+fn restore_ai_tabs_relaunches_with_configured_command() {
+    let mut state = state_with_temp_paths();
+    let manager = ProcessManager::new();
+
+    let report = manager.restore_ai_tabs(&mut state, SessionDimensions::default());
+    let session_id = state
+        .find_ai_tab("claude-1")
+        .and_then(|tab| tab.pty_session_id.clone())
+        .expect("restored claude session id");
+
+    assert_eq!(report.relaunched, 1);
+    wait_for_ai_startup_command(&manager, &session_id, "echo claude-ready");
+
+    manager
+        .close_ai_session(&mut state, "claude-1")
+        .expect("close relaunched claude tab");
+}
+
+fn wait_for_ai_startup_command(manager: &ProcessManager, session_id: &str, expected: &str) {
+    for _ in 0..30 {
+        let runtime = manager.runtime_state();
+        let startup_command = runtime
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.ai_launch.as_ref())
+            .map(|launch| launch.startup_command.clone());
+        if startup_command.as_deref() == Some(expected) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    panic!("session `{session_id}` never recorded startup command `{expected}`");
 }

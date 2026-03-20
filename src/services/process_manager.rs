@@ -2,14 +2,16 @@ use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
 use crate::notifications;
-use crate::services::env_service;
+use crate::services::{env_service, pid_file, platform_service};
 use crate::state::AppState;
 use crate::state::{
     AiIdleTransition, AiLaunchSpec, ResourceSnapshot, RuntimeState, ServerLaunchSpec,
     SessionDimensions, SessionExitState, SessionKind, SessionRuntimeState, SessionStatus,
     SshLaunchSpec,
 };
-use crate::terminal::session::{TerminalBackend, TerminalSession, TerminalSessionView};
+use crate::terminal::session::{
+    preferred_windows_bash_program, TerminalBackend, TerminalSession, TerminalSessionView,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -54,6 +56,14 @@ pub struct SshRestoreReport {
     pub reattached: usize,
     pub recovered: usize,
     pub disconnected: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ManagedShutdownReport {
+    pub requested_sessions: usize,
+    pub forced_kill_pids: usize,
+    pub remaining_live_sessions: usize,
+    pub remaining_tracked_pids: usize,
 }
 
 static AI_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -123,8 +133,14 @@ impl ProcessManager {
     }
 
     pub fn set_log_buffer_size(&self, lines: usize) {
+        let lines = lines.max(100);
         if let Ok(mut scrollback_lines) = self.inner.scrollback_lines.write() {
-            *scrollback_lines = lines.max(500);
+            *scrollback_lines = lines;
+        }
+        if let Ok(sessions) = self.inner.sessions.lock() {
+            for session in sessions.values() {
+                session.set_scrollback_lines(lines);
+            }
         }
     }
 
@@ -140,17 +156,6 @@ impl ProcessManager {
         let session_id = session_id.into();
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
             runtime.active_session_id = Some(session_id.clone());
-            runtime
-                .sessions
-                .entry(session_id.clone())
-                .or_insert_with(|| {
-                    SessionRuntimeState::new(
-                        session_id.clone(),
-                        std::env::current_dir().unwrap_or_else(|_| ".".into()),
-                        SessionDimensions::default(),
-                        self.inner.terminal_backend,
-                    )
-                });
             if let Some(session) = runtime.sessions.get_mut(&session_id) {
                 session.clear_unseen_ready();
             }
@@ -211,9 +216,35 @@ impl ProcessManager {
         session.write_text(text)
     }
 
+    pub fn write_bytes_to_session(&self, session_id: &str, bytes: &[u8]) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        session.write_bytes(bytes)
+    }
+
     pub fn paste_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
         let session = self.get_session(session_id)?;
         session.paste_text(text)
+    }
+
+    pub fn write_virtual_text(&self, session_id: &str, text: &str) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        session.write_virtual_text(text);
+        Ok(())
+    }
+
+    pub fn clear_virtual_output(&self, session_id: &str) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        session.clear_virtual_output();
+        self.update_session_state(session_id, |state| {
+            state.display_offset = 0;
+            state.mark_dirty();
+        });
+        Ok(())
+    }
+
+    pub fn report_focus(&self, session_id: &str, focused: bool) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        session.report_focus(focused)
     }
 
     pub fn resize_session(
@@ -242,8 +273,7 @@ impl ProcessManager {
     }
 
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
-        let session = self.get_session(session_id)?;
-        session.close(true)
+        self.request_session_close(session_id, true)
     }
 
     pub fn active_session(&self) -> Option<TerminalSessionView> {
@@ -323,7 +353,8 @@ impl ProcessManager {
                 .sessions
                 .get(existing_session_id)
                 .map(|session| session.status.is_live())
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && self.get_session(existing_session_id).is_ok();
             if session_live && !force_new_session {
                 if activate_tab {
                     let _ = app_state.select_tab(&tab.id);
@@ -539,7 +570,8 @@ impl ProcessManager {
                 .map(|session| {
                     session.status.is_live() && matches!(session.session_kind, SessionKind::Ssh)
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && self.get_session(existing_session_id).is_ok();
             if session_live && !force_new_session {
                 if activate_tab {
                     let _ = app_state.select_tab(&tab.id);
@@ -716,7 +748,8 @@ impl ProcessManager {
             if matches!(
                 session.status,
                 SessionStatus::Running | SessionStatus::Starting
-            ) {
+            ) && self.get_session(&session_id).is_ok()
+            {
                 app_state.open_server_tab(&project_id, &command_id, Some(command_label.clone()));
                 self.set_active_session(session_id);
                 return Ok(());
@@ -804,6 +837,7 @@ impl ProcessManager {
             if state.status.is_live() {
                 state.status = SessionStatus::Stopped;
                 state.pid = None;
+                state.resources = ResourceSnapshot::default();
                 state.mark_dirty();
             }
         });
@@ -816,13 +850,94 @@ impl ProcessManager {
         command_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<(), String> {
-        let _ = self.stop_server_and_wait(command_id, Duration::from_secs(5));
+        self.restart_server_with_banner(app_state, command_id, dimensions, "--- Restarting... ---")
+    }
 
-        if let Ok(session) = self.get_session(command_id) {
-            let _ = session.write_text("\r\n\x1b[33m--- Restarting... ---\x1b[0m\r\n");
+    pub fn restart_server_with_banner(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+        banner: &str,
+    ) -> Result<(), String> {
+        let lookup = app_state
+            .find_command(command_id)
+            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
+
+        let project_id = lookup.project.id.clone();
+        let command_id = lookup.command.id.clone();
+        let command_label = lookup.command.label.clone();
+        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
+        let clear_logs_on_restart = lookup.command.clear_logs_on_restart.unwrap_or(true);
+        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
+        let cwd = if cwd.is_dir() {
+            cwd
+        } else {
+            PathBuf::from(lookup.project.root_path.clone())
+        };
+        let env = build_command_env(lookup.folder, lookup.command);
+        let (program, args) =
+            build_server_launch_command(&app_state.config.settings, lookup.command);
+        let launch_spec = ServerLaunchSpec {
+            command_id: command_id.clone(),
+            project_id: project_id.clone(),
+            cwd: cwd.clone(),
+            program: program.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            auto_restart: command_auto_restart,
+            log_file_path: build_server_log_file_path(
+                lookup.project,
+                lookup.folder,
+                lookup.command,
+            ),
+        };
+
+        let _ = self.stop_server_and_wait(&command_id, Duration::from_secs(5));
+        self.set_active_session(command_id.clone());
+        app_state.open_server_tab(&project_id, &command_id, Some(command_label));
+        self.update_session_state(&command_id, |state| {
+            state.status = SessionStatus::Starting;
+            state.cwd = cwd.clone();
+            state.dimensions = dimensions;
+            state.shell_program = program.clone();
+            state.configure_server(launch_spec.clone());
+            state.exit = None;
+            state.mark_dirty();
+        });
+
+        if let Ok(session) = self.get_session(&command_id) {
+            if clear_logs_on_restart {
+                session.clear_virtual_output();
+            }
+            session.write_virtual_text(&format!(
+                "{}\x1b[33m{banner}\x1b[0m\r\n",
+                if clear_logs_on_restart { "" } else { "\r\n" }
+            ));
+            session.restart_command(
+                cwd.clone(),
+                dimensions,
+                program.clone(),
+                args.clone(),
+                env.clone(),
+                launch_spec.log_file_path.clone(),
+                true,
+            )?;
+            self.update_session_state(&command_id, |state| {
+                state.configure_server(launch_spec.clone());
+            });
+            return Ok(());
         }
 
-        self.start_server(app_state, command_id, dimensions)
+        self.start_server(app_state, &command_id, dimensions)?;
+        let _ = self.write_virtual_text(
+            &command_id,
+            &format!(
+                "{}\x1b[33m{banner}\x1b[0m\r\n",
+                if clear_logs_on_restart { "" } else { "\r\n" }
+            ),
+        );
+        Ok(())
     }
 
     pub fn start_all_for_project(
@@ -877,19 +992,77 @@ impl ProcessManager {
     }
 
     pub fn close_all_live_sessions(&self) -> usize {
-        let session_ids: Vec<String> = self
-            .runtime_state()
-            .sessions
-            .values()
-            .filter(|session| session.status.is_live())
-            .map(|session| session.session_id.clone())
-            .collect();
+        let session_ids = self.live_session_ids();
 
         for session_id in &session_ids {
             let _ = self.close_session(session_id);
         }
 
         session_ids.len()
+    }
+
+    pub fn shutdown_managed_processes(&self, timeout: Duration) -> ManagedShutdownReport {
+        let session_ids = self.live_session_ids();
+        for session_id in &session_ids {
+            let _ = self.request_session_close(session_id, false);
+        }
+
+        let started_at = Instant::now();
+        let mut active_tracked_processes = loop {
+            let _ = pid_file::prune_inactive_entries();
+            let remaining_live_sessions = self.live_session_count();
+            let active_tracked_processes = pid_file::active_tracked_processes();
+            if remaining_live_sessions == 0 && active_tracked_processes.is_empty() {
+                break active_tracked_processes;
+            }
+            if started_at.elapsed() >= timeout {
+                break active_tracked_processes;
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+
+        let mut forced_kill_pids = 0;
+        if self.live_session_count() > 0 || !active_tracked_processes.is_empty() {
+            let mut pids_to_kill = self.live_session_pids();
+            pids_to_kill.extend(active_tracked_processes.iter().map(|entry| entry.pid));
+            pids_to_kill.sort_unstable();
+            pids_to_kill.dedup();
+
+            for pid in pids_to_kill {
+                if !platform_service::is_pid_running(pid) {
+                    continue;
+                }
+                if platform_service::kill_process_tree(pid).is_ok()
+                    || !platform_service::is_pid_running(pid)
+                {
+                    forced_kill_pids += 1;
+                }
+            }
+
+            let _ = pid_file::prune_inactive_entries();
+            let force_started = Instant::now();
+            while force_started.elapsed() < Duration::from_secs(1) {
+                let _ = pid_file::prune_inactive_entries();
+                let remaining_live_sessions = self.live_session_count();
+                active_tracked_processes = pid_file::active_tracked_processes();
+                if remaining_live_sessions == 0 && active_tracked_processes.is_empty() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        let _ = pid_file::prune_inactive_entries();
+        let report = ManagedShutdownReport {
+            requested_sessions: session_ids.len(),
+            forced_kill_pids,
+            remaining_live_sessions: self.live_session_count(),
+            remaining_tracked_pids: pid_file::active_tracked_processes().len(),
+        };
+        if report.remaining_live_sessions == 0 && report.remaining_tracked_pids == 0 {
+            pid_file::clear_all();
+        }
+        report
     }
 
     pub fn reconcile_saved_server_tabs(&self, app_state: &mut AppState) -> usize {
@@ -970,7 +1143,8 @@ impl ProcessManager {
     }
 
     fn session_exists(&self, session_id: &str) -> bool {
-        self.inner
+        let runtime_live = self
+            .inner
             .runtime_state
             .read()
             .ok()
@@ -981,7 +1155,15 @@ impl ProcessManager {
                     .map(|session| session.status)
             })
             .map(SessionStatus::is_live)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        runtime_live
+            && self
+                .inner
+                .sessions
+                .lock()
+                .ok()
+                .map(|sessions| sessions.contains_key(session_id))
+                .unwrap_or(false)
     }
 
     fn get_session(&self, session_id: &str) -> Result<Arc<TerminalSession>, String> {
@@ -992,6 +1174,29 @@ impl ProcessManager {
             .get(session_id)
             .cloned()
             .ok_or_else(|| format!("Unknown session `{session_id}`"))
+    }
+
+    fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        session.close(closed_by_user)
+    }
+
+    fn live_session_ids(&self) -> Vec<String> {
+        self.runtime_state()
+            .sessions
+            .values()
+            .filter(|session| session.status.is_live())
+            .map(|session| session.session_id.clone())
+            .collect()
+    }
+
+    fn live_session_pids(&self) -> Vec<u32> {
+        self.runtime_state()
+            .sessions
+            .values()
+            .filter(|session| session.status.is_live())
+            .filter_map(|session| session.pid)
+            .collect()
     }
 
     fn update_session_state(&self, session_id: &str, f: impl FnOnce(&mut SessionRuntimeState)) {
@@ -1201,14 +1406,9 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                 .sessions
                 .iter()
                 .filter_map(|(id, session)| {
-                    if session.command_id.is_some()
-                        && matches!(session.status, SessionStatus::Running)
-                        && session.pid.is_some()
-                    {
-                        Some((id.clone(), session.pid.unwrap_or_default()))
-                    } else {
-                        None
-                    }
+                    (session.status.is_live())
+                        .then_some(session.pid.map(|pid| (id.clone(), pid)))
+                        .flatten()
                 })
                 .collect()
         })
@@ -1220,22 +1420,79 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
 
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
+    let tracked_processes: HashMap<String, pid_file::ManagedProcessRecord> = pid_file::tracked_processes()
+        .into_iter()
+        .map(|entry| (entry.session_id.clone(), entry))
+        .collect();
+    let sampled_at = Instant::now();
+    let mut snapshots = Vec::with_capacity(sessions.len());
+
     for (session_id, pid) in sessions {
-        let pid = sysinfo::Pid::from(pid as usize);
-        if let Some(process) = system.process(pid) {
-            let snapshot = ResourceSnapshot {
-                cpu_percent: process.cpu_usage(),
-                memory_bytes: process.memory() * 1024,
-                child_count: process.tasks().map(|tasks| tasks.len() as u32).unwrap_or(0),
-                last_sample_at: Some(Instant::now()),
-            };
-            if let Ok(mut runtime) = inner.runtime_state.write() {
-                if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                    session.note_resource_sample(snapshot);
+        let snapshot = tracked_processes
+            .get(&session_id)
+            .filter(|entry| entry.pid == pid)
+            .filter(|entry| {
+                platform_service::process_matches_identity_with_system(
+                    system,
+                    entry.pid,
+                    entry.started_at_unix_secs,
+                    entry.process_name.as_deref(),
+                )
+            })
+            .and_then(|entry| {
+                let root_pid = sysinfo::Pid::from_u32(entry.pid);
+                let _root_process = system.process(root_pid)?;
+                let process_tree_ids = collect_process_tree_ids(system, root_pid);
+                let mut cpu_percent = 0.0;
+                let mut memory_bytes = 0;
+
+                for tree_pid in &process_tree_ids {
+                    if let Some(process) = system.process(*tree_pid) {
+                        cpu_percent += process.cpu_usage();
+                        memory_bytes += process.memory();
+                    }
                 }
+
+                Some(ResourceSnapshot {
+                    cpu_percent,
+                    memory_bytes,
+                    process_count: process_tree_ids.len() as u32,
+                    process_ids: process_tree_ids
+                        .into_iter()
+                        .map(|pid| pid.as_u32())
+                        .collect(),
+                    last_sample_at: Some(sampled_at),
+                })
+            })
+            .unwrap_or_default();
+        snapshots.push((session_id, snapshot));
+    }
+
+    if let Ok(mut runtime) = inner.runtime_state.write() {
+        for (session_id, snapshot) in snapshots {
+            if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                session.note_resource_sample(snapshot);
             }
         }
     }
+}
+
+fn collect_process_tree_ids(system: &sysinfo::System, root_pid: sysinfo::Pid) -> Vec<sysinfo::Pid> {
+    let mut process_ids = vec![root_pid];
+    let mut cursor = 0;
+
+    while cursor < process_ids.len() {
+        let parent_pid = process_ids[cursor];
+        cursor += 1;
+
+        for (candidate_pid, process) in system.processes() {
+            if process.parent() == Some(parent_pid) && !process_ids.contains(candidate_pid) {
+                process_ids.push(*candidate_pid);
+            }
+        }
+    }
+
+    process_ids
 }
 
 fn reconcile_exit_states(inner: &ProcessManagerInner) {
@@ -1537,10 +1794,13 @@ fn build_interactive_shell_command(settings: &Settings) -> (String, Vec<String>)
     if cfg!(target_os = "windows") {
         return match settings.default_terminal.clone() {
             crate::models::DefaultTerminal::Powershell => {
-                ("powershell".to_string(), vec!["-NoLogo".to_string()])
+                ("powershell.exe".to_string(), Vec::new())
             }
-            crate::models::DefaultTerminal::Cmd => ("cmd".to_string(), Vec::new()),
-            crate::models::DefaultTerminal::Bash => ("cmd".to_string(), Vec::new()),
+            crate::models::DefaultTerminal::Cmd => ("cmd.exe".to_string(), Vec::new()),
+            crate::models::DefaultTerminal::Bash => (
+                preferred_windows_bash_program(),
+                vec!["--login".to_string()],
+            ),
         };
     }
 
@@ -1632,7 +1892,13 @@ fn spawn_server_session_with_inner(
         })
         .map(SessionStatus::is_live)
         .unwrap_or(false);
-    if session_live {
+    let session_handle_exists = inner
+        .sessions
+        .lock()
+        .ok()
+        .map(|sessions| sessions.contains_key(&session_id))
+        .unwrap_or(false);
+    if session_live && session_handle_exists {
         return Ok(());
     }
 
@@ -1691,4 +1957,269 @@ fn next_ssh_session_id(connection_id: &str) -> String {
         .as_millis();
     let counter = SSH_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{connection_id}-{millis:x}-{counter:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AppConfig, Project, ProjectFolder, RunCommand, Settings};
+    use crate::services::pid_file;
+    use std::fs;
+    use std::thread;
+
+    #[test]
+    fn clear_virtual_output_resets_terminal_snapshot() {
+        let manager = ProcessManager::new();
+        let cwd = temp_test_dir("clear-virtual-output");
+        let session_id = "test-shell";
+
+        manager
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None)
+            .unwrap();
+        manager
+            .write_virtual_text(session_id, "hello world\r\n")
+            .unwrap();
+
+        let before = manager.session_view(session_id).expect("session view");
+        assert!(screen_text(&before).contains("hello world"));
+
+        manager.clear_virtual_output(session_id).unwrap();
+        let after = manager.session_view(session_id).expect("session view");
+        assert!(!screen_text(&after).contains("hello world"));
+
+        let _ = manager.close_session(session_id);
+    }
+
+    #[test]
+    fn restart_server_preserves_or_clears_logs_based_on_setting() {
+        for clear_logs_on_restart in [false, true] {
+            let manager = ProcessManager::new();
+            let cwd = temp_test_dir(if clear_logs_on_restart {
+                "restart-clear-logs"
+            } else {
+                "restart-preserve-logs"
+            });
+            let mut app_state = app_state_with_server(&cwd, clear_logs_on_restart);
+            let command_id = "server-cmd";
+            let dimensions = SessionDimensions::default();
+
+            manager
+                .start_server(&mut app_state, command_id, dimensions)
+                .unwrap();
+            wait_for_live_session(&manager, command_id);
+            manager
+                .write_virtual_text(command_id, "stale output\r\n")
+                .unwrap();
+
+            manager
+                .restart_server(&mut app_state, command_id, dimensions)
+                .unwrap();
+            wait_for_live_session(&manager, command_id);
+
+            let view = manager
+                .session_view(command_id)
+                .expect("server session view");
+            let text = screen_text(&view);
+            assert!(text.contains("Restarting"));
+            if clear_logs_on_restart {
+                assert!(!text.contains("stale output"));
+            } else {
+                assert!(text.contains("stale output"));
+            }
+
+            let _ = manager.stop_server(command_id);
+        }
+    }
+
+    #[test]
+    fn shutdown_managed_processes_prunes_tracked_processes() {
+        let cwd = temp_test_dir("managed-shutdown");
+        let pid_file_path = cwd.join("running-pids.json");
+        let _pid_file_guard = pid_file::use_test_pid_file(pid_file_path);
+        let manager = ProcessManager::new();
+        let mut app_state = app_state_with_server(&cwd, true);
+        let command_id = "server-cmd";
+        let dimensions = SessionDimensions::default();
+
+        manager
+            .start_server(&mut app_state, command_id, dimensions)
+            .unwrap();
+        wait_for_live_session(&manager, command_id);
+        wait_for_tracked_process(command_id);
+        assert!(!pid_file::tracked_pids().is_empty());
+
+        let report = manager.shutdown_managed_processes(Duration::from_secs(5));
+
+        assert_eq!(report.requested_sessions, 1);
+        assert_eq!(report.remaining_live_sessions, 0);
+        assert_eq!(report.remaining_tracked_pids, 0);
+        wait_for_tracked_processes_to_clear();
+    }
+
+    #[test]
+    fn shell_sessions_are_tracked_in_managed_pid_ledger() {
+        let cwd = temp_test_dir("managed-shell");
+        let pid_file_path = cwd.join("running-pids.json");
+        let _pid_file_guard = pid_file::use_test_pid_file(pid_file_path);
+        let manager = ProcessManager::new();
+        let session_id = "shell-session";
+
+        manager
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None)
+            .unwrap();
+        wait_for_live_session(&manager, session_id);
+        wait_for_tracked_process(session_id);
+
+        let tracked = pid_file::tracked_processes();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].session_id, session_id);
+        assert_eq!(tracked[0].session_kind, "shell");
+
+        let _ = manager.close_session(session_id);
+    }
+
+    #[test]
+    fn set_active_session_does_not_create_placeholder_runtime_entry() {
+        let manager = ProcessManager::new();
+
+        manager.set_active_session("missing-session");
+
+        let runtime = manager.runtime_state();
+        assert_eq!(
+            runtime.active_session_id.as_deref(),
+            Some("missing-session")
+        );
+        assert!(!runtime.sessions.contains_key("missing-session"));
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("devmanager-tests-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn app_state_with_server(cwd: &Path, clear_logs_on_restart: bool) -> AppState {
+        let (command_text, args) = server_test_command();
+        let command = RunCommand {
+            id: "server-cmd".to_string(),
+            label: "Server".to_string(),
+            command: command_text,
+            args,
+            env: None,
+            port: Some(43123),
+            auto_restart: Some(false),
+            clear_logs_on_restart: Some(clear_logs_on_restart),
+        };
+        let folder = ProjectFolder {
+            id: "folder-1".to_string(),
+            name: "Folder".to_string(),
+            folder_path: cwd.to_string_lossy().to_string(),
+            commands: vec![command],
+            env_file_path: None,
+            port_variable: None,
+            hidden: Some(false),
+        };
+        let project = Project {
+            id: "project-1".to_string(),
+            name: "Project".to_string(),
+            root_path: cwd.to_string_lossy().to_string(),
+            folders: vec![folder],
+            color: None,
+            pinned: Some(false),
+            notes: None,
+            save_log_files: Some(false),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        AppState {
+            config: AppConfig {
+                version: crate::models::CURRENT_CONFIG_VERSION,
+                projects: vec![project],
+                settings: Settings::default(),
+                ssh_connections: Vec::new(),
+            },
+            open_tabs: Vec::new(),
+            active_tab_id: None,
+            sidebar_collapsed: false,
+        }
+    }
+
+    fn wait_for_live_session(manager: &ProcessManager, session_id: &str) {
+        for _ in 0..30 {
+            if manager
+                .runtime_state()
+                .sessions
+                .get(session_id)
+                .map(|session| session.status.is_live())
+                .unwrap_or(false)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("session `{session_id}` never became live");
+    }
+
+    fn wait_for_tracked_process(session_id: &str) {
+        for _ in 0..20 {
+            if pid_file::tracked_processes()
+                .into_iter()
+                .any(|entry| entry.session_id == session_id)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("session `{session_id}` was never tracked");
+    }
+
+    fn wait_for_tracked_processes_to_clear() {
+        for _ in 0..20 {
+            if pid_file::tracked_processes().is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("tracked process ledger never cleared");
+    }
+
+    fn screen_text(view: &TerminalSessionView) -> String {
+        view.screen
+            .lines
+            .iter()
+            .map(|line| {
+                let mut text: String = line
+                    .iter()
+                    .map(|cell| {
+                        if cell.character == '\u{00a0}' {
+                            ' '
+                        } else {
+                            cell.character
+                        }
+                    })
+                    .collect();
+                while text.ends_with(' ') {
+                    text.pop();
+                }
+                text
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(windows)]
+    fn server_test_command() -> (String, Vec<String>) {
+        (
+            "ping".to_string(),
+            vec!["127.0.0.1".to_string(), "-n".to_string(), "6".to_string()],
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn server_test_command() -> (String, Vec<String>) {
+        ("sleep".to_string(), vec!["5".to_string()])
+    }
 }

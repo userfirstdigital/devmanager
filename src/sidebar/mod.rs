@@ -2,12 +2,34 @@ use crate::models::SessionTab;
 use crate::state::{AppState, RuntimeState, SessionRuntimeState, SessionStatus};
 use crate::{icons, theme};
 use gpui::{
-    div, px, rgb, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, Styled, Window,
+    anchored, deferred, div, px, rgb, AnyElement, App, Corner, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, Styled, Window,
 };
 
 const SIDEBAR_WIDTH_PX: f32 = 220.0;
 const SIDEBAR_COLLAPSED_WIDTH_PX: f32 = 40.0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarContextMenu {
+    Project {
+        project_id: String,
+    },
+    Folder {
+        project_id: String,
+        folder_id: String,
+    },
+    SingleCommandFolder {
+        project_id: String,
+        folder_id: String,
+        command_id: String,
+    },
+    Command {
+        command_id: String,
+    },
+    Ssh {
+        connection_id: String,
+    },
+}
 
 pub struct SidebarActions<'a> {
     pub on_open_settings: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -49,6 +71,15 @@ pub struct SidebarActions<'a> {
     pub on_restart_ai_tab:
         &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_close_ai_tab: &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_move_project_up:
+        &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_move_project_down:
+        &'a dyn Fn(String) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_toggle_context_menu:
+        &'a dyn Fn(SidebarContextMenu) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_dismiss_context_menu:
+        &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub open_context_menu: &'a Option<SidebarContextMenu>,
 }
 
 pub fn sidebar_width_px(collapsed: bool) -> f32 {
@@ -84,11 +115,14 @@ fn render_collapsed_sidebar(actions: SidebarActions<'_>) -> AnyElement {
         .bg(rgb(theme::SIDEBAR_BG))
         .border_r_1()
         .border_color(rgb(theme::BORDER_PRIMARY))
-        .child(icon_button("▸", (actions.on_toggle_sidebar)()))
-        .child(icon_button("+", (actions.on_add_project)()))
+        .child(icon_button(
+            icons::CHEVRON_RIGHT,
+            (actions.on_toggle_sidebar)(),
+        ))
+        .child(icon_button(icons::PLUS, (actions.on_add_project)()))
         .child(div().flex_1())
-        .child(icon_button("■", (actions.on_stop_all_servers)()))
-        .child(icon_button("⚙", (actions.on_open_settings)()))
+        .child(icon_button(icons::SQUARE, (actions.on_stop_all_servers)()))
+        .child(icon_button(icons::SETTINGS, (actions.on_open_settings)()))
         .into_any_element()
 }
 
@@ -97,10 +131,12 @@ fn render_expanded_sidebar(
     runtime: &RuntimeState,
     actions: SidebarActions<'_>,
 ) -> AnyElement {
+    let project_count = state.projects().len();
     let project_rows = state
         .projects()
         .iter()
-        .map(|project| render_project_group(state, runtime, project, &actions));
+        .enumerate()
+        .map(|(index, project)| render_project_group(state, runtime, project, index, project_count, &actions));
     let ssh_rows = state
         .ssh_connections()
         .iter()
@@ -139,7 +175,10 @@ fn render_expanded_sidebar(
                             SharedString::from(format!("v{}", env!("CARGO_PKG_VERSION"))),
                         )),
                 )
-                .child(icon_button("◂", (actions.on_toggle_sidebar)())),
+                .child(icon_button(
+                    icons::CHEVRON_LEFT,
+                    (actions.on_toggle_sidebar)(),
+                )),
         )
         .child(
             div()
@@ -154,7 +193,6 @@ fn render_expanded_sidebar(
                         .flex()
                         .flex_col()
                         .gap(px(1.0))
-                        .child(section_label("PROJECTS"))
                         .children(
                             state
                                 .projects()
@@ -168,25 +206,13 @@ fn render_expanded_sidebar(
                         .flex()
                         .flex_col()
                         .gap(px(1.0))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(section_label("SSH"))
-                                .child(accent_text_action(
-                                    "+ Add SSH",
-                                    theme::SSH_DOT,
-                                    (actions.on_add_ssh)(),
-                                )),
-                        )
-                        .children(
-                            state
-                                .ssh_connections()
-                                .is_empty()
-                                .then(|| empty_state("No saved SSH connections.")),
-                        )
-                        .children(ssh_rows),
+                        .child(section_label("SSH"))
+                        .children(ssh_rows)
+                        .child(accent_text_action(
+                            "+ Add SSH",
+                            theme::SSH_DOT,
+                            (actions.on_add_ssh)(),
+                        )),
                 ),
         )
         .child(
@@ -201,8 +227,8 @@ fn render_expanded_sidebar(
                         .items_center()
                         .gap(px(4.0))
                         .child(primary_button("+ Add Project", (actions.on_add_project)()))
-                        .child(icon_button("■", (actions.on_stop_all_servers)()))
-                        .child(icon_button("⚙", (actions.on_open_settings)())),
+                        .child(icon_button(icons::SQUARE, (actions.on_stop_all_servers)()))
+                        .child(icon_button(icons::SETTINGS, (actions.on_open_settings)())),
                 ),
         )
         .into_any_element()
@@ -212,22 +238,58 @@ fn render_project_group(
     state: &AppState,
     runtime: &RuntimeState,
     project: &crate::models::Project,
+    index: usize,
+    project_count: usize,
     actions: &SidebarActions<'_>,
 ) -> impl IntoElement {
+    let can_move_up = index > 0;
+    let can_move_down = index + 1 < project_count;
     let project_accent = theme::parse_hex_color(project.color.as_deref(), theme::PROJECT_DOT);
     let is_active_project = state
         .active_project()
         .map(|active| active.id == project.id)
         .unwrap_or(false);
-    let project_id = project.id.clone();
-    let ai_rows = state
-        .ai_tabs()
-        .filter(move |tab| tab.project_id == project_id)
+    let claude_rows = state
+        .ai_tabs_for_project(&project.id, crate::models::TabType::Claude)
         .map(|tab| render_ai_row(state, runtime, tab, actions));
+    let codex_rows = state
+        .ai_tabs_for_project(&project.id, crate::models::TabType::Codex)
+        .map(|tab| render_ai_row(state, runtime, tab, actions));
+    let has_visible_folders = project
+        .folders
+        .iter()
+        .any(|folder| !folder.hidden.unwrap_or(false));
     let folder_rows = project
         .folders
         .iter()
+        .filter(|folder| !folder.hidden.unwrap_or(false))
         .map(|folder| render_folder_group(state, runtime, project, folder, actions));
+    let ai_launch_row =
+        div()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .pl_4()
+            .text_xs()
+            .child(icon_text_action(
+                icons::SPARKLES,
+                10.0,
+                "+ Claude",
+                theme::TEXT_SUBTLE,
+                (actions.on_launch_claude)(project.id.clone()),
+            ))
+            .child(icon_text_action(
+                icons::BOT,
+                10.0,
+                "+ Codex",
+                theme::TEXT_SUBTLE,
+                (actions.on_launch_codex)(project.id.clone()),
+            ));
+
+    let menu_open = matches!(
+        actions.open_context_menu,
+        Some(SidebarContextMenu::Project { ref project_id }) if *project_id == project.id
+    );
 
     div()
         .flex()
@@ -236,23 +298,27 @@ fn render_project_group(
         .pb(px(4.0))
         .child(
             div()
+                .group("project-row")
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap(px(4.0))
                 .px_2()
                 .py(px(4.0))
+                .rounded_sm()
+                .cursor_pointer()
                 .bg(rgb(if is_active_project {
                     theme::AGENT_ROW_BG
                 } else {
                     theme::SIDEBAR_BG
                 }))
+                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(5.0))
-                        .child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child("▾"))
+                        .child(icons::app_icon(icons::CHEVRON_DOWN, 10.0, theme::TEXT_DIM))
                         .child(div().size(px(6.0)).rounded_full().bg(rgb(project_accent)))
                         .child(
                             div()
@@ -266,49 +332,73 @@ fn render_project_group(
                         .flex()
                         .items_center()
                         .gap(px(4.0))
+                        .opacity(if menu_open { 1.0 } else { 0.0 })
+                        .group_hover("project-row", |s| s.opacity(1.0))
+                        .children(project.notes.as_ref().map(|_| {
+                            row_icon_action(
+                                icons::FILE_TEXT,
+                                (actions.on_open_project_notes)(project.id.clone()),
+                            )
+                        }))
+                        .children(can_move_up.then(|| {
+                            row_icon_action(
+                                icons::CHEVRON_UP,
+                                (actions.on_move_project_up)(project.id.clone()),
+                            )
+                        }))
+                        .children(can_move_down.then(|| {
+                            row_icon_action(
+                                icons::CHEVRON_DOWN,
+                                (actions.on_move_project_down)(project.id.clone()),
+                            )
+                        }))
                         .child(row_icon_action(
-                            "+",
+                            icons::PLUS,
                             (actions.on_add_folder)(project.id.clone()),
                         ))
                         .child(row_icon_action(
-                            "⋯",
-                            (actions.on_edit_project)(project.id.clone()),
+                            icons::MORE_HORIZONTAL,
+                            (actions.on_toggle_context_menu)(SidebarContextMenu::Project {
+                                project_id: project.id.clone(),
+                            }),
                         )),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .pl_4()
-                .text_xs()
-                .child(icon_text_action(
-                    icons::SPARKLES,
-                    10.0,
-                    "+ Claude",
-                    theme::AI_DOT,
-                    (actions.on_launch_claude)(project.id.clone()),
-                ))
-                .child(icon_text_action(
-                    icons::BOT,
-                    10.0,
-                    "+ Codex",
-                    theme::SUCCESS_TEXT,
-                    (actions.on_launch_codex)(project.id.clone()),
-                ))
-                .children(project.notes.as_ref().map(|_| {
-                    text_action("notes", (actions.on_open_project_notes)(project.id.clone()))
-                })),
-        )
-        .children(ai_rows)
+        .children(menu_open.then(|| {
+            let mut items: Vec<AnyElement> = vec![
+                context_menu_item(
+                    "Edit Project",
+                    (actions.on_edit_project)(project.id.clone()),
+                )
+                .into_any_element(),
+                context_menu_item("Add Folder", (actions.on_add_folder)(project.id.clone()))
+                    .into_any_element(),
+            ];
+            if project.notes.is_some() {
+                items.push(
+                    context_menu_item(
+                        "View Notes",
+                        (actions.on_open_project_notes)(project.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+            }
+            items.push(
+                context_menu_danger_item(
+                    "Delete Project",
+                    (actions.on_delete_project)(project.id.clone()),
+                )
+                .into_any_element(),
+            );
+            context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
+        }))
         .children(
-            project
-                .folders
-                .is_empty()
-                .then(|| empty_state_with_indent("No folders configured.", 14.0)),
+            (!has_visible_folders).then(|| empty_state_with_indent("No folders configured.", 14.0)),
         )
         .children(folder_rows)
+        .children(claude_rows)
+        .children(codex_rows)
+        .child(ai_launch_row)
 }
 
 fn render_ai_row(
@@ -329,6 +419,7 @@ fn render_ai_row(
     let status_color = ai_status_color(session, tab);
 
     div()
+        .group("ai-row")
         .flex()
         .items_center()
         .justify_between()
@@ -336,11 +427,14 @@ fn render_ai_row(
         .pl_4()
         .pr_2()
         .py(px(2.0))
+        .rounded_sm()
+        .cursor_pointer()
         .bg(rgb(if is_active {
             theme::PROJECT_ROW_BG
         } else {
             theme::SIDEBAR_BG
         }))
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
         .child(
             div()
                 .flex()
@@ -381,15 +475,22 @@ fn render_ai_row(
                         .text_color(rgb(status_color))
                         .child(status_label),
                 )
-                .children(
-                    session
-                        .is_some()
-                        .then(|| row_icon_action("×", (actions.on_close_ai_tab)(tab.id.clone()))),
-                )
-                .children(
-                    session
-                        .is_none()
-                        .then(|| row_icon_action("▶", (actions.on_restart_ai_tab)(tab.id.clone()))),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .opacity(0.0)
+                        .group_hover("ai-row", |s| s.opacity(1.0))
+                        .children(session.is_some().then(|| {
+                            row_icon_action(icons::X, (actions.on_close_ai_tab)(tab.id.clone()))
+                        }))
+                        .children(session.is_none().then(|| {
+                            row_icon_action(
+                                icons::PLAY,
+                                (actions.on_restart_ai_tab)(tab.id.clone()),
+                            )
+                        })),
                 ),
         )
 }
@@ -418,6 +519,12 @@ fn render_folder_group(
         .iter()
         .map(|command| render_command_row(state, runtime, project, folder, command, actions));
 
+    let menu_open = matches!(
+        actions.open_context_menu,
+        Some(SidebarContextMenu::Folder { ref project_id, ref folder_id })
+            if *project_id == project.id && *folder_id == folder.id
+    );
+
     div()
         .flex()
         .flex_col()
@@ -425,12 +532,16 @@ fn render_folder_group(
         .pl_4()
         .child(
             div()
+                .group("folder-group-row")
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap(px(4.0))
                 .px_2()
                 .py(px(3.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
                 .child(
                     div()
                         .flex()
@@ -449,16 +560,41 @@ fn render_folder_group(
                         .flex()
                         .items_center()
                         .gap(px(4.0))
+                        .opacity(if menu_open { 1.0 } else { 0.0 })
+                        .group_hover("folder-group-row", |s| s.opacity(1.0))
                         .child(row_icon_action(
-                            "+",
+                            icons::PLUS,
                             (actions.on_add_command)(project.id.clone(), folder.id.clone()),
                         ))
                         .child(row_icon_action(
-                            "⋯",
-                            (actions.on_edit_folder)(project.id.clone(), folder.id.clone()),
+                            icons::MORE_HORIZONTAL,
+                            (actions.on_toggle_context_menu)(SidebarContextMenu::Folder {
+                                project_id: project.id.clone(),
+                                folder_id: folder.id.clone(),
+                            }),
                         )),
                 ),
         )
+        .children(menu_open.then(|| {
+            let items: Vec<AnyElement> = vec![
+                context_menu_item(
+                    "Edit Folder",
+                    (actions.on_edit_folder)(project.id.clone(), folder.id.clone()),
+                )
+                .into_any_element(),
+                context_menu_item(
+                    "Add Command",
+                    (actions.on_add_command)(project.id.clone(), folder.id.clone()),
+                )
+                .into_any_element(),
+                context_menu_danger_item(
+                    "Remove Folder",
+                    (actions.on_delete_folder)(project.id.clone(), folder.id.clone()),
+                )
+                .into_any_element(),
+            ];
+            context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
+        }))
         .children(
             folder
                 .commands
@@ -482,69 +618,137 @@ fn render_single_command_folder_row(
         .map(|session| session.status)
         .unwrap_or(SessionStatus::Stopped);
     let is_active = state.active_tab_id.as_deref() == Some(command.id.as_str());
+    let menu_open = matches!(
+        actions.open_context_menu,
+        Some(SidebarContextMenu::SingleCommandFolder { ref project_id, ref folder_id, ref command_id })
+            if *project_id == project.id && *folder_id == folder.id && *command_id == command.id
+    );
 
     div()
         .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(4.0))
+        .flex_col()
         .pl_4()
-        .pr_2()
-        .py(px(2.0))
-        .bg(rgb(if is_active {
-            theme::PROJECT_ROW_BG
-        } else {
-            theme::SIDEBAR_BG
-        }))
         .child(
             div()
+                .group("folder-row")
                 .flex()
                 .items_center()
-                .gap(px(5.0))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    (actions.on_select_server_tab)(command.id.clone()),
-                )
-                .child(icons::app_icon(icons::FOLDER, 10.0, theme::TEXT_SUBTLE))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(SharedString::from(folder.name.clone())),
-                )
-                .children(command.port.map(|port| {
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_DIM))
-                        .child(SharedString::from(format!(":{port}")))
-                })),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
+                .justify_between()
                 .gap(px(4.0))
+                .pr_2()
+                .py(px(2.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(rgb(if is_active {
+                    theme::PROJECT_ROW_BG
+                } else {
+                    theme::SIDEBAR_BG
+                }))
+                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(status_color(status)))
-                        .child(status_label(status)),
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            (actions.on_select_server_tab)(command.id.clone()),
+                        )
+                        .child(icons::app_icon(icons::FOLDER, 10.0, theme::TEXT_SUBTLE))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(SharedString::from(folder.name.clone())),
+                        )
+                        .children(command.port.map(|port| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_DIM))
+                                .child(SharedString::from(format!(":{port}")))
+                        })),
                 )
-                .children(
-                    (!status.is_live()).then(|| {
-                        row_icon_action("▶", (actions.on_start_server)(command.id.clone()))
-                    }),
-                )
-                .children(
-                    status.is_live().then(|| {
-                        row_icon_action("■", (actions.on_stop_server)(command.id.clone()))
-                    }),
-                )
-                .child(row_icon_action(
-                    "⋯",
-                    (actions.on_edit_folder)(project.id.clone(), folder.id.clone()),
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(status_color(status)))
+                                .child(status_label(status)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .opacity(if menu_open { 1.0 } else { 0.0 })
+                                .group_hover("folder-row", |s| s.opacity(1.0))
+                                .children((!status.is_live()).then(|| {
+                                    row_icon_action(
+                                        icons::PLAY,
+                                        (actions.on_start_server)(command.id.clone()),
+                                    )
+                                }))
+                                .children(status.is_live().then(|| {
+                                    row_icon_action(
+                                        icons::SQUARE,
+                                        (actions.on_stop_server)(command.id.clone()),
+                                    )
+                                }))
+                                .child(row_icon_action(
+                                    icons::MORE_HORIZONTAL,
+                                    (actions.on_toggle_context_menu)(
+                                        SidebarContextMenu::SingleCommandFolder {
+                                            project_id: project.id.clone(),
+                                            folder_id: folder.id.clone(),
+                                            command_id: command.id.clone(),
+                                        },
+                                    ),
+                                )),
+                        ),
+                ),
         )
+        .children(menu_open.then(|| {
+            let mut items: Vec<AnyElement> = vec![
+                context_menu_item(
+                    "Edit Folder",
+                    (actions.on_edit_folder)(project.id.clone(), folder.id.clone()),
+                )
+                .into_any_element(),
+                context_menu_item(
+                    "Edit Command",
+                    (actions.on_edit_command)(command.id.clone()),
+                )
+                .into_any_element(),
+            ];
+            if !status.is_live() {
+                items.push(
+                    context_menu_item("Start", (actions.on_start_server)(command.id.clone()))
+                        .into_any_element(),
+                );
+            }
+            if status.is_live() {
+                items.push(
+                    context_menu_item("Restart", (actions.on_restart_server)(command.id.clone()))
+                        .into_any_element(),
+                );
+                items.push(
+                    context_menu_item("Stop", (actions.on_stop_server)(command.id.clone()))
+                        .into_any_element(),
+                );
+            }
+            items.push(
+                context_menu_danger_item(
+                    "Remove Folder",
+                    (actions.on_delete_folder)(project.id.clone(), folder.id.clone()),
+                )
+                .into_any_element(),
+            );
+            context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
+        }))
 }
 
 fn render_command_row(
@@ -569,36 +773,71 @@ fn render_command_row(
             )
         })
     });
+    let menu_open = matches!(
+        actions.open_context_menu,
+        Some(SidebarContextMenu::Command { ref command_id }) if *command_id == command.id
+    );
 
     div()
         .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(4.0))
-        .pl_5()
-        .pr_2()
-        .py(px(2.0))
-        .bg(rgb(if is_active {
-            theme::PROJECT_ROW_BG
-        } else if status.is_live() {
-            theme::SIDEBAR_BG
-        } else {
-            theme::SIDEBAR_BG
-        }))
+        .flex_col()
         .child(
             div()
+                .group("command-row")
                 .flex()
                 .items_center()
-                .gap(px(5.0))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    (actions.on_select_server_tab)(command.id.clone()),
-                )
+                .justify_between()
+                .gap(px(4.0))
+                .pl_5()
+                .pr_2()
+                .py(px(2.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(rgb(if is_active {
+                    theme::PROJECT_ROW_BG
+                } else {
+                    theme::SIDEBAR_BG
+                }))
+                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
                 .child(
                     div()
-                        .size(px(6.0))
-                        .rounded_full()
-                        .bg(rgb(status_color(status))),
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            (actions.on_select_server_tab)(command.id.clone()),
+                        )
+                        .child(
+                            div()
+                                .size(px(6.0))
+                                .rounded_full()
+                                .bg(rgb(status_color(status))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_PRIMARY))
+                                        .child(SharedString::from(command.label.clone())),
+                                )
+                                .children(command.port.map(|port| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_DIM))
+                                        .child(SharedString::from(format!(":{port}")))
+                                }))
+                                .children(resource_line.map(|line| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_DIM))
+                                        .child(SharedString::from(line))
+                                })),
+                        ),
                 )
                 .child(
                     div()
@@ -608,49 +847,68 @@ fn render_command_row(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(command.label.clone())),
+                                .text_color(rgb(status_color(status)))
+                                .child(status_label(status)),
                         )
-                        .children(command.port.map(|port| {
+                        .child(
                             div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
-                                .child(SharedString::from(format!(":{port}")))
-                        }))
-                        .children(resource_line.map(|line| {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
-                                .child(SharedString::from(line))
-                        })),
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .opacity(if menu_open { 1.0 } else { 0.0 })
+                                .group_hover("command-row", |s| s.opacity(1.0))
+                                .children((!status.is_live()).then(|| {
+                                    row_icon_action(
+                                        icons::PLAY,
+                                        (actions.on_start_server)(command.id.clone()),
+                                    )
+                                }))
+                                .children(status.is_live().then(|| {
+                                    row_icon_action(
+                                        icons::SQUARE,
+                                        (actions.on_stop_server)(command.id.clone()),
+                                    )
+                                }))
+                                .child(row_icon_action(
+                                    icons::MORE_HORIZONTAL,
+                                    (actions.on_toggle_context_menu)(SidebarContextMenu::Command {
+                                        command_id: command.id.clone(),
+                                    }),
+                                )),
+                        ),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(status_color(status)))
-                        .child(status_label(status)),
+        .children(menu_open.then(|| {
+            let mut items: Vec<AnyElement> = vec![context_menu_item(
+                "Edit Command",
+                (actions.on_edit_command)(command.id.clone()),
+            )
+            .into_any_element()];
+            if !status.is_live() {
+                items.push(
+                    context_menu_item("Start", (actions.on_start_server)(command.id.clone()))
+                        .into_any_element(),
+                );
+            }
+            if status.is_live() {
+                items.push(
+                    context_menu_item("Restart", (actions.on_restart_server)(command.id.clone()))
+                        .into_any_element(),
+                );
+                items.push(
+                    context_menu_item("Stop", (actions.on_stop_server)(command.id.clone()))
+                        .into_any_element(),
+                );
+            }
+            items.push(
+                context_menu_danger_item(
+                    "Delete Command",
+                    (actions.on_delete_command)(command.id.clone()),
                 )
-                .children(
-                    (!status.is_live()).then(|| {
-                        row_icon_action("▶", (actions.on_start_server)(command.id.clone()))
-                    }),
-                )
-                .children(
-                    status.is_live().then(|| {
-                        row_icon_action("■", (actions.on_stop_server)(command.id.clone()))
-                    }),
-                )
-                .child(row_icon_action(
-                    "⋯",
-                    (actions.on_edit_command)(command.id.clone()),
-                )),
-        )
+                .into_any_element(),
+            );
+            context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
+        }))
 }
 
 fn render_ssh_row(
@@ -668,107 +926,168 @@ fn render_ssh_row(
     let is_active = tab
         .map(|tab| state.active_tab_id.as_deref() == Some(tab.id.as_str()))
         .unwrap_or(false);
+    let is_connected = session.is_some();
+    let menu_open = matches!(
+        actions.open_context_menu,
+        Some(SidebarContextMenu::Ssh { ref connection_id }) if *connection_id == connection.id
+    );
 
     div()
         .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(4.0))
-        .px_2()
-        .py(px(2.0))
-        .bg(rgb(if is_active {
-            theme::PROJECT_ROW_BG
-        } else if session.is_some() {
-            theme::SIDEBAR_BG
-        } else {
-            theme::SIDEBAR_BG
-        }))
+        .flex_col()
         .child(
             div()
+                .group("ssh-row")
                 .flex()
                 .items_center()
-                .gap(px(5.0))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    (actions.on_open_ssh_tab)(connection.id.clone()),
+                .justify_between()
+                .gap(px(4.0))
+                .px_2()
+                .py(px(2.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(rgb(if is_active {
+                    theme::PROJECT_ROW_BG
+                } else {
+                    theme::SIDEBAR_BG
+                }))
+                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            (actions.on_open_ssh_tab)(connection.id.clone()),
+                        )
+                        .child(icons::app_icon(icons::TERMINAL, 10.0, color))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_PRIMARY))
+                                        .child(SharedString::from(connection.label.clone())),
+                                )
+                                .child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(
+                                    SharedString::from(format!(
+                                        "{}@{}",
+                                        connection.username, connection.host
+                                    )),
+                                )),
+                        ),
                 )
-                .child(icons::app_icon(icons::TERMINAL, 10.0, color))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(4.0))
+                        .child(div().text_xs().text_color(rgb(color)).child(label))
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(connection.label.clone())),
-                        )
-                        .child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(
-                            SharedString::from(format!(
-                                "{}@{}",
-                                connection.username, connection.host
-                            )),
-                        )),
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .opacity(if menu_open { 1.0 } else { 0.0 })
+                                .group_hover("ssh-row", |s| s.opacity(1.0))
+                                .child(row_icon_action(
+                                    if is_connected {
+                                        icons::SQUARE
+                                    } else {
+                                        icons::PLAY
+                                    },
+                                    if is_connected {
+                                        (actions.on_disconnect_ssh)(connection.id.clone())
+                                    } else {
+                                        (actions.on_connect_ssh)(connection.id.clone())
+                                    },
+                                ))
+                                .child(row_icon_action(
+                                    icons::MORE_HORIZONTAL,
+                                    (actions.on_toggle_context_menu)(SidebarContextMenu::Ssh {
+                                        connection_id: connection.id.clone(),
+                                    }),
+                                )),
+                        ),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .child(div().text_xs().text_color(rgb(color)).child(label))
-                .child(row_icon_action(
-                    if session.is_some() { "■" } else { "▶" },
-                    if session.is_some() {
-                        (actions.on_disconnect_ssh)(connection.id.clone())
-                    } else {
-                        (actions.on_connect_ssh)(connection.id.clone())
-                    },
-                ))
-                .child(row_icon_action(
-                    "⋯",
-                    (actions.on_edit_ssh)(connection.id.clone()),
-                )),
-        )
+        .children(menu_open.then(|| {
+            let mut items: Vec<AnyElement> =
+                vec![
+                    context_menu_item("Edit SSH", (actions.on_edit_ssh)(connection.id.clone()))
+                        .into_any_element(),
+                ];
+            if is_connected {
+                items.push(
+                    context_menu_item("Restart", (actions.on_restart_ssh)(connection.id.clone()))
+                        .into_any_element(),
+                );
+                items.push(
+                    context_menu_item(
+                        "Disconnect",
+                        (actions.on_disconnect_ssh)(connection.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+            } else {
+                items.push(
+                    context_menu_item("Connect", (actions.on_connect_ssh)(connection.id.clone()))
+                        .into_any_element(),
+                );
+            }
+            items.push(
+                context_menu_danger_item(
+                    "Delete SSH",
+                    (actions.on_delete_ssh)(connection.id.clone()),
+                )
+                .into_any_element(),
+            );
+            context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
+        }))
 }
 
 fn icon_button(
-    label: &str,
+    icon_path: &'static str,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
     div()
-        .w(px(18.0))
-        .h(px(18.0))
+        .w(px(20.0))
+        .h(px(20.0))
         .flex()
         .items_center()
         .justify_center()
-        .text_xs()
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(SharedString::from(label.to_string()))
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|s| {
+            s.bg(rgb(theme::BUTTON_HOVER_BG))
+                .text_color(rgb(theme::TEXT_PRIMARY))
+        })
+        .child(icons::app_icon(icon_path, 14.0, theme::TEXT_MUTED))
         .on_mouse_down(MouseButton::Left, on_click)
 }
 
 fn row_icon_action(
-    label: &str,
+    icon_path: &'static str,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
     div()
-        .min_w(px(10.0))
-        .text_xs()
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(SharedString::from(label.to_string()))
-        .on_mouse_down(MouseButton::Left, on_click)
-}
-
-fn text_action(
-    label: &str,
-    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    div()
-        .text_xs()
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(SharedString::from(label.to_string()))
+        .w(px(16.0))
+        .h(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .px(px(2.0))
+        .hover(|s| {
+            s.bg(rgb(theme::BUTTON_HOVER_BG))
+                .text_color(rgb(theme::TEXT_PRIMARY))
+        })
+        .child(icons::app_icon(icon_path, 10.0, theme::TEXT_MUTED))
         .on_mouse_down(MouseButton::Left, on_click)
 }
 
@@ -780,6 +1099,7 @@ fn accent_text_action(
     div()
         .text_xs()
         .text_color(rgb(color))
+        .cursor_pointer()
         .child(SharedString::from(label.to_string()))
         .on_mouse_down(MouseButton::Left, on_click)
 }
@@ -795,6 +1115,7 @@ fn icon_text_action(
         .flex()
         .items_center()
         .gap(px(3.0))
+        .cursor_pointer()
         .child(icons::app_icon(icon_path, icon_size_px, color))
         .child(
             div()
@@ -814,9 +1135,11 @@ fn primary_button(
         .px_2()
         .py(px(5.0))
         .rounded_sm()
-        .bg(rgb(theme::PROJECT_DOT))
+        .bg(rgb(theme::PRIMARY))
         .text_xs()
         .text_color(rgb(theme::SELECTION_TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
         .child(SharedString::from(label.to_string()))
         .on_mouse_down(MouseButton::Left, on_click)
 }
@@ -824,9 +1147,9 @@ fn primary_button(
 fn section_label(label: &str) -> impl IntoElement {
     div()
         .px_1()
-        .text_xs()
+        .text_size(px(10.0))
         .text_color(rgb(theme::TEXT_DIM))
-        .child(SharedString::from(label.to_string()))
+        .child(SharedString::from(label.to_uppercase()))
 }
 
 fn empty_state(message: &str) -> impl IntoElement {
@@ -849,7 +1172,7 @@ fn empty_state_with_indent(message: &str, indent_px: f32) -> impl IntoElement {
 
 fn status_label(status: SessionStatus) -> &'static str {
     match status {
-        SessionStatus::Stopped => "stopped",
+        SessionStatus::Stopped => "",
         SessionStatus::Starting => "starting",
         SessionStatus::Running => "running",
         SessionStatus::Stopping => "stopping",
@@ -881,7 +1204,7 @@ fn ai_status_label(session: Option<&SessionRuntimeState>) -> &'static str {
     ) {
         "thinking"
     } else if session.status == SessionStatus::Running {
-        "live"
+        "idle"
     } else {
         status_label(session.status)
     }
@@ -943,4 +1266,70 @@ fn ssh_status_color(tab: Option<&SessionTab>, session: Option<&SessionRuntimeSta
         SessionStatus::Stopped | SessionStatus::Exited => theme::TEXT_SUBTLE,
         status => status_color(status),
     }
+}
+
+fn context_menu_item(
+    label: &str,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .px(px(10.0))
+        .py(px(5.0))
+        .text_xs()
+        .text_color(rgb(theme::TEXT_PRIMARY))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .child(SharedString::from(label.to_string()))
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn context_menu_danger_item(
+    label: &str,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .px(px(10.0))
+        .py(px(5.0))
+        .text_xs()
+        .text_color(rgb(theme::DANGER_TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .child(SharedString::from(label.to_string()))
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn context_menu_panel(
+    items: Vec<AnyElement>,
+    on_dismiss: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    deferred(
+        anchored()
+            .anchor(Corner::TopLeft)
+            .snap_to_window()
+            .child(
+                // Full-screen invisible backdrop to catch clicks outside the menu
+                div()
+                    .id("context-menu-backdrop")
+                    .occlude()
+                    .size_full()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .on_mouse_down(MouseButton::Left, on_dismiss),
+            )
+            .child(
+                div()
+                    .occlude()
+                    .w(px(160.0))
+                    .py(px(4.0))
+                    .rounded_sm()
+                    .bg(rgb(theme::PANEL_HEADER_BG))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_PRIMARY))
+                    .flex()
+                    .flex_col()
+                    .children(items),
+            ),
+    )
+    .with_priority(1)
 }

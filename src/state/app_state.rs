@@ -433,6 +433,23 @@ impl AppState {
         project.id
     }
 
+    pub fn move_project(&mut self, project_id: &str, direction: i32) -> bool {
+        let Some(index) = self
+            .config
+            .projects
+            .iter()
+            .position(|p| p.id == project_id)
+        else {
+            return false;
+        };
+        let new_index = index as i32 + direction;
+        if new_index < 0 || new_index >= self.config.projects.len() as i32 {
+            return false;
+        }
+        self.config.projects.swap(index, new_index as usize);
+        true
+    }
+
     pub fn remove_project(&mut self, project_id: &str) -> bool {
         let original_len = self.config.projects.len();
         self.config

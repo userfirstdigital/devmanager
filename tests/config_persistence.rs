@@ -33,6 +33,9 @@ fn unique_temp_path(file_name: &str) -> PathBuf {
 fn native_config_edits_round_trip_through_disk() {
     let mut state = load_fixture_state();
     let mut settings = state.settings().clone();
+    settings.log_buffer_size = 1200;
+    settings.confirm_on_close = false;
+    settings.minimize_to_tray = true;
     settings.default_terminal = DefaultTerminal::Cmd;
     settings.claude_command = Some("claude --resume".to_string());
     settings.codex_command = Some("codex --resume".to_string());
@@ -97,7 +100,18 @@ fn native_config_edits_round_trip_through_disk() {
     save_config_to_path(&config_path, &state.config).expect("save config");
     let reloaded = load_config_from_path(&config_path).expect("reload config");
 
+    assert_eq!(reloaded.settings.log_buffer_size, 1200);
+    assert!(!reloaded.settings.confirm_on_close);
+    assert!(reloaded.settings.minimize_to_tray);
     assert_eq!(reloaded.settings.default_terminal, DefaultTerminal::Cmd);
+    assert_eq!(
+        reloaded.settings.claude_command.as_deref(),
+        Some("claude --resume")
+    );
+    assert_eq!(
+        reloaded.settings.codex_command.as_deref(),
+        Some("codex --resume")
+    );
     assert_eq!(
         reloaded.settings.notification_sound.as_deref(),
         Some("chord")
@@ -167,7 +181,12 @@ fn saved_config_keeps_legacy_compatible_camel_case_shape() {
     let saved_json = std::fs::read_to_string(&config_path).expect("read config");
 
     assert!(saved_json.contains("\"rootPath\""));
+    assert!(saved_json.contains("\"logBufferSize\""));
+    assert!(saved_json.contains("\"confirmOnClose\""));
+    assert!(saved_json.contains("\"minimizeToTray\""));
     assert!(saved_json.contains("\"defaultTerminal\""));
+    assert!(saved_json.contains("\"claudeCommand\""));
+    assert!(saved_json.contains("\"codexCommand\""));
     assert!(saved_json.contains("\"sshConnections\""));
     assert!(saved_json.contains("\"notes\""));
 

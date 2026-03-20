@@ -76,8 +76,8 @@ impl SessionDimensions {
         Self {
             cols,
             rows,
-            cell_width: cell_width.max(1.0) as u16,
-            cell_height: cell_height.max(1.0) as u16,
+            cell_width: cell_width.round().max(1.0) as u16,
+            cell_height: cell_height.round().max(1.0) as u16,
         }
     }
 }
@@ -94,7 +94,8 @@ pub struct SessionExitState {
 pub struct ResourceSnapshot {
     pub cpu_percent: f32,
     pub memory_bytes: u64,
-    pub child_count: u32,
+    pub process_count: u32,
+    pub process_ids: Vec<u32>,
     pub last_sample_at: Option<Instant>,
 }
 
@@ -336,6 +337,7 @@ impl SessionRuntimeState {
         self.exit = Some(exit);
         self.status = status;
         self.pid = None;
+        self.resources = ResourceSnapshot::default();
         if self.session_kind.is_ai() {
             self.ai_activity = Some(AiActivity::Idle);
             self.thinking_since = None;
@@ -351,6 +353,7 @@ impl SessionRuntimeState {
         self.started_at = Some(Instant::now());
         self.exit = None;
         self.exit_code = None;
+        self.resources = ResourceSnapshot::default();
         self.last_output_at = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
@@ -493,3 +496,54 @@ impl RuntimeState {
 
 pub use SessionRuntimeState as ProcessState;
 pub use SessionStatus as ProcessStatus;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn note_start_and_exit_clear_stale_resource_metrics() {
+        let mut session = SessionRuntimeState::new(
+            "session-1",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.resources = ResourceSnapshot {
+            cpu_percent: 42.0,
+            memory_bytes: 12_345,
+            process_count: 3,
+            process_ids: vec![11, 22, 33],
+            last_sample_at: Some(Instant::now()),
+        };
+
+        session.note_start(Some(44));
+        assert_eq!(session.resources.memory_bytes, 0);
+        assert_eq!(session.resources.process_count, 0);
+        assert!(session.resources.process_ids.is_empty());
+        assert!(session.resources.last_sample_at.is_none());
+
+        session.resources = ResourceSnapshot {
+            cpu_percent: 17.5,
+            memory_bytes: 9_999,
+            process_count: 2,
+            process_ids: vec![44, 55],
+            last_sample_at: Some(Instant::now()),
+        };
+        session.note_exit(
+            SessionExitState {
+                code: Some(0),
+                signal: None,
+                closed_by_user: true,
+                summary: "closed".to_string(),
+            },
+            SessionStatus::Exited,
+        );
+
+        assert_eq!(session.resources.memory_bytes, 0);
+        assert_eq!(session.resources.process_count, 0);
+        assert!(session.resources.process_ids.is_empty());
+        assert!(session.resources.last_sample_at.is_none());
+    }
+}

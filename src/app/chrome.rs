@@ -1,13 +1,13 @@
 use crate::state::RuntimeState;
-use crate::theme;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
+use crate::{icons, theme};
 use gpui::{
     div, px, rgb, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     SharedString, Styled, Window,
 };
 use time::{format_description, OffsetDateTime};
 
-pub const STATUS_BAR_HEIGHT_PX: f32 = 18.0;
+pub const STATUS_BAR_HEIGHT_PX: f32 = 22.0;
 
 pub struct StatusBarActions<'a> {
     pub on_install_update: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -18,7 +18,7 @@ pub fn render_status_bar(
     updater: &UpdaterSnapshot,
     actions: StatusBarActions<'_>,
 ) -> impl IntoElement {
-    let (running_servers, total_memory_bytes) = running_server_metrics(runtime);
+    let (open_terminals, total_memory_bytes) = running_terminal_metrics(runtime);
     let time_label = current_time_label();
     let update_content = render_updater_status(updater, &actions);
 
@@ -44,21 +44,20 @@ pub fn render_status_bar(
                         .gap(px(4.0))
                         .text_xs()
                         .text_color(rgb(theme::TEXT_MUTED))
-                        .child(
-                            div()
-                                .size(px(4.0))
-                                .rounded_full()
-                                .bg(rgb(theme::SUCCESS_TEXT)),
-                        )
+                        .child(icons::app_icon(icons::SERVER, 10.0, theme::SUCCESS_TEXT))
                         .child(SharedString::from(format!(
-                            "{running_servers} server{} running",
-                            plural(running_servers)
+                            "{open_terminals} terminal{} open",
+                            plural(open_terminals)
                         ))),
                 )
-                .children((running_servers > 0).then(|| {
+                .children((open_terminals > 0).then(|| {
                     div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
                         .text_xs()
                         .text_color(rgb(theme::TEXT_DIM))
+                        .child(icons::app_icon(icons::ACTIVITY, 10.0, theme::TEXT_DIM))
                         .child(SharedString::from(format!(
                             "{} total memory",
                             format_memory(total_memory_bytes)
@@ -106,7 +105,9 @@ fn render_updater_status(
             div()
                 .text_xs()
                 .text_color(rgb(theme::PROJECT_DOT))
-                .child(SharedString::from(format!("Restart to update {version}")))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(theme::PRIMARY_HOVER)))
+                .child(SharedString::from(format!("⊞ Restart to update {version}")))
                 .on_mouse_down(MouseButton::Left, (actions.on_install_update)())
         }
         UpdaterStage::UpdateAvailable => {
@@ -134,11 +135,11 @@ fn render_updater_status(
     }
 }
 
-fn running_server_metrics(runtime: &RuntimeState) -> (usize, u64) {
+fn running_terminal_metrics(runtime: &RuntimeState) -> (usize, u64) {
     runtime
         .sessions
         .values()
-        .filter(|session| session.command_id.is_some() && session.status.is_live())
+        .filter(|session| session.status.is_live())
         .fold((0, 0), |(count, memory), session| {
             (
                 count + 1,
@@ -167,5 +168,74 @@ fn plural(count: usize) -> &'static str {
         ""
     } else {
         "s"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::running_terminal_metrics;
+    use crate::state::{
+        ResourceSnapshot, RuntimeState, ServerLaunchSpec, SessionDimensions, SessionRuntimeState,
+        SessionStatus,
+    };
+    use crate::terminal::session::TerminalBackend;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn running_terminal_metrics_counts_all_live_sessions() {
+        let mut runtime = RuntimeState::new(false);
+
+        let mut shell = SessionRuntimeState::new(
+            "shell-1",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        shell.status = SessionStatus::Running;
+        shell.resources = ResourceSnapshot {
+            memory_bytes: 32,
+            ..Default::default()
+        };
+
+        let mut server = SessionRuntimeState::new(
+            "server-1",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        server.status = SessionStatus::Running;
+        server.configure_server(ServerLaunchSpec {
+            command_id: "cmd-1".to_string(),
+            project_id: "project-1".to_string(),
+            cwd: PathBuf::from("."),
+            program: "cmd".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            auto_restart: false,
+            log_file_path: None,
+        });
+        server.resources = ResourceSnapshot {
+            memory_bytes: 64,
+            ..Default::default()
+        };
+
+        let mut stopped = SessionRuntimeState::new(
+            "shell-2",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        stopped.status = SessionStatus::Stopped;
+        stopped.resources = ResourceSnapshot {
+            memory_bytes: 128,
+            ..Default::default()
+        };
+
+        runtime.sessions.insert(shell.session_id.clone(), shell);
+        runtime.sessions.insert(server.session_id.clone(), server);
+        runtime.sessions.insert(stopped.session_id.clone(), stopped);
+
+        assert_eq!(running_terminal_metrics(&runtime), (2, 96));
     }
 }

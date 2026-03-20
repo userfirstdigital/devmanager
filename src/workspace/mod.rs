@@ -4,12 +4,808 @@ use crate::models::{
 use crate::theme;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use gpui::{
-    div, px, rgb, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, Styled, Window,
+    anchored, deferred, div, px, rgb, AnyElement, App, Corner, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 use std::collections::{BTreeSet, HashMap};
 
-const EDITOR_TITLE_HEIGHT_PX: f32 = 46.0;
+// ── Add Project Wizard ──────────────────────────────────────────────────────
+
+const PROJECT_COLOR_PRESETS: &[(u32, &str)] = &[
+    (0x6366f1, "#6366f1"), // indigo
+    (0xec4899, "#ec4899"), // pink
+    (0xf59e0b, "#f59e0b"), // amber
+    (0x10b981, "#10b981"), // emerald
+    (0x3b82f6, "#3b82f6"), // blue
+    (0xef4444, "#ef4444"), // red
+    (0xa855f7, "#a855f7"), // purple
+    (0x14b8a6, "#14b8a6"), // teal
+];
+
+#[derive(Debug, Clone)]
+pub struct AddProjectWizard {
+    pub name: String,
+    pub color: String,
+    pub root_path: String,
+    pub cursor: usize,
+    pub step: u8,
+    pub scan_entries: Vec<RootScanEntry>,
+    pub selected_folders: std::collections::BTreeSet<String>,
+    pub selected_scripts: HashMap<String, BTreeSet<String>>,
+    pub selected_port_variables: HashMap<String, Option<String>>,
+}
+
+impl Default for AddProjectWizard {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            color: PROJECT_COLOR_PRESETS[0].1.to_string(),
+            root_path: String::new(),
+            cursor: 0,
+            step: 1,
+            scan_entries: Vec::new(),
+            selected_folders: Default::default(),
+            selected_scripts: Default::default(),
+            selected_port_variables: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum WizardAction {
+    Cancel,
+    Create,
+    Configure,
+    Back,
+    SelectColor(String),
+    PickRootFolder,
+    ToggleFolder(String),
+    ToggleScript {
+        folder_path: String,
+        script_name: String,
+    },
+    SelectPortVariable {
+        folder_path: String,
+        variable: Option<String>,
+    },
+}
+
+pub struct WizardActions<'a> {
+    pub on_action: &'a dyn Fn(WizardAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+}
+
+pub fn render_add_project_wizard(
+    wizard: &AddProjectWizard,
+    actions: WizardActions<'_>,
+) -> AnyElement {
+    match wizard.step {
+        2 => render_wizard_step2(wizard, actions).into_any_element(),
+        _ => render_wizard_step1(wizard, actions).into_any_element(),
+    }
+}
+
+fn render_wizard_step1(
+    wizard: &AddProjectWizard,
+    actions: WizardActions<'_>,
+) -> impl IntoElement {
+    let on_cancel = (actions.on_action)(WizardAction::Cancel);
+    let on_configure = (actions.on_action)(WizardAction::Configure);
+    let on_pick_root = (actions.on_action)(WizardAction::PickRootFolder);
+
+    let display_name = display_text_with_cursor(
+        if wizard.name.is_empty() { "My App" } else { &wizard.name },
+        if wizard.name.is_empty() { 6 } else { wizard.cursor },
+    );
+    let name_is_placeholder = wizard.name.is_empty();
+
+    deferred(
+        anchored()
+            .snap_to_window()
+            .anchor(Corner::TopLeft)
+            .child(
+                // Backdrop
+                div()
+                    .id("wizard-backdrop")
+                    .occlude()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        // Modal card
+                        div()
+                            .w(px(420.0))
+                            .rounded_md()
+                            .bg(rgb(theme::PANEL_HEADER_BG))
+                            .border_1()
+                            .border_color(rgb(theme::BORDER_PRIMARY))
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            // Header
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(16.0))
+                                    .py(px(12.0))
+                                    .border_b_1()
+                                    .border_color(rgb(theme::BORDER_PRIMARY))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(theme::TEXT_PRIMARY))
+                                            .child("Add Project"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .cursor_pointer()
+                                            .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)))
+                                            .child("\u{2715}")
+                                            .on_mouse_down(MouseButton::Left, on_cancel),
+                                    ),
+                            )
+                            // Body
+                            .child(
+                                div()
+                                    .px(px(16.0))
+                                    .py(px(16.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(16.0))
+                                    // Name field
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::TEXT_MUTED))
+                                                    .child("Project Name"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .px(px(10.0))
+                                                    .py(px(8.0))
+                                                    .rounded_sm()
+                                                    .bg(rgb(theme::APP_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(theme::PRIMARY))
+                                                    .text_sm()
+                                                    .text_color(rgb(if name_is_placeholder {
+                                                        theme::TEXT_SUBTLE
+                                                    } else {
+                                                        theme::TEXT_PRIMARY
+                                                    }))
+                                                    .child(SharedString::from(display_name)),
+                                            ),
+                                    )
+                                    // Color picker
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::TEXT_MUTED))
+                                                    .child("Color"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .children(
+                                                        PROJECT_COLOR_PRESETS.iter().map(
+                                                            |(hex, name)| {
+                                                                let selected =
+                                                                    wizard.color == *name;
+                                                                let on_select = (actions.on_action)(
+                                                                    WizardAction::SelectColor(
+                                                                        name.to_string(),
+                                                                    ),
+                                                                );
+                                                                div()
+                                                                    .size(px(28.0))
+                                                                    .rounded_full()
+                                                                    .cursor_pointer()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .border_2()
+                                                                    .border_color(rgb(if selected {
+                                                                        0xffffff
+                                                                    } else {
+                                                                        theme::PANEL_HEADER_BG
+                                                                    }))
+                                                                    .child(
+                                                                        div()
+                                                                            .size(px(20.0))
+                                                                            .rounded_full()
+                                                                            .bg(rgb(*hex)),
+                                                                    )
+                                                                    .on_mouse_down(
+                                                                        MouseButton::Left,
+                                                                        on_select,
+                                                                    )
+                                                                    .into_any_element()
+                                                            },
+                                                        ),
+                                                    ),
+                                            ),
+                                    )
+                                    // Root folder
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::TEXT_MUTED))
+                                                    .child("Root Folder"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .px(px(10.0))
+                                                    .py(px(8.0))
+                                                    .rounded_sm()
+                                                    .bg(rgb(theme::APP_BG))
+                                                    .border_1()
+                                                    .border_color(rgb(theme::BORDER_SECONDARY))
+                                                    .text_sm()
+                                                    .text_color(rgb(if wizard.root_path.is_empty() {
+                                                        theme::TEXT_SUBTLE
+                                                    } else {
+                                                        theme::TEXT_PRIMARY
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .hover(|s| {
+                                                        s.border_color(rgb(theme::TEXT_SUBTLE))
+                                                    })
+                                                    .child(SharedString::from(
+                                                        if wizard.root_path.is_empty() {
+                                                            "Select root folder\u{2026}".to_string()
+                                                        } else {
+                                                            wizard.root_path.clone()
+                                                        },
+                                                    ))
+                                                    .on_mouse_down(MouseButton::Left, on_pick_root),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::TEXT_SUBTLE))
+                                                    .child("Sub-folders with package.json or Cargo.toml will be discovered automatically"),
+                                            ),
+                                    )
+                                    // Discovered folders
+                                    .children(
+                                        (!wizard.scan_entries.is_empty()).then(|| {
+                                            let count = wizard.scan_entries.len();
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(6.0))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(theme::TEXT_MUTED))
+                                                        .child(SharedString::from(format!(
+                                                            "Discovered folders ({count})"
+                                                        ))),
+                                                )
+                                                .children(wizard.scan_entries.iter().map(|entry| {
+                                                    let selected = wizard
+                                                        .selected_folders
+                                                        .contains(&entry.path);
+                                                    let on_toggle = (actions.on_action)(
+                                                        WizardAction::ToggleFolder(
+                                                            entry.path.clone(),
+                                                        ),
+                                                    );
+                                                    let detail = wizard_scan_detail(entry);
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap(px(8.0))
+                                                        .px(px(10.0))
+                                                        .py(px(6.0))
+                                                        .rounded_sm()
+                                                        .bg(rgb(theme::APP_BG))
+                                                        .cursor_pointer()
+                                                        .hover(|s| {
+                                                            s.bg(rgb(theme::ROW_HOVER_BG))
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(px(8.0))
+                                                                .child(
+                                                                    div()
+                                                                        .size(px(16.0))
+                                                                        .rounded_sm()
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .bg(rgb(if selected {
+                                                                            theme::PRIMARY
+                                                                        } else {
+                                                                            theme::BORDER_SECONDARY
+                                                                        }))
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgb(
+                                                                                    0xffffff,
+                                                                                ))
+                                                                                .child(
+                                                                                    if selected {
+                                                                                        "\u{2713}"
+                                                                                    } else {
+                                                                                        ""
+                                                                                    },
+                                                                                ),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_sm()
+                                                                        .text_color(rgb(
+                                                                            theme::TEXT_PRIMARY,
+                                                                        ))
+                                                                        .child(SharedString::from(
+                                                                            entry.name.clone(),
+                                                                        )),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(
+                                                                    theme::TEXT_SUBTLE,
+                                                                ))
+                                                                .child(SharedString::from(
+                                                                    detail,
+                                                                )),
+                                                        )
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            on_toggle,
+                                                        )
+                                                        .into_any_element()
+                                                }))
+                                                .into_any_element()
+                                        }),
+                                    ),
+                            )
+                            // Footer
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap(px(8.0))
+                                    .px(px(16.0))
+                                    .py(px(12.0))
+                                    .border_t_1()
+                                    .border_color(rgb(theme::BORDER_PRIMARY))
+                                    .child(
+                                        div()
+                                            .px(px(12.0))
+                                            .py(px(6.0))
+                                            .rounded_sm()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .cursor_pointer()
+                                            .hover(|s| {
+                                                s.text_color(rgb(theme::TEXT_PRIMARY))
+                                                    .bg(rgb(theme::ROW_HOVER_BG))
+                                            })
+                                            .child("Cancel")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                (actions.on_action)(WizardAction::Cancel),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(14.0))
+                                            .py(px(6.0))
+                                            .rounded_sm()
+                                            .bg(rgb(theme::PRIMARY))
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(theme::SELECTION_TEXT))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
+                                            .child("Configure \u{2192}")
+                                            .on_mouse_down(MouseButton::Left, on_configure),
+                                    ),
+                            ),
+                    ),
+            ),
+    )
+    .with_priority(2)
+}
+
+fn wizard_scan_detail(entry: &RootScanEntry) -> String {
+    let scripts = entry.scripts.len();
+    let has_env = entry.has_env;
+    match (scripts, has_env) {
+        (0, false) => String::new(),
+        (0, true) => ".env".to_string(),
+        (n, false) => format!("{n} scripts"),
+        (n, true) => format!("{n} scripts + .env"),
+    }
+}
+
+fn render_wizard_step2(
+    wizard: &AddProjectWizard,
+    actions: WizardActions<'_>,
+) -> impl IntoElement {
+    let on_cancel = (actions.on_action)(WizardAction::Cancel);
+    let on_back = (actions.on_action)(WizardAction::Back);
+    let on_create = (actions.on_action)(WizardAction::Create);
+
+    let selected_entries: Vec<&RootScanEntry> = wizard
+        .scan_entries
+        .iter()
+        .filter(|e| wizard.selected_folders.contains(&e.path))
+        .collect();
+
+    deferred(
+        anchored()
+            .snap_to_window()
+            .anchor(Corner::TopLeft)
+            .child(
+                div()
+                    .id("wizard-step2-backdrop")
+                    .occlude()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(520.0))
+                            .max_h(px(600.0))
+                            .rounded_md()
+                            .bg(rgb(theme::PANEL_HEADER_BG))
+                            .border_1()
+                            .border_color(rgb(theme::BORDER_PRIMARY))
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            // Header
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(16.0))
+                                    .py(px(12.0))
+                                    .border_b_1()
+                                    .border_color(rgb(theme::BORDER_PRIMARY))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(theme::TEXT_PRIMARY))
+                                            .child(
+                                                "Add Project \u{2014} Configure Folders",
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .cursor_pointer()
+                                            .hover(|s| {
+                                                s.text_color(rgb(theme::TEXT_PRIMARY))
+                                            })
+                                            .child("\u{2715}")
+                                            .on_mouse_down(MouseButton::Left, on_cancel),
+                                    ),
+                            )
+                            // Body (scrollable)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("wizard-step2-scroll")
+                                    .overflow_y_scroll()
+                                    .scrollbar_width(px(6.0))
+                                    .child(
+                                        div()
+                                            .px(px(16.0))
+                                            .py(px(16.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(20.0))
+                                            .children(selected_entries.iter().map(|entry| {
+                                                render_wizard_folder_config(
+                                                    entry, wizard, &actions,
+                                                )
+                                                .into_any_element()
+                                            })),
+                                    ),
+                            )
+                            // Footer
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(16.0))
+                                    .py(px(12.0))
+                                    .border_t_1()
+                                    .border_color(rgb(theme::BORDER_PRIMARY))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .cursor_pointer()
+                                            .hover(|s| {
+                                                s.text_color(rgb(theme::TEXT_PRIMARY))
+                                            })
+                                            .child("\u{2190} Back")
+                                            .on_mouse_down(MouseButton::Left, on_back),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .child(
+                                                div()
+                                                    .px(px(12.0))
+                                                    .py(px(6.0))
+                                                    .rounded_sm()
+                                                    .text_xs()
+                                                    .text_color(rgb(theme::TEXT_MUTED))
+                                                    .cursor_pointer()
+                                                    .hover(|s| {
+                                                        s.text_color(rgb(theme::TEXT_PRIMARY))
+                                                            .bg(rgb(theme::ROW_HOVER_BG))
+                                                    })
+                                                    .child("Cancel")
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        (actions.on_action)(WizardAction::Cancel),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px(px(14.0))
+                                                    .py(px(6.0))
+                                                    .rounded_sm()
+                                                    .bg(rgb(theme::PRIMARY))
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(theme::SELECTION_TEXT))
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
+                                                    .child("Create Project")
+                                                    .on_mouse_down(MouseButton::Left, on_create),
+                                            ),
+                                    ),
+                            ),
+                    ),
+            ),
+    )
+    .with_priority(2)
+}
+
+fn render_wizard_folder_config(
+    entry: &RootScanEntry,
+    wizard: &AddProjectWizard,
+    actions: &WizardActions<'_>,
+) -> impl IntoElement {
+    let selected_scripts = wizard.selected_scripts.get(&entry.path);
+    let selected_port = wizard
+        .selected_port_variables
+        .get(&entry.path)
+        .cloned()
+        .flatten();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        // Folder header
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(SharedString::from(entry.name.clone())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child(SharedString::from(entry.path.clone())),
+                ),
+        )
+        // Scripts
+        .children((!entry.scripts.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(entry.scripts.iter().map(|script| {
+                    let is_selected = selected_scripts
+                        .map(|s| s.contains(&script.name))
+                        .unwrap_or(false);
+                    let on_toggle =
+                        (actions.on_action)(WizardAction::ToggleScript {
+                            folder_path: entry.path.clone(),
+                            script_name: script.name.clone(),
+                        });
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .px(px(6.0))
+                        .py(px(4.0))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .size(px(16.0))
+                                        .rounded_sm()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(rgb(if is_selected {
+                                            theme::PRIMARY
+                                        } else {
+                                            theme::BORDER_SECONDARY
+                                        }))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0xffffff))
+                                                .child(if is_selected {
+                                                    "\u{2713}"
+                                                } else {
+                                                    ""
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(theme::TEXT_PRIMARY))
+                                        .child(SharedString::from(
+                                            script.name.clone(),
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(script.command.clone())),
+                        )
+                        .on_mouse_down(MouseButton::Left, on_toggle)
+                        .into_any_element()
+                }))
+                .into_any_element()
+        }))
+        // Port variables
+        .children((!entry.ports.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .pt(px(4.0))
+                        .child("Port Variable (select one)"),
+                )
+                .children(entry.ports.iter().map(|port| {
+                    let is_selected = selected_port.as_deref() == Some(port.variable.as_str());
+                    let on_select =
+                        (actions.on_action)(WizardAction::SelectPortVariable {
+                            folder_path: entry.path.clone(),
+                            variable: Some(port.variable.clone()),
+                        });
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .px(px(6.0))
+                        .py(px(6.0))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(if is_selected {
+                            theme::APP_BG
+                        } else {
+                            theme::PANEL_HEADER_BG
+                        }))
+                        .border_1()
+                        .border_color(rgb(if is_selected {
+                            theme::PRIMARY
+                        } else {
+                            theme::PANEL_HEADER_BG
+                        }))
+                        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .size(px(14.0))
+                                        .rounded_full()
+                                        .border_2()
+                                        .border_color(rgb(if is_selected {
+                                            theme::PRIMARY
+                                        } else {
+                                            theme::TEXT_SUBTLE
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .children(is_selected.then(|| {
+                                            div()
+                                                .size(px(6.0))
+                                                .rounded_full()
+                                                .bg(rgb(theme::PRIMARY))
+                                        })),
+                                )
+                                .child(
+                                    div().text_sm().text_color(rgb(theme::TEXT_PRIMARY)).child(
+                                        SharedString::from(format!(
+                                            "{}  = {}",
+                                            port.variable, port.port
+                                        )),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(format!("({})", port.source))),
+                        )
+                        .on_mouse_down(MouseButton::Left, on_select)
+                        .into_any_element()
+                }))
+                .into_any_element()
+        }))
+}
 
 #[derive(Debug, Clone)]
 pub enum EditorPanel {
@@ -247,6 +1043,7 @@ pub struct SettingsDraft {
     pub minimize_to_tray: bool,
     pub restore_session_on_start: bool,
     pub terminal_font_size: String,
+    pub open_picker: Option<SettingsPicker>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +1148,13 @@ pub enum SettingsField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPicker {
+    Terminal,
+    NotificationSound,
+    DataActions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectField {
     Name,
     RootPath,
@@ -427,6 +1231,12 @@ pub enum EditorAction {
     CycleDefaultTerminal,
     CycleMacTerminalProfile,
     CycleNotificationSound,
+    PreviewNotificationSound,
+    ToggleSettingsPicker(SettingsPicker),
+    SelectDefaultTerminal(DefaultTerminal),
+    SelectMacTerminalProfile(MacTerminalProfile),
+    SelectNotificationSound(String),
+    SetTerminalFontSize(u16),
     ToggleConfirmOnClose,
     ToggleMinimizeToTray,
     ToggleRestoreSession,
@@ -441,25 +1251,13 @@ pub struct EditorActions<'a> {
     pub on_action: &'a dyn Fn(EditorAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 }
 
-pub fn render_editor_surface(
-    model: &EditorPaneModel,
-    actions: EditorActions<'_>,
-) -> impl IntoElement {
+pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>) -> AnyElement {
+    if let EditorPanel::Settings(draft) = &model.panel {
+        return render_settings_editor_surface(draft, model, &actions).into_any_element();
+    }
+
     let title = model.panel.title();
-    let subtitle = model.panel.subtitle();
     let save_label = model.panel.save_label();
-    let notice = model.notice.as_ref().map(|notice| {
-        div()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(theme::AGENT_ROW_BG))
-            .border_1()
-            .border_color(rgb(theme::BORDER_PRIMARY))
-            .text_sm()
-            .text_color(rgb(theme::TEXT_MUTED))
-            .child(SharedString::from(notice.clone()))
-    });
 
     let body: AnyElement = match &model.panel {
         EditorPanel::Settings(draft) => {
@@ -488,112 +1286,92 @@ pub fn render_editor_surface(
         .flex_1()
         .h_full()
         .flex()
-        .items_center()
-        .justify_center()
+        .flex_col()
         .bg(rgb(theme::APP_BG))
         .child(
-            div().w(px(820.0)).h_full().px_4().py_4().child(
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(12.0))
-                    .rounded_md()
-                    .bg(rgb(theme::PANEL_BG))
-                    .border_1()
-                    .border_color(rgb(theme::BORDER_PRIMARY))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .h(px(EDITOR_TITLE_HEIGHT_PX))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_3()
-                            .bg(rgb(theme::TOPBAR_BG))
-                            .border_b_1()
-                            .border_color(rgb(theme::BORDER_PRIMARY))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(title),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_SUBTLE))
-                                            .child(subtitle),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(theme::PANEL_HEADER_BG))
-                                    .text_xs()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .child("close")
-                                    .on_mouse_down(MouseButton::Left, on_close),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .p_3()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .children(notice)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme::TEXT_DIM))
-                                    .child("Click a field to type. Ctrl+S saves. Esc closes."),
-                            )
-                            .child(body)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .px_3()
-                                            .py(px(10.0))
-                                            .rounded_sm()
-                                            .bg(rgb(theme::PANEL_HEADER_BG))
-                                            .border_1()
-                                            .border_color(rgb(theme::BORDER_SECONDARY))
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_PRIMARY))
-                                            .child(save_label)
-                                            .on_mouse_down(MouseButton::Left, on_save),
-                                    )
-                                    .children(on_delete.map(|on_delete| {
-                                        div()
-                                            .px_3()
-                                            .py(px(10.0))
-                                            .rounded_sm()
-                                            .bg(rgb(theme::PROJECT_ROW_BG))
-                                            .border_1()
-                                            .border_color(rgb(theme::DANGER_TEXT))
-                                            .text_xs()
-                                            .text_color(rgb(theme::DANGER_TEXT))
-                                            .child("delete")
-                                            .on_mouse_down(MouseButton::Left, on_delete)
-                                    })),
-                            ),
-                    ),
-            ),
+            div()
+                .h(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px(px(6.0))
+                .bg(rgb(theme::TOPBAR_BG))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_PRIMARY))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded_sm()
+                                .bg(rgb(theme::PRIMARY))
+                                .text_xs()
+                                .text_color(rgb(theme::SELECTION_TEXT))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
+                                .child(save_label)
+                                .on_mouse_down(MouseButton::Left, on_save),
+                        )
+                        .children(on_delete.map(|on_delete| {
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(rgb(theme::DANGER_TEXT))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                                .child("delete")
+                                .on_mouse_down(MouseButton::Left, on_delete)
+                        }))
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                                .child("close")
+                                .on_mouse_down(MouseButton::Left, on_close),
+                        ),
+                ),
         )
+        .child(
+            div()
+                .flex_1()
+                .id("editor-panel-scroll")
+                .overflow_y_scroll()
+                .scrollbar_width(px(6.0))
+                .child(
+                    div().w_full().flex().justify_center().child(
+                        div()
+                            .w_full()
+                            .max_w(px(540.0))
+                            .pt(px(24.0))
+                            .pb(px(40.0))
+                            .px(px(20.0))
+                            .children(model.notice.as_ref().map(|notice| {
+                                render_notice_row(notice.as_str()).into_any_element()
+                            }))
+                            .child(body),
+                    ),
+                ),
+        )
+        .into_any_element()
 }
 
 pub fn next_default_terminal(current: DefaultTerminal) -> DefaultTerminal {
@@ -604,11 +1382,11 @@ pub fn next_default_terminal(current: DefaultTerminal) -> DefaultTerminal {
     }
 }
 
-pub fn default_terminal_label(value: DefaultTerminal) -> &'static str {
+pub fn default_terminal_label(value: &DefaultTerminal) -> &'static str {
     match value {
-        DefaultTerminal::Bash => "bash",
-        DefaultTerminal::Powershell => "powershell",
-        DefaultTerminal::Cmd => "cmd",
+        DefaultTerminal::Bash => "Bash (Git Bash)",
+        DefaultTerminal::Powershell => "PowerShell",
+        DefaultTerminal::Cmd => "CMD",
     }
 }
 
@@ -620,9 +1398,9 @@ pub fn next_mac_terminal_profile(current: MacTerminalProfile) -> MacTerminalProf
     }
 }
 
-pub fn mac_terminal_profile_label(value: MacTerminalProfile) -> &'static str {
+pub fn mac_terminal_profile_label(value: &MacTerminalProfile) -> &'static str {
     match value {
-        MacTerminalProfile::System => "system",
+        MacTerminalProfile::System => "User shell",
         MacTerminalProfile::Zsh => "zsh",
         MacTerminalProfile::Bash => "bash",
     }
@@ -634,6 +1412,21 @@ pub fn notification_sound_options() -> &'static [&'static str] {
     ]
 }
 
+pub fn notification_sound_label(value: &str) -> &'static str {
+    match value {
+        "glass" => "Glass",
+        "chord" => "Chord",
+        "glisten" => "Glisten",
+        "polite" => "Polite",
+        "calm" => "Calm",
+        "sharp" => "Sharp",
+        "jinja" => "Jinja",
+        "cloud" => "Cloud",
+        "none" => "None",
+        _ => "Glass",
+    }
+}
+
 pub fn next_notification_sound(current: &str) -> String {
     let options = notification_sound_options();
     let index = options
@@ -643,127 +1436,693 @@ pub fn next_notification_sound(current: &str) -> String {
     options[(index + 1) % options.len()].to_string()
 }
 
+fn render_settings_editor_surface(
+    draft: &SettingsDraft,
+    model: &EditorPaneModel,
+    actions: &EditorActions<'_>,
+) -> impl IntoElement {
+    let on_close = (actions.on_action)(EditorAction::Close);
+
+    div()
+        .flex_1()
+        .h_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(theme::APP_BG))
+        .child(
+            div()
+                .h(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px(px(6.0))
+                .bg(rgb(theme::TOPBAR_BG))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_PRIMARY))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child("Settings"),
+                )
+                .child(render_settings_close_button(on_close)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .id("settings-panel-scroll")
+                .overflow_y_scroll()
+                .scrollbar_width(px(6.0))
+                .child(
+                    div().w_full().flex().justify_center().child(
+                        div()
+                            .w_full()
+                            .max_w(px(540.0))
+                            .pt(px(24.0))
+                            .pb(px(40.0))
+                            .px(px(20.0))
+                            .child(render_settings_panel(draft, model, actions)),
+                    ),
+                ),
+        )
+}
+
 fn render_settings_panel(
     draft: &SettingsDraft,
     model: &EditorPaneModel,
     actions: &EditorActions<'_>,
 ) -> impl IntoElement {
-    let on_export = (actions.on_action)(EditorAction::ExportConfig);
-    let on_import_merge = (actions.on_action)(EditorAction::ImportConfigMerge);
-    let on_import_replace = (actions.on_action)(EditorAction::ImportConfigReplace);
-    let on_check_updates = (actions.on_action)(EditorAction::CheckForUpdates);
-    let on_cycle_terminal = (actions.on_action)(EditorAction::CycleDefaultTerminal);
-    let on_cycle_mac_profile = (actions.on_action)(EditorAction::CycleMacTerminalProfile);
-    let on_cycle_sound = (actions.on_action)(EditorAction::CycleNotificationSound);
-    let on_download_update = matches!(model.updater.stage, UpdaterStage::UpdateAvailable)
-        .then(|| (actions.on_action)(EditorAction::DownloadUpdate));
-    let on_install_update = matches!(model.updater.stage, UpdaterStage::ReadyToInstall)
-        .then(|| (actions.on_action)(EditorAction::InstallUpdate));
+    let is_mac = cfg!(target_os = "macos");
+    let on_toggle_terminal_picker =
+        (actions.on_action)(EditorAction::ToggleSettingsPicker(SettingsPicker::Terminal));
+    let on_toggle_sound_picker = (actions.on_action)(EditorAction::ToggleSettingsPicker(
+        SettingsPicker::NotificationSound,
+    ));
+    let on_preview_sound = (actions.on_action)(EditorAction::PreviewNotificationSound);
     let on_toggle_confirm = (actions.on_action)(EditorAction::ToggleConfirmOnClose);
     let on_toggle_tray = (actions.on_action)(EditorAction::ToggleMinimizeToTray);
     let on_toggle_restore = (actions.on_action)(EditorAction::ToggleRestoreSession);
+    let on_export = (actions.on_action)(EditorAction::ExportConfig);
+    let on_import_merge = (actions.on_action)(EditorAction::ImportConfigMerge);
+    let on_import_replace = (actions.on_action)(EditorAction::ImportConfigReplace);
+    let on_toggle_data_picker = (actions.on_action)(EditorAction::ToggleSettingsPicker(
+        SettingsPicker::DataActions,
+    ));
+
+    let terminal_options: Vec<AnyElement> = if is_mac {
+        [
+            MacTerminalProfile::System,
+            MacTerminalProfile::Zsh,
+            MacTerminalProfile::Bash,
+        ]
+        .into_iter()
+        .map(|profile| {
+            render_settings_dropdown_option(
+                mac_terminal_profile_label(&profile).to_string(),
+                draft.mac_terminal_profile == profile,
+                (actions.on_action)(EditorAction::SelectMacTerminalProfile(profile)),
+            )
+            .into_any_element()
+        })
+        .collect()
+    } else {
+        [
+            DefaultTerminal::Bash,
+            DefaultTerminal::Powershell,
+            DefaultTerminal::Cmd,
+        ]
+        .into_iter()
+        .map(|terminal| {
+            render_settings_dropdown_option(
+                default_terminal_label(&terminal).to_string(),
+                draft.default_terminal == terminal,
+                (actions.on_action)(EditorAction::SelectDefaultTerminal(terminal)),
+            )
+            .into_any_element()
+        })
+        .collect()
+    };
+
+    let sound_options: Vec<AnyElement> = notification_sound_options()
+        .iter()
+        .map(|sound_id| {
+            render_settings_dropdown_option(
+                notification_sound_label(sound_id).to_string(),
+                draft.notification_sound.eq_ignore_ascii_case(sound_id),
+                (actions.on_action)(EditorAction::SelectNotificationSound(
+                    (*sound_id).to_string(),
+                )),
+            )
+            .into_any_element()
+        })
+        .collect();
 
     div()
         .flex()
         .flex_col()
-        .gap_3()
-        .child(render_choice_row(
-            "Default terminal",
-            default_terminal_label(draft.default_terminal.clone()),
-            Some("Cycles through bash, powershell, and cmd"),
-            on_cycle_terminal,
+        .gap(px(20.0))
+        .children(
+            model
+                .notice
+                .as_ref()
+                .map(|notice| render_notice_row(notice.as_str()).into_any_element()),
+        )
+        // — General section
+        .child(render_settings_section(
+            "General",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(render_settings_toggle_row(
+                    "Confirm on close",
+                    "Show confirmation dialog when closing with running servers",
+                    draft.confirm_on_close,
+                    on_toggle_confirm,
+                ))
+                .child(render_settings_toggle_row(
+                    "Minimize to tray",
+                    minimize_to_tray_hint(),
+                    draft.minimize_to_tray,
+                    on_toggle_tray,
+                ))
+                .child(render_settings_toggle_row(
+                    "Resume previous session on startup",
+                    "Restore open tabs and sidebar state on launch",
+                    draft.restore_session_on_start,
+                    on_toggle_restore,
+                ))
+                .child(render_settings_text_input(
+                    "Log buffer size",
+                    "Maximum log lines per command (100 - 100,000)",
+                    draft.log_buffer_size.as_str(),
+                    EditorField::Settings(SettingsField::LogBufferSize),
+                    model,
+                    actions,
+                    Some(140.0),
+                    "10000",
+                ))
+                .into_any_element(),
         ))
-        .child(render_choice_row(
-            "macOS terminal profile",
-            mac_terminal_profile_label(draft.mac_terminal_profile.clone()),
-            Some("Cycles through system, zsh, and bash for macOS shell launch"),
-            on_cycle_mac_profile,
+        // — Terminal section
+        .child(render_settings_section(
+            "Terminal",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(render_settings_select_row(
+                    if is_mac {
+                        "Default terminal shell"
+                    } else {
+                        "Default terminal"
+                    },
+                    if is_mac {
+                        "Shell used for Claude Code and interactive terminals on macOS"
+                    } else {
+                        "Shell used for Claude Code and interactive terminals"
+                    },
+                    if is_mac {
+                        mac_terminal_profile_label(&draft.mac_terminal_profile)
+                    } else {
+                        default_terminal_label(&draft.default_terminal)
+                    },
+                    draft.open_picker == Some(SettingsPicker::Terminal),
+                    on_toggle_terminal_picker,
+                    None,
+                    Some(220.0),
+                    terminal_options,
+                ))
+                .child(render_settings_font_size_row(draft, actions))
+                .child(render_settings_select_row(
+                    "Notification sound",
+                    "Sound played when an AI terminal finishes a long task",
+                    notification_sound_label(&draft.notification_sound),
+                    draft.open_picker == Some(SettingsPicker::NotificationSound),
+                    on_toggle_sound_picker,
+                    Some(render_settings_icon_button("♪", on_preview_sound).into_any_element()),
+                    Some(180.0),
+                    sound_options,
+                ))
+                .into_any_element(),
         ))
-        .child(render_text_field(
-            "Theme",
-            "Persisted config theme id. The native shell currently uses the dark palette.",
-            draft.theme.as_str(),
-            EditorField::Settings(SettingsField::Theme),
-            model,
-            actions,
+        // — AI section
+        .child(render_settings_section(
+            "AI Commands",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(render_settings_text_input(
+                    "Claude command",
+                    "Command launched when opening a Claude terminal",
+                    draft.claude_command.as_str(),
+                    EditorField::Settings(SettingsField::ClaudeCommand),
+                    model,
+                    actions,
+                    None,
+                    "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
+                ))
+                .child(render_settings_text_input(
+                    "Codex command",
+                    "Command launched when opening a Codex terminal",
+                    draft.codex_command.as_str(),
+                    EditorField::Settings(SettingsField::CodexCommand),
+                    model,
+                    actions,
+                    None,
+                    "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+                ))
+                .into_any_element(),
         ))
-        .child(render_text_field(
-            "Log buffer size",
-            "Numeric terminal scrollback history size",
-            draft.log_buffer_size.as_str(),
-            EditorField::Settings(SettingsField::LogBufferSize),
-            model,
-            actions,
+        // — Data section
+        .child(render_settings_section(
+            "Data",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(render_settings_inline_button(
+                    "Import / Export Configuration",
+                    false,
+                    on_toggle_data_picker,
+                ))
+                .children(
+                    (draft.open_picker == Some(SettingsPicker::DataActions)).then(|| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(render_settings_dropdown_option(
+                                "Export config".to_string(),
+                                false,
+                                on_export,
+                            ))
+                            .child(render_settings_dropdown_option(
+                                "Import config (merge)".to_string(),
+                                false,
+                                on_import_merge,
+                            ))
+                            .child(render_settings_dropdown_option(
+                                "Import config (replace)".to_string(),
+                                false,
+                                on_import_replace,
+                            ))
+                            .into_any_element()
+                    }),
+                )
+                .into_any_element(),
         ))
-        .child(render_text_field(
-            "Claude command",
-            "Optional override for Claude shell startup",
-            draft.claude_command.as_str(),
-            EditorField::Settings(SettingsField::ClaudeCommand),
-            model,
-            actions,
-        ))
-        .child(render_text_field(
-            "Codex command",
-            "Optional override for Codex shell startup",
-            draft.codex_command.as_str(),
-            EditorField::Settings(SettingsField::CodexCommand),
-            model,
-            actions,
-        ))
-        .child(render_choice_row(
-            "Notification sound",
-            draft.notification_sound.as_str(),
-            Some("Cycles through the archived sound ids"),
-            on_cycle_sound,
-        ))
-        .child(render_toggle_row(
-            "Confirm before closing live tabs",
-            draft.confirm_on_close,
-            on_toggle_confirm,
-        ))
-        .child(render_toggle_row(
-            "Minimize to tray",
-            draft.minimize_to_tray,
-            on_toggle_tray,
-        ))
-        .child(render_toggle_row(
-            "Restore session on start",
-            draft.restore_session_on_start,
-            on_toggle_restore,
-        ))
-        .child(render_text_field(
-            "Terminal font size",
-            "Leave blank to use the default size",
-            draft.terminal_font_size.as_str(),
-            EditorField::Settings(SettingsField::TerminalFontSize),
-            model,
-            actions,
-        ))
-        .child(render_choice_row(
-            "Export config",
-            "Save a JSON backup",
-            Some("Exports projects, notes, settings, and SSH entries"),
-            on_export,
-        ))
-        .child(render_choice_row(
-            "Import config (merge)",
-            "Add non-duplicate projects",
-            Some("Keeps current settings and SSH entries"),
-            on_import_merge,
-        ))
-        .child(render_choice_row(
-            "Import config (replace)",
-            "Replace current config",
-            Some("Overwrites projects, settings, and SSH entries from the selected file"),
-            on_import_replace,
-        ))
-        .child(render_updater_panel(
-            &model.updater,
-            on_check_updates,
-            on_download_update,
-            on_install_update,
-        ))
+}
+
+fn render_settings_toggle_row(
+    label: &str,
+    description: &str,
+    checked: bool,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let mut toggle = div()
+        .w(px(36.0))
+        .h(px(20.0))
+        .p(px(2.0))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .bg(rgb(if checked {
+            theme::PRIMARY
+        } else {
+            theme::BORDER_SECONDARY
+        }))
+        .on_mouse_down(MouseButton::Left, on_click);
+    toggle = if checked {
+        toggle.justify_end()
+    } else {
+        toggle.justify_start()
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(SharedString::from(label.to_string())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child(SharedString::from(description.to_string())),
+                ),
+        )
+        .child(toggle.child(div().size(px(14.0)).rounded_full().bg(rgb(0xffffff))))
+}
+
+fn render_settings_text_input(
+    label: &str,
+    hint: &str,
+    value: &str,
+    field: EditorField,
+    model: &EditorPaneModel,
+    actions: &EditorActions<'_>,
+    width: Option<f32>,
+    placeholder: &str,
+) -> impl IntoElement {
+    let focused = model.active_field == Some(field);
+    let display_value = if focused {
+        display_text_with_cursor(value, model.cursor)
+    } else if value.is_empty() {
+        placeholder.to_string()
+    } else {
+        value.to_string()
+    };
+    let on_focus = (actions.on_action)(EditorAction::FocusField(field));
+
+    let mut input = div()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded_sm()
+        .bg(rgb(if focused {
+            0x1e1e22
+        } else {
+            theme::PANEL_HEADER_BG
+        }))
+        .border_1()
+        .border_color(rgb(if focused {
+            theme::PRIMARY
+        } else {
+            theme::BORDER_SECONDARY
+        }))
+        .text_xs()
+        .text_color(rgb(if value.is_empty() && !focused {
+            theme::TEXT_SUBTLE
+        } else {
+            theme::TEXT_PRIMARY
+        }))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .cursor_text()
+        .child(SharedString::from(display_value))
+        .on_mouse_down(MouseButton::Left, on_focus);
+    if let Some(width) = width {
+        input = input.w(px(width));
+    } else {
+        input = input.w_full();
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(hint.to_string())),
+        )
+        .child(input)
+}
+
+fn render_settings_select_row(
+    label: &str,
+    hint: &str,
+    value: &str,
+    expanded: bool,
+    on_toggle: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    accessory: Option<AnyElement>,
+    field_width: Option<f32>,
+    options: Vec<AnyElement>,
+) -> impl IntoElement {
+    let mut select = div()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded_sm()
+        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_1()
+        .border_color(rgb(if expanded {
+            theme::PRIMARY
+        } else {
+            theme::BORDER_SECONDARY
+        }))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, on_toggle)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(SharedString::from(value.to_string())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child(if expanded { "^" } else { "v" }),
+                ),
+        );
+    select = if let Some(field_width) = field_width {
+        select.w(px(field_width))
+    } else {
+        select.w_full()
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(hint.to_string())),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(select)
+                .children(accessory),
+        )
+        .children(expanded.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .p(px(4.0))
+                .rounded_sm()
+                .bg(rgb(theme::PANEL_HEADER_BG))
+                .border_1()
+                .border_color(rgb(theme::BORDER_SECONDARY))
+                .children(options)
+                .into_any_element()
+        }))
+}
+
+fn render_settings_dropdown_option(
+    label: String,
+    selected: bool,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .px(px(10.0))
+        .py(px(5.0))
+        .rounded_sm()
+        .bg(rgb(if selected {
+            0x1e1e22
+        } else {
+            theme::PANEL_HEADER_BG
+        }))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(SharedString::from(label)),
+                )
+                .children(
+                    selected.then(|| div().text_xs().text_color(rgb(theme::PRIMARY)).child("*")),
+                ),
+        )
+}
+
+fn render_settings_font_size_row(
+    draft: &SettingsDraft,
+    actions: &EditorActions<'_>,
+) -> impl IntoElement {
+    let current = settings_font_size_value(draft);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(format!(
+                    "Terminal font size: {current}px"
+                ))),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child("Default text size for all terminals"),
+        )
+        .child(
+            div()
+                .pt(px(2.0))
+                .flex()
+                .items_center()
+                .gap(px(1.0))
+                .children((8u16..=24).map(|size| {
+                    let on_select = (actions.on_action)(EditorAction::SetTerminalFontSize(size));
+                    let is_current = size == current;
+                    let in_range = size <= current;
+                    div()
+                        .flex_1()
+                        .h(px(if is_current { 14.0 } else { 6.0 }))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(if is_current {
+                            theme::PRIMARY
+                        } else if in_range {
+                            theme::BORDER_PRIMARY
+                        } else {
+                            theme::BORDER_SECONDARY
+                        }))
+                        .on_mouse_down(MouseButton::Left, on_select)
+                        .into_any_element()
+                })),
+        )
+}
+
+fn render_settings_section(label: &str, body: AnyElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(
+            div()
+                .pb(px(4.0))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_SECONDARY))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(SharedString::from(label.to_string())),
+                ),
+        )
+        .child(body)
+}
+
+fn render_settings_inline_button(
+    label: &str,
+    primary: bool,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .px(px(if primary { 14.0 } else { 10.0 }))
+        .py(px(6.0))
+        .rounded_sm()
+        .bg(rgb(if primary {
+            theme::PRIMARY
+        } else {
+            theme::PANEL_HEADER_BG
+        }))
+        .border_1()
+        .border_color(rgb(if primary {
+            theme::PRIMARY
+        } else {
+            theme::BORDER_SECONDARY
+        }))
+        .text_xs()
+        .text_color(rgb(if primary {
+            theme::APP_BG
+        } else {
+            theme::TEXT_PRIMARY
+        }))
+        .cursor_pointer()
+        .hover(|s| {
+            s.bg(rgb(if primary {
+                theme::PRIMARY_HOVER
+            } else {
+                theme::ROW_HOVER_BG
+            }))
+        })
+        .child(SharedString::from(label.to_string()))
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn render_settings_icon_button(
+    label: &str,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .w(px(26.0))
+        .h(px(26.0))
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SECONDARY))
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .child(SharedString::from(label.to_string()))
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn render_settings_close_button(
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded_sm()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .child("close")
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn settings_font_size_value(draft: &SettingsDraft) -> u16 {
+    draft
+        .terminal_font_size
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .unwrap_or(13)
+        .clamp(8, 24)
 }
 
 fn render_project_panel(
@@ -1118,43 +2477,47 @@ fn render_text_field(
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap(px(4.0))
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_PRIMARY))
                 .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(if focused {
-                    theme::PROJECT_ROW_BG
-                } else {
-                    theme::PANEL_HEADER_BG
-                }))
-                .border_1()
-                .border_color(rgb(if focused {
-                    theme::AI_DOT
-                } else {
-                    theme::BORDER_SECONDARY
-                }))
-                .text_sm()
-                .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_SUBTLE
-                } else {
-                    theme::TEXT_PRIMARY
-                }))
-                .child(SharedString::from(display_value))
-                .on_mouse_down(MouseButton::Left, on_focus),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_SUBTLE))
                 .child(SharedString::from(hint.to_string())),
+        )
+        .child(
+            div()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded_sm()
+                .bg(rgb(if focused {
+                    0x1e1e22
+                } else {
+                    theme::PANEL_HEADER_BG
+                }))
+                .border_1()
+                .border_color(rgb(if focused {
+                    theme::PRIMARY
+                } else {
+                    theme::BORDER_SECONDARY
+                }))
+                .text_xs()
+                .text_color(rgb(if value.is_empty() && !focused {
+                    theme::TEXT_SUBTLE
+                } else {
+                    theme::TEXT_PRIMARY
+                }))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .cursor_text()
+                .child(SharedString::from(display_value))
+                .on_mouse_down(MouseButton::Left, on_focus),
         )
 }
 
@@ -1180,44 +2543,46 @@ fn render_multiline_field(
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap(px(4.0))
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_PRIMARY))
                 .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .h(px(140.0))
-                .px_3()
-                .py_3()
-                .rounded_md()
-                .bg(rgb(if focused {
-                    theme::PROJECT_ROW_BG
-                } else {
-                    theme::PANEL_HEADER_BG
-                }))
-                .border_1()
-                .border_color(rgb(if focused {
-                    theme::AI_DOT
-                } else {
-                    theme::BORDER_SECONDARY
-                }))
-                .text_sm()
-                .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_SUBTLE
-                } else {
-                    theme::TEXT_PRIMARY
-                }))
-                .child(SharedString::from(display_value))
-                .on_mouse_down(MouseButton::Left, on_focus),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_SUBTLE))
                 .child(SharedString::from(hint.to_string())),
+        )
+        .child(
+            div()
+                .h(px(140.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded_sm()
+                .bg(rgb(if focused {
+                    0x1e1e22
+                } else {
+                    theme::PANEL_HEADER_BG
+                }))
+                .border_1()
+                .border_color(rgb(if focused {
+                    theme::PRIMARY
+                } else {
+                    theme::BORDER_SECONDARY
+                }))
+                .text_xs()
+                .text_color(rgb(if value.is_empty() && !focused {
+                    theme::TEXT_SUBTLE
+                } else {
+                    theme::TEXT_PRIMARY
+                }))
+                .cursor_text()
+                .child(SharedString::from(display_value))
+                .on_mouse_down(MouseButton::Left, on_focus),
         )
 }
 
@@ -1230,25 +2595,13 @@ fn render_choice_row(
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap(px(4.0))
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(theme::PANEL_HEADER_BG))
-                .border_1()
-                .border_color(rgb(theme::BORDER_SECONDARY))
-                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(value.to_string()))
-                .on_mouse_down(MouseButton::Left, on_click),
+                .child(SharedString::from(label.to_string())),
         )
         .children(hint.map(|hint| {
             div()
@@ -1256,6 +2609,21 @@ fn render_choice_row(
                 .text_color(rgb(theme::TEXT_SUBTLE))
                 .child(SharedString::from(hint.to_string()))
         }))
+        .child(
+            div()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded_sm()
+                .bg(rgb(theme::PANEL_HEADER_BG))
+                .border_1()
+                .border_color(rgb(theme::BORDER_SECONDARY))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .child(SharedString::from(value.to_string()))
+                .on_mouse_down(MouseButton::Left, on_click),
+        )
 }
 
 fn render_toggle_row(
@@ -1263,23 +2631,36 @@ fn render_toggle_row(
     value: bool,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
+    render_toggle_row_with_hint(label, value, "Click to toggle", on_click)
+}
+
+fn render_toggle_row_with_hint(
+    label: &str,
+    value: bool,
+    hint: &str,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
     render_choice_row(
         label,
         if value { "on" } else { "off" },
-        Some("Click to toggle"),
+        Some(hint),
         on_click,
     )
 }
 
+fn minimize_to_tray_hint() -> &'static str {
+    "Keep DevManager running when the window is closed"
+}
+
 fn render_notice_row(message: &str) -> impl IntoElement {
     div()
-        .px_3()
-        .py_2()
-        .rounded_md()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded_sm()
         .bg(rgb(theme::AGENT_ROW_BG))
         .border_1()
         .border_color(rgb(theme::BORDER_PRIMARY))
-        .text_sm()
+        .text_xs()
         .text_color(rgb(theme::TEXT_MUTED))
         .child(SharedString::from(message.to_string()))
 }
@@ -1502,20 +2883,22 @@ fn render_selection_row(
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
     div()
-        .px_3()
-        .py_2()
-        .rounded_md()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded_sm()
         .bg(rgb(if selected {
-            theme::PROJECT_ROW_BG
+            0x1e1e22
         } else {
-            theme::PANEL_BG
+            theme::PANEL_HEADER_BG
         }))
         .border_1()
         .border_color(rgb(if selected {
-            theme::AI_DOT
+            theme::PRIMARY
         } else {
             theme::BORDER_SECONDARY
         }))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
         .child(
             div()
                 .flex()
@@ -1530,7 +2913,7 @@ fn render_selection_row(
                         .gap(px(2.0))
                         .child(
                             div()
-                                .text_sm()
+                                .text_xs()
                                 .text_color(rgb(theme::TEXT_PRIMARY))
                                 .child(SharedString::from(label)),
                         )
@@ -1545,7 +2928,7 @@ fn render_selection_row(
                     div()
                         .text_xs()
                         .text_color(rgb(if selected {
-                            theme::AI_DOT
+                            theme::PRIMARY
                         } else {
                             theme::TEXT_MUTED
                         }))
@@ -1563,6 +2946,7 @@ fn project_type_label(value: &str) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn render_updater_panel(
     updater: &UpdaterSnapshot,
     on_check: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -1634,24 +3018,13 @@ fn render_info_row(label: &str, value: &str, hint: Option<&str>) -> impl IntoEle
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap(px(4.0))
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(rgb(theme::PANEL_HEADER_BG))
-                .border_1()
-                .border_color(rgb(theme::BORDER_SECONDARY))
-                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(value.to_string())),
+                .child(SharedString::from(label.to_string())),
         )
         .children(hint.map(|hint| {
             div()
@@ -1659,8 +3032,21 @@ fn render_info_row(label: &str, value: &str, hint: Option<&str>) -> impl IntoEle
                 .text_color(rgb(theme::TEXT_SUBTLE))
                 .child(SharedString::from(hint.to_string()))
         }))
+        .child(
+            div()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded_sm()
+                .bg(rgb(theme::PANEL_HEADER_BG))
+                .border_1()
+                .border_color(rgb(theme::BORDER_SECONDARY))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(value.to_string())),
+        )
 }
 
+#[allow(dead_code)]
 fn updater_stage_label(stage: &UpdaterStage) -> &'static str {
     match stage {
         UpdaterStage::Disabled => "disabled",

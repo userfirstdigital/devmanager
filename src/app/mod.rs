@@ -2,15 +2,17 @@ mod chrome;
 
 use crate::assets::AppAssets;
 use crate::models::{
-    AppConfig, DependencyStatus, Project, ProjectFolder, RunCommand, SSHConnection, TabType,
+    AppConfig, DependencyStatus, MacTerminalProfile, PortStatus, Project, ProjectFolder,
+    RunCommand, SSHConnection, SessionState, SessionTab, TabType,
 };
+use crate::notifications;
 use crate::services::{
-    env_service, pid_file, platform_service, scanner_service, ConfigImportMode, ProcessManager,
-    SessionManager,
+    env_service, pid_file, platform_service, ports_service, scanner_service, ConfigImportMode,
+    ManagedShutdownReport, ProcessManager, SessionManager,
 };
 use crate::sidebar;
 use crate::state::{AppState, SessionDimensions};
-use crate::terminal::view;
+use crate::terminal::{self, view};
 use crate::theme;
 use crate::updater::UpdaterService;
 use crate::workspace::{
@@ -18,24 +20,22 @@ use crate::workspace::{
     ProjectDraft, SettingsDraft, SshDraft,
 };
 use gpui::{
-    div, font, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardItem,
-    Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Window,
-    WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardItem, Context,
+    FocusHandle, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, TouchPhase,
+    Window, WindowBounds, WindowOptions,
 };
-use rfd::FileDialog;
+use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CONTENT_PADDING_PX: f32 = 4.0;
-const TERMINAL_TOPBAR_HEIGHT_PX: f32 = 28.0;
-const TERMINAL_CARD_PADDING_PX: f32 = 4.0;
-const TERMINAL_INNER_PADDING_PX: f32 = 8.0;
+const TERMINAL_TOPBAR_HEIGHT_PX: f32 = 22.0;
 const STACK_GAP_PX: f32 = 4.0;
 const META_TEXT_HEIGHT_PX: f32 = 0.0;
 const NOTICE_HEIGHT_PX: f32 = 26.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
+const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 static EDITOR_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -43,6 +43,12 @@ pub fn run() {
     Application::new()
         .with_assets(AppAssets::new())
         .run(|cx: &mut App| {
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
             let bounds = Bounds::centered(None, size(px(1440.0), px(920.0)), cx);
             cx.open_window(
                 WindowOptions {
@@ -53,7 +59,15 @@ pub fn run() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| cx.new(NativeShell::new),
+                |window, cx| {
+                    let shell = cx.new(NativeShell::new);
+                    let close_handler = shell.clone();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        close_handler
+                            .update(cx, |shell, cx| shell.handle_window_should_close(window, cx))
+                    });
+                    shell
+                },
             )
             .unwrap();
             cx.activate(true);
@@ -71,15 +85,20 @@ struct NativeShell {
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
     did_focus_terminal: bool,
+    focused_terminal_session_id: Option<String>,
+    active_port_state: Option<ActivePortState>,
     editor_needs_focus: bool,
     synced_session_id: Option<String>,
     last_dimensions: Option<SessionDimensions>,
     terminal_selection: Option<TerminalSelection>,
+    terminal_scroll_px: Pixels,
     is_selecting_terminal: bool,
+    last_terminal_mouse_report: Option<(TerminalGridPosition, Option<MouseButton>)>,
     editor_panel: Option<EditorPanel>,
     editor_active_field: Option<EditorField>,
     editor_cursor: usize,
-    pending_close_tab_id: Option<String>,
+    sidebar_context_menu: Option<sidebar::SidebarContextMenu>,
+    add_project_wizard: Option<workspace::AddProjectWizard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,11 +107,31 @@ struct TerminalGridPosition {
     column: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TerminalCellSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalSelectionEndpoint {
+    position: TerminalGridPosition,
+    side: TerminalCellSide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSelectionMode {
+    Simple,
+    Semantic,
+    Lines,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TerminalSelection {
-    anchor: TerminalGridPosition,
-    head: TerminalGridPosition,
+    anchor: TerminalSelectionEndpoint,
+    head: TerminalSelectionEndpoint,
     moved: bool,
+    mode: TerminalSelectionMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,6 +144,37 @@ struct TerminalTextBounds {
     row_height: f32,
     rows: usize,
     cols: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalViewportLayout {
+    left: f32,
+    top: f32,
+    available_width: f32,
+    available_height: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalRenderMetrics {
+    cell_width: f32,
+    line_height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortKillFeedback {
+    Killed,
+    None,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePortState {
+    command_id: String,
+    port: u16,
+    status: Option<PortStatus>,
+    last_checked_at: Option<Instant>,
+    kill_feedback: Option<PortKillFeedback>,
+    kill_feedback_until: Option<Instant>,
 }
 
 impl NativeShell {
@@ -135,44 +205,10 @@ impl NativeShell {
         if !restore_enabled {
             state.open_tabs.clear();
             state.active_tab_id = None;
+            state.sidebar_collapsed = false;
         } else {
-            let recovered = process_manager.reconcile_saved_server_tabs(&mut state);
-            let restored_servers =
-                process_manager.restore_saved_server_tabs(&mut state, SessionDimensions::default());
-            let ai_restore =
-                process_manager.restore_ai_tabs(&mut state, SessionDimensions::default());
-            let ssh_restore = process_manager.restore_ssh_tabs(&mut state);
-            let mut restore_notes = Vec::new();
-            if recovered > 0 {
-                restore_notes.push(format!("recovered {recovered} server tab(s)"));
-            }
-            if restored_servers > 0 {
-                restore_notes.push(format!("restarted {restored_servers} server tab(s)"));
-            }
-            if ai_restore.relaunched > 0 {
-                restore_notes.push(format!("relaunched {} AI tab(s)", ai_restore.relaunched));
-            }
-            if ai_restore.reattached > ai_restore.relaunched {
-                restore_notes.push(format!(
-                    "re-attached {} AI tab(s)",
-                    ai_restore.reattached.saturating_sub(ai_restore.relaunched)
-                ));
-            }
-            if ssh_restore.reattached > 0 || ssh_restore.recovered > 0 {
-                restore_notes.push(format!(
-                    "re-attached {} SSH tab(s)",
-                    ssh_restore.reattached + ssh_restore.recovered
-                ));
-            }
-            if ssh_restore.disconnected > 0 {
-                restore_notes.push(format!(
-                    "left {} SSH tab(s) disconnected",
-                    ssh_restore.disconnected
-                ));
-            }
-            if !restore_notes.is_empty() {
-                terminal_notice = Some(restore_notes.join(", "));
-            }
+            terminal_notice =
+                restore_saved_tabs(&process_manager, &mut state, SessionDimensions::default());
         }
 
         let active_spec = state.active_terminal_spec();
@@ -224,7 +260,7 @@ impl NativeShell {
             }
         };
 
-        let _ = session_manager.save_session(&state.session_state());
+        let _ = session_manager.save_session(&persisted_session_state(&state));
         if updater.is_configured() {
             let _ = updater.check_for_updates();
         }
@@ -240,22 +276,27 @@ impl NativeShell {
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
             did_focus_terminal: false,
+            focused_terminal_session_id: None,
+            active_port_state: None,
             editor_needs_focus: false,
             synced_session_id,
             last_dimensions: None,
             terminal_selection: None,
+            terminal_scroll_px: px(0.0),
             is_selecting_terminal: false,
+            last_terminal_mouse_report: None,
             editor_panel: None,
             editor_active_field: None,
             editor_cursor: 0,
-            pending_close_tab_id: None,
+            sidebar_context_menu: None,
+            add_project_wizard: None,
         }
     }
 
     fn save_session_state(&mut self) {
         if let Err(error) = self
             .session_manager
-            .save_session(&self.state.session_state())
+            .save_session(&persisted_session_state(&self.state))
         {
             self.terminal_notice = Some(format!("Failed to save session state: {error}"));
         }
@@ -272,41 +313,76 @@ impl NativeShell {
         }
     }
 
+    fn perform_managed_shutdown(&mut self) -> ManagedShutdownReport {
+        self.save_session_state();
+        self.process_manager
+            .shutdown_managed_processes(APP_SHUTDOWN_TIMEOUT)
+    }
+
+    fn handle_window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.sync_terminal_focus(None);
+
+        if self.state.settings().minimize_to_tray {
+            self.save_session_state();
+            window.minimize_window();
+            self.terminal_notice = Some(
+                "DevManager minimized instead of closing. Disable `Minimize to tray` to quit from the window close button."
+                    .to_string(),
+            );
+            cx.notify();
+            return false;
+        }
+
+        let live_sessions = self.process_manager.live_session_count();
+        if self.state.settings().confirm_on_close && live_sessions > 0 {
+            let result = MessageDialog::new()
+                .set_level(MessageLevel::Warning)
+                .set_title("Quit DevManager?")
+                .set_description(format!(
+                    "DevManager still has {live_sessions} live session(s). Quitting now will stop them."
+                ))
+                .set_buttons(MessageButtons::YesNo)
+                .show();
+            if result != MessageDialogResult::Yes {
+                self.save_session_state();
+                self.terminal_notice = Some("Quit canceled.".to_string());
+                cx.notify();
+                return false;
+            }
+        }
+
+        self.perform_managed_shutdown();
+        true
+    }
+
+    fn preview_notification_sound_action(&mut self, cx: &mut Context<Self>) {
+        let sound_id = self.state.settings().notification_sound.as_deref();
+        notifications::play_notification_sound(sound_id);
+        self.editor_notice = Some(match sound_id {
+            Some(sound_id) if sound_id.eq_ignore_ascii_case("none") => {
+                "Notification sound is disabled.".to_string()
+            }
+            Some(sound_id) => format!("Previewed `{sound_id}`."),
+            None => "Previewed `glass`.".to_string(),
+        });
+        cx.notify();
+    }
+
     fn sidebar_width(&self) -> f32 {
         sidebar::sidebar_width_px(self.state.sidebar_collapsed)
     }
 
     fn terminal_dimensions(&self, window: &Window) -> SessionDimensions {
-        let viewport = window.viewport_size();
-        let viewport_width: f32 = viewport.width.into();
-        let viewport_height: f32 = viewport.height.into();
-        let text_system = window.text_system();
-        let font = font(".ZedMono");
-        let font_id = text_system.resolve_font(&font);
-        let cell_width = text_system
-            .ch_width(font_id, px(self.terminal_font_size()))
-            .map(f32::from)
-            .unwrap_or(8.0)
-            .max(6.0);
-        let available_width = (viewport_width
-            - self.sidebar_width()
-            - (CONTENT_PADDING_PX * 2.0)
-            - (TERMINAL_CARD_PADDING_PX * 2.0)
-            - TERMINAL_INNER_PADDING_PX)
-            .max(320.0);
-        let available_height = (viewport_height
-            - chrome::STATUS_BAR_HEIGHT_PX
-            - TERMINAL_TOPBAR_HEIGHT_PX
-            - (CONTENT_PADDING_PX * 2.0)
-            - (TERMINAL_CARD_PADDING_PX * 2.0)
-            - TERMINAL_INNER_PADDING_PX)
-            .max(160.0);
+        let Some(layout) = self.terminal_viewport_layout(window, false) else {
+            return SessionDimensions::default();
+        };
+        let metrics = self.terminal_render_metrics(window);
 
         SessionDimensions::from_available_space(
-            available_width,
-            available_height,
-            cell_width,
-            self.terminal_line_height(),
+            layout.available_width,
+            layout.available_height,
+            metrics.cell_width,
+            metrics.line_height,
         )
     }
 
@@ -331,21 +407,15 @@ impl NativeShell {
         let Some(tab) = self.state.find_tab(tab_id).cloned() else {
             return;
         };
-        if self.should_confirm_tab_close(&tab)
-            && self.pending_close_tab_id.as_deref() != Some(tab_id)
-        {
-            self.pending_close_tab_id = Some(tab_id.to_string());
-            self.terminal_notice = Some(format!(
-                "Press close again to stop {}.",
-                self.state.tab_label(&tab)
-            ));
+        if self.should_confirm_tab_close(&tab) && !self.confirm_live_tab_close(&tab) {
+            self.terminal_notice = Some("Tab close canceled.".to_string());
             cx.notify();
             return;
         }
-        self.pending_close_tab_id = None;
 
         match tab.tab_type {
             TabType::Server => {
+                let _ = self.process_manager.stop_server(tab_id);
                 self.state.remove_tab(tab_id);
                 self.synced_session_id = None;
                 self.last_dimensions = None;
@@ -366,6 +436,25 @@ impl NativeShell {
                 cx.notify();
             }
         }
+    }
+
+    fn confirm_live_tab_close(&self, tab: &crate::models::SessionTab) -> bool {
+        let label = self.state.tab_label(tab);
+        let description = match tab.tab_type {
+            TabType::Server => format!("Close `{label}` and stop its running server?"),
+            TabType::Claude | TabType::Codex => {
+                format!("Close `{label}` and stop its live AI session?")
+            }
+            TabType::Ssh => format!("Close `{label}` and disconnect its live SSH session?"),
+        };
+
+        MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Confirm Close")
+            .set_description(description)
+            .set_buttons(MessageButtons::YesNo)
+            .show()
+            == MessageDialogResult::Yes
     }
 
     fn should_confirm_tab_close(&self, tab: &crate::models::SessionTab) -> bool {
@@ -526,8 +615,8 @@ impl NativeShell {
         let live_sessions = self.process_manager.live_session_count();
         match self.updater.install_update() {
             Ok(version) => {
-                let closed_sessions = self.process_manager.close_all_live_sessions();
-                self.save_session_state();
+                let shutdown = self.perform_managed_shutdown();
+                let closed_sessions = shutdown.requested_sessions;
                 self.editor_notice = Some(if closed_sessions > 0 {
                     format!(
                         "Installer for {version} launched. Closed {closed_sessions} live session(s) before exit."
@@ -558,8 +647,25 @@ impl NativeShell {
             .clamp(8.0, 32.0)
     }
 
-    fn terminal_line_height(&self) -> f32 {
-        view::terminal_line_height(self.terminal_font_size())
+    fn terminal_render_metrics(&self, window: &Window) -> TerminalRenderMetrics {
+        let font_size = self.terminal_font_size();
+        let font_size_px = px(font_size);
+        let text_system = window.text_system();
+        let font_id = text_system.resolve_font(&terminal::terminal_font());
+        let cell_width = text_system
+            .ch_advance(font_id, font_size_px)
+            .map(f32::from)
+            .or_else(|_| text_system.ch_width(font_id, font_size_px).map(f32::from))
+            .unwrap_or(8.0)
+            .max(6.0);
+        let ascent = f32::from(text_system.ascent(font_id, font_size_px));
+        let descent = f32::from(text_system.descent(font_id, font_size_px)).abs();
+        let line_height = (ascent + descent + 1.0).ceil().max(font_size + 1.0);
+
+        TerminalRenderMetrics {
+            cell_width,
+            line_height,
+        }
     }
 
     fn open_editor(&mut self, panel: EditorPanel, cx: &mut Context<Self>) {
@@ -599,6 +705,7 @@ impl NativeShell {
     }
 
     fn focus_editor(&mut self, window: &mut Window) {
+        self.sync_terminal_focus(None);
         window.focus(&self.editor_focus);
         self.editor_needs_focus = false;
     }
@@ -623,30 +730,75 @@ impl NativeShell {
                     .terminal_font_size
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
+                open_picker: None,
             }),
             cx,
         );
     }
 
     fn open_add_project_action(&mut self, cx: &mut Context<Self>) {
+        self.add_project_wizard = Some(workspace::AddProjectWizard::default());
+        cx.notify();
+    }
+
+    fn wizard_create_action(&mut self, cx: &mut Context<Self>) {
+        let Some(wizard) = self.add_project_wizard.take() else {
+            return;
+        };
+        let name = if wizard.name.is_empty() {
+            "My App".to_string()
+        } else {
+            wizard.name
+        };
+
         self.open_editor(
             EditorPanel::Project(ProjectDraft {
                 existing_id: None,
-                name: String::new(),
-                root_path: String::new(),
-                color: String::new(),
+                name,
+                root_path: wizard.root_path,
+                color: wizard.color,
                 pinned: false,
                 save_log_files: true,
                 notes: String::new(),
-                scan_entries: Vec::new(),
-                selected_folder_paths: Default::default(),
-                selected_scripts: Default::default(),
-                selected_port_variables: Default::default(),
+                scan_entries: wizard.scan_entries,
+                selected_folder_paths: wizard.selected_folders,
+                selected_scripts: wizard.selected_scripts,
+                selected_port_variables: wizard.selected_port_variables,
                 scan_message: None,
                 is_scanning: false,
             }),
             cx,
         );
+    }
+
+    fn wizard_pick_root_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let root_path = path.to_string_lossy().to_string();
+        let default_name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Auto-scan the picked folder
+        let scan_entries = scanner_service::scan_root(&root_path)
+            .unwrap_or_default();
+        let selected_folders: std::collections::BTreeSet<String> = scan_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+
+        if let Some(wizard) = self.add_project_wizard.as_mut() {
+            wizard.root_path = root_path;
+            if wizard.name.trim().is_empty() {
+                wizard.name = default_name;
+                wizard.cursor = wizard.name.len();
+            }
+            wizard.scan_entries = scan_entries;
+            wizard.selected_folders = selected_folders;
+            cx.notify();
+        }
     }
 
     fn open_edit_project_action(&mut self, project_id: &str, cx: &mut Context<Self>) {
@@ -1100,8 +1252,9 @@ impl NativeShell {
                 return;
             }
         };
+        let shell_path = external_terminal_shell_path(self.state.settings());
 
-        match platform_service::open_terminal(&folder_path, None) {
+        match platform_service::open_terminal(&folder_path, shell_path.as_deref()) {
             Ok(()) => {
                 self.editor_notice = Some("Opened external terminal.".to_string());
             }
@@ -1234,7 +1387,14 @@ impl NativeShell {
             draft.theme.trim().to_string()
         };
         settings.log_buffer_size = match parse_optional_u32(&draft.log_buffer_size) {
-            Ok(value) => value.unwrap_or(10_000),
+            Ok(value) => match validate_log_buffer_size(value) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.editor_notice = Some(error);
+                    cx.notify();
+                    return;
+                }
+            },
             Err(error) => {
                 self.editor_notice = Some(error);
                 cx.notify();
@@ -1252,7 +1412,14 @@ impl NativeShell {
         settings.minimize_to_tray = draft.minimize_to_tray;
         settings.restore_session_on_start = Some(draft.restore_session_on_start);
         settings.terminal_font_size = match parse_optional_u16(&draft.terminal_font_size) {
-            Ok(value) => value,
+            Ok(value) => match validate_terminal_font_size(value) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.editor_notice = Some(error);
+                    cx.notify();
+                    return;
+                }
+            },
             Err(error) => {
                 self.editor_notice = Some(error);
                 cx.notify();
@@ -1671,6 +1838,9 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            draft.open_picker = None;
+        }
         let cursor = self
             .editor_panel
             .as_ref()
@@ -1750,21 +1920,63 @@ impl NativeShell {
                     self.apply_settings_draft(cx);
                 }
             }
+            EditorAction::PreviewNotificationSound => self.preview_notification_sound_action(cx),
+            EditorAction::ToggleSettingsPicker(picker) => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.open_picker = if draft.open_picker == Some(picker) {
+                        None
+                    } else {
+                        Some(picker)
+                    };
+                    self.editor_active_field = None;
+                    cx.notify();
+                }
+            }
+            EditorAction::SelectDefaultTerminal(terminal) => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.default_terminal = terminal;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::SelectMacTerminalProfile(profile) => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.mac_terminal_profile = profile;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::SelectNotificationSound(sound_id) => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.notification_sound = sound_id;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::SetTerminalFontSize(size) => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.terminal_font_size = size.to_string();
+                    self.apply_settings_draft(cx);
+                }
+            }
             EditorAction::ToggleConfirmOnClose => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.confirm_on_close = !draft.confirm_on_close;
+                    draft.open_picker = None;
                     self.apply_settings_draft(cx);
                 }
             }
             EditorAction::ToggleMinimizeToTray => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.minimize_to_tray = !draft.minimize_to_tray;
+                    draft.open_picker = None;
                     self.apply_settings_draft(cx);
                 }
             }
             EditorAction::ToggleRestoreSession => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.restore_session_on_start = !draft.restore_session_on_start;
+                    draft.open_picker = None;
                     self.apply_settings_draft(cx);
                 }
             }
@@ -1810,12 +2022,76 @@ impl NativeShell {
         self.focus_editor(window);
     }
 
+    fn handle_wizard_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(wizard) = self.add_project_wizard.as_mut() else {
+            return false;
+        };
+        let step = wizard.step;
+
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let modifiers = event.keystroke.modifiers;
+        let secondary = modifiers.control || modifiers.platform;
+
+        if key == "escape" {
+            if step == 2 {
+                wizard.step = 1;
+                cx.notify();
+            } else {
+                self.add_project_wizard = None;
+                cx.notify();
+            }
+            window.prevent_default();
+            return true;
+        }
+        if key == "enter" {
+            if step == 2 {
+                self.wizard_create_action(cx);
+            }
+            // Step 1: don't auto-configure on Enter (user should click Configure)
+            window.prevent_default();
+            return true;
+        }
+
+        // Only step 1 has a text input
+        if step != 1 {
+            return true;
+        }
+
+        let paste_text = if secondary && key == "v" {
+            cx.read_from_clipboard().and_then(|item| item.text())
+        } else {
+            None
+        };
+
+        let changed = apply_text_key_to_string(
+            &mut wizard.name,
+            &mut wizard.cursor,
+            event,
+            paste_text.as_deref(),
+            false,
+            false,
+        );
+        if changed {
+            cx.notify();
+            window.prevent_default();
+        }
+        true
+    }
+
     fn handle_editor_key(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.handle_wizard_key(event, window, cx) {
+            return;
+        }
         if self.editor_panel.is_none() {
             return;
         }
@@ -2052,9 +2328,17 @@ impl NativeShell {
             self.did_focus_terminal = true;
         }
 
+        self.sync_terminal_focus(Some(active_spec.session_id.clone()));
+
         let selection = active_session
             .as_ref()
             .and_then(|session| self.selection_snapshot(session.screen.cols));
+        let runtime_controls = self.runtime_controls_model(
+            active_tab_type.clone(),
+            &active_spec,
+            active_session.as_ref(),
+        );
+        let terminal_metrics = self.terminal_render_metrics(window);
 
         view::TerminalPaneModel {
             active_project: self
@@ -2071,14 +2355,208 @@ impl NativeShell {
                 .or_else(|| self.terminal_notice.clone()),
             debug_enabled: self.process_manager.debug_enabled(),
             font_size: self.terminal_font_size(),
-            line_height: self.terminal_line_height(),
+            cell_width: terminal_metrics.cell_width,
+            line_height: terminal_metrics.line_height,
             selection,
+            runtime_controls,
         }
     }
 
     fn focus_terminal(&mut self, window: &mut Window) {
+        let session_id = self.state.active_terminal_spec().session_id;
+        self.sync_terminal_focus(Some(session_id));
         window.focus(&self.terminal_focus);
         self.did_focus_terminal = true;
+    }
+
+    fn sync_terminal_focus(&mut self, next_session_id: Option<String>) {
+        if self.focused_terminal_session_id == next_session_id {
+            return;
+        }
+
+        if let Some(previous_session_id) = self.focused_terminal_session_id.take() {
+            let _ = self
+                .process_manager
+                .report_focus(&previous_session_id, false);
+        }
+
+        if let Some(session_id) = next_session_id.clone() {
+            let _ = self.process_manager.report_focus(&session_id, true);
+        }
+
+        self.focused_terminal_session_id = next_session_id;
+    }
+
+    fn sync_active_port_state(
+        &mut self,
+        command_id: &str,
+        port: Option<u16>,
+        active_session: Option<&crate::terminal::session::TerminalSessionView>,
+    ) {
+        let Some(port) = port else {
+            self.active_port_state = None;
+            return;
+        };
+
+        let state_needs_reset = self
+            .active_port_state
+            .as_ref()
+            .map(|state| state.command_id != command_id || state.port != port)
+            .unwrap_or(true);
+        if state_needs_reset {
+            self.active_port_state = Some(ActivePortState {
+                command_id: command_id.to_string(),
+                port,
+                status: None,
+                last_checked_at: None,
+                kill_feedback: None,
+                kill_feedback_until: None,
+            });
+        }
+
+        if let Some(state) = self.active_port_state.as_mut() {
+            if state
+                .kill_feedback_until
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                state.kill_feedback = None;
+                state.kill_feedback_until = None;
+            }
+
+            let interval = port_refresh_interval(active_session);
+            let should_refresh = state
+                .last_checked_at
+                .map(|checked_at| checked_at.elapsed() >= interval)
+                .unwrap_or(true);
+            if should_refresh {
+                self.refresh_port_state(command_id, port);
+            }
+        }
+    }
+
+    fn refresh_port_state(&mut self, command_id: &str, port: u16) {
+        let status = ports_service::check_port_in_use(port).ok();
+        let state = self
+            .active_port_state
+            .get_or_insert_with(|| ActivePortState {
+                command_id: command_id.to_string(),
+                port,
+                status: None,
+                last_checked_at: None,
+                kill_feedback: None,
+                kill_feedback_until: None,
+            });
+        state.command_id = command_id.to_string();
+        state.port = port;
+        state.status = status;
+        state.last_checked_at = Some(Instant::now());
+    }
+
+    fn record_port_kill_feedback(
+        &mut self,
+        command_id: &str,
+        port: u16,
+        feedback: PortKillFeedback,
+    ) {
+        let state = self
+            .active_port_state
+            .get_or_insert_with(|| ActivePortState {
+                command_id: command_id.to_string(),
+                port,
+                status: None,
+                last_checked_at: None,
+                kill_feedback: None,
+                kill_feedback_until: None,
+            });
+        state.command_id = command_id.to_string();
+        state.port = port;
+        state.kill_feedback = Some(feedback);
+        state.kill_feedback_until = Some(Instant::now() + std::time::Duration::from_secs(2));
+        state.last_checked_at = None;
+    }
+
+    fn runtime_controls_model(
+        &mut self,
+        active_tab_type: Option<TabType>,
+        active_spec: &crate::state::ActiveTerminalSpec,
+        active_session: Option<&crate::terminal::session::TerminalSessionView>,
+    ) -> Option<view::TerminalRuntimeControlsModel> {
+        if active_tab_type != Some(TabType::Server) {
+            self.active_port_state = None;
+            return None;
+        }
+
+        let (command_id, port) = {
+            let lookup = self.state.find_command(&active_spec.session_id)?;
+            (lookup.command.id.clone(), lookup.command.port)
+        };
+        self.sync_active_port_state(&command_id, port, active_session);
+
+        let status = active_session
+            .map(|session| session.runtime.status)
+            .unwrap_or(crate::state::SessionStatus::Stopped);
+        let port_state = self
+            .active_port_state
+            .as_ref()
+            .filter(|state| state.command_id == command_id);
+        let has_port_conflict = port_state
+            .and_then(|state| state.status.as_ref())
+            .map(|status| !is_managed_port_owner(active_session, status))
+            .unwrap_or(false);
+        let port_label = port.map(|port| {
+            if let Some(status) = port_state.and_then(|state| state.status.as_ref()) {
+                if status.in_use {
+                    if is_managed_port_owner(active_session, status) {
+                        format!("port {port} • live")
+                    } else {
+                        let owner = status
+                            .process_name
+                            .clone()
+                            .unwrap_or_else(|| "external process".to_string());
+                        match status.pid {
+                            Some(pid) => format!("port {port} • {owner} ({pid})"),
+                            None => format!("port {port} • {owner}"),
+                        }
+                    }
+                } else {
+                    format!("port {port} • free")
+                }
+            } else {
+                format!("port {port} • checking")
+            }
+        });
+        let port_color = if has_port_conflict {
+            theme::WARNING_TEXT
+        } else if port_state
+            .and_then(|state| state.status.as_ref())
+            .map(|status| status.in_use)
+            .unwrap_or(false)
+        {
+            theme::SUCCESS_TEXT
+        } else {
+            theme::TEXT_DIM
+        };
+        let (kill_label, kill_color) = match port_state.and_then(|state| state.kill_feedback) {
+            Some(PortKillFeedback::Killed) => ("freed", theme::SUCCESS_TEXT),
+            Some(PortKillFeedback::None) => ("none", theme::TEXT_MUTED),
+            Some(PortKillFeedback::Error) => ("error", theme::DANGER_TEXT),
+            None => ("kill", theme::WARNING_TEXT),
+        };
+
+        Some(view::TerminalRuntimeControlsModel {
+            port_label,
+            port_color,
+            can_start: !status.is_live(),
+            can_stop: status.is_live(),
+            can_restart: status.is_live(),
+            can_clear: active_session.is_some(),
+            can_kill_port: port.is_some() && has_port_conflict,
+            can_open_url: port.is_some()
+                && status == crate::state::SessionStatus::Running
+                && !has_port_conflict,
+            kill_label,
+            kill_color,
+        })
     }
 
     fn start_server_action(
@@ -2124,6 +2602,126 @@ impl NativeShell {
         {
             self.terminal_notice = Some(format!("Failed to restart server: {error}"));
         }
+        cx.notify();
+    }
+
+    fn clear_server_output_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        if let Err(error) = self.process_manager.clear_virtual_output(command_id) {
+            self.terminal_notice = Some(format!("Failed to clear output: {error}"));
+        } else {
+            self.terminal_notice = Some("Cleared terminal output.".to_string());
+        }
+        cx.notify();
+    }
+
+    fn open_server_url_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        let Some(port) = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port)
+        else {
+            self.terminal_notice = Some("This command does not define a local port.".to_string());
+            cx.notify();
+            return;
+        };
+
+        let url = format!("http://localhost:{port}");
+        match platform_service::open_url(&url) {
+            Ok(()) => self.terminal_notice = Some(format!("Opened {url}")),
+            Err(error) => self.terminal_notice = Some(format!("Failed to open {url}: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn kill_server_port_action(
+        &mut self,
+        command_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(lookup) = self
+            .state
+            .find_command(command_id)
+            .map(|lookup| (lookup.project.id.clone(), lookup.command.clone()))
+        else {
+            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
+            cx.notify();
+            return;
+        };
+        let (project_id, command) = lookup;
+        let Some(port) = command.port else {
+            self.terminal_notice = Some("This command does not define a port.".to_string());
+            cx.notify();
+            return;
+        };
+
+        let _ = self.process_manager.write_virtual_text(
+            command_id,
+            &format!("\r\n\x1b[33m--- Resolving port {port} conflict... ---\x1b[0m\r\n"),
+        );
+
+        let is_active = self
+            .process_manager
+            .runtime_state()
+            .sessions
+            .get(command_id)
+            .map(|session| session.status.is_live())
+            .unwrap_or(false);
+        if is_active
+            && !self
+                .process_manager
+                .stop_server_and_wait(command_id, std::time::Duration::from_secs(5))
+        {
+            self.record_port_kill_feedback(command_id, port, PortKillFeedback::Error);
+            self.terminal_notice = Some(format!(
+                "Managed process `{command_id}` did not stop cleanly."
+            ));
+            cx.notify();
+            return;
+        }
+
+        let feedback = match ports_service::kill_port(port) {
+            Ok(()) => PortKillFeedback::Killed,
+            Err(error) if error.contains("No process found") => PortKillFeedback::None,
+            Err(error) => {
+                self.record_port_kill_feedback(command_id, port, PortKillFeedback::Error);
+                self.terminal_notice = Some(format!("Failed to free port {port}: {error}"));
+                let _ = self.process_manager.write_virtual_text(
+                    command_id,
+                    &format!("\x1b[31mFailed to resolve port {port} conflict: {error}\x1b[0m\r\n"),
+                );
+                cx.notify();
+                return;
+            }
+        };
+
+        self.record_port_kill_feedback(command_id, port, feedback);
+        self.refresh_port_state(command_id, port);
+        let dimensions = self.terminal_dimensions(window);
+
+        match self.process_manager.restart_server_with_banner(
+            &mut self.state,
+            command_id,
+            dimensions,
+            &format!("--- Starting after freeing port {port}... ---"),
+        ) {
+            Ok(()) => {
+                self.synced_session_id = Some(command_id.to_string());
+                self.terminal_notice = None;
+                self.save_session_state();
+            }
+            Err(error) => {
+                self.terminal_notice = Some(format!(
+                    "Failed to restart server after freeing port: {error}"
+                ));
+                let _ = self.process_manager.write_virtual_text(
+                    command_id,
+                    &format!("\x1b[31mFailed to restart after freeing port: {error}\x1b[0m\r\n"),
+                );
+            }
+        }
+        let _ = project_id;
+        let _ = command;
         cx.notify();
     }
 
@@ -2348,11 +2946,49 @@ impl NativeShell {
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.focus_terminal(window);
+        self.terminal_scroll_px = px(0.0);
 
-        let Some(cell) = self.grid_position_for_mouse(event.position, window) else {
+        let active_session = self.process_manager.active_session();
+        let session_mode = active_session.as_ref().map(|session| session.screen.mode);
+        let session_id = self.state.active_terminal_spec().session_id;
+        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+            self.terminal_selection = None;
+            self.is_selecting_terminal = false;
+            self.last_terminal_mouse_report = None;
+            if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
+                if let Some(sequence) = mouse_button_report(
+                    session_mode.unwrap_or_default(),
+                    cell,
+                    event.button,
+                    event.modifiers,
+                    true,
+                ) {
+                    let _ = self
+                        .process_manager
+                        .write_bytes_to_session(&session_id, &sequence);
+                    self.last_terminal_mouse_report = Some((cell, Some(event.button)));
+                    window.prevent_default();
+                }
+            }
+            return;
+        }
+
+        let Some(session) = active_session.as_ref() else {
+            self.terminal_selection = None;
+            self.is_selecting_terminal = false;
+            return;
+        };
+
+        if event.button != MouseButton::Left {
+            return;
+        }
+
+        let Some(endpoint) =
+            self.terminal_selection_endpoint_for_mouse(event.position, window, true)
+        else {
             self.terminal_selection = None;
             self.is_selecting_terminal = false;
             return;
@@ -2360,24 +2996,42 @@ impl NativeShell {
 
         if event.modifiers.shift {
             if let Some(selection) = self.terminal_selection.as_mut() {
-                selection.head = cell;
-                selection.moved = true;
+                selection.head = endpoint;
+                selection.moved = selection.anchor != endpoint;
+                selection.mode = TerminalSelectionMode::Simple;
             } else {
                 self.terminal_selection = Some(TerminalSelection {
-                    anchor: cell,
-                    head: cell,
+                    anchor: endpoint,
+                    head: endpoint,
                     moved: false,
+                    mode: TerminalSelectionMode::Simple,
                 });
             }
-        } else {
-            self.terminal_selection = Some(TerminalSelection {
-                anchor: cell,
-                head: cell,
-                moved: false,
-            });
+            self.is_selecting_terminal = true;
+            cx.notify();
+            window.prevent_default();
+            return;
         }
 
-        self.is_selecting_terminal = true;
+        match selection_mode_for_click(event.click_count) {
+            Some(TerminalSelectionMode::Simple) => {
+                self.terminal_selection = Some(TerminalSelection {
+                    anchor: endpoint,
+                    head: endpoint,
+                    moved: false,
+                    mode: TerminalSelectionMode::Simple,
+                });
+                self.is_selecting_terminal = true;
+            }
+            Some(mode @ (TerminalSelectionMode::Semantic | TerminalSelectionMode::Lines)) => {
+                self.terminal_selection =
+                    terminal_selection_for_click(&session.screen, endpoint.position, mode);
+                self.is_selecting_terminal = false;
+                cx.notify();
+            }
+            None => return,
+        }
+
         window.prevent_default();
     }
 
@@ -2387,18 +3041,44 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let active_session = self.process_manager.active_session();
+        let session_mode = active_session.as_ref().map(|session| session.screen.mode);
+        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+            if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
+                let report_key = (cell, event.pressed_button);
+                if self.last_terminal_mouse_report != Some(report_key) {
+                    if let Some(sequence) = mouse_move_report(
+                        session_mode.unwrap_or_default(),
+                        cell,
+                        event.pressed_button,
+                        event.modifiers,
+                    ) {
+                        let session_id = self.state.active_terminal_spec().session_id;
+                        let _ = self
+                            .process_manager
+                            .write_bytes_to_session(&session_id, &sequence);
+                        self.last_terminal_mouse_report = Some(report_key);
+                        window.prevent_default();
+                    }
+                }
+            }
+            return;
+        }
+
         if !self.is_selecting_terminal || !event.dragging() {
             return;
         }
 
-        let Some(cell) = self.grid_position_for_mouse(event.position, window) else {
+        let Some(endpoint) =
+            self.terminal_selection_endpoint_for_mouse(event.position, window, true)
+        else {
             return;
         };
 
         if let Some(selection) = self.terminal_selection.as_mut() {
-            if selection.head != cell {
-                selection.head = cell;
-                selection.moved = true;
+            if selection.head != endpoint {
+                selection.head = endpoint;
+                selection.moved = selection.anchor != endpoint;
                 cx.notify();
             }
         }
@@ -2406,30 +3086,80 @@ impl NativeShell {
 
     fn handle_terminal_mouse_up(
         &mut self,
-        _: &MouseUpEvent,
+        event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let active_session = self.process_manager.active_session();
+        let session_mode = active_session.as_ref().map(|session| session.screen.mode);
+        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+            if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
+                if let Some(sequence) = mouse_button_report(
+                    session_mode.unwrap_or_default(),
+                    cell,
+                    event.button,
+                    event.modifiers,
+                    false,
+                ) {
+                    let session_id = self.state.active_terminal_spec().session_id;
+                    let _ = self
+                        .process_manager
+                        .write_bytes_to_session(&session_id, &sequence);
+                    window.prevent_default();
+                }
+            }
+            self.last_terminal_mouse_report = None;
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
         self.finish_terminal_selection(window, cx);
     }
 
     fn handle_terminal_mouse_up_out(
         &mut self,
-        _: &MouseUpEvent,
+        event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let active_session = self.process_manager.active_session();
+        let session_mode = active_session.as_ref().map(|session| session.screen.mode);
+        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+            let cell = self
+                .grid_position_for_mouse(event.position, window, true)
+                .unwrap_or(TerminalGridPosition { row: 0, column: 0 });
+            if let Some(sequence) = mouse_button_report(
+                session_mode.unwrap_or_default(),
+                cell,
+                event.button,
+                event.modifiers,
+                false,
+            ) {
+                let session_id = self.state.active_terminal_spec().session_id;
+                let _ = self
+                    .process_manager
+                    .write_bytes_to_session(&session_id, &sequence);
+                window.prevent_default();
+            }
+            self.last_terminal_mouse_report = None;
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
         self.finish_terminal_selection(window, cx);
     }
 
     fn finish_terminal_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(selection) = self.terminal_selection {
-            if !selection.moved {
+            if !selection.moved && matches!(selection.mode, TerminalSelectionMode::Simple) {
                 self.terminal_selection = None;
                 cx.notify();
             }
         }
         self.is_selecting_terminal = false;
+        self.last_terminal_mouse_report = None;
         window.prevent_default();
     }
 
@@ -2439,8 +3169,25 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.handle_wizard_key(event, window, cx) {
+            return;
+        }
         let session_id = self.state.active_terminal_spec().session_id;
-        let action = translate_key_event(event);
+        let active_session = self.process_manager.active_session();
+        let mode = active_session.as_ref().map(|session| session.screen.mode);
+
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let modifiers = event.keystroke.modifiers;
+        let secondary = modifiers.control || modifiers.platform;
+        if secondary && key == "c" {
+            if let Some(text) = self.selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                window.prevent_default();
+                return;
+            }
+        }
+
+        let action = translate_key_event(event, mode);
 
         match action {
             TerminalKeyAction::Ignore => {}
@@ -2477,45 +3224,97 @@ impl NativeShell {
         window: &mut Window,
         _: &mut Context<Self>,
     ) {
-        let delta = event.delta.pixel_delta(px(self.terminal_line_height()));
-        let delta_lines = {
-            let y: f32 = delta.y.into();
-            (y / self.terminal_line_height()).round() as i32
+        let Some(delta_lines) = self.determine_terminal_scroll_lines(event, window) else {
+            return;
         };
 
-        if delta_lines != 0 {
-            let session_id = self.state.active_terminal_spec().session_id;
-            let _ = self
-                .process_manager
-                .scroll_session(&session_id, delta_lines);
-            window.prevent_default();
+        if delta_lines == 0 {
+            return;
         }
+
+        let session_id = self.state.active_terminal_spec().session_id;
+        if let Some(session) = self.process_manager.active_session() {
+            if session.screen.mode.mouse_reporting() {
+                if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
+                    if let Some(sequences) =
+                        mouse_scroll_report(session.screen.mode, cell, delta_lines, event)
+                    {
+                        for sequence in sequences {
+                            let _ = self
+                                .process_manager
+                                .write_bytes_to_session(&session_id, &sequence);
+                        }
+                        self.last_terminal_mouse_report = Some((cell, None));
+                    }
+                }
+            } else if session.screen.mode.alternate_screen
+                && session.screen.mode.alternate_scroll
+                && !event.modifiers.shift
+            {
+                let sequence = alt_scroll_bytes(delta_lines);
+                let _ = self
+                    .process_manager
+                    .write_bytes_to_session(&session_id, &sequence);
+            } else {
+                let _ = self
+                    .process_manager
+                    .scroll_session(&session_id, delta_lines);
+            }
+        } else {
+        }
+        window.prevent_default();
     }
 
     fn grid_position_for_mouse(
         &self,
         position: Point<Pixels>,
         window: &Window,
+        clamp_to_terminal: bool,
     ) -> Option<TerminalGridPosition> {
         let session = self.process_manager.active_session()?;
         let bounds = self.terminal_text_bounds(window, &session)?;
-        let x: f32 = position.x.into();
-        let y: f32 = position.y.into();
+        terminal_endpoint_for_mouse(position, bounds, clamp_to_terminal)
+            .map(|endpoint| endpoint.position)
+    }
 
-        if x < bounds.left
-            || y < bounds.top
-            || x >= bounds.left + bounds.width
-            || y >= bounds.top + bounds.height
-        {
-            return None;
+    fn terminal_selection_endpoint_for_mouse(
+        &self,
+        position: Point<Pixels>,
+        window: &Window,
+        clamp_to_terminal: bool,
+    ) -> Option<TerminalSelectionEndpoint> {
+        let session = self.process_manager.active_session()?;
+        let bounds = self.terminal_text_bounds(window, &session)?;
+        terminal_endpoint_for_mouse(position, bounds, clamp_to_terminal)
+    }
+
+    fn determine_terminal_scroll_lines(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &Window,
+    ) -> Option<i32> {
+        let line_height = px(self.terminal_render_metrics(window).line_height);
+        match event.touch_phase {
+            TouchPhase::Started => {
+                self.terminal_scroll_px = px(0.0);
+                None
+            }
+            TouchPhase::Moved => {
+                let old_offset = (self.terminal_scroll_px / line_height) as i32;
+                self.terminal_scroll_px += event.delta.pixel_delta(line_height).y;
+                let new_offset = (self.terminal_scroll_px / line_height) as i32;
+                let delta = new_offset - old_offset;
+                let viewport_height: f32 = window.viewport_size().height.into();
+                self.terminal_scroll_px %=
+                    px(viewport_height.max(self.terminal_render_metrics(window).line_height));
+                Some(delta)
+            }
+            _ => {
+                let delta = event.delta.pixel_delta(line_height);
+                let y: f32 = delta.y.into();
+                Some((y / f32::from(line_height)).round() as i32)
+            }
         }
-
-        let column = (((x - bounds.left) / bounds.cell_width).floor() as usize)
-            .min(bounds.cols.saturating_sub(1));
-        let row = (((y - bounds.top) / bounds.row_height).floor() as usize)
-            .min(bounds.rows.saturating_sub(1));
-
-        Some(TerminalGridPosition { row, column })
     }
 
     fn terminal_text_bounds(
@@ -2525,37 +3324,56 @@ impl NativeShell {
     ) -> Option<TerminalTextBounds> {
         let mut rows = session.screen.rows.max(1);
         let mut cols = session.screen.cols.max(1);
-        let cell_width = f32::from(session.runtime.dimensions.cell_width.max(1));
-        let row_height = self.terminal_line_height();
-        let mut top = TERMINAL_TOPBAR_HEIGHT_PX + CONTENT_PADDING_PX + TERMINAL_CARD_PADDING_PX;
+        let layout = self.terminal_viewport_layout(window, session.runtime.exit.is_some())?;
+        let metrics = self.terminal_render_metrics(window);
+        let cell_width = metrics.cell_width;
+        let row_height = metrics.line_height;
+        let available_width = layout.available_width.max(cell_width);
+        let available_height = layout.available_height.max(row_height);
+        cols = cols.min((available_width / cell_width).floor().max(1.0) as usize);
+        rows = rows.min((available_height / row_height).floor().max(1.0) as usize);
+        let width = cols as f32 * cell_width;
+        let height = rows as f32 * row_height;
+
+        Some(TerminalTextBounds {
+            left: layout.left,
+            top: layout.top,
+            width,
+            height,
+            cell_width,
+            row_height,
+            rows,
+            cols,
+        })
+    }
+
+    fn terminal_viewport_layout(
+        &self,
+        window: &Window,
+        include_exit_banner: bool,
+    ) -> Option<TerminalViewportLayout> {
+        let viewport = window.viewport_size();
+        let viewport_width: f32 = viewport.width.into();
+        let viewport_height: f32 = viewport.height.into();
+        let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
+        let mut top = TERMINAL_TOPBAR_HEIGHT_PX;
 
         if self.startup_notice.is_some() || self.terminal_notice.is_some() {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
         }
-        if session.runtime.exit.is_some() {
+        if include_exit_banner {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
         }
-
-        top += TERMINAL_INNER_PADDING_PX;
-
-        let viewport = window.viewport_size();
-        let viewport_width: f32 = viewport.width.into();
-        let viewport_height: f32 = viewport.height.into();
-        let left = self.sidebar_width()
-            + CONTENT_PADDING_PX
-            + TERMINAL_CARD_PADDING_PX
-            + TERMINAL_INNER_PADDING_PX;
+        top += 2.0; // py(px(2.0)) top on grid inner
 
         if viewport_width <= left || viewport_height <= top {
             return None;
         }
 
-        let right_padding =
-            CONTENT_PADDING_PX + TERMINAL_CARD_PADDING_PX + TERMINAL_INNER_PADDING_PX;
+        let right_padding = 4.0; // px_1() right padding on grid inner
         let bottom_padding = chrome::STATUS_BAR_HEIGHT_PX
-            + CONTENT_PADDING_PX
-            + TERMINAL_CARD_PADDING_PX
-            + TERMINAL_INNER_PADDING_PX
+            + 2.0  // py(px(2.0)) bottom on grid inner
+            + 2.0  // pb(px(2.0)) on body wrapper
             + FOOTER_HEIGHT_PX
             + if self.process_manager.debug_enabled() {
                 META_TEXT_HEIGHT_PX + STACK_GAP_PX
@@ -2563,22 +3381,11 @@ impl NativeShell {
                 0.0
             };
 
-        let available_width = (viewport_width - left - right_padding).max(cell_width);
-        let available_height = (viewport_height - top - bottom_padding).max(row_height);
-        cols = cols.min((available_width / cell_width).floor().max(1.0) as usize);
-        rows = rows.min((available_height / row_height).floor().max(1.0) as usize);
-        let width = cols as f32 * cell_width;
-        let height = rows as f32 * row_height;
-
-        Some(TerminalTextBounds {
+        Some(TerminalViewportLayout {
             left,
             top,
-            width,
-            height,
-            cell_width,
-            row_height,
-            rows,
-            cols,
+            available_width: (viewport_width - left - right_padding).max(320.0),
+            available_height: (viewport_height - top - bottom_padding).max(160.0),
         })
     }
 
@@ -2589,12 +3396,17 @@ impl NativeShell {
         }
 
         let (start, end) = ordered_selection(selection.anchor, selection.head);
+        let start_column = boundary_column(start, screen_cols);
+        let end_column = boundary_column(end, screen_cols);
+        if start.position.row == end.position.row && start_column == end_column {
+            return None;
+        }
 
         Some(view::TerminalSelectionSnapshot {
-            start_row: start.row,
-            start_column: start.column,
-            end_row: end.row,
-            end_column: (end.column + 1).min(screen_cols),
+            start_row: start.position.row,
+            start_column,
+            end_row: end.position.row,
+            end_column,
         })
     }
 
@@ -2605,7 +3417,7 @@ impl NativeShell {
 
         for row in selection.start_row..=selection.end_row {
             let line = session.screen.lines.get(row)?;
-            let characters: Vec<char> = line.chars().collect();
+            let characters: Vec<char> = line.iter().map(|cell| cell.character).collect();
             let start = if row == selection.start_row {
                 selection.start_column.min(characters.len())
             } else {
@@ -2617,16 +3429,7 @@ impl NativeShell {
                 characters.len()
             };
 
-            let mut segment: String = characters[start..end]
-                .iter()
-                .map(|character| {
-                    if *character == '\u{00a0}' {
-                        ' '
-                    } else {
-                        *character
-                    }
-                })
-                .collect();
+            let mut segment: String = characters[start..end].iter().collect();
 
             while segment.ends_with(' ') {
                 segment.pop();
@@ -2683,24 +3486,44 @@ impl Render for NativeShell {
         let make_edit_project_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.open_edit_project_action(&project_id, cx);
                 }))
             };
         let make_project_notes_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.open_project_notes_action(&project_id, cx);
                 }))
             };
         let make_delete_project_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.delete_project_action(&project_id, cx);
+                }))
+            };
+        let make_move_project_up_handler =
+            |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.state.move_project(&project_id, -1);
+                    this.save_config_state();
+                    cx.notify();
+                }))
+            };
+        let make_move_project_down_handler =
+            |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.state.move_project(&project_id, 1);
+                    this.save_config_state();
+                    cx.notify();
                 }))
             };
         let make_add_folder_handler =
             |project_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.open_add_folder_action(&project_id, cx);
                 }))
             };
@@ -2709,6 +3532,7 @@ impl Render for NativeShell {
              folder_id: String|
              -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.open_edit_folder_action(&project_id, &folder_id, cx);
                 }))
             };
@@ -2717,6 +3541,7 @@ impl Render for NativeShell {
              folder_id: String|
              -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.delete_folder_action(&project_id, &folder_id, cx);
                 }))
             };
@@ -2725,35 +3550,41 @@ impl Render for NativeShell {
              folder_id: String|
              -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.open_add_command_action(&project_id, &folder_id, cx);
                 }))
             };
         let make_edit_command_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.open_edit_command_action(&command_id, cx);
                 }))
             };
         let make_delete_command_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.delete_command_action(&command_id, cx);
                 }))
             };
         let make_add_ssh_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
             Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.sidebar_context_menu = None;
                 this.open_add_ssh_action(cx);
             }))
         };
         let make_edit_ssh_handler =
             |connection_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.open_edit_ssh_action(&connection_id, cx);
                 }))
             };
         let make_delete_ssh_handler =
             |connection_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.delete_ssh_action(&connection_id, cx);
                 }))
             };
@@ -2766,37 +3597,61 @@ impl Render for NativeShell {
         let make_connect_ssh_handler =
             |connection_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.sidebar_context_menu = None;
                     this.connect_ssh_action(&connection_id, window, cx);
                 }))
             };
         let make_disconnect_ssh_handler =
             |connection_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.disconnect_ssh_action(&connection_id, cx);
                 }))
             };
         let make_restart_ssh_handler =
             |connection_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.sidebar_context_menu = None;
                     this.restart_ssh_action(&connection_id, window, cx);
                 }))
             };
         let make_start_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.sidebar_context_menu = None;
                     this.start_server_action(&command_id, window, cx);
                 }))
             };
         let make_stop_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.sidebar_context_menu = None;
                     this.stop_server_action(&command_id, cx);
                 }))
             };
         let make_restart_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.sidebar_context_menu = None;
                     this.restart_server_action(&command_id, window, cx);
+                }))
+            };
+        let make_clear_output_handler =
+            |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.clear_server_output_action(&command_id, cx);
+                }))
+            };
+        let make_open_server_url_handler =
+            |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.open_server_url_action(&command_id, cx);
+                }))
+            };
+        let make_kill_port_handler =
+            |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.kill_server_port_action(&command_id, window, cx);
                 }))
             };
         let make_select_server_handler =
@@ -2835,6 +3690,108 @@ impl Render for NativeShell {
                     this.close_ai_tab_action(&tab_id, cx);
                 }))
             };
+        let make_toggle_context_menu_handler = |menu: sidebar::SidebarContextMenu| -> Box<
+            dyn Fn(&MouseDownEvent, &mut Window, &mut App),
+        > {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                if this.sidebar_context_menu.as_ref() == Some(&menu) {
+                    this.sidebar_context_menu = None;
+                } else {
+                    this.sidebar_context_menu = Some(menu.clone());
+                }
+                cx.notify();
+            }))
+        };
+        let make_dismiss_context_menu_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if this.sidebar_context_menu.is_some() {
+                        this.sidebar_context_menu = None;
+                        cx.notify();
+                    }
+                }))
+            };
+        let make_wizard_action_handler =
+            |action: workspace::WizardAction| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    match &action {
+                        workspace::WizardAction::Cancel => {
+                            this.add_project_wizard = None;
+                            cx.notify();
+                        }
+                        workspace::WizardAction::Create => {
+                            this.wizard_create_action(cx);
+                        }
+                        workspace::WizardAction::SelectColor(color) => {
+                            if let Some(wizard) = this.add_project_wizard.as_mut() {
+                                wizard.color = color.clone();
+                                cx.notify();
+                            }
+                        }
+                        workspace::WizardAction::PickRootFolder => {
+                            this.wizard_pick_root_folder(cx);
+                        }
+                        workspace::WizardAction::ToggleFolder(path) => {
+                            if let Some(wizard) = this.add_project_wizard.as_mut() {
+                                if !wizard.selected_folders.insert(path.clone()) {
+                                    wizard.selected_folders.remove(path);
+                                }
+                                cx.notify();
+                            }
+                        }
+                        workspace::WizardAction::Configure => {
+                            if let Some(wizard) = this.add_project_wizard.as_mut() {
+                                // Populate defaults for step 2
+                                for entry in &wizard.scan_entries {
+                                    if wizard.selected_folders.contains(&entry.path) {
+                                        wizard.selected_scripts
+                                            .entry(entry.path.clone())
+                                            .or_insert_with(|| {
+                                                scanner_service::auto_selected_script_names(&entry.scripts)
+                                                    .into_iter()
+                                                    .collect()
+                                            });
+                                        wizard.selected_port_variables
+                                            .entry(entry.path.clone())
+                                            .or_insert_with(|| {
+                                                scanner_service::auto_selected_port_variable(&entry.ports)
+                                            });
+                                    }
+                                }
+                                // Prune deselected folders
+                                wizard.selected_scripts.retain(|p, _| wizard.selected_folders.contains(p));
+                                wizard.selected_port_variables.retain(|p, _| wizard.selected_folders.contains(p));
+                                wizard.step = 2;
+                                cx.notify();
+                            }
+                        }
+                        workspace::WizardAction::Back => {
+                            if let Some(wizard) = this.add_project_wizard.as_mut() {
+                                wizard.step = 1;
+                                cx.notify();
+                            }
+                        }
+                        workspace::WizardAction::ToggleScript { folder_path, script_name } => {
+                            if let Some(wizard) = this.add_project_wizard.as_mut() {
+                                let scripts = wizard.selected_scripts
+                                    .entry(folder_path.clone())
+                                    .or_default();
+                                if !scripts.insert(script_name.clone()) {
+                                    scripts.remove(script_name);
+                                }
+                                cx.notify();
+                            }
+                        }
+                        workspace::WizardAction::SelectPortVariable { folder_path, variable } => {
+                            if let Some(wizard) = this.add_project_wizard.as_mut() {
+                                wizard.selected_port_variables
+                                    .insert(folder_path.clone(), variable.clone());
+                                cx.notify();
+                            }
+                        }
+                    }
+                }))
+            };
         let make_install_update_handler =
             || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -2865,6 +3822,32 @@ impl Render for NativeShell {
         if updater_snapshot.is_busy() {
             window.request_animation_frame();
         }
+
+        let terminal_actions = terminal_model.as_ref().and_then(|model| {
+            model.runtime_controls.as_ref().map(|controls| {
+                let command_id = self.state.active_terminal_spec().session_id;
+                view::TerminalPaneActions {
+                    on_start_server: controls
+                        .can_start
+                        .then(|| make_start_handler(command_id.clone())),
+                    on_stop_server: controls
+                        .can_stop
+                        .then(|| make_stop_handler(command_id.clone())),
+                    on_restart_server: controls
+                        .can_restart
+                        .then(|| make_restart_handler(command_id.clone())),
+                    on_clear_output: controls
+                        .can_clear
+                        .then(|| make_clear_output_handler(command_id.clone())),
+                    on_kill_port: controls
+                        .can_kill_port
+                        .then(|| make_kill_port_handler(command_id.clone())),
+                    on_open_local_url: controls
+                        .can_open_url
+                        .then(|| make_open_server_url_handler(command_id)),
+                }
+            })
+        });
 
         div()
             .size_full()
@@ -2904,6 +3887,11 @@ impl Render for NativeShell {
                     on_select_ai_tab: &make_select_ai_handler,
                     on_restart_ai_tab: &make_restart_ai_handler,
                     on_close_ai_tab: &make_close_ai_handler,
+                    on_move_project_up: &make_move_project_up_handler,
+                    on_move_project_down: &make_move_project_down_handler,
+                    on_toggle_context_menu: &make_toggle_context_menu_handler,
+                    on_dismiss_context_menu: &make_dismiss_context_menu_handler,
+                    open_context_menu: &self.sidebar_context_menu,
                 },
             ))
             .child(
@@ -2939,18 +3927,42 @@ impl Render for NativeShell {
                                 MouseButton::Left,
                                 cx.listener(Self::handle_terminal_mouse_down),
                             )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(Self::handle_terminal_mouse_down),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(Self::handle_terminal_mouse_down),
+                            )
                             .on_mouse_move(cx.listener(Self::handle_terminal_mouse_move))
                             .on_mouse_up(
                                 MouseButton::Left,
+                                cx.listener(Self::handle_terminal_mouse_up),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Right,
+                                cx.listener(Self::handle_terminal_mouse_up),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Middle,
                                 cx.listener(Self::handle_terminal_mouse_up),
                             )
                             .on_mouse_up_out(
                                 MouseButton::Left,
                                 cx.listener(Self::handle_terminal_mouse_up_out),
                             )
+                            .on_mouse_up_out(
+                                MouseButton::Right,
+                                cx.listener(Self::handle_terminal_mouse_up_out),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Middle,
+                                cx.listener(Self::handle_terminal_mouse_up_out),
+                            )
                             .on_key_down(cx.listener(Self::handle_terminal_key))
                             .on_scroll_wheel(cx.listener(Self::handle_terminal_scroll))
-                            .child(view::render_terminal_surface(model))
+                            .child(view::render_terminal_surface(model, terminal_actions))
                     })
                     .child(chrome::render_status_bar(
                         &runtime_snapshot,
@@ -2960,6 +3972,15 @@ impl Render for NativeShell {
                         },
                     )),
             )
+            .children(self.add_project_wizard.as_ref().map(|wizard| {
+                workspace::render_add_project_wizard(
+                    wizard,
+                    workspace::WizardActions {
+                        on_action: &make_wizard_action_handler,
+                    },
+                )
+                .into_any_element()
+            }))
     }
 }
 
@@ -2972,9 +3993,9 @@ enum TerminalKeyAction {
 }
 
 fn ordered_selection(
-    anchor: TerminalGridPosition,
-    head: TerminalGridPosition,
-) -> (TerminalGridPosition, TerminalGridPosition) {
+    anchor: TerminalSelectionEndpoint,
+    head: TerminalSelectionEndpoint,
+) -> (TerminalSelectionEndpoint, TerminalSelectionEndpoint) {
     if anchor <= head {
         (anchor, head)
     } else {
@@ -2982,9 +4003,237 @@ fn ordered_selection(
     }
 }
 
-fn translate_key_event(event: &KeyDownEvent) -> TerminalKeyAction {
+#[derive(Debug, Clone, Copy)]
+enum TerminalMouseFormat {
+    Sgr,
+    Normal { utf8: bool },
+}
+
+impl TerminalMouseFormat {
+    fn from_mode(mode: crate::terminal::session::TerminalModeSnapshot) -> Self {
+        if mode.sgr_mouse {
+            Self::Sgr
+        } else {
+            Self::Normal {
+                utf8: mode.utf8_mouse,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TerminalMouseButton {
+    LeftButton = 0,
+    MiddleButton = 1,
+    RightButton = 2,
+    LeftMove = 32,
+    MiddleMove = 33,
+    RightMove = 34,
+    NoneMove = 35,
+    ScrollUp = 64,
+    ScrollDown = 65,
+}
+
+impl TerminalMouseButton {
+    fn from_button(button: MouseButton) -> Option<Self> {
+        match button {
+            MouseButton::Left => Some(Self::LeftButton),
+            MouseButton::Right => Some(Self::MiddleButton),
+            MouseButton::Middle => Some(Self::RightButton),
+            MouseButton::Navigate(_) => None,
+        }
+    }
+
+    fn from_move_button(button: Option<MouseButton>) -> Option<Self> {
+        match button {
+            Some(MouseButton::Left) => Some(Self::LeftMove),
+            Some(MouseButton::Middle) => Some(Self::MiddleMove),
+            Some(MouseButton::Right) => Some(Self::RightMove),
+            Some(MouseButton::Navigate(_)) => None,
+            None => Some(Self::NoneMove),
+        }
+    }
+
+    fn from_scroll(event: &ScrollWheelEvent) -> Self {
+        let positive = match event.delta {
+            gpui::ScrollDelta::Pixels(delta) => delta.y > px(0.0),
+            gpui::ScrollDelta::Lines(delta) => delta.y > 0.0,
+        };
+        if positive {
+            Self::ScrollUp
+        } else {
+            Self::ScrollDown
+        }
+    }
+}
+
+fn selection_mode_for_click(click_count: usize) -> Option<TerminalSelectionMode> {
+    match click_count {
+        0 => None,
+        1 => Some(TerminalSelectionMode::Simple),
+        2 => Some(TerminalSelectionMode::Semantic),
+        _ => Some(TerminalSelectionMode::Lines),
+    }
+}
+
+fn boundary_column(endpoint: TerminalSelectionEndpoint, screen_cols: usize) -> usize {
+    match endpoint.side {
+        TerminalCellSide::Left => endpoint.position.column.min(screen_cols),
+        TerminalCellSide::Right => (endpoint.position.column + 1).min(screen_cols),
+    }
+}
+
+fn endpoint_at_boundary(
+    row: usize,
+    boundary: usize,
+    screen_cols: usize,
+) -> TerminalSelectionEndpoint {
+    if screen_cols == 0 || boundary == 0 {
+        return TerminalSelectionEndpoint {
+            position: TerminalGridPosition { row, column: 0 },
+            side: TerminalCellSide::Left,
+        };
+    }
+
+    TerminalSelectionEndpoint {
+        position: TerminalGridPosition {
+            row,
+            column: boundary
+                .saturating_sub(1)
+                .min(screen_cols.saturating_sub(1)),
+        },
+        side: TerminalCellSide::Right,
+    }
+}
+
+fn terminal_selection_for_click(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    position: TerminalGridPosition,
+    mode: TerminalSelectionMode,
+) -> Option<TerminalSelection> {
+    let row = position.row.min(screen.lines.len().saturating_sub(1));
+    match mode {
+        TerminalSelectionMode::Simple => Some(TerminalSelection {
+            anchor: TerminalSelectionEndpoint {
+                position,
+                side: TerminalCellSide::Left,
+            },
+            head: TerminalSelectionEndpoint {
+                position,
+                side: TerminalCellSide::Left,
+            },
+            moved: false,
+            mode,
+        }),
+        TerminalSelectionMode::Semantic => {
+            let line = screen.lines.get(row)?;
+            let (start, end) = semantic_selection_bounds(line, position.column, screen.cols);
+            Some(TerminalSelection {
+                anchor: endpoint_at_boundary(row, start, screen.cols),
+                head: endpoint_at_boundary(row, end, screen.cols),
+                moved: start != end,
+                mode,
+            })
+        }
+        TerminalSelectionMode::Lines => Some(TerminalSelection {
+            anchor: endpoint_at_boundary(row, 0, screen.cols),
+            head: endpoint_at_boundary(row, screen.cols, screen.cols),
+            moved: screen.cols > 0,
+            mode,
+        }),
+    }
+}
+
+fn semantic_selection_bounds(
+    line: &[crate::terminal::session::TerminalCellSnapshot],
+    column: usize,
+    screen_cols: usize,
+) -> (usize, usize) {
+    let len = line.len().min(screen_cols);
+    if len == 0 {
+        return (0, 0);
+    }
+
+    let column = column.min(len.saturating_sub(1));
+    let whitespace = line[column].character.is_whitespace();
+    let mut start = column;
+    while start > 0 && line[start - 1].character.is_whitespace() == whitespace {
+        start -= 1;
+    }
+
+    let mut end = column + 1;
+    while end < len && line[end].character.is_whitespace() == whitespace {
+        end += 1;
+    }
+
+    (start, end)
+}
+
+fn terminal_endpoint_for_mouse(
+    position: Point<Pixels>,
+    bounds: TerminalTextBounds,
+    clamp_to_terminal: bool,
+) -> Option<TerminalSelectionEndpoint> {
+    if bounds.cols == 0 || bounds.rows == 0 {
+        return None;
+    }
+
+    let left = bounds.left;
+    let top = bounds.top;
+    let right = bounds.left + bounds.width;
+    let bottom = bounds.top + bounds.height;
+    let mut x: f32 = position.x.into();
+    let mut y: f32 = position.y.into();
+
+    if !clamp_to_terminal && (x < left || y < top || x >= right || y >= bottom) {
+        return None;
+    }
+
+    if clamp_to_terminal {
+        x = x.clamp(left, right);
+        y = y.clamp(top, bottom);
+    }
+
+    let relative_x = (x - left).max(0.0);
+    let relative_y = (y - top).max(0.0);
+    let mut column = (relative_x / bounds.cell_width).floor() as usize;
+    let mut row = (relative_y / bounds.row_height).floor() as usize;
+    let mut side = if relative_x % bounds.cell_width > bounds.cell_width / 2.0 {
+        TerminalCellSide::Right
+    } else {
+        TerminalCellSide::Left
+    };
+
+    if relative_x >= bounds.width {
+        column = bounds.cols.saturating_sub(1);
+        side = TerminalCellSide::Right;
+    } else {
+        column = column.min(bounds.cols.saturating_sub(1));
+    }
+
+    if y < top {
+        row = 0;
+        side = TerminalCellSide::Left;
+    } else if relative_y >= bounds.height {
+        row = bounds.rows.saturating_sub(1);
+        side = TerminalCellSide::Right;
+    } else {
+        row = row.min(bounds.rows.saturating_sub(1));
+    }
+
+    Some(TerminalSelectionEndpoint {
+        position: TerminalGridPosition { row, column },
+        side,
+    })
+}
+
+fn translate_key_event(
+    event: &KeyDownEvent,
+    mode: Option<crate::terminal::session::TerminalModeSnapshot>,
+) -> TerminalKeyAction {
     let key = event.keystroke.key.to_ascii_lowercase();
     let modifiers = event.keystroke.modifiers;
+    let mode = mode.unwrap_or_default();
 
     let secondary = modifiers.control || modifiers.platform;
     if secondary && modifiers.shift && key == "w" {
@@ -2997,17 +4246,25 @@ fn translate_key_event(event: &KeyDownEvent) -> TerminalKeyAction {
         return TerminalKeyAction::Paste;
     }
 
-    if modifiers.control && !modifiers.alt && !modifiers.platform && key.len() == 1 {
+    if modifiers.control && !modifiers.alt && !modifiers.platform {
         if let Some(control_char) = control_character(&key) {
             return TerminalKeyAction::Write(control_char.to_string());
         }
+        if let Some(control_sequence) = control_symbol_sequence(&key) {
+            return TerminalKeyAction::Write(control_sequence);
+        }
     }
 
-    if let Some(sequence) = special_key_sequence(&key) {
-        return TerminalKeyAction::Write(sequence.to_string());
+    if let Some(sequence) =
+        special_key_sequence(&key, modifiers.shift, modifiers.alt, secondary, mode)
+    {
+        return TerminalKeyAction::Write(sequence);
     }
 
     if key == "space" {
+        if modifiers.control && !modifiers.alt && !modifiers.platform {
+            return TerminalKeyAction::Write("\u{0}".to_string());
+        }
         if modifiers.alt && !secondary {
             return TerminalKeyAction::Write("\u{1b} ".to_string());
         }
@@ -3037,28 +4294,390 @@ fn control_character(key: &str) -> Option<char> {
     }
 }
 
-fn special_key_sequence(key: &str) -> Option<&'static str> {
+fn control_symbol_sequence(key: &str) -> Option<String> {
     match key {
-        "enter" => Some("\r"),
-        "tab" => Some("\t"),
-        "backspace" => Some("\u{7f}"),
-        "escape" => Some("\u{1b}"),
-        "up" => Some("\u{1b}[A"),
-        "down" => Some("\u{1b}[B"),
-        "right" => Some("\u{1b}[C"),
-        "left" => Some("\u{1b}[D"),
-        "home" => Some("\u{1b}[H"),
-        "end" => Some("\u{1b}[F"),
-        "pageup" => Some("\u{1b}[5~"),
-        "pagedown" => Some("\u{1b}[6~"),
-        "delete" => Some("\u{1b}[3~"),
+        "2" | "@" => Some("\u{0}".to_string()),
+        "[" => Some("\u{1b}".to_string()),
+        "\\" => Some("\u{1c}".to_string()),
+        "]" => Some("\u{1d}".to_string()),
+        "6" | "^" => Some("\u{1e}".to_string()),
+        "-" | "_" => Some("\u{1f}".to_string()),
+        "/" | "?" => Some("\u{7f}".to_string()),
         _ => None,
     }
+}
+
+fn special_key_sequence(
+    key: &str,
+    shift: bool,
+    alt: bool,
+    secondary: bool,
+    mode: crate::terminal::session::TerminalModeSnapshot,
+) -> Option<String> {
+    let modifier = modifier_parameter(shift, alt, secondary);
+    match key {
+        "enter" => Some("\r".to_string()),
+        "tab" if shift => Some("\u{1b}[Z".to_string()),
+        "tab" => Some("\t".to_string()),
+        "backspace" if alt && !secondary => Some("\u{1b}\u{7f}".to_string()),
+        "backspace" => Some("\u{7f}".to_string()),
+        "escape" => Some("\u{1b}".to_string()),
+        "up" => Some(cursor_sequence('A', modifier, mode.app_cursor)),
+        "down" => Some(cursor_sequence('B', modifier, mode.app_cursor)),
+        "right" => Some(cursor_sequence('C', modifier, mode.app_cursor)),
+        "left" => Some(cursor_sequence('D', modifier, mode.app_cursor)),
+        "home" => Some(home_end_sequence('H', modifier, mode.app_cursor)),
+        "end" => Some(home_end_sequence('F', modifier, mode.app_cursor)),
+        "pageup" => Some(csi_tilde_sequence(5, modifier)),
+        "pagedown" => Some(csi_tilde_sequence(6, modifier)),
+        "insert" => Some(csi_tilde_sequence(2, modifier)),
+        "delete" => Some(csi_tilde_sequence(3, modifier)),
+        "f1" => Some(function_sequence('P', 11, modifier)),
+        "f2" => Some(function_sequence('Q', 12, modifier)),
+        "f3" => Some(function_sequence('R', 13, modifier)),
+        "f4" => Some(function_sequence('S', 14, modifier)),
+        "f5" => Some(csi_tilde_sequence(15, modifier)),
+        "f6" => Some(csi_tilde_sequence(17, modifier)),
+        "f7" => Some(csi_tilde_sequence(18, modifier)),
+        "f8" => Some(csi_tilde_sequence(19, modifier)),
+        "f9" => Some(csi_tilde_sequence(20, modifier)),
+        "f10" => Some(csi_tilde_sequence(21, modifier)),
+        "f11" => Some(csi_tilde_sequence(23, modifier)),
+        "f12" => Some(csi_tilde_sequence(24, modifier)),
+        _ => None,
+    }
+}
+
+fn modifier_parameter(shift: bool, alt: bool, secondary: bool) -> Option<u8> {
+    let mut value = 1;
+    if shift {
+        value += 1;
+    }
+    if alt {
+        value += 2;
+    }
+    if secondary {
+        value += 4;
+    }
+    (value > 1).then_some(value)
+}
+
+fn cursor_sequence(suffix: char, modifier: Option<u8>, app_cursor: bool) -> String {
+    match modifier {
+        Some(modifier) => format!("\u{1b}[1;{modifier}{suffix}"),
+        None if app_cursor => format!("\u{1b}O{suffix}"),
+        None => format!("\u{1b}[{suffix}"),
+    }
+}
+
+fn home_end_sequence(suffix: char, modifier: Option<u8>, app_cursor: bool) -> String {
+    match modifier {
+        Some(modifier) => format!("\u{1b}[1;{modifier}{suffix}"),
+        None if app_cursor => format!("\u{1b}O{suffix}"),
+        None => format!("\u{1b}[{suffix}"),
+    }
+}
+
+fn csi_tilde_sequence(code: u8, modifier: Option<u8>) -> String {
+    match modifier {
+        Some(modifier) => format!("\u{1b}[{code};{modifier}~"),
+        None => format!("\u{1b}[{code}~"),
+    }
+}
+
+fn function_sequence(ss3_suffix: char, _csi_code: u8, modifier: Option<u8>) -> String {
+    match modifier {
+        Some(modifier) => format!("\u{1b}[1;{modifier}{ss3_suffix}"),
+        None => format!("\u{1b}O{ss3_suffix}"),
+    }
+}
+
+fn mouse_move_report(
+    mode: crate::terminal::session::TerminalModeSnapshot,
+    cell: TerminalGridPosition,
+    button: Option<MouseButton>,
+    modifiers: Modifiers,
+) -> Option<Vec<u8>> {
+    let button = TerminalMouseButton::from_move_button(button)?;
+    if !(mode.mouse_drag || mode.mouse_motion) {
+        return None;
+    }
+    if mode.mouse_drag && matches!(button, TerminalMouseButton::NoneMove) {
+        return None;
+    }
+
+    mouse_report_bytes(
+        cell,
+        button as u8,
+        true,
+        modifiers,
+        TerminalMouseFormat::from_mode(mode),
+    )
+}
+
+fn mouse_button_report(
+    mode: crate::terminal::session::TerminalModeSnapshot,
+    cell: TerminalGridPosition,
+    button: MouseButton,
+    modifiers: Modifiers,
+    pressed: bool,
+) -> Option<Vec<u8>> {
+    if !mode.mouse_reporting() {
+        return None;
+    }
+
+    let button = TerminalMouseButton::from_button(button)?;
+    mouse_report_bytes(
+        cell,
+        button as u8,
+        pressed,
+        modifiers,
+        TerminalMouseFormat::from_mode(mode),
+    )
+}
+
+fn mouse_scroll_report(
+    mode: crate::terminal::session::TerminalModeSnapshot,
+    cell: TerminalGridPosition,
+    scroll_lines: i32,
+    event: &ScrollWheelEvent,
+) -> Option<Vec<Vec<u8>>> {
+    if !mode.mouse_reporting() {
+        return None;
+    }
+
+    let report = mouse_report_bytes(
+        cell,
+        TerminalMouseButton::from_scroll(event) as u8,
+        true,
+        event.modifiers,
+        TerminalMouseFormat::from_mode(mode),
+    )?;
+    Some(
+        std::iter::repeat(report)
+            .take(scroll_lines.unsigned_abs() as usize)
+            .collect(),
+    )
+}
+
+fn mouse_report_bytes(
+    cell: TerminalGridPosition,
+    button: u8,
+    pressed: bool,
+    modifiers: Modifiers,
+    format: TerminalMouseFormat,
+) -> Option<Vec<u8>> {
+    let mut modifier_bits = 0;
+    if modifiers.shift {
+        modifier_bits += 4;
+    }
+    if modifiers.alt {
+        modifier_bits += 8;
+    }
+    if modifiers.control {
+        modifier_bits += 16;
+    }
+
+    match format {
+        TerminalMouseFormat::Sgr => Some(sgr_mouse_bytes(button + modifier_bits, cell, pressed)),
+        TerminalMouseFormat::Normal { utf8 } => {
+            let button = if pressed {
+                button + modifier_bits
+            } else {
+                3 + modifier_bits
+            };
+            normal_mouse_bytes(cell, button, utf8)
+        }
+    }
+}
+
+fn sgr_mouse_bytes(button: u8, cell: TerminalGridPosition, pressed: bool) -> Vec<u8> {
+    let terminator = if pressed { 'M' } else { 'm' };
+    format!(
+        "\u{1b}[<{};{};{}{}",
+        button,
+        cell.column + 1,
+        cell.row + 1,
+        terminator
+    )
+    .into_bytes()
+}
+
+fn normal_mouse_bytes(cell: TerminalGridPosition, button: u8, utf8: bool) -> Option<Vec<u8>> {
+    let max_point = if utf8 { 2015 } else { 223 };
+    if cell.row >= max_point || cell.column >= max_point {
+        return None;
+    }
+
+    let mut message = vec![b'\x1b', b'[', b'M', 32 + button];
+    let encode_position = |position: usize| -> Vec<u8> {
+        let position = 32 + 1 + position;
+        let first = 0xC0 + position / 64;
+        let second = 0x80 + (position & 63);
+        vec![first as u8, second as u8]
+    };
+
+    if utf8 && cell.column >= 95 {
+        message.extend(encode_position(cell.column));
+    } else {
+        message.push(32 + 1 + cell.column as u8);
+    }
+
+    if utf8 && cell.row >= 95 {
+        message.extend(encode_position(cell.row));
+    } else {
+        message.push(32 + 1 + cell.row as u8);
+    }
+
+    Some(message)
+}
+
+fn alt_scroll_bytes(scroll_lines: i32) -> Vec<u8> {
+    let command = if scroll_lines < 0 { b'A' } else { b'B' };
+    let mut content = Vec::with_capacity(scroll_lines.unsigned_abs() as usize * 3);
+    for _ in 0..scroll_lines.unsigned_abs() {
+        content.push(0x1b);
+        content.push(b'O');
+        content.push(command);
+    }
+    content
+}
+
+fn port_refresh_interval(
+    active_session: Option<&crate::terminal::session::TerminalSessionView>,
+) -> std::time::Duration {
+    let Some(session) = active_session else {
+        return std::time::Duration::from_secs(5);
+    };
+
+    if matches!(
+        session.runtime.status,
+        crate::state::SessionStatus::Starting | crate::state::SessionStatus::Stopping
+    ) {
+        return std::time::Duration::from_secs(2);
+    }
+
+    if session
+        .runtime
+        .started_at
+        .is_some_and(|started_at| started_at.elapsed() < std::time::Duration::from_secs(15))
+    {
+        return std::time::Duration::from_secs(2);
+    }
+
+    std::time::Duration::from_secs(5)
+}
+
+fn is_managed_port_owner(
+    active_session: Option<&crate::terminal::session::TerminalSessionView>,
+    status: &PortStatus,
+) -> bool {
+    let Some(pid) = status.pid else {
+        return false;
+    };
+    let Some(session) = active_session else {
+        return false;
+    };
+
+    if session.runtime.pid == Some(pid) {
+        return true;
+    }
+
+    session.runtime.resources.process_ids.contains(&pid)
 }
 
 fn normalize_optional_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn is_startup_restorable_tab(tab: &SessionTab) -> bool {
+    matches!(tab.tab_type, TabType::Server | TabType::Ssh)
+}
+
+fn retain_startup_restorable_tabs(
+    open_tabs: &mut Vec<SessionTab>,
+    active_tab_id: &mut Option<String>,
+) {
+    open_tabs.retain(is_startup_restorable_tab);
+    if active_tab_id
+        .as_ref()
+        .is_none_or(|active| !open_tabs.iter().any(|tab| &tab.id == active))
+    {
+        *active_tab_id = open_tabs.first().map(|tab| tab.id.clone());
+    }
+}
+
+fn persisted_session_state(state: &AppState) -> SessionState {
+    let mut session = state.session_state();
+    if state.settings().restore_session_on_start == Some(false) {
+        session.open_tabs.clear();
+        session.active_tab_id = None;
+        session.sidebar_collapsed = false;
+    } else {
+        retain_startup_restorable_tabs(&mut session.open_tabs, &mut session.active_tab_id);
+    }
+    session
+}
+
+fn restore_saved_tabs(
+    process_manager: &ProcessManager,
+    state: &mut AppState,
+    _dimensions: SessionDimensions,
+) -> Option<String> {
+    retain_startup_restorable_tabs(&mut state.open_tabs, &mut state.active_tab_id);
+    let recovered = process_manager.reconcile_saved_server_tabs(state);
+    let ssh_restore = process_manager.restore_ssh_tabs(state);
+    let mut restore_notes = Vec::new();
+    if recovered > 0 {
+        restore_notes.push(format!("recovered {recovered} server tab(s)"));
+    }
+    if ssh_restore.reattached > 0 || ssh_restore.recovered > 0 {
+        restore_notes.push(format!(
+            "re-attached {} SSH tab(s)",
+            ssh_restore.reattached + ssh_restore.recovered
+        ));
+    }
+    if ssh_restore.disconnected > 0 {
+        restore_notes.push(format!(
+            "left {} SSH tab(s) disconnected",
+            ssh_restore.disconnected
+        ));
+    }
+    (!restore_notes.is_empty()).then(|| restore_notes.join(", "))
+}
+
+fn validate_terminal_font_size(value: Option<u16>) -> Result<Option<u16>, String> {
+    match value {
+        Some(value) if !(8..=24).contains(&value) => {
+            Err("Terminal font size must be between 8 and 24.".to_string())
+        }
+        _ => Ok(value),
+    }
+}
+
+fn validate_log_buffer_size(value: Option<u32>) -> Result<u32, String> {
+    let value = value.unwrap_or(10_000);
+    if (100..=100_000).contains(&value) {
+        Ok(value)
+    } else {
+        Err("Log buffer size must be between 100 and 100,000.".to_string())
+    }
+}
+
+fn external_terminal_shell_path(settings: &crate::models::Settings) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let shell = match settings.mac_terminal_profile.clone().unwrap_or_default() {
+            MacTerminalProfile::System => {
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+            }
+            MacTerminalProfile::Zsh => "/bin/zsh".to_string(),
+            MacTerminalProfile::Bash => "/bin/bash".to_string(),
+        };
+        Some(shell)
+    } else {
+        None
+    }
 }
 
 fn parse_optional_u16(value: &str) -> Result<Option<u16>, String> {
@@ -3383,4 +5002,246 @@ fn config_has_ssh_connection(config: &AppConfig, connection_id: &str) -> bool {
         .ssh_connections
         .iter()
         .any(|connection| connection.id == connection_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{SessionTab, Settings};
+    use crate::services::ProcessManager;
+    use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
+    use gpui::point;
+
+    fn sample_ai_tab() -> SessionTab {
+        SessionTab {
+            id: "tab-1".to_string(),
+            tab_type: TabType::Claude,
+            project_id: "project-1".to_string(),
+            command_id: None,
+            pty_session_id: Some("session-1".to_string()),
+            label: Some("Claude 1".to_string()),
+            ssh_connection_id: None,
+        }
+    }
+
+    fn sample_server_tab() -> SessionTab {
+        SessionTab {
+            id: "server-tab".to_string(),
+            tab_type: TabType::Server,
+            project_id: "project-1".to_string(),
+            command_id: Some("server-cmd".to_string()),
+            pty_session_id: Some("server-cmd".to_string()),
+            label: Some("Server".to_string()),
+            ssh_connection_id: None,
+        }
+    }
+
+    fn sample_ssh_tab() -> SessionTab {
+        SessionTab {
+            id: "ssh-tab".to_string(),
+            tab_type: TabType::Ssh,
+            project_id: "project-1".to_string(),
+            command_id: None,
+            pty_session_id: Some("ssh-session".to_string()),
+            label: Some("SSH".to_string()),
+            ssh_connection_id: Some("ssh-1".to_string()),
+        }
+    }
+
+    fn snapshot_cell(character: char) -> TerminalCellSnapshot {
+        TerminalCellSnapshot {
+            character,
+            zero_width: Vec::new(),
+            foreground: 0,
+            background: 0,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+        }
+    }
+
+    #[test]
+    fn persisted_session_state_clears_restore_data_when_disabled() {
+        let mut state = AppState::default();
+        let mut settings = Settings::default();
+        settings.restore_session_on_start = Some(false);
+        state.update_settings(settings);
+        state.open_tabs.push(sample_ai_tab());
+        state.active_tab_id = Some("tab-1".to_string());
+        state.sidebar_collapsed = true;
+
+        let session = persisted_session_state(&state);
+
+        assert!(session.open_tabs.is_empty());
+        assert!(session.active_tab_id.is_none());
+        assert!(!session.sidebar_collapsed);
+    }
+
+    #[test]
+    fn persisted_session_state_drops_ai_tabs_and_repairs_active_tab() {
+        let mut state = AppState::default();
+        let mut settings = Settings::default();
+        settings.restore_session_on_start = Some(true);
+        state.update_settings(settings);
+        state.open_tabs.push(sample_ai_tab());
+        state.open_tabs.push(sample_server_tab());
+        state.open_tabs.push(sample_ssh_tab());
+        state.active_tab_id = Some("tab-1".to_string());
+        state.sidebar_collapsed = true;
+
+        let session = persisted_session_state(&state);
+
+        assert_eq!(
+            session
+                .open_tabs
+                .iter()
+                .map(|tab| tab.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["server-tab", "ssh-tab"]
+        );
+        assert_eq!(session.active_tab_id.as_deref(), Some("server-tab"));
+        assert!(session.sidebar_collapsed);
+    }
+
+    #[test]
+    fn restore_saved_tabs_does_not_restart_saved_server_tabs() {
+        let mut state = AppState::default();
+        state.open_tabs.push(sample_server_tab());
+        state.active_tab_id = Some("server-tab".to_string());
+
+        let manager = ProcessManager::new();
+        let notice = restore_saved_tabs(&manager, &mut state, SessionDimensions::default());
+
+        assert!(notice.is_none());
+        assert!(manager.runtime_state().sessions.is_empty());
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.active_tab_id.as_deref(), Some("server-tab"));
+    }
+
+    #[test]
+    fn restore_saved_tabs_drops_ai_tabs_and_falls_back_to_fresh_shell() {
+        let mut state = AppState::default();
+        state.open_tabs.push(sample_ai_tab());
+        state.active_tab_id = Some("tab-1".to_string());
+
+        let manager = ProcessManager::new();
+        let notice = restore_saved_tabs(&manager, &mut state, SessionDimensions::default());
+
+        assert!(notice.is_none());
+        assert!(manager.runtime_state().sessions.is_empty());
+        assert!(state.open_tabs.is_empty());
+        assert!(state.active_tab_id.is_none());
+
+        let active_spec = state.active_terminal_spec();
+        assert!(active_spec.session_id.starts_with("phase1-shell"));
+    }
+
+    #[test]
+    fn restore_saved_tabs_reselects_surviving_server_when_ai_tab_was_active() {
+        let mut state = AppState::default();
+        state.open_tabs.push(sample_ai_tab());
+        state.open_tabs.push(sample_server_tab());
+        state.active_tab_id = Some("tab-1".to_string());
+
+        let manager = ProcessManager::new();
+        let notice = restore_saved_tabs(&manager, &mut state, SessionDimensions::default());
+
+        assert!(notice.is_none());
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.open_tabs[0].id, "server-tab");
+        assert_eq!(state.active_tab_id.as_deref(), Some("server-tab"));
+    }
+
+    #[test]
+    fn terminal_endpoint_uses_cell_half_and_clamps_to_edges() {
+        let bounds = TerminalTextBounds {
+            left: 0.0,
+            top: 0.0,
+            width: 40.0,
+            height: 20.0,
+            cell_width: 10.0,
+            row_height: 10.0,
+            rows: 2,
+            cols: 4,
+        };
+
+        let left_half = terminal_endpoint_for_mouse(point(px(4.0), px(5.0)), bounds, true).unwrap();
+        let right_half =
+            terminal_endpoint_for_mouse(point(px(7.0), px(5.0)), bounds, true).unwrap();
+        let edge = terminal_endpoint_for_mouse(point(px(40.0), px(19.0)), bounds, true).unwrap();
+
+        assert_eq!(left_half.position.column, 0);
+        assert_eq!(left_half.side, TerminalCellSide::Left);
+        assert_eq!(right_half.position.column, 0);
+        assert_eq!(right_half.side, TerminalCellSide::Right);
+        assert_eq!(edge.position.column, 3);
+        assert_eq!(edge.side, TerminalCellSide::Right);
+    }
+
+    #[test]
+    fn semantic_selection_selects_whole_non_whitespace_run() {
+        let line: Vec<TerminalCellSnapshot> = "cargo test".chars().map(snapshot_cell).collect();
+        let screen = TerminalScreenSnapshot {
+            lines: vec![line],
+            cols: 10,
+            rows: 1,
+            ..Default::default()
+        };
+
+        let selection = terminal_selection_for_click(
+            &screen,
+            TerminalGridPosition { row: 0, column: 2 },
+            TerminalSelectionMode::Semantic,
+        )
+        .unwrap();
+        let snapshot = {
+            let (start, end) = ordered_selection(selection.anchor, selection.head);
+            view::TerminalSelectionSnapshot {
+                start_row: start.position.row,
+                start_column: boundary_column(start, screen.cols),
+                end_row: end.position.row,
+                end_column: boundary_column(end, screen.cols),
+            }
+        };
+
+        assert_eq!(snapshot.start_column, 0);
+        assert_eq!(snapshot.end_column, 5);
+    }
+
+    #[test]
+    fn sgr_mouse_reports_include_modifier_bits() {
+        let mode = crate::terminal::session::TerminalModeSnapshot {
+            mouse_report_click: true,
+            sgr_mouse: true,
+            ..Default::default()
+        };
+        let modifiers = Modifiers {
+            shift: true,
+            alt: true,
+            ..Default::default()
+        };
+
+        let report = mouse_button_report(
+            mode,
+            TerminalGridPosition { row: 3, column: 4 },
+            MouseButton::Left,
+            modifiers,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report, b"\x1b[<12;5;4M".to_vec());
+    }
+
+    #[test]
+    fn alternate_scroll_uses_ss3_arrow_bytes() {
+        assert_eq!(alt_scroll_bytes(-2), b"\x1bOA\x1bOA".to_vec());
+        assert_eq!(alt_scroll_bytes(2), b"\x1bOB\x1bOB".to_vec());
+    }
 }

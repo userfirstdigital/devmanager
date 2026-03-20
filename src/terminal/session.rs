@@ -1,11 +1,17 @@
 use crate::models::DefaultTerminal;
-use crate::services::pid_file;
-use crate::state::{SessionDimensions, SessionExitState, SessionRuntimeState, SessionStatus};
+use crate::services::{pid_file, platform_service};
+use crate::state::{
+    RuntimeState, SessionDimensions, SessionExitState, SessionKind, SessionRuntimeState,
+    SessionStatus,
+};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{point_to_viewport, Config as TermConfig, Term, TermMode};
-use alacritty_terminal::vte::ansi::{CursorShape, Processor, StdSyncHandler};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
+};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -13,8 +19,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-
-use crate::state::RuntimeState;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalBackend {
@@ -37,13 +42,79 @@ pub struct TerminalCursorSnapshot {
     pub shape: CursorShape,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalCellSnapshot {
+    pub character: char,
+    pub zero_width: Vec<char>,
+    pub foreground: u32,
+    pub background: u32,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub undercurl: bool,
+    pub strike: bool,
+    pub hidden: bool,
+    pub has_hyperlink: bool,
+    pub default_background: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalIndexedCellSnapshot {
+    pub row: usize,
+    pub column: usize,
+    pub cell: TerminalCellSnapshot,
+}
+
+impl TerminalCellSnapshot {
+    fn blank(foreground: u32, background: u32) -> Self {
+        Self {
+            character: ' ',
+            zero_width: Vec::new(),
+            foreground,
+            background,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalModeSnapshot {
+    pub alternate_screen: bool,
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
+    pub focus_in_out: bool,
+    pub mouse_report_click: bool,
+    pub mouse_drag: bool,
+    pub mouse_motion: bool,
+    pub sgr_mouse: bool,
+    pub utf8_mouse: bool,
+    pub alternate_scroll: bool,
+}
+
+impl TerminalModeSnapshot {
+    pub fn mouse_reporting(self) -> bool {
+        self.mouse_report_click || self.mouse_drag || self.mouse_motion
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TerminalScreenSnapshot {
-    pub lines: Vec<String>,
+    pub cells: Vec<TerminalIndexedCellSnapshot>,
+    pub lines: Vec<Vec<TerminalCellSnapshot>>,
     pub cursor: Option<TerminalCursorSnapshot>,
     pub display_offset: usize,
     pub rows: usize,
     pub cols: usize,
+    pub mode: TerminalModeSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -173,9 +244,12 @@ impl EventListener for SessionEventProxy {
                     );
                 });
             }
-            Event::ClipboardLoad(_, _)
-            | Event::ClipboardStore(_, _)
-            | Event::ColorRequest(_, _) => {
+            Event::ColorRequest(index, formatter) => {
+                let color = color_for_index(index);
+                let response = formatter(color);
+                self.write_to_pty(&response);
+            }
+            Event::ClipboardLoad(_, _) | Event::ClipboardStore(_, _) => {
                 self.debug_log("ignored optional terminal event");
             }
         }
@@ -190,7 +264,9 @@ pub struct TerminalSession {
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     dimensions: Arc<Mutex<SessionDimensions>>,
+    event_proxy: SessionEventProxy,
     backend: TerminalBackend,
+    scrolling_history: Arc<RwLock<usize>>,
 }
 
 impl TerminalSession {
@@ -222,7 +298,7 @@ impl TerminalSession {
                 runtime_state.clone(),
                 debug_enabled,
                 backend,
-                false,
+                true,
             ) {
                 Ok(session) => return Ok(session),
                 Err(error) => last_error = Some(format!("{}: {}", candidate.program, error)),
@@ -269,18 +345,22 @@ impl TerminalSession {
         &self.session_id
     }
 
-    pub fn write_text(&self, text: &str) -> Result<(), String> {
+    pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), String> {
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| "PTY writer poisoned".to_string())?;
         writer
-            .write_all(text.as_bytes())
+            .write_all(bytes)
             .map_err(|error| format!("Failed to write to PTY: {error}"))?;
         writer
             .flush()
             .map_err(|error| format!("Failed to flush PTY input: {error}"))?;
         Ok(())
+    }
+
+    pub fn write_text(&self, text: &str) -> Result<(), String> {
+        self.write_bytes(text.as_bytes())
     }
 
     pub fn paste_text(&self, text: &str) -> Result<(), String> {
@@ -385,58 +465,219 @@ impl TerminalSession {
             .map_err(|error| format!("Failed to terminate shell session: {error}"))
     }
 
+    pub fn restart_command(
+        &self,
+        cwd: PathBuf,
+        dimensions: SessionDimensions,
+        program: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        log_file_path: Option<PathBuf>,
+        track_pid: bool,
+    ) -> Result<(), String> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(pty_size(dimensions))
+            .map_err(|error| error.to_string())?;
+        let mut command = CommandBuilder::new(program.clone());
+        if let Some(valid_cwd) = existing_directory(&cwd) {
+            command.cwd(valid_cwd);
+        }
+        if !args.is_empty() {
+            command.args(args.clone());
+        }
+        apply_terminal_env_defaults(&mut command, env);
+
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| format!("Failed to spawn command: {error}"))?;
+
+        let pid = child.process_id();
+        let mut cleanup_killer = child.clone_killer();
+
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                cleanup_failed_spawn(&mut cleanup_killer);
+                return Err(format!("Failed to acquire PTY writer: {error}"));
+            }
+        };
+        let reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                cleanup_failed_spawn(&mut cleanup_killer);
+                return Err(format!("Failed to clone PTY reader: {error}"));
+            }
+        };
+        let log_file = match open_log_file(log_file_path) {
+            Ok(log_file) => log_file,
+            Err(error) => {
+                cleanup_failed_spawn(&mut cleanup_killer);
+                return Err(error);
+            }
+        };
+
+        {
+            let mut writer_slot = match self.writer.lock() {
+                Ok(writer_slot) => writer_slot,
+                Err(_) => {
+                    cleanup_failed_spawn(&mut cleanup_killer);
+                    return Err("PTY writer poisoned".to_string());
+                }
+            };
+            *writer_slot = writer;
+        }
+        {
+            let mut master_slot = match self.master.lock() {
+                Ok(master_slot) => master_slot,
+                Err(_) => {
+                    cleanup_failed_spawn(&mut cleanup_killer);
+                    return Err("PTY master poisoned".to_string());
+                }
+            };
+            *master_slot = pair.master;
+        }
+        {
+            let mut killer_slot = match self.killer.lock() {
+                Ok(killer_slot) => killer_slot,
+                Err(_) => {
+                    cleanup_failed_spawn(&mut cleanup_killer);
+                    return Err("Session killer poisoned".to_string());
+                }
+            };
+            *killer_slot = child.clone_killer();
+        }
+        {
+            let mut current_dimensions = match self.dimensions.lock() {
+                Ok(current_dimensions) => current_dimensions,
+                Err(_) => {
+                    cleanup_failed_spawn(&mut cleanup_killer);
+                    return Err("Size lock poisoned".to_string());
+                }
+            };
+            *current_dimensions = dimensions;
+        }
+        {
+            let mut term = match self.term.lock() {
+                Ok(term) => term,
+                Err(_) => {
+                    cleanup_failed_spawn(&mut cleanup_killer);
+                    return Err("Terminal state poisoned".to_string());
+                }
+            };
+            term.resize(TerminalSize::new(
+                dimensions.cols as usize,
+                dimensions.rows as usize,
+            ));
+        }
+
+        initialize_runtime_entry(
+            &self.runtime_state,
+            &self.session_id,
+            cwd.clone(),
+            dimensions,
+            program.clone(),
+            self.backend,
+            pid,
+        );
+
+        if track_pid {
+            if let Err(error) = track_managed_process(&self.runtime_state, &self.session_id, pid, &program)
+            {
+                cleanup_failed_spawn(&mut cleanup_killer);
+                return Err(error);
+            }
+        }
+
+        spawn_reader_thread(
+            self.session_id.clone(),
+            reader,
+            self.term.clone(),
+            log_file,
+            self.runtime_state.clone(),
+            self.event_proxy.debug_enabled,
+        );
+        spawn_wait_thread(
+            self.session_id.clone(),
+            child,
+            pid,
+            self.runtime_state.clone(),
+            self.event_proxy.debug_enabled,
+        );
+
+        self.event_proxy.debug_log(format!("respawned {}", program));
+        Ok(())
+    }
+
+    pub fn write_virtual_text(&self, text: &str) {
+        let mut parser = Processor::<StdSyncHandler>::new();
+        let mut term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        parser.advance(&mut *term, text.as_bytes());
+    }
+
+    pub fn set_scrollback_lines(&self, lines: usize) {
+        let lines = lines.max(100);
+        if let Ok(mut scrollback) = self.scrolling_history.write() {
+            *scrollback = lines;
+        }
+        let mut term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        term.set_options(configured_term(lines));
+        self.event_proxy.with_runtime(|session| {
+            session.display_offset = session.display_offset.min(lines);
+            session.mark_dirty();
+        });
+    }
+
+    pub fn clear_virtual_output(&self) {
+        let dimensions = self
+            .dimensions
+            .lock()
+            .map(|dimensions| *dimensions)
+            .unwrap_or_default();
+        let mut term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        let scrolling_history = self
+            .scrolling_history
+            .read()
+            .map(|lines| *lines)
+            .unwrap_or(10_000);
+        *term = Term::new(
+            configured_term(scrolling_history),
+            &TerminalSize::new(dimensions.cols as usize, dimensions.rows as usize),
+            self.event_proxy.clone(),
+        );
+    }
+
+    pub fn mode_snapshot(&self) -> TerminalModeSnapshot {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        mode_snapshot(*term.mode())
+    }
+
+    pub fn report_focus(&self, focused: bool) -> Result<(), String> {
+        if !self.mode_snapshot().focus_in_out {
+            return Ok(());
+        }
+        self.write_text(if focused { "\u{1b}[I" } else { "\u{1b}[O" })
+    }
+
     pub fn snapshot(&self) -> TerminalScreenSnapshot {
         let term = match self.term.lock() {
             Ok(term) => term,
             Err(error) => error.into_inner(),
         };
-
-        let content = term.renderable_content();
-        let display_offset = content.display_offset;
-        let rows = term.screen_lines();
-        let cols = term.columns();
-        let cursor = if content.cursor.shape == CursorShape::Hidden {
-            None
-        } else {
-            point_to_viewport(display_offset, content.cursor.point).map(|point| {
-                TerminalCursorSnapshot {
-                    row: point.line,
-                    column: point.column.0,
-                    shape: content.cursor.shape,
-                }
-            })
-        };
-
-        let mut grid_lines = vec![vec!['\u{00a0}'; cols]; rows];
-        for indexed in content.display_iter {
-            let Some(point) = point_to_viewport(display_offset, indexed.point) else {
-                continue;
-            };
-            if point.line >= rows || point.column.0 >= cols {
-                continue;
-            }
-
-            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                || indexed.cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                continue;
-            }
-
-            grid_lines[point.line][point.column.0] = renderable_char(indexed.cell);
-        }
-
-        let lines = grid_lines
-            .into_iter()
-            .map(|line| line.into_iter().collect::<String>())
-            .collect();
-
-        TerminalScreenSnapshot {
-            lines,
-            cursor,
-            display_offset,
-            rows,
-            cols,
-        }
+        snapshot_term(&term)
     }
 }
 
@@ -448,77 +689,100 @@ impl Drop for TerminalSession {
 
 #[derive(Clone)]
 struct ShellCandidate {
-    program: &'static str,
+    program: String,
     args: Vec<String>,
 }
 
 fn shell_candidates(preferred_terminal: Option<&DefaultTerminal>) -> Vec<ShellCandidate> {
+    let preferred_terminal = preferred_terminal.cloned().unwrap_or_default();
     if cfg!(target_os = "windows") {
         match preferred_terminal {
-            Some(DefaultTerminal::Cmd) => vec![
+            DefaultTerminal::Cmd => vec![
                 ShellCandidate {
-                    program: "cmd",
+                    program: "cmd.exe".to_string(),
                     args: Vec::new(),
                 },
                 ShellCandidate {
-                    program: "pwsh",
+                    program: "pwsh".to_string(),
                     args: vec!["-NoLogo".to_string()],
                 },
                 ShellCandidate {
-                    program: "powershell",
+                    program: "powershell.exe".to_string(),
                     args: vec!["-NoLogo".to_string()],
                 },
             ],
-            _ => vec![
+            DefaultTerminal::Powershell => vec![
                 ShellCandidate {
-                    program: "pwsh",
+                    program: "pwsh".to_string(),
                     args: vec!["-NoLogo".to_string()],
                 },
                 ShellCandidate {
-                    program: "powershell",
+                    program: "powershell.exe".to_string(),
                     args: vec!["-NoLogo".to_string()],
                 },
                 ShellCandidate {
-                    program: "cmd",
+                    program: "cmd.exe".to_string(),
+                    args: Vec::new(),
+                },
+            ],
+            DefaultTerminal::Bash => vec![
+                ShellCandidate {
+                    program: preferred_windows_bash_program(),
+                    args: vec!["--login".to_string()],
+                },
+                ShellCandidate {
+                    program: "bash".to_string(),
+                    args: vec!["--login".to_string()],
+                },
+                ShellCandidate {
+                    program: "pwsh".to_string(),
+                    args: vec!["-NoLogo".to_string()],
+                },
+                ShellCandidate {
+                    program: "powershell.exe".to_string(),
+                    args: vec!["-NoLogo".to_string()],
+                },
+                ShellCandidate {
+                    program: "cmd.exe".to_string(),
                     args: Vec::new(),
                 },
             ],
         }
     } else {
         match preferred_terminal {
-            Some(DefaultTerminal::Powershell) => vec![
+            DefaultTerminal::Powershell => vec![
                 ShellCandidate {
-                    program: "pwsh",
+                    program: "pwsh".to_string(),
                     args: Vec::new(),
                 },
                 ShellCandidate {
-                    program: "bash",
+                    program: "bash".to_string(),
                     args: Vec::new(),
                 },
                 ShellCandidate {
-                    program: "zsh",
+                    program: "zsh".to_string(),
                     args: Vec::new(),
                 },
                 ShellCandidate {
-                    program: "sh",
+                    program: "sh".to_string(),
                     args: Vec::new(),
                 },
             ],
             _ => vec![
                 ShellCandidate {
-                    program: "bash",
+                    program: "bash".to_string(),
                     args: Vec::new(),
                 },
                 ShellCandidate {
-                    program: "zsh",
+                    program: "zsh".to_string(),
                     args: Vec::new(),
                 },
                 ShellCandidate {
-                    program: "sh",
+                    program: "sh".to_string(),
                     args: Vec::new(),
                 },
                 ShellCandidate {
-                    program: "pwsh",
+                    program: "pwsh".to_string(),
                     args: Vec::new(),
                 },
             ],
@@ -526,11 +790,86 @@ fn shell_candidates(preferred_terminal: Option<&DefaultTerminal>) -> Vec<ShellCa
     }
 }
 
+pub fn preferred_windows_bash_program() -> String {
+    std::env::var("DEVMANAGER_GIT_BASH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            [
+                "C:/Program Files/Git/bin/bash.exe",
+                "C:/Program Files (x86)/Git/bin/bash.exe",
+            ]
+            .iter()
+            .find(|path| Path::new(path).exists())
+            .map(|path| (*path).to_string())
+        })
+        .unwrap_or_else(|| "bash".to_string())
+}
+
 fn renderable_char(cell: &Cell) -> char {
-    if cell.flags.contains(Flags::HIDDEN) || cell.c == ' ' {
-        '\u{00a0}'
+    if cell.flags.contains(Flags::HIDDEN) {
+        ' '
     } else {
         cell.c
+    }
+}
+
+fn snapshot_term(term: &Term<SessionEventProxy>) -> TerminalScreenSnapshot {
+    let content = term.renderable_content();
+    let display_offset = content.display_offset;
+    let rows = term.screen_lines();
+    let cols = term.columns();
+    let mode = mode_snapshot(content.mode);
+    let cursor = if content.cursor.shape == CursorShape::Hidden {
+        None
+    } else {
+        point_to_viewport(display_offset, content.cursor.point).map(|point| {
+            TerminalCursorSnapshot {
+                row: point.line,
+                column: point.column.0,
+                shape: content.cursor.shape,
+            }
+        })
+    };
+
+    let default_foreground =
+        resolve_terminal_color(AnsiColor::Named(NamedColor::Foreground), content.colors);
+    let default_background =
+        resolve_terminal_color(AnsiColor::Named(NamedColor::Background), content.colors);
+    let mut grid_lines =
+        vec![vec![TerminalCellSnapshot::blank(default_foreground, default_background); cols]; rows];
+    let mut indexed_cells = Vec::with_capacity(content.display_iter.size_hint().0);
+    for indexed in content.display_iter {
+        let Some(point) = point_to_viewport(display_offset, indexed.point) else {
+            continue;
+        };
+        if point.line >= rows || point.column.0 >= cols {
+            continue;
+        }
+
+        if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+            || indexed.cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+
+        let cell = renderable_cell_snapshot(indexed.cell, content.colors);
+        grid_lines[point.line][point.column.0] = cell.clone();
+        indexed_cells.push(TerminalIndexedCellSnapshot {
+            row: point.line,
+            column: point.column.0,
+            cell,
+        });
+    }
+
+    TerminalScreenSnapshot {
+        cells: indexed_cells,
+        lines: grid_lines,
+        cursor,
+        display_offset,
+        rows,
+        cols,
+        mode,
     }
 }
 
@@ -539,6 +878,32 @@ fn configured_term(scrolling_history: usize) -> TermConfig {
         scrolling_history,
         ..Default::default()
     }
+}
+
+fn apply_terminal_env_defaults(command: &mut CommandBuilder, env: HashMap<String, String>) {
+    command.env_remove("NO_COLOR");
+    command.env_remove("NODE_DISABLE_COLORS");
+    for (key, value) in with_terminal_env_defaults(env) {
+        command.env(key, value);
+    }
+}
+
+fn with_terminal_env_defaults(mut env: HashMap<String, String>) -> HashMap<String, String> {
+    env.entry("TERM".to_string())
+        .or_insert_with(|| "xterm-256color".to_string());
+    env.entry("COLORTERM".to_string())
+        .or_insert_with(|| "truecolor".to_string());
+    env.entry("TERM_PROGRAM".to_string())
+        .or_insert_with(|| "DevManager".to_string());
+    env.entry("TERM_PROGRAM_VERSION".to_string())
+        .or_insert_with(|| env!("CARGO_PKG_VERSION").to_string());
+    env.entry("CLICOLOR".to_string())
+        .or_insert_with(|| "1".to_string());
+    env.entry("CLICOLOR_FORCE".to_string())
+        .or_insert_with(|| "1".to_string());
+    env.entry("FORCE_COLOR".to_string())
+        .or_insert_with(|| "1".to_string());
+    env
 }
 
 fn pty_size(dimensions: SessionDimensions) -> PtySize {
@@ -552,6 +917,63 @@ fn pty_size(dimensions: SessionDimensions) -> PtySize {
 
 fn existing_directory(path: &Path) -> Option<&Path> {
     path.is_dir().then_some(path)
+}
+
+fn session_kind_label(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Shell => "shell",
+        SessionKind::Server => "server",
+        SessionKind::Claude => "claude",
+        SessionKind::Codex => "codex",
+        SessionKind::Ssh => "ssh",
+    }
+}
+
+fn capture_process_identity_with_retry(pid: u32) -> Option<platform_service::ProcessIdentity> {
+    for _ in 0..20 {
+        if let Some(identity) = platform_service::capture_process_identity(pid) {
+            return Some(identity);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    None
+}
+
+fn track_managed_process(
+    runtime_state: &Arc<RwLock<RuntimeState>>,
+    session_id: &str,
+    pid: Option<u32>,
+    program: &str,
+) -> Result<(), String> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    let identity = capture_process_identity_with_retry(pid)
+        .ok_or_else(|| format!("Failed to capture process identity for `{session_id}`"))?;
+    let session = runtime_state
+        .read()
+        .map_err(|_| "Runtime state poisoned".to_string())?
+        .sessions
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| format!("Missing runtime session `{session_id}` for process tracking"))?;
+    pid_file::track_session_process(pid_file::ManagedProcessRecord {
+        session_id: session_id.to_string(),
+        pid,
+        started_at_unix_secs: identity.started_at_unix_secs,
+        process_name: identity.process_name,
+        session_kind: session_kind_label(session.session_kind).to_string(),
+        program: program.to_string(),
+        project_id: session.project_id.clone(),
+        command_id: session.command_id.clone(),
+        tab_id: session.tab_id.clone(),
+    })
+}
+
+fn cleanup_failed_spawn(
+    cleanup_killer: &mut Box<dyn ChildKiller + Send + Sync>,
+) {
+    let _ = cleanup_killer.kill();
 }
 
 fn initialize_runtime_entry(
@@ -680,7 +1102,7 @@ fn spawn_wait_thread(
                 }
             }
             if let Some(pid) = pid {
-                pid_file::untrack_pid(pid);
+                let _ = pid_file::untrack_session_process(&session_id, pid);
             }
         }
         Err(error) => {
@@ -701,7 +1123,7 @@ fn spawn_wait_thread(
                 }
             }
             if let Some(pid) = pid {
-                pid_file::untrack_pid(pid);
+                let _ = pid_file::untrack_session_process(&session_id, pid);
             }
         }
     });
@@ -725,6 +1147,7 @@ fn spawn_with_command(
     let pair = pty_system
         .openpty(pty_size(dimensions))
         .map_err(|error| error.to_string())?;
+    let scrolling_history = scrolling_history.max(100);
 
     let mut command = CommandBuilder::new(program.clone());
     if let Some(valid_cwd) = existing_directory(&cwd) {
@@ -733,9 +1156,7 @@ fn spawn_with_command(
     if !args.is_empty() {
         command.args(args.clone());
     }
-    for (key, value) in env {
-        command.env(key, value);
-    }
+    apply_terminal_env_defaults(&mut command, env);
 
     let child = pair
         .slave
@@ -743,37 +1164,27 @@ fn spawn_with_command(
         .map_err(|error| format!("Failed to spawn command: {error}"))?;
 
     let pid = child.process_id();
-    if track_pid {
-        if let Some(pid) = pid {
-            pid_file::track_pid(pid);
+    let mut cleanup_killer = child.clone_killer();
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            cleanup_failed_spawn(&mut cleanup_killer);
+            return Err(format!("Failed to acquire PTY writer: {error}"));
         }
-    }
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|error| format!("Failed to acquire PTY writer: {error}"))?;
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|error| format!("Failed to clone PTY reader: {error}"))?;
-    let log_file = if let Some(log_file_path) = log_file_path {
-        if let Some(parent) = log_file_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    };
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            cleanup_failed_spawn(&mut cleanup_killer);
+            return Err(format!("Failed to clone PTY reader: {error}"));
         }
-        Some(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_file_path)
-                .map_err(|error| {
-                    format!(
-                        "Failed to open log file {}: {error}",
-                        log_file_path.display()
-                    )
-                })?,
-        )
-    } else {
-        None
+    };
+    let log_file = match open_log_file(log_file_path) {
+        Ok(log_file) => log_file,
+        Err(error) => {
+            cleanup_failed_spawn(&mut cleanup_killer);
+            return Err(error);
+        }
     };
 
     let writer = Arc::new(Mutex::new(writer));
@@ -793,6 +1204,7 @@ fn spawn_with_command(
         &TerminalSize::new(dimensions.cols as usize, dimensions.rows as usize),
         event_proxy.clone(),
     )));
+    let scrolling_history = Arc::new(RwLock::new(scrolling_history));
 
     initialize_runtime_entry(
         &runtime_state,
@@ -803,6 +1215,13 @@ fn spawn_with_command(
         backend,
         pid,
     );
+
+    if track_pid {
+        if let Err(error) = track_managed_process(&runtime_state, session_id, pid, &program) {
+            cleanup_failed_spawn(&mut cleanup_killer);
+            return Err(error);
+        }
+    }
 
     spawn_reader_thread(
         session_id.to_string(),
@@ -831,6 +1250,254 @@ fn spawn_with_command(
         killer,
         runtime_state,
         dimensions: dimensions_state,
+        event_proxy,
         backend,
+        scrolling_history,
     })
+}
+
+fn open_log_file(log_file_path: Option<PathBuf>) -> Result<Option<std::fs::File>, String> {
+    if let Some(log_file_path) = log_file_path {
+        if let Some(parent) = log_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return Ok(Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file_path)
+                .map_err(|error| {
+                    format!(
+                        "Failed to open log file {}: {error}",
+                        log_file_path.display()
+                    )
+                })?,
+        ));
+    }
+
+    Ok(None)
+}
+
+fn renderable_cell_snapshot(cell: &Cell, colors: &Colors) -> TerminalCellSnapshot {
+    let mut foreground = resolve_terminal_color(cell.fg, colors);
+    let mut background = resolve_terminal_color(cell.bg, colors);
+    let default_background = if cell.flags.contains(Flags::INVERSE) {
+        matches!(cell.fg, AnsiColor::Named(NamedColor::Background))
+    } else {
+        matches!(cell.bg, AnsiColor::Named(NamedColor::Background))
+    };
+
+    if cell.flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+
+    let bold = cell.flags.intersects(Flags::BOLD | Flags::DIM_BOLD);
+    let dim = cell.flags.intersects(Flags::DIM | Flags::DIM_BOLD);
+
+    TerminalCellSnapshot {
+        character: renderable_char(cell),
+        zero_width: cell.zerowidth().unwrap_or(&[]).to_vec(),
+        foreground,
+        background,
+        bold,
+        dim,
+        italic: cell.flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
+        underline: cell.flags.intersects(Flags::ALL_UNDERLINES) || cell.hyperlink().is_some(),
+        undercurl: cell.flags.contains(Flags::UNDERCURL),
+        strike: cell.flags.contains(Flags::STRIKEOUT),
+        hidden: cell.flags.contains(Flags::HIDDEN),
+        has_hyperlink: cell.hyperlink().is_some(),
+        default_background,
+    }
+}
+
+fn resolve_terminal_color(color: AnsiColor, colors: &Colors) -> u32 {
+    match color {
+        AnsiColor::Spec(rgb) => rgb_to_u32(rgb),
+        AnsiColor::Indexed(index) => colors[index as usize]
+            .map(rgb_to_u32)
+            .unwrap_or_else(|| indexed_color_fallback(index)),
+        AnsiColor::Named(name) => colors[name]
+            .map(rgb_to_u32)
+            .unwrap_or_else(|| named_color_fallback(name)),
+    }
+}
+
+fn rgb_to_u32(rgb: Rgb) -> u32 {
+    ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | rgb.b as u32
+}
+
+fn dim_color(color: u32) -> u32 {
+    let red = (((color >> 16) & 0xff) as f32 * 0.7) as u32;
+    let green = (((color >> 8) & 0xff) as f32 * 0.7) as u32;
+    let blue = ((color & 0xff) as f32 * 0.7) as u32;
+    (red << 16) | (green << 8) | blue
+}
+
+fn indexed_color_fallback(index: u8) -> u32 {
+    match index {
+        0 => 0x18181b,
+        1 => 0xef4444,
+        2 => 0x22c55e,
+        3 => 0xeab308,
+        4 => 0x3b82f6,
+        5 => 0xa855f7,
+        6 => 0x06b6d4,
+        7 => 0xe4e4e7,
+        8 => 0x52525b,
+        9 => 0xf87171,
+        10 => 0x4ade80,
+        11 => 0xfacc15,
+        12 => 0x60a5fa,
+        13 => 0xc084fc,
+        14 => 0x22d3ee,
+        15 => 0xfafafa,
+        16..=231 => {
+            let cube = index - 16;
+            let red = cube / 36;
+            let green = (cube % 36) / 6;
+            let blue = cube % 6;
+            let channel = |value: u8| {
+                if value == 0 {
+                    0
+                } else {
+                    55 + value as u32 * 40
+                }
+            };
+            (channel(red) << 16) | (channel(green) << 8) | channel(blue)
+        }
+        232..=255 => {
+            let shade = 8 + (index as u32 - 232) * 10;
+            (shade << 16) | (shade << 8) | shade
+        }
+    }
+}
+
+fn named_color_fallback(name: NamedColor) -> u32 {
+    match name {
+        NamedColor::Black => 0x18181b,
+        NamedColor::Red => 0xef4444,
+        NamedColor::Green => 0x22c55e,
+        NamedColor::Yellow => 0xeab308,
+        NamedColor::Blue => 0x3b82f6,
+        NamedColor::Magenta => 0xa855f7,
+        NamedColor::Cyan => 0x06b6d4,
+        NamedColor::White => 0xe4e4e7,
+        NamedColor::BrightBlack => 0x52525b,
+        NamedColor::BrightRed => 0xf87171,
+        NamedColor::BrightGreen => 0x4ade80,
+        NamedColor::BrightYellow => 0xfacc15,
+        NamedColor::BrightBlue => 0x60a5fa,
+        NamedColor::BrightMagenta => 0xc084fc,
+        NamedColor::BrightCyan => 0x22d3ee,
+        NamedColor::BrightWhite => 0xfafafa,
+        NamedColor::Foreground | NamedColor::BrightForeground => 0xe4e4e7,
+        NamedColor::Background => crate::theme::TERMINAL_BG,
+        NamedColor::Cursor => 0xe4e4e7,
+        NamedColor::DimBlack => dim_color(0x18181b),
+        NamedColor::DimRed => dim_color(0xef4444),
+        NamedColor::DimGreen => dim_color(0x22c55e),
+        NamedColor::DimYellow => dim_color(0xeab308),
+        NamedColor::DimBlue => dim_color(0x3b82f6),
+        NamedColor::DimMagenta => dim_color(0xa855f7),
+        NamedColor::DimCyan => dim_color(0x06b6d4),
+        NamedColor::DimWhite | NamedColor::DimForeground => dim_color(0xe4e4e7),
+    }
+}
+
+fn u32_to_rgb(color: u32) -> Rgb {
+    Rgb {
+        r: ((color >> 16) & 0xff) as u8,
+        g: ((color >> 8) & 0xff) as u8,
+        b: (color & 0xff) as u8,
+    }
+}
+
+fn color_for_index(index: usize) -> Rgb {
+    let color = if index < 256 {
+        indexed_color_fallback(index as u8)
+    } else {
+        match index {
+            256 => named_color_fallback(NamedColor::Foreground),
+            257 => named_color_fallback(NamedColor::Background),
+            258 => named_color_fallback(NamedColor::Cursor),
+            _ => 0xe4e4e7,
+        }
+    };
+    u32_to_rgb(color)
+}
+
+fn mode_snapshot(mode: TermMode) -> TerminalModeSnapshot {
+    TerminalModeSnapshot {
+        alternate_screen: contains_mode(mode, "ALT_SCREEN"),
+        app_cursor: contains_mode(mode, "APP_CURSOR"),
+        bracketed_paste: contains_mode(mode, "BRACKETED_PASTE"),
+        focus_in_out: contains_mode(mode, "FOCUS_IN_OUT"),
+        mouse_report_click: contains_mode(mode, "MOUSE_REPORT_CLICK"),
+        mouse_drag: contains_mode(mode, "MOUSE_DRAG"),
+        mouse_motion: contains_mode(mode, "MOUSE_MOTION"),
+        sgr_mouse: contains_mode(mode, "SGR_MOUSE"),
+        utf8_mouse: contains_mode(mode, "UTF8_MOUSE"),
+        alternate_scroll: contains_mode(mode, "ALTERNATE_SCROLL"),
+    }
+}
+
+fn contains_mode(mode: TermMode, name: &str) -> bool {
+    TermMode::from_name(name)
+        .map(|flag| mode.contains(flag))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    fn test_event_proxy(dimensions: SessionDimensions) -> SessionEventProxy {
+        SessionEventProxy {
+            session_id: "test".to_string(),
+            writer: Arc::new(Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)),
+            runtime_state: Arc::new(RwLock::new(RuntimeState::default())),
+            dimensions: Arc::new(Mutex::new(dimensions)),
+            debug_enabled: false,
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_ansi_color_cells() {
+        let dimensions = SessionDimensions {
+            cols: 8,
+            rows: 2,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let proxy = test_event_proxy(dimensions);
+        let mut term = Term::new(configured_term(1000), &TerminalSize::new(8, 2), proxy);
+        let mut parser = Processor::<StdSyncHandler>::new();
+
+        parser.advance(&mut term, b"\x1b[31mR\x1b[32mG\x1b[0mW");
+
+        let snapshot = snapshot_term(&term);
+        let red = &snapshot.lines[0][0];
+        let green = &snapshot.lines[0][1];
+        let default = &snapshot.lines[0][2];
+
+        assert_eq!(red.character, 'R');
+        assert_eq!(green.character, 'G');
+        assert_eq!(default.character, 'W');
+        assert_ne!(red.foreground, default.foreground);
+        assert_ne!(green.foreground, default.foreground);
+        assert_ne!(red.foreground, green.foreground);
+    }
+
+    #[test]
+    fn terminal_env_defaults_force_color_output() {
+        let env = with_terminal_env_defaults(HashMap::new());
+
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert_eq!(env.get("CLICOLOR").map(String::as_str), Some("1"));
+        assert_eq!(env.get("CLICOLOR_FORCE").map(String::as_str), Some("1"));
+        assert_eq!(env.get("FORCE_COLOR").map(String::as_str), Some("1"));
+    }
 }

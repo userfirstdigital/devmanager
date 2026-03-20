@@ -81,10 +81,9 @@ pub fn session_path() -> Result<PathBuf> {
 }
 
 pub fn load_workspace() -> Result<WorkspaceSnapshot> {
-    Ok(WorkspaceSnapshot {
-        config: load_config()?,
-        session: load_session()?,
-    })
+    let config_path = config_path()?;
+    let session_path = session_path()?;
+    load_workspace_from_paths(&config_path, &session_path)
 }
 
 pub fn load_config() -> Result<AppConfig> {
@@ -112,7 +111,22 @@ pub fn load_config_from_path(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn load_session_from_path(path: &Path) -> Result<SessionState> {
-    load_json_file(path, SessionState::default(), load_session_from_str)
+    if !path.exists() {
+        return Ok(SessionState::default());
+    }
+
+    let contents = fs::read_to_string(path).map_err(|source| PersistenceError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    match load_session_from_str(&contents) {
+        Ok(session) => Ok(session),
+        Err(_) => {
+            let _ = fs::remove_file(path);
+            Ok(SessionState::default())
+        }
+    }
 }
 
 pub fn save_config_to_path(path: &Path, config: &AppConfig) -> Result<()> {
@@ -185,6 +199,13 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+fn load_workspace_from_paths(config_path: &Path, session_path: &Path) -> Result<WorkspaceSnapshot> {
+    Ok(WorkspaceSnapshot {
+        config: load_config_from_path(config_path)?,
+        session: load_session_from_path(session_path)?,
+    })
 }
 
 fn migrate_config_value(mut value: Value) -> Value {
@@ -286,5 +307,68 @@ fn default_settings_object() -> Map<String, Value> {
     match serde_json::to_value(Settings::default()) {
         Ok(Value::Object(map)) => map,
         _ => Map::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AppConfig, Project};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let path = std::env::temp_dir().join(format!(
+            "devmanager-persistence-tests-{label}-{millis}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn corrupt_session_file_is_deleted_and_defaults_restored() {
+        let temp_dir = temp_test_dir("corrupt-session");
+        let session_path = temp_dir.join("session.json");
+        fs::write(&session_path, "{ invalid json").unwrap();
+
+        let session = load_session_from_path(&session_path).unwrap();
+
+        assert_eq!(session, SessionState::default());
+        assert!(!session_path.exists());
+    }
+
+    #[test]
+    fn load_workspace_keeps_config_when_session_is_corrupt() {
+        let temp_dir = temp_test_dir("workspace-fallback");
+        let config_path = temp_dir.join("config.json");
+        let session_path = temp_dir.join("session.json");
+
+        let mut config = AppConfig::default();
+        config.projects.push(Project {
+            id: "project-1".to_string(),
+            name: "Recovered Project".to_string(),
+            root_path: ".".to_string(),
+            folders: Vec::new(),
+            color: None,
+            pinned: Some(false),
+            notes: None,
+            save_log_files: Some(false),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        save_config_to_path(&config_path, &config).unwrap();
+        fs::write(&session_path, "not valid json").unwrap();
+
+        let snapshot = load_workspace_from_paths(&config_path, &session_path).unwrap();
+
+        assert_eq!(snapshot.config.projects.len(), 1);
+        assert_eq!(snapshot.config.projects[0].name, "Recovered Project");
+        assert_eq!(snapshot.session, SessionState::default());
+        assert!(!session_path.exists());
     }
 }
