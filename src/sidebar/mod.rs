@@ -2,8 +2,8 @@ use crate::models::SessionTab;
 use crate::state::{AppState, RuntimeState, SessionRuntimeState, SessionStatus};
 use crate::{icons, theme};
 use gpui::{
-    anchored, deferred, div, px, rgb, AnyElement, App, Corner, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, SharedString, Styled, Window,
+    anchored, deferred, div, px, rgb, AnyElement, App, Corner, Div, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString, Styled, Window,
 };
 
 const SIDEBAR_WIDTH_PX: f32 = 220.0;
@@ -734,12 +734,7 @@ fn render_single_command_folder_row(
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(status_color(status)))
-                                .child(status_label(status)),
-                        )
+                        .child(status_indicator(status))
                         .child(
                             div()
                                 .flex()
@@ -1242,11 +1237,25 @@ fn status_label(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Stopped => "",
         SessionStatus::Starting => "starting",
-        SessionStatus::Running => "running",
+        SessionStatus::Running => "",
         SessionStatus::Stopping => "stopping",
         SessionStatus::Crashed => "crashed",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
+    }
+}
+
+fn status_indicator(status: SessionStatus) -> Div {
+    if status == SessionStatus::Running {
+        div()
+            .size(px(6.0))
+            .rounded_full()
+            .bg(rgb(status_color(status)))
+    } else {
+        div()
+            .text_xs()
+            .text_color(rgb(status_color(status)))
+            .child(status_label(status))
     }
 }
 

@@ -1,6 +1,5 @@
 use crate::assets::asset_path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::thread;
 
 pub fn play_notification_sound(sound_id: Option<&str>) {
@@ -18,9 +17,8 @@ pub fn play_notification_sound(sound_id: Option<&str>) {
         return;
     }
 
-    let path_str = sound_path.to_string_lossy().to_string();
     thread::spawn(move || {
-        play_wav_file(&path_str);
+        play_wav_file(&sound_path);
     });
 }
 
@@ -32,24 +30,38 @@ fn sound_file_path(sound_id: &str) -> PathBuf {
     asset_path(format!("sounds/{sanitized}.wav"))
 }
 
-fn play_wav_file(path: &str) {
+fn play_wav_file(path: &PathBuf) {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let escaped = path.replace('\'', "''");
-        let script =
-            format!("$p = New-Object System.Media.SoundPlayer '{escaped}'; $p.PlaySync()");
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .output();
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            fn PlaySoundW(psz_sound: *const u16, hmod: *const (), fdw_sound: u32) -> i32;
+        }
+
+        const SND_FILENAME: u32 = 0x0002_0000;
+        const SND_NODEFAULT: u32 = 0x0000_0002;
+        const SND_SYNC: u32 = 0x0000_0000;
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            PlaySoundW(wide.as_ptr(), std::ptr::null(), SND_FILENAME | SND_NODEFAULT | SND_SYNC);
+        }
     }
     #[cfg(target_os = "macos")]
     {
+        use std::process::Command;
         let _ = Command::new("afplay").arg(path).output();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        use std::process::Command;
         let _ = Command::new("aplay").arg("-q").arg(path).output();
     }
 }
