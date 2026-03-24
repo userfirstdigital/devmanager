@@ -9,6 +9,7 @@ const AI_IDLE_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const AI_BACKGROUND_READY_THRESHOLD: Duration = Duration::from_secs(30);
 const AI_FOREGROUND_READY_THRESHOLD: Duration = Duration::from_secs(60);
 const AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE: Duration = Duration::from_secs(2);
+const AI_NOTIFICATION_CONFIRM_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionStatus {
@@ -208,6 +209,7 @@ pub struct SessionRuntimeState {
     suppress_activity_until: Option<Instant>,
     last_output_event_at: Option<Instant>,
     output_burst_count: u8,
+    pending_notification: Option<(Instant, AiIdleTransition)>,
 }
 
 impl SessionRuntimeState {
@@ -251,6 +253,7 @@ impl SessionRuntimeState {
             suppress_activity_until: None,
             last_output_event_at: None,
             output_burst_count: 0,
+            pending_notification: None,
         }
     }
 
@@ -289,6 +292,7 @@ impl SessionRuntimeState {
             return;
         }
 
+        self.pending_notification = None;
         self.last_output_at = Some(now);
         self.output_burst_count = match self.last_output_event_at {
             Some(previous) if now.duration_since(previous) <= AI_ACTIVITY_BURST_WINDOW => {
@@ -365,6 +369,7 @@ impl SessionRuntimeState {
             self.suppress_activity_until = None;
             self.last_output_event_at = None;
             self.output_burst_count = 0;
+            self.pending_notification = None;
         }
         self.mark_dirty();
     }
@@ -384,6 +389,7 @@ impl SessionRuntimeState {
             self.ai_activity = Some(AiActivity::Idle);
             self.thinking_since = None;
             self.unseen_ready = false;
+            self.pending_notification = None;
             self.suppress_ai_activity_until(now + AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE);
         } else {
             self.suppress_activity_until = None;
@@ -408,6 +414,7 @@ impl SessionRuntimeState {
         self.tab_id = None;
         self.unseen_ready = false;
         self.suppress_activity_until = None;
+        self.pending_notification = None;
         self.mark_dirty();
     }
 
@@ -427,6 +434,7 @@ impl SessionRuntimeState {
         self.suppress_activity_until = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
+        self.pending_notification = None;
         self.mark_dirty();
     }
 
@@ -446,6 +454,7 @@ impl SessionRuntimeState {
         self.suppress_activity_until = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
+        self.pending_notification = None;
         self.mark_dirty();
     }
 
@@ -484,15 +493,37 @@ impl SessionRuntimeState {
         self.last_output_event_at = None;
         self.output_burst_count = 0;
 
-        if is_background && thinking_duration >= AI_BACKGROUND_READY_THRESHOLD {
+        let transition = if is_background && thinking_duration >= AI_BACKGROUND_READY_THRESHOLD {
             self.unseen_ready = true;
-            self.mark_dirty();
-            return AiIdleTransition::BackgroundReady;
-        }
+            AiIdleTransition::BackgroundReady
+        } else if !is_background && thinking_duration >= AI_FOREGROUND_READY_THRESHOLD {
+            AiIdleTransition::ForegroundReady
+        } else {
+            AiIdleTransition::NoChange
+        };
 
         self.mark_dirty();
-        if !is_background && thinking_duration >= AI_FOREGROUND_READY_THRESHOLD {
-            AiIdleTransition::ForegroundReady
+
+        if transition != AiIdleTransition::NoChange {
+            self.pending_notification = Some((now, transition));
+        }
+
+        AiIdleTransition::NoChange
+    }
+
+    pub fn check_pending_notification(&mut self, now: Instant) -> AiIdleTransition {
+        let Some((deferred_at, transition)) = self.pending_notification else {
+            return AiIdleTransition::NoChange;
+        };
+
+        if now.duration_since(deferred_at) < AI_NOTIFICATION_CONFIRM_DELAY {
+            return AiIdleTransition::NoChange;
+        }
+
+        self.pending_notification = None;
+
+        if self.ai_activity == Some(AiActivity::Idle) {
+            transition
         } else {
             AiIdleTransition::NoChange
         }
@@ -650,14 +681,16 @@ mod tests {
         session.note_output_activity_at(base + Duration::from_millis(200));
         session.note_output_activity_at(base + Duration::from_millis(300));
 
-        let transition = session.reconcile_ai_idle(
-            Some("different-session"),
-            base + AI_BACKGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD,
-        );
+        let idle_at = base + AI_BACKGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD;
+        let transition = session.reconcile_ai_idle(Some("different-session"), idle_at);
 
-        assert_eq!(transition, AiIdleTransition::BackgroundReady);
+        assert_eq!(transition, AiIdleTransition::NoChange);
         assert_eq!(session.ai_activity, Some(AiActivity::Idle));
         assert!(session.unseen_ready);
+        assert!(session.pending_notification.is_some());
+
+        let confirmed = session.check_pending_notification(idle_at + AI_NOTIFICATION_CONFIRM_DELAY);
+        assert_eq!(confirmed, AiIdleTransition::BackgroundReady);
     }
 
     #[test]
@@ -670,13 +703,58 @@ mod tests {
         session.note_output_activity_at(base + Duration::from_millis(200));
         session.note_output_activity_at(base + Duration::from_millis(300));
 
-        let transition = session.reconcile_ai_idle(
-            Some(session_id.as_str()),
-            base + AI_FOREGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD,
-        );
+        let idle_at = base + AI_FOREGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD;
+        let transition = session.reconcile_ai_idle(Some(session_id.as_str()), idle_at);
 
-        assert_eq!(transition, AiIdleTransition::ForegroundReady);
+        assert_eq!(transition, AiIdleTransition::NoChange);
         assert_eq!(session.ai_activity, Some(AiActivity::Idle));
         assert!(!session.unseen_ready);
+        assert!(session.pending_notification.is_some());
+
+        let confirmed = session.check_pending_notification(idle_at + AI_NOTIFICATION_CONFIRM_DELAY);
+        assert_eq!(confirmed, AiIdleTransition::ForegroundReady);
+    }
+
+    #[test]
+    fn pending_notification_cancelled_when_ai_resumes() {
+        let mut session = test_ai_session();
+        let base = Instant::now();
+
+        session.note_output_activity_at(base + Duration::from_millis(100));
+        session.note_output_activity_at(base + Duration::from_millis(200));
+        session.note_output_activity_at(base + Duration::from_millis(300));
+
+        let idle_at = base + AI_BACKGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD;
+        session.reconcile_ai_idle(Some("different-session"), idle_at);
+        assert!(session.pending_notification.is_some());
+
+        // AI resumes output — pending notification should be cancelled
+        let resume_at = idle_at + Duration::from_secs(1);
+        session.note_output_activity_at(resume_at);
+        session.note_output_activity_at(resume_at + Duration::from_millis(10));
+        session.note_output_activity_at(resume_at + Duration::from_millis(20));
+        assert!(session.pending_notification.is_none());
+
+        let confirmed = session.check_pending_notification(idle_at + AI_NOTIFICATION_CONFIRM_DELAY);
+        assert_eq!(confirmed, AiIdleTransition::NoChange);
+    }
+
+    #[test]
+    fn pending_notification_not_returned_before_delay() {
+        let mut session = test_ai_session();
+        let base = Instant::now();
+
+        session.note_output_activity_at(base + Duration::from_millis(100));
+        session.note_output_activity_at(base + Duration::from_millis(200));
+        session.note_output_activity_at(base + Duration::from_millis(300));
+
+        let idle_at = base + AI_BACKGROUND_READY_THRESHOLD + AI_IDLE_GRACE_PERIOD;
+        session.reconcile_ai_idle(Some("different-session"), idle_at);
+
+        // Check too early — should not fire
+        let too_early = idle_at + Duration::from_secs(1);
+        let confirmed = session.check_pending_notification(too_early);
+        assert_eq!(confirmed, AiIdleTransition::NoChange);
+        assert!(session.pending_notification.is_some());
     }
 }

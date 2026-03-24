@@ -1,5 +1,5 @@
-use std::ffi::OsStr;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 #[cfg(not(windows))]
@@ -169,7 +169,8 @@ pub fn collect_descendant_process_identities_with_system(
         for (candidate_pid, process) in system.processes() {
             if process.parent() == Some(parent_pid) && visited.insert(*candidate_pid) {
                 queue.push(*candidate_pid);
-                if let Some(identity) = process_identity_with_system(system, candidate_pid.as_u32()) {
+                if let Some(identity) = process_identity_with_system(system, candidate_pid.as_u32())
+                {
                     descendants.push(identity);
                 }
             }

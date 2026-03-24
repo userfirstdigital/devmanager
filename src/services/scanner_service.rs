@@ -17,6 +17,9 @@ const ROOT_SCAN_SKIP_DIRS: &[&str] = &[
     "target",
     ".next",
     ".nuxt",
+    "zz-archive",
+    "archive",
+    "archives",
 ];
 
 const AUTO_SELECTED_SCRIPT_NAMES: &[&str] = &["dev", "start", "serve", "cargo run", "tauri dev"];
@@ -146,6 +149,41 @@ pub fn auto_selected_script_names(scripts: &[ScannedScript]) -> Vec<String> {
 }
 
 pub fn auto_selected_port_variable(ports: &[ScannedPort]) -> Option<String> {
+    if let Some(port) = ports
+        .iter()
+        .find(|port| port.variable.eq_ignore_ascii_case("PORT"))
+    {
+        return Some(port.variable.clone());
+    }
+
+    const PREFERRED_VARIABLES: &[&str] = &[
+        "APP_PORT",
+        "SERVER_PORT",
+        "API_PORT",
+        "WEB_PORT",
+        "DEV_PORT",
+        "VITE_DEV_PORT",
+        "FRONTEND_PORT",
+        "BACKEND_PORT",
+    ];
+
+    for preferred in PREFERRED_VARIABLES {
+        if let Some(port) = ports
+            .iter()
+            .find(|port| port.variable.eq_ignore_ascii_case(preferred))
+        {
+            return Some(port.variable.clone());
+        }
+    }
+
+    let primary_ports: Vec<&ScannedPort> = ports
+        .iter()
+        .filter(|port| !is_auxiliary_port_variable(&port.variable))
+        .collect();
+    if primary_ports.len() == 1 {
+        return primary_ports.first().map(|port| port.variable.clone());
+    }
+
     if ports.len() == 1 {
         ports.first().map(|port| port.variable.clone())
     } else {
@@ -255,40 +293,13 @@ fn scan_dir_recursive(
     let has_cargo_toml = cargo_toml.exists();
 
     if (has_package_json || has_cargo_toml) && dir != root {
-        let mut scripts = Vec::new();
-        if has_package_json {
-            scripts.extend(read_package_scripts(&package_json)?);
-        }
-        if has_cargo_toml {
-            scripts.extend(read_cargo_scripts(&cargo_toml)?);
-        }
-        scripts.sort_by(|left, right| {
-            left.name
-                .cmp(&right.name)
-                .then(left.command.cmp(&right.command))
-        });
-        scripts.dedup_by(|left, right| left.name == right.name && left.command == right.command);
-
-        let ports = scan_env_ports(dir)?;
-        let name = dir
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let project_type = match (has_package_json, has_cargo_toml) {
-            (true, true) => "both",
-            (false, true) => "rust",
-            _ => "node",
-        }
-        .to_string();
-
-        entries.push(RootScanEntry {
-            path: dir.to_string_lossy().to_string(),
-            name,
-            has_env: default_env_file_for_dir(dir).is_some(),
-            project_type,
-            scripts,
-            ports,
-        });
+        entries.push(build_root_scan_entry(
+            dir,
+            has_package_json,
+            has_cargo_toml,
+            &package_json,
+            &cargo_toml,
+        ));
     }
 
     let Ok(read_dir) = std::fs::read_dir(dir) else {
@@ -312,6 +323,80 @@ fn scan_dir_recursive(
     }
 
     Ok(())
+}
+
+fn build_root_scan_entry(
+    dir: &Path,
+    has_package_json: bool,
+    has_cargo_toml: bool,
+    package_json: &Path,
+    cargo_toml: &Path,
+) -> RootScanEntry {
+    let mut scripts = Vec::new();
+    if has_package_json {
+        if let Ok(found_scripts) = read_package_scripts(package_json) {
+            scripts.extend(found_scripts);
+        }
+    }
+    if has_cargo_toml {
+        if let Ok(found_scripts) = read_cargo_scripts(cargo_toml) {
+            scripts.extend(found_scripts);
+        }
+    }
+    scripts.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.command.cmp(&right.command))
+    });
+    scripts.dedup_by(|left, right| left.name == right.name && left.command == right.command);
+
+    let name = dir
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let project_type = match (has_package_json, has_cargo_toml) {
+        (true, true) => "both",
+        (false, true) => "rust",
+        _ => "node",
+    }
+    .to_string();
+
+    RootScanEntry {
+        path: dir.to_string_lossy().to_string(),
+        name,
+        has_env: default_env_file_for_dir(dir).is_some(),
+        project_type,
+        scripts,
+        ports: scan_env_ports(dir).unwrap_or_default(),
+    }
+}
+
+fn is_auxiliary_port_variable(variable: &str) -> bool {
+    const AUXILIARY_VARIABLES: &[&str] = &[
+        "DATABASE_PORT",
+        "PGPORT",
+        "POSTGRES_PORT",
+        "MYSQL_PORT",
+        "MONGO_PORT",
+        "REDIS_PORT",
+        "SMTP_PORT",
+        "MAIL_PORT",
+        "SSH_PORT",
+        "FTP_PORT",
+        "S3_PORT",
+        "AMQP_PORT",
+        "RABBITMQ_PORT",
+    ];
+    const AUXILIARY_TOKENS: &[&str] = &[
+        "DATABASE", "DB", "POSTGRES", "MYSQL", "MONGO", "REDIS", "SMTP", "MAIL", "SSH", "FTP",
+        "S3", "AMQP", "RABBITMQ",
+    ];
+
+    let normalized = variable.to_ascii_uppercase();
+    AUXILIARY_VARIABLES.contains(&normalized.as_str())
+        || normalized
+            .split('_')
+            .any(|token| AUXILIARY_TOKENS.contains(&token))
 }
 
 fn scan_env_ports(dir: &Path) -> Result<Vec<ScannedPort>, String> {

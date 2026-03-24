@@ -265,7 +265,9 @@ fn render_project_group(
         .folders
         .iter()
         .filter(|folder| !folder.hidden.unwrap_or(false))
-        .map(|folder| render_folder_group(state, runtime, project, folder, project_accent, actions));
+        .map(|folder| {
+            render_folder_group(state, runtime, project, folder, project_accent, actions)
+        });
     let ai_launch_row = div()
         .flex()
         .items_center()
@@ -439,9 +441,8 @@ fn render_ai_row(
     let status_label = ai_status_label(session);
     let status_color = ai_status_color(session, tab);
     let show_ready_light = ai_ready_light_visible(session);
-    let is_thinking = session.is_some_and(|s| {
-        matches!(s.ai_activity, Some(crate::state::AiActivity::Thinking))
-    });
+    let is_thinking =
+        session.is_some_and(|s| matches!(s.ai_activity, Some(crate::state::AiActivity::Thinking)));
     let icon_opacity = if is_thinking {
         let elapsed_ms = session
             .and_then(|s| s.thinking_since)
@@ -474,77 +475,73 @@ fn render_ai_row(
         row = row.border_l_2().border_color(rgb(project_accent));
     }
 
-    row
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    (actions.on_select_ai_tab)(tab.id.clone()),
-                )
-                .child(
-                    div().opacity(icon_opacity).child(match tab.tab_type {
-                        crate::models::TabType::Claude => {
-                            icons::app_icon(icons::SPARKLES, 10.0, status_color).into_any_element()
-                        }
-                        crate::models::TabType::Codex => {
-                            icons::app_icon(icons::BOT, 10.0, status_color).into_any_element()
-                        }
-                        _ => div()
-                            .size(px(6.0))
-                            .rounded_full()
-                            .bg(rgb(status_color))
-                            .into_any_element(),
-                    }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(SharedString::from(label)),
-                ),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .children(show_ready_light.then(|| {
-                    div()
+    row.child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                (actions.on_select_ai_tab)(tab.id.clone()),
+            )
+            .child(
+                div().opacity(icon_opacity).child(match tab.tab_type {
+                    crate::models::TabType::Claude => {
+                        icons::app_icon(icons::SPARKLES, 10.0, status_color).into_any_element()
+                    }
+                    crate::models::TabType::Codex => {
+                        icons::app_icon(icons::BOT, 10.0, status_color).into_any_element()
+                    }
+                    _ => div()
                         .size(px(6.0))
                         .rounded_full()
-                        .bg(rgb(theme::SUCCESS_TEXT))
-                        .into_any_element()
-                }))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(status_color))
-                        .child(status_label),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .opacity(0.0)
-                        .group_hover("ai-row", |s| s.opacity(1.0))
-                        .children(session.is_some().then(|| {
-                            row_icon_action(icons::X, (actions.on_close_ai_tab)(tab.id.clone()))
-                        }))
-                        .children(session.is_none().then(|| {
-                            row_icon_action(
-                                icons::PLAY,
-                                (actions.on_restart_ai_tab)(tab.id.clone()),
-                            )
-                        })),
-                ),
-        )
+                        .bg(rgb(status_color))
+                        .into_any_element(),
+                }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(SharedString::from(label)),
+            ),
+    )
+    .child(
+        div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .children(show_ready_light.then(|| {
+                div()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(rgb(theme::SUCCESS_TEXT))
+                    .into_any_element()
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(status_color))
+                    .child(status_label),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .opacity(0.0)
+                    .group_hover("ai-row", |s| s.opacity(1.0))
+                    .children(session.is_some().then(|| {
+                        row_icon_action(icons::X, (actions.on_close_ai_tab)(tab.id.clone()))
+                    }))
+                    .children(session.is_none().then(|| {
+                        row_icon_action(icons::PLAY, (actions.on_restart_ai_tab)(tab.id.clone()))
+                    })),
+            ),
+    )
 }
 
 fn render_folder_group(
@@ -568,10 +565,17 @@ fn render_folder_group(
         .into_any_element();
     }
 
-    let command_rows = folder
-        .commands
-        .iter()
-        .map(|command| render_command_row(state, runtime, project, folder, command, project_accent, actions));
+    let command_rows = folder.commands.iter().map(|command| {
+        render_command_row(
+            state,
+            runtime,
+            project,
+            folder,
+            command,
+            project_accent,
+            actions,
+        )
+    });
 
     let menu_open = matches!(
         actions.open_context_menu,

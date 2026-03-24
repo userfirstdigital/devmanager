@@ -39,3 +39,4 @@ serviceAccountKey.json
 /target-live
 /target-watch
 /target-test
+/target-scan

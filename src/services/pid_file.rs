@@ -281,8 +281,9 @@ fn active_processes_in_record_with<F>(
 where
     F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
 {
-    let root_live = tracked_process_identity_state_with(&root_process_identity(entry), identify_process)
-        == TrackedProcessState::VerifiedRunning;
+    let root_live =
+        tracked_process_identity_state_with(&root_process_identity(entry), identify_process)
+            == TrackedProcessState::VerifiedRunning;
     let live_descendants = entry
         .descendant_processes
         .iter()
@@ -301,10 +302,7 @@ where
     }
 }
 
-fn active_pids_in_record_with<F>(
-    entry: &ManagedProcessRecord,
-    identify_process: &mut F,
-) -> Vec<u32>
+fn active_pids_in_record_with<F>(entry: &ManagedProcessRecord, identify_process: &mut F) -> Vec<u32>
 where
     F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
 {
@@ -315,7 +313,8 @@ where
         pids.push(entry.pid);
     }
     pids.extend(
-        entry.descendant_processes
+        entry
+            .descendant_processes
             .iter()
             .filter(|identity| {
                 tracked_process_identity_state_with(identity, identify_process)
@@ -331,7 +330,12 @@ where
 fn tracked_pids_for_record(entry: &ManagedProcessRecord) -> Vec<u32> {
     let mut pids = Vec::with_capacity(entry.descendant_processes.len() + 1);
     pids.push(entry.pid);
-    pids.extend(entry.descendant_processes.iter().map(|identity| identity.pid));
+    pids.extend(
+        entry
+            .descendant_processes
+            .iter()
+            .map(|identity| identity.pid),
+    );
     pids.sort_unstable();
     pids.dedup();
     pids
@@ -362,7 +366,10 @@ where
     pids
 }
 
-fn prune_inactive_entries_with_path<F>(path: &Path, mut identify_process: F) -> Result<usize, String>
+fn prune_inactive_entries_with_path<F>(
+    path: &Path,
+    mut identify_process: F,
+) -> Result<usize, String>
 where
     F: FnMut(u32) -> Option<platform_service::ProcessIdentity>,
 {
@@ -395,10 +402,12 @@ fn cleanup_orphaned_processes_with_path<F, G>(
 
     let mut retained = BTreeMap::new();
     for (session_id, entry) in ledger.sessions {
-        let root_live =
-            tracked_process_identity_state_with(&root_process_identity(&entry), &mut identify_process)
-                == TrackedProcessState::VerifiedRunning;
-        let Some(active_entry) = active_processes_in_record_with(&entry, &mut identify_process) else {
+        let root_live = tracked_process_identity_state_with(
+            &root_process_identity(&entry),
+            &mut identify_process,
+        ) == TrackedProcessState::VerifiedRunning;
+        let Some(active_entry) = active_processes_in_record_with(&entry, &mut identify_process)
+        else {
             continue;
         };
 
@@ -531,7 +540,9 @@ pub fn active_tracked_pids_for_session(session_id: &str) -> Vec<u32> {
         .sessions
         .into_values()
         .filter(|entry| entry.session_id == session_id)
-        .flat_map(|entry| active_pids_in_record_with(&entry, &mut platform_service::capture_process_identity))
+        .flat_map(|entry| {
+            active_pids_in_record_with(&entry, &mut platform_service::capture_process_identity)
+        })
         .collect();
     pids.sort_unstable();
     pids.dedup();
@@ -826,7 +837,10 @@ mod tests {
         };
         write_ledger_to_path(&path, &ledger).unwrap();
 
-        let running = RefCell::new(BTreeMap::from([(21, identity(21, 210)), (22, identity(22, 220))]));
+        let running = RefCell::new(BTreeMap::from([
+            (21, identity(21, 210)),
+            (22, identity(22, 220)),
+        ]));
         let mut killed = Vec::new();
         cleanup_orphaned_processes_with_path(
             &path,

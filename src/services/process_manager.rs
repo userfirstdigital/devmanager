@@ -915,7 +915,9 @@ impl ProcessManager {
         };
 
         if !self.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
-            return Err(format!("Managed process `{command_id}` did not stop cleanly."));
+            return Err(format!(
+                "Managed process `{command_id}` did not stop cleanly."
+            ));
         }
         self.set_active_session(command_id.clone());
         app_state.open_server_tab(&project_id, &command_id, Some(command_label));
@@ -1630,26 +1632,25 @@ fn reconcile_ai_activity(inner: &ProcessManagerInner) {
         .read()
         .map(|sound| sound.clone())
         .unwrap_or(None);
-    let mut transitions = Vec::new();
+    let mut should_notify = false;
     let now = Instant::now();
 
     if let Ok(mut runtime) = inner.runtime_state.write() {
         let active_session_id = runtime.active_session_id.clone();
-        for (session_id, session) in &mut runtime.sessions {
-            match session.reconcile_ai_idle(active_session_id.as_deref(), now) {
+        for (_session_id, session) in &mut runtime.sessions {
+            session.reconcile_ai_idle(active_session_id.as_deref(), now);
+
+            match session.check_pending_notification(now) {
+                AiIdleTransition::BackgroundReady | AiIdleTransition::ForegroundReady => {
+                    should_notify = true;
+                }
                 AiIdleTransition::NoChange => {}
-                transition => transitions.push((session_id.clone(), transition)),
             }
         }
     }
 
-    for (_, transition) in transitions {
-        if matches!(
-            transition,
-            AiIdleTransition::BackgroundReady | AiIdleTransition::ForegroundReady
-        ) {
-            notifications::play_notification_sound(notification_sound.as_deref());
-        }
+    if should_notify {
+        notifications::play_notification_sound(notification_sound.as_deref());
     }
 }
 

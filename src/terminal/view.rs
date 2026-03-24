@@ -140,7 +140,8 @@ pub fn render_terminal_surface(
         )
         .into_any_element()
     } else {
-        render_empty_body(empty_surface_message(model), model.splash_image.clone()).into_any_element()
+        render_empty_body(empty_surface_message(model), model.splash_image.clone())
+            .into_any_element()
     };
 
     div()

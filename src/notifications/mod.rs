@@ -51,7 +51,11 @@ fn play_wav_file(path: &PathBuf) {
             .collect();
 
         unsafe {
-            PlaySoundW(wide.as_ptr(), std::ptr::null(), SND_FILENAME | SND_NODEFAULT | SND_SYNC);
+            PlaySoundW(
+                wide.as_ptr(),
+                std::ptr::null(),
+                SND_FILENAME | SND_NODEFAULT | SND_SYNC,
+            );
         }
     }
     #[cfg(target_os = "macos")]

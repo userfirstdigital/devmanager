@@ -69,11 +69,7 @@ pub fn run() {
                     WindowBounds::Windowed(bounds)
                 }
             } else {
-                WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1440.0), px(920.0)),
-                    cx,
-                ))
+                WindowBounds::Windowed(Bounds::centered(None, size(px(1440.0), px(920.0)), cx))
             };
 
             cx.open_window(
@@ -292,9 +288,7 @@ impl NativeShell {
             move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut async_cx = cx.clone();
                 async move {
-                    let image = executor
-                        .spawn(async move { fetch_splash_image() })
-                        .await;
+                    let image = executor.spawn(async move { fetch_splash_image() }).await;
                     let _ = this.update(&mut async_cx, |shell, cx| {
                         shell.splash_fetch_in_flight = false;
                         if let Some(image) = image {
@@ -799,33 +793,28 @@ impl NativeShell {
     }
 
     fn wizard_create_action(&mut self, cx: &mut Context<Self>) {
+        let Some(wizard) = self.add_project_wizard.as_ref() else {
+            return;
+        };
+        if wizard.root_path.trim().is_empty() {
+            self.editor_notice = Some("Project root path is required".to_string());
+            cx.notify();
+            return;
+        }
+
         let Some(wizard) = self.add_project_wizard.take() else {
             return;
         };
-        let name = if wizard.name.is_empty() {
-            "My App".to_string()
-        } else {
-            wizard.name
-        };
+        let project = build_project_from_wizard(wizard);
+        let project_name = project.name.clone();
 
-        self.open_editor(
-            EditorPanel::Project(ProjectDraft {
-                existing_id: None,
-                name,
-                root_path: wizard.root_path,
-                color: wizard.color,
-                pinned: false,
-                save_log_files: true,
-                notes: String::new(),
-                scan_entries: wizard.scan_entries,
-                selected_folder_paths: wizard.selected_folders,
-                selected_scripts: wizard.selected_scripts,
-                selected_port_variables: wizard.selected_port_variables,
-                scan_message: None,
-                is_scanning: false,
-            }),
-            cx,
-        );
+        self.state.upsert_project(project);
+        self.save_config_state();
+        self.save_session_state();
+        if self.editor_notice.is_none() {
+            self.editor_notice = Some(format!("Created project `{project_name}`"));
+        }
+        cx.notify();
     }
 
     fn wizard_pick_root_folder(&mut self, cx: &mut Context<Self>) {
@@ -838,21 +827,37 @@ impl NativeShell {
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Auto-scan the picked folder
-        let scan_entries = scanner_service::scan_root(&root_path).unwrap_or_default();
-        let selected_folders: std::collections::BTreeSet<String> = scan_entries
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
-
         if let Some(wizard) = self.add_project_wizard.as_mut() {
             wizard.root_path = root_path;
             if wizard.name.trim().is_empty() {
                 wizard.name = default_name;
                 wizard.cursor = wizard.name.len();
             }
-            wizard.scan_entries = scan_entries;
-            wizard.selected_folders = selected_folders;
+            wizard.selected_scripts.clear();
+            wizard.selected_port_variables.clear();
+
+            match scanner_service::scan_root(&wizard.root_path) {
+                Ok(scan_entries) => {
+                    let selected_folders: std::collections::BTreeSet<String> = scan_entries
+                        .iter()
+                        .map(|entry| entry.path.clone())
+                        .collect();
+                    let count = scan_entries.len();
+
+                    wizard.scan_entries = scan_entries;
+                    wizard.selected_folders = selected_folders;
+                    wizard.scan_message = Some(if count == 0 {
+                        "No sub-folders with package.json or Cargo.toml were found.".to_string()
+                    } else {
+                        format!("Discovered {count} folder(s). Open Configure to review scripts and ports.")
+                    });
+                }
+                Err(error) => {
+                    wizard.scan_entries.clear();
+                    wizard.selected_folders.clear();
+                    wizard.scan_message = Some(error);
+                }
+            }
             cx.notify();
         }
     }
@@ -868,12 +873,6 @@ impl NativeShell {
                     pinned: project.pinned.unwrap_or(false),
                     save_log_files: project.save_log_files.unwrap_or(true),
                     notes: project.notes.unwrap_or_default(),
-                    scan_entries: Vec::new(),
-                    selected_folder_paths: Default::default(),
-                    selected_scripts: Default::default(),
-                    selected_port_variables: Default::default(),
-                    scan_message: None,
-                    is_scanning: false,
                 }),
                 cx,
             );
@@ -894,12 +893,6 @@ impl NativeShell {
                     pinned: project.pinned.unwrap_or(false),
                     save_log_files: project.save_log_files.unwrap_or(true),
                     notes: project.notes.unwrap_or_default(),
-                    scan_entries: Vec::new(),
-                    selected_folder_paths: Default::default(),
-                    selected_scripts: Default::default(),
-                    selected_port_variables: Default::default(),
-                    scan_message: None,
-                    is_scanning: false,
                 }),
                 EditorField::Project(workspace::ProjectField::Notes),
                 cx,
@@ -987,138 +980,6 @@ impl NativeShell {
             );
         } else {
             self.editor_notice = Some(format!("Unknown folder `{folder_id}`"));
-            cx.notify();
-        }
-    }
-
-    fn pick_project_root_action(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = FileDialog::new().pick_folder() else {
-            return;
-        };
-        let root_path = path.to_string_lossy().to_string();
-        let default_name = path
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
-            draft.root_path = root_path.clone();
-            if draft.name.trim().is_empty() {
-                draft.name = default_name;
-            }
-            draft.scan_message = Some(format!("Picked root folder `{root_path}`"));
-            cx.notify();
-        }
-    }
-
-    fn scan_project_root_action(&mut self, cx: &mut Context<Self>) {
-        let root_path = match self.editor_panel.as_ref() {
-            Some(EditorPanel::Project(draft)) if !draft.root_path.trim().is_empty() => {
-                draft.root_path.trim().to_string()
-            }
-            _ => {
-                self.editor_notice =
-                    Some("Choose a project root path before scanning.".to_string());
-                cx.notify();
-                return;
-            }
-        };
-
-        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
-            draft.is_scanning = true;
-            draft.scan_message = Some(format!("Scanning `{root_path}`..."));
-        }
-        cx.notify();
-
-        let scan_result = scanner_service::scan_root(&root_path);
-        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
-            draft.is_scanning = false;
-            match scan_result {
-                Ok(entries) => {
-                    let mut selected_folder_paths = std::collections::BTreeSet::new();
-                    let mut selected_scripts = HashMap::new();
-                    let mut selected_port_variables = HashMap::new();
-
-                    for entry in &entries {
-                        selected_folder_paths.insert(entry.path.clone());
-                        selected_scripts.insert(
-                            entry.path.clone(),
-                            scanner_service::auto_selected_script_names(&entry.scripts)
-                                .into_iter()
-                                .collect(),
-                        );
-                        selected_port_variables.insert(
-                            entry.path.clone(),
-                            scanner_service::auto_selected_port_variable(&entry.ports),
-                        );
-                    }
-
-                    let count = entries.len();
-                    draft.scan_entries = entries;
-                    draft.selected_folder_paths = selected_folder_paths;
-                    draft.selected_scripts = selected_scripts;
-                    draft.selected_port_variables = selected_port_variables;
-                    draft.scan_message = Some(if count == 0 {
-                        "No sub-folders with package.json or Cargo.toml were found. You can still create the project and add folders manually.".to_string()
-                    } else {
-                        format!(
-                            "Discovered {count} folder(s). Default dev/start/serve scripts were pre-selected."
-                        )
-                    });
-                }
-                Err(error) => {
-                    draft.scan_entries.clear();
-                    draft.selected_folder_paths.clear();
-                    draft.selected_scripts.clear();
-                    draft.selected_port_variables.clear();
-                    draft.scan_message = Some(error);
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    fn toggle_project_scan_folder_action(&mut self, folder_path: &str, cx: &mut Context<Self>) {
-        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
-            if draft.selected_folder_paths.contains(folder_path) {
-                draft.selected_folder_paths.remove(folder_path);
-            } else {
-                draft.selected_folder_paths.insert(folder_path.to_string());
-            }
-            cx.notify();
-        }
-    }
-
-    fn toggle_project_scan_script_action(
-        &mut self,
-        folder_path: &str,
-        script_name: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
-            let entry = draft
-                .selected_scripts
-                .entry(folder_path.to_string())
-                .or_default();
-            if entry.contains(script_name) {
-                entry.remove(script_name);
-            } else {
-                entry.insert(script_name.to_string());
-            }
-            cx.notify();
-        }
-    }
-
-    fn select_project_port_variable_action(
-        &mut self,
-        folder_path: &str,
-        variable: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
-            draft
-                .selected_port_variables
-                .insert(folder_path.to_string(), variable);
             cx.notify();
         }
     }
@@ -1521,28 +1382,7 @@ impl NativeShell {
                     .as_deref()
                     .and_then(|id| self.state.find_project(id))
                     .cloned();
-                let timestamp = current_timestamp_string();
-                let project = Project {
-                    id: draft
-                        .existing_id
-                        .clone()
-                        .unwrap_or_else(|| next_entity_id("project")),
-                    name: draft.name.trim().to_string(),
-                    root_path: draft.root_path.trim().to_string(),
-                    folders: existing
-                        .as_ref()
-                        .map(|project| project.folders.clone())
-                        .unwrap_or_else(|| build_project_folders_from_scan(&draft)),
-                    color: normalize_optional_string(&draft.color),
-                    pinned: Some(draft.pinned),
-                    notes: normalize_optional_string(&draft.notes),
-                    save_log_files: Some(draft.save_log_files),
-                    created_at: existing
-                        .as_ref()
-                        .map(|project| project.created_at.clone())
-                        .unwrap_or_else(|| timestamp.clone()),
-                    updated_at: timestamp,
-                };
+                let project = build_project_from_draft(&draft, existing.as_ref());
                 self.state.upsert_project(project);
                 self.save_config_state();
                 self.save_session_state();
@@ -1923,19 +1763,6 @@ impl NativeShell {
             EditorAction::Save => self.save_editor_action(cx),
             EditorAction::Delete => self.delete_editor_action(cx),
             EditorAction::Close => self.close_editor(cx),
-            EditorAction::PickProjectRoot => self.pick_project_root_action(cx),
-            EditorAction::ScanProjectRoot => self.scan_project_root_action(cx),
-            EditorAction::ToggleProjectScanFolder(folder_path) => {
-                self.toggle_project_scan_folder_action(&folder_path, cx)
-            }
-            EditorAction::ToggleProjectScanScript {
-                folder_path,
-                script_name,
-            } => self.toggle_project_scan_script_action(&folder_path, &script_name, cx),
-            EditorAction::SelectProjectPortVariable {
-                folder_path,
-                variable,
-            } => self.select_project_port_variable_action(&folder_path, variable, cx),
             EditorAction::PickFolderPath => self.pick_folder_path_action(cx),
             EditorAction::ScanFolderPath => self.scan_folder_path_action(cx),
             EditorAction::ToggleFolderScanScript(script_name) => {
@@ -2773,10 +2600,11 @@ impl NativeShell {
                             return;
                         }
 
-                        match this
-                            .process_manager
-                            .start_server(&mut this.state, &command_id, dimensions)
-                        {
+                        match this.process_manager.start_server(
+                            &mut this.state,
+                            &command_id,
+                            dimensions,
+                        ) {
                             Ok(()) => {
                                 this.synced_session_id = Some(command_id.clone());
                                 this.terminal_notice = None;
@@ -3437,7 +3265,9 @@ impl NativeShell {
                             let _ = self.process_manager.paste_to_session(&session_id, &text);
                         }
                         Some(TerminalClipboardPayload::RawBytes(bytes)) => {
-                            let _ = self.process_manager.write_bytes_to_session(&session_id, &bytes);
+                            let _ = self
+                                .process_manager
+                                .write_bytes_to_session(&session_id, &bytes);
                         }
                         None => {}
                     }
@@ -4128,12 +3958,11 @@ impl Render for NativeShell {
         if updater_snapshot.is_busy() {
             window.request_animation_frame();
         }
-        if runtime_snapshot.sessions.values().any(|s| {
-            matches!(
-                s.ai_activity,
-                Some(crate::state::AiActivity::Thinking)
-            )
-        }) {
+        if runtime_snapshot
+            .sessions
+            .values()
+            .any(|s| matches!(s.ai_activity, Some(crate::state::AiActivity::Thinking)))
+        {
             window.request_animation_frame();
         }
 
@@ -4592,10 +4421,7 @@ fn terminal_endpoint_for_mouse(
     })
 }
 
-fn translate_key_event(
-    event: &KeyDownEvent,
-    context: TerminalBindingContext,
-) -> TerminalKeyAction {
+fn translate_key_event(event: &KeyDownEvent, context: TerminalBindingContext) -> TerminalKeyAction {
     if let Some(action) = terminal_binding_action(&event.keystroke, context) {
         return action;
     }
@@ -4776,10 +4602,7 @@ impl TerminalShortcut {
                     && !modifiers.alt
             }
             Self::ShiftOnly => {
-                modifiers.shift
-                    && !modifiers.control
-                    && !modifiers.platform
-                    && !modifiers.alt
+                modifiers.shift && !modifiers.control && !modifiers.platform && !modifiers.alt
             }
         }
     }
@@ -5372,21 +5195,21 @@ fn next_entity_id(prefix: &str) -> String {
     format!("{prefix}-{millis:x}-{counter:x}")
 }
 
-fn build_project_folders_from_scan(draft: &ProjectDraft) -> Vec<ProjectFolder> {
-    draft
-        .scan_entries
+fn build_project_folders_from_selection(
+    scan_entries: &[crate::models::RootScanEntry],
+    selected_folder_paths: &std::collections::BTreeSet<String>,
+    selected_scripts: &HashMap<String, std::collections::BTreeSet<String>>,
+    selected_port_variables: &HashMap<String, Option<String>>,
+) -> Vec<ProjectFolder> {
+    scan_entries
         .iter()
         .map(|entry| {
-            let selected_names = draft
-                .selected_scripts
+            let selected_names = selected_scripts
                 .get(&entry.path)
                 .cloned()
                 .unwrap_or_default();
-            let selected_port_variable = draft
-                .selected_port_variables
-                .get(&entry.path)
-                .cloned()
-                .flatten();
+            let selected_port_variable =
+                selected_port_variables.get(&entry.path).cloned().flatten();
             let selected_port =
                 scanner_service::port_for_variable(&entry.ports, selected_port_variable.as_deref());
             let commands = entry
@@ -5411,10 +5234,71 @@ fn build_project_folders_from_scan(draft: &ProjectDraft) -> Vec<ProjectFolder> {
                     &entry.path,
                 )),
                 port_variable: selected_port_variable,
-                hidden: Some(!draft.selected_folder_paths.contains(&entry.path)),
+                hidden: Some(!selected_folder_paths.contains(&entry.path)),
             }
         })
         .collect()
+}
+
+fn build_project_from_draft(draft: &ProjectDraft, existing: Option<&Project>) -> Project {
+    let timestamp = current_timestamp_string();
+
+    Project {
+        id: draft
+            .existing_id
+            .clone()
+            .unwrap_or_else(|| next_entity_id("project")),
+        name: draft.name.trim().to_string(),
+        root_path: draft.root_path.trim().to_string(),
+        folders: existing
+            .map(|project| project.folders.clone())
+            .unwrap_or_default(),
+        color: normalize_optional_string(&draft.color),
+        pinned: Some(draft.pinned),
+        notes: normalize_optional_string(&draft.notes),
+        save_log_files: Some(draft.save_log_files),
+        created_at: existing
+            .map(|project| project.created_at.clone())
+            .unwrap_or_else(|| timestamp.clone()),
+        updated_at: timestamp,
+    }
+}
+
+fn build_project_from_wizard(wizard: workspace::AddProjectWizard) -> Project {
+    let workspace::AddProjectWizard {
+        name,
+        color,
+        root_path,
+        scan_entries,
+        selected_folders,
+        selected_scripts,
+        selected_port_variables,
+        ..
+    } = wizard;
+
+    let timestamp = current_timestamp_string();
+
+    Project {
+        id: next_entity_id("project"),
+        name: if name.trim().is_empty() {
+            "My App".to_string()
+        } else {
+            name.trim().to_string()
+        },
+        root_path: root_path.trim().to_string(),
+        folders: build_project_folders_from_selection(
+            &scan_entries,
+            &selected_folders,
+            &selected_scripts,
+            &selected_port_variables,
+        ),
+        color: normalize_optional_string(&color),
+        pinned: Some(false),
+        notes: None,
+        save_log_files: Some(true),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    }
 }
 
 fn build_folder_commands_from_scan(
@@ -5618,11 +5502,15 @@ fn config_has_ssh_connection(config: &AppConfig, connection_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings};
+    use crate::models::{
+        Project, ProjectFolder, RootScanEntry, RunCommand, SSHConnection, ScannedPort,
+        ScannedScript, SessionTab, Settings,
+    };
     use crate::services::ProcessManager;
     use crate::state::{RuntimeState, SessionRuntimeState};
     use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
     use gpui::point;
+    use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
 
     fn sample_ai_tab() -> SessionTab {
@@ -5816,8 +5704,68 @@ mod tests {
     }
 
     #[test]
+    fn build_project_from_wizard_uses_selected_scan_configuration() {
+        let folder_path = "C:/Code/personal/househunter/api".to_string();
+        let selected_scripts =
+            HashMap::from([(folder_path.clone(), BTreeSet::from(["dev".to_string()]))]);
+        let selected_port_variables =
+            HashMap::from([(folder_path.clone(), Some("PORT".to_string()))]);
+        let wizard = workspace::AddProjectWizard {
+            name: "Househunter".to_string(),
+            color: "#6366f1".to_string(),
+            root_path: "C:/Code/personal/househunter".to_string(),
+            step: 2,
+            scan_entries: vec![RootScanEntry {
+                path: folder_path.clone(),
+                name: "api".to_string(),
+                has_env: true,
+                project_type: "node".to_string(),
+                scripts: vec![
+                    ScannedScript {
+                        name: "build".to_string(),
+                        command: "tsc -p tsconfig.json".to_string(),
+                    },
+                    ScannedScript {
+                        name: "dev".to_string(),
+                        command: "tsx watch src/server.ts".to_string(),
+                    },
+                ],
+                ports: vec![ScannedPort {
+                    variable: "PORT".to_string(),
+                    port: 4555,
+                    source: ".env".to_string(),
+                }],
+            }],
+            selected_folders: BTreeSet::from([folder_path.clone()]),
+            selected_scripts,
+            selected_port_variables,
+            ..Default::default()
+        };
+
+        let project = build_project_from_wizard(wizard);
+
+        assert_eq!(project.name, "Househunter");
+        assert_eq!(project.root_path, "C:/Code/personal/househunter");
+        assert_eq!(project.folders.len(), 1);
+
+        let folder = &project.folders[0];
+        assert_eq!(folder.name, "api");
+        assert_eq!(folder.folder_path, folder_path);
+        assert_eq!(folder.port_variable.as_deref(), Some("PORT"));
+        assert_eq!(folder.hidden, Some(false));
+        assert_eq!(folder.commands.len(), 1);
+        assert_eq!(folder.commands[0].label, "dev");
+        assert_eq!(folder.commands[0].command, "npm");
+        assert_eq!(folder.commands[0].args, vec!["run", "dev"]);
+        assert_eq!(folder.commands[0].port, Some(4555));
+    }
+
+    #[test]
     fn port_refresh_interval_is_eager_without_active_session() {
-        assert_eq!(port_refresh_interval(None), std::time::Duration::from_secs(1));
+        assert_eq!(
+            port_refresh_interval(None),
+            std::time::Duration::from_secs(1)
+        );
     }
 
     #[test]
@@ -5977,7 +5925,10 @@ mod tests {
 
     #[test]
     fn ctrl_enter_binding_sends_raw_newline_text() {
-        let action = translate_key_event(&key_down_event("ctrl-enter"), TerminalBindingContext::default());
+        let action = translate_key_event(
+            &key_down_event("ctrl-enter"),
+            TerminalBindingContext::default(),
+        );
 
         assert_eq!(
             action,
@@ -5987,7 +5938,8 @@ mod tests {
 
     #[test]
     fn plain_enter_uses_keystroke_path_and_stays_carriage_return() {
-        let action = translate_key_event(&key_down_event("enter"), TerminalBindingContext::default());
+        let action =
+            translate_key_event(&key_down_event("enter"), TerminalBindingContext::default());
 
         assert_eq!(
             action,
@@ -6016,7 +5968,10 @@ mod tests {
             TerminalKeyAction::Paste
         );
         assert_eq!(
-            translate_key_event(&key_down_event("ctrl-shift-c"), TerminalBindingContext::default()),
+            translate_key_event(
+                &key_down_event("ctrl-shift-c"),
+                TerminalBindingContext::default()
+            ),
             TerminalKeyAction::CopySelection
         );
     }
@@ -6034,8 +5989,10 @@ mod tests {
 
     #[test]
     fn shift_enter_binding_sends_raw_newline_text() {
-        let action =
-            translate_key_event(&key_down_event("shift-enter"), TerminalBindingContext::default());
+        let action = translate_key_event(
+            &key_down_event("shift-enter"),
+            TerminalBindingContext::default(),
+        );
 
         assert_eq!(
             action,

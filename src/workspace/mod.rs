@@ -31,6 +31,7 @@ pub struct AddProjectWizard {
     pub cursor: usize,
     pub name_focused: bool,
     pub step: u8,
+    pub scan_message: Option<String>,
     pub scan_entries: Vec<RootScanEntry>,
     pub selected_folders: std::collections::BTreeSet<String>,
     pub selected_scripts: HashMap<String, BTreeSet<String>>,
@@ -46,6 +47,7 @@ impl Default for AddProjectWizard {
             cursor: 0,
             name_focused: false,
             step: 1,
+            scan_message: None,
             scan_entries: Vec::new(),
             selected_folders: Default::default(),
             selected_scripts: Default::default(),
@@ -305,6 +307,12 @@ fn render_wizard_step1(wizard: &AddProjectWizard, actions: WizardActions<'_>) ->
                                                     .child("Sub-folders with package.json or Cargo.toml will be discovered automatically"),
                                             ),
                                     )
+                                    .children(wizard.scan_message.as_ref().map(|message| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .child(SharedString::from(message.clone()))
+                                    }))
                                     // Discovered folders
                                     .children(
                                         (!wizard.scan_entries.is_empty()).then(|| {
@@ -810,13 +818,7 @@ impl EditorPanel {
     pub fn title(&self) -> &'static str {
         match self {
             Self::Settings(_) => "Settings",
-            Self::Project(draft) => {
-                if draft.existing_id.is_some() {
-                    "Edit Project"
-                } else {
-                    "Add Project"
-                }
-            }
+            Self::Project(_) => "Edit Project",
             Self::Folder(draft) => {
                 if draft.existing_id.is_some() {
                     "Edit Folder"
@@ -851,16 +853,191 @@ impl EditorPanel {
         }
     }
 
+    pub fn accent_color(&self) -> u32 {
+        match self {
+            Self::Settings(_) => theme::PRIMARY,
+            Self::Project(draft) => {
+                theme::parse_hex_color(Some(draft.color.as_str()), theme::PROJECT_DOT)
+            }
+            Self::Folder(_) => theme::PROJECT_DOT,
+            Self::Command(_) => theme::AI_DOT,
+            Self::Ssh(_) => theme::SSH_DOT,
+        }
+    }
+
+    pub fn headline(&self) -> String {
+        match self {
+            Self::Settings(_) => "Workspace settings".to_string(),
+            Self::Project(draft) => fallback_editor_label(draft.name.as_str(), "Untitled project"),
+            Self::Folder(draft) => fallback_editor_label(
+                if draft.name.trim().is_empty() {
+                    path_leaf(draft.folder_path.as_str())
+                } else {
+                    draft.name.as_str()
+                },
+                "Folder",
+            ),
+            Self::Command(draft) => fallback_editor_label(
+                if draft.label.trim().is_empty() {
+                    draft.command.as_str()
+                } else {
+                    draft.label.as_str()
+                },
+                "Command",
+            ),
+            Self::Ssh(draft) => fallback_editor_label(
+                if draft.label.trim().is_empty() {
+                    draft.host.as_str()
+                } else {
+                    draft.label.as_str()
+                },
+                "SSH connection",
+            ),
+        }
+    }
+
+    pub fn context_line(&self) -> Option<String> {
+        match self {
+            Self::Settings(_) => None,
+            Self::Project(draft) => non_empty_value(draft.root_path.as_str()),
+            Self::Folder(draft) => non_empty_value(draft.folder_path.as_str()),
+            Self::Command(draft) => {
+                let command = draft.command.trim();
+                if command.is_empty() {
+                    None
+                } else if draft.args_text.trim().is_empty() {
+                    Some(command.to_string())
+                } else {
+                    Some(format!("{command} {}", draft.args_text.trim()))
+                }
+            }
+            Self::Ssh(draft) => {
+                let host = draft.host.trim();
+                let username = draft.username.trim();
+                if host.is_empty() {
+                    None
+                } else if username.is_empty() {
+                    Some(host.to_string())
+                } else {
+                    Some(format!("{username}@{host}"))
+                }
+            }
+        }
+    }
+
+    pub fn summary_items(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Settings(_) => Vec::new(),
+            Self::Project(draft) => vec![
+                (
+                    "Accent".to_string(),
+                    if draft.color.trim().is_empty() {
+                        "Default".to_string()
+                    } else {
+                        draft.color.trim().to_string()
+                    },
+                ),
+                (
+                    "Sidebar".to_string(),
+                    if draft.pinned {
+                        "Pinned".to_string()
+                    } else {
+                        "Standard".to_string()
+                    },
+                ),
+                (
+                    "Logs".to_string(),
+                    if draft.save_log_files {
+                        "Saved".to_string()
+                    } else {
+                        "Off".to_string()
+                    },
+                ),
+            ],
+            Self::Folder(draft) => vec![
+                (
+                    "Visibility".to_string(),
+                    if draft.hidden {
+                        "Hidden".to_string()
+                    } else {
+                        "Visible".to_string()
+                    },
+                ),
+                (
+                    "Port".to_string(),
+                    if draft.port_variable.trim().is_empty() {
+                        "Not set".to_string()
+                    } else {
+                        draft.port_variable.trim().to_string()
+                    },
+                ),
+                (
+                    "Git".to_string(),
+                    draft
+                        .git_branch
+                        .clone()
+                        .unwrap_or_else(|| "No repo".to_string()),
+                ),
+            ],
+            Self::Command(draft) => vec![
+                (
+                    "Port".to_string(),
+                    if draft.port_text.trim().is_empty() {
+                        "Not set".to_string()
+                    } else {
+                        draft.port_text.trim().to_string()
+                    },
+                ),
+                (
+                    "Restart".to_string(),
+                    if draft.auto_restart {
+                        "Auto".to_string()
+                    } else {
+                        "Manual".to_string()
+                    },
+                ),
+                (
+                    "Logs".to_string(),
+                    if draft.clear_logs_on_restart {
+                        "Clear on restart".to_string()
+                    } else {
+                        "Keep history".to_string()
+                    },
+                ),
+            ],
+            Self::Ssh(draft) => vec![
+                (
+                    "Host".to_string(),
+                    if draft.host.trim().is_empty() {
+                        "Not set".to_string()
+                    } else {
+                        draft.host.trim().to_string()
+                    },
+                ),
+                (
+                    "Port".to_string(),
+                    if draft.port_text.trim().is_empty() {
+                        "22".to_string()
+                    } else {
+                        draft.port_text.trim().to_string()
+                    },
+                ),
+                (
+                    "Password".to_string(),
+                    if draft.password.trim().is_empty() {
+                        "Not saved".to_string()
+                    } else {
+                        "Saved".to_string()
+                    },
+                ),
+            ],
+        }
+    }
+
     pub fn save_label(&self) -> &'static str {
         match self {
             Self::Settings(_) => "Close",
-            Self::Project(draft) => {
-                if draft.existing_id.is_some() {
-                    "Save Project"
-                } else {
-                    "Create Project"
-                }
-            }
+            Self::Project(_) => "Save Project",
             Self::Folder(draft) => {
                 if draft.existing_id.is_some() {
                     "Save Folder"
@@ -1048,12 +1225,6 @@ pub struct ProjectDraft {
     pub pinned: bool,
     pub save_log_files: bool,
     pub notes: String,
-    pub scan_entries: Vec<RootScanEntry>,
-    pub selected_folder_paths: BTreeSet<String>,
-    pub selected_scripts: HashMap<String, BTreeSet<String>>,
-    pub selected_port_variables: HashMap<String, Option<String>>,
-    pub scan_message: Option<String>,
-    pub is_scanning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1198,17 +1369,6 @@ pub enum EditorAction {
     Save,
     Delete,
     Close,
-    PickProjectRoot,
-    ScanProjectRoot,
-    ToggleProjectScanFolder(String),
-    ToggleProjectScanScript {
-        folder_path: String,
-        script_name: String,
-    },
-    SelectProjectPortVariable {
-        folder_path: String,
-        variable: Option<String>,
-    },
     PickFolderPath,
     ScanFolderPath,
     ToggleFolderScanScript(String),
@@ -1253,7 +1413,9 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
     }
 
     let title = model.panel.title();
+    let subtitle = model.panel.subtitle();
     let save_label = model.panel.save_label();
+    let accent = model.panel.accent_color();
 
     let body: AnyElement = match &model.panel {
         EditorPanel::Settings(draft) => {
@@ -1284,68 +1446,9 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
         .flex()
         .flex_col()
         .bg(rgb(theme::APP_BG))
-        .child(
-            div()
-                .h(px(22.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px(px(6.0))
-                .bg(rgb(theme::TOPBAR_BG))
-                .border_b_1()
-                .border_color(rgb(theme::BORDER_PRIMARY))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .rounded_sm()
-                                .bg(rgb(theme::PRIMARY))
-                                .text_xs()
-                                .text_color(rgb(theme::SELECTION_TEXT))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
-                                .child(save_label)
-                                .on_mouse_down(MouseButton::Left, on_save),
-                        )
-                        .children(on_delete.map(|on_delete| {
-                            div()
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .rounded_sm()
-                                .text_xs()
-                                .text_color(rgb(theme::DANGER_TEXT))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                                .child("delete")
-                                .on_mouse_down(MouseButton::Left, on_delete)
-                        }))
-                        .child(
-                            div()
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .rounded_sm()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_MUTED))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                                .child("close")
-                                .on_mouse_down(MouseButton::Left, on_close),
-                        ),
-                ),
-        )
+        .child(render_editor_toolbar(
+            title, subtitle, accent, save_label, on_save, on_delete, on_close,
+        ))
         .child(
             div()
                 .flex_1()
@@ -1356,13 +1459,17 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
                     div().w_full().flex().justify_center().child(
                         div()
                             .w_full()
-                            .max_w(px(540.0))
-                            .pt(px(24.0))
-                            .pb(px(40.0))
-                            .px(px(20.0))
+                            .max_w(px(760.0))
+                            .pt(px(28.0))
+                            .pb(px(56.0))
+                            .px(px(24.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(18.0))
                             .children(model.notice.as_ref().map(|notice| {
                                 render_notice_row(notice.as_str()).into_any_element()
                             }))
+                            .child(render_editor_intro(&model.panel))
                             .child(body),
                     ),
                 ),
@@ -2064,6 +2171,55 @@ fn render_settings_section(label: &str, body: AnyElement) -> impl IntoElement {
         .child(body)
 }
 
+fn render_editor_section(label: &str, hint: Option<&str>, body: AnyElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .p(px(16.0))
+        .rounded_md()
+        .bg(rgb(theme::EDITOR_CARD_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(div().size(px(8.0)).rounded_full().bg(rgb(theme::PRIMARY)))
+                .children(hint.map(|hint| {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(label.to_string())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(hint.to_string())),
+                        )
+                        .into_any_element()
+                }))
+                .children(hint.is_none().then(|| {
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(SharedString::from(label.to_string()))
+                        .into_any_element()
+                })),
+        )
+        .child(body)
+}
+
 fn render_settings_inline_button(
     label: &str,
     primary: bool,
@@ -2139,6 +2295,221 @@ fn render_settings_close_button(
         .on_mouse_down(MouseButton::Left, on_click)
 }
 
+#[derive(Clone, Copy)]
+enum EditorActionButtonStyle {
+    Primary,
+    Danger,
+    Ghost,
+}
+
+fn render_editor_toolbar(
+    title: &str,
+    subtitle: &str,
+    accent: u32,
+    save_label: &str,
+    on_save: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    on_delete: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    on_close: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .flex_none()
+        .px(px(12.0))
+        .py(px(10.0))
+        .bg(rgb(theme::TOPBAR_BG))
+        .border_b_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(div().size(px(10.0)).rounded_full().bg(rgb(accent)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(theme::TEXT_PRIMARY))
+                                        .child(SharedString::from(title.to_string())),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_SUBTLE))
+                                        .child(SharedString::from(subtitle.to_string())),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(render_editor_action_button(
+                            save_label,
+                            EditorActionButtonStyle::Primary,
+                            on_save,
+                        ))
+                        .children(on_delete.map(|on_delete| {
+                            render_editor_action_button(
+                                "Delete",
+                                EditorActionButtonStyle::Danger,
+                                on_delete,
+                            )
+                            .into_any_element()
+                        }))
+                        .child(render_editor_action_button(
+                            "Close",
+                            EditorActionButtonStyle::Ghost,
+                            on_close,
+                        )),
+                ),
+        )
+}
+
+fn render_editor_action_button(
+    label: &str,
+    style: EditorActionButtonStyle,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let (bg, border, text, hover_bg) = match style {
+        EditorActionButtonStyle::Primary => (
+            theme::PRIMARY,
+            theme::PRIMARY,
+            theme::SELECTION_TEXT,
+            theme::PRIMARY_HOVER,
+        ),
+        EditorActionButtonStyle::Danger => (
+            theme::EDITOR_CARD_BG,
+            0x5a2630,
+            theme::DANGER_TEXT,
+            0x382029,
+        ),
+        EditorActionButtonStyle::Ghost => (
+            theme::EDITOR_CARD_BG,
+            theme::BORDER_SECONDARY,
+            theme::TEXT_MUTED,
+            theme::ROW_HOVER_BG,
+        ),
+    };
+
+    div()
+        .px(px(12.0))
+        .py(px(6.0))
+        .rounded_sm()
+        .bg(rgb(bg))
+        .border_1()
+        .border_color(rgb(border))
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(rgb(text))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(hover_bg)))
+        .child(SharedString::from(label.to_string()))
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn render_editor_intro(panel: &EditorPanel) -> impl IntoElement {
+    let accent = panel.accent_color();
+    let summary_items = panel.summary_items();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .p(px(18.0))
+        .rounded_md()
+        .bg(rgb(theme::EDITOR_CARD_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().size(px(8.0)).rounded_full().bg(rgb(accent)))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(SharedString::from(panel.title().to_string())),
+                ),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(panel.headline())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(SharedString::from(panel.subtitle().to_string())),
+        )
+        .children(panel.context_line().map(|context| {
+            div()
+                .px(px(12.0))
+                .py(px(10.0))
+                .rounded_md()
+                .bg(rgb(theme::EDITOR_FIELD_BG))
+                .border_1()
+                .border_color(rgb(theme::BORDER_SECONDARY))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(context))
+                .into_any_element()
+        }))
+        .children((!summary_items.is_empty()).then(|| {
+            div()
+                .flex()
+                .gap(px(10.0))
+                .children(summary_items.into_iter().map(|(label, value)| {
+                    render_editor_summary_item(label, value).into_any_element()
+                }))
+                .into_any_element()
+        }))
+}
+
+fn render_editor_summary_item(label: String, value: String) -> impl IntoElement {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::EDITOR_FIELD_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SECONDARY))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(label)),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(value)),
+        )
+}
+
 fn settings_font_size_value(draft: &SettingsDraft) -> u16 {
     draft
         .terminal_font_size
@@ -2149,6 +2520,26 @@ fn settings_font_size_value(draft: &SettingsDraft) -> u16 {
         .clamp(8, 24)
 }
 
+fn fallback_editor_label(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn non_empty_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn path_leaf(path: &str) -> &str {
+    path.rsplit(['\\', '/'])
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or(path)
+}
+
 fn render_project_panel(
     draft: &ProjectDraft,
     model: &EditorPaneModel,
@@ -2156,89 +2547,82 @@ fn render_project_panel(
 ) -> impl IntoElement {
     let on_toggle_pinned = (actions.on_action)(EditorAction::ToggleProjectPinned);
     let on_toggle_save_logs = (actions.on_action)(EditorAction::ToggleProjectSaveLogs);
-    let on_pick_root = (actions.on_action)(EditorAction::PickProjectRoot);
-    let on_scan_root = (actions.on_action)(EditorAction::ScanProjectRoot);
 
     div()
         .flex()
         .flex_col()
-        .gap_3()
-        .child(render_text_field(
-            "Name",
-            "Display name in the sidebar",
-            draft.name.as_str(),
-            EditorField::Project(ProjectField::Name),
-            model,
-            actions,
+        .gap(px(18.0))
+        .child(render_editor_section(
+            "Overview",
+            Some("Name, location, and accent used to identify this project."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(render_text_field(
+                    "Project name",
+                    "What the sidebar shows for this workspace.",
+                    draft.name.as_str(),
+                    EditorField::Project(ProjectField::Name),
+                    model,
+                    actions,
+                ))
+                .child(render_text_field(
+                    "Root path",
+                    "Absolute path to the main repository or workspace root.",
+                    draft.root_path.as_str(),
+                    EditorField::Project(ProjectField::RootPath),
+                    model,
+                    actions,
+                ))
+                .child(render_text_field(
+                    "Accent color",
+                    "Hex color used for the project marker, for example #6366f1.",
+                    draft.color.as_str(),
+                    EditorField::Project(ProjectField::Color),
+                    model,
+                    actions,
+                ))
+                .into_any_element(),
         ))
-        .child(render_text_field(
-            "Root path",
-            "Absolute project root path",
-            draft.root_path.as_str(),
-            EditorField::Project(ProjectField::RootPath),
-            model,
-            actions,
-        ))
-        .children(draft.existing_id.is_none().then(|| {
-            render_choice_row(
-                "Pick root folder",
-                if draft.root_path.is_empty() {
-                    "Choose directory"
-                } else {
-                    draft.root_path.as_str()
-                },
-                Some("Opens the native folder picker for scanner-driven onboarding"),
-                on_pick_root,
-            )
-            .into_any_element()
-        }))
-        .children(draft.existing_id.is_none().then(|| {
-            render_choice_row(
-                "Scan root folder",
-                if draft.is_scanning {
-                    "Scanning..."
-                } else {
-                    "Discover folders, scripts, and env ports"
-                },
-                Some(
-                    "Scans up to three levels deep, skipping node_modules, target, dist, and .git",
-                ),
-                on_scan_root,
-            )
-            .into_any_element()
-        }))
-        .children(
-            draft
-                .scan_message
-                .as_ref()
-                .map(|message| render_notice_row(message.as_str()).into_any_element()),
-        )
-        .children(
-            (draft.existing_id.is_none() && !draft.scan_entries.is_empty())
-                .then(|| render_project_scan_panel(draft, actions).into_any_element()),
-        )
-        .child(render_text_field(
-            "Color",
-            "Optional hex accent like #6366f1",
-            draft.color.as_str(),
-            EditorField::Project(ProjectField::Color),
-            model,
-            actions,
-        ))
-        .child(render_multiline_field(
+        .child(render_editor_section(
             "Notes",
-            "Project notes stored in config.json. Enter inserts a new line.",
-            draft.notes.as_str(),
-            EditorField::Project(ProjectField::Notes),
-            model,
-            actions,
+            Some("Useful context about the repo, owners, setup quirks, or onboarding steps."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(render_multiline_field(
+                    "Project notes",
+                    "Multi-line notes saved with the project.",
+                    draft.notes.as_str(),
+                    EditorField::Project(ProjectField::Notes),
+                    model,
+                    actions,
+                ))
+                .into_any_element(),
         ))
-        .child(render_toggle_row(
-            "Save log files",
-            draft.save_log_files,
-            on_toggle_save_logs,
+        .child(render_editor_section(
+            "Workspace Defaults",
+            Some("How this project should behave in the sidebar and on disk."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(render_toggle_row_with_hint(
+                    "Save log files",
+                    draft.save_log_files,
+                    "Keep command output persisted to log files for this project.",
+                    on_toggle_save_logs,
+                ))
+                .child(render_toggle_row_with_hint(
+                    "Pinned",
+                    draft.pinned,
+                    "Keep this project near the top of the sidebar.",
+                    on_toggle_pinned,
+                ))
+                .into_any_element(),
         ))
-        .child(render_toggle_row("Pinned", draft.pinned, on_toggle_pinned))
 }
 
 fn render_folder_panel(
@@ -2251,117 +2635,170 @@ fn render_folder_panel(
     let on_scan_folder = (actions.on_action)(EditorAction::ScanFolderPath);
     let on_load_env = (actions.on_action)(EditorAction::LoadFolderEnvFile);
     let on_open_terminal = (actions.on_action)(EditorAction::OpenFolderExternalTerminal);
+    let scan_notice = draft
+        .scan_message
+        .as_ref()
+        .filter(|message| draft.scan_result.is_none() || !message.starts_with("Discovered "));
 
     div()
         .flex()
         .flex_col()
-        .gap_3()
-        .child(render_text_field(
-            "Name",
-            "Folder label shown in the project workspace",
-            draft.name.as_str(),
-            EditorField::Folder(FolderField::Name),
-            model,
-            actions,
+        .gap(px(18.0))
+        .child(render_editor_section(
+            "Overview",
+            Some("Identity, location, and visibility inside this project."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(render_text_field(
+                    "Folder name",
+                    "Label shown for this folder in the workspace.",
+                    draft.name.as_str(),
+                    EditorField::Folder(FolderField::Name),
+                    model,
+                    actions,
+                ))
+                .child(render_text_field(
+                    "Folder path",
+                    "Absolute path to the folder on disk.",
+                    draft.folder_path.as_str(),
+                    EditorField::Folder(FolderField::FolderPath),
+                    model,
+                    actions,
+                ))
+                .child(render_toggle_row_with_hint(
+                    "Hidden",
+                    draft.hidden,
+                    "Hide this folder in the sidebar without removing it from the project.",
+                    on_toggle_hidden,
+                ))
+                .into_any_element(),
         ))
-        .child(render_text_field(
-            "Folder path",
-            "Absolute path to the folder",
-            draft.folder_path.as_str(),
-            EditorField::Folder(FolderField::FolderPath),
-            model,
-            actions,
+        .child(render_editor_section(
+            "Tools",
+            Some("Rescan the folder or jump directly into a terminal."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(render_choice_row(
+                    "Folder picker",
+                    if draft.folder_path.is_empty() {
+                        "Choose directory"
+                    } else {
+                        draft.folder_path.as_str()
+                    },
+                    Some("Open the native folder picker and replace the current path."),
+                    on_pick_folder,
+                ))
+                .child(render_choice_row(
+                    "Rescan folder",
+                    if draft.is_scanning {
+                        "Scanning..."
+                    } else {
+                        "Refresh scripts and env ports"
+                    },
+                    Some("Read package manifests and .env files again."),
+                    on_scan_folder,
+                ))
+                .child(render_choice_row(
+                    "Open in terminal",
+                    if draft.folder_path.is_empty() {
+                        "Pick a folder first"
+                    } else {
+                        "Open external terminal"
+                    },
+                    Some("Launch this folder in your system terminal."),
+                    on_open_terminal,
+                ))
+                .into_any_element(),
         ))
-        .child(render_choice_row(
-            "Pick folder",
-            if draft.folder_path.is_empty() {
-                "Choose directory"
-            } else {
-                draft.folder_path.as_str()
-            },
-            Some("Opens the native folder picker and updates the folder path"),
-            on_pick_folder,
+        .child(render_editor_section(
+            "Detected Status",
+            Some("Read-only information gathered from the local filesystem."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .children(draft.git_branch.as_ref().map(|branch| {
+                    render_info_row(
+                        "Git branch",
+                        branch.as_str(),
+                        Some("Read directly from .git/HEAD."),
+                    )
+                    .into_any_element()
+                }))
+                .children(draft.dependency_status.as_ref().map(|status| {
+                    render_info_row(
+                        "Dependencies",
+                        status.status.as_str(),
+                        Some(status.message.as_str()),
+                    )
+                    .into_any_element()
+                }))
+                .children(
+                    scan_notice
+                        .map(|message| render_notice_row(message.as_str()).into_any_element()),
+                )
+                .into_any_element(),
         ))
-        .child(render_choice_row(
-            "Scan folder",
-            if draft.is_scanning {
-                "Scanning..."
-            } else {
-                "Discover scripts and env ports"
-            },
-            Some("Imports package.json/Cargo.toml commands and .env port variables"),
-            on_scan_folder,
-        ))
-        .child(render_choice_row(
-            "Open external terminal",
-            if draft.folder_path.is_empty() {
-                "Pick a folder first"
-            } else {
-                "Open terminal"
-            },
-            Some("Matches the archived app's helper for opening the current folder in a system terminal."),
-            on_open_terminal,
-        ))
-        .children(
-            draft
-                .git_branch
-                .as_ref()
-                .map(|branch| render_info_row("Git branch", branch.as_str(), Some("Read directly from .git/HEAD"))),
-        )
-        .children(draft.dependency_status.as_ref().map(|status| {
-            render_info_row(
-                "Dependencies",
-                status.status.as_str(),
-                Some(status.message.as_str()),
-            )
-        }))
-        .children(
-            draft
-                .scan_message
-                .as_ref()
-                .map(|message| render_notice_row(message.as_str()).into_any_element()),
-        )
         .children(draft.scan_result.as_ref().map(|scan_result| {
-            render_folder_scan_panel(draft, scan_result, actions).into_any_element()
-        }))
-        .child(render_text_field(
-            "Env file path",
-            "Optional relative .env path",
-            draft.env_file_path.as_str(),
-            EditorField::Folder(FolderField::EnvFilePath),
-            model,
-            actions,
-        ))
-        .child(render_choice_row(
-            "Load env file",
-            if draft.env_file_loaded {
-                "Reload env contents"
-            } else {
-                "Load env contents"
-            },
-            Some("Reads the configured env file so you can edit and save it inline."),
-            on_load_env,
-        ))
-        .children((draft.env_file_loaded || !draft.env_file_contents.is_empty()).then(|| {
-            render_multiline_field(
-                "Env file contents",
-                "Raw .env editor. Comments and blank lines are preserved on save.",
-                draft.env_file_contents.as_str(),
-                EditorField::Folder(FolderField::EnvContents),
-                model,
-                actions,
+            render_editor_section(
+                "Scan Results",
+                Some("Choose which discovered scripts to merge and which env port should be the default."),
+                render_folder_scan_panel(draft, scan_result, actions).into_any_element(),
             )
             .into_any_element()
         }))
-        .child(render_text_field(
-            "Port variable",
-            "Optional env var used to derive a server port",
-            draft.port_variable.as_str(),
-            EditorField::Folder(FolderField::PortVariable),
-            model,
-            actions,
+        .child(render_editor_section(
+            "Environment",
+            Some("Choose the env file, the default port variable, and inline env editing."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(render_text_field(
+                    "Env file path",
+                    "Relative path to the env file inside this folder, for example .env.local.",
+                    draft.env_file_path.as_str(),
+                    EditorField::Folder(FolderField::EnvFilePath),
+                    model,
+                    actions,
+                ))
+                .child(render_text_field(
+                    "Default port variable",
+                    "Env var used to derive the default server port for this folder.",
+                    draft.port_variable.as_str(),
+                    EditorField::Folder(FolderField::PortVariable),
+                    model,
+                    actions,
+                ))
+                .child(render_choice_row(
+                    "Load env file",
+                    if draft.env_file_loaded {
+                        "Reload env contents"
+                    } else {
+                        "Load env contents"
+                    },
+                    Some("Read the configured env file so it can be edited inline."),
+                    on_load_env,
+                ))
+                .children(
+                    (draft.env_file_loaded || !draft.env_file_contents.is_empty()).then(|| {
+                        render_multiline_field(
+                            "Env file contents",
+                            "Comments and blank lines are preserved when you save.",
+                            draft.env_file_contents.as_str(),
+                            EditorField::Folder(FolderField::EnvContents),
+                            model,
+                            actions,
+                        )
+                        .into_any_element()
+                    }),
+                )
+                .into_any_element(),
         ))
-        .child(render_toggle_row("Hidden", draft.hidden, on_toggle_hidden))
 }
 
 fn render_command_panel(
@@ -2375,56 +2812,85 @@ fn render_command_panel(
     div()
         .flex()
         .flex_col()
-        .gap_3()
-        .child(render_text_field(
-            "Label",
-            "Sidebar display label",
-            draft.label.as_str(),
-            EditorField::Command(CommandField::Label),
-            model,
-            actions,
+        .gap(px(18.0))
+        .child(render_editor_section(
+            "Overview",
+            Some("What this command is called and what executable it runs."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(render_text_field(
+                    "Command label",
+                    "Name shown in the sidebar and command tabs.",
+                    draft.label.as_str(),
+                    EditorField::Command(CommandField::Label),
+                    model,
+                    actions,
+                ))
+                .child(render_text_field(
+                    "Executable",
+                    "Program or script that should be launched.",
+                    draft.command.as_str(),
+                    EditorField::Command(CommandField::Command),
+                    model,
+                    actions,
+                ))
+                .child(render_text_field(
+                    "Arguments",
+                    "Space-separated arguments passed to the executable.",
+                    draft.args_text.as_str(),
+                    EditorField::Command(CommandField::Args),
+                    model,
+                    actions,
+                ))
+                .into_any_element(),
         ))
-        .child(render_text_field(
-            "Command",
-            "Program to execute",
-            draft.command.as_str(),
-            EditorField::Command(CommandField::Command),
-            model,
-            actions,
+        .child(render_editor_section(
+            "Runtime",
+            Some("Optional environment overrides and port metadata for this command."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(render_text_field(
+                    "Environment",
+                    "Semicolon-separated KEY=VALUE pairs.",
+                    draft.env_text.as_str(),
+                    EditorField::Command(CommandField::Env),
+                    model,
+                    actions,
+                ))
+                .child(render_text_field(
+                    "Port",
+                    "Numeric port exposed by this command, if known.",
+                    draft.port_text.as_str(),
+                    EditorField::Command(CommandField::Port),
+                    model,
+                    actions,
+                ))
+                .into_any_element(),
         ))
-        .child(render_text_field(
-            "Args",
-            "Space-separated args",
-            draft.args_text.as_str(),
-            EditorField::Command(CommandField::Args),
-            model,
-            actions,
-        ))
-        .child(render_text_field(
-            "Env",
-            "KEY=VALUE;KEY2=VALUE2",
-            draft.env_text.as_str(),
-            EditorField::Command(CommandField::Env),
-            model,
-            actions,
-        ))
-        .child(render_text_field(
-            "Port",
-            "Optional numeric port",
-            draft.port_text.as_str(),
-            EditorField::Command(CommandField::Port),
-            model,
-            actions,
-        ))
-        .child(render_toggle_row(
-            "Auto restart",
-            draft.auto_restart,
-            on_toggle_restart,
-        ))
-        .child(render_toggle_row(
-            "Clear logs on restart",
-            draft.clear_logs_on_restart,
-            on_toggle_clear_logs,
+        .child(render_editor_section(
+            "Behavior",
+            Some("What should happen when this command restarts."),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(render_toggle_row_with_hint(
+                    "Auto restart",
+                    draft.auto_restart,
+                    "Restart the command automatically after it exits.",
+                    on_toggle_restart,
+                ))
+                .child(render_toggle_row_with_hint(
+                    "Clear logs on restart",
+                    draft.clear_logs_on_restart,
+                    "Clear previous output before the command starts again.",
+                    on_toggle_clear_logs,
+                ))
+                .into_any_element(),
         ))
 }
 
@@ -2491,7 +2957,7 @@ fn render_text_field(
     let display_value = if focused {
         display_text_with_cursor(value, model.cursor)
     } else if value.is_empty() {
-        "[empty]".to_string()
+        "Not set".to_string()
     } else {
         value.to_string()
     };
@@ -2501,44 +2967,55 @@ fn render_text_field(
     div()
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(6.0))
         .child(
             div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(label.to_string())),
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(label.to_string())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(hint.to_string())),
+                        ),
+                )
+                .children(focused.then(|| {
+                    render_inline_state_badge("Editing", theme::PRIMARY).into_any_element()
+                })),
         )
         .child(
             div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
-                .child(SharedString::from(hint.to_string())),
-        )
-        .child(
-            div()
-                .px(px(10.0))
-                .py(px(6.0))
-                .rounded_sm()
-                .bg(rgb(if focused {
-                    0x1e1e22
-                } else {
-                    theme::PANEL_HEADER_BG
-                }))
+                .px(px(12.0))
+                .py(px(10.0))
+                .rounded_md()
+                .bg(rgb(theme::EDITOR_FIELD_BG))
                 .border_1()
                 .border_color(rgb(if focused {
                     theme::PRIMARY
                 } else {
-                    theme::BORDER_SECONDARY
+                    theme::BORDER_PRIMARY
                 }))
-                .text_xs()
+                .text_sm()
                 .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_SUBTLE
+                    theme::TEXT_DIM
                 } else {
                     theme::TEXT_PRIMARY
                 }))
-                .overflow_hidden()
-                .whitespace_nowrap()
                 .cursor_text()
                 .child(SharedString::from(display_value))
                 .on_mouse_down(MouseButton::Left, on_focus),
@@ -2557,7 +3034,7 @@ fn render_multiline_field(
     let display_value = if focused {
         display_text_with_cursor(value, model.cursor)
     } else if value.is_empty() {
-        "[empty]".to_string()
+        "Not set".to_string()
     } else {
         value.to_string()
     };
@@ -2567,40 +3044,53 @@ fn render_multiline_field(
     div()
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(6.0))
         .child(
             div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
-                .child(SharedString::from(hint.to_string())),
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(label.to_string())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(hint.to_string())),
+                        ),
+                )
+                .children(focused.then(|| {
+                    render_inline_state_badge("Editing", theme::PRIMARY).into_any_element()
+                })),
         )
         .child(
             div()
                 .h(px(140.0))
-                .px(px(10.0))
-                .py(px(6.0))
-                .rounded_sm()
-                .bg(rgb(if focused {
-                    0x1e1e22
-                } else {
-                    theme::PANEL_HEADER_BG
-                }))
+                .px(px(12.0))
+                .py(px(10.0))
+                .rounded_md()
+                .bg(rgb(theme::EDITOR_FIELD_BG))
                 .border_1()
                 .border_color(rgb(if focused {
                     theme::PRIMARY
                 } else {
-                    theme::BORDER_SECONDARY
+                    theme::BORDER_PRIMARY
                 }))
-                .text_xs()
+                .text_sm()
                 .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_SUBTLE
+                    theme::TEXT_DIM
                 } else {
                     theme::TEXT_PRIMARY
                 }))
@@ -2619,43 +3109,62 @@ fn render_choice_row(
     div()
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(6.0))
         .child(
             div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(label.to_string())),
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(SharedString::from(label.to_string())),
+                )
+                .children(hint.map(|hint| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child(SharedString::from(hint.to_string()))
+                        .into_any_element()
+                })),
         )
-        .children(hint.map(|hint| {
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
-                .child(SharedString::from(hint.to_string()))
-        }))
         .child(
             div()
-                .px(px(10.0))
-                .py(px(6.0))
-                .rounded_sm()
-                .bg(rgb(theme::PANEL_HEADER_BG))
+                .px(px(12.0))
+                .py(px(10.0))
+                .rounded_md()
+                .bg(rgb(theme::EDITOR_FIELD_BG))
                 .border_1()
-                .border_color(rgb(theme::BORDER_SECONDARY))
-                .text_xs()
-                .text_color(rgb(theme::TEXT_PRIMARY))
+                .border_color(rgb(theme::BORDER_PRIMARY))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                .child(SharedString::from(value.to_string()))
+                .hover(|s| {
+                    s.bg(rgb(theme::ROW_HOVER_BG))
+                        .border_color(rgb(theme::PRIMARY))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(value.to_string())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(">"),
+                        ),
+                )
                 .on_mouse_down(MouseButton::Left, on_click),
         )
-}
-
-fn render_toggle_row(
-    label: &str,
-    value: bool,
-    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    render_toggle_row_with_hint(label, value, "Click to toggle", on_click)
 }
 
 fn render_toggle_row_with_hint(
@@ -2664,161 +3173,120 @@ fn render_toggle_row_with_hint(
     hint: &str,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
-    render_choice_row(
-        label,
-        if value { "on" } else { "off" },
-        Some(hint),
-        on_click,
-    )
+    let mut toggle = div()
+        .w(px(38.0))
+        .h(px(22.0))
+        .p(px(2.0))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .bg(rgb(if value {
+            theme::PRIMARY
+        } else {
+            theme::BORDER_SECONDARY
+        }));
+    toggle = if value {
+        toggle.justify_end()
+    } else {
+        toggle.justify_start()
+    };
+
+    div()
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::EDITOR_FIELD_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .cursor_pointer()
+        .hover(|s| {
+            s.bg(rgb(theme::ROW_HOVER_BG))
+                .border_color(rgb(theme::PRIMARY))
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(label.to_string())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(hint.to_string())),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(if value {
+                                    theme::PRIMARY
+                                } else {
+                                    theme::TEXT_SUBTLE
+                                }))
+                                .child(if value { "On" } else { "Off" }),
+                        )
+                        .child(toggle.child(div().size(px(16.0)).rounded_full().bg(rgb(0xffffff)))),
+                ),
+        )
+        .on_mouse_down(MouseButton::Left, on_click)
 }
 
 fn minimize_to_tray_hint() -> &'static str {
     "Keep DevManager running when the window is closed"
 }
 
+fn render_inline_state_badge(label: &str, color: u32) -> impl IntoElement {
+    div()
+        .px(px(8.0))
+        .py(px(4.0))
+        .rounded_full()
+        .bg(rgb(theme::APP_BG))
+        .border_1()
+        .border_color(rgb(color))
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(rgb(color))
+        .child(SharedString::from(label.to_string()))
+}
+
 fn render_notice_row(message: &str) -> impl IntoElement {
     div()
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded_sm()
-        .bg(rgb(theme::AGENT_ROW_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .text_xs()
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(SharedString::from(message.to_string()))
-}
-
-fn render_project_scan_panel(
-    draft: &ProjectDraft,
-    actions: &EditorActions<'_>,
-) -> impl IntoElement {
-    let summary = format!("{} discovered folder(s)", draft.scan_entries.len());
-
-    div()
         .flex()
-        .flex_col()
-        .gap_2()
-        .child(render_info_row(
-            "Discovered folders",
-            summary.as_str(),
-            Some(
-                "Toggle folders to include them in the new project. Selected scripts become commands and selected env ports seed folder defaults.",
-            ),
-        ))
-        .children(
-            draft
-                .scan_entries
-                .iter()
-                .map(|entry| render_project_scan_entry(entry, draft, actions).into_any_element()),
-        )
-}
-
-fn render_project_scan_entry(
-    entry: &RootScanEntry,
-    draft: &ProjectDraft,
-    actions: &EditorActions<'_>,
-) -> impl IntoElement {
-    let selected = draft.selected_folder_paths.contains(&entry.path);
-    let selected_scripts = draft.selected_scripts.get(&entry.path);
-    let selected_script_count = selected_scripts.map(|scripts| scripts.len()).unwrap_or(0);
-    let selected_port_variable = draft
-        .selected_port_variables
-        .get(&entry.path)
-        .cloned()
-        .flatten();
-    let detail = format!(
-        "{} | {} script(s) | {} port var(s){}",
-        project_type_label(&entry.project_type),
-        entry.scripts.len(),
-        entry.ports.len(),
-        if entry.has_env { " | env file" } else { "" }
-    );
-    let on_toggle_folder =
-        (actions.on_action)(EditorAction::ToggleProjectScanFolder(entry.path.clone()));
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p_2()
+        .items_center()
+        .gap(px(10.0))
+        .px(px(12.0))
+        .py(px(10.0))
         .rounded_md()
-        .bg(rgb(theme::PANEL_HEADER_BG))
+        .bg(rgb(theme::EDITOR_NOTICE_BG))
         .border_1()
-        .border_color(rgb(theme::BORDER_SECONDARY))
-        .child(render_selection_row(
-            entry.name.clone(),
-            Some(detail),
-            selected,
-            on_toggle_folder,
-        ))
-        .children((!entry.scripts.is_empty()).then(|| {
-            let script_summary = format!("{selected_script_count} selected");
+        .border_color(rgb(theme::BORDER_ACCENT))
+        .child(div().size(px(8.0)).rounded_full().bg(rgb(theme::PRIMARY)))
+        .child(
             div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(SharedString::from(format!("Scripts ({script_summary})"))),
-                )
-                .children(entry.scripts.iter().map(|script| {
-                    let is_selected = selected_scripts
-                        .map(|scripts| scripts.contains(&script.name))
-                        .unwrap_or(false);
-                    let on_toggle_script =
-                        (actions.on_action)(EditorAction::ToggleProjectScanScript {
-                            folder_path: entry.path.clone(),
-                            script_name: script.name.clone(),
-                        });
-                    render_selection_row(
-                        script.name.clone(),
-                        Some(script.command.clone()),
-                        is_selected,
-                        on_toggle_script,
-                    )
-                    .into_any_element()
-                }))
-                .into_any_element()
-        }))
-        .children((!entry.ports.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child("Port variable"),
-                )
-                .child(render_selection_row(
-                    "None".to_string(),
-                    Some("Leave the folder without a default port variable".to_string()),
-                    selected_port_variable.is_none(),
-                    (actions.on_action)(EditorAction::SelectProjectPortVariable {
-                        folder_path: entry.path.clone(),
-                        variable: None,
-                    }),
-                ))
-                .children(entry.ports.iter().map(|port| {
-                    let on_select_port =
-                        (actions.on_action)(EditorAction::SelectProjectPortVariable {
-                            folder_path: entry.path.clone(),
-                            variable: Some(port.variable.clone()),
-                        });
-                    render_selection_row(
-                        format!("{} = {}", port.variable, port.port),
-                        Some(port.source.clone()),
-                        selected_port_variable.as_deref() == Some(port.variable.as_str()),
-                        on_select_port,
-                    )
-                    .into_any_element()
-                }))
-                .into_any_element()
-        }))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(SharedString::from(message.to_string())),
+        )
 }
 
 fn render_folder_scan_panel(
@@ -2907,22 +3375,25 @@ fn render_selection_row(
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
     div()
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded_sm()
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded_md()
         .bg(rgb(if selected {
-            0x1e1e22
+            theme::EDITOR_NOTICE_BG
         } else {
-            theme::PANEL_HEADER_BG
+            theme::EDITOR_FIELD_BG
         }))
         .border_1()
         .border_color(rgb(if selected {
             theme::PRIMARY
         } else {
-            theme::BORDER_SECONDARY
+            theme::BORDER_PRIMARY
         }))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .hover(|s| {
+            s.bg(rgb(theme::ROW_HOVER_BG))
+                .border_color(rgb(theme::PRIMARY))
+        })
         .child(
             div()
                 .flex()
@@ -2938,6 +3409,7 @@ fn render_selection_row(
                         .child(
                             div()
                                 .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(rgb(theme::TEXT_PRIMARY))
                                 .child(SharedString::from(label)),
                         )
@@ -2956,18 +3428,10 @@ fn render_selection_row(
                         } else {
                             theme::TEXT_MUTED
                         }))
-                        .child(if selected { "selected" } else { "available" }),
+                        .child(if selected { "Selected" } else { "Available" }),
                 ),
         )
         .on_mouse_down(MouseButton::Left, on_click)
-}
-
-fn project_type_label(value: &str) -> &'static str {
-    match value {
-        "rust" => "Rust",
-        "both" => "Node + Rust",
-        _ => "Node",
-    }
 }
 
 fn render_updater_panel(
@@ -3034,29 +3498,45 @@ fn render_info_row(label: &str, value: &str, hint: Option<&str>) -> impl IntoEle
     div()
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(6.0))
         .child(
             div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(label.to_string())),
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(label.to_string())),
+                        )
+                        .children(hint.map(|hint| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                                .child(SharedString::from(hint.to_string()))
+                                .into_any_element()
+                        })),
+                )
+                .child(render_inline_state_badge("Detected", theme::TEXT_MUTED)),
         )
-        .children(hint.map(|hint| {
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
-                .child(SharedString::from(hint.to_string()))
-        }))
         .child(
             div()
-                .px(px(10.0))
-                .py(px(6.0))
-                .rounded_sm()
-                .bg(rgb(theme::PANEL_HEADER_BG))
+                .px(px(12.0))
+                .py(px(10.0))
+                .rounded_md()
+                .bg(rgb(theme::EDITOR_FIELD_BG))
                 .border_1()
-                .border_color(rgb(theme::BORDER_SECONDARY))
-                .text_xs()
+                .border_color(rgb(theme::BORDER_PRIMARY))
+                .text_sm()
                 .text_color(rgb(theme::TEXT_PRIMARY))
                 .child(SharedString::from(value.to_string())),
         )

@@ -252,7 +252,8 @@ impl EventListener for SessionEventProxy {
                 self.write_to_pty(&response);
             }
             Event::ClipboardStore(_, data) => {
-                let clipped = truncate_utf8_boundary(&data, MAX_TERMINAL_CLIPBOARD_BYTES).to_string();
+                let clipped =
+                    truncate_utf8_boundary(&data, MAX_TERMINAL_CLIPBOARD_BYTES).to_string();
                 if let Err(error) = write_system_clipboard_text(&clipped) {
                     self.debug_log(format!("clipboard store failed: {error}"));
                 }
@@ -942,7 +943,8 @@ fn read_system_clipboard_text() -> Option<String> {
 }
 
 fn write_system_clipboard_text(text: &str) -> Result<(), String> {
-    let mut clipboard = Clipboard::new().map_err(|error| format!("Failed to open clipboard: {error}"))?;
+    let mut clipboard =
+        Clipboard::new().map_err(|error| format!("Failed to open clipboard: {error}"))?;
     clipboard
         .set_text(truncate_utf8_boundary(text, MAX_TERMINAL_CLIPBOARD_BYTES).to_string())
         .map_err(|error| format!("Failed to write clipboard: {error}"))
