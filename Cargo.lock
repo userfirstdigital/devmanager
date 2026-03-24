@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "devmanager"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "alacritty_terminal",
  "arboard",
