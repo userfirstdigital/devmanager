@@ -17,7 +17,7 @@ use crate::theme;
 use crate::updater::UpdaterService;
 use crate::workspace::{
     self, CommandDraft, EditorAction, EditorField, EditorPaneModel, EditorPanel, FolderDraft,
-    ProjectDraft, SettingsDraft, SshDraft,
+    ProjectDraft, SettingsDraft, SshDraft, UiPreviewDraft,
 };
 use gpui::{
     div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
@@ -787,6 +787,10 @@ impl NativeShell {
         );
     }
 
+    fn open_ui_preview_action(&mut self, cx: &mut Context<Self>) {
+        self.open_editor(EditorPanel::UiPreview(UiPreviewDraft), cx);
+    }
+
     fn open_add_project_action(&mut self, cx: &mut Context<Self>) {
         self.add_project_wizard = Some(workspace::AddProjectWizard::default());
         cx.notify();
@@ -1365,6 +1369,9 @@ impl NativeShell {
             EditorPanel::Settings(_) => {
                 self.close_editor(cx);
             }
+            EditorPanel::UiPreview(_) => {
+                self.close_editor(cx);
+            }
             EditorPanel::Project(draft) => {
                 if draft.name.trim().is_empty() {
                     self.editor_notice = Some("Project name is required".to_string());
@@ -1533,6 +1540,7 @@ impl NativeShell {
 
         match panel {
             EditorPanel::Settings(_) => {}
+            EditorPanel::UiPreview(_) => {}
             EditorPanel::Project(draft) => {
                 let Some(project_id) = draft.existing_id else {
                     return;
@@ -1785,6 +1793,7 @@ impl NativeShell {
             EditorAction::CheckForUpdates => self.check_for_updates_action(cx),
             EditorAction::DownloadUpdate => self.download_update_action(cx),
             EditorAction::InstallUpdate => self.install_update_action(cx),
+            EditorAction::OpenUiPreview => self.open_ui_preview_action(cx),
             EditorAction::CycleDefaultTerminal => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.default_terminal =

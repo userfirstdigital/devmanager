@@ -1,5 +1,16 @@
+mod editor_ui;
+
+use self::editor_ui::{
+    render_choice_row, render_display_field, render_editor_intro, render_editor_section,
+    render_editor_toolbar, render_form_fields, render_form_sections, render_info_row,
+    render_notice_row, render_preview_stories, render_selection_row, render_static_form_fields,
+    render_static_form_sections, render_surface_action_button, FormAction, FormActionGroup,
+    FormField, FormSection, FormSelectionList, FormSelectionRow, PreviewState, PreviewStory,
+    SurfaceActionButtonStyle, SurfaceBadge, SurfaceTone,
+};
 use crate::models::{
-    DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult,
+    DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult, ScannedPort,
+    ScannedScript,
 };
 use crate::theme;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
@@ -90,539 +101,419 @@ pub fn render_add_project_wizard(
     }
 }
 
-fn render_wizard_step1(wizard: &AddProjectWizard, actions: WizardActions<'_>) -> impl IntoElement {
-    let on_cancel = (actions.on_action)(WizardAction::Cancel);
-    let on_configure = (actions.on_action)(WizardAction::Configure);
-    let on_pick_root = (actions.on_action)(WizardAction::PickRootFolder);
-    let on_click_name = (actions.on_action)(WizardAction::ClickName);
-
-    let focused = wizard.name_focused;
-    let display_name = if focused || !wizard.name.is_empty() {
-        let text = if wizard.name.is_empty() {
-            ""
-        } else {
-            &wizard.name
-        };
-        display_text_with_cursor(text, wizard.cursor)
-    } else {
-        "My App".to_string()
-    };
-    let name_is_placeholder = wizard.name.is_empty() && !focused;
-
-    deferred(
-        anchored()
-            .snap_to_window()
-            .anchor(Corner::TopLeft)
-            .child(
-                // Backdrop
-                div()
-                    .id("wizard-backdrop")
-                    .occlude()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        // Modal card
-                        div()
-                            .w(px(420.0))
-                            .rounded_md()
-                            .bg(rgb(theme::PANEL_HEADER_BG))
-                            .border_1()
-                            .border_color(rgb(theme::BORDER_PRIMARY))
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            // Header
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px(px(16.0))
-                                    .py(px(12.0))
-                                    .border_b_1()
-                                    .border_color(rgb(theme::BORDER_PRIMARY))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(rgb(theme::TEXT_PRIMARY))
-                                            .child("Add Project"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .cursor_pointer()
-                                            .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)))
-                                            .child("\u{2715}")
-                                            .on_mouse_down(MouseButton::Left, on_cancel),
-                                    ),
-                            )
-                            // Body
-                            .child(
-                                div()
-                                    .px(px(16.0))
-                                    .py(px(16.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(16.0))
-                                    // Name field
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(theme::TEXT_MUTED))
-                                                    .child("Project Name"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w_full()
-                                                    .px(px(10.0))
-                                                    .py(px(8.0))
-                                                    .rounded_sm()
-                                                    .bg(rgb(theme::APP_BG))
-                                                    .border_1()
-                                                    .border_color(rgb(if focused {
-                                                        theme::PRIMARY
-                                                    } else {
-                                                        theme::BORDER_SECONDARY
-                                                    }))
-                                                    .text_sm()
-                                                    .text_color(rgb(if name_is_placeholder {
-                                                        theme::TEXT_SUBTLE
-                                                    } else {
-                                                        theme::TEXT_PRIMARY
-                                                    }))
-                                                    .cursor_text()
-                                                    .child(SharedString::from(display_name))
-                                                    .on_mouse_down(MouseButton::Left, on_click_name),
-                                            ),
-                                    )
-                                    // Color picker
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(theme::TEXT_MUTED))
-                                                    .child("Color"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(8.0))
-                                                    .children(
-                                                        PROJECT_COLOR_PRESETS.iter().map(
-                                                            |(hex, name)| {
-                                                                let selected =
-                                                                    wizard.color == *name;
-                                                                let on_select = (actions.on_action)(
-                                                                    WizardAction::SelectColor(
-                                                                        name.to_string(),
-                                                                    ),
-                                                                );
-                                                                div()
-                                                                    .size(px(28.0))
-                                                                    .rounded_full()
-                                                                    .cursor_pointer()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .border_2()
-                                                                    .border_color(rgb(if selected {
-                                                                        0xffffff
-                                                                    } else {
-                                                                        theme::PANEL_HEADER_BG
-                                                                    }))
-                                                                    .child(
-                                                                        div()
-                                                                            .size(px(20.0))
-                                                                            .rounded_full()
-                                                                            .bg(rgb(*hex)),
-                                                                    )
-                                                                    .on_mouse_down(
-                                                                        MouseButton::Left,
-                                                                        on_select,
-                                                                    )
-                                                                    .into_any_element()
-                                                            },
-                                                        ),
-                                                    ),
-                                            ),
-                                    )
-                                    // Root folder
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(theme::TEXT_MUTED))
-                                                    .child("Root Folder"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w_full()
-                                                    .px(px(10.0))
-                                                    .py(px(8.0))
-                                                    .rounded_sm()
-                                                    .bg(rgb(theme::APP_BG))
-                                                    .border_1()
-                                                    .border_color(rgb(theme::BORDER_SECONDARY))
-                                                    .text_sm()
-                                                    .text_color(rgb(if wizard.root_path.is_empty() {
-                                                        theme::TEXT_SUBTLE
-                                                    } else {
-                                                        theme::TEXT_PRIMARY
-                                                    }))
-                                                    .cursor_pointer()
-                                                    .hover(|s| {
-                                                        s.border_color(rgb(theme::TEXT_SUBTLE))
-                                                    })
-                                                    .child(SharedString::from(
-                                                        if wizard.root_path.is_empty() {
-                                                            "Select root folder\u{2026}".to_string()
-                                                        } else {
-                                                            wizard.root_path.clone()
-                                                        },
-                                                    ))
-                                                    .on_mouse_down(MouseButton::Left, on_pick_root),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(theme::TEXT_SUBTLE))
-                                                    .child("Sub-folders with package.json or Cargo.toml will be discovered automatically"),
-                                            ),
-                                    )
-                                    .children(wizard.scan_message.as_ref().map(|message| {
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .child(SharedString::from(message.clone()))
-                                    }))
-                                    // Discovered folders
-                                    .children(
-                                        (!wizard.scan_entries.is_empty()).then(|| {
-                                            let count = wizard.scan_entries.len();
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap(px(6.0))
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(theme::TEXT_MUTED))
-                                                        .child(SharedString::from(format!(
-                                                            "Discovered folders ({count})"
-                                                        ))),
-                                                )
-                                                .children(wizard.scan_entries.iter().map(|entry| {
-                                                    let selected = wizard
-                                                        .selected_folders
-                                                        .contains(&entry.path);
-                                                    let on_toggle = (actions.on_action)(
-                                                        WizardAction::ToggleFolder(
-                                                            entry.path.clone(),
-                                                        ),
-                                                    );
-                                                    let detail = wizard_scan_detail(entry);
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .gap(px(8.0))
-                                                        .px(px(10.0))
-                                                        .py(px(6.0))
-                                                        .rounded_sm()
-                                                        .bg(rgb(theme::APP_BG))
-                                                        .cursor_pointer()
-                                                        .hover(|s| {
-                                                            s.bg(rgb(theme::ROW_HOVER_BG))
-                                                        })
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap(px(8.0))
-                                                                .child(
-                                                                    div()
-                                                                        .size(px(16.0))
-                                                                        .rounded_sm()
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .bg(rgb(if selected {
-                                                                            theme::PRIMARY
-                                                                        } else {
-                                                                            theme::BORDER_SECONDARY
-                                                                        }))
-                                                                        .child(
-                                                                            div()
-                                                                                .text_xs()
-                                                                                .text_color(rgb(
-                                                                                    0xffffff,
-                                                                                ))
-                                                                                .child(
-                                                                                    if selected {
-                                                                                        "\u{2713}"
-                                                                                    } else {
-                                                                                        ""
-                                                                                    },
-                                                                                ),
-                                                                        ),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .text_sm()
-                                                                        .text_color(rgb(
-                                                                            theme::TEXT_PRIMARY,
-                                                                        ))
-                                                                        .child(SharedString::from(
-                                                                            entry.name.clone(),
-                                                                        )),
-                                                                ),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(rgb(
-                                                                    theme::TEXT_SUBTLE,
-                                                                ))
-                                                                .child(SharedString::from(
-                                                                    detail,
-                                                                )),
-                                                        )
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            on_toggle,
-                                                        )
-                                                        .into_any_element()
-                                                }))
-                                                .into_any_element()
-                                        }),
-                                    ),
-                            )
-                            // Footer
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .gap(px(8.0))
-                                    .px(px(16.0))
-                                    .py(px(12.0))
-                                    .border_t_1()
-                                    .border_color(rgb(theme::BORDER_PRIMARY))
-                                    .child(
-                                        div()
-                                            .px(px(12.0))
-                                            .py(px(6.0))
-                                            .rounded_sm()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .cursor_pointer()
-                                            .hover(|s| {
-                                                s.text_color(rgb(theme::TEXT_PRIMARY))
-                                                    .bg(rgb(theme::ROW_HOVER_BG))
-                                            })
-                                            .child("Cancel")
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                (actions.on_action)(WizardAction::Cancel),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .px(px(14.0))
-                                            .py(px(6.0))
-                                            .rounded_sm()
-                                            .bg(rgb(theme::PRIMARY))
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme::SELECTION_TEXT))
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
-                                            .child("Configure \u{2192}")
-                                            .on_mouse_down(MouseButton::Left, on_configure),
-                                    ),
-                            ),
-                    ),
-            ),
-    )
-    .with_priority(2)
-}
-
-fn wizard_scan_detail(entry: &RootScanEntry) -> String {
-    let scripts = entry.scripts.len();
-    let has_env = entry.has_env;
-    match (scripts, has_env) {
-        (0, false) => String::new(),
-        (0, true) => ".env".to_string(),
-        (n, false) => format!("{n} scripts"),
-        (n, true) => format!("{n} scripts + .env"),
-    }
-}
-
-fn render_wizard_step2(wizard: &AddProjectWizard, actions: WizardActions<'_>) -> impl IntoElement {
-    let on_cancel = (actions.on_action)(WizardAction::Cancel);
-    let on_back = (actions.on_action)(WizardAction::Back);
-    let on_create = (actions.on_action)(WizardAction::Create);
-
-    let selected_entries: Vec<&RootScanEntry> = wizard
-        .scan_entries
-        .iter()
-        .filter(|e| wizard.selected_folders.contains(&e.path))
-        .collect();
-
+fn render_wizard_shell(backdrop_id: &'static str, frame: AnyElement) -> impl IntoElement {
     deferred(
         anchored().snap_to_window().anchor(Corner::TopLeft).child(
             div()
-                .id("wizard-step2-backdrop")
+                .id(backdrop_id)
                 .occlude()
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    div()
-                        .w(px(520.0))
-                        .max_h(px(600.0))
-                        .rounded_md()
-                        .bg(rgb(theme::PANEL_HEADER_BG))
-                        .border_1()
-                        .border_color(rgb(theme::BORDER_PRIMARY))
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        // Header
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px(px(16.0))
-                                .py(px(12.0))
-                                .border_b_1()
-                                .border_color(rgb(theme::BORDER_PRIMARY))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .text_color(rgb(theme::TEXT_PRIMARY))
-                                        .child("Add Project \u{2014} Configure Folders"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_MUTED))
-                                        .cursor_pointer()
-                                        .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)))
-                                        .child("\u{2715}")
-                                        .on_mouse_down(MouseButton::Left, on_cancel),
-                                ),
-                        )
-                        // Body (scrollable)
-                        .child(
-                            div()
-                                .flex_1()
-                                .id("wizard-step2-scroll")
-                                .overflow_y_scroll()
-                                .scrollbar_width(px(6.0))
-                                .child(
-                                    div()
-                                        .px(px(16.0))
-                                        .py(px(16.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(20.0))
-                                        .children(selected_entries.iter().map(|entry| {
-                                            render_wizard_folder_config(entry, wizard, &actions)
-                                                .into_any_element()
-                                        })),
-                                ),
-                        )
-                        // Footer
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px(px(16.0))
-                                .py(px(12.0))
-                                .border_t_1()
-                                .border_color(rgb(theme::BORDER_PRIMARY))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_MUTED))
-                                        .cursor_pointer()
-                                        .hover(|s| s.text_color(rgb(theme::TEXT_PRIMARY)))
-                                        .child("\u{2190} Back")
-                                        .on_mouse_down(MouseButton::Left, on_back),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.0))
-                                        .child(
-                                            div()
-                                                .px(px(12.0))
-                                                .py(px(6.0))
-                                                .rounded_sm()
-                                                .text_xs()
-                                                .text_color(rgb(theme::TEXT_MUTED))
-                                                .cursor_pointer()
-                                                .hover(|s| {
-                                                    s.text_color(rgb(theme::TEXT_PRIMARY))
-                                                        .bg(rgb(theme::ROW_HOVER_BG))
-                                                })
-                                                .child("Cancel")
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    (actions.on_action)(WizardAction::Cancel),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .px(px(14.0))
-                                                .py(px(6.0))
-                                                .rounded_sm()
-                                                .bg(rgb(theme::PRIMARY))
-                                                .text_xs()
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(rgb(theme::SELECTION_TEXT))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
-                                                .child("Create Project")
-                                                .on_mouse_down(MouseButton::Left, on_create),
-                                        ),
-                                ),
-                        ),
-                ),
+                .child(frame),
         ),
     )
     .with_priority(2)
 }
 
+fn render_wizard_frame(
+    scroll_id: &'static str,
+    width: f32,
+    title: &str,
+    description: &str,
+    on_close: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    body: AnyElement,
+    footer: AnyElement,
+) -> impl IntoElement {
+    div()
+        .w(px(width))
+        .max_h(px(720.0))
+        .rounded_md()
+        .bg(rgb(theme::EDITOR_CARD_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .px(px(18.0))
+                .py(px(14.0))
+                .bg(rgb(theme::TOPBAR_BG))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_PRIMARY))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(div().size(px(10.0)).rounded_full().bg(rgb(theme::PRIMARY)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(theme::TEXT_PRIMARY))
+                                        .child(SharedString::from(title.to_string())),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_SUBTLE))
+                                        .child(SharedString::from(description.to_string())),
+                                ),
+                        ),
+                )
+                .child(render_surface_action_button(
+                    "Close",
+                    SurfaceActionButtonStyle::Ghost,
+                    on_close,
+                )),
+        )
+        .child(
+            div()
+                .flex_1()
+                .id(scroll_id)
+                .overflow_y_scroll()
+                .scrollbar_width(px(6.0))
+                .child(
+                    div()
+                        .px(px(20.0))
+                        .py(px(20.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(18.0))
+                        .child(body),
+                ),
+        )
+        .child(
+            div()
+                .px(px(18.0))
+                .py(px(14.0))
+                .border_t_1()
+                .border_color(rgb(theme::BORDER_PRIMARY))
+                .child(footer),
+        )
+}
+
+fn render_wizard_step1(wizard: &AddProjectWizard, actions: WizardActions<'_>) -> impl IntoElement {
+    render_wizard_shell(
+        "wizard-backdrop",
+        render_wizard_step1_frame("add-project-step1-scroll", wizard, &actions).into_any_element(),
+    )
+}
+
+fn render_wizard_step1_frame(
+    scroll_id: &'static str,
+    wizard: &AddProjectWizard,
+    actions: &WizardActions<'_>,
+) -> impl IntoElement {
+    let on_cancel = (actions.on_action)(WizardAction::Cancel);
+    let on_configure = (actions.on_action)(WizardAction::Configure);
+
+    render_wizard_frame(
+        scroll_id,
+        760.0,
+        "Add Project",
+        "Define the project identity, pick a root folder, and review the detected apps.",
+        on_cancel,
+        render_wizard_step1_content(wizard, actions).into_any_element(),
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(10.0))
+            .child(render_surface_action_button(
+                "Cancel",
+                SurfaceActionButtonStyle::Ghost,
+                (actions.on_action)(WizardAction::Cancel),
+            ))
+            .child(render_surface_action_button(
+                "Configure Folders",
+                SurfaceActionButtonStyle::Primary,
+                on_configure,
+            ))
+            .into_any_element(),
+    )
+}
+
+fn wizard_scan_detail(entry: &RootScanEntry) -> String {
+    let scripts = entry.scripts.len();
+    let has_env = entry.has_env;
+    let mut parts = Vec::new();
+
+    if !entry.project_type.trim().is_empty() {
+        parts.push(scan_project_type_label(entry.project_type.as_str()));
+    }
+
+    match (scripts, has_env) {
+        (0, false) => {}
+        (0, true) => parts.push(".env".to_string()),
+        (1, false) => parts.push("1 script".to_string()),
+        (n, false) => parts.push(format!("{n} scripts")),
+        (1, true) => {
+            parts.push("1 script".to_string());
+            parts.push(".env".to_string());
+        }
+        (n, true) => {
+            parts.push(format!("{n} scripts"));
+            parts.push(".env".to_string());
+        }
+    }
+
+    parts.join(" | ")
+}
+
+fn scan_project_type_label(project_type: &str) -> String {
+    match project_type.trim().to_ascii_lowercase().as_str() {
+        "node" | "npm" => "Node".to_string(),
+        "cargo" | "rust" => "Rust".to_string(),
+        "python" => "Python".to_string(),
+        other if other.is_empty() => String::new(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+fn render_wizard_step1_content(
+    wizard: &AddProjectWizard,
+    actions: &WizardActions<'_>,
+) -> impl IntoElement {
+    let on_pick_root = (actions.on_action)(WizardAction::PickRootFolder);
+    let on_click_name = (actions.on_action)(WizardAction::ClickName);
+    let display_name = if wizard.name_focused {
+        display_text_with_cursor(wizard.name.as_str(), wizard.cursor)
+    } else {
+        wizard.name.clone()
+    };
+
+    let scan_notice = wizard
+        .scan_message
+        .as_ref()
+        .filter(|message| wizard.scan_entries.is_empty() || !message.starts_with("Discovered "));
+
+    let mut sections = vec![FormSection::new("Project").fields(vec![
+        FormField::custom(
+            render_display_field(
+                "Name",
+                "Shown in the sidebar.",
+                display_name.as_str(),
+                "My App",
+                wizard.name_focused,
+                on_click_name,
+            )
+            .into_any_element(),
+        ),
+        FormField::custom(render_wizard_color_picker(wizard, actions).into_any_element()),
+        FormField::choice(
+            "Root folder",
+            if wizard.root_path.is_empty() {
+                "Choose root folder".to_string()
+            } else {
+                wizard.root_path.clone()
+            },
+            Some(if wizard.root_path.is_empty() {
+                "Pick the repo root to detect app folders.".to_string()
+            } else {
+                "Change the folder DevManager scans.".to_string()
+            }),
+            on_pick_root,
+        ),
+    ])];
+
+    if wizard.root_path.is_empty() {
+        sections.push(FormSection::new("Scan").field(FormField::empty_state(
+            "Pick a root folder",
+            "DevManager will look for app folders, scripts, and env ports there.",
+            SurfaceTone::Muted,
+        )));
+    } else if let Some(message) = scan_notice {
+        sections.push(
+            FormSection::new("Scan").field(FormField::notice(message.clone(), SurfaceTone::Accent)),
+        );
+    }
+
+    if !wizard.scan_entries.is_empty() {
+        let count = wizard.scan_entries.len();
+        let mut list = FormSelectionList::untitled();
+        for entry in &wizard.scan_entries {
+            let selected = wizard.selected_folders.contains(&entry.path);
+            let on_toggle = (actions.on_action)(WizardAction::ToggleFolder(entry.path.clone()));
+            let detail = wizard_scan_detail(entry);
+            list = list.row(FormSelectionRow::new(
+                entry.name.clone(),
+                (!detail.is_empty()).then_some(detail),
+                selected,
+                on_toggle,
+            ));
+        }
+        sections.push(
+            FormSection::new("Folders to Add")
+                .hint(format!(
+                    "{count} found. Clear anything you do not want in the new project."
+                ))
+                .field(FormField::selection_list(list)),
+        );
+    }
+
+    render_static_form_sections(sections)
+}
+
+fn render_wizard_color_picker(
+    wizard: &AddProjectWizard,
+    actions: &WizardActions<'_>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child("Accent color"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child("Sidebar marker color."),
+                ),
+        )
+        .child(div().flex().items_center().gap(px(10.0)).children(
+            PROJECT_COLOR_PRESETS.iter().map(|(hex, name)| {
+                let selected = wizard.color == *name;
+                let on_select = (actions.on_action)(WizardAction::SelectColor(name.to_string()));
+                div()
+                    .size(px(34.0))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(theme::EDITOR_FIELD_BG))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        theme::PRIMARY
+                    } else {
+                        theme::BORDER_PRIMARY
+                    }))
+                    .hover(|s| s.border_color(rgb(theme::PRIMARY)))
+                    .child(div().size(px(22.0)).rounded_full().bg(rgb(*hex)))
+                    .on_mouse_down(MouseButton::Left, on_select)
+                    .into_any_element()
+            }),
+        ))
+}
+
+fn render_wizard_step2(wizard: &AddProjectWizard, actions: WizardActions<'_>) -> impl IntoElement {
+    render_wizard_shell(
+        "wizard-step2-backdrop",
+        render_wizard_step2_frame("add-project-step2-scroll", wizard, &actions).into_any_element(),
+    )
+}
+
+fn render_wizard_step2_frame(
+    scroll_id: &'static str,
+    wizard: &AddProjectWizard,
+    actions: &WizardActions<'_>,
+) -> impl IntoElement {
+    let on_cancel = (actions.on_action)(WizardAction::Cancel);
+    let on_back = (actions.on_action)(WizardAction::Back);
+    let on_create = (actions.on_action)(WizardAction::Create);
+
+    render_wizard_frame(
+        scroll_id,
+        820.0,
+        "Add Project",
+        "Choose which scripts and default port variables should seed the new project folders.",
+        on_cancel,
+        render_wizard_step2_content(wizard, actions).into_any_element(),
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .child(render_surface_action_button(
+                "Back",
+                SurfaceActionButtonStyle::Ghost,
+                on_back,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(render_surface_action_button(
+                        "Cancel",
+                        SurfaceActionButtonStyle::Ghost,
+                        (actions.on_action)(WizardAction::Cancel),
+                    ))
+                    .child(render_surface_action_button(
+                        "Create Project",
+                        SurfaceActionButtonStyle::Primary,
+                        on_create,
+                    )),
+            )
+            .into_any_element(),
+    )
+}
+
+fn render_wizard_step2_content(
+    wizard: &AddProjectWizard,
+    actions: &WizardActions<'_>,
+) -> impl IntoElement {
+    let selected_entries: Vec<&RootScanEntry> = wizard
+        .scan_entries
+        .iter()
+        .filter(|entry| wizard.selected_folders.contains(&entry.path))
+        .collect();
+
+    if selected_entries.is_empty() {
+        return render_static_form_sections(vec![FormSection::new("Folders").field(
+            FormField::empty_state(
+                "No folders selected",
+                "Go back and pick at least one folder to configure.",
+                SurfaceTone::Warning,
+            ),
+        )]);
+    }
+
+    let mut sections = Vec::new();
+    for entry in selected_entries {
+        sections.push(render_wizard_folder_config(entry, wizard, actions));
+    }
+
+    render_static_form_sections(sections)
+}
+
+#[allow(unreachable_code)]
 fn render_wizard_folder_config(
     entry: &RootScanEntry,
     wizard: &AddProjectWizard,
     actions: &WizardActions<'_>,
-) -> impl IntoElement {
+) -> FormSection {
     let selected_scripts = wizard.selected_scripts.get(&entry.path);
     let selected_port = wizard
         .selected_port_variables
@@ -630,184 +521,163 @@ fn render_wizard_folder_config(
         .cloned()
         .flatten();
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        // Folder header
-        .child(
-            div()
-                .flex()
-                .items_baseline()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child(SharedString::from(entry.name.clone())),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_SUBTLE))
-                        .child(SharedString::from(entry.path.clone())),
-                ),
-        )
-        // Scripts
-        .children((!entry.scripts.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .children(entry.scripts.iter().map(|script| {
-                    let is_selected = selected_scripts
-                        .map(|s| s.contains(&script.name))
-                        .unwrap_or(false);
-                    let on_toggle = (actions.on_action)(WizardAction::ToggleScript {
-                        folder_path: entry.path.clone(),
-                        script_name: script.name.clone(),
-                    });
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.0))
-                        .px(px(6.0))
-                        .py(px(4.0))
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .size(px(16.0))
-                                        .rounded_sm()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(rgb(if is_selected {
-                                            theme::PRIMARY
-                                        } else {
-                                            theme::BORDER_SECONDARY
-                                        }))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(0xffffff))
-                                                .child(if is_selected { "\u{2713}" } else { "" }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(theme::TEXT_PRIMARY))
-                                        .child(SharedString::from(script.name.clone())),
-                                ),
+    let detail = wizard_scan_detail(entry);
+    let section_hint = if detail.is_empty() {
+        entry.path.clone()
+    } else {
+        format!("{} | {}", detail, entry.path)
+    };
+
+    let mut fields = Vec::new();
+
+    if !entry.scripts.is_empty() {
+        let mut list = FormSelectionList::new("Create commands")
+            .hint("Selected scripts become commands in the new folder.");
+        for script in &entry.scripts {
+            let is_selected = selected_scripts
+                .map(|scripts| scripts.contains(&script.name))
+                .unwrap_or(false);
+            let on_toggle = (actions.on_action)(WizardAction::ToggleScript {
+                folder_path: entry.path.clone(),
+                script_name: script.name.clone(),
+            });
+            list = list.row(FormSelectionRow::new(
+                script.name.clone(),
+                Some(script.command.clone()),
+                is_selected,
+                on_toggle,
+            ));
+        }
+        fields.push(FormField::selection_list(list));
+    }
+
+    if !entry.ports.is_empty() {
+        let mut list = FormSelectionList::new("Default port")
+            .hint("Choose which env var should fill the folder port setting.");
+        list = list.row(FormSelectionRow::new(
+            "None",
+            Some("Do not set a default port.".to_string()),
+            selected_port.is_none(),
+            (actions.on_action)(WizardAction::SelectPortVariable {
+                folder_path: entry.path.clone(),
+                variable: None,
+            }),
+        ));
+        for port in &entry.ports {
+            let is_selected = selected_port.as_deref() == Some(port.variable.as_str());
+            let on_select = (actions.on_action)(WizardAction::SelectPortVariable {
+                folder_path: entry.path.clone(),
+                variable: Some(port.variable.clone()),
+            });
+            list = list.row(FormSelectionRow::new(
+                format!("{} = {}", port.variable, port.port),
+                Some(port.source.clone()),
+                is_selected,
+                on_select,
+            ));
+        }
+        fields.push(FormField::selection_list(list));
+    }
+
+    if fields.is_empty() {
+        fields.push(FormField::empty_state(
+            "No detected scripts or ports",
+            "This folder can still be added, but the scan did not find anything to prefill.",
+            SurfaceTone::Muted,
+        ));
+    }
+
+    return FormSection::new(entry.name.clone())
+        .hint(section_hint)
+        .fields(fields);
+
+    let _ = render_editor_section(
+        entry.name.as_str(),
+        Some(section_hint.as_str()),
+        /*
+                format!("{} · {}", entry.path, detail).as_str()
+            },
+        ),
+        */
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .children((!entry.scripts.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("Scripts"),
+                    )
+                    .children(entry.scripts.iter().map(|script| {
+                        let is_selected = selected_scripts
+                            .map(|scripts| scripts.contains(&script.name))
+                            .unwrap_or(false);
+                        let on_toggle = (actions.on_action)(WizardAction::ToggleScript {
+                            folder_path: entry.path.clone(),
+                            script_name: script.name.clone(),
+                        });
+                        render_selection_row(
+                            script.name.clone(),
+                            Some(script.command.clone()),
+                            is_selected,
+                            on_toggle,
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(script.command.clone())),
-                        )
-                        .on_mouse_down(MouseButton::Left, on_toggle)
                         .into_any_element()
-                }))
-                .into_any_element()
-        }))
-        // Port variables
-        .children((!entry.ports.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .pt(px(4.0))
-                        .child("Port Variable (select one)"),
-                )
-                .children(entry.ports.iter().map(|port| {
-                    let is_selected = selected_port.as_deref() == Some(port.variable.as_str());
-                    let on_select = (actions.on_action)(WizardAction::SelectPortVariable {
-                        folder_path: entry.path.clone(),
-                        variable: Some(port.variable.clone()),
-                    });
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.0))
-                        .px(px(6.0))
-                        .py(px(6.0))
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .bg(rgb(if is_selected {
-                            theme::APP_BG
-                        } else {
-                            theme::PANEL_HEADER_BG
-                        }))
-                        .border_1()
-                        .border_color(rgb(if is_selected {
-                            theme::PRIMARY
-                        } else {
-                            theme::PANEL_HEADER_BG
-                        }))
-                        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .size(px(14.0))
-                                        .rounded_full()
-                                        .border_2()
-                                        .border_color(rgb(if is_selected {
-                                            theme::PRIMARY
-                                        } else {
-                                            theme::TEXT_SUBTLE
-                                        }))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .children(is_selected.then(|| {
-                                            div()
-                                                .size(px(6.0))
-                                                .rounded_full()
-                                                .bg(rgb(theme::PRIMARY))
-                                        })),
-                                )
-                                .child(div().text_sm().text_color(rgb(theme::TEXT_PRIMARY)).child(
-                                    SharedString::from(format!(
-                                        "{}  = {}",
-                                        port.variable, port.port
-                                    )),
-                                )),
+                    }))
+                    .into_any_element()
+            }))
+            .children((!entry.ports.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("Default port variable"),
+                    )
+                    .child(render_selection_row(
+                        "None".to_string(),
+                        Some("Do not set a default port variable for this folder.".to_string()),
+                        selected_port.is_none(),
+                        (actions.on_action)(WizardAction::SelectPortVariable {
+                            folder_path: entry.path.clone(),
+                            variable: None,
+                        }),
+                    ))
+                    .children(entry.ports.iter().map(|port| {
+                        let is_selected = selected_port.as_deref() == Some(port.variable.as_str());
+                        let on_select = (actions.on_action)(WizardAction::SelectPortVariable {
+                            folder_path: entry.path.clone(),
+                            variable: Some(port.variable.clone()),
+                        });
+                        render_selection_row(
+                            format!("{} = {}", port.variable, port.port),
+                            Some(port.source.clone()),
+                            is_selected,
+                            on_select,
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(format!("({})", port.source))),
-                        )
-                        .on_mouse_down(MouseButton::Left, on_select)
                         .into_any_element()
-                }))
-                .into_any_element()
-        }))
+                    }))
+                    .into_any_element()
+            }))
+            .into_any_element(),
+    );
 }
 
 #[derive(Debug, Clone)]
 pub enum EditorPanel {
     Settings(SettingsDraft),
+    UiPreview(UiPreviewDraft),
     Project(ProjectDraft),
     Folder(FolderDraft),
     Command(CommandDraft),
@@ -818,6 +688,7 @@ impl EditorPanel {
     pub fn title(&self) -> &'static str {
         match self {
             Self::Settings(_) => "Settings",
+            Self::UiPreview(_) => "UI Preview",
             Self::Project(_) => "Edit Project",
             Self::Folder(draft) => {
                 if draft.existing_id.is_some() {
@@ -845,17 +716,21 @@ impl EditorPanel {
 
     pub fn subtitle(&self) -> &'static str {
         match self {
-            Self::Settings(_) => "Click a field to type. Settings persist as you change them.",
-            Self::Project(_) => "Project metadata and notes are persisted to config.json.",
-            Self::Folder(_) => "Folders own command definitions and env helpers.",
-            Self::Command(_) => "Args use space-separated tokens. Env uses KEY=VALUE;KEY2=VALUE2.",
-            Self::Ssh(_) => "Saved SSH entries can now open native terminal sessions.",
+            Self::Settings(_) => "Workspace defaults for terminals, AI tools, and data handling.",
+            Self::UiPreview(_) => {
+                "Read-only stories for iterating on native UI without touching live data."
+            }
+            Self::Project(_) => "Project identity, notes, and workspace defaults.",
+            Self::Folder(_) => "Folder path, env settings, and detected commands.",
+            Self::Command(_) => "Process command, env overrides, and restart behavior.",
+            Self::Ssh(_) => "Connection details for remote terminal sessions.",
         }
     }
 
     pub fn accent_color(&self) -> u32 {
         match self {
             Self::Settings(_) => theme::PRIMARY,
+            Self::UiPreview(_) => 0x14b8a6,
             Self::Project(draft) => {
                 theme::parse_hex_color(Some(draft.color.as_str()), theme::PROJECT_DOT)
             }
@@ -868,6 +743,7 @@ impl EditorPanel {
     pub fn headline(&self) -> String {
         match self {
             Self::Settings(_) => "Workspace settings".to_string(),
+            Self::UiPreview(_) => "Native UI preview lab".to_string(),
             Self::Project(draft) => fallback_editor_label(draft.name.as_str(), "Untitled project"),
             Self::Folder(draft) => fallback_editor_label(
                 if draft.name.trim().is_empty() {
@@ -899,6 +775,10 @@ impl EditorPanel {
     pub fn context_line(&self) -> Option<String> {
         match self {
             Self::Settings(_) => None,
+            Self::UiPreview(_) => Some(
+                "Seeded states only. Actions are intentionally disabled in this surface."
+                    .to_string(),
+            ),
             Self::Project(draft) => non_empty_value(draft.root_path.as_str()),
             Self::Folder(draft) => non_empty_value(draft.folder_path.as_str()),
             Self::Command(draft) => {
@@ -928,6 +808,11 @@ impl EditorPanel {
     pub fn summary_items(&self) -> Vec<(String, String)> {
         match self {
             Self::Settings(_) => Vec::new(),
+            Self::UiPreview(_) => vec![
+                ("Stories".to_string(), "6".to_string()),
+                ("Mode".to_string(), "Design".to_string()),
+                ("Safety".to_string(), "Read-only".to_string()),
+            ],
             Self::Project(draft) => vec![
                 (
                     "Accent".to_string(),
@@ -1037,6 +922,7 @@ impl EditorPanel {
     pub fn save_label(&self) -> &'static str {
         match self {
             Self::Settings(_) => "Close",
+            Self::UiPreview(_) => "Close",
             Self::Project(_) => "Save Project",
             Self::Folder(draft) => {
                 if draft.existing_id.is_some() {
@@ -1065,6 +951,7 @@ impl EditorPanel {
     pub fn show_delete(&self) -> bool {
         match self {
             Self::Settings(_) => false,
+            Self::UiPreview(_) => false,
             Self::Project(draft) => draft.existing_id.is_some(),
             Self::Folder(draft) => draft.existing_id.is_some(),
             Self::Command(draft) => draft.existing_id.is_some(),
@@ -1077,6 +964,7 @@ impl EditorPanel {
             (Self::Settings(draft), EditorField::Settings(SettingsField::Theme)) => {
                 Some(&draft.theme)
             }
+            (Self::UiPreview(_), _) => None,
             (Self::Settings(draft), EditorField::Settings(SettingsField::LogBufferSize)) => {
                 Some(&draft.log_buffer_size)
             }
@@ -1135,6 +1023,7 @@ impl EditorPanel {
             (Self::Settings(draft), EditorField::Settings(SettingsField::Theme)) => {
                 Some(&mut draft.theme)
             }
+            (Self::UiPreview(_), _) => None,
             (Self::Settings(draft), EditorField::Settings(SettingsField::LogBufferSize)) => {
                 Some(&mut draft.log_buffer_size)
             }
@@ -1215,6 +1104,9 @@ pub struct SettingsDraft {
     pub keep_selection_on_copy: bool,
     pub open_picker: Option<SettingsPicker>,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct UiPreviewDraft;
 
 #[derive(Debug, Clone)]
 pub struct ProjectDraft {
@@ -1381,6 +1273,7 @@ pub enum EditorAction {
     CheckForUpdates,
     DownloadUpdate,
     InstallUpdate,
+    OpenUiPreview,
     CycleDefaultTerminal,
     CycleMacTerminalProfile,
     CycleNotificationSound,
@@ -1421,6 +1314,9 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
         EditorPanel::Settings(draft) => {
             render_settings_panel(draft, model, &actions).into_any_element()
         }
+        EditorPanel::UiPreview(draft) => {
+            render_ui_preview_panel(draft, model, &actions).into_any_element()
+        }
         EditorPanel::Project(draft) => {
             render_project_panel(draft, model, &actions).into_any_element()
         }
@@ -1439,6 +1335,7 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
         .panel
         .show_delete()
         .then(|| (actions.on_action)(EditorAction::Delete));
+    let show_intro = matches!(model.panel, EditorPanel::UiPreview(_));
 
     div()
         .flex_1()
@@ -1460,7 +1357,7 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
                         div()
                             .w_full()
                             .max_w(px(760.0))
-                            .pt(px(28.0))
+                            .pt(px(if show_intro { 28.0 } else { 20.0 }))
                             .pb(px(56.0))
                             .px(px(24.0))
                             .flex()
@@ -1469,7 +1366,10 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
                             .children(model.notice.as_ref().map(|notice| {
                                 render_notice_row(notice.as_str()).into_any_element()
                             }))
-                            .child(render_editor_intro(&model.panel))
+                            .children(
+                                show_intro
+                                    .then(|| render_editor_intro(&model.panel).into_any_element()),
+                            )
                             .child(body),
                     ),
                 ),
@@ -1592,6 +1492,7 @@ fn render_settings_editor_surface(
         )
 }
 
+#[allow(unreachable_code)]
 fn render_settings_panel(
     draft: &SettingsDraft,
     model: &EditorPaneModel,
@@ -1616,6 +1517,7 @@ fn render_settings_panel(
     let on_toggle_data_picker = (actions.on_action)(EditorAction::ToggleSettingsPicker(
         SettingsPicker::DataActions,
     ));
+    let on_open_ui_preview = (actions.on_action)(EditorAction::OpenUiPreview);
 
     let terminal_options: Vec<AnyElement> = if is_mac {
         [
@@ -1665,187 +1567,403 @@ fn render_settings_panel(
         })
         .collect();
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(20.0))
-        .children(
-            model
-                .notice
-                .as_ref()
-                .map(|notice| render_notice_row(notice.as_str()).into_any_element()),
-        )
-        // — General section
-        .child(render_settings_section(
-            "General",
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .child(render_settings_toggle_row(
-                    "Confirm on close",
-                    "Show confirmation dialog when closing with running servers",
-                    draft.confirm_on_close,
-                    on_toggle_confirm,
-                ))
-                .child(render_settings_toggle_row(
-                    "Minimize to tray",
-                    minimize_to_tray_hint(),
-                    draft.minimize_to_tray,
-                    on_toggle_tray,
-                ))
-                .child(render_settings_toggle_row(
-                    "Resume previous session on startup",
-                    "Restore open tabs and sidebar state on launch",
-                    draft.restore_session_on_start,
-                    on_toggle_restore,
-                ))
-                .child(render_settings_text_input(
-                    "Log buffer size",
-                    "Maximum log lines per command (100 - 100,000)",
-                    draft.log_buffer_size.as_str(),
-                    EditorField::Settings(SettingsField::LogBufferSize),
-                    model,
-                    actions,
-                    Some(140.0),
-                    "10000",
-                ))
+    let mut sections = Vec::new();
+
+    if let Some(notice) = model.notice.as_ref() {
+        sections.push(
+            FormSection::new("Status")
+                .field(FormField::notice(notice.clone(), SurfaceTone::Accent)),
+        );
+    }
+
+    sections.push(FormSection::new("App").fields(vec![
+        FormField::toggle(
+            "Confirm before closing",
+            draft.confirm_on_close,
+            "Warn when servers are still running.",
+            on_toggle_confirm,
+        ),
+        FormField::toggle(
+            "Minimize to tray",
+            draft.minimize_to_tray,
+            minimize_to_tray_hint(),
+            on_toggle_tray,
+        ),
+        FormField::toggle(
+            "Restore previous session",
+            draft.restore_session_on_start,
+            "Reopen tabs and sidebar state on launch.",
+            on_toggle_restore,
+        ),
+    ]));
+
+    let mut terminal_fields = vec![
+        FormField::custom(
+            render_settings_select_row(
+                if is_mac {
+                    "Default terminal shell"
+                } else {
+                    "Default terminal"
+                },
+                if is_mac {
+                    "Shell used for interactive and AI terminals on macOS."
+                } else {
+                    "Shell used for interactive and AI terminals."
+                },
+                if is_mac {
+                    mac_terminal_profile_label(&draft.mac_terminal_profile)
+                } else {
+                    default_terminal_label(&draft.default_terminal)
+                },
+                draft.open_picker == Some(SettingsPicker::Terminal),
+                on_toggle_terminal_picker,
+                None,
+                Some(220.0),
+                terminal_options,
+            )
+            .into_any_element(),
+        ),
+        FormField::custom(render_settings_font_size_row(draft, actions).into_any_element()),
+    ];
+
+    if is_mac {
+        terminal_fields.push(FormField::toggle(
+            "Option acts as Meta",
+            draft.option_as_meta,
+            "Use Option as terminal Meta/Alt instead of character input.",
+            (actions.on_action)(EditorAction::ToggleOptionAsMeta),
+        ));
+    }
+
+    terminal_fields.extend([
+        FormField::custom(
+            render_settings_text_input(
+                "Log history",
+                "Max lines kept per terminal.",
+                draft.log_buffer_size.as_str(),
+                EditorField::Settings(SettingsField::LogBufferSize),
+                model,
+                actions,
+                Some(140.0),
+                "10000",
+            )
+            .into_any_element(),
+        ),
+        FormField::toggle(
+            "Copy on select",
+            draft.copy_on_select,
+            "Copy terminal selections to the clipboard.",
+            (actions.on_action)(EditorAction::ToggleCopyOnSelect),
+        ),
+        FormField::toggle(
+            "Keep selection after copy",
+            draft.keep_selection_on_copy,
+            "Leave the current selection highlighted after copy.",
+            (actions.on_action)(EditorAction::ToggleKeepSelectionOnCopy),
+        ),
+        FormField::custom(
+            render_settings_select_row(
+                "Notification sound",
+                "Played when an AI terminal finishes a long task.",
+                notification_sound_label(&draft.notification_sound),
+                draft.open_picker == Some(SettingsPicker::NotificationSound),
+                on_toggle_sound_picker,
+                Some(
+                    render_settings_inline_button("Test", false, on_preview_sound)
+                        .into_any_element(),
+                ),
+                Some(180.0),
+                sound_options,
+            )
+            .into_any_element(),
+        ),
+    ]);
+
+    sections.push(FormSection::new("Terminal").fields(terminal_fields));
+
+    sections.push(FormSection::new("AI").fields(vec![
+                FormField::custom(
+                    render_settings_text_input(
+                        "Claude command",
+                        "Command used for Claude terminals.",
+                        draft.claude_command.as_str(),
+                        EditorField::Settings(SettingsField::ClaudeCommand),
+                        model,
+                        actions,
+                        None,
+                        "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
+                    )
+                    .into_any_element(),
+                ),
+                FormField::custom(
+                    render_settings_text_input(
+                        "Codex command",
+                        "Command used for Codex terminals.",
+                        draft.codex_command.as_str(),
+                        EditorField::Settings(SettingsField::CodexCommand),
+                        model,
+                        actions,
+                        None,
+                        "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+                    )
+                    .into_any_element(),
+                ),
+            ]));
+
+    sections.push(
+        FormSection::new("Updates").field(FormField::custom(
+            render_updater_panel(&model.updater, on_check_updates, None, on_install_update)
                 .into_any_element(),
-        ))
-        // — Terminal section
-        .child(render_settings_section(
-            "Terminal",
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .child(render_settings_select_row(
-                    if is_mac {
-                        "Default terminal shell"
-                    } else {
-                        "Default terminal"
-                    },
-                    if is_mac {
-                        "Shell used for Claude Code and interactive terminals on macOS"
-                    } else {
-                        "Shell used for Claude Code and interactive terminals"
-                    },
-                    if is_mac {
-                        mac_terminal_profile_label(&draft.mac_terminal_profile)
-                    } else {
-                        default_terminal_label(&draft.default_terminal)
-                    },
-                    draft.open_picker == Some(SettingsPicker::Terminal),
-                    on_toggle_terminal_picker,
-                    None,
-                    Some(220.0),
-                    terminal_options,
-                ))
-                .child(render_settings_font_size_row(draft, actions))
-                .children(is_mac.then(|| {
-                    render_settings_toggle_row(
+        )),
+    );
+
+    sections.push(FormSection::new("Configuration").fields({
+        let mut fields = vec![FormField::action(
+            FormAction::new(
+                "Configuration tools",
+                if draft.open_picker == Some(SettingsPicker::DataActions) {
+                    "Hide"
+                } else {
+                    "Show"
+                },
+                on_toggle_data_picker,
+            )
+            .description("Import or export config.json."),
+        )];
+
+        if draft.open_picker == Some(SettingsPicker::DataActions) {
+            fields.push(FormField::action_group(
+                FormActionGroup::new("Config actions")
+                    .action(
+                        FormAction::new("Export current config", "Export", on_export)
+                            .description("Write the current config to disk."),
+                    )
+                    .action(
+                        FormAction::new("Import and merge", "Merge", on_import_merge).description(
+                            "Merge imported projects and settings into the current config.",
+                        ),
+                    )
+                    .action(
+                        FormAction::new("Import and replace", "Replace", on_import_replace)
+                            .description("Replace the current config with the imported file.")
+                            .style(SurfaceActionButtonStyle::Danger),
+                    ),
+            ));
+        }
+
+        fields
+    }));
+
+    sections.push(
+        FormSection::new("Developer").field(FormField::action(
+            FormAction::new("Open UI preview", "Open", on_open_ui_preview)
+                .description(
+                    "Inspect seeded editor and settings states without touching live data.",
+                )
+                .badge(SurfaceBadge::new("Read-only", SurfaceTone::Muted)),
+        )),
+    );
+
+    return render_form_sections(sections, model, actions);
+
+    let _ =
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(20.0))
+            .children(
+                model
+                    .notice
+                    .as_ref()
+                    .map(|notice| render_notice_row(notice.as_str()).into_any_element()),
+            )
+            // — General section
+            .child(render_settings_section(
+                "General",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(render_settings_toggle_row(
+                        "Confirm on close",
+                        "Show confirmation dialog when closing with running servers",
+                        draft.confirm_on_close,
+                        on_toggle_confirm,
+                    ))
+                    .child(render_settings_toggle_row(
+                        "Minimize to tray",
+                        minimize_to_tray_hint(),
+                        draft.minimize_to_tray,
+                        on_toggle_tray,
+                    ))
+                    .child(render_settings_toggle_row(
+                        "Resume previous session on startup",
+                        "Restore open tabs and sidebar state on launch",
+                        draft.restore_session_on_start,
+                        on_toggle_restore,
+                    ))
+                    .child(render_settings_text_input(
+                        "Log buffer size",
+                        "Maximum log lines per command (100 - 100,000)",
+                        draft.log_buffer_size.as_str(),
+                        EditorField::Settings(SettingsField::LogBufferSize),
+                        model,
+                        actions,
+                        Some(140.0),
+                        "10000",
+                    ))
+                    .into_any_element(),
+            ))
+            // — Terminal section
+            .child(render_settings_section(
+                "Terminal",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(render_settings_select_row(
+                        if is_mac {
+                            "Default terminal shell"
+                        } else {
+                            "Default terminal"
+                        },
+                        if is_mac {
+                            "Shell used for Claude Code and interactive terminals on macOS"
+                        } else {
+                            "Shell used for Claude Code and interactive terminals"
+                        },
+                        if is_mac {
+                            mac_terminal_profile_label(&draft.mac_terminal_profile)
+                        } else {
+                            default_terminal_label(&draft.default_terminal)
+                        },
+                        draft.open_picker == Some(SettingsPicker::Terminal),
+                        on_toggle_terminal_picker,
+                        None,
+                        Some(220.0),
+                        terminal_options,
+                    ))
+                    .child(render_settings_font_size_row(draft, actions))
+                    .children(is_mac.then(|| {
+                        render_settings_toggle_row(
                         "Option acts as Meta",
                         "On macOS, treat Option as terminal Meta/Alt instead of character input",
                         draft.option_as_meta,
                         (actions.on_action)(EditorAction::ToggleOptionAsMeta),
                     )
-                }))
-                .child(render_settings_toggle_row(
-                    "Copy on select",
-                    "Copy terminal selections to the clipboard when you release the mouse",
-                    draft.copy_on_select,
-                    (actions.on_action)(EditorAction::ToggleCopyOnSelect),
-                ))
-                .child(render_settings_toggle_row(
-                    "Keep selection after copy",
-                    "Preserve the current terminal selection after a copy action",
-                    draft.keep_selection_on_copy,
-                    (actions.on_action)(EditorAction::ToggleKeepSelectionOnCopy),
-                ))
-                .child(render_settings_select_row(
-                    "Notification sound",
-                    "Sound played when an AI terminal finishes a long task",
-                    notification_sound_label(&draft.notification_sound),
-                    draft.open_picker == Some(SettingsPicker::NotificationSound),
-                    on_toggle_sound_picker,
-                    Some(render_settings_icon_button("♪", on_preview_sound).into_any_element()),
-                    Some(180.0),
-                    sound_options,
-                ))
-                .into_any_element(),
-        ))
-        // — AI section
-        .child(render_settings_section(
-            "AI Commands",
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .child(render_settings_text_input(
-                    "Claude command",
-                    "Command launched when opening a Claude terminal",
-                    draft.claude_command.as_str(),
-                    EditorField::Settings(SettingsField::ClaudeCommand),
-                    model,
-                    actions,
-                    None,
-                    "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
-                ))
-                .child(render_settings_text_input(
-                    "Codex command",
-                    "Command launched when opening a Codex terminal",
-                    draft.codex_command.as_str(),
-                    EditorField::Settings(SettingsField::CodexCommand),
-                    model,
-                    actions,
-                    None,
-                    "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
-                ))
-                .into_any_element(),
-        ))
-        .child(render_settings_section(
-            "Updates",
-            render_updater_panel(&model.updater, on_check_updates, None, on_install_update)
-                .into_any_element(),
-        ))
-        // — Data section
-        .child(render_settings_section(
-            "Data",
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(10.0))
-                .child(render_settings_inline_button(
-                    "Import / Export Configuration",
-                    false,
-                    on_toggle_data_picker,
-                ))
-                .children(
-                    (draft.open_picker == Some(SettingsPicker::DataActions)).then(|| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(render_settings_dropdown_option(
-                                "Export config".to_string(),
-                                false,
-                                on_export,
-                            ))
-                            .child(render_settings_dropdown_option(
-                                "Import config (merge)".to_string(),
-                                false,
-                                on_import_merge,
-                            ))
-                            .child(render_settings_dropdown_option(
-                                "Import config (replace)".to_string(),
-                                false,
-                                on_import_replace,
-                            ))
-                            .into_any_element()
-                    }),
-                )
-                .into_any_element(),
-        ))
+                    }))
+                    .child(render_settings_toggle_row(
+                        "Copy on select",
+                        "Copy terminal selections to the clipboard when you release the mouse",
+                        draft.copy_on_select,
+                        (actions.on_action)(EditorAction::ToggleCopyOnSelect),
+                    ))
+                    .child(render_settings_toggle_row(
+                        "Keep selection after copy",
+                        "Preserve the current terminal selection after a copy action",
+                        draft.keep_selection_on_copy,
+                        (actions.on_action)(EditorAction::ToggleKeepSelectionOnCopy),
+                    ))
+                    .child(render_settings_select_row(
+                        "Notification sound",
+                        "Sound played when an AI terminal finishes a long task",
+                        notification_sound_label(&draft.notification_sound),
+                        draft.open_picker == Some(SettingsPicker::NotificationSound),
+                        on_toggle_sound_picker,
+                        Some(render_settings_icon_button("♪", on_preview_sound).into_any_element()),
+                        Some(180.0),
+                        sound_options,
+                    ))
+                    .into_any_element(),
+            ))
+            // — AI section
+            .child(render_settings_section(
+                "AI Commands",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(render_settings_text_input(
+                        "Claude command",
+                        "Command launched when opening a Claude terminal",
+                        draft.claude_command.as_str(),
+                        EditorField::Settings(SettingsField::ClaudeCommand),
+                        model,
+                        actions,
+                        None,
+                        "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
+                    ))
+                    .child(render_settings_text_input(
+                        "Codex command",
+                        "Command launched when opening a Codex terminal",
+                        draft.codex_command.as_str(),
+                        EditorField::Settings(SettingsField::CodexCommand),
+                        model,
+                        actions,
+                        None,
+                        "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+                    ))
+                    .into_any_element(),
+            ))
+            .child(render_settings_section(
+                "Updates",
+                render_updater_panel(&model.updater, on_check_updates, None, on_install_update)
+                    .into_any_element(),
+            ))
+            .child(render_settings_section(
+                "Design",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(render_settings_inline_button(
+                        "Open UI Preview",
+                        false,
+                        on_open_ui_preview,
+                    ))
+                    .child(div().text_xs().text_color(rgb(theme::TEXT_SUBTLE)).child(
+                        "Preview seeded editor and wizard states without touching live data.",
+                    ))
+                    .into_any_element(),
+            ))
+            // — Data section
+            .child(render_settings_section(
+                "Data",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(render_settings_inline_button(
+                        "Import / Export Configuration",
+                        false,
+                        on_toggle_data_picker,
+                    ))
+                    .children(
+                        (draft.open_picker == Some(SettingsPicker::DataActions)).then(|| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(render_settings_dropdown_option(
+                                    "Export config".to_string(),
+                                    false,
+                                    on_export,
+                                ))
+                                .child(render_settings_dropdown_option(
+                                    "Import config (merge)".to_string(),
+                                    false,
+                                    on_import_merge,
+                                ))
+                                .child(render_settings_dropdown_option(
+                                    "Import config (replace)".to_string(),
+                                    false,
+                                    on_import_replace,
+                                ))
+                                .into_any_element()
+                        }),
+                    )
+                    .into_any_element(),
+            ));
 }
 
 fn render_settings_toggle_row(
@@ -2171,55 +2289,6 @@ fn render_settings_section(label: &str, body: AnyElement) -> impl IntoElement {
         .child(body)
 }
 
-fn render_editor_section(label: &str, hint: Option<&str>, body: AnyElement) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(14.0))
-        .p(px(16.0))
-        .rounded_md()
-        .bg(rgb(theme::EDITOR_CARD_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .child(div().size(px(8.0)).rounded_full().bg(rgb(theme::PRIMARY)))
-                .children(hint.map(|hint| {
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(label.to_string())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(hint.to_string())),
-                        )
-                        .into_any_element()
-                }))
-                .children(hint.is_none().then(|| {
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child(SharedString::from(label.to_string()))
-                        .into_any_element()
-                })),
-        )
-        .child(body)
-}
-
 fn render_settings_inline_button(
     label: &str,
     primary: bool,
@@ -2295,221 +2364,6 @@ fn render_settings_close_button(
         .on_mouse_down(MouseButton::Left, on_click)
 }
 
-#[derive(Clone, Copy)]
-enum EditorActionButtonStyle {
-    Primary,
-    Danger,
-    Ghost,
-}
-
-fn render_editor_toolbar(
-    title: &str,
-    subtitle: &str,
-    accent: u32,
-    save_label: &str,
-    on_save: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-    on_delete: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
-    on_close: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    div()
-        .flex_none()
-        .px(px(12.0))
-        .py(px(10.0))
-        .bg(rgb(theme::TOPBAR_BG))
-        .border_b_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(16.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.0))
-                        .child(div().size(px(10.0)).rounded_full().bg(rgb(accent)))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(rgb(theme::TEXT_PRIMARY))
-                                        .child(SharedString::from(title.to_string())),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_SUBTLE))
-                                        .child(SharedString::from(subtitle.to_string())),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(render_editor_action_button(
-                            save_label,
-                            EditorActionButtonStyle::Primary,
-                            on_save,
-                        ))
-                        .children(on_delete.map(|on_delete| {
-                            render_editor_action_button(
-                                "Delete",
-                                EditorActionButtonStyle::Danger,
-                                on_delete,
-                            )
-                            .into_any_element()
-                        }))
-                        .child(render_editor_action_button(
-                            "Close",
-                            EditorActionButtonStyle::Ghost,
-                            on_close,
-                        )),
-                ),
-        )
-}
-
-fn render_editor_action_button(
-    label: &str,
-    style: EditorActionButtonStyle,
-    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    let (bg, border, text, hover_bg) = match style {
-        EditorActionButtonStyle::Primary => (
-            theme::PRIMARY,
-            theme::PRIMARY,
-            theme::SELECTION_TEXT,
-            theme::PRIMARY_HOVER,
-        ),
-        EditorActionButtonStyle::Danger => (
-            theme::EDITOR_CARD_BG,
-            0x5a2630,
-            theme::DANGER_TEXT,
-            0x382029,
-        ),
-        EditorActionButtonStyle::Ghost => (
-            theme::EDITOR_CARD_BG,
-            theme::BORDER_SECONDARY,
-            theme::TEXT_MUTED,
-            theme::ROW_HOVER_BG,
-        ),
-    };
-
-    div()
-        .px(px(12.0))
-        .py(px(6.0))
-        .rounded_sm()
-        .bg(rgb(bg))
-        .border_1()
-        .border_color(rgb(border))
-        .text_xs()
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(rgb(text))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(hover_bg)))
-        .child(SharedString::from(label.to_string()))
-        .on_mouse_down(MouseButton::Left, on_click)
-}
-
-fn render_editor_intro(panel: &EditorPanel) -> impl IntoElement {
-    let accent = panel.accent_color();
-    let summary_items = panel.summary_items();
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(14.0))
-        .p(px(18.0))
-        .rounded_md()
-        .bg(rgb(theme::EDITOR_CARD_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(div().size(px(8.0)).rounded_full().bg(rgb(accent)))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(SharedString::from(panel.title().to_string())),
-                ),
-        )
-        .child(
-            div()
-                .text_sm()
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(panel.headline())),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(panel.subtitle().to_string())),
-        )
-        .children(panel.context_line().map(|context| {
-            div()
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(theme::BORDER_SECONDARY))
-                .text_xs()
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(context))
-                .into_any_element()
-        }))
-        .children((!summary_items.is_empty()).then(|| {
-            div()
-                .flex()
-                .gap(px(10.0))
-                .children(summary_items.into_iter().map(|(label, value)| {
-                    render_editor_summary_item(label, value).into_any_element()
-                }))
-                .into_any_element()
-        }))
-}
-
-fn render_editor_summary_item(label: String, value: String) -> impl IntoElement {
-    div()
-        .flex_1()
-        .flex()
-        .flex_col()
-        .gap(px(4.0))
-        .p(px(12.0))
-        .rounded_md()
-        .bg(rgb(theme::EDITOR_FIELD_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_SECONDARY))
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
-                .child(SharedString::from(label)),
-        )
-        .child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(value)),
-        )
-}
-
 fn settings_font_size_value(draft: &SettingsDraft) -> u16 {
     draft
         .terminal_font_size
@@ -2540,6 +2394,694 @@ fn path_leaf(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+#[allow(unreachable_code)]
+fn render_ui_preview_panel(
+    _: &UiPreviewDraft,
+    model: &EditorPaneModel,
+    _: &EditorActions<'_>,
+) -> impl IntoElement {
+    let preview_actions = EditorActions {
+        on_action: &preview_editor_action_handler,
+    };
+    let preview_wizard_actions = WizardActions {
+        on_action: &preview_wizard_action_handler,
+    };
+
+    let project_draft = sample_project_draft();
+    let project_empty_draft = sample_project_draft_empty();
+    let folder_draft = sample_folder_draft();
+    let folder_scanning_draft = sample_folder_draft_scanning();
+    let folder_minimal_draft = sample_folder_draft_minimal();
+    let command_draft = sample_command_draft();
+    let ssh_draft = sample_ssh_draft();
+    let settings_default = sample_settings_draft(None);
+    let settings_terminal = sample_settings_draft(Some(SettingsPicker::Terminal));
+    let settings_sound = sample_settings_draft(Some(SettingsPicker::NotificationSound));
+    let project_preview = preview_editor_model(EditorPanel::Project(project_draft.clone()), model);
+    let project_notes_preview = preview_editor_model_with_state(
+        EditorPanel::Project(project_draft.clone()),
+        model,
+        Some(EditorField::Project(ProjectField::Notes)),
+        project_draft.notes.chars().count(),
+        Some("Preview mode: edits here are visual only.".to_string()),
+    );
+    let project_empty_preview =
+        preview_editor_model(EditorPanel::Project(project_empty_draft.clone()), model);
+    let folder_preview = preview_editor_model(EditorPanel::Folder(folder_draft.clone()), model);
+    let folder_scanning_preview =
+        preview_editor_model(EditorPanel::Folder(folder_scanning_draft.clone()), model);
+    let folder_minimal_preview =
+        preview_editor_model(EditorPanel::Folder(folder_minimal_draft.clone()), model);
+    let command_preview = preview_editor_model(EditorPanel::Command(command_draft.clone()), model);
+    let ssh_preview = preview_editor_model(EditorPanel::Ssh(ssh_draft.clone()), model);
+    let settings_preview =
+        preview_editor_model(EditorPanel::Settings(settings_default.clone()), model);
+    let settings_terminal_preview =
+        preview_editor_model(EditorPanel::Settings(settings_terminal.clone()), model);
+    let settings_sound_preview =
+        preview_editor_model(EditorPanel::Settings(settings_sound.clone()), model);
+    let wizard_initial = sample_wizard_initial();
+    let wizard_step1 = sample_wizard(1);
+    let wizard_step2 = sample_wizard(2);
+
+    let stories = vec![
+        PreviewStory::new(
+            "Add Project Flow",
+            "Reference states for onboarding a repo into DevManager without touching live project data.",
+        )
+        .state(
+            PreviewState::new(
+                "Fresh start",
+                render_wizard_step1_frame(
+                    "preview-step1-initial-scroll",
+                    &wizard_initial,
+                    &preview_wizard_actions,
+                )
+                .into_any_element(),
+            )
+            .note("No root selected yet, so the wizard explains the next action instead of showing scan results.")
+            .badge(SurfaceBadge::new("Empty", SurfaceTone::Muted)),
+        )
+        .state(
+            PreviewState::new(
+                "Detected folders",
+                render_wizard_step1_frame(
+                    "preview-step1-scroll",
+                    &wizard_step1,
+                    &preview_wizard_actions,
+                )
+                .into_any_element(),
+            )
+            .note("A scanned repo with multiple candidate folders and explicit selection choices.")
+            .badge(SurfaceBadge::new("Workflow", SurfaceTone::Accent)),
+        )
+        .state(
+            PreviewState::new(
+                "Folder configuration",
+                render_wizard_step2_frame(
+                    "preview-step2-scroll",
+                    &wizard_step2,
+                    &preview_wizard_actions,
+                )
+                .into_any_element(),
+            )
+            .note("Second step for default scripts and primary port variables.")
+            .badge(SurfaceBadge::new("Configured", SurfaceTone::Success)),
+        ),
+        PreviewStory::new(
+            "Project Editor",
+            "Project-level editing states for identity, notes, and defaults.",
+        )
+        .state(
+            PreviewState::new(
+                "Default state",
+                render_project_panel(&project_draft, &project_preview, &preview_actions)
+                    .into_any_element(),
+            )
+            .note("A healthy saved project with notes and defaults already in place.")
+            .badge(SurfaceBadge::new("Saved", SurfaceTone::Success)),
+        )
+        .state(
+            PreviewState::new(
+                "Focused text field",
+                render_project_panel(&project_draft, &project_notes_preview, &preview_actions)
+                    .into_any_element(),
+            )
+            .note("Used for checking focus rings, cursor placement, and dense text content.")
+            .badge(SurfaceBadge::new("Editing", SurfaceTone::Accent)),
+        )
+        .state(
+            PreviewState::new(
+                "Minimal project",
+                render_project_panel(&project_empty_draft, &project_empty_preview, &preview_actions)
+                    .into_any_element(),
+            )
+            .note("Useful for testing empty-field readability and onboarding copy.")
+            .badge(SurfaceBadge::new("Empty", SurfaceTone::Muted)),
+        ),
+        PreviewStory::new(
+            "Folder Editor",
+            "Operational folder states covering discovery, loading, and manual setup.",
+        )
+        .state(
+            PreviewState::new(
+                "Scanned and healthy",
+                render_folder_panel(&folder_draft, &folder_preview, &preview_actions)
+                    .into_any_element(),
+            )
+            .note("A fully scanned frontend folder with scripts, env contents, and dependency status.")
+            .badge(SurfaceBadge::new("Ready", SurfaceTone::Success)),
+        )
+        .state(
+            PreviewState::new(
+                "Scanning",
+                render_folder_panel(
+                    &folder_scanning_draft,
+                    &folder_scanning_preview,
+                    &preview_actions,
+                )
+                .into_any_element(),
+            )
+            .note("Use this state to inspect busy affordances, notices, and reduced metadata.")
+            .badge(SurfaceBadge::new("Busy", SurfaceTone::Accent)),
+        )
+        .state(
+            PreviewState::new(
+                "Manual setup",
+                render_folder_panel(
+                    &folder_minimal_draft,
+                    &folder_minimal_preview,
+                    &preview_actions,
+                )
+                .into_any_element(),
+            )
+            .note("Manual folder setup before scans or env loading have happened.")
+            .badge(SurfaceBadge::new("Manual", SurfaceTone::Warning)),
+        ),
+        PreviewStory::new(
+            "Command and SSH",
+            "Secondary editor surfaces that should still read like part of the same system.",
+        )
+        .state(
+            PreviewState::new(
+                "Command editor",
+                render_command_panel(&command_draft, &command_preview, &preview_actions)
+                    .into_any_element(),
+            )
+            .note("Checks command naming, runtime metadata, and restart toggles.")
+            .badge(SurfaceBadge::new("Runtime", SurfaceTone::Accent)),
+        )
+        .state(
+            PreviewState::new(
+                "SSH editor",
+                render_ssh_panel(&ssh_draft, &ssh_preview, &preview_actions).into_any_element(),
+            )
+            .note("Connection information and credentials should feel as clear as project editing.")
+            .badge(SurfaceBadge::new("Remote", SurfaceTone::Muted)),
+        ),
+        PreviewStory::new(
+            "Settings Surface",
+            "Non-editor surfaces should share the same section and action language.",
+        )
+        .state(
+            PreviewState::new(
+                "Default settings",
+                render_settings_panel(&settings_default, &settings_preview, &preview_actions)
+                    .into_any_element(),
+            )
+            .note("The baseline settings experience using the same card and action system.")
+            .badge(SurfaceBadge::new("Default", SurfaceTone::Success)),
+        )
+        .state(
+            PreviewState::new(
+                "Terminal picker open",
+                render_settings_panel(
+                    &settings_terminal,
+                    &settings_terminal_preview,
+                    &preview_actions,
+                )
+                .into_any_element(),
+            )
+            .note("Dropdown and picker states need to remain legible inside dense settings screens.")
+            .badge(SurfaceBadge::new("Picker", SurfaceTone::Accent)),
+        )
+        .state(
+            PreviewState::new(
+                "Notification picker open",
+                render_settings_panel(&settings_sound, &settings_sound_preview, &preview_actions)
+                    .into_any_element(),
+            )
+            .note("Use this state when tuning accessory buttons and dropdown density.")
+            .badge(SurfaceBadge::new("Audio", SurfaceTone::Warning)),
+        ),
+        PreviewStory::new(
+            "Component Kit",
+            "Atomic stories for the reusable rows, callouts, and empty states that power the app shell.",
+        )
+        .state(
+            PreviewState::new(
+                "Actions and notices",
+                render_static_form_fields(vec![
+                    FormField::action(
+                        FormAction::new("Primary action", "Run task", preview_click_handler())
+                            .description("Use when the next step is the obvious forward action.")
+                            .style(SurfaceActionButtonStyle::Primary)
+                            .badge(SurfaceBadge::new("Primary", SurfaceTone::Accent)),
+                    ),
+                    FormField::action(
+                        FormAction::new("Destructive action", "Delete", preview_click_handler())
+                            .description("Use for irreversible flows that need stronger contrast.")
+                            .style(SurfaceActionButtonStyle::Danger)
+                            .badge(SurfaceBadge::new("Danger", SurfaceTone::Danger)),
+                    ),
+                    FormField::notice(
+                        "Accent notices call attention to the most relevant guidance for the current surface.",
+                        SurfaceTone::Accent,
+                    ),
+                    FormField::notice(
+                        "Warning notices are available for risky or incomplete states.",
+                        SurfaceTone::Warning,
+                    ),
+                ])
+                .into_any_element(),
+            )
+            .note("Helps tune row density, contrast, and tone semantics in isolation.")
+            .badge(SurfaceBadge::new("Kit", SurfaceTone::Muted)),
+        )
+        .state(
+            PreviewState::new(
+                "Selection and empty states",
+                render_static_form_fields(vec![
+                    FormField::selection_list(
+                        FormSelectionList::new("Selectable rows")
+                            .hint("Use for scripts, ports, and scan-driven choices.")
+                            .row(FormSelectionRow::new(
+                                "Selected item",
+                                Some("Shows the active state and detail copy.".to_string()),
+                                true,
+                                preview_click_handler(),
+                            ))
+                            .row(FormSelectionRow::new(
+                                "Available item",
+                                Some("Hover and selection styling stay consistent across editors.".to_string()),
+                                false,
+                                preview_click_handler(),
+                            )),
+                    ),
+                    FormField::empty_state(
+                        "Empty state",
+                        "Use this when the user has not scanned, loaded, or configured anything yet.",
+                        SurfaceTone::Muted,
+                    ),
+                ])
+                .into_any_element(),
+            )
+            .note("These are the fallback states that usually break visual consistency first.")
+            .badge(SurfaceBadge::new("Fallback", SurfaceTone::Muted)),
+        ),
+    ];
+
+    return div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(render_notice_row(
+            "This surface is read-only and seeded with sample data so UI work can happen without mutating real projects.",
+        ))
+        .child(render_preview_stories(stories));
+
+    let project_draft = sample_project_draft();
+    let folder_draft = sample_folder_draft();
+    let command_draft = sample_command_draft();
+    let ssh_draft = sample_ssh_draft();
+    let project_preview = preview_editor_model(EditorPanel::Project(project_draft.clone()), model);
+    let folder_preview = preview_editor_model(EditorPanel::Folder(folder_draft.clone()), model);
+    let command_preview = preview_editor_model(EditorPanel::Command(command_draft.clone()), model);
+    let ssh_preview = preview_editor_model(EditorPanel::Ssh(ssh_draft.clone()), model);
+    let wizard_step1 = sample_wizard(1);
+    let wizard_step2 = sample_wizard(2);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(render_notice_row(
+            "This surface is read-only and seeded with sample data so UI work can happen without mutating real projects.",
+        ))
+        .child(render_preview_story(
+            "Add Project Wizard · Step 1",
+            "The full modal frame for project basics, root selection, and discovered folders.",
+            render_wizard_step1_frame(
+                "preview-step1-scroll",
+                &wizard_step1,
+                &preview_wizard_actions,
+            )
+            .into_any_element(),
+        ))
+        .child(render_preview_story(
+            "Add Project Wizard · Step 2",
+            "The full modal frame for selecting scripts and default port variables.",
+            render_wizard_step2_frame(
+                "preview-step2-scroll",
+                &wizard_step2,
+                &preview_wizard_actions,
+            )
+            .into_any_element(),
+        ))
+        .child(render_preview_story(
+            "Project Editor",
+            "Reference state for project identity, notes, and defaults.",
+            render_project_panel(&project_draft, &project_preview, &preview_actions)
+                .into_any_element(),
+        ))
+        .child(render_preview_story(
+            "Folder Editor",
+            "Reference state for runtime metadata, scan results, and env editing.",
+            render_folder_panel(&folder_draft, &folder_preview, &preview_actions)
+                .into_any_element(),
+        ))
+        .child(render_preview_story(
+            "Command Editor",
+            "Reference state for executable configuration and restart behavior.",
+            render_command_panel(&command_draft, &command_preview, &preview_actions)
+                .into_any_element(),
+        ))
+        .child(render_preview_story(
+            "SSH Editor",
+            "Reference state for connection setup and saved credentials.",
+            render_ssh_panel(&ssh_draft, &ssh_preview, &preview_actions).into_any_element(),
+        ))
+}
+
+fn render_preview_story(title: &str, description: &str, body: AnyElement) -> impl IntoElement {
+    let cleaned_title = title.to_string();
+    let cleaned_description = description.to_string();
+    render_editor_section(
+        cleaned_title.as_str(),
+        Some(cleaned_description.as_str()),
+        body,
+    )
+}
+
+fn preview_editor_model(panel: EditorPanel, model: &EditorPaneModel) -> EditorPaneModel {
+    EditorPaneModel {
+        panel,
+        active_field: None,
+        cursor: 0,
+        notice: None,
+        updater: model.updater.clone(),
+    }
+}
+
+fn preview_editor_model_with_state(
+    panel: EditorPanel,
+    model: &EditorPaneModel,
+    active_field: Option<EditorField>,
+    cursor: usize,
+    notice: Option<String>,
+) -> EditorPaneModel {
+    EditorPaneModel {
+        panel,
+        active_field,
+        cursor,
+        notice,
+        updater: model.updater.clone(),
+    }
+}
+
+fn preview_editor_action_handler(
+    _: EditorAction,
+) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+    Box::new(|_, _, _| {})
+}
+
+fn preview_wizard_action_handler(
+    _: WizardAction,
+) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+    Box::new(|_, _, _| {})
+}
+
+fn preview_click_handler() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+    Box::new(|_, _, _| {})
+}
+
+fn sample_project_draft() -> ProjectDraft {
+    ProjectDraft {
+        existing_id: Some("project-preview".to_string()),
+        name: "House Hunter".to_string(),
+        root_path: "C:\\Code\\personal\\househunter".to_string(),
+        color: "#ef4444".to_string(),
+        pinned: true,
+        save_log_files: true,
+        notes: "Main app.\nUse the API folder for backend work and the web folder for UI changes."
+            .to_string(),
+    }
+}
+
+fn sample_project_draft_empty() -> ProjectDraft {
+    ProjectDraft {
+        existing_id: None,
+        name: String::new(),
+        root_path: String::new(),
+        color: "#6366f1".to_string(),
+        pinned: false,
+        save_log_files: false,
+        notes: String::new(),
+    }
+}
+
+fn sample_folder_draft() -> FolderDraft {
+    FolderDraft {
+        project_id: "project-preview".to_string(),
+        existing_id: Some("folder-preview".to_string()),
+        name: "web".to_string(),
+        folder_path: "C:\\Code\\personal\\househunter\\web".to_string(),
+        env_file_path: ".env.local".to_string(),
+        env_file_contents: "VITE_DEV_PORT=5173\nVITE_API_ORIGIN=http://localhost:4555\n"
+            .to_string(),
+        env_file_loaded: true,
+        port_variable: "VITE_DEV_PORT".to_string(),
+        hidden: false,
+        git_branch: Some("feature/native-ui".to_string()),
+        dependency_status: Some(DependencyStatus {
+            status: "up to date".to_string(),
+            message: "package-lock.json matches node_modules metadata.".to_string(),
+        }),
+        scan_result: Some(ScanResult {
+            scripts: vec![
+                ScannedScript {
+                    name: "dev".to_string(),
+                    command: "vite".to_string(),
+                },
+                ScannedScript {
+                    name: "build".to_string(),
+                    command: "vite build".to_string(),
+                },
+            ],
+            ports: vec![
+                ScannedPort {
+                    variable: "VITE_DEV_PORT".to_string(),
+                    port: 5173,
+                    source: ".env.local".to_string(),
+                },
+                ScannedPort {
+                    variable: "PORT".to_string(),
+                    port: 3000,
+                    source: "package.json".to_string(),
+                },
+            ],
+            has_package_json: true,
+            has_cargo_toml: false,
+            has_env_file: true,
+        }),
+        selected_scanned_scripts: ["dev".to_string()].into_iter().collect(),
+        selected_scanned_port_variable: Some("VITE_DEV_PORT".to_string()),
+        scan_message: Some("Discovered 2 scripts and 2 port variables.".to_string()),
+        is_scanning: false,
+    }
+}
+
+fn sample_folder_draft_scanning() -> FolderDraft {
+    FolderDraft {
+        project_id: "project-preview".to_string(),
+        existing_id: Some("folder-scanning".to_string()),
+        name: "api".to_string(),
+        folder_path: "C:\\Code\\personal\\househunter\\api".to_string(),
+        env_file_path: ".env".to_string(),
+        env_file_contents: String::new(),
+        env_file_loaded: false,
+        port_variable: String::new(),
+        hidden: false,
+        git_branch: Some("feature/onboarding".to_string()),
+        dependency_status: None,
+        scan_result: None,
+        selected_scanned_scripts: BTreeSet::new(),
+        selected_scanned_port_variable: None,
+        scan_message: Some(
+            "Scanning folder for scripts, env files, and default ports.".to_string(),
+        ),
+        is_scanning: true,
+    }
+}
+
+fn sample_folder_draft_minimal() -> FolderDraft {
+    FolderDraft {
+        project_id: "project-preview".to_string(),
+        existing_id: None,
+        name: String::new(),
+        folder_path: "C:\\Code\\personal\\househunter\\worker".to_string(),
+        env_file_path: ".env".to_string(),
+        env_file_contents: String::new(),
+        env_file_loaded: false,
+        port_variable: String::new(),
+        hidden: false,
+        git_branch: None,
+        dependency_status: None,
+        scan_result: None,
+        selected_scanned_scripts: BTreeSet::new(),
+        selected_scanned_port_variable: None,
+        scan_message: None,
+        is_scanning: false,
+    }
+}
+
+fn sample_command_draft() -> CommandDraft {
+    CommandDraft {
+        project_id: "project-preview".to_string(),
+        folder_id: "folder-preview".to_string(),
+        existing_id: Some("command-preview".to_string()),
+        label: "web dev".to_string(),
+        command: "npm".to_string(),
+        args_text: "run dev -- --host".to_string(),
+        env_text: "NODE_ENV=development;FORCE_COLOR=1".to_string(),
+        port_text: "5173".to_string(),
+        auto_restart: true,
+        clear_logs_on_restart: false,
+    }
+}
+
+fn sample_ssh_draft() -> SshDraft {
+    SshDraft {
+        existing_id: Some("ssh-preview".to_string()),
+        label: "Prod Box".to_string(),
+        host: "prod.example.com".to_string(),
+        port_text: "22".to_string(),
+        username: "deploy".to_string(),
+        password: String::new(),
+    }
+}
+
+fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
+    SettingsDraft {
+        default_terminal: DefaultTerminal::Powershell,
+        mac_terminal_profile: MacTerminalProfile::Zsh,
+        theme: "dark".to_string(),
+        log_buffer_size: "10000".to_string(),
+        claude_command: "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions"
+            .to_string(),
+        codex_command: "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox"
+            .to_string(),
+        notification_sound: "glass".to_string(),
+        confirm_on_close: true,
+        minimize_to_tray: false,
+        restore_session_on_start: true,
+        terminal_font_size: "13".to_string(),
+        option_as_meta: false,
+        copy_on_select: true,
+        keep_selection_on_copy: false,
+        open_picker,
+    }
+}
+
+fn sample_wizard_initial() -> AddProjectWizard {
+    AddProjectWizard {
+        name: String::new(),
+        color: "#6366f1".to_string(),
+        root_path: String::new(),
+        cursor: 0,
+        name_focused: false,
+        step: 1,
+        scan_message: Some(
+            "Pick a repository root to scan for package.json files, Cargo projects, and env ports."
+                .to_string(),
+        ),
+        scan_entries: Vec::new(),
+        selected_folders: BTreeSet::new(),
+        selected_scripts: HashMap::new(),
+        selected_port_variables: HashMap::new(),
+    }
+}
+
+fn sample_wizard(step: u8) -> AddProjectWizard {
+    let api_entry = RootScanEntry {
+        path: "C:\\Code\\personal\\househunter\\api".to_string(),
+        name: "api".to_string(),
+        has_env: true,
+        project_type: "node".to_string(),
+        scripts: vec![
+            ScannedScript {
+                name: "dev".to_string(),
+                command: "tsx watch src/server.ts".to_string(),
+            },
+            ScannedScript {
+                name: "migrate".to_string(),
+                command: "drizzle-kit migrate".to_string(),
+            },
+        ],
+        ports: vec![
+            ScannedPort {
+                variable: "PORT".to_string(),
+                port: 4555,
+                source: ".env".to_string(),
+            },
+            ScannedPort {
+                variable: "SMTP_PORT".to_string(),
+                port: 1025,
+                source: ".env".to_string(),
+            },
+        ],
+    };
+    let web_entry = RootScanEntry {
+        path: "C:\\Code\\personal\\househunter\\web".to_string(),
+        name: "web".to_string(),
+        has_env: true,
+        project_type: "node".to_string(),
+        scripts: vec![
+            ScannedScript {
+                name: "dev".to_string(),
+                command: "vite".to_string(),
+            },
+            ScannedScript {
+                name: "build".to_string(),
+                command: "vite build".to_string(),
+            },
+        ],
+        ports: vec![ScannedPort {
+            variable: "VITE_DEV_PORT".to_string(),
+            port: 5173,
+            source: ".env.local".to_string(),
+        }],
+    };
+
+    let mut wizard = AddProjectWizard {
+        name: "House Hunter".to_string(),
+        color: "#ef4444".to_string(),
+        root_path: "C:\\Code\\personal\\househunter".to_string(),
+        cursor: "House Hunter".chars().count(),
+        name_focused: false,
+        step,
+        scan_message: Some(
+            "Discovered 2 folder(s). Review scripts and ports before creating the project."
+                .to_string(),
+        ),
+        scan_entries: vec![api_entry.clone(), web_entry.clone()],
+        selected_folders: [api_entry.path.clone(), web_entry.path.clone()]
+            .into_iter()
+            .collect(),
+        selected_scripts: HashMap::new(),
+        selected_port_variables: HashMap::new(),
+    };
+
+    wizard.selected_scripts.insert(
+        api_entry.path.clone(),
+        ["dev".to_string(), "migrate".to_string()]
+            .into_iter()
+            .collect(),
+    );
+    wizard.selected_scripts.insert(
+        web_entry.path.clone(),
+        ["dev".to_string()].into_iter().collect(),
+    );
+    wizard
+        .selected_port_variables
+        .insert(api_entry.path.clone(), Some("PORT".to_string()));
+    wizard
+        .selected_port_variables
+        .insert(web_entry.path.clone(), Some("VITE_DEV_PORT".to_string()));
+
+    wizard
+}
+
 fn render_project_panel(
     draft: &ProjectDraft,
     model: &EditorPaneModel,
@@ -2548,81 +3090,52 @@ fn render_project_panel(
     let on_toggle_pinned = (actions.on_action)(EditorAction::ToggleProjectPinned);
     let on_toggle_save_logs = (actions.on_action)(EditorAction::ToggleProjectSaveLogs);
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(18.0))
-        .child(render_editor_section(
-            "Overview",
-            Some("Name, location, and accent used to identify this project."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .child(render_text_field(
-                    "Project name",
-                    "What the sidebar shows for this workspace.",
-                    draft.name.as_str(),
+    render_form_sections(
+        vec![
+            FormSection::new("Project").fields(vec![
+                FormField::text(
+                    "Name",
+                    "Shown in the sidebar.",
+                    draft.name.clone(),
                     EditorField::Project(ProjectField::Name),
-                    model,
-                    actions,
-                ))
-                .child(render_text_field(
-                    "Root path",
-                    "Absolute path to the main repository or workspace root.",
-                    draft.root_path.as_str(),
+                ),
+                FormField::text(
+                    "Root folder",
+                    "Main repo or workspace path.",
+                    draft.root_path.clone(),
                     EditorField::Project(ProjectField::RootPath),
-                    model,
-                    actions,
-                ))
-                .child(render_text_field(
+                ),
+                FormField::text(
                     "Accent color",
-                    "Hex color used for the project marker, for example #6366f1.",
-                    draft.color.as_str(),
+                    "Sidebar marker color, for example #6366f1.",
+                    draft.color.clone(),
                     EditorField::Project(ProjectField::Color),
-                    model,
-                    actions,
-                ))
-                .into_any_element(),
-        ))
-        .child(render_editor_section(
-            "Notes",
-            Some("Useful context about the repo, owners, setup quirks, or onboarding steps."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .child(render_multiline_field(
-                    "Project notes",
-                    "Multi-line notes saved with the project.",
-                    draft.notes.as_str(),
-                    EditorField::Project(ProjectField::Notes),
-                    model,
-                    actions,
-                ))
-                .into_any_element(),
-        ))
-        .child(render_editor_section(
-            "Workspace Defaults",
-            Some("How this project should behave in the sidebar and on disk."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .child(render_toggle_row_with_hint(
-                    "Save log files",
+                ),
+            ]),
+            FormSection::new("Notes").field(FormField::multiline(
+                "Notes",
+                "Optional setup notes or reminders.",
+                draft.notes.clone(),
+                EditorField::Project(ProjectField::Notes),
+            )),
+            FormSection::new("Behavior").fields(vec![
+                FormField::toggle(
+                    "Save logs",
                     draft.save_log_files,
-                    "Keep command output persisted to log files for this project.",
+                    "Write command output to disk.",
                     on_toggle_save_logs,
-                ))
-                .child(render_toggle_row_with_hint(
-                    "Pinned",
+                ),
+                FormField::toggle(
+                    "Pin in sidebar",
                     draft.pinned,
-                    "Keep this project near the top of the sidebar.",
+                    "Keep this project near the top.",
                     on_toggle_pinned,
-                ))
-                .into_any_element(),
-        ))
+                ),
+            ]),
+        ],
+        model,
+        actions,
+    )
 }
 
 fn render_folder_panel(
@@ -2640,165 +3153,139 @@ fn render_folder_panel(
         .as_ref()
         .filter(|message| draft.scan_result.is_none() || !message.starts_with("Discovered "));
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(18.0))
-        .child(render_editor_section(
-            "Overview",
-            Some("Identity, location, and visibility inside this project."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .child(render_text_field(
-                    "Folder name",
-                    "Label shown for this folder in the workspace.",
-                    draft.name.as_str(),
-                    EditorField::Folder(FolderField::Name),
-                    model,
-                    actions,
-                ))
-                .child(render_text_field(
-                    "Folder path",
-                    "Absolute path to the folder on disk.",
-                    draft.folder_path.as_str(),
-                    EditorField::Folder(FolderField::FolderPath),
-                    model,
-                    actions,
-                ))
-                .child(render_toggle_row_with_hint(
-                    "Hidden",
-                    draft.hidden,
-                    "Hide this folder in the sidebar without removing it from the project.",
-                    on_toggle_hidden,
-                ))
-                .into_any_element(),
-        ))
-        .child(render_editor_section(
-            "Tools",
-            Some("Rescan the folder or jump directly into a terminal."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .child(render_choice_row(
-                    "Folder picker",
-                    if draft.folder_path.is_empty() {
-                        "Choose directory"
-                    } else {
-                        draft.folder_path.as_str()
-                    },
-                    Some("Open the native folder picker and replace the current path."),
-                    on_pick_folder,
-                ))
-                .child(render_choice_row(
-                    "Rescan folder",
-                    if draft.is_scanning {
-                        "Scanning..."
-                    } else {
-                        "Refresh scripts and env ports"
-                    },
-                    Some("Read package manifests and .env files again."),
-                    on_scan_folder,
-                ))
-                .child(render_choice_row(
-                    "Open in terminal",
-                    if draft.folder_path.is_empty() {
-                        "Pick a folder first"
-                    } else {
-                        "Open external terminal"
-                    },
-                    Some("Launch this folder in your system terminal."),
-                    on_open_terminal,
-                ))
-                .into_any_element(),
-        ))
-        .child(render_editor_section(
-            "Detected Status",
-            Some("Read-only information gathered from the local filesystem."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .children(draft.git_branch.as_ref().map(|branch| {
-                    render_info_row(
-                        "Git branch",
-                        branch.as_str(),
-                        Some("Read directly from .git/HEAD."),
+    let mut sections = vec![FormSection::new("Folder").fields(vec![
+        FormField::text(
+            "Name",
+            "Shown in the workspace.",
+            draft.name.clone(),
+            EditorField::Folder(FolderField::Name),
+        ),
+        FormField::choice(
+            "Path",
+            if draft.folder_path.is_empty() {
+                "Choose folder".to_string()
+            } else {
+                draft.folder_path.clone()
+            },
+            Some(if draft.folder_path.is_empty() {
+                "Click to choose the folder on disk.".to_string()
+            } else {
+                "Click to replace the current folder.".to_string()
+            }),
+            on_pick_folder,
+        ),
+        FormField::toggle(
+            "Show in sidebar",
+            !draft.hidden,
+            "Turn this off to keep the folder without showing it in the list.",
+            on_toggle_hidden,
+        ),
+        FormField::action_group(
+            FormActionGroup::new("Actions")
+                .action(
+                    FormAction::new(
+                        "Scan folder",
+                        if draft.is_scanning {
+                            "Scanning..."
+                        } else {
+                            "Scan"
+                        },
+                        on_scan_folder,
                     )
-                    .into_any_element()
-                }))
-                .children(draft.dependency_status.as_ref().map(|status| {
-                    render_info_row(
-                        "Dependencies",
-                        status.status.as_str(),
-                        Some(status.message.as_str()),
-                    )
-                    .into_any_element()
-                }))
-                .children(
-                    scan_notice
-                        .map(|message| render_notice_row(message.as_str()).into_any_element()),
-                )
-                .into_any_element(),
-        ))
-        .children(draft.scan_result.as_ref().map(|scan_result| {
-            render_editor_section(
-                "Scan Results",
-                Some("Choose which discovered scripts to merge and which env port should be the default."),
-                render_folder_scan_panel(draft, scan_result, actions).into_any_element(),
-            )
-            .into_any_element()
-        }))
-        .child(render_editor_section(
-            "Environment",
-            Some("Choose the env file, the default port variable, and inline env editing."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .child(render_text_field(
-                    "Env file path",
-                    "Relative path to the env file inside this folder, for example .env.local.",
-                    draft.env_file_path.as_str(),
-                    EditorField::Folder(FolderField::EnvFilePath),
-                    model,
-                    actions,
-                ))
-                .child(render_text_field(
-                    "Default port variable",
-                    "Env var used to derive the default server port for this folder.",
-                    draft.port_variable.as_str(),
-                    EditorField::Folder(FolderField::PortVariable),
-                    model,
-                    actions,
-                ))
-                .child(render_choice_row(
-                    "Load env file",
-                    if draft.env_file_loaded {
-                        "Reload env contents"
+                    .description("Refresh commands, ports, and repo status.")
+                    .style(SurfaceActionButtonStyle::Primary)
+                    .badge(if draft.is_scanning {
+                        SurfaceBadge::new("Busy", SurfaceTone::Accent)
                     } else {
-                        "Load env contents"
-                    },
-                    Some("Read the configured env file so it can be edited inline."),
-                    on_load_env,
-                ))
-                .children(
-                    (draft.env_file_loaded || !draft.env_file_contents.is_empty()).then(|| {
-                        render_multiline_field(
-                            "Env file contents",
-                            "Comments and blank lines are preserved when you save.",
-                            draft.env_file_contents.as_str(),
-                            EditorField::Folder(FolderField::EnvContents),
-                            model,
-                            actions,
-                        )
-                        .into_any_element()
+                        SurfaceBadge::new("Ready", SurfaceTone::Muted)
                     }),
                 )
-                .into_any_element(),
-        ))
+                .action(
+                    FormAction::new(
+                        "Open terminal",
+                        if draft.folder_path.is_empty() {
+                            "Pick folder first"
+                        } else {
+                            "Open"
+                        },
+                        on_open_terminal,
+                    )
+                    .description("Open this folder in your system terminal."),
+                ),
+        ),
+    ])];
+
+    let mut detected_fields = Vec::new();
+    if let Some(message) = scan_notice {
+        detected_fields.push(FormField::notice(message.clone(), SurfaceTone::Accent));
+    }
+    if let Some(branch) = draft.git_branch.as_ref() {
+        detected_fields.push(FormField::info("Branch", branch.clone(), None));
+    }
+    if let Some(status) = draft.dependency_status.as_ref() {
+        detected_fields.push(FormField::info(
+            "Dependencies",
+            status.status.clone(),
+            Some(status.message.clone()),
+        ));
+    }
+    if !detected_fields.is_empty() {
+        sections.push(FormSection::new("Detected").fields(detected_fields));
+    }
+
+    if let Some(scan_result) = draft.scan_result.as_ref() {
+        sections.push(
+            FormSection::new("Commands and Port").field(FormField::custom(
+                render_folder_scan_panel(draft, scan_result, model, actions).into_any_element(),
+            )),
+        );
+    }
+
+    let mut environment_fields = vec![
+        FormField::text(
+            "Env file",
+            "Relative path inside this folder, for example .env.local.",
+            draft.env_file_path.clone(),
+            EditorField::Folder(FolderField::EnvFilePath),
+        ),
+        FormField::action(
+            FormAction::new(
+                "Load env file",
+                if draft.env_file_loaded {
+                    "Reload"
+                } else {
+                    "Load"
+                },
+                on_load_env,
+            )
+            .description("Load the env file for inline editing."),
+        ),
+        FormField::text(
+            "Default port env var",
+            "Env var used for the folder port.",
+            draft.port_variable.clone(),
+            EditorField::Folder(FolderField::PortVariable),
+        ),
+    ];
+
+    if draft.env_file_loaded || !draft.env_file_contents.is_empty() {
+        environment_fields.push(FormField::multiline_sized(
+            "Env contents",
+            "Edit inline. Comments and blank lines are preserved when you save the folder.",
+            draft.env_file_contents.clone(),
+            EditorField::Folder(FolderField::EnvContents),
+            320.0,
+        ));
+    } else {
+        environment_fields.push(FormField::notice(
+            "Load the env file to edit it inline.",
+            SurfaceTone::Muted,
+        ));
+    }
+
+    sections.push(FormSection::new("Environment").fields(environment_fields));
+
+    render_form_sections(sections, model, actions)
 }
 
 fn render_command_panel(
@@ -2809,89 +3296,60 @@ fn render_command_panel(
     let on_toggle_restart = (actions.on_action)(EditorAction::ToggleCommandAutoRestart);
     let on_toggle_clear_logs = (actions.on_action)(EditorAction::ToggleCommandClearLogs);
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(18.0))
-        .child(render_editor_section(
-            "Overview",
-            Some("What this command is called and what executable it runs."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .child(render_text_field(
-                    "Command label",
-                    "Name shown in the sidebar and command tabs.",
-                    draft.label.as_str(),
+    render_form_sections(
+        vec![
+            FormSection::new("Command").fields(vec![
+                FormField::text(
+                    "Name",
+                    "Shown in the sidebar and tabs.",
+                    draft.label.clone(),
                     EditorField::Command(CommandField::Label),
-                    model,
-                    actions,
-                ))
-                .child(render_text_field(
-                    "Executable",
-                    "Program or script that should be launched.",
-                    draft.command.as_str(),
+                ),
+                FormField::text(
+                    "Run",
+                    "Program or script to launch.",
+                    draft.command.clone(),
                     EditorField::Command(CommandField::Command),
-                    model,
-                    actions,
-                ))
-                .child(render_text_field(
+                ),
+                FormField::text(
                     "Arguments",
-                    "Space-separated arguments passed to the executable.",
-                    draft.args_text.as_str(),
+                    "Space-separated arguments.",
+                    draft.args_text.clone(),
                     EditorField::Command(CommandField::Args),
-                    model,
-                    actions,
-                ))
-                .into_any_element(),
-        ))
-        .child(render_editor_section(
-            "Runtime",
-            Some("Optional environment overrides and port metadata for this command."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.0))
-                .child(render_text_field(
-                    "Environment",
+                ),
+            ]),
+            FormSection::new("Runtime").fields(vec![
+                FormField::text(
+                    "Env overrides",
                     "Semicolon-separated KEY=VALUE pairs.",
-                    draft.env_text.as_str(),
+                    draft.env_text.clone(),
                     EditorField::Command(CommandField::Env),
-                    model,
-                    actions,
-                ))
-                .child(render_text_field(
-                    "Port",
-                    "Numeric port exposed by this command, if known.",
-                    draft.port_text.as_str(),
+                ),
+                FormField::text(
+                    "Known port",
+                    "Numeric port, if this command owns one.",
+                    draft.port_text.clone(),
                     EditorField::Command(CommandField::Port),
-                    model,
-                    actions,
-                ))
-                .into_any_element(),
-        ))
-        .child(render_editor_section(
-            "Behavior",
-            Some("What should happen when this command restarts."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .child(render_toggle_row_with_hint(
-                    "Auto restart",
+                ),
+            ]),
+            FormSection::new("Restart").fields(vec![
+                FormField::toggle(
+                    "Restart automatically",
                     draft.auto_restart,
-                    "Restart the command automatically after it exits.",
+                    "Restart the command after it exits.",
                     on_toggle_restart,
-                ))
-                .child(render_toggle_row_with_hint(
-                    "Clear logs on restart",
+                ),
+                FormField::toggle(
+                    "Clear output on restart",
                     draft.clear_logs_on_restart,
-                    "Clear previous output before the command starts again.",
+                    "Clear previous output before starting again.",
                     on_toggle_clear_logs,
-                ))
-                .into_any_element(),
-        ))
+                ),
+            ]),
+        ],
+        model,
+        actions,
+    )
 }
 
 fn render_ssh_panel(
@@ -2899,539 +3357,108 @@ fn render_ssh_panel(
     model: &EditorPaneModel,
     actions: &EditorActions<'_>,
 ) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(render_text_field(
-            "Label",
-            "Display name for the SSH target",
-            draft.label.as_str(),
-            EditorField::Ssh(SshField::Label),
-            model,
-            actions,
-        ))
-        .child(render_text_field(
-            "Host",
-            "Hostname or IP address",
-            draft.host.as_str(),
-            EditorField::Ssh(SshField::Host),
-            model,
-            actions,
-        ))
-        .child(render_text_field(
-            "Port",
-            "Defaults to 22",
-            draft.port_text.as_str(),
-            EditorField::Ssh(SshField::Port),
-            model,
-            actions,
-        ))
-        .child(render_text_field(
-            "Username",
-            "Remote user name",
-            draft.username.as_str(),
-            EditorField::Ssh(SshField::Username),
-            model,
-            actions,
-        ))
-        .child(render_text_field(
-            "Password",
-            "Optional saved password",
-            draft.password.as_str(),
-            EditorField::Ssh(SshField::Password),
-            model,
-            actions,
-        ))
-}
-
-fn render_text_field(
-    label: &str,
-    hint: &str,
-    value: &str,
-    field: EditorField,
-    model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
-) -> impl IntoElement {
-    let focused = model.active_field == Some(field);
-    let display_value = if focused {
-        display_text_with_cursor(value, model.cursor)
-    } else if value.is_empty() {
-        "Not set".to_string()
-    } else {
-        value.to_string()
-    };
-
-    let on_focus = (actions.on_action)(EditorAction::FocusField(field));
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(label.to_string())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(hint.to_string())),
-                        ),
-                )
-                .children(focused.then(|| {
-                    render_inline_state_badge("Editing", theme::PRIMARY).into_any_element()
-                })),
-        )
-        .child(
-            div()
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(if focused {
-                    theme::PRIMARY
-                } else {
-                    theme::BORDER_PRIMARY
-                }))
-                .text_sm()
-                .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_DIM
-                } else {
-                    theme::TEXT_PRIMARY
-                }))
-                .cursor_text()
-                .child(SharedString::from(display_value))
-                .on_mouse_down(MouseButton::Left, on_focus),
-        )
-}
-
-fn render_multiline_field(
-    label: &str,
-    hint: &str,
-    value: &str,
-    field: EditorField,
-    model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
-) -> impl IntoElement {
-    let focused = model.active_field == Some(field);
-    let display_value = if focused {
-        display_text_with_cursor(value, model.cursor)
-    } else if value.is_empty() {
-        "Not set".to_string()
-    } else {
-        value.to_string()
-    };
-
-    let on_focus = (actions.on_action)(EditorAction::FocusField(field));
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(label.to_string())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(hint.to_string())),
-                        ),
-                )
-                .children(focused.then(|| {
-                    render_inline_state_badge("Editing", theme::PRIMARY).into_any_element()
-                })),
-        )
-        .child(
-            div()
-                .h(px(140.0))
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(if focused {
-                    theme::PRIMARY
-                } else {
-                    theme::BORDER_PRIMARY
-                }))
-                .text_sm()
-                .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_DIM
-                } else {
-                    theme::TEXT_PRIMARY
-                }))
-                .cursor_text()
-                .child(SharedString::from(display_value))
-                .on_mouse_down(MouseButton::Left, on_focus),
-        )
-}
-
-fn render_choice_row(
-    label: &str,
-    value: &str,
-    hint: Option<&str>,
-    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child(SharedString::from(label.to_string())),
-                )
-                .children(hint.map(|hint| {
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_SUBTLE))
-                        .child(SharedString::from(hint.to_string()))
-                        .into_any_element()
-                })),
-        )
-        .child(
-            div()
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(theme::BORDER_PRIMARY))
-                .cursor_pointer()
-                .hover(|s| {
-                    s.bg(rgb(theme::ROW_HOVER_BG))
-                        .border_color(rgb(theme::PRIMARY))
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_sm()
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(value.to_string())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(">"),
-                        ),
-                )
-                .on_mouse_down(MouseButton::Left, on_click),
-        )
-}
-
-fn render_toggle_row_with_hint(
-    label: &str,
-    value: bool,
-    hint: &str,
-    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    let mut toggle = div()
-        .w(px(38.0))
-        .h(px(22.0))
-        .p(px(2.0))
-        .rounded_full()
-        .flex()
-        .items_center()
-        .bg(rgb(if value {
-            theme::PRIMARY
-        } else {
-            theme::BORDER_SECONDARY
-        }));
-    toggle = if value {
-        toggle.justify_end()
-    } else {
-        toggle.justify_start()
-    };
-
-    div()
-        .px(px(12.0))
-        .py(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::EDITOR_FIELD_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_PRIMARY))
-        .cursor_pointer()
-        .hover(|s| {
-            s.bg(rgb(theme::ROW_HOVER_BG))
-                .border_color(rgb(theme::PRIMARY))
-        })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(label.to_string())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(hint.to_string())),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(if value {
-                                    theme::PRIMARY
-                                } else {
-                                    theme::TEXT_SUBTLE
-                                }))
-                                .child(if value { "On" } else { "Off" }),
-                        )
-                        .child(toggle.child(div().size(px(16.0)).rounded_full().bg(rgb(0xffffff)))),
+    render_form_sections(
+        vec![
+            FormSection::new("Connection").fields(vec![
+                FormField::text(
+                    "Name",
+                    "Shown in the sidebar.",
+                    draft.label.clone(),
+                    EditorField::Ssh(SshField::Label),
                 ),
-        )
-        .on_mouse_down(MouseButton::Left, on_click)
+                FormField::text(
+                    "Host",
+                    "Hostname or IP address.",
+                    draft.host.clone(),
+                    EditorField::Ssh(SshField::Host),
+                ),
+                FormField::text(
+                    "Username",
+                    "Remote account name.",
+                    draft.username.clone(),
+                    EditorField::Ssh(SshField::Username),
+                ),
+                FormField::text(
+                    "Port",
+                    "Leave blank to use 22.",
+                    draft.port_text.clone(),
+                    EditorField::Ssh(SshField::Port),
+                ),
+            ]),
+            FormSection::new("Authentication").field(FormField::text(
+                "Password",
+                "Leave blank if you use keys or an agent.",
+                draft.password.clone(),
+                EditorField::Ssh(SshField::Password),
+            )),
+        ],
+        model,
+        actions,
+    )
 }
 
 fn minimize_to_tray_hint() -> &'static str {
     "Keep DevManager running when the window is closed"
 }
 
-fn render_inline_state_badge(label: &str, color: u32) -> impl IntoElement {
-    div()
-        .px(px(8.0))
-        .py(px(4.0))
-        .rounded_full()
-        .bg(rgb(theme::APP_BG))
-        .border_1()
-        .border_color(rgb(color))
-        .text_xs()
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(rgb(color))
-        .child(SharedString::from(label.to_string()))
-}
-
-fn render_notice_row(message: &str) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .px(px(12.0))
-        .py(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::EDITOR_NOTICE_BG))
-        .border_1()
-        .border_color(rgb(theme::BORDER_ACCENT))
-        .child(div().size(px(8.0)).rounded_full().bg(rgb(theme::PRIMARY)))
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(message.to_string())),
-        )
-}
-
 fn render_folder_scan_panel(
     draft: &FolderDraft,
     scan_result: &ScanResult,
+    model: &EditorPaneModel,
     actions: &EditorActions<'_>,
 ) -> impl IntoElement {
     let script_summary = format!(
-        "{} discovered script(s), {} selected",
+        "{} commands found, {} selected",
         scan_result.scripts.len(),
         draft.selected_scanned_scripts.len()
     );
 
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(render_info_row(
-            "Scan results",
-            script_summary.as_str(),
-            Some("Selected scripts will be created for new folders and merged into existing folders when they are not already present."),
-        ))
-        .children((!scan_result.scripts.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child("Scripts"),
-                )
-                .children(scan_result.scripts.iter().map(|script| {
-                    let on_toggle_script =
-                        (actions.on_action)(EditorAction::ToggleFolderScanScript(script.name.clone()));
-                    render_selection_row(
-                        script.name.clone(),
-                        Some(script.command.clone()),
-                        draft.selected_scanned_scripts.contains(&script.name),
-                        on_toggle_script,
-                    )
-                    .into_any_element()
-                }))
-                .into_any_element()
-        }))
-        .children((!scan_result.ports.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child("Port variable"),
-                )
-                .child(render_selection_row(
-                    "None".to_string(),
-                    Some("Do not bind a default port variable".to_string()),
-                    draft.selected_scanned_port_variable.is_none(),
-                    (actions.on_action)(EditorAction::SelectFolderPortVariable(None)),
-                ))
-                .children(scan_result.ports.iter().map(|port| {
-                    let on_select_port =
-                        (actions.on_action)(EditorAction::SelectFolderPortVariable(Some(
-                            port.variable.clone(),
-                        )));
-                    render_selection_row(
-                        format!("{} = {}", port.variable, port.port),
-                        Some(port.source.clone()),
-                        draft.selected_scanned_port_variable.as_deref()
-                            == Some(port.variable.as_str()),
-                        on_select_port,
-                    )
-                    .into_any_element()
-                }))
-                .into_any_element()
-        }))
-}
+    let mut fields = vec![FormField::info(
+        "Summary",
+        script_summary,
+        Some("Only missing commands are added when you save.".to_string()),
+    )];
 
-fn render_selection_row(
-    label: String,
-    detail: Option<String>,
-    selected: bool,
-    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    div()
-        .px(px(12.0))
-        .py(px(10.0))
-        .rounded_md()
-        .bg(rgb(if selected {
-            theme::EDITOR_NOTICE_BG
-        } else {
-            theme::EDITOR_FIELD_BG
-        }))
-        .border_1()
-        .border_color(rgb(if selected {
-            theme::PRIMARY
-        } else {
-            theme::BORDER_PRIMARY
-        }))
-        .cursor_pointer()
-        .hover(|s| {
-            s.bg(rgb(theme::ROW_HOVER_BG))
-                .border_color(rgb(theme::PRIMARY))
-        })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(10.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(label)),
-                        )
-                        .children(detail.map(|detail| {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(detail))
-                        })),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(if selected {
-                            theme::PRIMARY
-                        } else {
-                            theme::TEXT_MUTED
-                        }))
-                        .child(if selected { "Selected" } else { "Available" }),
-                ),
-        )
-        .on_mouse_down(MouseButton::Left, on_click)
+    if !scan_result.scripts.is_empty() {
+        let mut list = FormSelectionList::new("Add commands")
+            .hint("Detected scripts that can become commands.");
+        for script in &scan_result.scripts {
+            let on_toggle_script =
+                (actions.on_action)(EditorAction::ToggleFolderScanScript(script.name.clone()));
+            list = list.row(FormSelectionRow::new(
+                script.name.clone(),
+                Some(script.command.clone()),
+                draft.selected_scanned_scripts.contains(&script.name),
+                on_toggle_script,
+            ));
+        }
+        fields.push(FormField::selection_list(list));
+    }
+
+    if !scan_result.ports.is_empty() {
+        let mut list = FormSelectionList::new("Default port")
+            .hint("Choose which env var should fill the folder port setting.");
+        list = list.row(FormSelectionRow::new(
+            "None",
+            Some("Do not set a default port.".to_string()),
+            draft.selected_scanned_port_variable.is_none(),
+            (actions.on_action)(EditorAction::SelectFolderPortVariable(None)),
+        ));
+        for port in &scan_result.ports {
+            let on_select_port = (actions.on_action)(EditorAction::SelectFolderPortVariable(Some(
+                port.variable.clone(),
+            )));
+            list = list.row(FormSelectionRow::new(
+                format!("{} = {}", port.variable, port.port),
+                Some(port.source.clone()),
+                draft.selected_scanned_port_variable.as_deref() == Some(port.variable.as_str()),
+                on_select_port,
+            ));
+        }
+        fields.push(FormField::selection_list(list));
+    }
+
+    render_form_fields(fields, model, actions)
 }
 
 fn render_updater_panel(
@@ -3453,27 +3480,27 @@ fn render_updater_panel(
             render_info_row(
                 "Latest available version",
                 version.as_str(),
-                Some("This version comes from the signed latest.json manifest."),
+                Some("From the signed release manifest."),
             )
         }))
         .children(updater.endpoints.first().map(|endpoint| {
             render_info_row(
                 "Manifest endpoint",
                 endpoint.as_str(),
-                Some("The updater checks this URL for a signed release manifest."),
+                Some("Where update checks run."),
             )
         }))
         .child(render_choice_row(
             "Check for updates",
             "Check now",
-            Some("Queries the configured manifest URL in the background."),
+            Some("Check in the background."),
             on_check,
         ))
         .children(on_download.map(|on_download| {
             render_choice_row(
                 "Download update",
                 "Download now",
-                Some("Downloads and verifies the signed installer bundle."),
+                Some("Download and verify the installer."),
                 on_download,
             )
         }))
@@ -3481,7 +3508,7 @@ fn render_updater_panel(
             render_choice_row(
                 "Restart to update",
                 "Install and close DevManager",
-                Some("Launches the installer and closes the current app to finish the update."),
+                Some("Close DevManager and launch the installer."),
                 on_install,
             )
         }))
@@ -3489,57 +3516,9 @@ fn render_updater_panel(
             render_info_row(
                 "Release notes",
                 notes.as_str(),
-                Some("Release notes from the signed manifest / GitHub release."),
+                Some("From the signed release manifest."),
             )
         }))
-}
-
-fn render_info_row(label: &str, value: &str, hint: Option<&str>) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(label.to_string())),
-                        )
-                        .children(hint.map(|hint| {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(hint.to_string()))
-                                .into_any_element()
-                        })),
-                )
-                .child(render_inline_state_badge("Detected", theme::TEXT_MUTED)),
-        )
-        .child(
-            div()
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(theme::BORDER_PRIMARY))
-                .text_sm()
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(value.to_string())),
-        )
 }
 
 fn updater_stage_label(stage: &UpdaterStage) -> &'static str {
