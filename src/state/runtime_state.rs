@@ -10,6 +10,7 @@ const AI_BACKGROUND_READY_THRESHOLD: Duration = Duration::from_secs(30);
 const AI_FOREGROUND_READY_THRESHOLD: Duration = Duration::from_secs(60);
 const AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE: Duration = Duration::from_secs(2);
 const AI_NOTIFICATION_CONFIRM_DELAY: Duration = Duration::from_secs(2);
+const USER_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionStatus {
@@ -180,6 +181,7 @@ pub struct SessionRuntimeState {
     pub pid: Option<u32>,
     pub status: SessionStatus,
     pub session_kind: SessionKind,
+    pub interactive_shell: bool,
     pub project_id: Option<String>,
     pub command_id: Option<String>,
     pub tab_id: Option<String>,
@@ -206,6 +208,8 @@ pub struct SessionRuntimeState {
     pub last_output_at: Option<Instant>,
     pub thinking_since: Option<Instant>,
     pub unseen_ready: bool,
+    last_user_interrupt_at: Option<Instant>,
+    last_user_stop_request_at: Option<Instant>,
     suppress_activity_until: Option<Instant>,
     last_output_event_at: Option<Instant>,
     output_burst_count: u8,
@@ -213,6 +217,10 @@ pub struct SessionRuntimeState {
 }
 
 impl SessionRuntimeState {
+    pub fn has_live_process(&self) -> bool {
+        self.status.is_live() && self.pid.is_some() && !self.interactive_shell
+    }
+
     pub fn new(
         session_id: impl Into<String>,
         cwd: PathBuf,
@@ -224,6 +232,7 @@ impl SessionRuntimeState {
             pid: None,
             status: SessionStatus::Starting,
             session_kind: SessionKind::Shell,
+            interactive_shell: false,
             project_id: None,
             command_id: None,
             tab_id: None,
@@ -250,6 +259,8 @@ impl SessionRuntimeState {
             last_output_at: None,
             thinking_since: None,
             unseen_ready: false,
+            last_user_interrupt_at: None,
+            last_user_stop_request_at: None,
             suppress_activity_until: None,
             last_output_event_at: None,
             output_burst_count: 0,
@@ -361,6 +372,7 @@ impl SessionRuntimeState {
         self.exit_code = exit.code;
         self.exit = Some(exit);
         self.status = status;
+        self.interactive_shell = false;
         self.pid = None;
         self.resources = ResourceSnapshot::default();
         if self.session_kind.is_ai() {
@@ -378,6 +390,7 @@ impl SessionRuntimeState {
         let now = Instant::now();
         self.pid = pid;
         self.status = SessionStatus::Running;
+        self.interactive_shell = false;
         self.started_at = Some(now);
         self.exit = None;
         self.exit_code = None;
@@ -385,6 +398,8 @@ impl SessionRuntimeState {
         self.last_output_at = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
+        self.last_user_interrupt_at = None;
+        self.last_user_stop_request_at = None;
         if self.session_kind.is_ai() {
             self.ai_activity = Some(AiActivity::Idle);
             self.thinking_since = None;
@@ -402,8 +417,56 @@ impl SessionRuntimeState {
         self.mark_dirty();
     }
 
+    pub fn note_user_interrupt(&mut self) {
+        self.last_user_interrupt_at = Some(Instant::now());
+        self.mark_dirty();
+    }
+
+    pub fn note_user_stop_request(&mut self) {
+        self.last_user_stop_request_at = Some(Instant::now());
+        self.interactive_shell = false;
+        self.mark_dirty();
+    }
+
+    pub fn has_recent_user_interrupt(&self, now: Instant) -> bool {
+        self.last_user_interrupt_at.is_some_and(|interrupted_at| {
+            now.duration_since(interrupted_at) <= USER_EXIT_GRACE_PERIOD
+        })
+    }
+
+    pub fn has_recent_user_stop_request(&self, now: Instant) -> bool {
+        self.last_user_stop_request_at
+            .is_some_and(|requested_at| now.duration_since(requested_at) <= USER_EXIT_GRACE_PERIOD)
+    }
+
+    pub fn clear_user_exit_requests(&mut self) {
+        self.last_user_interrupt_at = None;
+        self.last_user_stop_request_at = None;
+    }
+
+    pub fn activate_interactive_shell(
+        &mut self,
+        shell_program: String,
+        summary: impl Into<String>,
+    ) {
+        self.status = SessionStatus::Stopped;
+        self.interactive_shell = true;
+        self.shell_program = shell_program;
+        self.exit_code = None;
+        self.exit = Some(SessionExitState {
+            code: None,
+            signal: None,
+            closed_by_user: true,
+            summary: summary.into(),
+        });
+        self.resources = ResourceSnapshot::default();
+        self.clear_user_exit_requests();
+        self.mark_dirty();
+    }
+
     pub fn configure_server(&mut self, launch: ServerLaunchSpec) {
         self.session_kind = SessionKind::Server;
+        self.interactive_shell = false;
         self.project_id = Some(launch.project_id.clone());
         self.command_id = Some(launch.command_id.clone());
         self.auto_restart = launch.auto_restart;
@@ -413,6 +476,7 @@ impl SessionRuntimeState {
         self.ai_activity = None;
         self.tab_id = None;
         self.unseen_ready = false;
+        self.clear_user_exit_requests();
         self.suppress_activity_until = None;
         self.pending_notification = None;
         self.mark_dirty();
@@ -420,6 +484,7 @@ impl SessionRuntimeState {
 
     pub fn configure_ai(&mut self, launch: AiLaunchSpec) {
         self.session_kind = launch.tool;
+        self.interactive_shell = false;
         self.project_id = Some(launch.project_id.clone());
         self.tab_id = Some(launch.tab_id.clone());
         self.command_id = None;
@@ -431,6 +496,7 @@ impl SessionRuntimeState {
         self.last_output_at = None;
         self.thinking_since = None;
         self.unseen_ready = false;
+        self.clear_user_exit_requests();
         self.suppress_activity_until = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
@@ -440,6 +506,7 @@ impl SessionRuntimeState {
 
     pub fn configure_ssh(&mut self, launch: SshLaunchSpec) {
         self.session_kind = SessionKind::Ssh;
+        self.interactive_shell = false;
         self.project_id = Some(launch.project_id.clone());
         self.tab_id = Some(launch.tab_id.clone());
         self.command_id = None;
@@ -451,6 +518,7 @@ impl SessionRuntimeState {
         self.last_output_at = None;
         self.thinking_since = None;
         self.unseen_ready = false;
+        self.clear_user_exit_requests();
         self.suppress_activity_until = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
@@ -648,6 +716,40 @@ mod tests {
         assert_eq!(session.resources.process_count, 0);
         assert!(session.resources.process_ids.is_empty());
         assert!(session.resources.last_sample_at.is_none());
+    }
+
+    #[test]
+    fn interactive_shell_mode_clears_when_session_restarts_or_exits() {
+        let mut session = SessionRuntimeState::new(
+            "session-1",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        session.note_user_interrupt();
+        assert!(session.has_recent_user_interrupt(Instant::now()));
+
+        session.activate_interactive_shell("powershell.exe".to_string(), "prompt ready");
+        assert_eq!(session.status, SessionStatus::Stopped);
+        assert!(session.interactive_shell);
+        assert!(!session.has_recent_user_interrupt(Instant::now()));
+
+        session.note_start(Some(42));
+        assert!(session.status.is_live());
+        assert!(!session.interactive_shell);
+
+        session.activate_interactive_shell("powershell.exe".to_string(), "prompt ready");
+        session.note_exit(
+            SessionExitState {
+                code: Some(0),
+                signal: None,
+                closed_by_user: true,
+                summary: "closed".to_string(),
+            },
+            SessionStatus::Exited,
+        );
+        assert!(!session.interactive_shell);
     }
 
     #[test]

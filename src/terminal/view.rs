@@ -312,6 +312,7 @@ fn render_empty_body(
 
 fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
     let session = model.session.as_ref()?;
+    let has_live_terminal = session.runtime.status.is_live() || session.runtime.interactive_shell;
 
     if session.runtime.status.is_live() && session.runtime.resources.last_sample_at.is_some() {
         let mem_mb = session.runtime.resources.memory_bytes / 1024 / 1024;
@@ -343,20 +344,16 @@ fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
         ));
     }
 
-    session
-        .runtime
-        .status
-        .is_live()
-        .then(|| match model.active_tab_type.as_ref() {
-            Some(TabType::Claude) | Some(TabType::Codex) => {
-                format!(
-                    "{} • {}",
-                    tab_kind_label(model.active_tab_type.as_ref()),
-                    session.runtime.shell_program
-                )
-            }
-            _ => session.runtime.shell_program.clone(),
-        })
+    has_live_terminal.then(|| match model.active_tab_type.as_ref() {
+        Some(TabType::Claude) | Some(TabType::Codex) => {
+            format!(
+                "{} • {}",
+                tab_kind_label(model.active_tab_type.as_ref()),
+                session.runtime.shell_program
+            )
+        }
+        _ => session.runtime.shell_program.clone(),
+    })
 }
 
 fn empty_surface_message(model: &TerminalPaneModel) -> String {

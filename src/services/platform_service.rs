@@ -15,32 +15,12 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
     #[cfg(windows)]
     {
-        let output = Command::new("netstat")
-            .args(["-ano", "-p", "tcp"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|error| format!("Failed to run netstat: {error}"))?;
-        if !output.status.success() {
-            return Err("netstat did not complete successfully".to_string());
+        match find_pid_on_port_with_netstat(port) {
+            Ok(Some(pid)) => return Ok(Some(pid)),
+            Ok(None) => {}
+            Err(_) => {}
         }
-        let needle = format!(":{port}");
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let trimmed = line.trim();
-            if !trimmed.starts_with("TCP") {
-                continue;
-            }
-            let columns: Vec<&str> = trimmed.split_whitespace().collect();
-            if columns.len() < 5 {
-                continue;
-            }
-            if !columns[1].ends_with(&needle) || !columns[3].eq_ignore_ascii_case("LISTENING") {
-                continue;
-            }
-            if let Ok(pid) = columns[4].parse::<u32>() {
-                return Ok(Some(pid));
-            }
-        }
-        Ok(None)
+        find_pid_on_port_with_powershell(port)
     }
 
     #[cfg(not(windows))]
@@ -57,6 +37,75 @@ pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
             .find_map(|line| line.trim().parse::<u32>().ok());
         Ok(pid)
     }
+}
+
+#[cfg(windows)]
+fn find_pid_on_port_with_netstat(port: u16) -> Result<Option<u32>, String> {
+    let output = Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("Failed to run netstat: {error}"))?;
+    if !output.status.success() {
+        return Err("netstat did not complete successfully".to_string());
+    }
+
+    Ok(parse_netstat_pid_on_port(
+        &String::from_utf8_lossy(&output.stdout),
+        port,
+    ))
+}
+
+#[cfg(windows)]
+fn find_pid_on_port_with_powershell(port: u16) -> Result<Option<u32>, String> {
+    let script = format!(
+        "$conn = Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -First 1; if ($conn) {{ $conn.OwningProcess }}"
+    );
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("Failed to run PowerShell port probe: {error}"))?;
+    if !output.status.success() {
+        return Err("PowerShell port probe did not complete successfully".to_string());
+    }
+
+    Ok(parse_pid_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+#[cfg(windows)]
+fn parse_netstat_pid_on_port(output: &str, port: u16) -> Option<u32> {
+    let needle = format!(":{port}");
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("TCP") {
+            continue;
+        }
+        let columns: Vec<&str> = trimmed.split_whitespace().collect();
+        if columns.len() < 5 {
+            continue;
+        }
+        if !columns[1].ends_with(&needle) || !columns[3].eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        if let Ok(pid) = columns[4].parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn parse_pid_output(output: &str) -> Option<u32> {
+    output
+        .lines()
+        .find_map(|line| line.trim().parse::<u32>().ok())
 }
 
 pub fn kill_process_tree(pid: u32) -> Result<(), String> {
@@ -221,6 +270,29 @@ pub fn get_process_name(pid: u32) -> Result<Option<String>, String> {
 fn normalize_process_name(name: &OsStr) -> Option<String> {
     let value = name.to_string_lossy().trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{parse_netstat_pid_on_port, parse_pid_output};
+
+    #[test]
+    fn parse_netstat_pid_on_port_handles_ipv4_and_ipv6() {
+        let output = r#"
+  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       1111
+  TCP    [::1]:5174             [::]:0                 LISTENING       2222
+"#;
+
+        assert_eq!(parse_netstat_pid_on_port(output, 3000), Some(1111));
+        assert_eq!(parse_netstat_pid_on_port(output, 5174), Some(2222));
+        assert_eq!(parse_netstat_pid_on_port(output, 9999), None);
+    }
+
+    #[test]
+    fn parse_pid_output_ignores_blank_lines() {
+        assert_eq!(parse_pid_output("\r\n5174\r\n"), Some(5174));
+        assert_eq!(parse_pid_output(""), None);
+    }
 }
 
 pub fn open_terminal(folder_path: &str, shell_path: Option<&str>) -> Result<(), String> {

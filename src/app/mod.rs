@@ -216,6 +216,7 @@ impl NativeShell {
             ),
         };
         let process_manager = ProcessManager::new();
+        process_manager.set_settings(state.config.settings.clone());
         process_manager.set_notification_sound(state.config.settings.notification_sound.clone());
         process_manager.set_log_buffer_size(state.config.settings.log_buffer_size as usize);
         let updater = UpdaterService::new();
@@ -348,6 +349,8 @@ impl NativeShell {
         if let Err(error) = self.session_manager.save_config(&self.state.config) {
             self.editor_notice = Some(format!("Failed to save config: {error}"));
         } else {
+            self.process_manager
+                .set_settings(self.state.config.settings.clone());
             self.process_manager
                 .set_notification_sound(self.state.config.settings.notification_sound.clone());
             self.process_manager
@@ -2089,14 +2092,21 @@ impl NativeShell {
                     self.active_port_state = None;
                 }
 
-                let session_live = self
+                let server_runtime = self
                     .process_manager
                     .runtime_state()
                     .sessions
                     .get(&active_spec.session_id)
+                    .cloned();
+                let session_live = server_runtime
+                    .as_ref()
                     .map(|session| session.status.is_live())
                     .unwrap_or(false);
-                if session_live {
+                let interactive_prompt = server_runtime
+                    .as_ref()
+                    .map(|session| session.interactive_shell)
+                    .unwrap_or(false);
+                if session_live || interactive_prompt {
                     let dimensions = self.terminal_dimensions(window);
                     if self.last_dimensions != Some(dimensions)
                         && self
@@ -2107,7 +2117,7 @@ impl NativeShell {
                         self.last_dimensions = Some(dimensions);
                     }
                     self.terminal_notice = None;
-                    active_session = self.process_manager.active_session();
+                    active_session = self.process_manager.session_view(&active_spec.session_id);
                 } else if self.terminal_notice.is_none() {
                     self.terminal_notice = Some(
                         "Server session is not running. Start it from the sidebar.".to_string(),
@@ -2368,7 +2378,13 @@ impl NativeShell {
                 state.kill_feedback_until = None;
             }
 
-            let interval = port_refresh_interval(active_session);
+            let interval = if active_session.is_some_and(|session| session.runtime.status.is_live())
+                && state.status.as_ref().is_some_and(|status| !status.in_use)
+            {
+                std::time::Duration::from_secs(1)
+            } else {
+                port_refresh_interval(active_session)
+            };
             let should_refresh = state
                 .last_checked_at
                 .map(|checked_at| checked_at.elapsed() >= interval)
@@ -2473,9 +2489,16 @@ impl NativeShell {
             .and_then(|state| state.status.as_ref())
             .map(|status| !is_managed_port_owner(active_session, status))
             .unwrap_or(false);
+        let probe_disagrees_with_live_session = active_session
+            .is_some_and(|session| session.runtime.status.is_live())
+            && port_state
+                .and_then(|state| state.status.as_ref())
+                .is_some_and(|status| !status.in_use);
         let port_label = port.map(|port| {
             if let Some(status) = port_state.and_then(|state| state.status.as_ref()) {
-                if status.in_use {
+                if probe_disagrees_with_live_session {
+                    format!("port {port} • probing")
+                } else if status.in_use {
                     if is_managed_port_owner(active_session, status) {
                         format!("port {port} • live")
                     } else {
@@ -2497,6 +2520,8 @@ impl NativeShell {
         });
         let port_color = if has_port_conflict {
             theme::WARNING_TEXT
+        } else if probe_disagrees_with_live_session {
+            theme::TEXT_MUTED
         } else if port_state
             .and_then(|state| state.status.as_ref())
             .map(|status| status.in_use)
@@ -2532,6 +2557,7 @@ impl NativeShell {
     fn start_server_action(
         &mut self,
         command_id: &str,
+        focus_started_server: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2541,12 +2567,21 @@ impl NativeShell {
             .find_command(command_id)
             .and_then(|lookup| lookup.command.port)
         else {
-            match self
-                .process_manager
-                .start_server(&mut self.state, command_id, dimensions)
-            {
+            let result = if focus_started_server {
+                self.process_manager
+                    .start_server(&mut self.state, command_id, dimensions)
+            } else {
+                self.process_manager.start_server_in_background(
+                    &mut self.state,
+                    command_id,
+                    dimensions,
+                )
+            };
+            match result {
                 Ok(()) => {
-                    self.synced_session_id = Some(command_id.to_string());
+                    if focus_started_server {
+                        self.synced_session_id = Some(command_id.to_string());
+                    }
                     self.terminal_notice = None;
                     self.save_session_state();
                 }
@@ -2558,22 +2593,13 @@ impl NativeShell {
             return;
         };
 
-        let state = self
-            .active_port_state
-            .get_or_insert_with(|| ActivePortState {
-                command_id: command_id.to_string(),
-                port,
-                status: None,
-                last_checked_at: None,
-                kill_feedback: None,
-                kill_feedback_until: None,
-                refresh_in_flight: false,
-            });
-        state.command_id = command_id.to_string();
-        state.port = port;
-        state.status = None;
-        state.last_checked_at = None;
-        state.refresh_in_flight = true;
+        if let Some(state) = self.active_port_state.as_mut() {
+            if state.command_id == command_id && state.port == port {
+                state.status = None;
+                state.last_checked_at = None;
+                state.refresh_in_flight = true;
+            }
+        }
 
         let command_id = command_id.to_string();
         let background_executor = cx.background_executor().clone();
@@ -2586,12 +2612,11 @@ impl NativeShell {
                         .await;
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
                         if let Some(state) = this.active_port_state.as_mut() {
-                            if state.command_id != command_id || state.port != port {
-                                return;
+                            if state.command_id == command_id && state.port == port {
+                                state.status = status.clone();
+                                state.last_checked_at = Some(Instant::now());
+                                state.refresh_in_flight = false;
                             }
-                            state.status = status.clone();
-                            state.last_checked_at = Some(Instant::now());
-                            state.refresh_in_flight = false;
                         }
 
                         if let Some(status) = status.filter(|status| status.in_use) {
@@ -2609,13 +2634,25 @@ impl NativeShell {
                             return;
                         }
 
-                        match this.process_manager.start_server(
-                            &mut this.state,
-                            &command_id,
-                            dimensions,
-                        ) {
+                        let result = if focus_started_server {
+                            this.process_manager.start_server(
+                                &mut this.state,
+                                &command_id,
+                                dimensions,
+                            )
+                        } else {
+                            this.process_manager.start_server_in_background(
+                                &mut this.state,
+                                &command_id,
+                                dimensions,
+                            )
+                        };
+
+                        match result {
                             Ok(()) => {
-                                this.synced_session_id = Some(command_id.clone());
+                                if focus_started_server {
+                                    this.synced_session_id = Some(command_id.clone());
+                                }
                                 this.terminal_notice = None;
                                 this.save_session_state();
                             }
@@ -2637,9 +2674,55 @@ impl NativeShell {
     }
 
     fn stop_server_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
-        if let Err(error) = self.process_manager.stop_server(command_id) {
-            self.terminal_notice = Some(format!("Failed to stop server: {error}"));
+        let command_id = command_id.to_string();
+        if let Some(state) = self.active_port_state.as_mut() {
+            if state.command_id == command_id {
+                state.status = None;
+                state.last_checked_at = None;
+                state.refresh_in_flight = true;
+            }
         }
+        self.terminal_notice = Some(format!("Stopping `{command_id}`..."));
+
+        let process_manager = self.process_manager.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let background_executor = cx.background_executor().clone();
+                let mut async_cx = cx.clone();
+                async move {
+                    let command_id_for_wait = command_id.clone();
+                    let stopped = background_executor
+                        .spawn(async move {
+                            process_manager.stop_server_and_wait(
+                                &command_id_for_wait,
+                                std::time::Duration::from_secs(5),
+                            )
+                        })
+                        .await;
+
+                    let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        if let Some(state) = this.active_port_state.as_mut() {
+                            if state.command_id == command_id {
+                                state.status = None;
+                                state.last_checked_at = None;
+                                state.refresh_in_flight = false;
+                            }
+                        }
+
+                        if stopped {
+                            this.terminal_notice =
+                                Some(format!("Stopped `{command_id}` and released its processes."));
+                        } else {
+                            this.terminal_notice = Some(format!(
+                                "Failed to stop `{command_id}` cleanly. The port may still be in use."
+                            ));
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
         cx.notify();
     }
 
@@ -3285,6 +3368,17 @@ impl NativeShell {
             }
             TerminalKeyAction::SendInput(input) => {
                 if let Some(text) = resolve_terminal_input_text(&input, input_context) {
+                    if text == "\u{3}"
+                        && matches!(
+                            self.state.active_tab().map(|tab| tab.tab_type.clone()),
+                            Some(TabType::Server)
+                        )
+                        && active_session.as_ref().is_some_and(|session| {
+                            session.runtime.status.is_live() && !session.runtime.interactive_shell
+                        })
+                    {
+                        self.process_manager.note_server_interrupt(&session_id);
+                    }
                     let _ = self.process_manager.write_to_session(&session_id, &text);
                     window.prevent_default();
                 }
@@ -3738,7 +3832,13 @@ impl Render for NativeShell {
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     this.sidebar_context_menu = None;
-                    this.start_server_action(&command_id, window, cx);
+                    this.start_server_action(&command_id, false, window, cx);
+                }))
+            };
+        let make_focused_start_handler =
+            |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.start_server_action(&command_id, true, window, cx);
                 }))
             };
         let make_stop_handler =
@@ -3954,7 +4054,9 @@ impl Render for NativeShell {
             if model
                 .session
                 .as_ref()
-                .map(|session| session.runtime.status.is_live())
+                .map(|session| {
+                    session.runtime.status.is_live() || session.runtime.interactive_shell
+                })
                 .unwrap_or(false)
             {
                 window.request_animation_frame();
@@ -3981,7 +4083,7 @@ impl Render for NativeShell {
                 view::TerminalPaneActions {
                     on_start_server: controls
                         .can_start
-                        .then(|| make_start_handler(command_id.clone())),
+                        .then(|| make_focused_start_handler(command_id.clone())),
                     on_stop_server: controls
                         .can_stop
                         .then(|| make_stop_handler(command_id.clone())),

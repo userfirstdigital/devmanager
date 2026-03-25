@@ -29,6 +29,7 @@ pub struct ProcessManager {
 struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
+    settings: RwLock<Settings>,
     terminal_backend: TerminalBackend,
     debug_enabled: bool,
     restart_backoffs: Mutex<HashMap<String, RestartBackoff>>,
@@ -87,6 +88,7 @@ impl ProcessManager {
         let inner = Arc::new(ProcessManagerInner {
             sessions: Mutex::new(HashMap::new()),
             runtime_state: Arc::new(RwLock::new(RuntimeState::new(debug_enabled))),
+            settings: RwLock::new(Settings::default()),
             terminal_backend: TerminalBackend::PortablePtyFeedingAlacritty,
             debug_enabled,
             restart_backoffs: Mutex::new(HashMap::new()),
@@ -129,6 +131,12 @@ impl ProcessManager {
     pub fn set_notification_sound(&self, sound_id: Option<String>) {
         if let Ok(mut notification_sound) = self.inner.notification_sound.write() {
             *notification_sound = sound_id;
+        }
+    }
+
+    pub fn set_settings(&self, settings: Settings) {
+        if let Ok(mut settings_slot) = self.inner.settings.write() {
+            *settings_slot = settings;
         }
     }
 
@@ -240,6 +248,17 @@ impl ProcessManager {
             state.mark_dirty();
         });
         Ok(())
+    }
+
+    pub fn note_server_interrupt(&self, session_id: &str) {
+        self.update_session_state(session_id, |state| {
+            if matches!(state.session_kind, SessionKind::Server)
+                && state.status.is_live()
+                && !state.interactive_shell
+            {
+                state.note_user_interrupt();
+            }
+        });
     }
 
     pub fn report_focus(&self, session_id: &str, focused: bool) -> Result<(), String> {
@@ -734,6 +753,25 @@ impl ProcessManager {
         command_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<(), String> {
+        self.start_server_with_activation(app_state, command_id, dimensions, true)
+    }
+
+    pub fn start_server_in_background(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+    ) -> Result<(), String> {
+        self.start_server_with_activation(app_state, command_id, dimensions, false)
+    }
+
+    fn start_server_with_activation(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+        activate_tab: bool,
+    ) -> Result<(), String> {
         let lookup = app_state
             .find_command(command_id)
             .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
@@ -745,18 +783,32 @@ impl ProcessManager {
         let session_id = command_id.clone();
         let runtime = self.runtime_state();
         if let Some(session) = runtime.sessions.get(&session_id) {
-            if matches!(
-                session.status,
-                SessionStatus::Running | SessionStatus::Starting
-            ) && self.get_session(&session_id).is_ok()
-            {
-                app_state.open_server_tab(&project_id, &command_id, Some(command_label.clone()));
-                self.set_active_session(session_id);
+            if session.has_live_process() && self.get_session(&session_id).is_ok() {
+                if activate_tab {
+                    app_state.open_server_tab(
+                        &project_id,
+                        &command_id,
+                        Some(command_label.clone()),
+                    );
+                    self.set_active_session(session_id);
+                } else {
+                    app_state.ensure_server_tab(
+                        &project_id,
+                        &command_id,
+                        Some(command_label.clone()),
+                    );
+                }
                 return Ok(());
             }
         }
 
-        self.set_active_session(session_id.clone());
+        let previous_active_session_id = (!activate_tab)
+            .then(|| runtime.active_session_id.clone())
+            .flatten();
+
+        if activate_tab {
+            self.set_active_session(session_id.clone());
+        }
 
         let cwd = PathBuf::from(lookup.folder.folder_path.clone());
         let cwd = if cwd.is_dir() {
@@ -785,7 +837,11 @@ impl ProcessManager {
             ),
         };
 
-        app_state.open_server_tab(&project_id, &command_id, Some(command_label.clone()));
+        if activate_tab {
+            app_state.open_server_tab(&project_id, &command_id, Some(command_label.clone()));
+        } else {
+            app_state.ensure_server_tab(&project_id, &command_id, Some(command_label.clone()));
+        }
 
         self.update_session_state(&session_id, |state| {
             state.status = SessionStatus::Starting;
@@ -797,17 +853,22 @@ impl ProcessManager {
             state.mark_dirty();
         });
 
-        self.spawn_server_session(&launch_spec, dimensions)?;
+        self.spawn_server_session(&launch_spec, dimensions, activate_tab)?;
 
         self.update_session_state(&session_id, |state| {
             state.configure_server(launch_spec.clone());
         });
+
+        if !activate_tab {
+            self.restore_active_session(previous_active_session_id);
+        }
 
         Ok(())
     }
 
     pub fn stop_server(&self, command_id: &str) -> Result<(), String> {
         self.update_session_state(command_id, |state| {
+            state.note_user_stop_request();
             state.status = SessionStatus::Stopping;
             state.exit = Some(SessionExitState {
                 code: None,
@@ -973,7 +1034,7 @@ impl ProcessManager {
     ) {
         for folder in &project.folders {
             for command in &folder.commands {
-                let _ = self.start_server(app_state, &command.id, dimensions);
+                let _ = self.start_server_in_background(app_state, &command.id, dimensions);
             }
         }
     }
@@ -1313,9 +1374,12 @@ impl ProcessManager {
         &self,
         launch: &ServerLaunchSpec,
         dimensions: SessionDimensions,
+        activate_session: bool,
     ) -> Result<(), String> {
         let session_id = launch.command_id.clone();
-        self.set_active_session(session_id.clone());
+        if activate_session {
+            self.set_active_session(session_id.clone());
+        }
 
         match spawn_server_session_with_inner(&self.inner, launch, dimensions) {
             Ok(()) => Ok(()),
@@ -1332,6 +1396,12 @@ impl ProcessManager {
                 });
                 Err(error)
             }
+        }
+    }
+
+    fn restore_active_session(&self, active_session_id: Option<String>) {
+        if let Ok(mut runtime) = self.inner.runtime_state.write() {
+            runtime.active_session_id = active_session_id;
         }
     }
 
@@ -1589,7 +1659,23 @@ fn collect_process_tree_ids(system: &sysinfo::System, root_pid: sysinfo::Pid) ->
 }
 
 fn reconcile_exit_states(inner: &ProcessManagerInner) {
-    let mut to_crash = Vec::new();
+    #[derive(Debug)]
+    enum ExitReconciliation {
+        RestoreInterruptedServer {
+            session_id: String,
+            cwd: PathBuf,
+            dimensions: SessionDimensions,
+        },
+        MarkStopped {
+            session_id: String,
+        },
+        MarkCrashed {
+            session_id: String,
+        },
+    }
+
+    let now = Instant::now();
+    let mut actions = Vec::new();
     if let Ok(runtime) = inner.runtime_state.read() {
         for (id, session) in &runtime.sessions {
             if matches!(
@@ -1599,28 +1685,71 @@ fn reconcile_exit_states(inner: &ProcessManagerInner) {
                 || session.session_kind.is_ai()
                 || matches!(session.session_kind, SessionKind::Ssh))
             {
-                to_crash.push((id.clone(), session.exit.clone()));
+                let closed_by_user = session
+                    .exit
+                    .as_ref()
+                    .map(|exit| exit.closed_by_user)
+                    .unwrap_or(false);
+                let requested_stop = closed_by_user || session.has_recent_user_stop_request(now);
+                if matches!(session.session_kind, SessionKind::Server)
+                    && session.has_recent_user_interrupt(now)
+                {
+                    actions.push(ExitReconciliation::RestoreInterruptedServer {
+                        session_id: id.clone(),
+                        cwd: session.cwd.clone(),
+                        dimensions: session.dimensions,
+                    });
+                } else if requested_stop {
+                    actions.push(ExitReconciliation::MarkStopped {
+                        session_id: id.clone(),
+                    });
+                } else {
+                    actions.push(ExitReconciliation::MarkCrashed {
+                        session_id: id.clone(),
+                    });
+                }
             }
         }
     }
 
-    if to_crash.is_empty() {
+    if actions.is_empty() {
         return;
     }
 
-    if let Ok(mut runtime) = inner.runtime_state.write() {
-        for (session_id, exit) in to_crash {
-            if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                let closed_by_user = exit
-                    .as_ref()
-                    .map(|exit| exit.closed_by_user)
-                    .unwrap_or(false);
-                if closed_by_user {
-                    session.status = SessionStatus::Stopped;
-                } else {
-                    session.status = SessionStatus::Crashed;
+    for action in actions {
+        match action {
+            ExitReconciliation::RestoreInterruptedServer {
+                session_id,
+                cwd,
+                dimensions,
+            } => {
+                if restore_interrupted_server_prompt(inner, &session_id, cwd, dimensions).is_err() {
+                    if let Ok(mut runtime) = inner.runtime_state.write() {
+                        if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                            session.status = SessionStatus::Stopped;
+                            session.clear_user_exit_requests();
+                            session.mark_dirty();
+                        }
+                    }
                 }
-                session.mark_dirty();
+            }
+            ExitReconciliation::MarkStopped { session_id } => {
+                if let Ok(mut runtime) = inner.runtime_state.write() {
+                    if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                        session.status = SessionStatus::Stopped;
+                        session.clear_user_exit_requests();
+                        session.mark_dirty();
+                    }
+                }
+            }
+            ExitReconciliation::MarkCrashed { session_id } => {
+                if let Ok(mut runtime) = inner.runtime_state.write() {
+                    if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                        session.status = SessionStatus::Crashed;
+                        session.clear_user_exit_requests();
+                        session.mark_dirty();
+                    }
+                }
             }
         }
     }
@@ -1899,6 +2028,15 @@ fn build_interactive_shell_command(settings: &Settings) -> (String, Vec<String>)
     }
 }
 
+fn interactive_shell_command_from_inner(inner: &ProcessManagerInner) -> (String, Vec<String>) {
+    let settings = inner
+        .settings
+        .read()
+        .map(|settings| settings.clone())
+        .unwrap_or_default();
+    build_interactive_shell_command(&settings)
+}
+
 fn resolve_ai_startup_command(settings: &Settings, tab_type: TabType) -> Result<String, String> {
     let configured = match tab_type {
         TabType::Claude => settings
@@ -1974,9 +2112,8 @@ fn spawn_server_session_with_inner(
             runtime
                 .sessions
                 .get(&session_id)
-                .map(|session| session.status)
+                .map(|session| session.has_live_process())
         })
-        .map(SessionStatus::is_live)
         .unwrap_or(false);
     let session_handle_exists = inner
         .sessions
@@ -1988,8 +2125,22 @@ fn spawn_server_session_with_inner(
         return Ok(());
     }
 
-    if let Ok(mut sessions) = inner.sessions.lock() {
-        sessions.remove(&session_id);
+    if let Ok(existing_session) = inner
+        .sessions
+        .lock()
+        .map(|sessions| sessions.get(&session_id).cloned())
+    {
+        if let Some(session) = existing_session {
+            return session.restart_command(
+                launch.cwd.clone(),
+                dimensions,
+                launch.program.clone(),
+                launch.args.clone(),
+                launch.env.clone(),
+                launch.log_file_path.clone(),
+                true,
+            );
+        }
     }
 
     let session = TerminalSession::spawn_command(
@@ -2016,6 +2167,68 @@ fn spawn_server_session_with_inner(
     if let Ok(mut runtime) = inner.runtime_state.write() {
         if runtime.active_session_id.is_none() {
             runtime.active_session_id = Some(session_id);
+        }
+    }
+
+    Ok(())
+}
+
+fn restore_interrupted_server_prompt(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    cwd: PathBuf,
+    dimensions: SessionDimensions,
+) -> Result<(), String> {
+    let (shell_program, shell_args) = interactive_shell_command_from_inner(inner);
+    let existing_session = inner
+        .sessions
+        .lock()
+        .map_err(|_| "Session store poisoned".to_string())?
+        .get(session_id)
+        .cloned();
+
+    if let Some(session) = existing_session {
+        session.restart_command(
+            cwd.clone(),
+            dimensions,
+            shell_program.clone(),
+            shell_args,
+            HashMap::new(),
+            None,
+            false,
+        )?;
+    } else {
+        let session = TerminalSession::spawn_command(
+            session_id.to_string(),
+            cwd.clone(),
+            dimensions,
+            shell_program.clone(),
+            shell_args,
+            HashMap::new(),
+            inner
+                .scrollback_lines
+                .read()
+                .map(|lines| *lines)
+                .unwrap_or(10_000),
+            None,
+            inner.runtime_state.clone(),
+            inner.debug_enabled,
+        )?;
+        inner
+            .sessions
+            .lock()
+            .map_err(|_| "Session store poisoned".to_string())?
+            .insert(session_id.to_string(), Arc::new(session));
+    }
+
+    if let Ok(mut runtime) = inner.runtime_state.write() {
+        if let Some(session) = runtime.sessions.get_mut(session_id) {
+            session.cwd = cwd;
+            session.dimensions = dimensions;
+            session.activate_interactive_shell(
+                shell_program,
+                "Server interrupted with Ctrl+C. Terminal ready.",
+            );
         }
     }
 
@@ -2168,6 +2381,30 @@ mod tests {
     }
 
     #[test]
+    fn stopped_server_can_start_again_on_same_terminal_session() {
+        let cwd = temp_test_dir("restart-after-stop");
+        let pid_file_path = cwd.join("running-pids.json");
+        let _pid_file_guard = pid_file::use_test_pid_file(pid_file_path);
+        let manager = ProcessManager::new();
+        let mut app_state = app_state_with_server(&cwd, true);
+        let command_id = "server-cmd";
+        let dimensions = SessionDimensions::default();
+
+        manager
+            .start_server(&mut app_state, command_id, dimensions)
+            .unwrap();
+        wait_for_running_session(&manager, command_id);
+
+        assert!(manager.stop_server_and_wait(command_id, Duration::from_secs(5)));
+        wait_for_stopped_session(&manager, command_id);
+
+        manager
+            .start_server(&mut app_state, command_id, dimensions)
+            .unwrap();
+        wait_for_running_session(&manager, command_id);
+    }
+
+    #[test]
     fn set_active_session_does_not_create_placeholder_runtime_entry() {
         let manager = ProcessManager::new();
 
@@ -2252,6 +2489,38 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         panic!("session `{session_id}` never became live");
+    }
+
+    fn wait_for_running_session(manager: &ProcessManager, session_id: &str) {
+        for _ in 0..30 {
+            if manager
+                .runtime_state()
+                .sessions
+                .get(session_id)
+                .is_some_and(|session| {
+                    session.status == SessionStatus::Running && session.pid.is_some()
+                })
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("session `{session_id}` never became fully running");
+    }
+
+    fn wait_for_stopped_session(manager: &ProcessManager, session_id: &str) {
+        for _ in 0..30 {
+            if manager
+                .runtime_state()
+                .sessions
+                .get(session_id)
+                .is_some_and(|session| session.status == SessionStatus::Stopped)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("session `{session_id}` never became stopped");
     }
 
     fn wait_for_tracked_process(session_id: &str) {

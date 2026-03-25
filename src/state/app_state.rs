@@ -228,14 +228,21 @@ impl AppState {
         self.sidebar_collapsed = !self.sidebar_collapsed;
     }
 
-    pub fn open_server_tab(
+    pub fn ensure_server_tab(
         &mut self,
         project_id: &str,
         command_id: &str,
         label: Option<String>,
     ) -> String {
         let tab_id = command_id.to_string();
-        if !self.open_tabs.iter().any(|tab| tab.id == tab_id) {
+        if let Some(tab) = self.open_tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.project_id = project_id.to_string();
+            tab.tab_type = TabType::Server;
+            tab.command_id = Some(command_id.to_string());
+            tab.pty_session_id = Some(command_id.to_string());
+            tab.label = label;
+            tab.ssh_connection_id = None;
+        } else {
             self.open_tabs.push(SessionTab {
                 id: tab_id.clone(),
                 tab_type: TabType::Server,
@@ -246,6 +253,16 @@ impl AppState {
                 ssh_connection_id: None,
             });
         }
+        tab_id
+    }
+
+    pub fn open_server_tab(
+        &mut self,
+        project_id: &str,
+        command_id: &str,
+        label: Option<String>,
+    ) -> String {
+        let tab_id = self.ensure_server_tab(project_id, command_id, label);
         self.active_tab_id = Some(tab_id.clone());
         tab_id
     }
@@ -708,5 +725,38 @@ impl AppState {
         {
             self.active_tab_id = self.open_tabs.first().map(|tab| tab.id.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_shell_tab() -> SessionTab {
+        SessionTab {
+            id: "shell-tab".to_string(),
+            tab_type: TabType::Claude,
+            project_id: "project-1".to_string(),
+            command_id: None,
+            pty_session_id: Some("claude-session".to_string()),
+            label: Some("Claude".to_string()),
+            ssh_connection_id: None,
+        }
+    }
+
+    #[test]
+    fn ensure_server_tab_does_not_change_active_selection() {
+        let mut state = AppState::default();
+        state.open_tabs.push(sample_shell_tab());
+        state.active_tab_id = Some("shell-tab".to_string());
+
+        let tab_id = state.ensure_server_tab("project-1", "server-cmd", Some("Web".to_string()));
+
+        assert_eq!(tab_id, "server-cmd");
+        assert_eq!(state.active_tab_id.as_deref(), Some("shell-tab"));
+        let tab = state.find_tab("server-cmd").expect("server tab");
+        assert_eq!(tab.project_id, "project-1");
+        assert_eq!(tab.command_id.as_deref(), Some("server-cmd"));
+        assert_eq!(tab.pty_session_id.as_deref(), Some("server-cmd"));
     }
 }
