@@ -33,6 +33,7 @@ pub struct TerminalPaneModel {
     pub active_tab_type: Option<TabType>,
     pub session: Option<TerminalSessionView>,
     pub startup_notice: Option<String>,
+    pub blocking_notice: Option<String>,
     pub debug_enabled: bool,
     pub font_size: f32,
     pub cell_width: f32,
@@ -49,6 +50,7 @@ pub struct TerminalPaneActions {
     pub on_clear_output: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_kill_port: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_open_local_url: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_prompt_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +65,8 @@ pub struct TerminalRuntimeControlsModel {
     pub can_open_url: bool,
     pub kill_label: &'static str,
     pub kill_color: u32,
+    pub prompt_action_label: Option<String>,
+    pub prompt_action_color: u32,
 }
 
 pub fn render_terminal_surface(
@@ -77,6 +81,24 @@ pub fn render_terminal_surface(
             .text_xs()
             .text_color(rgb(theme::TEXT_MUTED))
             .child(SharedString::from(message.clone()))
+    });
+    let blocking_notice = model.blocking_notice.as_ref().map(|message| {
+        div()
+            .mx_2()
+            .my_1()
+            .py_2()
+            .border_t_1()
+            .border_b_1()
+            .border_color(rgb(theme::BORDER_PRIMARY))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(SharedString::from(message.clone())),
+            )
     });
 
     let is_ai_tab = matches!(
@@ -234,6 +256,7 @@ pub fn render_terminal_surface(
                     .gap(px(2.0))
                     .bg(rgb(theme::TERMINAL_BG))
                     .children(notice)
+                    .children(blocking_notice)
                     .children(exit_banner)
                     .child(terminal_body)
                     .children(model.debug_enabled.then(|| {
@@ -797,6 +820,7 @@ fn render_runtime_actions(
         on_clear_output,
         on_kill_port,
         on_open_local_url,
+        on_prompt_action,
     } = actions;
 
     div()
@@ -846,6 +870,14 @@ fn render_runtime_actions(
                 .then_some(on_open_local_url)
                 .flatten()
                 .map(|on_click| runtime_action_button("open", theme::PRIMARY, on_click)),
+        )
+        .children(
+            controls
+                .prompt_action_label
+                .zip(on_prompt_action)
+                .map(|(label, on_click)| {
+                    runtime_action_button(label.as_str(), controls.prompt_action_color, on_click)
+                }),
         )
 }
 

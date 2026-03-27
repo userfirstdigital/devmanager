@@ -23,7 +23,8 @@ use gpui::{
     div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
     ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, RenderImage, ScrollWheelEvent, Styled, TouchPhase, Window, WindowBounds, WindowOptions,
+    Render, RenderImage, ScrollWheelEvent, Styled, Subscription, TouchPhase, Window, WindowBounds,
+    WindowOptions,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::HashMap;
@@ -88,6 +89,9 @@ pub fn run() {
                         close_handler
                             .update(cx, |shell, cx| shell.handle_window_should_close(window, cx))
                     });
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.register_focus_observers(window, cx);
+                    });
                     shell
                 },
             )
@@ -109,6 +113,7 @@ struct NativeShell {
     did_focus_terminal: bool,
     focused_terminal_session_id: Option<String>,
     active_port_state: Option<ActivePortState>,
+    ssh_password_prompt_state: Option<SshPasswordPromptState>,
     editor_needs_focus: bool,
     synced_session_id: Option<String>,
     last_dimensions: Option<SessionDimensions>,
@@ -124,6 +129,7 @@ struct NativeShell {
     last_window_title: Option<String>,
     splash_image: Option<Arc<RenderImage>>,
     splash_fetch_in_flight: bool,
+    window_subscriptions: Vec<Subscription>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -203,6 +209,17 @@ struct ActivePortState {
     refresh_in_flight: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshPasswordPromptState {
+    session_id: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshPasswordPromptMatch {
+    fingerprint: String,
+}
+
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
@@ -261,6 +278,7 @@ impl NativeShell {
             did_focus_terminal: false,
             focused_terminal_session_id: None,
             active_port_state: None,
+            ssh_password_prompt_state: None,
             editor_needs_focus: false,
             synced_session_id,
             last_dimensions: None,
@@ -276,11 +294,88 @@ impl NativeShell {
             last_window_title: None,
             splash_image: None,
             splash_fetch_in_flight: false,
+            window_subscriptions: Vec::new(),
         };
 
         Self::spawn_splash_image_fetch(cx);
 
         shell
+    }
+
+    fn register_focus_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.window_subscriptions.is_empty() {
+            return;
+        }
+
+        self.window_subscriptions
+            .push(cx.observe_window_activation(window, Self::handle_window_activation_changed));
+        self.window_subscriptions.push(cx.on_focus_in(
+            &self.terminal_focus,
+            window,
+            Self::handle_terminal_focus_in,
+        ));
+        self.window_subscriptions.push(cx.on_focus_out(
+            &self.terminal_focus,
+            window,
+            Self::handle_terminal_focus_out,
+        ));
+    }
+
+    fn handle_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = window.is_window_active();
+
+        let session_id = self.terminal_focus_session_id();
+
+        if let Some(session_id) = session_id {
+            let _ = self.process_manager.report_focus(&session_id, active);
+        }
+
+        if active {
+            if self.editor_panel.is_none() {
+                self.did_focus_terminal = false;
+            }
+        } else {
+            self.last_terminal_mouse_report = None;
+            self.is_selecting_terminal = false;
+        }
+
+        cx.notify();
+    }
+
+    fn handle_terminal_focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session_id) = self.terminal_focus_session_id() {
+            let _ = self.process_manager.report_focus(&session_id, true);
+        }
+        self.did_focus_terminal = true;
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    fn handle_terminal_focus_out(
+        &mut self,
+        _event: gpui::FocusOutEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session_id) = self.terminal_focus_session_id() {
+            let _ = self.process_manager.report_focus(&session_id, false);
+        }
+        self.did_focus_terminal = false;
+        self.last_terminal_mouse_report = None;
+        self.is_selecting_terminal = false;
+        cx.notify();
+    }
+
+    fn terminal_focus_session_id(&self) -> Option<String> {
+        self.focused_terminal_session_id.clone().or_else(|| {
+            if self.editor_panel.is_none() {
+                self.state
+                    .active_tab()
+                    .and_then(|tab| tab.pty_session_id.clone())
+            } else {
+                None
+            }
+        })
     }
 
     fn spawn_splash_image_fetch(cx: &mut Context<Self>) {
@@ -742,13 +837,17 @@ impl NativeShell {
     }
 
     fn close_editor(&mut self, cx: &mut Context<Self>) {
+        self.show_terminal_surface();
+        cx.notify();
+    }
+
+    fn show_terminal_surface(&mut self) {
         self.editor_panel = None;
         self.editor_active_field = None;
         self.editor_cursor = 0;
         self.editor_notice = None;
         self.editor_needs_focus = false;
         self.did_focus_terminal = false;
-        cx.notify();
     }
 
     fn focus_editor(&mut self, window: &mut Window) {
@@ -2266,6 +2365,12 @@ impl NativeShell {
             }
         }
 
+        if active_tab_type == Some(TabType::Ssh) {
+            self.maybe_auto_submit_ssh_password(active_session.as_ref());
+        } else {
+            self.ssh_password_prompt_state = None;
+        }
+
         if !self.did_focus_terminal {
             window.focus(&self.terminal_focus);
             self.did_focus_terminal = true;
@@ -2283,6 +2388,12 @@ impl NativeShell {
             cx,
         );
         let terminal_metrics = self.terminal_render_metrics(window);
+        let blocking_notice = active_session.as_ref().and_then(|session| {
+            session
+                .runtime
+                .awaiting_external_editor
+                .then_some("Save and close text editor to continue...".to_string())
+        });
 
         let has_active_tab = active_tab_type.is_some();
         view::TerminalPaneModel {
@@ -2305,6 +2416,7 @@ impl NativeShell {
                 .startup_notice
                 .clone()
                 .or_else(|| self.terminal_notice.clone()),
+            blocking_notice,
             debug_enabled: self.process_manager.debug_enabled(),
             font_size: self.terminal_font_size(),
             cell_width: terminal_metrics.cell_width,
@@ -2460,6 +2572,130 @@ impl NativeShell {
         state.last_checked_at = None;
     }
 
+    fn maybe_auto_submit_ssh_password(
+        &mut self,
+        active_session: Option<&crate::terminal::session::TerminalSessionView>,
+    ) {
+        let Some(session) = active_session else {
+            self.ssh_password_prompt_state = None;
+            return;
+        };
+        let Some(connection_id) = session
+            .runtime
+            .ssh_launch
+            .as_ref()
+            .map(|launch| launch.ssh_connection_id.as_str())
+        else {
+            self.ssh_password_prompt_state = None;
+            return;
+        };
+        let Some(connection) = self.state.find_ssh_connection(connection_id) else {
+            self.ssh_password_prompt_state = None;
+            return;
+        };
+        let Some(prompt) = ssh_password_prompt(session, connection) else {
+            self.ssh_password_prompt_state = None;
+            return;
+        };
+        let Some(password) = connection
+            .password
+            .as_ref()
+            .filter(|password| !password.is_empty())
+        else {
+            return;
+        };
+
+        let prompt_state = SshPasswordPromptState {
+            session_id: session.runtime.session_id.clone(),
+            fingerprint: prompt.fingerprint,
+        };
+        if self.ssh_password_prompt_state.as_ref() == Some(&prompt_state) {
+            return;
+        }
+
+        match self
+            .process_manager
+            .write_to_session(&session.runtime.session_id, &format!("{password}\r"))
+        {
+            Ok(()) => {
+                self.ssh_password_prompt_state = Some(prompt_state);
+                self.terminal_notice = Some("Sent saved SSH password.".to_string());
+            }
+            Err(error) => {
+                self.terminal_notice = Some(format!("Failed to send SSH password: {error}"));
+            }
+        }
+    }
+
+    fn respond_to_ssh_prompt_action(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let Some(session) = self.process_manager.session_view(session_id) else {
+            self.terminal_notice = Some("SSH session is not available.".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(connection_id) = session
+            .runtime
+            .ssh_launch
+            .as_ref()
+            .map(|launch| launch.ssh_connection_id.as_str())
+        else {
+            self.terminal_notice = Some("This terminal is not an SSH session.".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(connection) = self.state.find_ssh_connection(connection_id) else {
+            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
+            cx.notify();
+            return;
+        };
+        if let Some(prompt) = ssh_password_prompt(&session, connection) {
+            let Some(password) = connection
+                .password
+                .as_ref()
+                .filter(|password| !password.is_empty())
+            else {
+                self.terminal_notice =
+                    Some("No saved password for this SSH connection.".to_string());
+                cx.notify();
+                return;
+            };
+            self.ssh_password_prompt_state = Some(SshPasswordPromptState {
+                session_id: session.runtime.session_id.clone(),
+                fingerprint: prompt.fingerprint,
+            });
+
+            match self
+                .process_manager
+                .write_to_session(session_id, &format!("{password}\r"))
+            {
+                Ok(()) => {
+                    self.terminal_notice = Some("Sent SSH password.".to_string());
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to send SSH password: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        if ssh_host_key_prompt(&session) {
+            match self.process_manager.write_to_session(session_id, "yes\r") {
+                Ok(()) => {
+                    self.terminal_notice = Some("Sent `yes` to the SSH host check.".to_string());
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to send `yes`: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        self.terminal_notice = Some("No active SSH prompt to answer.".to_string());
+        cx.notify();
+    }
+
     fn runtime_controls_model(
         &mut self,
         active_tab_type: Option<TabType>,
@@ -2467,6 +2703,59 @@ impl NativeShell {
         active_session: Option<&crate::terminal::session::TerminalSessionView>,
         cx: &mut Context<Self>,
     ) -> Option<view::TerminalRuntimeControlsModel> {
+        if active_tab_type == Some(TabType::Ssh) {
+            self.active_port_state = None;
+            let session = active_session?;
+            let connection_id = session
+                .runtime
+                .ssh_launch
+                .as_ref()
+                .map(|launch| launch.ssh_connection_id.as_str())?;
+            let connection = self.state.find_ssh_connection(connection_id)?;
+            let password_prompt = ssh_password_prompt(session, connection);
+            let host_key_prompt = ssh_host_key_prompt(session);
+            let has_saved_password = connection
+                .password
+                .as_ref()
+                .is_some_and(|password| !password.is_empty());
+
+            let (port_label, prompt_action_label, prompt_action_color) =
+                if password_prompt.is_some() {
+                    (
+                        Some("password prompt".to_string()),
+                        has_saved_password.then_some("send password".to_string()),
+                        if has_saved_password {
+                            theme::PRIMARY
+                        } else {
+                            theme::TEXT_MUTED
+                        },
+                    )
+                } else if host_key_prompt {
+                    (
+                        Some("verify host".to_string()),
+                        Some("send yes".to_string()),
+                        theme::WARNING_TEXT,
+                    )
+                } else {
+                    return None;
+                };
+
+            return Some(view::TerminalRuntimeControlsModel {
+                port_label,
+                port_color: theme::WARNING_TEXT,
+                can_start: false,
+                can_stop: false,
+                can_restart: false,
+                can_clear: false,
+                can_kill_port: false,
+                can_open_url: false,
+                kill_label: "kill",
+                kill_color: theme::WARNING_TEXT,
+                prompt_action_label,
+                prompt_action_color,
+            });
+        }
+
         if active_tab_type != Some(TabType::Server) {
             self.active_port_state = None;
             return None;
@@ -2551,6 +2840,8 @@ impl NativeShell {
                 && !has_port_conflict,
             kill_label,
             kill_color,
+            prompt_action_label: None,
+            prompt_action_color: theme::PRIMARY,
         })
     }
 
@@ -2877,6 +3168,7 @@ impl NativeShell {
         } else {
             self.state.select_tab(command_id);
         }
+        self.show_terminal_surface();
         self.synced_session_id = Some(command_id.to_string());
         self.save_session_state();
         cx.notify();
@@ -2897,6 +3189,7 @@ impl NativeShell {
             dimensions,
         ) {
             Ok(session_id) => {
+                self.show_terminal_surface();
                 self.synced_session_id = Some(session_id);
                 self.terminal_notice = None;
                 self.save_session_state();
@@ -2918,6 +3211,7 @@ impl NativeShell {
             false,
         ) {
             Ok(session_id) => {
+                self.show_terminal_surface();
                 self.synced_session_id = Some(session_id);
                 self.terminal_notice = None;
                 self.save_session_state();
@@ -2936,6 +3230,7 @@ impl NativeShell {
             .restart_ai_session(&mut self.state, tab_id, dimensions)
         {
             Ok(session_id) => {
+                self.show_terminal_surface();
                 self.synced_session_id = Some(session_id);
                 self.terminal_notice = None;
                 self.save_session_state();
@@ -2989,6 +3284,7 @@ impl NativeShell {
             .state
             .open_ssh_tab(&project_id, connection_id, Some(connection.label));
 
+        self.show_terminal_surface();
         self.synced_session_id = self
             .state
             .find_ssh_tab(&tab_id)
@@ -3010,6 +3306,7 @@ impl NativeShell {
             .start_ssh_session(&mut self.state, connection_id, dimensions)
         {
             Ok(session_id) => {
+                self.show_terminal_surface();
                 self.synced_session_id = Some(session_id);
                 self.last_dimensions = None;
                 self.terminal_notice = None;
@@ -3043,6 +3340,7 @@ impl NativeShell {
             .restart_ssh_session(&mut self.state, &tab_id, dimensions)
         {
             Ok(session_id) => {
+                self.show_terminal_surface();
                 self.synced_session_id = Some(session_id);
                 self.last_dimensions = None;
                 self.terminal_notice = None;
@@ -3828,6 +4126,12 @@ impl Render for NativeShell {
                     this.restart_ssh_action(&connection_id, window, cx);
                 }))
             };
+        let make_respond_to_ssh_prompt_handler =
+            |session_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.respond_to_ssh_prompt_action(&session_id, cx);
+                }))
+            };
         let make_start_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -4098,7 +4402,11 @@ impl Render for NativeShell {
                         .then(|| make_kill_port_handler(command_id.clone())),
                     on_open_local_url: controls
                         .can_open_url
-                        .then(|| make_open_server_url_handler(command_id)),
+                        .then(|| make_open_server_url_handler(command_id.clone())),
+                    on_prompt_action: controls
+                        .prompt_action_label
+                        .as_ref()
+                        .map(|_| make_respond_to_ssh_prompt_handler(command_id)),
                 }
             })
         });
@@ -4541,7 +4849,7 @@ fn translate_key_event(event: &KeyDownEvent, context: TerminalBindingContext) ->
 }
 
 // Keep terminal-specific raw text overrides separate from keystroke translation,
-// following the same SendText/SendKeystroke split Zed uses.
+// following the same SendText/SendKeystroke split used by the terminal layer.
 fn terminal_binding_action(
     keystroke: &Keystroke,
     context: TerminalBindingContext,
@@ -5183,12 +5491,6 @@ fn restore_saved_tabs(
             ssh_restore.reattached + ssh_restore.recovered
         ));
     }
-    if ssh_restore.disconnected > 0 {
-        restore_notes.push(format!(
-            "left {} SSH tab(s) disconnected",
-            ssh_restore.disconnected
-        ));
-    }
     (!restore_notes.is_empty()).then(|| restore_notes.join(", "))
 }
 
@@ -5585,6 +5887,89 @@ fn filter_editor_text_input(value: &str, numeric_only: bool, allow_newlines: boo
     }
 }
 
+fn ssh_password_prompt(
+    session: &crate::terminal::session::TerminalSessionView,
+    connection: &SSHConnection,
+) -> Option<SshPasswordPromptMatch> {
+    if !matches!(session.runtime.session_kind, crate::state::SessionKind::Ssh) {
+        return None;
+    }
+
+    let target = format!(
+        "{}@{}",
+        connection.username.trim().to_ascii_lowercase(),
+        connection.host.trim().to_ascii_lowercase()
+    );
+    if target.is_empty() {
+        return None;
+    }
+
+    let lines = visible_terminal_lines(&session.screen);
+    let start = lines.len().saturating_sub(3);
+    for index in start..lines.len() {
+        let candidate = collapse_terminal_whitespace(&lines[index..].join(" "));
+        let lower = candidate.to_ascii_lowercase();
+        if lower.contains(&target) && lower.contains("password:") && lower.ends_with(':') {
+            return Some(SshPasswordPromptMatch {
+                fingerprint: candidate,
+            });
+        }
+    }
+
+    None
+}
+
+fn ssh_host_key_prompt(session: &crate::terminal::session::TerminalSessionView) -> bool {
+    if !matches!(session.runtime.session_kind, crate::state::SessionKind::Ssh) {
+        return false;
+    }
+
+    let lines = visible_terminal_lines(&session.screen);
+    let start = lines.len().saturating_sub(3);
+    for index in start..lines.len() {
+        let candidate = collapse_terminal_whitespace(&lines[index..].join(" "));
+        let lower = candidate.to_ascii_lowercase();
+        if lower.contains("are you sure you want to continue connecting")
+            && lower.contains("(yes/no")
+            && lower.ends_with('?')
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn visible_terminal_lines(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+) -> Vec<String> {
+    screen
+        .lines
+        .iter()
+        .map(|line| {
+            let mut text: String = line
+                .iter()
+                .map(|cell| {
+                    if cell.character == '\u{00a0}' {
+                        ' '
+                    } else {
+                        cell.character
+                    }
+                })
+                .collect();
+            while text.ends_with(' ') {
+                text.pop();
+            }
+            text
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect()
+}
+
+fn collapse_terminal_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn config_has_project(config: &AppConfig, project_id: &str) -> bool {
     config
         .projects
@@ -5619,7 +6004,9 @@ mod tests {
     };
     use crate::services::ProcessManager;
     use crate::state::{RuntimeState, SessionRuntimeState};
-    use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
+    use crate::terminal::session::{
+        TerminalBackend, TerminalCellSnapshot, TerminalScreenSnapshot, TerminalSessionView,
+    };
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
@@ -5722,6 +6109,96 @@ mod tests {
         }
     }
 
+    fn screen_from_lines(lines: &[&str]) -> TerminalScreenSnapshot {
+        let rendered_lines: Vec<Vec<TerminalCellSnapshot>> = lines
+            .iter()
+            .map(|line| line.chars().map(snapshot_cell).collect())
+            .collect();
+        let cols = rendered_lines
+            .iter()
+            .map(|line| line.len())
+            .max()
+            .unwrap_or(0);
+        TerminalScreenSnapshot {
+            lines: rendered_lines,
+            cols,
+            rows: lines.len(),
+            ..Default::default()
+        }
+    }
+
+    fn ssh_terminal_view(lines: &[&str]) -> TerminalSessionView {
+        let mut runtime = SessionRuntimeState::new(
+            "ssh-session",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        runtime.session_kind = crate::state::SessionKind::Ssh;
+        runtime.status = crate::state::SessionStatus::Running;
+        runtime.ssh_launch = Some(crate::state::SshLaunchSpec {
+            tab_id: "ssh-tab".to_string(),
+            ssh_connection_id: "ssh-1".to_string(),
+            project_id: "project-1".to_string(),
+            cwd: PathBuf::from("."),
+            program: "ssh".to_string(),
+            args: Vec::new(),
+        });
+
+        TerminalSessionView {
+            runtime,
+            screen: screen_from_lines(lines),
+        }
+    }
+
+    #[test]
+    fn ssh_password_prompt_matches_connection_target() {
+        let connection = sample_ssh_connection("SSH");
+        let session = ssh_terminal_view(&["dev@example.com's password:"]);
+
+        let prompt = ssh_password_prompt(&session, &connection);
+
+        assert!(prompt.is_some());
+        assert_eq!(
+            prompt.map(|prompt| prompt.fingerprint),
+            Some("dev@example.com's password:".to_string())
+        );
+    }
+
+    #[test]
+    fn ssh_password_prompt_ignores_unrelated_password_prompts() {
+        let connection = sample_ssh_connection("SSH");
+        let session = ssh_terminal_view(&["[sudo] password for root:"]);
+
+        assert!(ssh_password_prompt(&session, &connection).is_none());
+    }
+
+    #[test]
+    fn ssh_password_prompt_matches_wrapped_login_prompt() {
+        let connection = sample_ssh_connection("SSH");
+        let session = ssh_terminal_view(&["dev@example.com's", "password:"]);
+
+        assert!(ssh_password_prompt(&session, &connection).is_some());
+    }
+
+    #[test]
+    fn ssh_host_key_prompt_matches_confirmation_prompt() {
+        let session = ssh_terminal_view(&[
+            "The authenticity of host 'example.com (192.168.0.11)' can't be established.",
+            "ED25519 key fingerprint is SHA256:abc123.",
+            "Are you sure you want to continue connecting (yes/no/[fingerprint])?",
+        ]);
+
+        assert!(ssh_host_key_prompt(&session));
+    }
+
+    #[test]
+    fn ssh_host_key_prompt_ignores_unrelated_yes_no_prompt() {
+        let session = ssh_terminal_view(&["Overwrite existing file? (yes/no)"]);
+
+        assert!(!ssh_host_key_prompt(&session));
+    }
+
     #[test]
     fn persisted_session_state_clears_restore_data_when_disabled() {
         let mut state = AppState::default();
@@ -5778,6 +6255,22 @@ mod tests {
         assert!(manager.runtime_state().sessions.is_empty());
         assert_eq!(state.open_tabs.len(), 1);
         assert_eq!(state.active_tab_id.as_deref(), Some("server-tab"));
+    }
+
+    #[test]
+    fn restore_saved_tabs_does_not_show_notice_for_disconnected_saved_ssh_tabs() {
+        let mut state = AppState::default();
+        state.open_tabs.push(sample_ssh_tab());
+        state.active_tab_id = Some("ssh-tab".to_string());
+
+        let manager = ProcessManager::new();
+        let notice = restore_saved_tabs(&manager, &mut state, SessionDimensions::default());
+
+        assert!(notice.is_none());
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.open_tabs[0].id, "ssh-tab");
+        assert_eq!(state.open_tabs[0].pty_session_id, None);
+        assert_eq!(state.active_tab_id.as_deref(), Some("ssh-tab"));
     }
 
     #[test]
@@ -6132,7 +6625,7 @@ mod tests {
     }
 
     #[test]
-    fn option_as_meta_matches_zed_platform_behavior() {
+    fn option_as_meta_matches_platform_behavior() {
         let input = TerminalInputAction::SendKeystroke(Keystroke {
             modifiers: Modifiers {
                 alt: true,

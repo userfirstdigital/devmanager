@@ -40,9 +40,5 @@ serviceAccountKey.json
 /target-watch
 /target-test
 /target-scan
-/target-test-interactive
-/target-test-interrupt
-/target-test-port
-/target-test-restart
-/target-test-start
-/target-test-stop
+/target-test-*
+/tests/targets/

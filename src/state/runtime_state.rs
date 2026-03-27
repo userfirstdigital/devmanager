@@ -201,6 +201,7 @@ pub struct SessionRuntimeState {
     pub backend: TerminalBackend,
     pub metrics: SessionMetrics,
     pub resources: ResourceSnapshot,
+    pub awaiting_external_editor: bool,
     pub server_launch: Option<ServerLaunchSpec>,
     pub ai_launch: Option<AiLaunchSpec>,
     pub ssh_launch: Option<SshLaunchSpec>,
@@ -252,6 +253,7 @@ impl SessionRuntimeState {
             backend,
             metrics: SessionMetrics::default(),
             resources: ResourceSnapshot::default(),
+            awaiting_external_editor: false,
             server_launch: None,
             ai_launch: None,
             ssh_launch: None,
@@ -375,6 +377,7 @@ impl SessionRuntimeState {
         self.interactive_shell = false;
         self.pid = None;
         self.resources = ResourceSnapshot::default();
+        self.awaiting_external_editor = false;
         if self.session_kind.is_ai() {
             self.ai_activity = Some(AiActivity::Idle);
             self.thinking_since = None;
@@ -395,6 +398,7 @@ impl SessionRuntimeState {
         self.exit = None;
         self.exit_code = None;
         self.resources = ResourceSnapshot::default();
+        self.awaiting_external_editor = false;
         self.last_output_at = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
@@ -414,6 +418,14 @@ impl SessionRuntimeState {
 
     pub fn note_resource_sample(&mut self, snapshot: ResourceSnapshot) {
         self.resources = snapshot;
+        self.mark_dirty();
+    }
+
+    pub fn note_external_editor_wait(&mut self, waiting: bool) {
+        if self.awaiting_external_editor == waiting {
+            return;
+        }
+        self.awaiting_external_editor = waiting;
         self.mark_dirty();
     }
 
@@ -453,6 +465,7 @@ impl SessionRuntimeState {
         self.interactive_shell = true;
         self.shell_program = shell_program;
         self.exit_code = None;
+        self.awaiting_external_editor = false;
         self.exit = Some(SessionExitState {
             code: None,
             signal: None,
@@ -467,6 +480,7 @@ impl SessionRuntimeState {
     pub fn configure_server(&mut self, launch: ServerLaunchSpec) {
         self.session_kind = SessionKind::Server;
         self.interactive_shell = false;
+        self.awaiting_external_editor = false;
         self.project_id = Some(launch.project_id.clone());
         self.command_id = Some(launch.command_id.clone());
         self.auto_restart = launch.auto_restart;
@@ -485,6 +499,7 @@ impl SessionRuntimeState {
     pub fn configure_ai(&mut self, launch: AiLaunchSpec) {
         self.session_kind = launch.tool;
         self.interactive_shell = false;
+        self.awaiting_external_editor = false;
         self.project_id = Some(launch.project_id.clone());
         self.tab_id = Some(launch.tab_id.clone());
         self.command_id = None;
@@ -507,6 +522,7 @@ impl SessionRuntimeState {
     pub fn configure_ssh(&mut self, launch: SshLaunchSpec) {
         self.session_kind = SessionKind::Ssh;
         self.interactive_shell = false;
+        self.awaiting_external_editor = false;
         self.project_id = Some(launch.project_id.clone());
         self.tab_id = Some(launch.tab_id.clone());
         self.command_id = None;

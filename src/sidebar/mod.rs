@@ -994,6 +994,7 @@ fn render_ssh_row(
         .map(|tab| state.active_tab_id.as_deref() == Some(tab.id.as_str()))
         .unwrap_or(false);
     let is_connected = session.is_some();
+    let connection_target = ssh_connection_target(connection);
     let menu_open = matches!(
         actions.open_context_menu,
         Some(SidebarContextMenu::Ssh { ref connection_id }) if *connection_id == connection.id
@@ -1006,11 +1007,11 @@ fn render_ssh_row(
             div()
                 .group("ssh-row")
                 .flex()
-                .items_center()
+                .items_start()
                 .justify_between()
-                .gap(px(4.0))
+                .gap(px(8.0))
                 .px_2()
-                .py(px(2.0))
+                .py(px(6.0))
                 .rounded_sm()
                 .cursor_pointer()
                 .bg(rgb(if is_active {
@@ -1021,9 +1022,11 @@ fn render_ssh_row(
                 .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
-                        .items_center()
-                        .gap(px(5.0))
+                        .items_start()
+                        .gap(px(6.0))
                         .on_mouse_down(
                             MouseButton::Left,
                             (actions.on_open_ssh_tab)(connection.id.clone()),
@@ -1031,55 +1034,81 @@ fn render_ssh_row(
                         .child(icons::app_icon(icons::TERMINAL, 10.0, color))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
                                 .flex()
-                                .items_center()
-                                .gap(px(4.0))
+                                .flex_col()
+                                .gap(px(2.0))
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_PRIMARY))
-                                        .child(SharedString::from(connection.label.clone())),
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .min_w(px(0.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .text_xs()
+                                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(SharedString::from(
+                                                    connection.label.clone(),
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .px(px(6.0))
+                                                .py(px(1.0))
+                                                .rounded_full()
+                                                .bg(rgb(theme::BUTTON_HOVER_BG))
+                                                .text_size(px(9.0))
+                                                .text_color(rgb(color))
+                                                .child(label),
+                                        ),
                                 )
-                                .child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(
-                                    SharedString::from(format!(
-                                        "{}@{}",
-                                        connection.username, connection.host
-                                    )),
-                                )),
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(theme::TEXT_DIM))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .child(SharedString::from(connection_target)),
+                                ),
                         ),
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .child(div().text_xs().text_color(rgb(color)).child(label))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.0))
-                                .opacity(if menu_open { 1.0 } else { 0.0 })
-                                .group_hover("ssh-row", |s| s.opacity(1.0))
-                                .child(row_icon_action(
-                                    if is_connected {
-                                        icons::SQUARE
-                                    } else {
-                                        icons::PLAY
-                                    },
-                                    if is_connected {
-                                        (actions.on_disconnect_ssh)(connection.id.clone())
-                                    } else {
-                                        (actions.on_connect_ssh)(connection.id.clone())
-                                    },
-                                ))
-                                .child(row_icon_action(
-                                    icons::MORE_HORIZONTAL,
-                                    (actions.on_toggle_context_menu)(SidebarContextMenu::Ssh {
-                                        connection_id: connection.id.clone(),
-                                    }),
-                                )),
-                        ),
+                        .opacity(if menu_open || is_active { 1.0 } else { 0.0 })
+                        .group_hover("ssh-row", |s| s.opacity(1.0))
+                        .child(row_icon_action(
+                            if is_connected {
+                                icons::SQUARE
+                            } else {
+                                icons::PLAY
+                            },
+                            if is_connected {
+                                (actions.on_disconnect_ssh)(connection.id.clone())
+                            } else {
+                                (actions.on_connect_ssh)(connection.id.clone())
+                            },
+                        ))
+                        .child(row_icon_action(
+                            icons::SETTINGS,
+                            (actions.on_edit_ssh)(connection.id.clone()),
+                        ))
+                        .child(row_icon_action(
+                            icons::MORE_HORIZONTAL,
+                            (actions.on_toggle_context_menu)(SidebarContextMenu::Ssh {
+                                connection_id: connection.id.clone(),
+                            }),
+                        )),
                 ),
         )
         .children(menu_open.then(|| {
@@ -1377,6 +1406,15 @@ fn ssh_status_color(tab: Option<&SessionTab>, session: Option<&SessionRuntimeSta
     }
 }
 
+fn ssh_connection_target(connection: &crate::models::SSHConnection) -> String {
+    let host = format!("{}@{}", connection.username.trim(), connection.host.trim());
+    if connection.port == 22 {
+        host
+    } else {
+        format!("{host}:{}", connection.port)
+    }
+}
+
 fn context_menu_item(
     label: &str,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -1496,5 +1534,27 @@ mod tests {
         assert_eq!(ai_status_label(Some(&session)), "thinking");
         assert_eq!(ai_status_color(Some(&session), &tab), theme::WARNING_TEXT);
         assert!(!ai_ready_light_visible(Some(&session)));
+    }
+
+    #[test]
+    fn ssh_connection_target_hides_default_port_and_keeps_custom_port() {
+        let default_port = crate::models::SSHConnection {
+            id: "ssh-1".to_string(),
+            label: "Prod".to_string(),
+            host: "example.com".to_string(),
+            username: "deploy".to_string(),
+            port: 22,
+            password: None,
+        };
+        let custom_port = crate::models::SSHConnection {
+            port: 2222,
+            ..default_port.clone()
+        };
+
+        assert_eq!(ssh_connection_target(&default_port), "deploy@example.com");
+        assert_eq!(
+            ssh_connection_target(&custom_port),
+            "deploy@example.com:2222"
+        );
     }
 }

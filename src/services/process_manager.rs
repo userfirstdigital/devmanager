@@ -1548,7 +1548,7 @@ fn spawn_background_tasks(inner: Arc<ProcessManagerInner>) -> thread::JoinHandle
 }
 
 fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo::System) {
-    let sessions: Vec<(String, u32)> = inner
+    let sessions: Vec<(String, u32, bool)> = inner
         .runtime_state
         .read()
         .map(|runtime| {
@@ -1557,7 +1557,11 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                 .iter()
                 .filter_map(|(id, session)| {
                     (session.status.is_live())
-                        .then_some(session.pid.map(|pid| (id.clone(), pid)))
+                        .then_some(
+                            session
+                                .pid
+                                .map(|pid| (id.clone(), pid, session.session_kind.is_ai())),
+                        )
                         .flatten()
                 })
                 .collect()
@@ -1578,8 +1582,8 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     let sampled_at = Instant::now();
     let mut snapshots = Vec::with_capacity(sessions.len());
 
-    for (session_id, pid) in sessions {
-        let snapshot = tracked_processes
+    for (session_id, pid, is_ai_session) in sessions {
+        let (snapshot, awaiting_external_editor) = tracked_processes
             .get(&session_id)
             .filter(|entry| entry.pid == pid)
             .filter(|entry| {
@@ -1601,6 +1605,8 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                         platform_service::process_identity_with_system(system, pid.as_u32())
                     })
                     .collect::<Vec<_>>();
+                let awaiting_external_editor =
+                    is_ai_session && is_blocking_external_editor(&descendant_processes);
                 let _ = pid_file::sync_session_descendant_processes(
                     session_id.as_str(),
                     entry.pid,
@@ -1616,28 +1622,60 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                     }
                 }
 
-                Some(ResourceSnapshot {
-                    cpu_percent,
-                    memory_bytes,
-                    process_count: process_tree_ids.len() as u32,
-                    process_ids: process_tree_ids
-                        .into_iter()
-                        .map(|pid| pid.as_u32())
-                        .collect(),
-                    last_sample_at: Some(sampled_at),
-                })
+                Some((
+                    ResourceSnapshot {
+                        cpu_percent,
+                        memory_bytes,
+                        process_count: process_tree_ids.len() as u32,
+                        process_ids: process_tree_ids
+                            .into_iter()
+                            .map(|pid| pid.as_u32())
+                            .collect(),
+                        last_sample_at: Some(sampled_at),
+                    },
+                    awaiting_external_editor,
+                ))
             })
             .unwrap_or_default();
-        snapshots.push((session_id, snapshot));
+        snapshots.push((session_id, snapshot, awaiting_external_editor));
     }
 
     if let Ok(mut runtime) = inner.runtime_state.write() {
-        for (session_id, snapshot) in snapshots {
+        for (session_id, snapshot, awaiting_external_editor) in snapshots {
             if let Some(session) = runtime.sessions.get_mut(&session_id) {
                 session.note_resource_sample(snapshot);
+                session.note_external_editor_wait(awaiting_external_editor);
             }
         }
     }
+}
+
+fn is_blocking_external_editor(descendants: &[platform_service::ProcessIdentity]) -> bool {
+    descendants.iter().any(|identity| {
+        identity
+            .process_name
+            .as_deref()
+            .map(normalize_process_name_for_detection)
+            .is_some_and(|name| {
+                matches!(
+                    name.as_str(),
+                    "code"
+                        | "code-insiders"
+                        | "cursor"
+                        | "windsurf"
+                        | "notepad"
+                        | "notepad++"
+                        | "sublime_text"
+                        | "devenv"
+                        | "gvim"
+                        | "nvim-qt"
+                )
+            })
+    })
+}
+
+fn normalize_process_name_for_detection(name: &str) -> String {
+    name.trim().trim_end_matches(".exe").to_ascii_lowercase()
 }
 
 fn collect_process_tree_ids(system: &sysinfo::System, root_pid: sysinfo::Pid) -> Vec<sysinfo::Pid> {
@@ -2416,6 +2454,30 @@ mod tests {
             Some("missing-session")
         );
         assert!(!runtime.sessions.contains_key("missing-session"));
+    }
+
+    #[test]
+    fn detects_blocking_external_editor_children() {
+        let descendants = vec![
+            platform_service::ProcessIdentity {
+                pid: 11,
+                started_at_unix_secs: 1,
+                process_name: Some("node.exe".to_string()),
+            },
+            platform_service::ProcessIdentity {
+                pid: 12,
+                started_at_unix_secs: 1,
+                process_name: Some("Code.exe".to_string()),
+            },
+        ];
+        assert!(is_blocking_external_editor(&descendants));
+
+        let non_editor_descendants = vec![platform_service::ProcessIdentity {
+            pid: 21,
+            started_at_unix_secs: 1,
+            process_name: Some("node.exe".to_string()),
+        }];
+        assert!(!is_blocking_external_editor(&non_editor_descendants));
     }
 
     fn temp_test_dir(label: &str) -> PathBuf {
