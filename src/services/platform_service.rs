@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{c_void, OsStr};
 use std::path::Path;
 use std::process::Command;
 #[cfg(not(windows))]
@@ -12,100 +12,233 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
+pub fn snapshot_listener_pids(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+    if ports.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     #[cfg(windows)]
     {
-        match find_pid_on_port_with_netstat(port) {
-            Ok(Some(pid)) => return Ok(Some(pid)),
-            Ok(None) => {}
-            Err(_) => {}
-        }
-        find_pid_on_port_with_powershell(port)
+        snapshot_listener_pids_windows(ports)
     }
 
     #[cfg(not(windows))]
     {
-        let output = Command::new("lsof")
-            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
-            .output()
-            .map_err(|error| format!("Failed to run lsof: {error}"))?;
-        if !output.status.success() {
-            return Ok(None);
-        }
-        let pid = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.trim().parse::<u32>().ok());
-        Ok(pid)
+        snapshot_listener_pids_with_lsof(ports)
     }
 }
 
+pub fn find_pid_on_port(port: u16) -> Result<Option<u32>, String> {
+    Ok(snapshot_listener_pids(&[port])?.remove(&port))
+}
+
 #[cfg(windows)]
-fn find_pid_on_port_with_netstat(port: u16) -> Result<Option<u32>, String> {
-    let output = Command::new("netstat")
-        .args(["-ano", "-p", "tcp"])
-        .creation_flags(CREATE_NO_WINDOW)
+fn snapshot_listener_pids_windows(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+    let filter: HashSet<u16> = ports.iter().copied().collect();
+    let mut listeners = HashMap::with_capacity(filter.len());
+    collect_windows_listener_pids(AF_INET, &filter, &mut listeners)?;
+    collect_windows_listener_pids(AF_INET6, &filter, &mut listeners)?;
+    Ok(listeners)
+}
+
+#[cfg(windows)]
+fn collect_windows_listener_pids(
+    address_family: u32,
+    filter: &HashSet<u16>,
+    listeners: &mut HashMap<u16, u32>,
+) -> Result<(), String> {
+    let mut size = 0u32;
+    let first = unsafe {
+        GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            address_family,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if first != ERROR_INSUFFICIENT_BUFFER && first != NO_ERROR {
+        return Err(format!(
+            "GetExtendedTcpTable size probe failed for AF {address_family}: {first}"
+        ));
+    }
+    if size == 0 {
+        return Ok(());
+    }
+
+    let mut buffer = vec![0u8; size as usize];
+    let result = unsafe {
+        GetExtendedTcpTable(
+            buffer.as_mut_ptr() as *mut c_void,
+            &mut size,
+            0,
+            address_family,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if result != NO_ERROR {
+        return Err(format!(
+            "GetExtendedTcpTable failed for AF {address_family}: {result}"
+        ));
+    }
+
+    match address_family {
+        AF_INET => {
+            let table = buffer.as_ptr() as *const MibTcpTableOwnerPid;
+            let entry_count = unsafe { (*table).dw_num_entries as usize };
+            let rows = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*table).table) as *const MibTcpRowOwnerPid,
+                    entry_count,
+                )
+            };
+            for row in rows {
+                let port = windows_port(row.dw_local_port);
+                if filter.contains(&port) {
+                    listeners.entry(port).or_insert(row.dw_owning_pid);
+                }
+            }
+        }
+        AF_INET6 => {
+            let table = buffer.as_ptr() as *const MibTcp6TableOwnerPid;
+            let entry_count = unsafe { (*table).dw_num_entries as usize };
+            let rows = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*table).table) as *const MibTcp6RowOwnerPid,
+                    entry_count,
+                )
+            };
+            for row in rows {
+                let port = windows_port(row.dw_local_port);
+                if filter.contains(&port) {
+                    listeners.entry(port).or_insert(row.dw_owning_pid);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn snapshot_listener_pids_with_lsof(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
+    let filter: HashSet<u16> = ports.iter().copied().collect();
+    let output = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"])
         .output()
-        .map_err(|error| format!("Failed to run netstat: {error}"))?;
+        .map_err(|error| format!("Failed to run lsof: {error}"))?;
     if !output.status.success() {
-        return Err("netstat did not complete successfully".to_string());
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    Ok(parse_netstat_pid_on_port(
-        &String::from_utf8_lossy(&output.stdout),
-        port,
-    ))
+    let mut listeners = HashMap::with_capacity(filter.len());
+    let mut current_pid = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (prefix, value) = line.split_at(1);
+        match prefix {
+            "p" => current_pid = value.trim().parse::<u32>().ok(),
+            "n" => {
+                let Some(pid) = current_pid else {
+                    continue;
+                };
+                let Some(port) = parse_lsof_listener_port(value) else {
+                    continue;
+                };
+                if filter.contains(&port) {
+                    listeners.entry(port).or_insert(pid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(listeners)
+}
+
+#[cfg(not(windows))]
+fn parse_lsof_listener_port(value: &str) -> Option<u16> {
+    let endpoint = value
+        .trim()
+        .split("->")
+        .next()
+        .unwrap_or(value)
+        .trim_end_matches(" (LISTEN)")
+        .trim();
+    let port_text = endpoint.rsplit(':').next()?.trim();
+    port_text.parse::<u16>().ok()
 }
 
 #[cfg(windows)]
-fn find_pid_on_port_with_powershell(port: u16) -> Result<Option<u32>, String> {
-    let script = format!(
-        "$conn = Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -First 1; if ($conn) {{ $conn.OwningProcess }}"
-    );
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("Failed to run PowerShell port probe: {error}"))?;
-    if !output.status.success() {
-        return Err("PowerShell port probe did not complete successfully".to_string());
-    }
+const AF_INET: u32 = 2;
+#[cfg(windows)]
+const AF_INET6: u32 = 23;
+#[cfg(windows)]
+const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
+#[cfg(windows)]
+const NO_ERROR: u32 = 0;
+#[cfg(windows)]
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
-    Ok(parse_pid_output(&String::from_utf8_lossy(&output.stdout)))
+#[cfg(windows)]
+#[repr(C)]
+struct MibTcpRowOwnerPid {
+    dw_state: u32,
+    dw_local_addr: u32,
+    dw_local_port: u32,
+    dw_remote_addr: u32,
+    dw_remote_port: u32,
+    dw_owning_pid: u32,
 }
 
 #[cfg(windows)]
-fn parse_netstat_pid_on_port(output: &str, port: u16) -> Option<u32> {
-    let needle = format!(":{port}");
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("TCP") {
-            continue;
-        }
-        let columns: Vec<&str> = trimmed.split_whitespace().collect();
-        if columns.len() < 5 {
-            continue;
-        }
-        if !columns[1].ends_with(&needle) || !columns[3].eq_ignore_ascii_case("LISTENING") {
-            continue;
-        }
-        if let Ok(pid) = columns[4].parse::<u32>() {
-            return Some(pid);
-        }
-    }
-    None
+#[repr(C)]
+struct MibTcpTableOwnerPid {
+    dw_num_entries: u32,
+    table: [MibTcpRowOwnerPid; 1],
 }
 
 #[cfg(windows)]
-fn parse_pid_output(output: &str) -> Option<u32> {
-    output
-        .lines()
-        .find_map(|line| line.trim().parse::<u32>().ok())
+#[repr(C)]
+struct MibTcp6RowOwnerPid {
+    uc_local_addr: [u8; 16],
+    dw_local_scope_id: u32,
+    dw_local_port: u32,
+    uc_remote_addr: [u8; 16],
+    dw_remote_scope_id: u32,
+    dw_remote_port: u32,
+    dw_state: u32,
+    dw_owning_pid: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct MibTcp6TableOwnerPid {
+    dw_num_entries: u32,
+    table: [MibTcp6RowOwnerPid; 1],
+}
+
+#[cfg(windows)]
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn GetExtendedTcpTable(
+        p_tcp_table: *mut c_void,
+        pdw_size: *mut u32,
+        b_order: i32,
+        ul_af: u32,
+        table_class: u32,
+        reserved: u32,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+fn windows_port(raw_port: u32) -> u16 {
+    u16::from_be((raw_port & 0xffff) as u16)
 }
 
 pub fn kill_process_tree(pid: u32) -> Result<(), String> {
@@ -274,24 +407,24 @@ fn normalize_process_name(name: &OsStr) -> Option<String> {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{parse_netstat_pid_on_port, parse_pid_output};
+    use super::windows_port;
 
     #[test]
-    fn parse_netstat_pid_on_port_handles_ipv4_and_ipv6() {
-        let output = r#"
-  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       1111
-  TCP    [::1]:5174             [::]:0                 LISTENING       2222
-"#;
-
-        assert_eq!(parse_netstat_pid_on_port(output, 3000), Some(1111));
-        assert_eq!(parse_netstat_pid_on_port(output, 5174), Some(2222));
-        assert_eq!(parse_netstat_pid_on_port(output, 9999), None);
+    fn windows_port_decodes_network_order_port() {
+        assert_eq!(windows_port(0x5000), 80);
+        assert_eq!(windows_port(0x3614), 5174);
     }
+}
+
+#[cfg(all(test, not(windows)))]
+mod non_windows_tests {
+    use super::parse_lsof_listener_port;
 
     #[test]
-    fn parse_pid_output_ignores_blank_lines() {
-        assert_eq!(parse_pid_output("\r\n5174\r\n"), Some(5174));
-        assert_eq!(parse_pid_output(""), None);
+    fn parse_lsof_listener_port_handles_localhost_and_ipv6() {
+        assert_eq!(parse_lsof_listener_port("127.0.0.1:3000"), Some(3000));
+        assert_eq!(parse_lsof_listener_port("[::1]:5174"), Some(5174));
+        assert_eq!(parse_lsof_listener_port("*:8080 (LISTEN)"), Some(8080));
     }
 }
 

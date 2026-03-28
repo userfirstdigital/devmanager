@@ -1,22 +1,45 @@
 use crate::models::{AppConfig, PortConflict, PortConflictEntry, PortStatus};
 use crate::services::{pid_file, platform_service};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+pub fn snapshot_ports(ports: &[u16]) -> Result<HashMap<u16, PortStatus>, String> {
+    let listener_pids = platform_service::snapshot_listener_pids(ports)?;
+    let mut statuses = HashMap::with_capacity(ports.len());
+
+    for &port in ports {
+        let status = match listener_pids.get(&port).copied() {
+            Some(pid) => PortStatus {
+                port,
+                in_use: true,
+                pid: Some(pid),
+                process_name: None,
+            },
+            None => PortStatus {
+                port,
+                in_use: false,
+                pid: None,
+                process_name: None,
+            },
+        };
+        statuses.insert(port, status);
+    }
+
+    Ok(statuses)
+}
 
 pub fn check_port_in_use(port: u16) -> Result<PortStatus, String> {
-    match platform_service::find_pid_on_port(port)? {
-        Some(pid) => Ok(PortStatus {
-            port,
-            in_use: true,
-            pid: Some(pid),
-            process_name: platform_service::get_process_name(pid)?,
-        }),
-        None => Ok(PortStatus {
+    let mut status = snapshot_ports(&[port])?
+        .remove(&port)
+        .unwrap_or(PortStatus {
             port,
             in_use: false,
             pid: None,
             process_name: None,
-        }),
+        });
+    if let Some(pid) = status.pid {
+        status.process_name = platform_service::get_process_name(pid)?;
     }
+    Ok(status)
 }
 
 pub fn kill_port(port: u16) -> Result<(), String> {

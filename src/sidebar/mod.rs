@@ -5,6 +5,7 @@ use gpui::{
     anchored, deferred, div, px, rgb, AnyElement, App, Corner, Div, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString, Styled, Window,
 };
+use std::collections::HashMap;
 
 const SIDEBAR_WIDTH_PX: f32 = 220.0;
 const SIDEBAR_COLLAPSED_WIDTH_PX: f32 = 40.0;
@@ -29,6 +30,17 @@ pub enum SidebarContextMenu {
     Ssh {
         connection_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerIndicatorState {
+    Stopped,
+    Unready,
+    Ready,
+    Stopping,
+    Crashed,
+    Exited,
+    Failed,
 }
 
 pub struct SidebarActions<'a> {
@@ -95,12 +107,13 @@ pub fn sidebar_width_px(collapsed: bool) -> f32 {
 pub fn render_sidebar(
     state: &AppState,
     runtime: &RuntimeState,
+    server_indicators: &HashMap<String, ServerIndicatorState>,
     actions: SidebarActions<'_>,
 ) -> impl IntoElement {
     if state.sidebar_collapsed {
         render_collapsed_sidebar(actions).into_any_element()
     } else {
-        render_expanded_sidebar(state, runtime, actions).into_any_element()
+        render_expanded_sidebar(state, runtime, server_indicators, actions).into_any_element()
     }
 }
 
@@ -131,11 +144,20 @@ fn render_collapsed_sidebar(actions: SidebarActions<'_>) -> AnyElement {
 fn render_expanded_sidebar(
     state: &AppState,
     runtime: &RuntimeState,
+    server_indicators: &HashMap<String, ServerIndicatorState>,
     actions: SidebarActions<'_>,
 ) -> AnyElement {
     let project_count = state.projects().len();
     let project_rows = state.projects().iter().enumerate().map(|(index, project)| {
-        render_project_group(state, runtime, project, index, project_count, &actions)
+        render_project_group(
+            state,
+            runtime,
+            server_indicators,
+            project,
+            index,
+            project_count,
+            &actions,
+        )
     });
     let ssh_rows = state
         .ssh_connections()
@@ -238,6 +260,7 @@ fn render_expanded_sidebar(
 fn render_project_group(
     state: &AppState,
     runtime: &RuntimeState,
+    server_indicators: &HashMap<String, ServerIndicatorState>,
     project: &crate::models::Project,
     index: usize,
     project_count: usize,
@@ -266,7 +289,15 @@ fn render_project_group(
         .iter()
         .filter(|folder| !folder.hidden.unwrap_or(false))
         .map(|folder| {
-            render_folder_group(state, runtime, project, folder, project_accent, actions)
+            render_folder_group(
+                state,
+                runtime,
+                server_indicators,
+                project,
+                folder,
+                project_accent,
+                actions,
+            )
         });
     let ai_launch_row = div()
         .flex()
@@ -547,6 +578,7 @@ fn render_ai_row(
 fn render_folder_group(
     state: &AppState,
     runtime: &RuntimeState,
+    server_indicators: &HashMap<String, ServerIndicatorState>,
     project: &crate::models::Project,
     folder: &crate::models::ProjectFolder,
     project_accent: u32,
@@ -556,6 +588,7 @@ fn render_folder_group(
         return render_single_command_folder_row(
             state,
             runtime,
+            server_indicators,
             project,
             folder,
             &folder.commands[0],
@@ -569,6 +602,7 @@ fn render_folder_group(
         render_command_row(
             state,
             runtime,
+            server_indicators,
             project,
             folder,
             command,
@@ -666,6 +700,7 @@ fn render_folder_group(
 fn render_single_command_folder_row(
     state: &AppState,
     runtime: &RuntimeState,
+    server_indicators: &HashMap<String, ServerIndicatorState>,
     project: &crate::models::Project,
     folder: &crate::models::ProjectFolder,
     command: &crate::models::RunCommand,
@@ -676,6 +711,10 @@ fn render_single_command_folder_row(
     let status = session
         .map(|session| session.status)
         .unwrap_or(SessionStatus::Stopped);
+    let indicator = server_indicators
+        .get(&command.id)
+        .copied()
+        .unwrap_or(ServerIndicatorState::Stopped);
     let is_active = state.active_tab_id.as_deref() == Some(command.id.as_str());
     let menu_open = matches!(
         actions.open_context_menu,
@@ -738,7 +777,7 @@ fn render_single_command_folder_row(
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .child(status_indicator(status))
+                        .child(server_status_indicator(indicator))
                         .child(
                             div()
                                 .flex()
@@ -814,6 +853,7 @@ fn render_single_command_folder_row(
 fn render_command_row(
     state: &AppState,
     runtime: &RuntimeState,
+    server_indicators: &HashMap<String, ServerIndicatorState>,
     _project: &crate::models::Project,
     _folder: &crate::models::ProjectFolder,
     command: &crate::models::RunCommand,
@@ -824,6 +864,10 @@ fn render_command_row(
     let status = session
         .map(|session| session.status)
         .unwrap_or(SessionStatus::Stopped);
+    let indicator = server_indicators
+        .get(&command.id)
+        .copied()
+        .unwrap_or(ServerIndicatorState::Stopped);
     let is_active = state.active_tab_id.as_deref() == Some(command.id.as_str());
     let resource_line = session.and_then(|session| {
         session.resources.last_sample_at.map(|_| {
@@ -879,7 +923,7 @@ fn render_command_row(
                             div()
                                 .size(px(6.0))
                                 .rounded_full()
-                                .bg(rgb(status_color(status))),
+                                .bg(rgb(server_status_color(indicator))),
                         )
                         .child(
                             div()
@@ -914,8 +958,8 @@ fn render_command_row(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(status_color(status)))
-                                .child(status_label(status)),
+                                .text_color(rgb(server_status_color(indicator)))
+                                .child(server_status_label(indicator)),
                         )
                         .child(
                             div()
@@ -1278,26 +1322,50 @@ fn status_label(status: SessionStatus) -> &'static str {
     }
 }
 
-fn status_indicator(status: SessionStatus) -> Div {
-    if status == SessionStatus::Running {
-        div()
-            .size(px(6.0))
-            .rounded_full()
-            .bg(rgb(status_color(status)))
-    } else {
-        div()
-            .text_xs()
-            .text_color(rgb(status_color(status)))
-            .child(status_label(status))
-    }
-}
-
 fn status_color(status: SessionStatus) -> u32 {
     match status {
         SessionStatus::Running => theme::SUCCESS_TEXT,
         SessionStatus::Starting | SessionStatus::Stopping => theme::WARNING_TEXT,
         SessionStatus::Crashed | SessionStatus::Failed => theme::DANGER_TEXT,
         _ => theme::TEXT_SUBTLE,
+    }
+}
+
+fn server_status_label(state: ServerIndicatorState) -> &'static str {
+    match state {
+        ServerIndicatorState::Stopped
+        | ServerIndicatorState::Unready
+        | ServerIndicatorState::Ready => "",
+        ServerIndicatorState::Stopping => "stopping",
+        ServerIndicatorState::Crashed => "crashed",
+        ServerIndicatorState::Exited => "exited",
+        ServerIndicatorState::Failed => "failed",
+    }
+}
+
+fn server_status_indicator(state: ServerIndicatorState) -> Div {
+    if matches!(
+        state,
+        ServerIndicatorState::Stopped | ServerIndicatorState::Unready | ServerIndicatorState::Ready
+    ) {
+        div()
+            .size(px(6.0))
+            .rounded_full()
+            .bg(rgb(server_status_color(state)))
+    } else {
+        div()
+            .text_xs()
+            .text_color(rgb(server_status_color(state)))
+            .child(server_status_label(state))
+    }
+}
+
+fn server_status_color(state: ServerIndicatorState) -> u32 {
+    match state {
+        ServerIndicatorState::Ready => theme::SUCCESS_TEXT,
+        ServerIndicatorState::Unready | ServerIndicatorState::Stopping => theme::WARNING_TEXT,
+        ServerIndicatorState::Crashed | ServerIndicatorState::Failed => theme::DANGER_TEXT,
+        ServerIndicatorState::Stopped | ServerIndicatorState::Exited => theme::TEXT_SUBTLE,
     }
 }
 
@@ -1534,6 +1602,20 @@ mod tests {
         assert_eq!(ai_status_label(Some(&session)), "thinking");
         assert_eq!(ai_status_color(Some(&session), &tab), theme::WARNING_TEXT);
         assert!(!ai_ready_light_visible(Some(&session)));
+    }
+
+    #[test]
+    fn server_indicator_uses_warning_for_unready_and_success_for_ready() {
+        assert_eq!(server_status_label(ServerIndicatorState::Unready), "");
+        assert_eq!(
+            server_status_color(ServerIndicatorState::Unready),
+            theme::WARNING_TEXT
+        );
+        assert_eq!(
+            server_status_color(ServerIndicatorState::Ready),
+            theme::SUCCESS_TEXT
+        );
+        assert_eq!(server_status_label(ServerIndicatorState::Failed), "failed");
     }
 
     #[test]

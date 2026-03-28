@@ -11,7 +11,7 @@ use crate::services::{
     ManagedShutdownReport, ProcessManager, SessionManager,
 };
 use crate::sidebar;
-use crate::state::{AppState, SessionDimensions};
+use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState, SessionStatus};
 use crate::terminal::{self, view};
 use crate::theme;
 use crate::updater::UpdaterService;
@@ -113,6 +113,7 @@ struct NativeShell {
     did_focus_terminal: bool,
     focused_terminal_session_id: Option<String>,
     active_port_state: Option<ActivePortState>,
+    server_port_snapshot: ServerPortSnapshotState,
     ssh_password_prompt_state: Option<SshPasswordPromptState>,
     editor_needs_focus: bool,
     synced_session_id: Option<String>,
@@ -209,6 +210,14 @@ struct ActivePortState {
     refresh_in_flight: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ServerPortSnapshotState {
+    tracked_ports: Vec<u16>,
+    statuses: HashMap<u16, PortStatus>,
+    last_checked_at: Option<Instant>,
+    refresh_in_flight: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SshPasswordPromptState {
     session_id: String,
@@ -278,6 +287,7 @@ impl NativeShell {
             did_focus_terminal: false,
             focused_terminal_session_id: None,
             active_port_state: None,
+            server_port_snapshot: ServerPortSnapshotState::default(),
             ssh_password_prompt_state: None,
             editor_needs_focus: false,
             synced_session_id,
@@ -2385,7 +2395,6 @@ impl NativeShell {
             active_tab_type.clone(),
             &active_spec,
             active_session.as_ref(),
-            cx,
         );
         let terminal_metrics = self.terminal_render_metrics(window);
         let blocking_notice = active_session.as_ref().and_then(|session| {
@@ -2452,13 +2461,70 @@ impl NativeShell {
         self.focused_terminal_session_id = next_session_id;
     }
 
-    fn sync_active_port_state(
-        &mut self,
-        command_id: &str,
-        port: Option<u16>,
-        active_session: Option<&crate::terminal::session::TerminalSessionView>,
-        cx: &mut Context<Self>,
-    ) {
+    fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
+        let tracked_ports = live_server_ports(&self.state, runtime);
+        if tracked_ports.is_empty() {
+            self.server_port_snapshot = ServerPortSnapshotState::default();
+            return;
+        }
+
+        if self.server_port_snapshot.tracked_ports != tracked_ports {
+            self.server_port_snapshot.tracked_ports = tracked_ports.clone();
+            self.server_port_snapshot
+                .statuses
+                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+            self.server_port_snapshot.last_checked_at = None;
+        }
+
+        let missing_status = tracked_ports
+            .iter()
+            .any(|port| !self.server_port_snapshot.statuses.contains_key(port));
+        let should_refresh = missing_status
+            || self
+                .server_port_snapshot
+                .last_checked_at
+                .map(|checked_at| {
+                    checked_at.elapsed()
+                        >= server_port_refresh_interval(
+                            runtime,
+                            &self.state,
+                            &self.server_port_snapshot,
+                        )
+                })
+                .unwrap_or(true);
+        if !should_refresh || self.server_port_snapshot.refresh_in_flight {
+            return;
+        }
+
+        self.server_port_snapshot.refresh_in_flight = true;
+        let ports = tracked_ports.clone();
+        let background_executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let statuses = background_executor
+                        .spawn(async move { ports_service::snapshot_ports(&ports).ok() })
+                        .await;
+                    let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        this.server_port_snapshot.refresh_in_flight = false;
+                        this.server_port_snapshot.last_checked_at = Some(Instant::now());
+                        if let Some(statuses) = statuses {
+                            this.server_port_snapshot.statuses = statuses;
+                            let tracked_ports = this.server_port_snapshot.tracked_ports.clone();
+                            this.server_port_snapshot
+                                .statuses
+                                .retain(|port, _| tracked_ports.binary_search(port).is_ok());
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn sync_active_port_state(&mut self, command_id: &str, port: Option<u16>) {
         let Some(port) = port else {
             self.active_port_state = None;
             return;
@@ -2489,21 +2555,14 @@ impl NativeShell {
                 state.kill_feedback = None;
                 state.kill_feedback_until = None;
             }
-
-            let interval = if active_session.is_some_and(|session| session.runtime.status.is_live())
-                && state.status.as_ref().is_some_and(|status| !status.in_use)
-            {
-                std::time::Duration::from_secs(1)
-            } else {
-                port_refresh_interval(active_session)
-            };
-            let should_refresh = state
-                .last_checked_at
-                .map(|checked_at| checked_at.elapsed() >= interval)
-                .unwrap_or(true);
-            if should_refresh && !state.refresh_in_flight {
-                self.refresh_port_state(command_id.to_string(), port, cx);
-            }
+            state.status = self.server_port_snapshot.statuses.get(&port).cloned();
+            state.last_checked_at = self.server_port_snapshot.last_checked_at;
+            state.refresh_in_flight = self.server_port_snapshot.refresh_in_flight
+                && self
+                    .server_port_snapshot
+                    .tracked_ports
+                    .binary_search(&port)
+                    .is_ok();
         }
     }
 
@@ -2521,31 +2580,29 @@ impl NativeShell {
             });
         state.command_id = command_id.clone();
         state.port = port;
+        state.status = None;
+        state.last_checked_at = None;
         state.refresh_in_flight = true;
+        self.server_port_snapshot.statuses.remove(&port);
+        self.server_port_snapshot.last_checked_at = None;
+        self.server_port_snapshot.refresh_in_flight = false;
+        self.sync_active_port_state(&command_id, Some(port));
+        cx.notify();
+    }
 
-        let background_executor = cx.background_executor().clone();
-        cx.spawn(
-            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let mut async_cx = cx.clone();
-                async move {
-                    let status = background_executor
-                        .spawn(async move { ports_service::check_port_in_use(port).ok() })
-                        .await;
-                    let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
-                        if let Some(state) = this.active_port_state.as_mut() {
-                            if state.command_id != command_id || state.port != port {
-                                return;
-                            }
-                            state.status = status;
-                            state.last_checked_at = Some(Instant::now());
-                            state.refresh_in_flight = false;
-                            cx.notify();
-                        }
-                    });
+    fn invalidate_server_port_snapshot(&mut self, port: Option<u16>) {
+        if let Some(port) = port {
+            self.server_port_snapshot.statuses.remove(&port);
+            if let Some(state) = self.active_port_state.as_mut() {
+                if state.port == port {
+                    state.status = None;
+                    state.last_checked_at = None;
+                    state.refresh_in_flight = true;
                 }
-            },
-        )
-        .detach();
+            }
+        }
+        self.server_port_snapshot.last_checked_at = None;
+        self.server_port_snapshot.refresh_in_flight = false;
     }
 
     fn record_port_kill_feedback(
@@ -2701,7 +2758,6 @@ impl NativeShell {
         active_tab_type: Option<TabType>,
         active_spec: &crate::state::ActiveTerminalSpec,
         active_session: Option<&crate::terminal::session::TerminalSessionView>,
-        cx: &mut Context<Self>,
     ) -> Option<view::TerminalRuntimeControlsModel> {
         if active_tab_type == Some(TabType::Ssh) {
             self.active_port_state = None;
@@ -2765,7 +2821,7 @@ impl NativeShell {
             let lookup = self.state.find_command(&active_spec.session_id)?;
             (lookup.command.id.clone(), lookup.command.port)
         };
-        self.sync_active_port_state(&command_id, port, active_session, cx);
+        self.sync_active_port_state(&command_id, port);
 
         let status = active_session
             .map(|session| session.runtime.status)
@@ -2884,6 +2940,7 @@ impl NativeShell {
             return;
         };
 
+        self.invalidate_server_port_snapshot(Some(port));
         if let Some(state) = self.active_port_state.as_mut() {
             if state.command_id == command_id && state.port == port {
                 state.status = None;
@@ -2965,6 +3022,11 @@ impl NativeShell {
     }
 
     fn stop_server_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
+        self.invalidate_server_port_snapshot(port);
         let command_id = command_id.to_string();
         if let Some(state) = self.active_port_state.as_mut() {
             if state.command_id == command_id {
@@ -3024,6 +3086,11 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         let dimensions = self.terminal_dimensions(window);
+        let port = self
+            .state
+            .find_command(command_id)
+            .and_then(|lookup| lookup.command.port);
+        self.invalidate_server_port_snapshot(port);
         if let Err(error) =
             self.process_manager
                 .restart_server(&mut self.state, command_id, dimensions)
@@ -3948,7 +4015,13 @@ impl Render for NativeShell {
         let render_started = Instant::now();
         self.capture_window_bounds(window);
         let runtime_snapshot = self.process_manager.runtime_state();
+        self.sync_server_port_snapshot(&runtime_snapshot, cx);
         self.sync_window_title(window, &runtime_snapshot);
+        let server_indicators = derive_server_indicator_states(
+            &self.state,
+            &runtime_snapshot,
+            &self.server_port_snapshot.statuses,
+        );
         let updater_snapshot = self.updater.snapshot();
         let editor_model = self.editor_panel.clone().map(|panel| EditorPaneModel {
             panel,
@@ -4419,6 +4492,7 @@ impl Render for NativeShell {
             .child(sidebar::render_sidebar(
                 &self.state,
                 &runtime_snapshot,
+                &server_indicators,
                 sidebar::SidebarActions {
                     on_open_settings: &make_open_settings_handler,
                     on_toggle_sidebar: &make_toggle_sidebar_handler,
@@ -5289,47 +5363,108 @@ fn alt_scroll_bytes(scroll_lines: i32) -> Vec<u8> {
     content
 }
 
-fn port_refresh_interval(
-    active_session: Option<&crate::terminal::session::TerminalSessionView>,
+fn server_port_refresh_interval(
+    _runtime: &RuntimeState,
+    _state: &AppState,
+    _snapshot: &ServerPortSnapshotState,
 ) -> std::time::Duration {
-    let Some(session) = active_session else {
-        return std::time::Duration::from_secs(1);
+    std::time::Duration::from_secs(1)
+}
+
+fn live_server_ports(state: &AppState, runtime: &RuntimeState) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for project in state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                let Some(port) = command.port else {
+                    continue;
+                };
+                let Some(session) = runtime.sessions.get(&command.id) else {
+                    continue;
+                };
+                if session.status.is_live() {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn derive_server_indicator_states(
+    state: &AppState,
+    runtime: &RuntimeState,
+    port_statuses: &HashMap<u16, PortStatus>,
+) -> HashMap<String, sidebar::ServerIndicatorState> {
+    let mut indicators = HashMap::new();
+    for project in state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                let session = runtime.sessions.get(&command.id);
+                indicators.insert(
+                    command.id.clone(),
+                    derive_server_indicator(session, command.port, port_statuses),
+                );
+            }
+        }
+    }
+    indicators
+}
+
+fn derive_server_indicator(
+    session: Option<&SessionRuntimeState>,
+    port: Option<u16>,
+    port_statuses: &HashMap<u16, PortStatus>,
+) -> sidebar::ServerIndicatorState {
+    let Some(session) = session else {
+        return sidebar::ServerIndicatorState::Stopped;
     };
 
-    if matches!(
-        session.runtime.status,
-        crate::state::SessionStatus::Starting | crate::state::SessionStatus::Stopping
-    ) {
-        return std::time::Duration::from_secs(2);
+    match session.status {
+        SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
+        SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
+        SessionStatus::Running => match port {
+            Some(port) => {
+                if port_statuses
+                    .get(&port)
+                    .is_some_and(|status| status.in_use && runtime_owns_port(session, status))
+                {
+                    sidebar::ServerIndicatorState::Ready
+                } else {
+                    sidebar::ServerIndicatorState::Unready
+                }
+            }
+            None => sidebar::ServerIndicatorState::Ready,
+        },
+        SessionStatus::Stopping => sidebar::ServerIndicatorState::Stopping,
+        SessionStatus::Crashed => sidebar::ServerIndicatorState::Crashed,
+        SessionStatus::Exited => sidebar::ServerIndicatorState::Exited,
+        SessionStatus::Failed => sidebar::ServerIndicatorState::Failed,
     }
-
-    if session
-        .runtime
-        .started_at
-        .is_some_and(|started_at| started_at.elapsed() < std::time::Duration::from_secs(15))
-    {
-        return std::time::Duration::from_secs(2);
-    }
-
-    std::time::Duration::from_secs(5)
 }
 
 fn is_managed_port_owner(
     active_session: Option<&crate::terminal::session::TerminalSessionView>,
     status: &PortStatus,
 ) -> bool {
+    active_session
+        .map(|session| runtime_owns_port(&session.runtime, status))
+        .unwrap_or(false)
+}
+
+fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
     let Some(pid) = status.pid else {
         return false;
     };
-    let Some(session) = active_session else {
-        return false;
-    };
 
-    if session.runtime.pid == Some(pid) {
+    if session.pid == Some(pid) {
         return true;
     }
 
-    session.runtime.resources.process_ids.contains(&pid)
+    session.resources.process_ids.contains(&pid)
 }
 
 fn normalize_optional_string(value: &str) -> Option<String> {
@@ -6365,10 +6500,70 @@ mod tests {
     }
 
     #[test]
-    fn port_refresh_interval_is_eager_without_active_session() {
+    fn derive_server_indicator_uses_managed_port_ownership() {
+        let mut state = AppState::default();
+        let mut project = sample_project();
+        project.folders[0].commands[0].port = Some(5174);
+        state.config.projects.push(project);
+
+        let mut runtime = RuntimeState::new(false);
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.pid = Some(42);
+        session.status = SessionStatus::Running;
+        runtime
+            .sessions
+            .insert("server-cmd".to_string(), session.clone());
+
+        let mut port_statuses = HashMap::new();
+        port_statuses.insert(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(42),
+                process_name: None,
+            },
+        );
+        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
         assert_eq!(
-            port_refresh_interval(None),
-            std::time::Duration::from_secs(1)
+            indicators.get("server-cmd"),
+            Some(&sidebar::ServerIndicatorState::Ready)
+        );
+
+        port_statuses.insert(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(99),
+                process_name: None,
+            },
+        );
+        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        assert_eq!(
+            indicators.get("server-cmd"),
+            Some(&sidebar::ServerIndicatorState::Unready)
+        );
+    }
+
+    #[test]
+    fn derive_server_indicator_keeps_running_no_port_server_ready() {
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+
+        assert_eq!(
+            derive_server_indicator(Some(&session), None, &HashMap::new()),
+            sidebar::ServerIndicatorState::Ready
         );
     }
 
