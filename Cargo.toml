@@ -40,7 +40,7 @@ icons = [
     "packaging/icons/devmanager-512.png",
     "packaging/icons/devmanager.ico",
 ]
-resources = ["assets"]
+resources = ["assets", "third_party/ghostty"]
 long-description = "DevManager is the native GPUI rewrite of the archived Tauri app. It keeps local project orchestration, server tabs, AI terminals, SSH sessions, config import/export, and a signed update path in a single desktop shell."
 out-dir = "dist/packager"
 publisher = "UserFirst"

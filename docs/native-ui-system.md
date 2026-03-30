@@ -4,10 +4,6 @@ This app stays native Rust because the terminal experience is non-negotiable. Th
 
 ## Reference projects
 
-- Zed local codebase
-  - `C:\Code\userfirst\zed-main\crates\ui\src\components\modal.rs`
-  - `C:\Code\userfirst\zed-main\crates\ui\src\components\toggle.rs`
-  - `C:\Code\userfirst\zed-main\crates\agent_ui\src\agent_configuration.rs`
 - `gpui-component`
   - https://github.com/longbridge/gpui-component/releases
 - `scopeclient/components`
@@ -65,3 +61,4 @@ These are reference points for architecture and interaction patterns. Do not ven
 - Bring settings onto the same card and field system.
 - Add a dedicated UI preview/debug surface with seeded editor states.
 - Replace remaining ad-hoc sidebar and dialog rows with semantic components.
+

@@ -1,11 +1,12 @@
 use crate::models::DefaultTerminal;
 use crate::services::{pid_file, platform_service};
 use crate::state::{
-    RuntimeState, SessionDimensions, SessionExitState, SessionKind, SessionRuntimeState,
-    SessionStatus,
+    PromptMarkKind, RuntimeState, SessionDimensions, SessionExitState, SessionKind,
+    SessionRuntimeState, SessionStatus, ShellIntegrationKind,
 };
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::Line;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{point_to_viewport, Config as TermConfig, Term, TermMode};
@@ -114,9 +115,19 @@ pub struct TerminalScreenSnapshot {
     pub lines: Vec<Vec<TerminalCellSnapshot>>,
     pub cursor: Option<TerminalCursorSnapshot>,
     pub display_offset: usize,
+    pub history_size: usize,
+    pub total_lines: usize,
     pub rows: usize,
     pub cols: usize,
     pub mode: TerminalModeSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSearchMatch {
+    pub buffer_line: usize,
+    pub start_column: usize,
+    pub end_column: usize,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +297,7 @@ impl TerminalSession {
         cwd: PathBuf,
         dimensions: SessionDimensions,
         preferred_terminal: Option<DefaultTerminal>,
+        shell_integration_enabled: bool,
         scrolling_history: usize,
         runtime_state: Arc<RwLock<RuntimeState>>,
         debug_enabled: bool,
@@ -293,7 +305,7 @@ impl TerminalSession {
         let session_id = session_id.into();
         let backend = TerminalBackend::PortablePtyFeedingAlacritty;
 
-        let candidates = shell_candidates(preferred_terminal.as_ref());
+        let candidates = shell_candidates(preferred_terminal.as_ref(), shell_integration_enabled);
         let mut last_error = None;
 
         for candidate in candidates {
@@ -449,6 +461,96 @@ impl TerminalSession {
         }
 
         Ok(())
+    }
+
+    pub fn scroll_to_display_offset(&self, display_offset: usize) -> Result<(), String> {
+        let (clamped_offset, changed) = {
+            let mut term = self
+                .term
+                .lock()
+                .map_err(|_| "Terminal state poisoned".to_string())?;
+            let history_size = term
+                .grid()
+                .total_lines()
+                .saturating_sub(term.grid().screen_lines());
+            let target = display_offset.min(history_size);
+            let current = term.grid().display_offset();
+            if current == target {
+                return Ok(());
+            }
+            let delta = target as i32 - current as i32;
+            term.scroll_display(Scroll::Delta(delta));
+            (term.grid().display_offset(), true)
+        };
+
+        if changed {
+            if let Ok(mut runtime) = self.runtime_state.write() {
+                if let Some(session) = runtime.sessions.get_mut(&self.session_id) {
+                    session.note_scroll(clamped_offset);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn scroll_to_buffer_line(&self, buffer_line: usize) -> Result<(), String> {
+        let target_offset = {
+            let term = self
+                .term
+                .lock()
+                .map_err(|_| "Terminal state poisoned".to_string())?;
+            let history_size = term
+                .grid()
+                .total_lines()
+                .saturating_sub(term.grid().screen_lines());
+            let total_lines = term.grid().total_lines().max(1);
+            let screen_lines = term.screen_lines().max(1);
+            let clamped_line = buffer_line.min(total_lines.saturating_sub(1));
+            let grid_line = clamped_line as i32 - history_size as i32;
+            let desired_viewport_row = screen_lines as i32 / 2;
+            let target = desired_viewport_row.saturating_sub(grid_line).max(0) as usize;
+            target.min(history_size)
+        };
+
+        self.scroll_to_display_offset(target_offset)
+    }
+
+    pub fn screen_text(&self) -> String {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        terminal_buffer_lines(&term)
+            .into_iter()
+            .skip(
+                term.grid()
+                    .total_lines()
+                    .saturating_sub(term.screen_lines()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn scrollback_text(&self) -> String {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        terminal_buffer_lines(&term).join("\n")
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        max_results: usize,
+    ) -> Vec<TerminalSearchMatch> {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        search_terminal_buffer(&term, query, case_sensitive, max_results)
     }
 
     pub fn close(&self, closed_by_user: bool) -> Result<(), String> {
@@ -701,7 +803,10 @@ struct ShellCandidate {
     args: Vec<String>,
 }
 
-fn shell_candidates(preferred_terminal: Option<&DefaultTerminal>) -> Vec<ShellCandidate> {
+fn shell_candidates(
+    preferred_terminal: Option<&DefaultTerminal>,
+    shell_integration_enabled: bool,
+) -> Vec<ShellCandidate> {
     let preferred_terminal = preferred_terminal.cloned().unwrap_or_default();
     if cfg!(target_os = "windows") {
         match preferred_terminal {
@@ -736,11 +841,11 @@ fn shell_candidates(preferred_terminal: Option<&DefaultTerminal>) -> Vec<ShellCa
             DefaultTerminal::Bash => vec![
                 ShellCandidate {
                     program: preferred_windows_bash_program(),
-                    args: vec!["--login".to_string()],
+                    args: bash_shell_args(shell_integration_enabled),
                 },
                 ShellCandidate {
                     program: "bash".to_string(),
-                    args: vec!["--login".to_string()],
+                    args: bash_shell_args(shell_integration_enabled),
                 },
                 ShellCandidate {
                     program: "pwsh".to_string(),
@@ -779,7 +884,7 @@ fn shell_candidates(preferred_terminal: Option<&DefaultTerminal>) -> Vec<ShellCa
             _ => vec![
                 ShellCandidate {
                     program: "bash".to_string(),
-                    args: Vec::new(),
+                    args: bash_shell_args(shell_integration_enabled),
                 },
                 ShellCandidate {
                     program: "zsh".to_string(),
@@ -795,6 +900,28 @@ fn shell_candidates(preferred_terminal: Option<&DefaultTerminal>) -> Vec<ShellCa
                 },
             ],
         }
+    }
+}
+
+pub fn bash_shell_args(shell_integration_enabled: bool) -> Vec<String> {
+    if shell_integration_enabled {
+        let wrapper = crate::assets::ghostty_resources_dir()
+            .join("shell-integration")
+            .join("bash")
+            .join("devmanager.bashrc");
+        if wrapper.is_file() {
+            return vec![
+                "--rcfile".to_string(),
+                wrapper.to_string_lossy().to_string(),
+                "-i".to_string(),
+            ];
+        }
+    }
+
+    if cfg!(target_os = "windows") {
+        vec!["--login".to_string()]
+    } else {
+        Vec::new()
     }
 }
 
@@ -827,6 +954,8 @@ fn snapshot_term(term: &Term<SessionEventProxy>) -> TerminalScreenSnapshot {
     let display_offset = content.display_offset;
     let rows = term.screen_lines();
     let cols = term.columns();
+    let total_lines = term.grid().total_lines();
+    let history_size = total_lines.saturating_sub(rows);
     let mode = mode_snapshot(content.mode);
     let cursor = if content.cursor.shape == CursorShape::Hidden {
         None
@@ -875,6 +1004,8 @@ fn snapshot_term(term: &Term<SessionEventProxy>) -> TerminalScreenSnapshot {
         lines: grid_lines,
         cursor,
         display_offset,
+        history_size,
+        total_lines,
         rows,
         cols,
         mode,
@@ -911,6 +1042,12 @@ fn with_terminal_env_defaults(mut env: HashMap<String, String>) -> HashMap<Strin
         .or_insert_with(|| "1".to_string());
     env.entry("FORCE_COLOR".to_string())
         .or_insert_with(|| "1".to_string());
+    env.entry("GHOSTTY_RESOURCES_DIR".to_string())
+        .or_insert_with(|| {
+            crate::assets::ghostty_resources_dir()
+                .to_string_lossy()
+                .to_string()
+        });
     env
 }
 
@@ -1055,6 +1192,7 @@ fn spawn_reader_thread(
 ) {
     thread::spawn(move || {
         let mut parser = Processor::<StdSyncHandler>::new();
+        let mut shell_sequences = ShellSequenceParser::default();
         let mut buffer = [0_u8; 4096];
 
         loop {
@@ -1066,13 +1204,15 @@ fn spawn_reader_thread(
                     break;
                 }
                 Ok(bytes_read) => {
-                    {
+                    let parsed_sequences = shell_sequences.push_chunk(&buffer[..bytes_read]);
+                    let cursor_buffer_line = {
                         let mut term = match term.lock() {
                             Ok(term) => term,
                             Err(error) => error.into_inner(),
                         };
                         parser.advance(&mut *term, &buffer[..bytes_read]);
-                    }
+                        terminal_cursor_buffer_line(&term)
+                    };
 
                     if let Some(writer) = log_writer.as_mut() {
                         writer.write_chunk(&buffer[..bytes_read]);
@@ -1082,6 +1222,7 @@ fn spawn_reader_thread(
                         if let Some(session) = runtime.sessions.get_mut(&session_id) {
                             session.record_pty_bytes(bytes_read);
                             session.note_output_activity();
+                            apply_shell_sequences(session, &parsed_sequences, cursor_buffer_line);
                         }
                     }
                 }
@@ -1551,6 +1692,274 @@ fn contains_mode(mode: TermMode, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn terminal_buffer_lines(term: &Term<SessionEventProxy>) -> Vec<String> {
+    let grid = term.grid();
+    let cols = term.columns();
+    let history_size = grid.total_lines().saturating_sub(grid.screen_lines());
+    let mut lines = Vec::with_capacity(history_size + term.screen_lines());
+
+    for grid_line in -(history_size as i32)..(term.screen_lines() as i32) {
+        let row = &grid[Line(grid_line)];
+        let mut text = String::new();
+        for cell in row.into_iter().take(cols) {
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            text.push(renderable_char(cell));
+            if let Some(extra) = cell.zerowidth() {
+                for &character in extra {
+                    text.push(character);
+                }
+            }
+        }
+        while text.ends_with(' ') {
+            text.pop();
+        }
+        lines.push(text);
+    }
+
+    lines
+}
+
+fn search_terminal_buffer(
+    term: &Term<SessionEventProxy>,
+    query: &str,
+    case_sensitive: bool,
+    max_results: usize,
+) -> Vec<TerminalSearchMatch> {
+    let needle = query.trim();
+    if needle.is_empty() || max_results == 0 {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    for (buffer_line, line) in terminal_buffer_lines(term).into_iter().enumerate() {
+        let mut search_start = 0;
+        while search_start <= line.len() {
+            let Some(relative_start) =
+                find_text_match(&line[search_start..], needle, case_sensitive)
+            else {
+                break;
+            };
+            let start = search_start + relative_start;
+            let end = start + needle.len();
+            matches.push(TerminalSearchMatch {
+                buffer_line,
+                start_column: start,
+                end_column: end,
+                preview: line.clone(),
+            });
+            if matches.len() >= max_results {
+                return matches;
+            }
+            search_start = end.max(search_start + 1);
+        }
+    }
+
+    matches
+}
+
+fn find_text_match(haystack: &str, needle: &str, case_sensitive: bool) -> Option<usize> {
+    if case_sensitive {
+        return haystack.find(needle);
+    }
+
+    if haystack.is_ascii() && needle.is_ascii() {
+        for start in 0..=haystack.len().saturating_sub(needle.len()) {
+            let end = start + needle.len();
+            if haystack.get(start..end)?.eq_ignore_ascii_case(needle) {
+                return Some(start);
+            }
+        }
+        return None;
+    }
+
+    haystack.to_lowercase().find(&needle.to_lowercase())
+}
+
+#[derive(Debug)]
+enum ShellSequence {
+    PromptMark(PromptMarkKind, Option<i32>),
+    ReportedCwd(PathBuf),
+}
+
+#[derive(Default)]
+struct ShellSequenceParser {
+    pending: Vec<u8>,
+}
+
+impl ShellSequenceParser {
+    fn push_chunk(&mut self, chunk: &[u8]) -> Vec<ShellSequence> {
+        self.pending.extend_from_slice(chunk);
+
+        let mut events = Vec::new();
+        let mut cursor = 0;
+        let mut processed_until = 0;
+
+        while cursor < self.pending.len() {
+            if self.pending[cursor] == 0x1b
+                && self
+                    .pending
+                    .get(cursor + 1)
+                    .is_some_and(|byte| *byte == b']')
+            {
+                let start = cursor + 2;
+                let Some((end, terminator_len)) = osc_terminator_bounds(&self.pending, start)
+                else {
+                    break;
+                };
+
+                if let Ok(payload) = std::str::from_utf8(&self.pending[start..end]) {
+                    if let Some(event) = parse_shell_sequence(payload) {
+                        events.push(event);
+                    }
+                }
+
+                processed_until = end + terminator_len;
+                cursor = processed_until;
+                continue;
+            }
+
+            cursor += 1;
+            processed_until = cursor;
+        }
+
+        if processed_until > 0 {
+            self.pending.drain(0..processed_until);
+        }
+        if self.pending.len() > 8192 {
+            let keep_from = self.pending.len().saturating_sub(1024);
+            self.pending.drain(0..keep_from);
+        }
+
+        events
+    }
+}
+
+fn osc_terminator_bounds(buffer: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut cursor = start;
+    while cursor < buffer.len() {
+        match buffer[cursor] {
+            0x07 => return Some((cursor, 1)),
+            0x1b if buffer.get(cursor + 1).is_some_and(|byte| *byte == b'\\') => {
+                return Some((cursor, 2));
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn parse_shell_sequence(payload: &str) -> Option<ShellSequence> {
+    if let Some(rest) = payload.strip_prefix("133;") {
+        return parse_ghostty_prompt_mark(rest);
+    }
+    if let Some(rest) = payload.strip_prefix("7;") {
+        return parse_ghostty_cwd(rest);
+    }
+    None
+}
+
+fn parse_ghostty_prompt_mark(payload: &str) -> Option<ShellSequence> {
+    let mut parts = payload.split(';');
+    let code = parts.next()?;
+    match code {
+        "A" => Some(ShellSequence::PromptMark(PromptMarkKind::PromptStart, None)),
+        "P" => Some(ShellSequence::PromptMark(
+            if payload.contains("k=s") {
+                PromptMarkKind::PromptContinuation
+            } else {
+                PromptMarkKind::PromptStart
+            },
+            None,
+        )),
+        "B" => Some(ShellSequence::PromptMark(PromptMarkKind::InputReady, None)),
+        "C" => Some(ShellSequence::PromptMark(
+            PromptMarkKind::CommandStart,
+            None,
+        )),
+        "D" => Some(ShellSequence::PromptMark(
+            PromptMarkKind::CommandFinished,
+            parts.next().and_then(|value| value.parse::<i32>().ok()),
+        )),
+        _ => None,
+    }
+}
+
+fn parse_ghostty_cwd(payload: &str) -> Option<ShellSequence> {
+    let url = payload
+        .strip_prefix("kitty-shell-cwd://")
+        .or_else(|| payload.strip_prefix("file://"))?;
+    let slash = url.find('/')?;
+    let decoded = percent_decode(&url[slash..]);
+    let normalized = if cfg!(target_os = "windows")
+        && decoded.len() > 3
+        && decoded.starts_with('/')
+        && decoded.as_bytes().get(2) == Some(&b':')
+    {
+        decoded[1..].to_string()
+    } else {
+        decoded
+    };
+    Some(ShellSequence::ReportedCwd(PathBuf::from(normalized)))
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' && cursor + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[cursor + 1..cursor + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    decoded.push(byte);
+                    cursor += 3;
+                    continue;
+                }
+            }
+        }
+
+        decoded.push(bytes[cursor]);
+        cursor += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn terminal_cursor_buffer_line(term: &Term<SessionEventProxy>) -> usize {
+    let content = term.renderable_content();
+    let history_size = term
+        .grid()
+        .total_lines()
+        .saturating_sub(term.grid().screen_lines());
+    history_size.saturating_add(content.cursor.point.line.0.max(0) as usize)
+}
+
+fn apply_shell_sequences(
+    session: &mut SessionRuntimeState,
+    sequences: &[ShellSequence],
+    buffer_line: usize,
+) {
+    if sequences.is_empty() {
+        return;
+    }
+
+    session.note_shell_integration_detected(ShellIntegrationKind::Ghostty);
+    for sequence in sequences {
+        match sequence {
+            ShellSequence::PromptMark(kind, exit_status) => {
+                session.note_prompt_mark(buffer_line, *kind, *exit_status);
+            }
+            ShellSequence::ReportedCwd(cwd) => {
+                session.note_shell_reported_cwd(cwd.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,6 +1973,60 @@ mod tests {
             dimensions: Arc::new(Mutex::new(dimensions)),
             debug_enabled: false,
         }
+    }
+
+    #[test]
+    fn search_terminal_buffer_finds_matches_across_scrollback() {
+        let dimensions = SessionDimensions {
+            cols: 32,
+            rows: 2,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let proxy = test_event_proxy(dimensions);
+        let mut term = Term::new(configured_term(1000), &TerminalSize::new(32, 2), proxy);
+        let mut parser = Processor::<StdSyncHandler>::new();
+
+        parser.advance(&mut term, b"alpha\r\nBeta alpha\r\ngamma\r\n");
+
+        let matches = search_terminal_buffer(&term, "alpha", false, 8);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].buffer_line, 0);
+        assert_eq!(matches[0].start_column, 0);
+        assert_eq!(matches[1].buffer_line, 1);
+        assert_eq!(matches[1].start_column, 5);
+        assert_eq!(matches[1].preview, "Beta alpha");
+    }
+
+    #[test]
+    fn shell_sequence_parser_handles_chunked_prompt_and_cwd_sequences() {
+        let mut parser = ShellSequenceParser::default();
+
+        let events = parser.push_chunk(b"\x1b]133;");
+        assert!(events.is_empty());
+
+        let events = parser.push_chunk(b"A\x07\x1b]7;file:///tmp/house%20hunter\x07");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ShellSequence::PromptMark(PromptMarkKind::PromptStart, None)
+        ));
+        assert!(matches!(
+            &events[1],
+            ShellSequence::ReportedCwd(path)
+                if path == &PathBuf::from("/tmp/house hunter")
+        ));
+    }
+
+    #[test]
+    fn bash_shell_args_use_vendored_wrapper_when_enabled() {
+        let args = bash_shell_args(true);
+
+        assert_eq!(args.first().map(String::as_str), Some("--rcfile"));
+        assert!(args.get(1).is_some_and(|value| value
+            .ends_with("shell-integration\\bash\\devmanager.bashrc")
+            || value.ends_with("shell-integration/bash/devmanager.bashrc")));
+        assert_eq!(args.get(2).map(String::as_str), Some("-i"));
     }
 
     #[test]

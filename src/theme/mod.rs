@@ -43,6 +43,8 @@ pub const DANGER_TEXT: u32 = 0xfb7185;
 pub const PRIMARY: u32 = 0x4f46e5; // indigo-600 — primary action
 pub const PRIMARY_HOVER: u32 = 0x4338ca; // indigo-700 — primary hover
 
+pub const PRIMARY_MUTED: u32 = 0x2c266b; // indigo-900 tint for subtle highlights
+
 // Hover variants
 pub const ROW_HOVER_BG: u32 = 0x323238; // zinc-700/30 approximation
 pub const BUTTON_HOVER_BG: u32 = 0x52525b; // zinc-600

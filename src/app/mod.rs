@@ -36,6 +36,7 @@ const TERMINAL_TOPBAR_HEIGHT_PX: f32 = 22.0;
 const STACK_GAP_PX: f32 = 4.0;
 const META_TEXT_HEIGHT_PX: f32 = 0.0;
 const NOTICE_HEIGHT_PX: f32 = 26.0;
+const SEARCH_BAR_HEIGHT_PX: f32 = 34.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_WINDOW_TITLE: &str = "DevManager";
@@ -122,6 +123,9 @@ struct NativeShell {
     terminal_scroll_px: Pixels,
     is_selecting_terminal: bool,
     last_terminal_mouse_report: Option<(TerminalGridPosition, Option<MouseButton>)>,
+    terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
+    pending_terminal_display_offset: Option<usize>,
+    terminal_search: TerminalSearchState,
     editor_panel: Option<EditorPanel>,
     editor_active_field: Option<EditorField>,
     editor_cursor: usize,
@@ -192,6 +196,26 @@ struct TerminalRenderMetrics {
     line_height: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TerminalScrollbarGeometry {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    track_top: f32,
+    track_height: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+    max_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalScrollbarDrag {
+    grab_offset_px: f32,
+    thumb_top_ratio: f32,
+    last_display_offset: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortKillFeedback {
     Killed,
@@ -216,6 +240,15 @@ struct ServerPortSnapshotState {
     statuses: HashMap<u16, PortStatus>,
     last_checked_at: Option<Instant>,
     refresh_in_flight: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TerminalSearchState {
+    active: bool,
+    query: String,
+    matches: Vec<crate::terminal::session::TerminalSearchMatch>,
+    selected_index: Option<usize>,
+    case_sensitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +329,9 @@ impl NativeShell {
             terminal_scroll_px: px(0.0),
             is_selecting_terminal: false,
             last_terminal_mouse_report: None,
+            terminal_scrollbar_drag: None,
+            pending_terminal_display_offset: None,
+            terminal_search: TerminalSearchState::default(),
             editor_panel: None,
             editor_active_field: None,
             editor_cursor: 0,
@@ -529,9 +565,14 @@ impl NativeShell {
             return SessionDimensions::default();
         };
         let metrics = self.terminal_render_metrics(window);
+        let available_width = if self.state.settings().show_terminal_scrollbar {
+            (layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX).max(metrics.cell_width)
+        } else {
+            layout.available_width
+        };
 
         SessionDimensions::from_available_space(
-            layout.available_width,
+            available_width,
             layout.available_height,
             metrics.cell_width,
             metrics.line_height,
@@ -893,6 +934,10 @@ impl NativeShell {
                 option_as_meta: settings.option_as_meta,
                 copy_on_select: settings.copy_on_select,
                 keep_selection_on_copy: settings.keep_selection_on_copy,
+                show_terminal_scrollbar: settings.show_terminal_scrollbar,
+                shell_integration_enabled: settings.shell_integration_enabled,
+                terminal_mouse_override: settings.terminal_mouse_override,
+                terminal_read_only: settings.terminal_read_only,
                 open_picker: None,
             }),
             cx,
@@ -1462,6 +1507,10 @@ impl NativeShell {
         settings.option_as_meta = draft.option_as_meta;
         settings.copy_on_select = draft.copy_on_select;
         settings.keep_selection_on_copy = draft.keep_selection_on_copy;
+        settings.show_terminal_scrollbar = draft.show_terminal_scrollbar;
+        settings.shell_integration_enabled = draft.shell_integration_enabled;
+        settings.terminal_mouse_override = draft.terminal_mouse_override;
+        settings.terminal_read_only = draft.terminal_read_only;
 
         self.state.update_settings(settings);
         self.process_manager
@@ -2008,6 +2057,34 @@ impl NativeShell {
                     self.apply_settings_draft(cx);
                 }
             }
+            EditorAction::ToggleShowTerminalScrollbar => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.show_terminal_scrollbar = !draft.show_terminal_scrollbar;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::ToggleShellIntegrationEnabled => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.shell_integration_enabled = !draft.shell_integration_enabled;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::ToggleTerminalMouseOverride => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.terminal_mouse_override = !draft.terminal_mouse_override;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
+            EditorAction::ToggleTerminalReadOnly => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.terminal_read_only = !draft.terminal_read_only;
+                    draft.open_picker = None;
+                    self.apply_settings_draft(cx);
+                }
+            }
             EditorAction::ToggleProjectPinned => {
                 if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
                     draft.pinned = !draft.pinned;
@@ -2404,6 +2481,8 @@ impl NativeShell {
                 .then_some("Save and close text editor to continue...".to_string())
         });
 
+        let search_highlight = self.current_search_highlight(active_session.as_ref());
+        let scrollbar = self.terminal_scrollbar_model(active_session.as_ref());
         let has_active_tab = active_tab_type.is_some();
         view::TerminalPaneModel {
             active_project: if has_active_tab {
@@ -2431,6 +2510,9 @@ impl NativeShell {
             cell_width: terminal_metrics.cell_width,
             line_height: terminal_metrics.line_height,
             selection,
+            search: self.terminal_search_model(),
+            search_highlight,
+            scrollbar,
             runtime_controls,
             splash_image: self.splash_image.clone(),
         }
@@ -2459,6 +2541,184 @@ impl NativeShell {
         }
 
         self.focused_terminal_session_id = next_session_id;
+    }
+
+    fn terminal_scrollbar_model(
+        &self,
+        session: Option<&crate::terminal::session::TerminalSessionView>,
+    ) -> Option<view::TerminalScrollbarModel> {
+        let session = session?;
+        if !self.terminal_has_scrollbar(session) {
+            return None;
+        }
+
+        let total_lines = session.screen.total_lines.max(session.screen.rows.max(1));
+        let visible_lines = session.screen.rows.max(1);
+        if total_lines <= visible_lines {
+            return None;
+        }
+
+        let max_offset = session.screen.history_size.max(1);
+        let thumb_height_ratio = visible_lines as f32 / total_lines as f32;
+        let thumb_top_ratio = self
+            .terminal_scrollbar_drag
+            .map(|drag| drag.thumb_top_ratio)
+            .unwrap_or_else(|| {
+                scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
+            });
+
+        Some(view::TerminalScrollbarModel {
+            thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
+            thumb_height_ratio,
+        })
+    }
+
+    fn terminal_has_scrollbar(
+        &self,
+        session: &crate::terminal::session::TerminalSessionView,
+    ) -> bool {
+        self.state.settings().show_terminal_scrollbar
+            && session.screen.total_lines > session.screen.rows.max(1)
+    }
+
+    fn terminal_scrollbar_geometry(
+        &self,
+        window: &Window,
+        session: &crate::terminal::session::TerminalSessionView,
+    ) -> Option<TerminalScrollbarGeometry> {
+        if !self.terminal_has_scrollbar(session) {
+            return None;
+        }
+
+        let layout = self.terminal_viewport_layout(window, session.runtime.exit.is_some())?;
+        let total_lines = session.screen.total_lines.max(session.screen.rows.max(1));
+        let visible_lines = session.screen.rows.max(1);
+        let max_offset = session.screen.history_size.max(1);
+
+        let left = layout.left + layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        let top = layout.top - 2.0;
+        let width = view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        let height = layout.available_height + 4.0;
+        let track_top = top + view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX;
+        let track_height = (height - view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX * 2.0).max(12.0);
+        let thumb_height = (track_height
+            * (visible_lines as f32 / total_lines as f32).clamp(0.08, 1.0))
+        .max(view::TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX)
+        .min(track_height);
+        let thumb_range = (track_height - thumb_height).max(0.0);
+        let thumb_top = track_top
+            + thumb_range
+                * scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
+                    .clamp(0.0, 1.0);
+
+        Some(TerminalScrollbarGeometry {
+            left,
+            top,
+            width,
+            height,
+            track_top,
+            track_height,
+            thumb_top,
+            thumb_height,
+            max_offset,
+        })
+    }
+
+    fn scrollbar_hit_test(
+        &self,
+        position: Point<Pixels>,
+        geometry: TerminalScrollbarGeometry,
+    ) -> bool {
+        let x: f32 = position.x.into();
+        let y: f32 = position.y.into();
+        x >= geometry.left
+            && x <= geometry.left + geometry.width
+            && y >= geometry.top
+            && y <= geometry.top + geometry.height
+    }
+
+    fn scrollbar_thumb_contains(
+        &self,
+        position: Point<Pixels>,
+        geometry: TerminalScrollbarGeometry,
+    ) -> bool {
+        let y: f32 = position.y.into();
+        y >= geometry.thumb_top && y <= geometry.thumb_top + geometry.thumb_height
+    }
+
+    fn scroll_terminal_from_scrollbar(
+        &mut self,
+        position: Point<Pixels>,
+        geometry: TerminalScrollbarGeometry,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.terminal_scrollbar_drag.as_mut() else {
+            return;
+        };
+
+        let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab_offset_px);
+        let display_offset =
+            display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
+        let ratio_changed = (drag.thumb_top_ratio - thumb_top_ratio).abs() > 0.0001;
+        let offset_changed = drag.last_display_offset != display_offset;
+
+        drag.thumb_top_ratio = thumb_top_ratio;
+        drag.last_display_offset = display_offset;
+
+        if offset_changed {
+            self.pending_terminal_display_offset = Some(display_offset);
+        }
+
+        if ratio_changed || offset_changed {
+            cx.notify();
+        }
+    }
+
+    fn current_terminal_buffer_line(
+        &self,
+        session: &crate::terminal::session::TerminalSessionView,
+    ) -> usize {
+        session
+            .screen
+            .history_size
+            .saturating_sub(session.screen.display_offset)
+            .saturating_add(session.screen.rows / 2)
+    }
+
+    fn current_search_highlight(
+        &self,
+        session: Option<&crate::terminal::session::TerminalSessionView>,
+    ) -> Option<view::TerminalSearchHighlight> {
+        let session = session?;
+        let selected_index = self.terminal_search.selected_index?;
+        let selected = self.terminal_search.matches.get(selected_index)?;
+        let top_buffer_line = session
+            .screen
+            .history_size
+            .saturating_sub(session.screen.display_offset);
+        let viewport_row = selected.buffer_line.checked_sub(top_buffer_line)?;
+        (viewport_row < session.screen.rows).then_some(view::TerminalSearchHighlight {
+            row: viewport_row,
+            start_column: selected.start_column,
+            end_column: selected.end_column,
+        })
+    }
+
+    fn terminal_search_model(&self) -> Option<view::TerminalSearchUiModel> {
+        self.terminal_search.active.then(|| {
+            let summary = match (
+                self.terminal_search.selected_index,
+                self.terminal_search.matches.len(),
+            ) {
+                (Some(index), total) if total > 0 => format!("{} of {}", index + 1, total),
+                _ => "no matches".to_string(),
+            };
+            view::TerminalSearchUiModel {
+                query: self.terminal_search.query.clone(),
+                summary,
+                case_sensitive: self.terminal_search.case_sensitive,
+            }
+        })
     }
 
     fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
@@ -2809,12 +3069,55 @@ impl NativeShell {
                 kill_color: theme::WARNING_TEXT,
                 prompt_action_label,
                 prompt_action_color,
+                search_active: self.terminal_search.active,
+                search_case_sensitive: self.terminal_search.case_sensitive,
+                search_summary: None,
+                can_search: active_session.is_some(),
+                can_jump_prev_prompt: session.runtime.previous_prompt_line(None).is_some(),
+                can_jump_next_prompt: false,
+                can_export_screen: active_session.is_some(),
+                can_export_scrollback: active_session.is_some(),
+                can_export_selection: self.selection_snapshot(session.screen.cols).is_some(),
+                mouse_override_enabled: self.state.settings().terminal_mouse_override,
+                read_only_enabled: self.state.settings().terminal_read_only,
             });
         }
 
         if active_tab_type != Some(TabType::Server) {
             self.active_port_state = None;
-            return None;
+            let session = active_session?;
+            let current_line = self.current_terminal_buffer_line(session);
+            return Some(view::TerminalRuntimeControlsModel {
+                port_label: None,
+                port_color: theme::TEXT_DIM,
+                can_start: false,
+                can_stop: false,
+                can_restart: false,
+                can_clear: active_session.is_some(),
+                can_kill_port: false,
+                can_open_url: false,
+                kill_label: "kill",
+                kill_color: theme::WARNING_TEXT,
+                prompt_action_label: None,
+                prompt_action_color: theme::PRIMARY,
+                search_active: self.terminal_search.active,
+                search_case_sensitive: self.terminal_search.case_sensitive,
+                search_summary: self.terminal_search_model().map(|search| search.summary),
+                can_search: true,
+                can_jump_prev_prompt: session
+                    .runtime
+                    .previous_prompt_line(Some(current_line))
+                    .is_some(),
+                can_jump_next_prompt: session
+                    .runtime
+                    .next_prompt_line(Some(current_line))
+                    .is_some(),
+                can_export_screen: true,
+                can_export_scrollback: true,
+                can_export_selection: self.selection_snapshot(session.screen.cols).is_some(),
+                mouse_override_enabled: self.state.settings().terminal_mouse_override,
+                read_only_enabled: self.state.settings().terminal_read_only,
+            });
         }
 
         let (command_id, port) = {
@@ -2898,7 +3201,198 @@ impl NativeShell {
             kill_color,
             prompt_action_label: None,
             prompt_action_color: theme::PRIMARY,
+            search_active: self.terminal_search.active,
+            search_case_sensitive: self.terminal_search.case_sensitive,
+            search_summary: self.terminal_search_model().map(|search| search.summary),
+            can_search: active_session.is_some(),
+            can_jump_prev_prompt: active_session
+                .map(|session| {
+                    session
+                        .runtime
+                        .previous_prompt_line(Some(self.current_terminal_buffer_line(session)))
+                        .is_some()
+                })
+                .unwrap_or(false),
+            can_jump_next_prompt: active_session
+                .map(|session| {
+                    session
+                        .runtime
+                        .next_prompt_line(Some(self.current_terminal_buffer_line(session)))
+                        .is_some()
+                })
+                .unwrap_or(false),
+            can_export_screen: active_session.is_some(),
+            can_export_scrollback: active_session.is_some(),
+            can_export_selection: active_session
+                .and_then(|session| self.selection_snapshot(session.screen.cols))
+                .is_some(),
+            mouse_override_enabled: self.state.settings().terminal_mouse_override,
+            read_only_enabled: self.state.settings().terminal_read_only,
         })
+    }
+
+    fn toggle_terminal_search_action(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_search.active {
+            self.terminal_search = TerminalSearchState::default();
+        } else {
+            self.terminal_search.active = true;
+            self.refresh_terminal_search_results(cx);
+        }
+        cx.notify();
+    }
+
+    fn close_terminal_search_action(&mut self, cx: &mut Context<Self>) {
+        self.terminal_search = TerminalSearchState::default();
+        cx.notify();
+    }
+
+    fn toggle_terminal_search_case_action(&mut self, cx: &mut Context<Self>) {
+        self.terminal_search.case_sensitive = !self.terminal_search.case_sensitive;
+        self.refresh_terminal_search_results(cx);
+    }
+
+    fn refresh_terminal_search_results(&mut self, cx: &mut Context<Self>) {
+        let session_id = self.state.active_terminal_spec().session_id;
+        let query = self.terminal_search.query.clone();
+        self.terminal_search.matches = self
+            .process_manager
+            .search_session(
+                &session_id,
+                &query,
+                self.terminal_search.case_sensitive,
+                256,
+            )
+            .unwrap_or_default();
+        self.terminal_search.selected_index =
+            (!self.terminal_search.matches.is_empty()).then_some(0);
+        if self.terminal_search.selected_index.is_some() {
+            self.jump_to_selected_search_match();
+        }
+        cx.notify();
+    }
+
+    fn jump_to_selected_search_match(&mut self) {
+        let Some(index) = self.terminal_search.selected_index else {
+            return;
+        };
+        let Some(found) = self.terminal_search.matches.get(index) else {
+            return;
+        };
+        let session_id = self.state.active_terminal_spec().session_id;
+        let _ = self
+            .process_manager
+            .scroll_session_to_buffer_line(&session_id, found.buffer_line);
+    }
+
+    fn cycle_terminal_search_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.terminal_search.matches.is_empty() {
+            return;
+        }
+
+        let len = self.terminal_search.matches.len();
+        let next_index = match self.terminal_search.selected_index {
+            Some(current) if forward => (current + 1) % len,
+            Some(current) => (current + len - 1) % len,
+            None => 0,
+        };
+        self.terminal_search.selected_index = Some(next_index);
+        self.jump_to_selected_search_match();
+        cx.notify();
+    }
+
+    fn jump_terminal_prompt(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.process_manager.active_session() else {
+            return;
+        };
+        let current_line = self.current_terminal_buffer_line(&session);
+        let target = if previous {
+            session.runtime.previous_prompt_line(Some(current_line))
+        } else {
+            session.runtime.next_prompt_line(Some(current_line))
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let session_id = self.state.active_terminal_spec().session_id;
+        if self
+            .process_manager
+            .scroll_session_to_buffer_line(&session_id, target)
+            .is_ok()
+        {
+            cx.notify();
+        }
+    }
+
+    fn toggle_terminal_mouse_override_action(&mut self, cx: &mut Context<Self>) {
+        let mut settings = self.state.settings().clone();
+        settings.terminal_mouse_override = !settings.terminal_mouse_override;
+        self.state.update_settings(settings);
+        self.save_config_state();
+        cx.notify();
+    }
+
+    fn toggle_terminal_read_only_action(&mut self, cx: &mut Context<Self>) {
+        let mut settings = self.state.settings().clone();
+        settings.terminal_read_only = !settings.terminal_read_only;
+        self.state.update_settings(settings);
+        self.save_config_state();
+        self.terminal_notice = Some(if self.state.settings().terminal_read_only {
+            "Terminal input is now read-only.".to_string()
+        } else {
+            "Terminal input is live again.".to_string()
+        });
+        cx.notify();
+    }
+
+    fn export_terminal_view_action(
+        &mut self,
+        include_scrollback: bool,
+        selection_only: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = self.state.active_terminal_spec().session_id;
+        let text = if selection_only {
+            self.selected_text().unwrap_or_default()
+        } else if include_scrollback {
+            self.process_manager
+                .session_scrollback_text(&session_id)
+                .unwrap_or_default()
+        } else {
+            self.process_manager
+                .session_screen_text(&session_id)
+                .unwrap_or_default()
+        };
+
+        if text.is_empty() {
+            self.terminal_notice = Some("Nothing to export from this terminal.".to_string());
+            cx.notify();
+            return;
+        }
+
+        let kind = if selection_only {
+            "selection"
+        } else if include_scrollback {
+            "scrollback"
+        } else {
+            "screen"
+        };
+        let file_name = format!(
+            "devmanager-terminal-{kind}-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+        let path = std::env::temp_dir().join(file_name);
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.terminal_notice = Some(format!("Wrote terminal {kind} to {}", path.display()));
+            }
+            Err(error) => {
+                self.terminal_notice = Some(format!("Failed to export terminal {kind}: {error}"));
+            }
+        }
+        cx.notify();
     }
 
     fn start_server_action(
@@ -3457,10 +3951,15 @@ impl NativeShell {
         self.focus_terminal(window);
         self.terminal_scroll_px = px(0.0);
 
+        if self.handle_terminal_scrollbar_mouse_down(event, window, cx) {
+            return;
+        }
+
         let active_session = self.process_manager.active_session();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         let session_id = self.state.active_terminal_spec().session_id;
-        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             self.terminal_selection = None;
             self.is_selecting_terminal = false;
             self.last_terminal_mouse_report = None;
@@ -3547,9 +4046,13 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.handle_terminal_scrollbar_mouse_move(event, window, cx) {
+            return;
+        }
+
         let active_session = self.process_manager.active_session();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
-        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                 let report_key = (cell, event.pressed_button);
                 if self.last_terminal_mouse_report != Some(report_key) {
@@ -3590,15 +4093,83 @@ impl NativeShell {
         }
     }
 
+    fn handle_terminal_scrollbar_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.button != MouseButton::Left {
+            return false;
+        }
+
+        if let Some(session) = self.process_manager.active_session() {
+            if let Some(geometry) = self.terminal_scrollbar_geometry(window, &session) {
+                if self.scrollbar_hit_test(event.position, geometry) {
+                    self.terminal_selection = None;
+                    self.is_selecting_terminal = false;
+                    let grab_offset_px = if self.scrollbar_thumb_contains(event.position, geometry)
+                    {
+                        let y: f32 = event.position.y.into();
+                        (y - geometry.thumb_top).clamp(0.0, geometry.thumb_height)
+                    } else {
+                        geometry.thumb_height / 2.0
+                    };
+                    self.terminal_scrollbar_drag = Some(TerminalScrollbarDrag {
+                        grab_offset_px,
+                        thumb_top_ratio: scrollbar_thumb_top_ratio(
+                            session.screen.display_offset,
+                            geometry.max_offset,
+                        ),
+                        last_display_offset: session.screen.display_offset.min(geometry.max_offset),
+                    });
+                    self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
+                    window.prevent_default();
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn handle_terminal_scrollbar_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(_) = self.terminal_scrollbar_drag else {
+            return false;
+        };
+        if !event.dragging() {
+            return false;
+        }
+
+        if let Some(session) = self.process_manager.active_session() {
+            if let Some(geometry) = self.terminal_scrollbar_geometry(window, &session) {
+                self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
+                window.prevent_default();
+                return true;
+            }
+        }
+        self.terminal_scrollbar_drag = None;
+        false
+    }
+
     fn handle_terminal_mouse_up(
         &mut self,
         event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.handle_terminal_scrollbar_mouse_up(event, window, cx) {
+            return;
+        }
+
         let active_session = self.process_manager.active_session();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
-        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                 if let Some(sequence) = mouse_button_report(
                     session_mode.unwrap_or_default(),
@@ -3623,15 +4194,32 @@ impl NativeShell {
         self.finish_terminal_selection(window, cx);
     }
 
+    fn handle_terminal_scrollbar_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) -> bool {
+        if event.button == MouseButton::Left && self.terminal_scrollbar_drag.take().is_some() {
+            window.prevent_default();
+            return true;
+        }
+        false
+    }
+
     fn handle_terminal_mouse_up_out(
         &mut self,
         event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.handle_terminal_scrollbar_mouse_up(event, window, cx) {
+            return;
+        }
+
         let active_session = self.process_manager.active_session();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
-        if session_mode.is_some_and(|mode| mode.mouse_reporting()) {
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             let cell = self
                 .grid_position_for_mouse(event.position, window, true)
                 .unwrap_or(TerminalGridPosition { row: 0, column: 0 });
@@ -3668,8 +4256,58 @@ impl NativeShell {
             let _ = self.copy_terminal_selection_to_clipboard(cx);
         }
         self.is_selecting_terminal = false;
+        self.terminal_scrollbar_drag = None;
         self.last_terminal_mouse_report = None;
         window.prevent_default();
+    }
+
+    fn terminal_mouse_capture_active(
+        &self,
+        mode: crate::terminal::session::TerminalModeSnapshot,
+    ) -> bool {
+        mode.mouse_reporting() && !self.state.settings().terminal_mouse_override
+    }
+
+    fn handle_terminal_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !self.terminal_search.active {
+            return false;
+        }
+
+        let key = event.keystroke.key.to_ascii_lowercase();
+        match key.as_str() {
+            "escape" => {
+                self.close_terminal_search_action(cx);
+                true
+            }
+            "backspace" => {
+                self.terminal_search.query.pop();
+                self.refresh_terminal_search_results(cx);
+                true
+            }
+            "enter" | "down" => {
+                self.cycle_terminal_search_match(true, cx);
+                true
+            }
+            "up" => {
+                self.cycle_terminal_search_match(false, cx);
+                true
+            }
+            "space" => {
+                self.terminal_search.query.push(' ');
+                self.refresh_terminal_search_results(cx);
+                true
+            }
+            _ if key.chars().count() == 1
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform
+                && !event.keystroke.modifiers.alt =>
+            {
+                self.terminal_search.query.push_str(&event.keystroke.key);
+                self.refresh_terminal_search_results(cx);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn handle_terminal_key(
@@ -3679,6 +4317,10 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         if self.handle_wizard_key(event, window, cx) {
+            return;
+        }
+        if self.handle_terminal_search_key(event, cx) {
+            window.prevent_default();
             return;
         }
         let session_id = self.state.active_terminal_spec().session_id;
@@ -3716,6 +4358,12 @@ impl NativeShell {
                 }
             }
             TerminalKeyAction::Paste => {
+                if self.state.settings().terminal_read_only {
+                    self.terminal_notice =
+                        Some("Terminal is read-only. Disable it to paste.".to_string());
+                    window.prevent_default();
+                    return;
+                }
                 if let Some(clipboard) = cx.read_from_clipboard() {
                     match terminal_clipboard_payload(&clipboard) {
                         Some(TerminalClipboardPayload::Text(text)) => {
@@ -3732,6 +4380,12 @@ impl NativeShell {
                 window.prevent_default();
             }
             TerminalKeyAction::SendInput(input) => {
+                if self.state.settings().terminal_read_only {
+                    self.terminal_notice =
+                        Some("Terminal is read-only. Disable it to type.".to_string());
+                    window.prevent_default();
+                    return;
+                }
                 if let Some(text) = resolve_terminal_input_text(&input, input_context) {
                     if text == "\u{3}"
                         && matches!(
@@ -3767,7 +4421,7 @@ impl NativeShell {
 
         let session_id = self.state.active_terminal_spec().session_id;
         if let Some(session) = self.process_manager.active_session() {
-            if session.screen.mode.mouse_reporting() {
+            if self.terminal_mouse_capture_active(session.screen.mode) {
                 if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                     if let Some(sequences) =
                         mouse_scroll_report(session.screen.mode, cell, delta_lines, event)
@@ -3861,7 +4515,12 @@ impl NativeShell {
         let metrics = self.terminal_render_metrics(window);
         let cell_width = metrics.cell_width;
         let row_height = metrics.line_height;
-        let available_width = layout.available_width.max(cell_width);
+        let scrollbar_width = if self.terminal_has_scrollbar(session) {
+            view::TERMINAL_SCROLLBAR_WIDTH_PX
+        } else {
+            0.0
+        };
+        let available_width = (layout.available_width - scrollbar_width).max(cell_width);
         let available_height = layout.available_height.max(row_height);
         cols = cols.min((available_width / cell_width).floor().max(1.0) as usize);
         rows = rows.min((available_height / row_height).floor().max(1.0) as usize);
@@ -3893,6 +4552,16 @@ impl NativeShell {
 
         if self.startup_notice.is_some() || self.terminal_notice.is_some() {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
+        }
+        if self
+            .process_manager
+            .active_session()
+            .is_some_and(|session| session.runtime.awaiting_external_editor)
+        {
+            top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
+        }
+        if self.terminal_search.active {
+            top += SEARCH_BAR_HEIGHT_PX + STACK_GAP_PX;
         }
         if include_exit_banner {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
@@ -4014,6 +4683,12 @@ impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
         self.capture_window_bounds(window);
+        if let Some(display_offset) = self.pending_terminal_display_offset.take() {
+            let session_id = self.state.active_terminal_spec().session_id;
+            let _ = self
+                .process_manager
+                .scroll_session_to_offset(&session_id, display_offset);
+        }
         let runtime_snapshot = self.process_manager.runtime_state();
         self.sync_server_port_snapshot(&runtime_snapshot, cx);
         self.sync_window_title(window, &runtime_snapshot);
@@ -4203,6 +4878,73 @@ impl Render for NativeShell {
             |session_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                     this.respond_to_ssh_prompt_action(&session_id, cx);
+                }))
+            };
+        let make_toggle_terminal_search_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.toggle_terminal_search_action(cx);
+                }))
+            };
+        let make_close_terminal_search_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.close_terminal_search_action(cx);
+                }))
+            };
+        let make_search_prev_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.cycle_terminal_search_match(false, cx);
+            }))
+        };
+        let make_search_next_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.cycle_terminal_search_match(true, cx);
+            }))
+        };
+        let make_search_case_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.toggle_terminal_search_case_action(cx);
+            }))
+        };
+        let make_prev_prompt_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.jump_terminal_prompt(true, cx);
+            }))
+        };
+        let make_next_prompt_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.jump_terminal_prompt(false, cx);
+            }))
+        };
+        let make_export_screen_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.export_terminal_view_action(false, false, cx);
+                }))
+            };
+        let make_export_scrollback_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.export_terminal_view_action(true, false, cx);
+                }))
+            };
+        let make_export_selection_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.export_terminal_view_action(false, true, cx);
+                }))
+            };
+        let make_toggle_mouse_override_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.toggle_terminal_mouse_override_action(cx);
+                }))
+            };
+        let make_toggle_read_only_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.toggle_terminal_read_only_action(cx);
                 }))
             };
         let make_start_handler =
@@ -4446,6 +5188,10 @@ impl Render for NativeShell {
         if updater_snapshot.is_busy() {
             window.request_animation_frame();
         }
+        if self.terminal_scrollbar_drag.is_some() || self.pending_terminal_display_offset.is_some()
+        {
+            window.request_animation_frame();
+        }
         if runtime_snapshot
             .sessions
             .values()
@@ -4454,34 +5200,79 @@ impl Render for NativeShell {
             window.request_animation_frame();
         }
 
-        let terminal_actions = terminal_model.as_ref().and_then(|model| {
-            model.runtime_controls.as_ref().map(|controls| {
-                let command_id = self.state.active_terminal_spec().session_id;
-                view::TerminalPaneActions {
-                    on_start_server: controls
-                        .can_start
-                        .then(|| make_focused_start_handler(command_id.clone())),
-                    on_stop_server: controls
-                        .can_stop
-                        .then(|| make_stop_handler(command_id.clone())),
-                    on_restart_server: controls
-                        .can_restart
-                        .then(|| make_restart_handler(command_id.clone())),
-                    on_clear_output: controls
-                        .can_clear
-                        .then(|| make_clear_output_handler(command_id.clone())),
-                    on_kill_port: controls
-                        .can_kill_port
-                        .then(|| make_kill_port_handler(command_id.clone())),
-                    on_open_local_url: controls
-                        .can_open_url
-                        .then(|| make_open_server_url_handler(command_id.clone())),
-                    on_prompt_action: controls
-                        .prompt_action_label
-                        .as_ref()
-                        .map(|_| make_respond_to_ssh_prompt_handler(command_id)),
-                }
-            })
+        let terminal_actions = terminal_model.as_ref().map(|model| {
+            let controls = model.runtime_controls.as_ref();
+            let command_id = self.state.active_terminal_spec().session_id;
+            view::TerminalPaneActions {
+                on_start_server: controls
+                    .filter(|controls| controls.can_start)
+                    .map(|_| make_focused_start_handler(command_id.clone())),
+                on_stop_server: controls
+                    .filter(|controls| controls.can_stop)
+                    .map(|_| make_stop_handler(command_id.clone())),
+                on_restart_server: controls
+                    .filter(|controls| controls.can_restart)
+                    .map(|_| make_restart_handler(command_id.clone())),
+                on_clear_output: controls
+                    .filter(|controls| controls.can_clear)
+                    .map(|_| make_clear_output_handler(command_id.clone())),
+                on_kill_port: controls
+                    .filter(|controls| controls.can_kill_port)
+                    .map(|_| make_kill_port_handler(command_id.clone())),
+                on_open_local_url: controls
+                    .filter(|controls| controls.can_open_url)
+                    .map(|_| make_open_server_url_handler(command_id.clone())),
+                on_prompt_action: controls
+                    .and_then(|controls| controls.prompt_action_label.as_ref())
+                    .map(|_| make_respond_to_ssh_prompt_handler(command_id.clone())),
+                on_toggle_search: controls
+                    .filter(|controls| controls.can_search)
+                    .map(|_| make_toggle_terminal_search_handler()),
+                on_search_prev: controls
+                    .filter(|controls| controls.search_active)
+                    .map(|_| make_search_prev_handler()),
+                on_search_next: controls
+                    .filter(|controls| controls.search_active)
+                    .map(|_| make_search_next_handler()),
+                on_toggle_search_case: controls
+                    .filter(|controls| controls.search_active)
+                    .map(|_| make_search_case_handler()),
+                on_close_search: controls
+                    .filter(|controls| controls.search_active)
+                    .map(|_| make_close_terminal_search_handler()),
+                on_jump_prev_prompt: controls
+                    .filter(|controls| controls.can_jump_prev_prompt)
+                    .map(|_| make_prev_prompt_handler()),
+                on_jump_next_prompt: controls
+                    .filter(|controls| controls.can_jump_next_prompt)
+                    .map(|_| make_next_prompt_handler()),
+                on_export_screen: controls
+                    .filter(|controls| controls.can_export_screen)
+                    .map(|_| make_export_screen_handler()),
+                on_export_scrollback: controls
+                    .filter(|controls| controls.can_export_scrollback)
+                    .map(|_| make_export_scrollback_handler()),
+                on_export_selection: controls
+                    .filter(|controls| controls.can_export_selection)
+                    .map(|_| make_export_selection_handler()),
+                on_toggle_mouse_override: Some(make_toggle_mouse_override_handler()),
+                on_toggle_read_only: Some(make_toggle_read_only_handler()),
+                scrollbar: Some(view::TerminalScrollbarActions {
+                    on_mouse_down: Arc::new(cx.listener(
+                        |this, event: &MouseDownEvent, window, cx| {
+                            this.handle_terminal_scrollbar_mouse_down(event, window, cx);
+                        },
+                    )),
+                    on_mouse_move: Arc::new(cx.listener(
+                        |this, event: &MouseMoveEvent, window, cx| {
+                            this.handle_terminal_scrollbar_mouse_move(event, window, cx);
+                        },
+                    )),
+                    on_mouse_up: Arc::new(cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        this.handle_terminal_scrollbar_mouse_up(event, window, cx);
+                    })),
+                }),
+            }
         });
 
         div()
@@ -6105,6 +6896,38 @@ fn collapse_terminal_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn scrollbar_thumb_top_ratio(display_offset: usize, max_offset: usize) -> f32 {
+    if max_offset == 0 {
+        1.0
+    } else {
+        1.0 - (display_offset as f32 / max_offset as f32)
+    }
+}
+
+fn scrollbar_ratio_for_position(
+    position: Point<Pixels>,
+    geometry: TerminalScrollbarGeometry,
+    grab_offset_px: f32,
+) -> f32 {
+    let thumb_range = (geometry.track_height - geometry.thumb_height).max(0.0);
+    let position_y: f32 = position.y.into();
+    let unclamped_thumb_top = position_y - geometry.track_top - grab_offset_px;
+
+    if thumb_range <= f32::EPSILON {
+        1.0
+    } else {
+        (unclamped_thumb_top / thumb_range).clamp(0.0, 1.0)
+    }
+}
+
+fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -> usize {
+    if max_offset == 0 {
+        0
+    } else {
+        ((1.0 - thumb_top_ratio.clamp(0.0, 1.0)) * max_offset as f32).round() as usize
+    }
+}
+
 fn config_has_project(config: &AppConfig, project_id: &str) -> bool {
     config
         .projects
@@ -6224,6 +7047,33 @@ mod tests {
             username: "dev".to_string(),
             password: None,
         }
+    }
+
+    #[test]
+    fn scrollbar_ratio_maps_live_bottom_to_bottom_thumb() {
+        assert_eq!(scrollbar_thumb_top_ratio(0, 120), 1.0);
+        assert_eq!(scrollbar_thumb_top_ratio(120, 120), 0.0);
+        assert_eq!(display_offset_for_scrollbar_ratio(1.0, 120), 0);
+        assert_eq!(display_offset_for_scrollbar_ratio(0.0, 120), 120);
+        assert_eq!(display_offset_for_scrollbar_ratio(0.5, 120), 60);
+    }
+
+    #[test]
+    fn scrollbar_ratio_for_position_respects_track_offset_and_grab_offset() {
+        let geometry = TerminalScrollbarGeometry {
+            left: 0.0,
+            top: 0.0,
+            width: 10.0,
+            height: 100.0,
+            track_top: 10.0,
+            track_height: 80.0,
+            thumb_top: 34.0,
+            thumb_height: 20.0,
+            max_offset: 120,
+        };
+
+        let ratio = scrollbar_ratio_for_position(point(px(5.0), px(44.0)), geometry, 10.0);
+        assert!((ratio - 0.4).abs() < 0.001);
     }
 
     fn snapshot_cell(character: char) -> TerminalCellSnapshot {

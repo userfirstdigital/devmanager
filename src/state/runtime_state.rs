@@ -53,6 +53,29 @@ pub enum AiActivity {
     Thinking,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellIntegrationKind {
+    #[default]
+    None,
+    Ghostty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMarkKind {
+    PromptStart,
+    PromptContinuation,
+    InputReady,
+    CommandStart,
+    CommandFinished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptMark {
+    pub buffer_line: usize,
+    pub kind: PromptMarkKind,
+    pub exit_status: Option<i32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionDimensions {
     pub cols: u16,
@@ -202,6 +225,10 @@ pub struct SessionRuntimeState {
     pub metrics: SessionMetrics,
     pub resources: ResourceSnapshot,
     pub awaiting_external_editor: bool,
+    pub shell_integration: ShellIntegrationKind,
+    pub prompt_marks: Vec<PromptMark>,
+    pub reported_cwd: Option<PathBuf>,
+    pub at_prompt: bool,
     pub server_launch: Option<ServerLaunchSpec>,
     pub ai_launch: Option<AiLaunchSpec>,
     pub ssh_launch: Option<SshLaunchSpec>,
@@ -254,6 +281,10 @@ impl SessionRuntimeState {
             metrics: SessionMetrics::default(),
             resources: ResourceSnapshot::default(),
             awaiting_external_editor: false,
+            shell_integration: ShellIntegrationKind::None,
+            prompt_marks: Vec::new(),
+            reported_cwd: None,
+            at_prompt: false,
             server_launch: None,
             ai_launch: None,
             ssh_launch: None,
@@ -378,6 +409,7 @@ impl SessionRuntimeState {
         self.pid = None;
         self.resources = ResourceSnapshot::default();
         self.awaiting_external_editor = false;
+        self.at_prompt = false;
         if self.session_kind.is_ai() {
             self.ai_activity = Some(AiActivity::Idle);
             self.thinking_since = None;
@@ -399,6 +431,9 @@ impl SessionRuntimeState {
         self.exit_code = None;
         self.resources = ResourceSnapshot::default();
         self.awaiting_external_editor = false;
+        self.prompt_marks.clear();
+        self.reported_cwd = None;
+        self.at_prompt = false;
         self.last_output_at = None;
         self.last_output_event_at = None;
         self.output_burst_count = 0;
@@ -466,6 +501,7 @@ impl SessionRuntimeState {
         self.shell_program = shell_program;
         self.exit_code = None;
         self.awaiting_external_editor = false;
+        self.at_prompt = true;
         self.exit = Some(SessionExitState {
             code: None,
             signal: None,
@@ -481,6 +517,9 @@ impl SessionRuntimeState {
         self.session_kind = SessionKind::Server;
         self.interactive_shell = false;
         self.awaiting_external_editor = false;
+        self.prompt_marks.clear();
+        self.reported_cwd = None;
+        self.at_prompt = false;
         self.project_id = Some(launch.project_id.clone());
         self.command_id = Some(launch.command_id.clone());
         self.auto_restart = launch.auto_restart;
@@ -500,6 +539,9 @@ impl SessionRuntimeState {
         self.session_kind = launch.tool;
         self.interactive_shell = false;
         self.awaiting_external_editor = false;
+        self.prompt_marks.clear();
+        self.reported_cwd = None;
+        self.at_prompt = false;
         self.project_id = Some(launch.project_id.clone());
         self.tab_id = Some(launch.tab_id.clone());
         self.command_id = None;
@@ -523,6 +565,9 @@ impl SessionRuntimeState {
         self.session_kind = SessionKind::Ssh;
         self.interactive_shell = false;
         self.awaiting_external_editor = false;
+        self.prompt_marks.clear();
+        self.reported_cwd = None;
+        self.at_prompt = false;
         self.project_id = Some(launch.project_id.clone());
         self.tab_id = Some(launch.tab_id.clone());
         self.command_id = None;
@@ -547,6 +592,90 @@ impl SessionRuntimeState {
             self.unseen_ready = false;
             self.mark_dirty();
         }
+    }
+
+    pub fn note_shell_integration_detected(&mut self, kind: ShellIntegrationKind) {
+        if self.shell_integration == kind {
+            return;
+        }
+        self.shell_integration = kind;
+        self.mark_dirty();
+    }
+
+    pub fn note_shell_reported_cwd(&mut self, cwd: PathBuf) {
+        let changed = self.reported_cwd.as_ref() != Some(&cwd) || self.cwd != cwd;
+        if !changed {
+            return;
+        }
+        self.reported_cwd = Some(cwd.clone());
+        self.cwd = cwd;
+        self.mark_dirty();
+    }
+
+    pub fn note_prompt_mark(
+        &mut self,
+        buffer_line: usize,
+        kind: PromptMarkKind,
+        exit_status: Option<i32>,
+    ) {
+        const MAX_PROMPT_MARKS: usize = 256;
+
+        self.at_prompt = matches!(
+            kind,
+            PromptMarkKind::PromptStart
+                | PromptMarkKind::PromptContinuation
+                | PromptMarkKind::InputReady
+                | PromptMarkKind::CommandFinished
+        );
+        self.prompt_marks.push(PromptMark {
+            buffer_line,
+            kind,
+            exit_status,
+        });
+        if self.prompt_marks.len() > MAX_PROMPT_MARKS {
+            let overflow = self.prompt_marks.len() - MAX_PROMPT_MARKS;
+            self.prompt_marks.drain(0..overflow);
+        }
+        self.mark_dirty();
+    }
+
+    pub fn previous_prompt_line(&self, before_buffer_line: Option<usize>) -> Option<usize> {
+        self.prompt_marks
+            .iter()
+            .rev()
+            .filter(|mark| {
+                matches!(
+                    mark.kind,
+                    PromptMarkKind::PromptStart
+                        | PromptMarkKind::PromptContinuation
+                        | PromptMarkKind::InputReady
+                )
+            })
+            .find(|mark| {
+                before_buffer_line
+                    .map(|buffer_line| mark.buffer_line < buffer_line)
+                    .unwrap_or(true)
+            })
+            .map(|mark| mark.buffer_line)
+    }
+
+    pub fn next_prompt_line(&self, after_buffer_line: Option<usize>) -> Option<usize> {
+        self.prompt_marks
+            .iter()
+            .filter(|mark| {
+                matches!(
+                    mark.kind,
+                    PromptMarkKind::PromptStart
+                        | PromptMarkKind::PromptContinuation
+                        | PromptMarkKind::InputReady
+                )
+            })
+            .find(|mark| {
+                after_buffer_line
+                    .map(|buffer_line| mark.buffer_line > buffer_line)
+                    .unwrap_or(true)
+            })
+            .map(|mark| mark.buffer_line)
     }
 
     pub fn reconcile_ai_idle(
@@ -874,5 +1003,28 @@ mod tests {
         let confirmed = session.check_pending_notification(too_early);
         assert_eq!(confirmed, AiIdleTransition::NoChange);
         assert!(session.pending_notification.is_some());
+    }
+
+    #[test]
+    fn prompt_marks_drive_navigation_and_prompt_state() {
+        let mut session = SessionRuntimeState::new(
+            "session-1",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        session.note_prompt_mark(4, PromptMarkKind::PromptStart, None);
+        session.note_prompt_mark(5, PromptMarkKind::CommandStart, None);
+        assert!(!session.at_prompt);
+
+        session.note_prompt_mark(8, PromptMarkKind::InputReady, None);
+        session.note_prompt_mark(12, PromptMarkKind::CommandFinished, Some(0));
+
+        assert!(session.at_prompt);
+        assert_eq!(session.previous_prompt_line(Some(8)), Some(4));
+        assert_eq!(session.previous_prompt_line(Some(13)), Some(8));
+        assert_eq!(session.next_prompt_line(Some(4)), Some(8));
+        assert_eq!(session.next_prompt_line(Some(8)), None);
     }
 }

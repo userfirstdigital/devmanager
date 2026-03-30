@@ -1102,6 +1102,10 @@ pub struct SettingsDraft {
     pub option_as_meta: bool,
     pub copy_on_select: bool,
     pub keep_selection_on_copy: bool,
+    pub show_terminal_scrollbar: bool,
+    pub shell_integration_enabled: bool,
+    pub terminal_mouse_override: bool,
+    pub terminal_read_only: bool,
     pub open_picker: Option<SettingsPicker>,
 }
 
@@ -1289,6 +1293,10 @@ pub enum EditorAction {
     ToggleOptionAsMeta,
     ToggleCopyOnSelect,
     ToggleKeepSelectionOnCopy,
+    ToggleShowTerminalScrollbar,
+    ToggleShellIntegrationEnabled,
+    ToggleTerminalMouseOverride,
+    ToggleTerminalReadOnly,
     ToggleProjectPinned,
     ToggleProjectSaveLogs,
     ToggleFolderHidden,
@@ -1660,6 +1668,30 @@ fn render_settings_panel(
             draft.keep_selection_on_copy,
             "Leave the current selection highlighted after copy.",
             (actions.on_action)(EditorAction::ToggleKeepSelectionOnCopy),
+        ),
+        FormField::toggle(
+            "Show terminal scrollbar",
+            draft.show_terminal_scrollbar,
+            "Keep a visible scroll indicator on terminal tabs.",
+            (actions.on_action)(EditorAction::ToggleShowTerminalScrollbar),
+        ),
+        FormField::toggle(
+            "Enable shell integration",
+            draft.shell_integration_enabled,
+            "Allow Ghostty-style shell markers for supported shells.",
+            (actions.on_action)(EditorAction::ToggleShellIntegrationEnabled),
+        ),
+        FormField::toggle(
+            "Override app mouse capture",
+            draft.terminal_mouse_override,
+            "Prefer selection and scrolling over terminal mouse reporting.",
+            (actions.on_action)(EditorAction::ToggleTerminalMouseOverride),
+        ),
+        FormField::toggle(
+            "Read-only terminal",
+            draft.terminal_read_only,
+            "Block accidental typing and pasting into terminal tabs.",
+            (actions.on_action)(EditorAction::ToggleTerminalReadOnly),
         ),
         FormField::custom(
             render_settings_select_row(
@@ -2969,6 +3001,10 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         option_as_meta: false,
         copy_on_select: true,
         keep_selection_on_copy: false,
+        show_terminal_scrollbar: true,
+        shell_integration_enabled: true,
+        terminal_mouse_override: false,
+        terminal_read_only: false,
         open_picker,
     }
 }

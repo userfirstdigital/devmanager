@@ -10,9 +10,15 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement,
     SharedString, StrikethroughStyle, Styled, StyledImage, TextRun, UnderlineStyle, Window,
 };
+use std::sync::Arc;
 
 pub const TERMINAL_FONT_SIZE: f32 = 13.0;
 pub const TERMINAL_LINE_HEIGHT: f32 = 18.0;
+pub const TERMINAL_SCROLLBAR_WIDTH_PX: f32 = 10.0;
+pub const TERMINAL_SCROLLBAR_TRACK_INSET_X_PX: f32 = 2.0;
+pub const TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX: f32 = 6.0;
+pub const TERMINAL_SCROLLBAR_TRACK_WIDTH_PX: f32 = 6.0;
+pub const TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX: f32 = 18.0;
 
 pub fn terminal_line_height(font_size: f32) -> f32 {
     (font_size + 5.0).max(TERMINAL_LINE_HEIGHT)
@@ -39,6 +45,9 @@ pub struct TerminalPaneModel {
     pub cell_width: f32,
     pub line_height: f32,
     pub selection: Option<TerminalSelectionSnapshot>,
+    pub search: Option<TerminalSearchUiModel>,
+    pub search_highlight: Option<TerminalSearchHighlight>,
+    pub scrollbar: Option<TerminalScrollbarModel>,
     pub runtime_controls: Option<TerminalRuntimeControlsModel>,
     pub splash_image: Option<std::sync::Arc<gpui::RenderImage>>,
 }
@@ -51,6 +60,26 @@ pub struct TerminalPaneActions {
     pub on_kill_port: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_open_local_url: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_prompt_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_toggle_search: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_search_prev: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_search_next: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_toggle_search_case: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_close_search: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_jump_prev_prompt: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_jump_next_prompt: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_export_screen: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_export_scrollback: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_export_selection: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_toggle_mouse_override: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_toggle_read_only: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub scrollbar: Option<TerminalScrollbarActions>,
+}
+
+#[derive(Clone)]
+pub struct TerminalScrollbarActions {
+    pub on_mouse_down: Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_mouse_move: Arc<dyn Fn(&gpui::MouseMoveEvent, &mut Window, &mut App)>,
+    pub on_mouse_up: Arc<dyn Fn(&gpui::MouseUpEvent, &mut Window, &mut App)>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,12 +96,46 @@ pub struct TerminalRuntimeControlsModel {
     pub kill_color: u32,
     pub prompt_action_label: Option<String>,
     pub prompt_action_color: u32,
+    pub search_active: bool,
+    pub search_case_sensitive: bool,
+    pub search_summary: Option<String>,
+    pub can_search: bool,
+    pub can_jump_prev_prompt: bool,
+    pub can_jump_next_prompt: bool,
+    pub can_export_screen: bool,
+    pub can_export_scrollback: bool,
+    pub can_export_selection: bool,
+    pub mouse_override_enabled: bool,
+    pub read_only_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalSearchUiModel {
+    pub query: String,
+    pub summary: String,
+    pub case_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalSearchHighlight {
+    pub row: usize,
+    pub start_column: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalScrollbarModel {
+    pub thumb_top_ratio: f32,
+    pub thumb_height_ratio: f32,
 }
 
 pub fn render_terminal_surface(
     model: &TerminalPaneModel,
     actions: Option<TerminalPaneActions>,
 ) -> impl IntoElement {
+    let scrollbar_actions = actions
+        .as_ref()
+        .and_then(|actions| actions.scrollbar.clone());
     let notice = model.startup_notice.as_ref().map(|message| {
         div()
             .px_2()
@@ -156,6 +219,9 @@ pub fn render_terminal_surface(
         render_grid(
             session,
             model.selection.as_ref(),
+            model.search_highlight,
+            model.scrollbar,
+            scrollbar_actions,
             model.font_size,
             model.cell_width,
             model.line_height,
@@ -257,6 +323,7 @@ pub fn render_terminal_surface(
                     .bg(rgb(theme::TERMINAL_BG))
                     .children(notice)
                     .children(blocking_notice)
+                    .children(model.search.as_ref().map(render_search_bar))
                     .children(exit_banner)
                     .child(terminal_body)
                     .children(model.debug_enabled.then(|| {
@@ -276,16 +343,32 @@ pub fn render_terminal_surface(
 fn render_grid(
     session: &TerminalSessionView,
     selection: Option<&TerminalSelectionSnapshot>,
+    search_highlight: Option<TerminalSearchHighlight>,
+    scrollbar: Option<TerminalScrollbarModel>,
+    scrollbar_actions: Option<TerminalScrollbarActions>,
     font_size: f32,
     cell_width: f32,
     line_height: f32,
 ) -> impl IntoElement {
     let (background_runs, text_runs, cursor_overlay) = collect_grid_paint_runs(session, selection);
+    let search_highlight = search_highlight.map(|highlight| {
+        let start_column = highlight.start_column.min(session.screen.cols);
+        let end_column = highlight
+            .end_column
+            .min(session.screen.cols)
+            .max(start_column + 1);
+        TerminalBackgroundRect {
+            row: highlight.row.min(session.screen.rows.saturating_sub(1)),
+            start_column,
+            cell_count: end_column.saturating_sub(start_column),
+            color: theme::PRIMARY_MUTED,
+        }
+    });
 
     div()
         .flex_1()
         .flex()
-        .flex_col()
+        .flex_row()
         .bg(rgb(theme::TERMINAL_BG))
         .overflow_hidden()
         .child(
@@ -298,6 +381,7 @@ fn render_grid(
                 .bg(rgb(theme::TERMINAL_BG))
                 .child(render_grid_canvas(
                     background_runs,
+                    search_highlight,
                     text_runs,
                     cursor_overlay,
                     font_size,
@@ -305,6 +389,7 @@ fn render_grid(
                     line_height,
                 )),
         )
+        .children(scrollbar.map(|scrollbar| render_scrollbar(scrollbar, scrollbar_actions)))
 }
 
 fn render_empty_body(
@@ -331,6 +416,122 @@ fn render_empty_body(
                 .text_color(rgb(theme::TEXT_SUBTLE))
                 .child(SharedString::from(message))
         }))
+}
+
+fn render_search_bar(model: &TerminalSearchUiModel) -> impl IntoElement {
+    div()
+        .mx_2()
+        .mt_1()
+        .px_2()
+        .py(px(6.0))
+        .bg(rgb(theme::PANEL_HEADER_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child("Search"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(SharedString::from(model.query.clone())),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if model.case_sensitive {
+                            theme::PRIMARY
+                        } else {
+                            theme::TEXT_DIM
+                        }))
+                        .child(if model.case_sensitive { "Aa" } else { "aa" }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child(SharedString::from(model.summary.clone())),
+                ),
+        )
+}
+
+fn render_scrollbar(
+    scrollbar: TerminalScrollbarModel,
+    actions: Option<TerminalScrollbarActions>,
+) -> impl IntoElement {
+    canvas(
+        move |_bounds, _window, _cx| (scrollbar, actions.clone()),
+        move |bounds: Bounds<_>, state, window, _cx| {
+            let (scrollbar, actions) = state;
+            let track = Bounds::new(
+                point(
+                    bounds.origin.x + px(TERMINAL_SCROLLBAR_TRACK_INSET_X_PX),
+                    bounds.origin.y + px(TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX),
+                ),
+                size(
+                    px(TERMINAL_SCROLLBAR_TRACK_WIDTH_PX),
+                    (bounds.size.height - px(TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX * 2.0))
+                        .max(px(12.0)),
+                ),
+            );
+            window.paint_quad(fill(track, rgb(theme::PANEL_HEADER_BG)));
+
+            let thumb_height = (track.size.height * scrollbar.thumb_height_ratio.clamp(0.08, 1.0))
+                .max(px(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX));
+            let thumb_range = (track.size.height - thumb_height).max(px(0.0));
+            let thumb_top =
+                track.origin.y + thumb_range * scrollbar.thumb_top_ratio.clamp(0.0, 1.0);
+            let thumb = Bounds::new(
+                point(track.origin.x, thumb_top),
+                size(track.size.width, thumb_height),
+            );
+            window.paint_quad(fill(thumb, rgb(theme::TEXT_DIM)));
+
+            if let Some(actions) = actions.as_ref() {
+                let on_mouse_down = actions.on_mouse_down.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, _, window, cx| {
+                    if bounds.contains(&event.position) {
+                        (on_mouse_down)(event, window, cx);
+                    }
+                });
+
+                let on_mouse_move = actions.on_mouse_move.clone();
+                window.on_mouse_event(move |event: &gpui::MouseMoveEvent, _, window, cx| {
+                    (on_mouse_move)(event, window, cx);
+                });
+
+                let on_mouse_up = actions.on_mouse_up.clone();
+                window.on_mouse_event(move |event: &gpui::MouseUpEvent, _, window, cx| {
+                    (on_mouse_up)(event, window, cx);
+                });
+            }
+        },
+    )
+    .w(px(TERMINAL_SCROLLBAR_WIDTH_PX))
+    .flex_none()
+    .h_full()
 }
 
 fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
@@ -513,6 +714,7 @@ fn collect_grid_paint_runs(
 
 fn render_grid_canvas(
     background_runs: Vec<TerminalBackgroundRect>,
+    search_highlight: Option<TerminalBackgroundRect>,
     text_runs: Vec<TerminalTextRun>,
     cursor_overlay: Option<TerminalCursorOverlay>,
     font_size: f32,
@@ -520,9 +722,21 @@ fn render_grid_canvas(
     line_height: f32,
 ) -> impl IntoElement {
     canvas(
-        move |_bounds, _window, _cx| (background_runs, text_runs, cursor_overlay),
-        move |bounds: Bounds<_>, (background_runs, text_runs, cursor_overlay), window, cx| {
+        move |_bounds, _window, _cx| (background_runs, search_highlight, text_runs, cursor_overlay),
+        move |bounds: Bounds<_>,
+              (background_runs, search_highlight, text_runs, cursor_overlay),
+              window,
+              cx| {
             for run in background_runs {
+                let position = point(
+                    bounds.origin.x + px(run.start_column as f32 * cell_width),
+                    bounds.origin.y + px(run.row as f32 * line_height),
+                );
+                let run_size = size(px(cell_width * run.cell_count as f32), px(line_height));
+                window.paint_quad(fill(Bounds::new(position, run_size), rgb(run.color)));
+            }
+
+            if let Some(run) = search_highlight {
                 let position = point(
                     bounds.origin.x + px(run.start_column as f32 * cell_width),
                     bounds.origin.y + px(run.row as f32 * line_height),
@@ -817,10 +1031,23 @@ fn render_runtime_actions(
         on_start_server,
         on_stop_server,
         on_restart_server,
-        on_clear_output,
+        on_clear_output: _,
         on_kill_port,
         on_open_local_url,
         on_prompt_action,
+        on_toggle_search,
+        on_search_prev,
+        on_search_next,
+        on_toggle_search_case,
+        on_close_search,
+        on_jump_prev_prompt: _,
+        on_jump_next_prompt: _,
+        on_export_screen: _,
+        on_export_scrollback,
+        on_export_selection,
+        on_toggle_mouse_override: _,
+        on_toggle_read_only: _,
+        scrollbar: _,
     } = actions;
 
     div()
@@ -850,13 +1077,6 @@ fn render_runtime_actions(
         )
         .children(
             controls
-                .can_clear
-                .then_some(on_clear_output)
-                .flatten()
-                .map(|on_click| runtime_action_button("clear", theme::TEXT_MUTED, on_click)),
-        )
-        .children(
-            controls
                 .can_kill_port
                 .then_some(on_kill_port)
                 .flatten()
@@ -878,6 +1098,83 @@ fn render_runtime_actions(
                 .map(|(label, on_click)| {
                     runtime_action_button(label.as_str(), controls.prompt_action_color, on_click)
                 }),
+        )
+        .children(
+            controls
+                .can_search
+                .then_some(on_toggle_search)
+                .flatten()
+                .map(|on_click| {
+                    runtime_action_button(
+                        if controls.search_active {
+                            "find"
+                        } else {
+                            "search"
+                        },
+                        if controls.search_active {
+                            theme::PRIMARY
+                        } else {
+                            theme::TEXT_MUTED
+                        },
+                        on_click,
+                    )
+                }),
+        )
+        .children(
+            controls
+                .search_active
+                .then_some(on_search_prev)
+                .flatten()
+                .map(|on_click| runtime_action_button("prev", theme::TEXT_MUTED, on_click)),
+        )
+        .children(
+            controls
+                .search_active
+                .then_some(on_search_next)
+                .flatten()
+                .map(|on_click| runtime_action_button("next", theme::TEXT_MUTED, on_click)),
+        )
+        .children(
+            controls
+                .search_active
+                .then_some(on_toggle_search_case)
+                .flatten()
+                .map(|on_click| {
+                    runtime_action_button(
+                        if controls.search_case_sensitive {
+                            "Aa"
+                        } else {
+                            "aa"
+                        },
+                        if controls.search_case_sensitive {
+                            theme::PRIMARY
+                        } else {
+                            theme::TEXT_MUTED
+                        },
+                        on_click,
+                    )
+                }),
+        )
+        .children(
+            controls
+                .search_active
+                .then_some(on_close_search)
+                .flatten()
+                .map(|on_click| runtime_action_button("close", theme::TEXT_MUTED, on_click)),
+        )
+        .children(
+            controls
+                .can_export_scrollback
+                .then_some(on_export_scrollback)
+                .flatten()
+                .map(|on_click| runtime_action_button("export", theme::TEXT_MUTED, on_click)),
+        )
+        .children(
+            controls
+                .can_export_selection
+                .then_some(on_export_selection)
+                .flatten()
+                .map(|on_click| runtime_action_button("selection", theme::TEXT_MUTED, on_click)),
         )
 }
 

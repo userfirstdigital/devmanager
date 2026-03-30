@@ -129,6 +129,10 @@ pub struct Settings {
     pub option_as_meta: bool,
     pub copy_on_select: bool,
     pub keep_selection_on_copy: bool,
+    pub show_terminal_scrollbar: bool,
+    pub shell_integration_enabled: bool,
+    pub terminal_mouse_override: bool,
+    pub terminal_read_only: bool,
 }
 
 impl Default for Settings {
@@ -148,6 +152,10 @@ impl Default for Settings {
             option_as_meta: false,
             copy_on_select: false,
             keep_selection_on_copy: true,
+            show_terminal_scrollbar: true,
+            shell_integration_enabled: true,
+            terminal_mouse_override: false,
+            terminal_read_only: false,
         }
     }
 }

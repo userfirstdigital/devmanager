@@ -10,7 +10,8 @@ use crate::state::{
     SshLaunchSpec,
 };
 use crate::terminal::session::{
-    preferred_windows_bash_program, TerminalBackend, TerminalSession, TerminalSessionView,
+    bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalSession,
+    TerminalSessionView,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -189,6 +190,11 @@ impl ProcessManager {
             cwd.to_path_buf(),
             dimensions,
             default_terminal,
+            self.inner
+                .settings
+                .read()
+                .map(|settings| settings.shell_integration_enabled)
+                .unwrap_or(true),
             self.log_buffer_size(),
             self.inner.runtime_state.clone(),
             self.inner.debug_enabled,
@@ -289,6 +295,45 @@ impl ProcessManager {
     pub fn scroll_session(&self, session_id: &str, delta_lines: i32) -> Result<(), String> {
         let session = self.get_session(session_id)?;
         session.scroll(delta_lines)
+    }
+
+    pub fn scroll_session_to_offset(
+        &self,
+        session_id: &str,
+        display_offset: usize,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        session.scroll_to_display_offset(display_offset)
+    }
+
+    pub fn scroll_session_to_buffer_line(
+        &self,
+        session_id: &str,
+        buffer_line: usize,
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        session.scroll_to_buffer_line(buffer_line)
+    }
+
+    pub fn session_screen_text(&self, session_id: &str) -> Result<String, String> {
+        let session = self.get_session(session_id)?;
+        Ok(session.screen_text())
+    }
+
+    pub fn session_scrollback_text(&self, session_id: &str) -> Result<String, String> {
+        let session = self.get_session(session_id)?;
+        Ok(session.scrollback_text())
+    }
+
+    pub fn search_session(
+        &self,
+        session_id: &str,
+        query: &str,
+        case_sensitive: bool,
+        max_results: usize,
+    ) -> Result<Vec<crate::terminal::session::TerminalSearchMatch>, String> {
+        let session = self.get_session(session_id)?;
+        Ok(session.search(query, case_sensitive, max_results))
     }
 
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
@@ -2052,13 +2097,16 @@ fn build_interactive_shell_command(settings: &Settings) -> (String, Vec<String>)
             crate::models::DefaultTerminal::Cmd => ("cmd.exe".to_string(), Vec::new()),
             crate::models::DefaultTerminal::Bash => (
                 preferred_windows_bash_program(),
-                vec!["--login".to_string()],
+                bash_shell_args(settings.shell_integration_enabled),
             ),
         };
     }
 
     match settings.default_terminal.clone() {
-        crate::models::DefaultTerminal::Bash => ("bash".to_string(), Vec::new()),
+        crate::models::DefaultTerminal::Bash => (
+            "bash".to_string(),
+            bash_shell_args(settings.shell_integration_enabled),
+        ),
         _ => {
             let shell = resolve_shell_path(settings);
             (shell, Vec::new())
