@@ -19,6 +19,7 @@ const UPDATE_ENDPOINTS_VAR: &str = "DEVMANAGER_UPDATE_ENDPOINTS";
 const UPDATE_PUBKEY_VAR: &str = "DEVMANAGER_UPDATE_PUBKEY";
 const UPDATE_WINDOWS_INSTALL_MODE_VAR: &str = "DEVMANAGER_UPDATE_WINDOWS_INSTALL_MODE";
 const BACKGROUND_UPDATE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const READY_UPDATE_RECHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdaterStage {
@@ -285,7 +286,7 @@ impl UpdaterService {
         thread::spawn(move || {
             let _ = updater.check_for_updates();
             loop {
-                thread::sleep(BACKGROUND_UPDATE_INTERVAL);
+                thread::sleep(updater.background_check_interval());
                 let _ = updater.check_for_updates();
             }
         });
@@ -355,6 +356,10 @@ impl Default for UpdaterService {
 }
 
 impl UpdaterService {
+    fn background_check_interval(&self) -> Duration {
+        self.inner.background_check_interval()
+    }
+
     fn spawn_download_thread(inner: Arc<UpdaterInner>, update: PackagerUpdate) {
         let version = update.version.clone();
         thread::spawn(move || {
@@ -375,6 +380,19 @@ impl UpdaterService {
 }
 
 impl UpdaterInner {
+    fn background_check_interval(&self) -> Duration {
+        self.state
+            .read()
+            .map(|state| {
+                if state.ready_update.is_some() {
+                    READY_UPDATE_RECHECK_INTERVAL
+                } else {
+                    BACKGROUND_UPDATE_INTERVAL
+                }
+            })
+            .unwrap_or(BACKGROUND_UPDATE_INTERVAL)
+    }
+
     fn prepare_check(&self) -> Result<CheckPlan, String> {
         let mut state = self
             .state
@@ -387,6 +405,11 @@ impl UpdaterInner {
             return Err(state.snapshot.detail.clone());
         }
         if state.ready_update.is_some() {
+            state.snapshot.stage = UpdaterStage::Checking;
+            state.snapshot.detail = format!(
+                "Checking {} for something newer than the downloaded update...",
+                summarize_endpoint(state.snapshot.endpoints.first())
+            );
             return Ok(CheckPlan::PreserveReady);
         }
         state.pending_update = None;
@@ -800,6 +823,11 @@ mod tests {
 
         inner.set_ready_to_install(ready_update.clone(), vec![1, 2, 3]);
         assert_eq!(inner.prepare_check().unwrap(), CheckPlan::PreserveReady);
+        {
+            let state = inner.state.read().unwrap();
+            assert_eq!(state.snapshot.stage, UpdaterStage::Checking);
+            assert_eq!(state.snapshot.target_version.as_deref(), Some("0.2.1"));
+        }
         assert_eq!(
             inner.prepare_auto_download(&newer_update).unwrap(),
             AutoDownloadAction::Start
@@ -814,6 +842,22 @@ mod tests {
                 .as_ref()
                 .map(|update| update.update.version.as_str()),
             Some("0.2.1")
+        );
+    }
+
+    #[test]
+    fn ready_update_uses_faster_background_recheck_interval() {
+        let inner = test_inner();
+        assert_eq!(
+            inner.background_check_interval(),
+            BACKGROUND_UPDATE_INTERVAL
+        );
+
+        inner.set_ready_to_install(test_update("0.2.1", None), vec![1, 2, 3]);
+
+        assert_eq!(
+            inner.background_check_interval(),
+            READY_UPDATE_RECHECK_INTERVAL
         );
     }
 
