@@ -363,6 +363,23 @@ impl ProcessManager {
         })
     }
 
+    pub fn all_session_views(&self) -> HashMap<String, TerminalSessionView> {
+        let runtime = self.runtime_state();
+        let mut views = HashMap::new();
+        for (session_id, runtime_session) in runtime.sessions.iter() {
+            if let Ok(session) = self.get_session(session_id) {
+                views.insert(
+                    session_id.clone(),
+                    TerminalSessionView {
+                        runtime: runtime_session.clone(),
+                        screen: session.snapshot(),
+                    },
+                );
+            }
+        }
+        views
+    }
+
     pub fn record_frame(&self, session_id: &str, render_duration: Duration) {
         let render_micros = render_duration.as_micros() as u64;
         self.update_session_state(session_id, |state| state.record_frame(render_micros));
@@ -2332,7 +2349,8 @@ fn next_ai_session_id(tab_type: &TabType) -> String {
         .unwrap_or_default()
         .as_millis();
     let counter = AI_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{millis:x}-{counter:x}")
+    let scope = crate::persistence::runtime_session_scope();
+    format!("{prefix}-{scope}-{millis:x}-{counter:x}")
 }
 
 fn next_ssh_session_id(connection_id: &str) -> String {
@@ -2341,7 +2359,8 @@ fn next_ssh_session_id(connection_id: &str) -> String {
         .unwrap_or_default()
         .as_millis();
     let counter = SSH_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{connection_id}-{millis:x}-{counter:x}")
+    let scope = crate::persistence::runtime_session_scope();
+    format!("{connection_id}-{scope}-{millis:x}-{counter:x}")
 }
 
 #[cfg(test)]

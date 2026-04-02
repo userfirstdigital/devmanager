@@ -42,3 +42,4 @@ serviceAccountKey.json
 /target-scan
 /target-test-*
 /tests/targets/
+/target-live-dev

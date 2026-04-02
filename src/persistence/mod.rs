@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const APP_CONFIG_DIR: &str = "com.userfirst.devmanager";
+const APP_PROFILE_ENV: &str = "DEVMANAGER_PROFILE";
+const APP_INSTANCE_LABEL_ENV: &str = "DEVMANAGER_INSTANCE_LABEL";
 const CONFIG_FILE_NAME: &str = "config.json";
 const SESSION_FILE_NAME: &str = "session.json";
 
@@ -68,8 +70,79 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 
 pub fn app_config_dir() -> Result<PathBuf> {
     dirs::config_dir()
-        .map(|path| path.join(APP_CONFIG_DIR))
+        .map(|path| path.join(app_config_dir_name()))
         .ok_or(PersistenceError::ConfigDirectoryUnavailable)
+}
+
+pub fn app_display_name() -> String {
+    match app_instance_label() {
+        Some(label) => format!("DevManager [{label}]"),
+        None => "DevManager".to_string(),
+    }
+}
+
+pub fn app_instance_label() -> Option<String> {
+    sanitize_instance_label(std::env::var(APP_INSTANCE_LABEL_ENV).ok())
+}
+
+pub fn app_instance_profile() -> Option<String> {
+    sanitize_scope_segment(std::env::var(APP_PROFILE_ENV).ok())
+}
+
+pub fn runtime_session_scope() -> String {
+    app_instance_profile().unwrap_or_else(|| format!("pid-{:x}", std::process::id()))
+}
+
+fn app_config_dir_name() -> String {
+    match app_instance_profile() {
+        Some(profile) => format!("{APP_CONFIG_DIR}-{profile}"),
+        None => APP_CONFIG_DIR.to_string(),
+    }
+}
+
+fn sanitize_scope_segment(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let sanitized: String = trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-').to_string();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn sanitize_instance_label(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let sanitized: String = trimmed
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(32)
+        .collect();
+    let sanitized = sanitized.trim().to_string();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -340,6 +413,32 @@ mod tests {
 
         assert_eq!(session, SessionState::default());
         assert!(!session_path.exists());
+    }
+
+    #[test]
+    fn app_config_dir_name_defaults_without_profile() {
+        assert_eq!(app_config_dir_name(), "com.userfirst.devmanager");
+    }
+
+    #[test]
+    fn sanitize_scope_segment_normalizes_profile_values() {
+        assert_eq!(
+            sanitize_scope_segment(Some(" Dev Watch ".to_string())).as_deref(),
+            Some("dev-watch")
+        );
+        assert_eq!(
+            sanitize_scope_segment(Some("___".to_string())).as_deref(),
+            Some("___")
+        );
+        assert_eq!(sanitize_scope_segment(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn sanitize_instance_label_preserves_human_friendly_text() {
+        assert_eq!(
+            sanitize_instance_label(Some(" Dev Build ".to_string())).as_deref(),
+            Some("Dev Build")
+        );
     }
 
     #[test]

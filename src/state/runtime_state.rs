@@ -1,4 +1,5 @@
 use crate::terminal::session::TerminalBackend;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ const AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE: Duration = Duration::from_secs(2);
 const AI_NOTIFICATION_CONFIRM_DELAY: Duration = Duration::from_secs(2);
 const USER_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SessionStatus {
     #[default]
     Stopped,
@@ -30,7 +31,7 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SessionKind {
     #[default]
     Shell,
@@ -46,21 +47,21 @@ impl SessionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AiActivity {
     #[default]
     Idle,
     Thinking,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ShellIntegrationKind {
     #[default]
     None,
     Ghostty,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PromptMarkKind {
     PromptStart,
     PromptContinuation,
@@ -69,14 +70,14 @@ pub enum PromptMarkKind {
     CommandFinished,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptMark {
     pub buffer_line: usize,
     pub kind: PromptMarkKind,
     pub exit_status: Option<i32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDimensions {
     pub cols: u16,
     pub rows: u16,
@@ -114,7 +115,7 @@ impl SessionDimensions {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionExitState {
     pub code: Option<u32>,
     pub signal: Option<String>,
@@ -122,16 +123,17 @@ pub struct SessionExitState {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     pub cpu_percent: f32,
     pub memory_bytes: u64,
     pub process_count: u32,
     pub process_ids: Vec<u32>,
+    #[serde(skip, default)]
     pub last_sample_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerLaunchSpec {
     pub command_id: String,
     pub project_id: String,
@@ -143,7 +145,7 @@ pub struct ServerLaunchSpec {
     pub log_file_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiLaunchSpec {
     pub tab_id: String,
     pub project_id: String,
@@ -154,7 +156,7 @@ pub struct AiLaunchSpec {
     pub startup_command: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshLaunchSpec {
     pub tab_id: String,
     pub ssh_connection_id: String,
@@ -164,7 +166,7 @@ pub struct SshLaunchSpec {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetrics {
     pub total_pty_bytes: u64,
     pub pty_bytes_per_second: u64,
@@ -173,8 +175,10 @@ pub struct SessionMetrics {
     pub last_render_micros: u64,
     pub resize_events: u64,
     pub scroll_events: u64,
+    #[serde(skip, default = "instant_now")]
     pub last_bytes_sample_at: Instant,
     pub last_bytes_total: u64,
+    #[serde(skip, default = "instant_now")]
     pub last_frames_sample_at: Instant,
     pub last_frames_total: u64,
 }
@@ -198,7 +202,7 @@ impl Default for SessionMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRuntimeState {
     pub session_id: String,
     pub pid: Option<u32>,
@@ -208,6 +212,7 @@ pub struct SessionRuntimeState {
     pub project_id: Option<String>,
     pub command_id: Option<String>,
     pub tab_id: Option<String>,
+    #[serde(skip, default)]
     pub started_at: Option<Instant>,
     pub exit_code: Option<u32>,
     pub auto_restart: bool,
@@ -215,6 +220,7 @@ pub struct SessionRuntimeState {
     pub cwd: PathBuf,
     pub shell_program: String,
     pub bell_count: u64,
+    #[serde(skip, default)]
     pub last_bell_at: Option<Instant>,
     pub dirty_generation: u64,
     pub frame_generation: u64,
@@ -233,14 +239,21 @@ pub struct SessionRuntimeState {
     pub ai_launch: Option<AiLaunchSpec>,
     pub ssh_launch: Option<SshLaunchSpec>,
     pub ai_activity: Option<AiActivity>,
+    #[serde(skip, default)]
     pub last_output_at: Option<Instant>,
+    #[serde(skip, default)]
     pub thinking_since: Option<Instant>,
     pub unseen_ready: bool,
+    #[serde(skip, default)]
     last_user_interrupt_at: Option<Instant>,
+    #[serde(skip, default)]
     last_user_stop_request_at: Option<Instant>,
+    #[serde(skip, default)]
     suppress_activity_until: Option<Instant>,
+    #[serde(skip, default)]
     last_output_event_at: Option<Instant>,
     output_burst_count: u8,
+    #[serde(skip, default)]
     pending_notification: Option<(Instant, AiIdleTransition)>,
 }
 
@@ -766,14 +779,14 @@ impl SessionRuntimeState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AiIdleTransition {
     NoChange,
     BackgroundReady,
     ForegroundReady,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeState {
     pub sessions: HashMap<String, SessionRuntimeState>,
     pub active_session_id: Option<String>,
@@ -788,6 +801,10 @@ impl RuntimeState {
             debug_enabled,
         }
     }
+}
+
+fn instant_now() -> Instant {
+    Instant::now()
 }
 
 pub use SessionRuntimeState as ProcessState;

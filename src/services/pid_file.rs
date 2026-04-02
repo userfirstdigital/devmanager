@@ -1,3 +1,4 @@
+use crate::persistence;
 use crate::services::platform_service;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -125,11 +126,9 @@ fn pid_file_path() -> Result<PathBuf, String> {
         }
     }
 
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| "Could not determine config directory".to_string())?;
-    Ok(config_dir
-        .join("com.userfirst.devmanager")
-        .join("running-pids.json"))
+    let config_dir = persistence::app_config_dir()
+        .map_err(|_| "Could not determine config directory".to_string())?;
+    Ok(config_dir.join("running-pids.json"))
 }
 
 fn read_ledger_from_path(path: &Path) -> ManagedProcessLedgerFile {

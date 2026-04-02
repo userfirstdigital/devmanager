@@ -15,10 +15,12 @@ $BuildTargetDir = Join-Path $RepoRoot "target-watch"
 $BuildOutputDir = Join-Path $BuildTargetDir $BuildProfile
 $BuildExe = Join-Path $BuildOutputDir "devmanager.exe"
 $BuildPdb = Join-Path $BuildOutputDir "devmanager.pdb"
-$LiveDir = Join-Path $RepoRoot "target-live"
+$LiveDir = Join-Path $RepoRoot "target-live-dev"
 $LiveExe = Join-Path $LiveDir "devmanager.exe"
 $LivePdb = Join-Path $LiveDir "devmanager.pdb"
 $script:AppProcess = $null
+$DevManagerProfile = "dev-watch"
+$DevManagerLabel = "Dev"
 
 function Write-Status {
     param(
@@ -130,8 +132,14 @@ function Invoke-BuildAndRelaunch {
         Copy-Item $BuildPdb $LivePdb -Force
     }
 
-    $script:AppProcess = Start-Process -FilePath $LiveExe -WorkingDirectory $RepoRoot -PassThru
-    Write-Status ("Launched DevManager from target-live (pid {0})." -f $script:AppProcess.Id) "success"
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $LiveExe
+    $startInfo.WorkingDirectory = $RepoRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.EnvironmentVariables["DEVMANAGER_PROFILE"] = $DevManagerProfile
+    $startInfo.EnvironmentVariables["DEVMANAGER_INSTANCE_LABEL"] = $DevManagerLabel
+    $script:AppProcess = [System.Diagnostics.Process]::Start($startInfo)
+    Write-Status ("Launched DevManager from target-live-dev (pid {0})." -f $script:AppProcess.Id) "success"
     return $true
 }
 
@@ -180,7 +188,8 @@ $lastReason = "startup"
 $lastChangeAt = Get-Date
 
 Write-Status "Watching src/, assets/, Cargo.toml, and Cargo.lock." "info"
-Write-Status "Builds go to target-watch/ and the running app comes from target-live/ to avoid Windows locking." "info"
+Write-Status "Builds go to target-watch/ and the running app comes from target-live-dev/ to avoid Windows locking." "info"
+Write-Status ("The hot-reload app runs in the '{0}' profile and uses its own app-data/session namespace." -f $DevManagerProfile) "info"
 
 try {
     if ($Once) {

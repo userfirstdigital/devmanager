@@ -15,6 +15,7 @@ use alacritty_terminal::vte::ansi::{
 };
 use arboard::Clipboard;
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TerminalBackend {
     #[default]
     PortablePtyFeedingAlacritty,
@@ -38,14 +39,15 @@ impl TerminalBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalCursorSnapshot {
     pub row: usize,
     pub column: usize,
+    #[serde(with = "cursor_shape_serde")]
     pub shape: CursorShape,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalCellSnapshot {
     pub character: char,
     pub zero_width: Vec<char>,
@@ -62,7 +64,7 @@ pub struct TerminalCellSnapshot {
     pub default_background: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalIndexedCellSnapshot {
     pub row: usize,
     pub column: usize,
@@ -89,7 +91,7 @@ impl TerminalCellSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TerminalModeSnapshot {
     pub alternate_screen: bool,
     pub app_cursor: bool,
@@ -109,7 +111,7 @@ impl TerminalModeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalScreenSnapshot {
     pub cells: Vec<TerminalIndexedCellSnapshot>,
     pub lines: Vec<Vec<TerminalCellSnapshot>>,
@@ -122,7 +124,7 @@ pub struct TerminalScreenSnapshot {
     pub mode: TerminalModeSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSearchMatch {
     pub buffer_line: usize,
     pub start_column: usize,
@@ -130,7 +132,7 @@ pub struct TerminalSearchMatch {
     pub preview: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSessionView {
     pub runtime: SessionRuntimeState,
     pub screen: TerminalScreenSnapshot,
@@ -1077,6 +1079,37 @@ fn read_system_clipboard_text() -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
     let text = clipboard.get_text().ok()?;
     Some(truncate_utf8_boundary(&text, MAX_TERMINAL_CLIPBOARD_BYTES).to_string())
+}
+
+mod cursor_shape_serde {
+    use super::CursorShape;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(shape: &CursorShape, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match shape {
+            CursorShape::Block => "block",
+            CursorShape::Underline => "underline",
+            CursorShape::Beam => "beam",
+            CursorShape::Hidden => "hidden",
+            _ => "hidden",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<CursorShape, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "block" => CursorShape::Block,
+            "underline" => CursorShape::Underline,
+            "beam" => CursorShape::Beam,
+            _ => CursorShape::Hidden,
+        })
+    }
 }
 
 fn write_system_clipboard_text(text: &str) -> Result<(), String> {

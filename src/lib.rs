@@ -4,6 +4,7 @@ pub mod icons;
 pub mod models;
 pub mod notifications;
 pub mod persistence;
+pub mod remote;
 pub mod services;
 pub mod sidebar;
 pub mod state;

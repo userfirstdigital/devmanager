@@ -6,6 +6,11 @@ use crate::models::{
     RunCommand, SSHConnection, SessionState, SessionTab, TabType,
 };
 use crate::notifications;
+use crate::remote::{
+    self, ClientAuth, PendingRemoteRequest, RemoteAction, RemoteActionPayload, RemoteActionResult,
+    RemoteClientHandle, RemoteClientPool, RemoteHostService, RemoteMachineState,
+    RemoteTerminalExport, RemoteTerminalInput,
+};
 use crate::services::{
     env_service, pid_file, platform_service, ports_service, scanner_service, ConfigImportMode,
     ManagedShutdownReport, ProcessManager, SessionManager,
@@ -28,7 +33,7 @@ use gpui::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +44,8 @@ const NOTICE_HEIGHT_PX: f32 = 26.0;
 const SEARCH_BAR_HEIGHT_PX: f32 = 34.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_HOST_SNAPSHOT_ACTIVE_INTERVAL: Duration = Duration::from_millis(120);
+const REMOTE_HOST_SNAPSHOT_IDLE_INTERVAL: Duration = Duration::from_millis(1500);
 const APP_WINDOW_TITLE: &str = "DevManager";
 const WINDOW_TITLE_SEPARATOR: &str = " • ";
 
@@ -78,7 +85,7 @@ pub fn run() {
                 WindowOptions {
                     window_bounds: Some(window_bounds),
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some(APP_WINDOW_TITLE.into()),
+                        title: Some(app_window_title().into()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -109,6 +116,13 @@ struct NativeShell {
     startup_notice: Option<String>,
     terminal_notice: Option<String>,
     editor_notice: Option<String>,
+    remote_machine_state: RemoteMachineState,
+    remote_host_service: RemoteHostService,
+    remote_client_pool: RemoteClientPool,
+    remote_mode: Option<RemoteModeState>,
+    local_state_backup: Option<AppState>,
+    last_remote_host_config_revision: u64,
+    last_remote_snapshot_sync_at: Option<Instant>,
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
     did_focus_terminal: bool,
@@ -134,7 +148,18 @@ struct NativeShell {
     last_window_title: Option<String>,
     splash_image: Option<Arc<RenderImage>>,
     splash_fetch_in_flight: bool,
+    native_dialog_blockers: Arc<AtomicUsize>,
     window_subscriptions: Vec<Subscription>,
+}
+
+struct NativeDialogPauseGuard {
+    blockers: Arc<AtomicUsize>,
+}
+
+impl Drop for NativeDialogPauseGuard {
+    fn drop(&mut self) {
+        self.blockers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -262,9 +287,19 @@ struct SshPasswordPromptMatch {
     fingerprint: String,
 }
 
+#[derive(Clone)]
+struct RemoteModeState {
+    client: RemoteClientHandle,
+    snapshot: remote::RemoteWorkspaceSnapshot,
+    connected_label: String,
+    pool_key: String,
+}
+
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
+        let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
+        let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
         let (mut state, startup_notice) = match session_manager.load_workspace() {
             Ok(snapshot) => (AppState::from_workspace(snapshot), None),
             Err(error) => (
@@ -279,6 +314,8 @@ impl NativeShell {
         process_manager.set_notification_sound(state.config.settings.notification_sound.clone());
         process_manager.set_log_buffer_size(state.config.settings.log_buffer_size as usize);
         let updater = UpdaterService::new();
+        let remote_host_service = RemoteHostService::new(remote_machine_state.host.clone());
+        let remote_client_pool = RemoteClientPool::default();
         let mut terminal_notice = None;
         let restore_enabled = state
             .config
@@ -304,8 +341,9 @@ impl NativeShell {
         let _ = session_manager.save_session(&persisted_session_state(&state));
         updater.start_background_checks();
         if updater.is_configured() {
-            Self::spawn_updater_refresh_task(updater.clone(), cx);
+            Self::spawn_updater_refresh_task(updater.clone(), native_dialog_blockers.clone(), cx);
         }
+        Self::spawn_remote_refresh_task(native_dialog_blockers.clone(), cx);
 
         let shell = Self {
             state,
@@ -315,6 +353,13 @@ impl NativeShell {
             startup_notice,
             terminal_notice,
             editor_notice: None,
+            remote_machine_state,
+            remote_host_service,
+            remote_client_pool,
+            remote_mode: None,
+            local_state_backup: None,
+            last_remote_host_config_revision: 0,
+            last_remote_snapshot_sync_at: None,
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
             did_focus_terminal: false,
@@ -340,10 +385,11 @@ impl NativeShell {
             last_window_title: None,
             splash_image: None,
             splash_fetch_in_flight: false,
+            native_dialog_blockers,
             window_subscriptions: Vec::new(),
         };
 
-        Self::spawn_splash_image_fetch(cx);
+        Self::spawn_splash_image_fetch(shell.native_dialog_blockers.clone(), cx);
 
         shell
     }
@@ -424,13 +470,17 @@ impl NativeShell {
         })
     }
 
-    fn spawn_splash_image_fetch(cx: &mut Context<Self>) {
+    fn spawn_splash_image_fetch(native_dialog_blockers: Arc<AtomicUsize>, cx: &mut Context<Self>) {
         let executor = cx.background_executor().clone();
         cx.spawn(
             move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut async_cx = cx.clone();
+                let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
                     let image = executor.spawn(async move { fetch_splash_image() }).await;
+                    while native_dialog_blockers.load(Ordering::Acquire) > 0 {
+                        executor.timer(Duration::from_millis(50)).await;
+                    }
                     let _ = this.update(&mut async_cx, |shell, cx| {
                         shell.splash_fetch_in_flight = false;
                         if let Some(image) = image {
@@ -447,15 +497,20 @@ impl NativeShell {
     fn ensure_splash_image(&mut self, cx: &mut Context<Self>) {
         if self.splash_image.is_none() && !self.splash_fetch_in_flight {
             self.splash_fetch_in_flight = true;
-            Self::spawn_splash_image_fetch(cx);
+            Self::spawn_splash_image_fetch(self.native_dialog_blockers.clone(), cx);
         }
     }
 
-    fn spawn_updater_refresh_task(updater: UpdaterService, cx: &mut Context<Self>) {
+    fn spawn_updater_refresh_task(
+        updater: UpdaterService,
+        native_dialog_blockers: Arc<AtomicUsize>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(
             move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let background_executor = cx.background_executor().clone();
                 let mut async_cx = cx.clone();
+                let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
                     let mut previous_snapshot = updater.snapshot();
                     loop {
@@ -463,6 +518,9 @@ impl NativeShell {
                         let next_snapshot = updater.snapshot();
                         if next_snapshot != previous_snapshot {
                             previous_snapshot = next_snapshot;
+                            while native_dialog_blockers.load(Ordering::Acquire) > 0 {
+                                background_executor.timer(Duration::from_millis(50)).await;
+                            }
                             if this
                                 .update(&mut async_cx, |_, cx: &mut Context<'_, Self>| cx.notify())
                                 .is_err()
@@ -477,7 +535,50 @@ impl NativeShell {
         .detach();
     }
 
+    fn spawn_remote_refresh_task(native_dialog_blockers: Arc<AtomicUsize>, cx: &mut Context<Self>) {
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let background_executor = cx.background_executor().clone();
+                let mut async_cx = cx.clone();
+                let native_dialog_blockers = native_dialog_blockers.clone();
+                async move {
+                    loop {
+                        background_executor.timer(Duration::from_millis(120)).await;
+                        while native_dialog_blockers.load(Ordering::Acquire) > 0 {
+                            background_executor.timer(Duration::from_millis(50)).await;
+                        }
+                        if this
+                            .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
+                                let mut changed = shell.sync_remote_client_snapshot();
+                                if shell.remote_host_service.has_pending_requests() {
+                                    changed = true;
+                                }
+                                if changed {
+                                    cx.notify();
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn pause_for_native_dialog(&self) -> NativeDialogPauseGuard {
+        self.native_dialog_blockers.fetch_add(1, Ordering::AcqRel);
+        NativeDialogPauseGuard {
+            blockers: self.native_dialog_blockers.clone(),
+        }
+    }
+
     fn save_session_state(&mut self) {
+        if self.remote_mode.is_some() {
+            return;
+        }
         if let Err(error) = self
             .session_manager
             .save_session(&persisted_session_state(&self.state))
@@ -487,6 +588,9 @@ impl NativeShell {
     }
 
     fn save_config_state(&mut self) {
+        if self.remote_mode.is_some() {
+            return;
+        }
         if let Err(error) = self.session_manager.save_config(&self.state.config) {
             self.editor_notice = Some(format!("Failed to save config: {error}"));
         } else {
@@ -496,6 +600,852 @@ impl NativeShell {
                 .set_notification_sound(self.state.config.settings.notification_sound.clone());
             self.process_manager
                 .set_log_buffer_size(self.state.config.settings.log_buffer_size as usize);
+        }
+    }
+
+    fn persist_remote_machine_state(&mut self) {
+        if let Err(error) = remote::save_remote_machine_state(&self.remote_machine_state) {
+            self.editor_notice = Some(format!("Failed to save remote settings: {error}"));
+        }
+    }
+
+    fn sync_remote_host_config_from_service(&mut self) {
+        let latest_revision = self.remote_host_service.config_revision();
+        if latest_revision == self.last_remote_host_config_revision {
+            return;
+        }
+        let latest = self.remote_host_service.config();
+        if self.remote_machine_state.host != latest {
+            self.remote_machine_state.host = latest;
+            self.persist_remote_machine_state();
+            self.sync_settings_remote_draft();
+        }
+        self.last_remote_host_config_revision = latest_revision;
+    }
+
+    fn sync_remote_client_snapshot(&mut self) -> bool {
+        let Some(remote_mode) = self.remote_mode.as_mut() else {
+            return false;
+        };
+
+        if let Some(message) = remote_mode.client.disconnected_message() {
+            self.disconnect_remote_host(Some(message));
+            return true;
+        }
+
+        let Some(snapshot) = remote_mode.client.latest_snapshot() else {
+            return false;
+        };
+        remote_mode.snapshot = snapshot.clone();
+        self.state = self.merge_remote_snapshot_into_state(&snapshot);
+        self.sync_settings_remote_draft();
+        true
+    }
+
+    fn merge_remote_snapshot_into_state(
+        &self,
+        snapshot: &remote::RemoteWorkspaceSnapshot,
+    ) -> AppState {
+        let preserve_active = self.state.active_tab_id.clone();
+        let preserve_sidebar = self.state.sidebar_collapsed;
+        let preserve_collapsed = self.state.collapsed_projects.clone();
+        let mut next = snapshot.app_state.clone();
+
+        next.active_tab_id = preserve_active
+            .filter(|active| next.open_tabs.iter().any(|tab| &tab.id == active))
+            .or_else(|| next.open_tabs.first().map(|tab| tab.id.clone()));
+        next.sidebar_collapsed = preserve_sidebar;
+        next.collapsed_projects = preserve_collapsed
+            .into_iter()
+            .filter(|project_id| {
+                next.projects()
+                    .iter()
+                    .any(|project| &project.id == project_id)
+            })
+            .collect();
+        next.window_bounds = self.state.window_bounds;
+        next
+    }
+
+    fn remote_has_control(&self) -> bool {
+        self.remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.snapshot.you_have_control)
+            .unwrap_or(false)
+    }
+
+    fn local_host_has_control(&self) -> bool {
+        self.remote_host_service.local_has_control()
+    }
+
+    fn ensure_remote_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.remote_mode.is_none() || self.remote_has_control() {
+            return true;
+        }
+        self.editor_notice =
+            Some("This remote client is in viewer mode. Take control first.".to_string());
+        cx.notify();
+        false
+    }
+
+    fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.remote_mode.is_some() {
+            return self.ensure_remote_control(cx);
+        }
+        if self.local_host_has_control() {
+            return true;
+        }
+        self.remote_host_service.take_local_control();
+        self.editor_notice =
+            Some("Took control back from the connected remote client.".to_string());
+        self.sync_settings_remote_draft();
+        cx.notify();
+        true
+    }
+
+    fn remote_request(&mut self, action: RemoteAction) -> Result<RemoteActionResult, String> {
+        let Some(remote_mode) = self.remote_mode.as_ref() else {
+            return Err("Remote host is not connected.".to_string());
+        };
+        remote_mode.client.request(action)
+    }
+
+    fn remote_send_terminal_input(&mut self, input: RemoteTerminalInput) {
+        if let Some(remote_mode) = self.remote_mode.as_ref() {
+            remote_mode.client.send_terminal_input(input);
+        }
+    }
+
+    fn remote_send_action(&mut self, action: RemoteAction) {
+        if let Some(remote_mode) = self.remote_mode.as_ref() {
+            remote_mode.client.send_action(action);
+        }
+    }
+
+    fn sync_settings_remote_draft(&mut self) {
+        if !matches!(self.editor_panel, Some(EditorPanel::Settings(_))) {
+            return;
+        }
+
+        let connected_label = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.connected_label.clone());
+        let remote_connected = self.remote_mode.is_some();
+        let remote_has_control = self.remote_has_control();
+        let remote_status = self.remote_host_service.status();
+
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            draft.remote_connected_label = connected_label;
+            draft.remote_has_control = remote_has_control;
+            draft.remote_connected = remote_connected;
+            draft.remote_host_clients = remote_status.connected_clients;
+            draft.remote_host_controller_client_id = remote_status.controller_client_id;
+            draft.remote_known_hosts = self.remote_machine_state.known_hosts.clone();
+            draft.remote_paired_clients = self.remote_machine_state.host.paired_clients.clone();
+            draft.remote_host_enabled = self.remote_machine_state.host.enabled;
+
+            if !draft.remote_connected && draft.remote_connect_address.trim().is_empty() {
+                if let Some(host) = draft.remote_known_hosts.first() {
+                    draft.remote_connect_address = host.address.clone();
+                    draft.remote_connect_port = host.port.to_string();
+                }
+            }
+        }
+    }
+
+    fn sync_remote_host_snapshot_if_due(&mut self, runtime_state: &RuntimeState) {
+        if self.remote_mode.is_some() {
+            return;
+        }
+
+        let remote_status = self.remote_host_service.status();
+        if !remote_status.enabled {
+            self.last_remote_snapshot_sync_at = None;
+            return;
+        }
+
+        let has_pending_requests = self.remote_host_service.has_pending_requests();
+        let refresh_interval = if remote_status.connected_clients > 0 || has_pending_requests {
+            REMOTE_HOST_SNAPSHOT_ACTIVE_INTERVAL
+        } else {
+            REMOTE_HOST_SNAPSHOT_IDLE_INTERVAL
+        };
+        let now = Instant::now();
+        let is_due = self
+            .last_remote_snapshot_sync_at
+            .map(|last_sync| now.duration_since(last_sync) >= refresh_interval)
+            .unwrap_or(true);
+        if !is_due {
+            return;
+        }
+
+        self.remote_host_service.update_snapshot(
+            self.state.clone(),
+            runtime_state.clone(),
+            self.process_manager.all_session_views(),
+            self.server_port_snapshot.statuses.clone(),
+        );
+        self.last_remote_snapshot_sync_at = Some(now);
+    }
+
+    fn connect_remote_host(
+        &mut self,
+        address: String,
+        port: u16,
+        pairing_token: Option<String>,
+    ) -> Result<(), String> {
+        let known_host = self
+            .remote_machine_state
+            .known_hosts
+            .iter()
+            .find(|host| host.address == address && host.port == port)
+            .cloned();
+        let auth = if let Some(token) = pairing_token.filter(|token| !token.trim().is_empty()) {
+            ClientAuth::PairToken {
+                token: token.trim().to_string(),
+            }
+        } else if let Some(host) = known_host.clone() {
+            ClientAuth::ClientToken {
+                client_id: host.client_id,
+                auth_token: host.auth_token,
+            }
+        } else {
+            return Err("Pair with a host token the first time you connect.".to_string());
+        };
+
+        let host_label = format!("{address}:{port}");
+        let expected_fingerprint = known_host
+            .as_ref()
+            .map(|host| host.certificate_fingerprint.trim())
+            .filter(|fingerprint| !fingerprint.is_empty());
+
+        let (
+            client,
+            pool_key,
+            snapshot,
+            server_id,
+            certificate_fingerprint,
+            client_id,
+            client_token,
+        ) = if let Some((pool_key, client)) = self.remote_client_pool.get_reusable(
+            &address,
+            port,
+            known_host.as_ref().map(|host| host.server_id.as_str()),
+            expected_fingerprint,
+        ) {
+            (
+                client.clone(),
+                pool_key,
+                client.latest_snapshot().unwrap_or_default(),
+                client.server_id().to_string(),
+                client.certificate_fingerprint().to_string(),
+                client.client_id().to_string(),
+                client.client_token().to_string(),
+            )
+        } else {
+            let result = RemoteClientHandle::connect(
+                &address,
+                port,
+                "DevManager",
+                auth,
+                expected_fingerprint,
+            )?;
+            let pool_key = self.remote_client_pool.insert(
+                address.clone(),
+                port,
+                result.server_id.clone(),
+                result.certificate_fingerprint.clone(),
+                result.client.clone(),
+            );
+            (
+                result.client,
+                pool_key,
+                result.snapshot,
+                result.server_id,
+                result.certificate_fingerprint,
+                result.client_id,
+                result.client_token,
+            )
+        };
+
+        if self.local_state_backup.is_none() {
+            self.local_state_backup = Some(self.state.clone());
+        }
+        remote::upsert_known_host(
+            &mut self.remote_machine_state,
+            host_label.clone(),
+            address,
+            port,
+            server_id.clone(),
+            certificate_fingerprint,
+            client_id,
+            client_token,
+        );
+        self.persist_remote_machine_state();
+        self.remote_mode = Some(RemoteModeState {
+            client,
+            snapshot,
+            connected_label: host_label,
+            pool_key,
+        });
+        self.state = AppState::default();
+        self.editor_notice = Some("Connected to remote host.".to_string());
+        self.sync_settings_remote_draft();
+        Ok(())
+    }
+
+    fn disconnect_remote_host(&mut self, message: Option<String>) {
+        if let Some(remote_mode) = self.remote_mode.take() {
+            self.remote_client_pool.remove(&remote_mode.pool_key);
+            remote_mode.client.disconnect();
+        }
+        if let Some(local_state) = self.local_state_backup.take() {
+            self.state = local_state;
+        }
+        self.synced_session_id = None;
+        self.last_dimensions = None;
+        self.terminal_notice = message;
+        self.sync_settings_remote_draft();
+    }
+
+    fn current_runtime_snapshot(&self) -> RuntimeState {
+        self.remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.snapshot.runtime_state.clone())
+            .unwrap_or_else(|| self.process_manager.runtime_state())
+    }
+
+    fn current_port_statuses(&self) -> HashMap<u16, PortStatus> {
+        self.remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.snapshot.port_statuses.clone())
+            .unwrap_or_else(|| self.server_port_snapshot.statuses.clone())
+    }
+
+    fn current_active_session_view(&self) -> Option<crate::terminal::session::TerminalSessionView> {
+        if let Some(remote_mode) = self.remote_mode.as_ref() {
+            let active_session_id = self.state.active_terminal_spec().session_id;
+            return remote_mode
+                .snapshot
+                .session_views
+                .get(&active_session_id)
+                .cloned();
+        }
+        self.process_manager.active_session()
+    }
+
+    fn current_session_view(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::terminal::session::TerminalSessionView> {
+        if let Some(remote_mode) = self.remote_mode.as_ref() {
+            return remote_mode.snapshot.session_views.get(session_id).cloned();
+        }
+        self.process_manager.session_view(session_id)
+    }
+
+    fn pump_remote_host_requests(&mut self, cx: &mut Context<Self>) {
+        let requests = self.remote_host_service.drain_requests();
+        if requests.is_empty() {
+            return;
+        }
+
+        let mut did_change = false;
+
+        for request in requests {
+            let PendingRemoteRequest {
+                client_id: _client_id,
+                action,
+                response,
+            } = request;
+
+            let result = match action {
+                RemoteAction::TerminalText { session_id, text } => self
+                    .process_manager
+                    .write_to_session(&session_id, &text)
+                    .map(|_| RemoteActionResult::ok(None, None))
+                    .unwrap_or_else(RemoteActionResult::error),
+                RemoteAction::TerminalBytes { session_id, bytes } => self
+                    .process_manager
+                    .write_bytes_to_session(&session_id, &bytes)
+                    .map(|_| RemoteActionResult::ok(None, None))
+                    .unwrap_or_else(RemoteActionResult::error),
+                RemoteAction::TerminalPaste { session_id, text } => self
+                    .process_manager
+                    .paste_to_session(&session_id, &text)
+                    .map(|_| RemoteActionResult::ok(None, None))
+                    .unwrap_or_else(RemoteActionResult::error),
+                RemoteAction::StartServer {
+                    command_id,
+                    focus,
+                    dimensions,
+                } => {
+                    let result = if focus {
+                        self.process_manager
+                            .start_server(&mut self.state, &command_id, dimensions)
+                    } else {
+                        self.process_manager.start_server_in_background(
+                            &mut self.state,
+                            &command_id,
+                            dimensions,
+                        )
+                    };
+                    match result {
+                        Ok(()) => {
+                            did_change = true;
+                            self.save_session_state();
+                            RemoteActionResult::ok(None, None)
+                        }
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::StopServer { command_id } => {
+                    match self.process_manager.stop_server(&command_id) {
+                        Ok(()) => {
+                            did_change = true;
+                            self.save_session_state();
+                            RemoteActionResult::ok(None, None)
+                        }
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::RestartServer {
+                    command_id,
+                    dimensions,
+                } => match self.process_manager.restart_server(
+                    &mut self.state,
+                    &command_id,
+                    dimensions,
+                ) {
+                    Ok(()) => {
+                        did_change = true;
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::LaunchAi {
+                    project_id,
+                    tab_type,
+                    dimensions,
+                } => match self.process_manager.start_ai_session(
+                    &mut self.state,
+                    &project_id,
+                    tab_type,
+                    dimensions,
+                ) {
+                    Ok(session_id) => {
+                        did_change = true;
+                        self.save_session_state();
+                        RemoteActionResult::ok(Some(format!("Opened {session_id}")), None)
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::OpenAiTab { tab_id, dimensions } => match self
+                    .process_manager
+                    .ensure_ai_session_for_tab(&mut self.state, &tab_id, dimensions, true, false)
+                {
+                    Ok(_) => {
+                        did_change = true;
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::RestartAiTab { tab_id, dimensions } => match self
+                    .process_manager
+                    .restart_ai_session(&mut self.state, &tab_id, dimensions)
+                {
+                    Ok(_) => {
+                        did_change = true;
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::CloseAiTab { tab_id } => match self
+                    .process_manager
+                    .close_ai_session(&mut self.state, &tab_id)
+                {
+                    Ok(()) => {
+                        did_change = true;
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::OpenSshTab { connection_id } => {
+                    if let Some(connection) =
+                        self.state.find_ssh_connection(&connection_id).cloned()
+                    {
+                        let project_id = self
+                            .state
+                            .find_ssh_tab_by_connection(&connection_id)
+                            .map(|tab| tab.project_id.clone())
+                            .or_else(|| {
+                                self.state
+                                    .active_project()
+                                    .map(|project| project.id.clone())
+                            })
+                            .or_else(|| {
+                                self.state
+                                    .projects()
+                                    .first()
+                                    .map(|project| project.id.clone())
+                            })
+                            .unwrap_or_default();
+                        self.state.open_ssh_tab(
+                            &project_id,
+                            &connection_id,
+                            Some(connection.label),
+                        );
+                        did_change = true;
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    } else {
+                        RemoteActionResult::error(format!(
+                            "Unknown SSH connection `{connection_id}`"
+                        ))
+                    }
+                }
+                RemoteAction::ConnectSsh {
+                    connection_id,
+                    dimensions,
+                } => match self.process_manager.start_ssh_session(
+                    &mut self.state,
+                    &connection_id,
+                    dimensions,
+                ) {
+                    Ok(_) => {
+                        did_change = true;
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::RestartSsh {
+                    connection_id,
+                    dimensions,
+                } => {
+                    let Some(tab_id) = self
+                        .state
+                        .find_ssh_tab_by_connection(&connection_id)
+                        .map(|tab| tab.id.clone())
+                    else {
+                        match self.process_manager.start_ssh_session(
+                            &mut self.state,
+                            &connection_id,
+                            dimensions,
+                        ) {
+                            Ok(_) => {
+                                did_change = true;
+                                self.save_session_state();
+                                if let Some(response) = response {
+                                    let _ = response.send(RemoteActionResult::ok(None, None));
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                if let Some(response) = response {
+                                    let _ = response.send(RemoteActionResult::error(error));
+                                }
+                                continue;
+                            }
+                        }
+                    };
+
+                    match self.process_manager.restart_ssh_session(
+                        &mut self.state,
+                        &tab_id,
+                        dimensions,
+                    ) {
+                        Ok(_) => {
+                            did_change = true;
+                            self.save_session_state();
+                            RemoteActionResult::ok(None, None)
+                        }
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::DisconnectSsh { connection_id } => {
+                    if let Some(tab_id) = self
+                        .state
+                        .find_ssh_tab_by_connection(&connection_id)
+                        .map(|tab| tab.id.clone())
+                    {
+                        match self
+                            .process_manager
+                            .close_ssh_session(&mut self.state, &tab_id)
+                        {
+                            Ok(()) => {
+                                did_change = true;
+                                self.save_session_state();
+                                RemoteActionResult::ok(None, None)
+                            }
+                            Err(error) => RemoteActionResult::error(error),
+                        }
+                    } else {
+                        RemoteActionResult::ok(None, None)
+                    }
+                }
+                RemoteAction::CloseTab { tab_id } => {
+                    if let Some(tab) = self.state.find_tab(&tab_id).cloned() {
+                        let result = match tab.tab_type {
+                            TabType::Server => {
+                                let command_id = tab.command_id.unwrap_or(tab.id.clone());
+                                let _ = self.process_manager.stop_server(&command_id);
+                                self.state.remove_tab(&tab_id);
+                                Ok(())
+                            }
+                            TabType::Claude | TabType::Codex => self
+                                .process_manager
+                                .close_ai_session(&mut self.state, &tab_id),
+                            TabType::Ssh => self
+                                .process_manager
+                                .close_ssh_session(&mut self.state, &tab_id),
+                        };
+                        match result {
+                            Ok(()) => {
+                                did_change = true;
+                                self.synced_session_id = None;
+                                self.last_dimensions = None;
+                                self.save_session_state();
+                                RemoteActionResult::ok(None, None)
+                            }
+                            Err(error) => RemoteActionResult::error(error),
+                        }
+                    } else {
+                        RemoteActionResult::ok(None, None)
+                    }
+                }
+                RemoteAction::SaveProject { project } => {
+                    self.state.upsert_project(project);
+                    did_change = true;
+                    self.save_config_state();
+                    self.save_session_state();
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::DeleteProject { project_id } => {
+                    self.delete_project_action(&project_id, cx);
+                    did_change = true;
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::SaveFolder {
+                    project_id,
+                    folder,
+                    env_file_contents,
+                } => {
+                    if let Some(contents) = env_file_contents.as_ref() {
+                        if let Some(env_file_path) = folder.env_file_path.as_ref() {
+                            let env_path =
+                                std::path::Path::new(&folder.folder_path).join(env_file_path);
+                            if let Err(error) = env_service::write_env_text(&env_path, contents) {
+                                if let Some(response) = response {
+                                    let _ = response.send(RemoteActionResult::error(error));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if self.state.upsert_folder(&project_id, folder) {
+                        did_change = true;
+                        self.save_config_state();
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    } else {
+                        RemoteActionResult::error("Could not save folder")
+                    }
+                }
+                RemoteAction::DeleteFolder {
+                    project_id,
+                    folder_id,
+                } => {
+                    self.delete_folder_action(&project_id, &folder_id, cx);
+                    did_change = true;
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::SaveCommand {
+                    project_id,
+                    folder_id,
+                    command,
+                } => {
+                    if self.state.upsert_command(&project_id, &folder_id, command) {
+                        did_change = true;
+                        self.save_config_state();
+                        self.save_session_state();
+                        RemoteActionResult::ok(None, None)
+                    } else {
+                        RemoteActionResult::error("Could not save command")
+                    }
+                }
+                RemoteAction::DeleteCommand {
+                    project_id,
+                    folder_id,
+                    command_id,
+                } => {
+                    let _ = self.process_manager.stop_server(&command_id);
+                    self.state
+                        .remove_command(&project_id, &folder_id, &command_id);
+                    did_change = true;
+                    self.save_config_state();
+                    self.save_session_state();
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::SaveSsh { connection } => {
+                    self.state.upsert_ssh_connection(connection);
+                    did_change = true;
+                    self.save_config_state();
+                    self.save_session_state();
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::DeleteSsh { connection_id } => {
+                    self.delete_ssh_action(&connection_id, cx);
+                    did_change = true;
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::SaveSettings { settings } => {
+                    self.state.update_settings(settings);
+                    self.process_manager
+                        .set_log_buffer_size(self.state.settings().log_buffer_size as usize);
+                    self.save_config_state();
+                    did_change = true;
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::BrowsePath {
+                    directories_only,
+                    start_path,
+                } => {
+                    let _dialog_pause = self.pause_for_native_dialog();
+                    RemoteActionResult::ok(
+                        None,
+                        Some(RemoteActionPayload::BrowsePath {
+                            path: browse_remote_host_path(start_path.as_deref(), directories_only),
+                        }),
+                    )
+                }
+                RemoteAction::ListDirectory { path } => match list_remote_directory(&path) {
+                    Ok(entries) => RemoteActionResult::ok(
+                        None,
+                        Some(RemoteActionPayload::DirectoryEntries { entries }),
+                    ),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::StatPath { path } => match remote_fs_entry_for_path(&path) {
+                    Ok(entry) => {
+                        RemoteActionResult::ok(None, Some(RemoteActionPayload::PathStat { entry }))
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::ReadTextFile { path } => match std::fs::read_to_string(&path) {
+                    Ok(contents) => RemoteActionResult::ok(
+                        None,
+                        Some(RemoteActionPayload::TextFile { path, contents }),
+                    ),
+                    Err(error) => RemoteActionResult::error(format!(
+                        "Could not read `{path}` on the host: {error}"
+                    )),
+                },
+                RemoteAction::WriteTextFile { path, contents } => {
+                    match std::fs::write(&path, contents) {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(format!(
+                            "Could not write `{path}` on the host: {error}"
+                        )),
+                    }
+                }
+                RemoteAction::ScanRoot { root_path } => {
+                    match scanner_service::scan_root(&root_path) {
+                        Ok(entries) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::RootScan { entries }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::ScanFolder { folder_path } => {
+                    match scanner_service::scan_project(&folder_path) {
+                        Ok(scan) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::FolderScan { scan }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::SearchSession {
+                    session_id,
+                    query,
+                    case_sensitive,
+                } => {
+                    let matches = self
+                        .process_manager
+                        .search_session(&session_id, &query, case_sensitive, 256)
+                        .unwrap_or_default();
+                    RemoteActionResult::ok(
+                        None,
+                        Some(RemoteActionPayload::SearchMatches { matches }),
+                    )
+                }
+                RemoteAction::ScrollSessionToBufferLine {
+                    session_id,
+                    buffer_line,
+                } => self
+                    .process_manager
+                    .scroll_session_to_buffer_line(&session_id, buffer_line)
+                    .map(|_| RemoteActionResult::ok(None, None))
+                    .unwrap_or_else(RemoteActionResult::error),
+                RemoteAction::ScrollSessionToOffset {
+                    session_id,
+                    display_offset,
+                } => self
+                    .process_manager
+                    .scroll_session_to_offset(&session_id, display_offset)
+                    .map(|_| RemoteActionResult::ok(None, None))
+                    .unwrap_or_else(RemoteActionResult::error),
+                RemoteAction::ScrollSession {
+                    session_id,
+                    delta_lines,
+                } => self
+                    .process_manager
+                    .scroll_session(&session_id, delta_lines)
+                    .map(|_| RemoteActionResult::ok(None, None))
+                    .unwrap_or_else(RemoteActionResult::error),
+                RemoteAction::ResizeSession {
+                    session_id,
+                    dimensions,
+                } => self
+                    .process_manager
+                    .resize_session(&session_id, dimensions)
+                    .map(|_| RemoteActionResult::ok(None, None))
+                    .unwrap_or_else(RemoteActionResult::error),
+                RemoteAction::ExportSessionText { session_id, export } => {
+                    let text = match export {
+                        RemoteTerminalExport::Screen => {
+                            self.process_manager.session_screen_text(&session_id)
+                        }
+                        RemoteTerminalExport::Scrollback => {
+                            self.process_manager.session_scrollback_text(&session_id)
+                        }
+                        RemoteTerminalExport::Selection { text } => Ok(text),
+                    };
+                    match text {
+                        Ok(text) if !text.is_empty() => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::ExportText { text }),
+                        ),
+                        Ok(_) => RemoteActionResult::error("Nothing to export from this terminal."),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+            };
+
+            if let Some(response) = response {
+                let _ = response.send(result);
+            }
+        }
+
+        if did_change {
+            cx.notify();
         }
     }
 
@@ -522,6 +1472,7 @@ impl NativeShell {
 
         let live_sessions = self.process_manager.live_session_count();
         if self.state.settings().confirm_on_close && live_sessions > 0 {
+            let _dialog_pause = self.pause_for_native_dialog();
             let result = MessageDialog::new()
                 .set_level(MessageLevel::Warning)
                 .set_title("Quit DevManager?")
@@ -587,6 +1538,36 @@ impl NativeShell {
     }
 
     fn stop_all_servers_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            let command_ids: Vec<String> = self
+                .current_runtime_snapshot()
+                .sessions
+                .iter()
+                .filter(|(_, session)| {
+                    matches!(session.session_kind, crate::state::SessionKind::Server)
+                        && session.status.is_live()
+                })
+                .map(|(command_id, _)| command_id.clone())
+                .collect();
+
+            for command_id in &command_ids {
+                self.remote_send_action(RemoteAction::StopServer {
+                    command_id: command_id.clone(),
+                });
+            }
+
+            self.terminal_notice = Some(if command_ids.is_empty() {
+                "No running remote servers to stop.".to_string()
+            } else {
+                format!("Stopping {} remote server tab(s).", command_ids.len())
+            });
+            cx.notify();
+            return;
+        }
+
         let stopped = self.process_manager.stop_all_servers();
         self.terminal_notice = Some(if stopped == 0 {
             "No running servers to stop.".to_string()
@@ -602,6 +1583,34 @@ impl NativeShell {
         };
         if self.should_confirm_tab_close(&tab) && !self.confirm_live_tab_close(&tab) {
             self.terminal_notice = Some("Tab close canceled.".to_string());
+            cx.notify();
+            return;
+        }
+
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::CloseTab {
+                tab_id: tab_id.to_string(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.state.remove_tab(tab_id);
+                    self.synced_session_id = None;
+                    self.last_dimensions = None;
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to close remote tab.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to close remote tab: {error}"));
+                }
+            }
             cx.notify();
             return;
         }
@@ -641,6 +1650,7 @@ impl NativeShell {
             TabType::Ssh => format!("Close `{label}` and disconnect its live SSH session?"),
         };
 
+        let _dialog_pause = self.pause_for_native_dialog();
         MessageDialog::new()
             .set_level(MessageLevel::Warning)
             .set_title("Confirm Close")
@@ -654,7 +1664,7 @@ impl NativeShell {
         if !self.state.settings().confirm_on_close {
             return false;
         }
-        let runtime = self.process_manager.runtime_state();
+        let runtime = self.current_runtime_snapshot();
 
         match tab.tab_type {
             TabType::Server => tab
@@ -673,6 +1683,7 @@ impl NativeShell {
     }
 
     fn export_config_action(&mut self, cx: &mut Context<Self>) {
+        let _dialog_pause = self.pause_for_native_dialog();
         match self
             .session_manager
             .export_config_dialog(&self.state.config)
@@ -689,6 +1700,7 @@ impl NativeShell {
     }
 
     fn import_config_action(&mut self, mode: ConfigImportMode, cx: &mut Context<Self>) {
+        let _dialog_pause = self.pause_for_native_dialog();
         match self
             .session_manager
             .import_config_dialog(&self.state.config, mode)
@@ -913,6 +1925,11 @@ impl NativeShell {
             return;
         }
         let settings = self.state.settings().clone();
+        let remote_status = self.remote_host_service.status();
+        let remote_connected_label = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.connected_label.clone());
         self.open_editor(
             EditorPanel::Settings(SettingsDraft {
                 default_terminal: settings.default_terminal,
@@ -938,6 +1955,30 @@ impl NativeShell {
                 shell_integration_enabled: settings.shell_integration_enabled,
                 terminal_mouse_override: settings.terminal_mouse_override,
                 terminal_read_only: settings.terminal_read_only,
+                remote_host_enabled: self.remote_machine_state.host.enabled,
+                remote_bind_address: self.remote_machine_state.host.bind_address.clone(),
+                remote_port: self.remote_machine_state.host.port.to_string(),
+                remote_pairing_token: remote_status.pairing_token,
+                remote_connect_address: self
+                    .remote_machine_state
+                    .known_hosts
+                    .first()
+                    .map(|host| host.address.clone())
+                    .unwrap_or_default(),
+                remote_connect_port: self
+                    .remote_machine_state
+                    .known_hosts
+                    .first()
+                    .map(|host| host.port.to_string())
+                    .unwrap_or_else(|| "43871".to_string()),
+                remote_connect_token: String::new(),
+                remote_connected_label,
+                remote_has_control: self.remote_has_control(),
+                remote_connected: self.remote_mode.is_some(),
+                remote_host_clients: remote_status.connected_clients,
+                remote_host_controller_client_id: remote_status.controller_client_id,
+                remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
+                remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
                 open_picker: None,
             }),
             cx,
@@ -969,6 +2010,33 @@ impl NativeShell {
         let project = build_project_from_wizard(wizard);
         let project_name = project.name.clone();
 
+        if !self.ensure_mutation_control(cx) {
+            self.add_project_wizard = None;
+            return;
+        }
+
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::SaveProject { project }) {
+                Ok(result) if result.ok => {
+                    if self.editor_notice.is_none() {
+                        self.editor_notice = Some(format!("Created project `{project_name}`"));
+                    }
+                }
+                Ok(result) => {
+                    self.editor_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Could not create remote project.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.editor_notice = Some(format!("Could not create remote project: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         self.state.upsert_project(project);
         self.save_config_state();
         self.save_session_state();
@@ -979,14 +2047,79 @@ impl NativeShell {
     }
 
     fn wizard_pick_root_folder(&mut self, cx: &mut Context<Self>) {
+        if self.remote_mode.is_some() {
+            let picked_path = match self.remote_request(RemoteAction::BrowsePath {
+                directories_only: true,
+                start_path: None,
+            }) {
+                Ok(RemoteActionResult {
+                    ok: true,
+                    payload: Some(RemoteActionPayload::BrowsePath { path }),
+                    ..
+                }) => path,
+                Ok(result) => {
+                    self.editor_notice = Some(result.message.unwrap_or_else(|| {
+                        "Could not pick a folder on the remote host.".to_string()
+                    }));
+                    cx.notify();
+                    return;
+                }
+                Err(error) => {
+                    self.editor_notice =
+                        Some(format!("Could not open the remote host picker: {error}"));
+                    cx.notify();
+                    return;
+                }
+            };
+            let Some(root_path) = picked_path else {
+                return;
+            };
+            let default_name = last_path_segment(&root_path);
+            let scan_result = self.remote_request(RemoteAction::ScanRoot {
+                root_path: root_path.clone(),
+            });
+
+            if let Some(wizard) = self.add_project_wizard.as_mut() {
+                wizard.root_path = root_path.clone();
+                if wizard.name.trim().is_empty() {
+                    wizard.name = default_name;
+                    wizard.cursor = wizard.name.len();
+                }
+                wizard.selected_scripts.clear();
+                wizard.selected_port_variables.clear();
+
+                match scan_result {
+                    Ok(RemoteActionResult {
+                        ok: true,
+                        payload: Some(RemoteActionPayload::RootScan { entries }),
+                        ..
+                    }) => apply_root_scan_entries(wizard, entries),
+                    Ok(result) => {
+                        clear_root_scan_entries(
+                            wizard,
+                            result.message.unwrap_or_else(|| {
+                                "Could not scan the selected remote project root.".to_string()
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        clear_root_scan_entries(
+                            wizard,
+                            format!("Could not scan the selected remote project root: {error}"),
+                        );
+                    }
+                }
+                cx.notify();
+            }
+            return;
+        }
+
+        let _dialog_pause = self.pause_for_native_dialog();
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
         let root_path = path.to_string_lossy().to_string();
-        let default_name = path
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let default_name = last_path_segment(&root_path);
 
         if let Some(wizard) = self.add_project_wizard.as_mut() {
             wizard.root_path = root_path;
@@ -998,26 +2131,8 @@ impl NativeShell {
             wizard.selected_port_variables.clear();
 
             match scanner_service::scan_root(&wizard.root_path) {
-                Ok(scan_entries) => {
-                    let selected_folders: std::collections::BTreeSet<String> = scan_entries
-                        .iter()
-                        .map(|entry| entry.path.clone())
-                        .collect();
-                    let count = scan_entries.len();
-
-                    wizard.scan_entries = scan_entries;
-                    wizard.selected_folders = selected_folders;
-                    wizard.scan_message = Some(if count == 0 {
-                        "No sub-folders with package.json or Cargo.toml were found.".to_string()
-                    } else {
-                        format!("Discovered {count} folder(s). Open Configure to review scripts and ports.")
-                    });
-                }
-                Err(error) => {
-                    wizard.scan_entries.clear();
-                    wizard.selected_folders.clear();
-                    wizard.scan_message = Some(error);
-                }
+                Ok(scan_entries) => apply_root_scan_entries(wizard, scan_entries),
+                Err(error) => clear_root_scan_entries(wizard, error),
             }
             cx.notify();
         }
@@ -1146,14 +2261,87 @@ impl NativeShell {
     }
 
     fn pick_folder_path_action(&mut self, cx: &mut Context<Self>) {
+        if self.remote_mode.is_some() {
+            let env_file_path = match self.editor_panel.as_ref() {
+                Some(EditorPanel::Folder(draft)) => draft.env_file_path.trim().to_string(),
+                _ => return,
+            };
+            let picked_path = match self.remote_request(RemoteAction::BrowsePath {
+                directories_only: true,
+                start_path: None,
+            }) {
+                Ok(RemoteActionResult {
+                    ok: true,
+                    payload: Some(RemoteActionPayload::BrowsePath { path }),
+                    ..
+                }) => path,
+                Ok(result) => {
+                    self.editor_notice = Some(result.message.unwrap_or_else(|| {
+                        "Could not pick a folder on the remote host.".to_string()
+                    }));
+                    cx.notify();
+                    return;
+                }
+                Err(error) => {
+                    self.editor_notice =
+                        Some(format!("Could not open the remote host picker: {error}"));
+                    cx.notify();
+                    return;
+                }
+            };
+            let Some(folder_path) = picked_path else {
+                return;
+            };
+            let default_name = last_path_segment(&folder_path);
+            let env_contents = if env_file_path.is_empty() {
+                None
+            } else {
+                match self.remote_request(RemoteAction::ReadTextFile {
+                    path: std::path::Path::new(&folder_path)
+                        .join(&env_file_path)
+                        .to_string_lossy()
+                        .to_string(),
+                }) {
+                    Ok(RemoteActionResult {
+                        ok: true,
+                        payload: Some(RemoteActionPayload::TextFile { contents, .. }),
+                        ..
+                    }) => Some(contents),
+                    _ => None,
+                }
+            };
+
+            if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
+                draft.folder_path = folder_path.clone();
+                if draft.name.trim().is_empty() {
+                    draft.name = default_name;
+                }
+                draft.git_branch = None;
+                draft.dependency_status = None;
+                draft.scan_result = None;
+                draft.selected_scanned_scripts.clear();
+                draft.selected_scanned_port_variable = None;
+                if !env_file_path.is_empty() {
+                    draft.env_file_loaded = env_contents.is_some();
+                    draft.env_file_contents = env_contents.unwrap_or_default();
+                } else {
+                    draft.env_file_contents.clear();
+                    draft.env_file_loaded = false;
+                }
+                draft.scan_message = Some(format!(
+                    "Picked remote folder `{folder_path}`. Scan the folder to refresh scripts, ports, and repo status."
+                ));
+                cx.notify();
+            }
+            return;
+        }
+
+        let _dialog_pause = self.pause_for_native_dialog();
         let Some(path) = FileDialog::new().pick_folder() else {
             return;
         };
         let folder_path = path.to_string_lossy().to_string();
-        let default_name = path
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let default_name = last_path_segment(&folder_path);
 
         if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
             draft.folder_path = folder_path.clone();
@@ -1215,7 +2403,22 @@ impl NativeShell {
             })
             .unwrap_or_default();
 
-        let scan_result = scanner_service::scan_project(&folder_path);
+        let scan_result = if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::ScanFolder {
+                folder_path: folder_path.clone(),
+            }) {
+                Ok(result) if result.ok => match result.payload {
+                    Some(RemoteActionPayload::FolderScan { scan }) => Ok(scan),
+                    _ => Err("Remote host did not return a folder scan.".to_string()),
+                },
+                Ok(result) => Err(result
+                    .message
+                    .unwrap_or_else(|| "Remote folder scan failed.".to_string())),
+                Err(error) => Err(format!("Remote folder scan failed: {error}")),
+            }
+        } else {
+            scanner_service::scan_project(&folder_path)
+        };
         if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
             draft.is_scanning = false;
             let (git_branch, dependency_status) = inspect_folder_runtime_metadata(&folder_path);
@@ -1296,7 +2499,37 @@ impl NativeShell {
             }
         };
 
-        match load_folder_env_contents(&folder_path, &env_file_path) {
+        let env_contents = if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::ReadTextFile {
+                path: std::path::Path::new(&folder_path)
+                    .join(&env_file_path)
+                    .to_string_lossy()
+                    .to_string(),
+            }) {
+                Ok(result) if result.ok => match result.payload {
+                    Some(RemoteActionPayload::TextFile { contents, .. }) => Some(contents),
+                    _ => None,
+                },
+                Ok(result) => {
+                    self.editor_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Remote env load failed.".to_string()),
+                    );
+                    cx.notify();
+                    return;
+                }
+                Err(error) => {
+                    self.editor_notice = Some(format!("Remote env load failed: {error}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            load_folder_env_contents(&folder_path, &env_file_path)
+        };
+
+        match env_contents {
             Some(contents) => {
                 if let Some(EditorPanel::Folder(draft)) = self.editor_panel.as_mut() {
                     draft.env_file_contents = contents;
@@ -1319,6 +2552,13 @@ impl NativeShell {
     }
 
     fn open_folder_external_terminal_action(&mut self, cx: &mut Context<Self>) {
+        if self.remote_mode.is_some() {
+            self.editor_notice =
+                Some("External terminal launch is only available on the host machine.".to_string());
+            cx.notify();
+            return;
+        }
+
         let folder_path = match self.editor_panel.as_ref() {
             Some(EditorPanel::Folder(draft)) if !draft.folder_path.trim().is_empty() => {
                 draft.folder_path.trim().to_string()
@@ -1452,6 +2692,9 @@ impl NativeShell {
     }
 
     fn apply_settings_draft(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_ref() else {
             return;
         };
@@ -1551,6 +2794,27 @@ impl NativeShell {
                     .and_then(|id| self.state.find_project(id))
                     .cloned();
                 let project = build_project_from_draft(&draft, existing.as_ref());
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if self.remote_mode.is_some() {
+                    match self.remote_request(RemoteAction::SaveProject { project }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice = Some(
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not save project".to_string()),
+                            );
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice = Some(format!("Could not save project: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 self.state.upsert_project(project);
                 self.save_config_state();
                 self.save_session_state();
@@ -1573,6 +2837,9 @@ impl NativeShell {
                     .as_deref()
                     .and_then(|folder_id| self.state.find_folder(&draft.project_id, folder_id))
                     .map(|lookup| lookup.folder.clone());
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
                 if draft.env_file_loaded && !draft.env_file_path.trim().is_empty() {
                     let env_file_path = std::path::Path::new(draft.folder_path.trim())
                         .join(draft.env_file_path.trim());
@@ -1596,6 +2863,30 @@ impl NativeShell {
                     port_variable: normalize_optional_string(&draft.port_variable),
                     hidden: Some(draft.hidden),
                 };
+                if self.remote_mode.is_some() {
+                    match self.remote_request(RemoteAction::SaveFolder {
+                        project_id: draft.project_id.clone(),
+                        folder,
+                        env_file_contents: (draft.env_file_loaded
+                            && !draft.env_file_path.trim().is_empty())
+                        .then_some(draft.env_file_contents.clone()),
+                    }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice = Some(
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not save folder".to_string()),
+                            );
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice = Some(format!("Could not save folder: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 if !self.state.upsert_folder(&draft.project_id, folder) {
                     self.editor_notice = Some("Could not save folder".to_string());
                     cx.notify();
@@ -1638,6 +2929,31 @@ impl NativeShell {
                     auto_restart: Some(draft.auto_restart),
                     clear_logs_on_restart: Some(draft.clear_logs_on_restart),
                 };
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if self.remote_mode.is_some() {
+                    match self.remote_request(RemoteAction::SaveCommand {
+                        project_id: draft.project_id.clone(),
+                        folder_id: draft.folder_id.clone(),
+                        command,
+                    }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice = Some(
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not save command".to_string()),
+                            );
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice = Some(format!("Could not save command: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 if !self
                     .state
                     .upsert_command(&draft.project_id, &draft.folder_id, command)
@@ -1686,6 +3002,27 @@ impl NativeShell {
                     username: draft.username.trim().to_string(),
                     password: normalize_optional_string(&draft.password),
                 };
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if self.remote_mode.is_some() {
+                    match self.remote_request(RemoteAction::SaveSsh { connection }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice =
+                                Some(result.message.unwrap_or_else(|| {
+                                    "Could not save SSH connection".to_string()
+                                }));
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice =
+                                Some(format!("Could not save SSH connection: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 self.state.upsert_ssh_connection(connection);
                 self.save_config_state();
                 self.save_session_state();
@@ -1706,6 +3043,29 @@ impl NativeShell {
                 let Some(project_id) = draft.existing_id else {
                     return;
                 };
+                if self.remote_mode.is_some() {
+                    if !self.ensure_remote_control(cx) {
+                        return;
+                    }
+                    match self.remote_request(RemoteAction::DeleteProject {
+                        project_id: project_id.clone(),
+                    }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice = Some(
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not delete project".to_string()),
+                            );
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice = Some(format!("Could not delete project: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 let ai_tab_ids: Vec<String> = self
                     .state
                     .ai_tabs()
@@ -1740,6 +3100,30 @@ impl NativeShell {
                 let Some(folder_id) = draft.existing_id else {
                     return;
                 };
+                if self.remote_mode.is_some() {
+                    if !self.ensure_remote_control(cx) {
+                        return;
+                    }
+                    match self.remote_request(RemoteAction::DeleteFolder {
+                        project_id: draft.project_id.clone(),
+                        folder_id: folder_id.clone(),
+                    }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice = Some(
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not delete folder".to_string()),
+                            );
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice = Some(format!("Could not delete folder: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 let command_ids: Vec<String> = self
                     .state
                     .find_folder(&draft.project_id, &folder_id)
@@ -1766,6 +3150,31 @@ impl NativeShell {
                 let Some(command_id) = draft.existing_id else {
                     return;
                 };
+                if self.remote_mode.is_some() {
+                    if !self.ensure_remote_control(cx) {
+                        return;
+                    }
+                    match self.remote_request(RemoteAction::DeleteCommand {
+                        project_id: draft.project_id.clone(),
+                        folder_id: draft.folder_id.clone(),
+                        command_id: command_id.clone(),
+                    }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice = Some(
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not delete command".to_string()),
+                            );
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice = Some(format!("Could not delete command: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 let _ = self.process_manager.stop_server(&command_id);
                 self.state
                     .remove_command(&draft.project_id, &draft.folder_id, &command_id);
@@ -1779,6 +3188,29 @@ impl NativeShell {
                 let Some(connection_id) = draft.existing_id else {
                     return;
                 };
+                if self.remote_mode.is_some() {
+                    if !self.ensure_remote_control(cx) {
+                        return;
+                    }
+                    match self.remote_request(RemoteAction::DeleteSsh {
+                        connection_id: connection_id.clone(),
+                    }) {
+                        Ok(result) if result.ok => self.close_editor(cx),
+                        Ok(result) => {
+                            self.editor_notice =
+                                Some(result.message.unwrap_or_else(|| {
+                                    "Could not delete SSH connection".to_string()
+                                }));
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            self.editor_notice =
+                                Some(format!("Could not delete SSH connection: {error}"));
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 let ssh_tab_ids: Vec<String> = self
                     .state
                     .ssh_tabs()
@@ -1801,6 +3233,31 @@ impl NativeShell {
     }
 
     fn delete_project_action(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::DeleteProject {
+                project_id: project_id.to_string(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Could not delete project.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Could not delete project: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let ai_tab_ids: Vec<String> = self
             .state
             .ai_tabs()
@@ -1833,6 +3290,32 @@ impl NativeShell {
     }
 
     fn delete_folder_action(&mut self, project_id: &str, folder_id: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::DeleteFolder {
+                project_id: project_id.to_string(),
+                folder_id: folder_id.to_string(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Could not delete folder.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Could not delete folder: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let command_ids: Vec<String> = self
             .state
             .find_folder(project_id, folder_id)
@@ -1870,6 +3353,33 @@ impl NativeShell {
             return;
         };
 
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::DeleteCommand {
+                project_id,
+                folder_id,
+                command_id: command_id.clone(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Could not delete command.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Could not delete command: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let _ = self.process_manager.stop_server(&command_id);
         self.state
             .remove_command(&project_id, &folder_id, &command_id);
@@ -1881,6 +3391,32 @@ impl NativeShell {
     }
 
     fn delete_ssh_action(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::DeleteSsh {
+                connection_id: connection_id.to_string(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Could not delete SSH connection.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice =
+                        Some(format!("Could not delete SSH connection: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let ssh_tab_ids: Vec<String> = self
             .state
             .ssh_tabs()
@@ -2085,6 +3621,135 @@ impl NativeShell {
                     self.apply_settings_draft(cx);
                 }
             }
+            EditorAction::ToggleRemoteHosting => {
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.remote_host_enabled = !draft.remote_host_enabled;
+                    self.remote_machine_state.host.enabled = draft.remote_host_enabled;
+                    self.remote_machine_state.host.bind_address =
+                        draft.remote_bind_address.trim().to_string();
+                    self.remote_machine_state.host.port = parse_optional_u16(&draft.remote_port)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(43871);
+                    self.remote_machine_state.host.pairing_token =
+                        draft.remote_pairing_token.clone();
+                    self.remote_host_service
+                        .apply_config(self.remote_machine_state.host.clone());
+                    self.persist_remote_machine_state();
+                    self.sync_settings_remote_draft();
+                    cx.notify();
+                }
+            }
+            EditorAction::RegenerateRemotePairingToken => {
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    let token = remote::generate_pairing_token();
+                    draft.remote_pairing_token = token.clone();
+                    self.remote_machine_state.host.pairing_token = token;
+                    self.remote_host_service
+                        .apply_config(self.remote_machine_state.host.clone());
+                    self.persist_remote_machine_state();
+                    self.sync_settings_remote_draft();
+                    cx.notify();
+                }
+            }
+            EditorAction::ConnectRemoteHost => {
+                let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_ref() else {
+                    return;
+                };
+                let port = parse_optional_u16(&draft.remote_connect_port)
+                    .map_err(|error| {
+                        self.editor_notice = Some(error);
+                        cx.notify();
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(43871);
+                match self.connect_remote_host(
+                    draft.remote_connect_address.trim().to_string(),
+                    port,
+                    normalize_optional_string(&draft.remote_connect_token),
+                ) {
+                    Ok(()) => {
+                        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                            draft.remote_connect_token.clear();
+                        }
+                        self.sync_settings_remote_draft();
+                    }
+                    Err(error) => {
+                        self.editor_notice = Some(error);
+                    }
+                }
+                cx.notify();
+            }
+            EditorAction::DisconnectRemoteHost => {
+                self.disconnect_remote_host(Some("Disconnected from remote host.".to_string()));
+                cx.notify();
+            }
+            EditorAction::TakeRemoteControl => {
+                if let Some(remote_mode) = self.remote_mode.as_ref() {
+                    remote_mode.client.take_control();
+                }
+                self.sync_settings_remote_draft();
+                cx.notify();
+            }
+            EditorAction::ReleaseRemoteControl => {
+                if let Some(remote_mode) = self.remote_mode.as_ref() {
+                    remote_mode.client.release_control();
+                }
+                self.sync_settings_remote_draft();
+                cx.notify();
+            }
+            EditorAction::TakeHostControl => {
+                self.remote_host_service.take_local_control();
+                self.editor_notice = Some("This machine controls the host again.".to_string());
+                self.sync_settings_remote_draft();
+                cx.notify();
+            }
+            EditorAction::UseKnownRemoteHost(server_id) => {
+                let host = self
+                    .remote_machine_state
+                    .known_hosts
+                    .iter()
+                    .find(|host| host.server_id == server_id)
+                    .cloned();
+                if let (Some(host), Some(EditorPanel::Settings(draft))) =
+                    (host, self.editor_panel.as_mut())
+                {
+                    draft.remote_connect_address = host.address;
+                    draft.remote_connect_port = host.port.to_string();
+                    draft.remote_connect_token.clear();
+                    draft.open_picker = None;
+                }
+                cx.notify();
+            }
+            EditorAction::ForgetKnownRemoteHost(server_id) => {
+                self.remote_machine_state
+                    .known_hosts
+                    .retain(|host| host.server_id != server_id);
+                self.persist_remote_machine_state();
+                self.sync_settings_remote_draft();
+                self.editor_notice = Some("Removed saved remote host.".to_string());
+                cx.notify();
+            }
+            EditorAction::RevokeRemoteClient(client_id) => {
+                self.remote_machine_state
+                    .host
+                    .paired_clients
+                    .retain(|client| client.client_id != client_id);
+                self.remote_host_service.revoke_paired_client(&client_id);
+                self.remote_host_service
+                    .apply_config(self.remote_machine_state.host.clone());
+                self.persist_remote_machine_state();
+                self.sync_settings_remote_draft();
+                self.editor_notice = Some("Revoked paired remote client.".to_string());
+                cx.notify();
+            }
             EditorAction::ToggleProjectPinned => {
                 if let Some(EditorPanel::Project(draft)) = self.editor_panel.as_mut() {
                     draft.pinned = !draft.pinned;
@@ -2259,6 +3924,115 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> view::TerminalPaneModel {
+        if self.remote_mode.is_some() {
+            let active_spec = self.state.active_terminal_spec();
+            let active_tab = self.state.active_tab().cloned();
+            let active_tab_type = active_tab.as_ref().map(|tab| tab.tab_type.clone());
+            let active_session = self.current_active_session_view();
+
+            if active_tab_type.is_some() {
+                self.splash_image = None;
+                if self.synced_session_id.as_deref() != Some(active_spec.session_id.as_str()) {
+                    self.synced_session_id = Some(active_spec.session_id.clone());
+                    self.last_dimensions = None;
+                    self.active_port_state = None;
+                }
+                if let Some(remote_mode) = self.remote_mode.as_mut() {
+                    let next_focused = Some(active_spec.session_id.clone());
+                    remote_mode.client.set_focused_session(next_focused);
+                }
+                let dimensions = self.terminal_dimensions(window);
+                if self.last_dimensions != Some(dimensions) {
+                    self.remote_send_action(RemoteAction::ResizeSession {
+                        session_id: active_spec.session_id.clone(),
+                        dimensions,
+                    });
+                    self.last_dimensions = Some(dimensions);
+                }
+            } else if !self.state.open_tabs.is_empty() {
+                self.ensure_splash_image(cx);
+            }
+
+            self.terminal_notice = match active_tab_type {
+                Some(TabType::Server) if active_session.is_none() => {
+                    Some("Remote server session is not available yet.".to_string())
+                }
+                Some(TabType::Ssh) if active_session.is_none() => {
+                    Some("Remote SSH session is disconnected.".to_string())
+                }
+                Some(TabType::Claude) | Some(TabType::Codex) if active_session.is_none() => {
+                    Some("Remote AI session is not available yet.".to_string())
+                }
+                Some(_) => None,
+                None => self.terminal_notice.clone(),
+            };
+
+            if active_tab_type == Some(TabType::Ssh) {
+                self.maybe_auto_submit_ssh_password(active_session.as_ref());
+            } else {
+                self.ssh_password_prompt_state = None;
+            }
+
+            if !self.did_focus_terminal {
+                window.focus(&self.terminal_focus);
+                self.did_focus_terminal = true;
+            }
+
+            self.sync_terminal_focus(Some(active_spec.session_id.clone()));
+
+            let selection = active_session
+                .as_ref()
+                .and_then(|session| self.selection_snapshot(session.screen.cols));
+            let runtime_controls = self.runtime_controls_model(
+                active_tab_type.clone(),
+                &active_spec,
+                active_session.as_ref(),
+            );
+            let terminal_metrics = self.terminal_render_metrics(window);
+            let blocking_notice = active_session.as_ref().and_then(|session| {
+                session
+                    .runtime
+                    .awaiting_external_editor
+                    .then_some("Save and close text editor to continue...".to_string())
+            });
+
+            let search_highlight = self.current_search_highlight(active_session.as_ref());
+            let scrollbar = self.terminal_scrollbar_model(active_session.as_ref());
+            let has_active_tab = active_tab_type.is_some();
+            return view::TerminalPaneModel {
+                active_project: if has_active_tab {
+                    self.state
+                        .active_project()
+                        .map(|project| project.name.clone())
+                        .unwrap_or_else(|| "No project selected".to_string())
+                } else {
+                    String::new()
+                },
+                session_label: if has_active_tab {
+                    active_spec.display_label
+                } else {
+                    String::new()
+                },
+                active_tab_type,
+                session: active_session,
+                startup_notice: self
+                    .startup_notice
+                    .clone()
+                    .or_else(|| self.terminal_notice.clone()),
+                blocking_notice,
+                debug_enabled: self.process_manager.debug_enabled(),
+                font_size: self.terminal_font_size(),
+                cell_width: terminal_metrics.cell_width,
+                line_height: terminal_metrics.line_height,
+                selection,
+                search: self.terminal_search_model(),
+                search_highlight,
+                scrollbar,
+                runtime_controls,
+                splash_image: self.splash_image.clone(),
+            };
+        }
+
         let mut active_spec = self.state.active_terminal_spec();
         let active_tab = self.state.active_tab().cloned();
         let active_tab_type = active_tab.as_ref().map(|tab| tab.tab_type.clone());
@@ -2759,13 +4533,18 @@ impl NativeShell {
         self.server_port_snapshot.refresh_in_flight = true;
         let ports = tracked_ports.clone();
         let background_executor = cx.background_executor().clone();
+        let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
             move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut async_cx = cx.clone();
+                let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
                     let statuses = background_executor
                         .spawn(async move { ports_service::snapshot_ports(&ports).ok() })
                         .await;
+                    while native_dialog_blockers.load(Ordering::Acquire) > 0 {
+                        background_executor.timer(Duration::from_millis(50)).await;
+                    }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
                         this.server_port_snapshot.refresh_in_flight = false;
                         this.server_port_snapshot.last_checked_at = Some(Instant::now());
@@ -2930,6 +4709,16 @@ impl NativeShell {
             return;
         }
 
+        if self.remote_mode.is_some() {
+            self.remote_send_terminal_input(RemoteTerminalInput::Text {
+                session_id: session.runtime.session_id.clone(),
+                text: format!("{password}\r"),
+            });
+            self.ssh_password_prompt_state = Some(prompt_state);
+            self.terminal_notice = Some("Sent saved SSH password.".to_string());
+            return;
+        }
+
         match self
             .process_manager
             .write_to_session(&session.runtime.session_id, &format!("{password}\r"))
@@ -2945,7 +4734,7 @@ impl NativeShell {
     }
 
     fn respond_to_ssh_prompt_action(&mut self, session_id: &str, cx: &mut Context<Self>) {
-        let Some(session) = self.process_manager.session_view(session_id) else {
+        let Some(session) = self.current_session_view(session_id) else {
             self.terminal_notice = Some("SSH session is not available.".to_string());
             cx.notify();
             return;
@@ -2981,6 +4770,16 @@ impl NativeShell {
                 fingerprint: prompt.fingerprint,
             });
 
+            if self.remote_mode.is_some() {
+                self.remote_send_terminal_input(RemoteTerminalInput::Text {
+                    session_id: session_id.to_string(),
+                    text: format!("{password}\r"),
+                });
+                self.terminal_notice = Some("Sent SSH password.".to_string());
+                cx.notify();
+                return;
+            }
+
             match self
                 .process_manager
                 .write_to_session(session_id, &format!("{password}\r"))
@@ -2997,6 +4796,16 @@ impl NativeShell {
         }
 
         if ssh_host_key_prompt(&session) {
+            if self.remote_mode.is_some() {
+                self.remote_send_terminal_input(RemoteTerminalInput::Text {
+                    session_id: session_id.to_string(),
+                    text: "yes\r".to_string(),
+                });
+                self.terminal_notice = Some("Sent `yes` to the SSH host check.".to_string());
+                cx.notify();
+                return;
+            }
+
             match self.process_manager.write_to_session(session_id, "yes\r") {
                 Ok(()) => {
                     self.terminal_notice = Some("Sent `yes` to the SSH host check.".to_string());
@@ -3019,6 +4828,9 @@ impl NativeShell {
         active_spec: &crate::state::ActiveTerminalSpec,
         active_session: Option<&crate::terminal::session::TerminalSessionView>,
     ) -> Option<view::TerminalRuntimeControlsModel> {
+        let remote = self.remote_mode.is_some();
+        let allow_mutation = !remote || self.remote_has_control();
+
         if active_tab_type == Some(TabType::Ssh) {
             self.active_port_state = None;
             let session = active_session?;
@@ -3093,7 +4905,7 @@ impl NativeShell {
                 can_start: false,
                 can_stop: false,
                 can_restart: false,
-                can_clear: active_session.is_some(),
+                can_clear: active_session.is_some() && !remote,
                 can_kill_port: false,
                 can_open_url: false,
                 kill_label: "kill",
@@ -3124,7 +4936,16 @@ impl NativeShell {
             let lookup = self.state.find_command(&active_spec.session_id)?;
             (lookup.command.id.clone(), lookup.command.port)
         };
-        self.sync_active_port_state(&command_id, port);
+        let port_status = if remote {
+            self.active_port_state = None;
+            port.and_then(|port| self.current_port_statuses().get(&port).cloned())
+        } else {
+            self.sync_active_port_state(&command_id, port);
+            self.active_port_state
+                .as_ref()
+                .filter(|state| state.command_id == command_id)
+                .and_then(|state| state.status.clone())
+        };
 
         let status = active_session
             .map(|session| session.runtime.status)
@@ -3133,17 +4954,15 @@ impl NativeShell {
             .active_port_state
             .as_ref()
             .filter(|state| state.command_id == command_id);
-        let has_port_conflict = port_state
-            .and_then(|state| state.status.as_ref())
+        let has_port_conflict = port_status
+            .as_ref()
             .map(|status| !is_managed_port_owner(active_session, status))
             .unwrap_or(false);
         let probe_disagrees_with_live_session = active_session
             .is_some_and(|session| session.runtime.status.is_live())
-            && port_state
-                .and_then(|state| state.status.as_ref())
-                .is_some_and(|status| !status.in_use);
+            && port_status.as_ref().is_some_and(|status| !status.in_use);
         let port_label = port.map(|port| {
-            if let Some(status) = port_state.and_then(|state| state.status.as_ref()) {
+            if let Some(status) = port_status.as_ref() {
                 if probe_disagrees_with_live_session {
                     format!("port {port} • probing")
                 } else if status.in_use {
@@ -3170,8 +4989,8 @@ impl NativeShell {
             theme::WARNING_TEXT
         } else if probe_disagrees_with_live_session {
             theme::TEXT_MUTED
-        } else if port_state
-            .and_then(|state| state.status.as_ref())
+        } else if port_status
+            .as_ref()
             .map(|status| status.in_use)
             .unwrap_or(false)
         {
@@ -3189,12 +5008,13 @@ impl NativeShell {
         Some(view::TerminalRuntimeControlsModel {
             port_label,
             port_color,
-            can_start: !status.is_live(),
-            can_stop: status.is_live(),
-            can_restart: status.is_live(),
-            can_clear: active_session.is_some(),
-            can_kill_port: port.is_some() && has_port_conflict,
-            can_open_url: port.is_some()
+            can_start: allow_mutation && !status.is_live(),
+            can_stop: allow_mutation && status.is_live(),
+            can_restart: allow_mutation && status.is_live(),
+            can_clear: active_session.is_some() && !remote,
+            can_kill_port: !remote && port.is_some() && has_port_conflict,
+            can_open_url: !remote
+                && port.is_some()
                 && status == crate::state::SessionStatus::Running
                 && !has_port_conflict,
             kill_label,
@@ -3254,15 +5074,40 @@ impl NativeShell {
     fn refresh_terminal_search_results(&mut self, cx: &mut Context<Self>) {
         let session_id = self.state.active_terminal_spec().session_id;
         let query = self.terminal_search.query.clone();
-        self.terminal_search.matches = self
-            .process_manager
-            .search_session(
-                &session_id,
-                &query,
-                self.terminal_search.case_sensitive,
-                256,
-            )
-            .unwrap_or_default();
+        self.terminal_search.matches = if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::SearchSession {
+                session_id,
+                query,
+                case_sensitive: self.terminal_search.case_sensitive,
+            }) {
+                Ok(RemoteActionResult {
+                    ok: true,
+                    payload: Some(RemoteActionPayload::SearchMatches { matches }),
+                    ..
+                }) => matches,
+                Ok(result) => {
+                    self.terminal_notice = Some(result.message.unwrap_or_else(|| {
+                        "Could not search the remote terminal buffer.".to_string()
+                    }));
+                    Vec::new()
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!(
+                        "Could not search the remote terminal buffer: {error}"
+                    ));
+                    Vec::new()
+                }
+            }
+        } else {
+            self.process_manager
+                .search_session(
+                    &session_id,
+                    &query,
+                    self.terminal_search.case_sensitive,
+                    256,
+                )
+                .unwrap_or_default()
+        };
         self.terminal_search.selected_index =
             (!self.terminal_search.matches.is_empty()).then_some(0);
         if self.terminal_search.selected_index.is_some() {
@@ -3279,6 +5124,13 @@ impl NativeShell {
             return;
         };
         let session_id = self.state.active_terminal_spec().session_id;
+        if self.remote_mode.is_some() {
+            self.remote_send_action(RemoteAction::ScrollSessionToBufferLine {
+                session_id,
+                buffer_line: found.buffer_line,
+            });
+            return;
+        }
         let _ = self
             .process_manager
             .scroll_session_to_buffer_line(&session_id, found.buffer_line);
@@ -3301,7 +5153,7 @@ impl NativeShell {
     }
 
     fn jump_terminal_prompt(&mut self, previous: bool, cx: &mut Context<Self>) {
-        let Some(session) = self.process_manager.active_session() else {
+        let Some(session) = self.current_active_session_view() else {
             return;
         };
         let current_line = self.current_terminal_buffer_line(&session);
@@ -3313,10 +5165,17 @@ impl NativeShell {
         let Some(target) = target else {
             return;
         };
-        let session_id = self.state.active_terminal_spec().session_id;
+        if self.remote_mode.is_some() {
+            self.remote_send_action(RemoteAction::ScrollSessionToBufferLine {
+                session_id: session.runtime.session_id.clone(),
+                buffer_line: target,
+            });
+            cx.notify();
+            return;
+        }
         if self
             .process_manager
-            .scroll_session_to_buffer_line(&session_id, target)
+            .scroll_session_to_buffer_line(&session.runtime.session_id, target)
             .is_ok()
         {
             cx.notify();
@@ -3351,7 +5210,46 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         let session_id = self.state.active_terminal_spec().session_id;
-        let text = if selection_only {
+        let kind = if selection_only {
+            "selection"
+        } else if include_scrollback {
+            "scrollback"
+        } else {
+            "screen"
+        };
+        let text = if self.remote_mode.is_some() {
+            let export = if selection_only {
+                RemoteTerminalExport::Selection {
+                    text: self.selected_text().unwrap_or_default(),
+                }
+            } else if include_scrollback {
+                RemoteTerminalExport::Scrollback
+            } else {
+                RemoteTerminalExport::Screen
+            };
+            match self.remote_request(RemoteAction::ExportSessionText { session_id, export }) {
+                Ok(RemoteActionResult {
+                    ok: true,
+                    payload: Some(RemoteActionPayload::ExportText { text }),
+                    ..
+                }) => text,
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| format!("Failed to export terminal {kind}.")),
+                    );
+                    cx.notify();
+                    return;
+                }
+                Err(error) => {
+                    self.terminal_notice =
+                        Some(format!("Failed to export terminal {kind}: {error}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else if selection_only {
             self.selected_text().unwrap_or_default()
         } else if include_scrollback {
             self.process_manager
@@ -3369,23 +5267,8 @@ impl NativeShell {
             return;
         }
 
-        let kind = if selection_only {
-            "selection"
-        } else if include_scrollback {
-            "scrollback"
-        } else {
-            "screen"
-        };
-        let file_name = format!(
-            "devmanager-terminal-{kind}-{}.txt",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        );
-        let path = std::env::temp_dir().join(file_name);
-        match std::fs::write(&path, text) {
-            Ok(()) => {
+        match write_terminal_export(kind, &text) {
+            Ok(path) => {
                 self.terminal_notice = Some(format!("Wrote terminal {kind} to {}", path.display()));
             }
             Err(error) => {
@@ -3402,6 +5285,37 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            let dimensions = self.terminal_dimensions(window);
+            match self.remote_request(RemoteAction::StartServer {
+                command_id: command_id.to_string(),
+                focus: focus_started_server,
+                dimensions,
+            }) {
+                Ok(result) if result.ok => {
+                    if focus_started_server {
+                        self.select_server_tab_action(command_id, cx);
+                    }
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to start remote server.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to start remote server: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let dimensions = self.terminal_dimensions(window);
         let Some(port) = self
             .state
@@ -3445,13 +5359,18 @@ impl NativeShell {
 
         let command_id = command_id.to_string();
         let background_executor = cx.background_executor().clone();
+        let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
             move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut async_cx = cx.clone();
+                let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
                     let status = background_executor
                         .spawn(async move { ports_service::check_port_in_use(port).ok() })
                         .await;
+                    while native_dialog_blockers.load(Ordering::Acquire) > 0 {
+                        background_executor.timer(Duration::from_millis(50)).await;
+                    }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
                         if let Some(state) = this.active_port_state.as_mut() {
                             if state.command_id == command_id && state.port == port {
@@ -3516,6 +5435,18 @@ impl NativeShell {
     }
 
     fn stop_server_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            self.remote_send_action(RemoteAction::StopServer {
+                command_id: command_id.to_string(),
+            });
+            self.terminal_notice = Some(format!("Stopping remote `{command_id}`..."));
+            cx.notify();
+            return;
+        }
+
         let port = self
             .state
             .find_command(command_id)
@@ -3532,10 +5463,12 @@ impl NativeShell {
         self.terminal_notice = Some(format!("Stopping `{command_id}`..."));
 
         let process_manager = self.process_manager.clone();
+        let native_dialog_blockers = self.native_dialog_blockers.clone();
         cx.spawn(
             move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let background_executor = cx.background_executor().clone();
                 let mut async_cx = cx.clone();
+                let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
                     let command_id_for_wait = command_id.clone();
                     let stopped = background_executor
@@ -3547,6 +5480,9 @@ impl NativeShell {
                         })
                         .await;
 
+                    while native_dialog_blockers.load(Ordering::Acquire) > 0 {
+                        background_executor.timer(Duration::from_millis(50)).await;
+                    }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
                         if let Some(state) = this.active_port_state.as_mut() {
                             if state.command_id == command_id {
@@ -3579,6 +5515,34 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            let dimensions = self.terminal_dimensions(window);
+            match self.remote_request(RemoteAction::RestartServer {
+                command_id: command_id.to_string(),
+                dimensions,
+            }) {
+                Ok(result) if result.ok => {
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to restart remote server.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice =
+                        Some(format!("Failed to restart remote server: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let dimensions = self.terminal_dimensions(window);
         let port = self
             .state
@@ -3715,6 +5679,31 @@ impl NativeShell {
     }
 
     fn select_server_tab_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        if self.remote_mode.is_some() {
+            let lookup = self.state.find_command(command_id).map(|lookup| {
+                (
+                    lookup.project.id.clone(),
+                    lookup.command.id.clone(),
+                    lookup.command.label.clone(),
+                )
+            });
+            if let Some((project_id, command_id, label)) = lookup {
+                self.state
+                    .open_server_tab(&project_id, &command_id, Some(label));
+            } else {
+                self.state.select_tab(command_id);
+            }
+            self.show_terminal_surface();
+            self.synced_session_id = Some(command_id.to_string());
+            if let Some(remote_mode) = self.remote_mode.as_ref() {
+                remote_mode
+                    .client
+                    .set_focused_session(Some(command_id.to_string()));
+            }
+            cx.notify();
+            return;
+        }
+
         let lookup = self.state.find_command(command_id).map(|lookup| {
             (
                 lookup.project.id.clone(),
@@ -3742,6 +5731,35 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            let dimensions = self.terminal_dimensions(window);
+            match self.remote_request(RemoteAction::LaunchAi {
+                project_id: project_id.to_string(),
+                tab_type,
+                dimensions,
+            }) {
+                Ok(result) if result.ok => {
+                    self.show_terminal_surface();
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to launch AI session.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to launch AI session: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let dimensions = self.terminal_dimensions(window);
         match self.process_manager.start_ai_session(
             &mut self.state,
@@ -3763,6 +5781,50 @@ impl NativeShell {
     }
 
     fn select_ai_tab_action(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_mode.is_some() {
+            if let Some(tab) = self.state.find_ai_tab(tab_id).cloned() {
+                self.state.select_tab(tab_id);
+                self.show_terminal_surface();
+                self.synced_session_id = tab.pty_session_id.clone();
+                self.last_dimensions = None;
+                if let Some(session_id) = tab.pty_session_id {
+                    if let Some(remote_mode) = self.remote_mode.as_mut() {
+                        remote_mode.client.set_focused_session(Some(session_id));
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            if !self.ensure_mutation_control(cx) {
+                return;
+            }
+            let dimensions = self.terminal_dimensions(window);
+            match self.remote_request(RemoteAction::OpenAiTab {
+                tab_id: tab_id.to_string(),
+                dimensions,
+            }) {
+                Ok(result) if result.ok => {
+                    self.show_terminal_surface();
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to open AI tab.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to open AI tab: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let dimensions = self.terminal_dimensions(window);
         match self.process_manager.ensure_ai_session_for_tab(
             &mut self.state,
@@ -3785,6 +5847,34 @@ impl NativeShell {
     }
 
     fn restart_ai_tab_action(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            let dimensions = self.terminal_dimensions(window);
+            match self.remote_request(RemoteAction::RestartAiTab {
+                tab_id: tab_id.to_string(),
+                dimensions,
+            }) {
+                Ok(result) if result.ok => {
+                    self.show_terminal_surface();
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to restart AI tab.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to restart AI tab: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let dimensions = self.terminal_dimensions(window);
         match self
             .process_manager
@@ -3804,6 +5894,33 @@ impl NativeShell {
     }
 
     fn close_ai_tab_action(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::CloseAiTab {
+                tab_id: tab_id.to_string(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.state.remove_tab(tab_id);
+                    self.synced_session_id = None;
+                    self.last_dimensions = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to close AI tab.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to close AI tab: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         if let Err(error) = self
             .process_manager
             .close_ai_session(&mut self.state, tab_id)
@@ -3818,6 +5935,52 @@ impl NativeShell {
     }
 
     fn open_ssh_tab_action(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        if self.remote_mode.is_some() {
+            if let Some(tab) = self
+                .state
+                .find_ssh_tab_by_connection(connection_id)
+                .cloned()
+            {
+                self.state.select_tab(&tab.id);
+                self.show_terminal_surface();
+                self.synced_session_id = tab.pty_session_id.clone();
+                self.last_dimensions = None;
+                if let Some(session_id) = tab.pty_session_id {
+                    if let Some(remote_mode) = self.remote_mode.as_mut() {
+                        remote_mode.client.set_focused_session(Some(session_id));
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            if !self.ensure_mutation_control(cx) {
+                return;
+            }
+            match self.remote_request(RemoteAction::OpenSshTab {
+                connection_id: connection_id.to_string(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.show_terminal_surface();
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to open SSH tab.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to open SSH tab: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let connection = self.state.find_ssh_connection(connection_id).cloned();
         let Some(connection) = connection else {
             self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
@@ -3861,6 +6024,34 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            let dimensions = self.terminal_dimensions(window);
+            match self.remote_request(RemoteAction::ConnectSsh {
+                connection_id: connection_id.to_string(),
+                dimensions,
+            }) {
+                Ok(result) if result.ok => {
+                    self.show_terminal_surface();
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to connect SSH session.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to connect SSH session: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let dimensions = self.terminal_dimensions(window);
         match self
             .process_manager
@@ -3886,6 +6077,34 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            let dimensions = self.terminal_dimensions(window);
+            match self.remote_request(RemoteAction::RestartSsh {
+                connection_id: connection_id.to_string(),
+                dimensions,
+            }) {
+                Ok(result) if result.ok => {
+                    self.show_terminal_surface();
+                    self.terminal_notice = None;
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to restart SSH session.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to restart SSH session: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let Some(tab_id) = self
             .state
             .find_ssh_tab_by_connection(connection_id)
@@ -3915,6 +6134,35 @@ impl NativeShell {
     }
 
     fn disconnect_ssh_action(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::DisconnectSsh {
+                connection_id: connection_id.to_string(),
+            }) {
+                Ok(result) if result.ok => {
+                    self.synced_session_id = None;
+                    self.last_dimensions = None;
+                    self.terminal_notice =
+                        Some("SSH session is disconnected. Connect from the sidebar.".to_string());
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to disconnect SSH session.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice =
+                        Some(format!("Failed to disconnect SSH session: {error}"));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let Some(tab_id) = self
             .state
             .find_ssh_tab_by_connection(connection_id)
@@ -3955,7 +6203,7 @@ impl NativeShell {
             return;
         }
 
-        let active_session = self.process_manager.active_session();
+        let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         let session_id = self.state.active_terminal_spec().session_id;
 
@@ -3971,9 +6219,16 @@ impl NativeShell {
                     event.modifiers,
                     true,
                 ) {
-                    let _ = self
-                        .process_manager
-                        .write_bytes_to_session(&session_id, &sequence);
+                    if self.remote_mode.is_some() {
+                        self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                            session_id: session_id.clone(),
+                            bytes: sequence.to_vec(),
+                        });
+                    } else {
+                        let _ = self
+                            .process_manager
+                            .write_bytes_to_session(&session_id, &sequence);
+                    }
                     self.last_terminal_mouse_report = Some((cell, Some(event.button)));
                     window.prevent_default();
                 }
@@ -4050,7 +6305,7 @@ impl NativeShell {
             return;
         }
 
-        let active_session = self.process_manager.active_session();
+        let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
@@ -4063,9 +6318,16 @@ impl NativeShell {
                         event.modifiers,
                     ) {
                         let session_id = self.state.active_terminal_spec().session_id;
-                        let _ = self
-                            .process_manager
-                            .write_bytes_to_session(&session_id, &sequence);
+                        if self.remote_mode.is_some() {
+                            self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                                session_id,
+                                bytes: sequence.to_vec(),
+                            });
+                        } else {
+                            let _ = self
+                                .process_manager
+                                .write_bytes_to_session(&session_id, &sequence);
+                        }
                         self.last_terminal_mouse_report = Some(report_key);
                         window.prevent_default();
                     }
@@ -4103,7 +6365,7 @@ impl NativeShell {
             return false;
         }
 
-        if let Some(session) = self.process_manager.active_session() {
+        if let Some(session) = self.current_active_session_view() {
             if let Some(geometry) = self.terminal_scrollbar_geometry(window, &session) {
                 if self.scrollbar_hit_test(event.position, geometry) {
                     self.terminal_selection = None;
@@ -4146,7 +6408,7 @@ impl NativeShell {
             return false;
         }
 
-        if let Some(session) = self.process_manager.active_session() {
+        if let Some(session) = self.current_active_session_view() {
             if let Some(geometry) = self.terminal_scrollbar_geometry(window, &session) {
                 self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
                 window.prevent_default();
@@ -4167,7 +6429,7 @@ impl NativeShell {
             return;
         }
 
-        let active_session = self.process_manager.active_session();
+        let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
@@ -4179,9 +6441,16 @@ impl NativeShell {
                     false,
                 ) {
                     let session_id = self.state.active_terminal_spec().session_id;
-                    let _ = self
-                        .process_manager
-                        .write_bytes_to_session(&session_id, &sequence);
+                    if self.remote_mode.is_some() {
+                        self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                            session_id,
+                            bytes: sequence.to_vec(),
+                        });
+                    } else {
+                        let _ = self
+                            .process_manager
+                            .write_bytes_to_session(&session_id, &sequence);
+                    }
                     window.prevent_default();
                 }
             }
@@ -4217,7 +6486,7 @@ impl NativeShell {
             return;
         }
 
-        let active_session = self.process_manager.active_session();
+        let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             let cell = self
@@ -4231,9 +6500,16 @@ impl NativeShell {
                 false,
             ) {
                 let session_id = self.state.active_terminal_spec().session_id;
-                let _ = self
-                    .process_manager
-                    .write_bytes_to_session(&session_id, &sequence);
+                if self.remote_mode.is_some() {
+                    self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                        session_id,
+                        bytes: sequence.to_vec(),
+                    });
+                } else {
+                    let _ = self
+                        .process_manager
+                        .write_bytes_to_session(&session_id, &sequence);
+                }
                 window.prevent_default();
             }
             self.last_terminal_mouse_report = None;
@@ -4324,7 +6600,7 @@ impl NativeShell {
             return;
         }
         let session_id = self.state.active_terminal_spec().session_id;
-        let active_session = self.process_manager.active_session();
+        let active_session = self.current_active_session_view();
         let mode = active_session
             .as_ref()
             .map(|session| session.screen.mode)
@@ -4367,12 +6643,26 @@ impl NativeShell {
                 if let Some(clipboard) = cx.read_from_clipboard() {
                     match terminal_clipboard_payload(&clipboard) {
                         Some(TerminalClipboardPayload::Text(text)) => {
-                            let _ = self.process_manager.paste_to_session(&session_id, &text);
+                            if self.remote_mode.is_some() {
+                                self.remote_send_terminal_input(RemoteTerminalInput::Paste {
+                                    session_id: session_id.clone(),
+                                    text,
+                                });
+                            } else {
+                                let _ = self.process_manager.paste_to_session(&session_id, &text);
+                            }
                         }
                         Some(TerminalClipboardPayload::RawBytes(bytes)) => {
-                            let _ = self
-                                .process_manager
-                                .write_bytes_to_session(&session_id, &bytes);
+                            if self.remote_mode.is_some() {
+                                self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                                    session_id: session_id.clone(),
+                                    bytes,
+                                });
+                            } else {
+                                let _ = self
+                                    .process_manager
+                                    .write_bytes_to_session(&session_id, &bytes);
+                            }
                         }
                         None => {}
                     }
@@ -4396,9 +6686,18 @@ impl NativeShell {
                             session.runtime.status.is_live() && !session.runtime.interactive_shell
                         })
                     {
-                        self.process_manager.note_server_interrupt(&session_id);
+                        if self.remote_mode.is_none() {
+                            self.process_manager.note_server_interrupt(&session_id);
+                        }
                     }
-                    let _ = self.process_manager.write_to_session(&session_id, &text);
+                    if self.remote_mode.is_some() {
+                        self.remote_send_terminal_input(RemoteTerminalInput::Text {
+                            session_id,
+                            text,
+                        });
+                    } else {
+                        let _ = self.process_manager.write_to_session(&session_id, &text);
+                    }
                     window.prevent_default();
                 }
             }
@@ -4420,16 +6719,23 @@ impl NativeShell {
         }
 
         let session_id = self.state.active_terminal_spec().session_id;
-        if let Some(session) = self.process_manager.active_session() {
+        if let Some(session) = self.current_active_session_view() {
             if self.terminal_mouse_capture_active(session.screen.mode) {
                 if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                     if let Some(sequences) =
                         mouse_scroll_report(session.screen.mode, cell, delta_lines, event)
                     {
                         for sequence in sequences {
-                            let _ = self
-                                .process_manager
-                                .write_bytes_to_session(&session_id, &sequence);
+                            if self.remote_mode.is_some() {
+                                self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                                    session_id: session_id.clone(),
+                                    bytes: sequence.to_vec(),
+                                });
+                            } else {
+                                let _ = self
+                                    .process_manager
+                                    .write_bytes_to_session(&session_id, &sequence);
+                            }
                         }
                         self.last_terminal_mouse_report = Some((cell, None));
                     }
@@ -4439,13 +6745,27 @@ impl NativeShell {
                 && !event.modifiers.shift
             {
                 let sequence = alt_scroll_bytes(delta_lines);
-                let _ = self
-                    .process_manager
-                    .write_bytes_to_session(&session_id, &sequence);
+                if self.remote_mode.is_some() {
+                    self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                        session_id,
+                        bytes: sequence.to_vec(),
+                    });
+                } else {
+                    let _ = self
+                        .process_manager
+                        .write_bytes_to_session(&session_id, &sequence);
+                }
             } else {
-                let _ = self
-                    .process_manager
-                    .scroll_session(&session_id, delta_lines);
+                if self.remote_mode.is_some() {
+                    self.remote_send_action(RemoteAction::ScrollSession {
+                        session_id,
+                        delta_lines,
+                    });
+                } else {
+                    let _ = self
+                        .process_manager
+                        .scroll_session(&session_id, delta_lines);
+                }
             }
         } else {
         }
@@ -4458,7 +6778,7 @@ impl NativeShell {
         window: &Window,
         clamp_to_terminal: bool,
     ) -> Option<TerminalGridPosition> {
-        let session = self.process_manager.active_session()?;
+        let session = self.current_active_session_view()?;
         let bounds = self.terminal_text_bounds(window, &session)?;
         terminal_endpoint_for_mouse(position, bounds, clamp_to_terminal)
             .map(|endpoint| endpoint.position)
@@ -4470,7 +6790,7 @@ impl NativeShell {
         window: &Window,
         clamp_to_terminal: bool,
     ) -> Option<TerminalSelectionEndpoint> {
-        let session = self.process_manager.active_session()?;
+        let session = self.current_active_session_view()?;
         let bounds = self.terminal_text_bounds(window, &session)?;
         terminal_endpoint_for_mouse(position, bounds, clamp_to_terminal)
     }
@@ -4554,8 +6874,7 @@ impl NativeShell {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
         }
         if self
-            .process_manager
-            .active_session()
+            .current_active_session_view()
             .is_some_and(|session| session.runtime.awaiting_external_editor)
         {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
@@ -4613,7 +6932,7 @@ impl NativeShell {
     }
 
     fn selected_text(&self) -> Option<String> {
-        let session = self.process_manager.active_session()?;
+        let session = self.current_active_session_view()?;
         let selection = self.selection_snapshot(session.screen.cols)?;
         let mut lines = Vec::new();
 
@@ -4683,22 +7002,44 @@ impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
         self.capture_window_bounds(window);
+        self.sync_remote_host_config_from_service();
         if let Some(display_offset) = self.pending_terminal_display_offset.take() {
             let session_id = self.state.active_terminal_spec().session_id;
-            let _ = self
-                .process_manager
-                .scroll_session_to_offset(&session_id, display_offset);
+            if self.remote_mode.is_some() {
+                self.remote_send_action(RemoteAction::ScrollSessionToOffset {
+                    session_id,
+                    display_offset,
+                });
+            } else {
+                let _ = self
+                    .process_manager
+                    .scroll_session_to_offset(&session_id, display_offset);
+            }
         }
-        let runtime_snapshot = self.process_manager.runtime_state();
-        self.sync_server_port_snapshot(&runtime_snapshot, cx);
+
+        if self.remote_mode.is_none() {
+            self.pump_remote_host_requests(cx);
+        }
+
+        let local_runtime_snapshot = self.process_manager.runtime_state();
+        if self.remote_mode.is_none() {
+            self.sync_server_port_snapshot(&local_runtime_snapshot, cx);
+            self.sync_remote_host_snapshot_if_due(&local_runtime_snapshot);
+        }
+
+        let runtime_snapshot = self.current_runtime_snapshot();
         self.sync_window_title(window, &runtime_snapshot);
         let server_indicators = derive_server_indicator_states(
             &self.state,
             &runtime_snapshot,
-            &self.server_port_snapshot.statuses,
+            &self.current_port_statuses(),
         );
         let updater_snapshot = self.updater.snapshot();
+        self.sync_settings_remote_draft();
+        let allow_editor_mutation = self.remote_mode.is_none() || self.remote_has_control();
         let editor_model = self.editor_panel.clone().map(|panel| EditorPaneModel {
+            allow_mutation: allow_editor_mutation
+                || matches!(panel, EditorPanel::Settings(_) | EditorPanel::UiPreview(_)),
             panel,
             active_field: self.editor_active_field,
             cursor: self.editor_cursor,
@@ -5285,6 +7626,7 @@ impl Render for NativeShell {
                 &runtime_snapshot,
                 &server_indicators,
                 sidebar::SidebarActions {
+                    mutations_allowed: self.remote_mode.is_none() || self.remote_has_control(),
                     on_open_settings: &make_open_settings_handler,
                     on_toggle_sidebar: &make_toggle_sidebar_handler,
                     on_stop_all_servers: &make_stop_all_servers_handler,
@@ -6263,16 +8605,22 @@ fn normalize_optional_string(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn app_window_title() -> String {
+    crate::persistence::app_instance_label()
+        .map(|label| format!("{APP_WINDOW_TITLE} [{label}]"))
+        .unwrap_or_else(|| APP_WINDOW_TITLE.to_string())
+}
+
 fn current_window_title(state: &AppState, runtime: &crate::state::RuntimeState) -> String {
     let Some(tab) = state.active_tab() else {
-        return APP_WINDOW_TITLE.to_string();
+        return app_window_title();
     };
 
     let segments = [
         window_title_project_name(tab, state),
         active_tab_live_title(tab, runtime)
             .or_else(|| Some(window_title_fallback_label(tab, state))),
-        Some(APP_WINDOW_TITLE.to_string()),
+        Some(app_window_title()),
     ]
     .into_iter()
     .flatten()
@@ -6707,6 +9055,126 @@ fn load_folder_env_contents(folder_path: &str, env_file_path: &str) -> Option<St
     }
 
     env_service::read_env_text(&path).ok()
+}
+
+fn browse_remote_host_path(start_path: Option<&str>, directories_only: bool) -> Option<String> {
+    let mut dialog = FileDialog::new();
+    if let Some(path) = start_path.filter(|path| !path.trim().is_empty()) {
+        dialog = dialog.set_directory(path);
+    }
+    let picked = if directories_only {
+        dialog.pick_folder()
+    } else {
+        dialog.pick_file()
+    };
+    picked.map(|path| path.to_string_lossy().to_string())
+}
+
+fn list_remote_directory(path: &str) -> Result<Vec<remote::RemoteFsEntry>, String> {
+    let dir = std::path::Path::new(path);
+    let read_dir = std::fs::read_dir(dir)
+        .map_err(|error| format!("Could not list `{path}` on the host: {error}"))?;
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry =
+            entry.map_err(|error| format!("Could not list `{path}` on the host: {error}"))?;
+        let entry_path = entry.path();
+        entries.push(remote_fs_entry_from_metadata(
+            &entry_path,
+            entry.metadata().ok(),
+        ));
+    }
+    entries.sort_by(|left, right| {
+        right.is_dir.cmp(&left.is_dir).then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+    });
+    Ok(entries)
+}
+
+fn remote_fs_entry_for_path(path: &str) -> Result<Option<remote::RemoteFsEntry>, String> {
+    let target = std::path::Path::new(path);
+    if !target.exists() {
+        return Ok(None);
+    }
+    let metadata = std::fs::metadata(target)
+        .map_err(|error| format!("Could not inspect `{path}` on the host: {error}"))?;
+    Ok(Some(remote_fs_entry_from_metadata(target, Some(metadata))))
+}
+
+fn remote_fs_entry_from_metadata(
+    path: &std::path::Path,
+    metadata: Option<std::fs::Metadata>,
+) -> remote::RemoteFsEntry {
+    let modified_epoch_ms = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_to_epoch_ms);
+    remote::RemoteFsEntry {
+        path: path.to_string_lossy().to_string(),
+        name: path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string()),
+        is_dir: metadata.as_ref().is_some_and(|metadata| metadata.is_dir()),
+        size_bytes: metadata
+            .as_ref()
+            .and_then(|metadata| (!metadata.is_dir()).then_some(metadata.len())),
+        modified_epoch_ms,
+    }
+}
+
+fn system_time_to_epoch_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn last_path_segment(path: &str) -> String {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn apply_root_scan_entries(
+    wizard: &mut workspace::AddProjectWizard,
+    scan_entries: Vec<crate::models::RootScanEntry>,
+) {
+    let selected_folders: std::collections::BTreeSet<String> = scan_entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    let count = scan_entries.len();
+    wizard.scan_entries = scan_entries;
+    wizard.selected_folders = selected_folders;
+    wizard.scan_message = Some(if count == 0 {
+        "No sub-folders with package.json or Cargo.toml were found.".to_string()
+    } else {
+        format!("Discovered {count} folder(s). Open Configure to review scripts and ports.")
+    });
+}
+
+fn clear_root_scan_entries(wizard: &mut workspace::AddProjectWizard, message: String) {
+    wizard.scan_entries.clear();
+    wizard.selected_folders.clear();
+    wizard.scan_message = Some(message);
+}
+
+fn write_terminal_export(kind: &str, text: &str) -> Result<std::path::PathBuf, String> {
+    let file_name = format!(
+        "devmanager-terminal-{kind}-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let path = std::env::temp_dir().join(file_name);
+    std::fs::write(&path, text).map_err(|error| error.to_string())?;
+    Ok(path)
 }
 
 fn apply_text_key_to_string(

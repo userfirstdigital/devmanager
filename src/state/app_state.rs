@@ -3,10 +3,11 @@ use crate::models::{
     Settings, TabType, WindowBoundsState,
 };
 use crate::persistence::WorkspaceSnapshot;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveTerminalSpec {
     pub session_id: String,
     pub cwd: PathBuf,
@@ -26,7 +27,7 @@ pub struct FolderLookup<'a> {
     pub folder: &'a ProjectFolder,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub config: AppConfig,
     pub open_tabs: Vec<SessionTab>,
@@ -698,14 +699,14 @@ impl AppState {
         if let Some(project) = self.config.projects.first() {
             let cwd = PathBuf::from(project.root_path.clone());
             return ActiveTerminalSpec {
-                session_id: format!("phase1-shell-{}", project.id),
+                session_id: scoped_shell_session_id(format!("phase1-shell-{}", project.id)),
                 cwd: if cwd.is_dir() { cwd } else { fallback_cwd() },
                 display_label: project.name.clone(),
             };
         }
 
         ActiveTerminalSpec {
-            session_id: "phase1-shell".to_string(),
+            session_id: scoped_shell_session_id("phase1-shell"),
             cwd: fallback_cwd(),
             display_label: "Shell".to_string(),
         }
@@ -714,6 +715,14 @@ impl AppState {
 
 fn fallback_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn scoped_shell_session_id(base: impl AsRef<str>) -> String {
+    format!(
+        "{}-{}",
+        base.as_ref(),
+        crate::persistence::runtime_session_scope()
+    )
 }
 
 impl AppState {
@@ -758,5 +767,26 @@ mod tests {
         assert_eq!(tab.project_id, "project-1");
         assert_eq!(tab.command_id.as_deref(), Some("server-cmd"));
         assert_eq!(tab.pty_session_id.as_deref(), Some("server-cmd"));
+    }
+
+    #[test]
+    fn fallback_shell_session_id_is_scoped_to_runtime_instance() {
+        let mut state = AppState::default();
+        state.config.projects.push(Project {
+            id: "project-1".to_string(),
+            name: "Project".to_string(),
+            root_path: ".".to_string(),
+            folders: Vec::new(),
+            color: None,
+            pinned: Some(false),
+            notes: None,
+            save_log_files: Some(false),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+
+        let spec = state.active_terminal_spec();
+
+        assert!(spec.session_id.starts_with("phase1-shell-project-1-"));
     }
 }

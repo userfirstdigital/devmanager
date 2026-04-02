@@ -12,6 +12,7 @@ use crate::models::{
     DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult, ScannedPort,
     ScannedScript,
 };
+use crate::remote::{KnownRemoteHost, PairedRemoteClient};
 use crate::theme;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use gpui::{
@@ -977,6 +978,21 @@ impl EditorPanel {
             (Self::Settings(draft), EditorField::Settings(SettingsField::TerminalFontSize)) => {
                 Some(&draft.terminal_font_size)
             }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteBindAddress)) => {
+                Some(&draft.remote_bind_address)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemotePort)) => {
+                Some(&draft.remote_port)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteConnectAddress)) => {
+                Some(&draft.remote_connect_address)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteConnectPort)) => {
+                Some(&draft.remote_connect_port)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteConnectToken)) => {
+                Some(&draft.remote_connect_token)
+            }
             (Self::Project(draft), EditorField::Project(ProjectField::Name)) => Some(&draft.name),
             (Self::Project(draft), EditorField::Project(ProjectField::RootPath)) => {
                 Some(&draft.root_path)
@@ -1035,6 +1051,21 @@ impl EditorPanel {
             }
             (Self::Settings(draft), EditorField::Settings(SettingsField::TerminalFontSize)) => {
                 Some(&mut draft.terminal_font_size)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteBindAddress)) => {
+                Some(&mut draft.remote_bind_address)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemotePort)) => {
+                Some(&mut draft.remote_port)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteConnectAddress)) => {
+                Some(&mut draft.remote_connect_address)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteConnectPort)) => {
+                Some(&mut draft.remote_connect_port)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteConnectToken)) => {
+                Some(&mut draft.remote_connect_token)
             }
             (Self::Project(draft), EditorField::Project(ProjectField::Name)) => {
                 Some(&mut draft.name)
@@ -1106,6 +1137,20 @@ pub struct SettingsDraft {
     pub shell_integration_enabled: bool,
     pub terminal_mouse_override: bool,
     pub terminal_read_only: bool,
+    pub remote_host_enabled: bool,
+    pub remote_bind_address: String,
+    pub remote_port: String,
+    pub remote_pairing_token: String,
+    pub remote_connect_address: String,
+    pub remote_connect_port: String,
+    pub remote_connect_token: String,
+    pub remote_connected_label: Option<String>,
+    pub remote_has_control: bool,
+    pub remote_connected: bool,
+    pub remote_host_clients: usize,
+    pub remote_host_controller_client_id: Option<String>,
+    pub remote_known_hosts: Vec<KnownRemoteHost>,
+    pub remote_paired_clients: Vec<PairedRemoteClient>,
     pub open_picker: Option<SettingsPicker>,
 }
 
@@ -1191,8 +1236,12 @@ impl EditorField {
     pub fn is_numeric(self) -> bool {
         matches!(
             self,
-            Self::Settings(SettingsField::LogBufferSize | SettingsField::TerminalFontSize)
-                | Self::Command(CommandField::Port)
+            Self::Settings(
+                SettingsField::LogBufferSize
+                    | SettingsField::TerminalFontSize
+                    | SettingsField::RemotePort
+                    | SettingsField::RemoteConnectPort
+            ) | Self::Command(CommandField::Port)
                 | Self::Ssh(SshField::Port)
         )
     }
@@ -1205,6 +1254,11 @@ pub enum SettingsField {
     ClaudeCommand,
     CodexCommand,
     TerminalFontSize,
+    RemoteBindAddress,
+    RemotePort,
+    RemoteConnectAddress,
+    RemoteConnectPort,
+    RemoteConnectToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1257,6 +1311,7 @@ pub struct EditorPaneModel {
     pub cursor: usize,
     pub notice: Option<String>,
     pub updater: UpdaterSnapshot,
+    pub allow_mutation: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1297,6 +1352,16 @@ pub enum EditorAction {
     ToggleShellIntegrationEnabled,
     ToggleTerminalMouseOverride,
     ToggleTerminalReadOnly,
+    ToggleRemoteHosting,
+    RegenerateRemotePairingToken,
+    ConnectRemoteHost,
+    DisconnectRemoteHost,
+    TakeRemoteControl,
+    ReleaseRemoteControl,
+    TakeHostControl,
+    UseKnownRemoteHost(String),
+    ForgetKnownRemoteHost(String),
+    RevokeRemoteClient(String),
     ToggleProjectPinned,
     ToggleProjectSaveLogs,
     ToggleFolderHidden,
@@ -1315,7 +1380,7 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
 
     let title = model.panel.title();
     let subtitle = model.panel.subtitle();
-    let save_label = model.panel.save_label();
+    let save_label = model.allow_mutation.then(|| model.panel.save_label());
     let accent = model.panel.accent_color();
 
     let body: AnyElement = match &model.panel {
@@ -1338,10 +1403,10 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>
     };
 
     let on_close = (actions.on_action)(EditorAction::Close);
-    let on_save = (actions.on_action)(EditorAction::Save);
-    let on_delete = model
-        .panel
-        .show_delete()
+    let on_save = model
+        .allow_mutation
+        .then(|| (actions.on_action)(EditorAction::Save));
+    let on_delete = (model.allow_mutation && model.panel.show_delete())
         .then(|| (actions.on_action)(EditorAction::Delete));
     let show_intro = matches!(model.panel, EditorPanel::UiPreview(_));
 
@@ -1526,6 +1591,14 @@ fn render_settings_panel(
         SettingsPicker::DataActions,
     ));
     let on_open_ui_preview = (actions.on_action)(EditorAction::OpenUiPreview);
+    let on_toggle_remote_hosting = (actions.on_action)(EditorAction::ToggleRemoteHosting);
+    let on_regenerate_remote_pairing =
+        (actions.on_action)(EditorAction::RegenerateRemotePairingToken);
+    let on_connect_remote = (actions.on_action)(EditorAction::ConnectRemoteHost);
+    let on_disconnect_remote = (actions.on_action)(EditorAction::DisconnectRemoteHost);
+    let on_take_remote_control = (actions.on_action)(EditorAction::TakeRemoteControl);
+    let on_release_remote_control = (actions.on_action)(EditorAction::ReleaseRemoteControl);
+    let on_take_host_control = (actions.on_action)(EditorAction::TakeHostControl);
 
     let terminal_options: Vec<AnyElement> = if is_mac {
         [
@@ -1584,26 +1657,51 @@ fn render_settings_panel(
         );
     }
 
-    sections.push(FormSection::new("App").fields(vec![
-        FormField::toggle(
-            "Confirm before closing",
-            draft.confirm_on_close,
-            "Warn when servers are still running.",
-            on_toggle_confirm,
-        ),
-        FormField::toggle(
-            "Minimize to tray",
-            draft.minimize_to_tray,
-            minimize_to_tray_hint(),
-            on_toggle_tray,
-        ),
-        FormField::toggle(
-            "Restore previous session",
-            draft.restore_session_on_start,
-            "Reopen tabs and sidebar state on launch.",
-            on_toggle_restore,
-        ),
-    ]));
+    if draft.remote_connected {
+        sections.push(FormSection::new("Remote Session").fields(vec![
+            FormField::notice(
+                "Connected to a remote host. Host settings stay on the host; this panel only manages the connection from this client.",
+                SurfaceTone::Muted,
+            ),
+            FormField::info(
+                "Control",
+                if draft.remote_has_control {
+                    "Controller"
+                } else {
+                    "Viewer"
+                },
+                Some(
+                    if draft.remote_has_control {
+                        "This client can type, edit, and manage the host."
+                    } else {
+                        "Take control to type, edit, or start and stop host processes."
+                    }
+                    .to_string(),
+                ),
+            ),
+        ]));
+    } else {
+        sections.push(FormSection::new("App").fields(vec![
+            FormField::toggle(
+                "Confirm before closing",
+                draft.confirm_on_close,
+                "Warn when servers are still running.",
+                on_toggle_confirm,
+            ),
+            FormField::toggle(
+                "Minimize to tray",
+                draft.minimize_to_tray,
+                minimize_to_tray_hint(),
+                on_toggle_tray,
+            ),
+            FormField::toggle(
+                "Restore previous session",
+                draft.restore_session_on_start,
+                "Reopen tabs and sidebar state on launch.",
+                on_toggle_restore,
+            ),
+        ]));
+    }
 
     let mut terminal_fields = vec![
         FormField::custom(
@@ -1711,9 +1809,10 @@ fn render_settings_panel(
         ),
     ]);
 
-    sections.push(FormSection::new("Terminal").fields(terminal_fields));
+    if !draft.remote_connected {
+        sections.push(FormSection::new("Terminal").fields(terminal_fields));
 
-    sections.push(FormSection::new("AI").fields(vec![
+        sections.push(FormSection::new("AI").fields(vec![
                 FormField::custom(
                     render_settings_text_input(
                         "Claude command",
@@ -1742,49 +1841,296 @@ fn render_settings_panel(
                 ),
             ]));
 
+        sections.push(
+            FormSection::new("Updates").field(FormField::custom(
+                render_updater_panel(&model.updater, on_check_updates, None, on_install_update)
+                    .into_any_element(),
+            )),
+        );
+
+        sections.push(FormSection::new("Configuration").fields({
+            let mut fields = vec![FormField::action(
+                FormAction::new(
+                    "Configuration tools",
+                    if draft.open_picker == Some(SettingsPicker::DataActions) {
+                        "Hide"
+                    } else {
+                        "Show"
+                    },
+                    on_toggle_data_picker,
+                )
+                .description("Import or export config.json."),
+            )];
+
+            if draft.open_picker == Some(SettingsPicker::DataActions) {
+                fields.push(FormField::action_group(
+                    FormActionGroup::new("Config actions")
+                        .action(
+                            FormAction::new("Export current config", "Export", on_export)
+                                .description("Write the current config to disk."),
+                        )
+                        .action(
+                            FormAction::new("Import and merge", "Merge", on_import_merge)
+                                .description(
+                                    "Merge imported projects and settings into the current config.",
+                                ),
+                        )
+                        .action(
+                            FormAction::new("Import and replace", "Replace", on_import_replace)
+                                .description("Replace the current config with the imported file.")
+                                .style(SurfaceActionButtonStyle::Danger),
+                        ),
+                ));
+            }
+
+            fields
+        }));
+    }
+
     sections.push(
-        FormSection::new("Updates").field(FormField::custom(
-            render_updater_panel(&model.updater, on_check_updates, None, on_install_update)
-                .into_any_element(),
-        )),
+        FormSection::new("Remote").fields(if draft.remote_connected {
+            vec![
+                FormField::info(
+                    "Connected host",
+                    draft
+                        .remote_connected_label
+                        .clone()
+                        .unwrap_or_else(|| "Unknown host".to_string()),
+                    Some("This client is rendering the host workspace and runtime.".to_string()),
+                ),
+                FormField::notice(
+                    if draft.remote_has_control {
+                        "This client currently controls the host."
+                    } else {
+                        "This client is connected in viewer mode."
+                    },
+                    SurfaceTone::Accent,
+                ),
+                FormField::info(
+                    "Known host id",
+                    draft
+                        .remote_connected_label
+                        .clone()
+                        .unwrap_or_else(|| "Unknown host".to_string()),
+                    Some("Reconnect uses the saved host fingerprint and client token.".to_string()),
+                ),
+                FormField::action_group(
+                    FormActionGroup::new("Remote session")
+                        .action(
+                            FormAction::new(
+                                "Disconnect from the current remote host",
+                                "Disconnect",
+                                on_disconnect_remote,
+                            )
+                            .description("Return this app to its local workspace."),
+                        )
+                        .action(
+                            FormAction::new(
+                                "Take control of the connected host",
+                                "Take control",
+                                on_take_remote_control,
+                            )
+                            .description(
+                                "Allow this client to type, edit, and manage host processes.",
+                            ),
+                        )
+                        .action(
+                            FormAction::new(
+                                "Release control back to viewers",
+                                "Release",
+                                on_release_remote_control,
+                            )
+                            .description("Keep the session open but stop mutating the host."),
+                        ),
+                ),
+            ]
+        } else {
+            let mut fields = vec![
+                FormField::toggle(
+                    "Enable remote hosting",
+                    draft.remote_host_enabled,
+                    "Listen for another DevManager client on this machine.",
+                    on_toggle_remote_hosting,
+                ),
+                FormField::custom(
+                    render_settings_text_input(
+                        "Bind address",
+                        "Address the host listener binds to on this machine.",
+                        draft.remote_bind_address.as_str(),
+                        EditorField::Settings(SettingsField::RemoteBindAddress),
+                        model,
+                        actions,
+                        Some(200.0),
+                        "0.0.0.0",
+                    )
+                    .into_any_element(),
+                ),
+                FormField::custom(
+                    render_settings_text_input(
+                        "Port",
+                        "TCP port used by DevManager remote hosting.",
+                        draft.remote_port.as_str(),
+                        EditorField::Settings(SettingsField::RemotePort),
+                        model,
+                        actions,
+                        Some(120.0),
+                        "43871",
+                    )
+                    .into_any_element(),
+                ),
+                FormField::action_group(
+                    FormActionGroup::new("Pairing")
+                        .action(
+                            FormAction::new(
+                                "Pairing token",
+                                draft.remote_pairing_token.as_str(),
+                                on_regenerate_remote_pairing,
+                            )
+                            .description("Regenerate the one-time token shown to a new client."),
+                        )
+                        .action(
+                            FormAction::new("Connect to remote host", "Connect", on_connect_remote)
+                                .description(
+                                    "Open a remote DevManager session from another machine.",
+                                ),
+                        ),
+                ),
+                FormField::custom(
+                    render_settings_text_input(
+                        "Remote address",
+                        "Host or IP for the remote DevManager instance.",
+                        draft.remote_connect_address.as_str(),
+                        EditorField::Settings(SettingsField::RemoteConnectAddress),
+                        model,
+                        actions,
+                        None,
+                        "192.168.0.20",
+                    )
+                    .into_any_element(),
+                ),
+                FormField::custom(
+                    render_settings_text_input(
+                        "Remote port",
+                        "Port for the remote DevManager host.",
+                        draft.remote_connect_port.as_str(),
+                        EditorField::Settings(SettingsField::RemoteConnectPort),
+                        model,
+                        actions,
+                        Some(120.0),
+                        "43871",
+                    )
+                    .into_any_element(),
+                ),
+                FormField::custom(
+                    render_settings_text_input(
+                        "Pair token",
+                        "Only needed the first time this client pairs with a host.",
+                        draft.remote_connect_token.as_str(),
+                        EditorField::Settings(SettingsField::RemoteConnectToken),
+                        model,
+                        actions,
+                        Some(180.0),
+                        "ABC123",
+                    )
+                    .into_any_element(),
+                ),
+                FormField::notice(
+                    format!(
+                        "Hosting is {} with {} connected client(s).",
+                        if draft.remote_host_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        draft.remote_host_clients
+                    ),
+                    SurfaceTone::Muted,
+                ),
+            ];
+            if let Some(controller_id) = draft.remote_host_controller_client_id.as_deref() {
+                fields.push(FormField::notice(
+                    format!("Remote client `{controller_id}` currently controls this host."),
+                    SurfaceTone::Accent,
+                ));
+                fields.push(FormField::action(
+                    FormAction::new(
+                        "Take local host control back from the active remote client",
+                        "Take local control",
+                        on_take_host_control,
+                    )
+                    .description(
+                        "Local edits and process actions will reclaim host control immediately.",
+                    ),
+                ));
+            }
+            fields
+        }),
     );
 
-    sections.push(FormSection::new("Configuration").fields({
-        let mut fields = vec![FormField::action(
-            FormAction::new(
-                "Configuration tools",
-                if draft.open_picker == Some(SettingsPicker::DataActions) {
-                    "Hide"
-                } else {
-                    "Show"
-                },
-                on_toggle_data_picker,
-            )
-            .description("Import or export config.json."),
-        )];
-
-        if draft.open_picker == Some(SettingsPicker::DataActions) {
-            fields.push(FormField::action_group(
-                FormActionGroup::new("Config actions")
-                    .action(
-                        FormAction::new("Export current config", "Export", on_export)
-                            .description("Write the current config to disk."),
-                    )
-                    .action(
-                        FormAction::new("Import and merge", "Merge", on_import_merge).description(
-                            "Merge imported projects and settings into the current config.",
-                        ),
-                    )
-                    .action(
-                        FormAction::new("Import and replace", "Replace", on_import_replace)
-                            .description("Replace the current config with the imported file.")
+    if !draft.remote_connected && !draft.remote_known_hosts.is_empty() {
+        let fields = draft
+            .remote_known_hosts
+            .iter()
+            .map(|host| {
+                let hint = format_saved_host_hint(host);
+                FormField::action_group(
+                    FormActionGroup::new(host.label.clone())
+                        .hint(hint)
+                        .action(
+                            FormAction::new(
+                                "Use this saved host",
+                                "Use",
+                                (actions.on_action)(EditorAction::UseKnownRemoteHost(
+                                    host.server_id.clone(),
+                                )),
+                            )
+                            .description("Fill the connect fields from this saved host."),
+                        )
+                        .action(
+                            FormAction::new(
+                                "Forget this saved host",
+                                "Forget",
+                                (actions.on_action)(EditorAction::ForgetKnownRemoteHost(
+                                    host.server_id.clone(),
+                                )),
+                            )
+                            .description("Remove the saved host fingerprint and client token.")
                             .style(SurfaceActionButtonStyle::Danger),
-                    ),
-            ));
-        }
+                        ),
+                )
+            })
+            .collect();
+        sections.push(FormSection::new("Saved Hosts").fields(fields));
+    }
 
-        fields
-    }));
+    if !draft.remote_connected && !draft.remote_paired_clients.is_empty() {
+        let controller_id = draft.remote_host_controller_client_id.as_deref();
+        let fields = draft
+            .remote_paired_clients
+            .iter()
+            .map(|client| {
+                let hint = format_paired_client_hint(client, controller_id);
+                FormField::action_group(
+                    FormActionGroup::new(client.label.clone())
+                        .hint(hint)
+                        .action(
+                            FormAction::new(
+                                "Revoke this paired client",
+                                "Revoke",
+                                (actions.on_action)(EditorAction::RevokeRemoteClient(
+                                    client.client_id.clone(),
+                                )),
+                            )
+                            .description(
+                                "Invalidate this client token and disconnect it if it is online.",
+                            )
+                            .style(SurfaceActionButtonStyle::Danger),
+                        ),
+                )
+            })
+            .collect();
+        sections.push(FormSection::new("Paired Clients").fields(fields));
+    }
 
     sections.push(
         FormSection::new("Developer").field(FormField::action(
@@ -2802,6 +3148,7 @@ fn preview_editor_model(panel: EditorPanel, model: &EditorPaneModel) -> EditorPa
         cursor: 0,
         notice: None,
         updater: model.updater.clone(),
+        allow_mutation: true,
     }
 }
 
@@ -2818,6 +3165,7 @@ fn preview_editor_model_with_state(
         cursor,
         notice,
         updater: model.updater.clone(),
+        allow_mutation: true,
     }
 }
 
@@ -3005,8 +3353,59 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         shell_integration_enabled: true,
         terminal_mouse_override: false,
         terminal_read_only: false,
+        remote_host_enabled: false,
+        remote_bind_address: "0.0.0.0".to_string(),
+        remote_port: "43871".to_string(),
+        remote_pairing_token: "ABC123".to_string(),
+        remote_connect_address: "192.168.0.20".to_string(),
+        remote_connect_port: "43871".to_string(),
+        remote_connect_token: String::new(),
+        remote_connected_label: Some("studio-pc".to_string()),
+        remote_has_control: true,
+        remote_connected: true,
+        remote_host_clients: 1,
+        remote_host_controller_client_id: Some("client-studio".to_string()),
+        remote_known_hosts: vec![KnownRemoteHost {
+            label: "studio-pc".to_string(),
+            address: "192.168.0.20".to_string(),
+            port: 43871,
+            server_id: "host-studio".to_string(),
+            certificate_fingerprint: "fingerprint".to_string(),
+            client_id: "client-laptop".to_string(),
+            auth_token: "token".to_string(),
+            last_connected_epoch_ms: Some(1_710_000_000_000),
+        }],
+        remote_paired_clients: vec![PairedRemoteClient {
+            client_id: "client-studio".to_string(),
+            label: "studio-laptop".to_string(),
+            auth_token: "token".to_string(),
+            last_seen_epoch_ms: Some(1_710_000_000_000),
+        }],
         open_picker,
     }
+}
+
+fn format_saved_host_hint(host: &KnownRemoteHost) -> String {
+    let mut hint = format!("{}:{}", host.address, host.port);
+    if host.last_connected_epoch_ms.is_some() {
+        hint.push_str(" • previously connected");
+    }
+    hint
+}
+
+fn format_paired_client_hint(
+    client: &PairedRemoteClient,
+    controller_client_id: Option<&str>,
+) -> String {
+    let mut hint = if controller_client_id == Some(client.client_id.as_str()) {
+        "Currently has control".to_string()
+    } else {
+        "Saved client token".to_string()
+    };
+    if client.last_seen_epoch_ms.is_some() {
+        hint.push_str(" • seen before");
+    }
+    hint
 }
 
 fn sample_wizard_initial() -> AddProjectWizard {

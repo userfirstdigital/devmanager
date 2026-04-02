@@ -44,6 +44,7 @@ pub enum ServerIndicatorState {
 }
 
 pub struct SidebarActions<'a> {
+    pub mutations_allowed: bool,
     pub on_open_settings: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_toggle_sidebar: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_stop_all_servers: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
@@ -134,9 +135,15 @@ fn render_collapsed_sidebar(actions: SidebarActions<'_>) -> AnyElement {
             icons::CHEVRON_RIGHT,
             (actions.on_toggle_sidebar)(),
         ))
-        .child(icon_button(icons::PLUS, (actions.on_add_project)()))
+        .children(
+            actions
+                .mutations_allowed
+                .then(|| icon_button(icons::PLUS, (actions.on_add_project)()).into_any_element()),
+        )
         .child(div().flex_1())
-        .child(icon_button(icons::SQUARE, (actions.on_stop_all_servers)()))
+        .children(actions.mutations_allowed.then(|| {
+            icon_button(icons::SQUARE, (actions.on_stop_all_servers)()).into_any_element()
+        }))
         .child(icon_button(icons::SETTINGS, (actions.on_open_settings)()))
         .into_any_element()
 }
@@ -231,11 +238,10 @@ fn render_expanded_sidebar(
                         .gap(px(1.0))
                         .child(section_label("SSH"))
                         .children(ssh_rows)
-                        .child(accent_text_action(
-                            "+ Add SSH",
-                            theme::SSH_DOT,
-                            (actions.on_add_ssh)(),
-                        )),
+                        .children(actions.mutations_allowed.then(|| {
+                            accent_text_action("+ Add SSH", theme::SSH_DOT, (actions.on_add_ssh)())
+                                .into_any_element()
+                        })),
                 ),
         )
         .child(
@@ -249,8 +255,14 @@ fn render_expanded_sidebar(
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .child(primary_button("+ Add Project", (actions.on_add_project)()))
-                        .child(icon_button(icons::SQUARE, (actions.on_stop_all_servers)()))
+                        .children(actions.mutations_allowed.then(|| {
+                            primary_button("+ Add Project", (actions.on_add_project)())
+                                .into_any_element()
+                        }))
+                        .children(actions.mutations_allowed.then(|| {
+                            icon_button(icons::SQUARE, (actions.on_stop_all_servers)())
+                                .into_any_element()
+                        }))
                         .child(icon_button(icons::SETTINGS, (actions.on_open_settings)())),
                 ),
         )
@@ -299,26 +311,28 @@ fn render_project_group(
                 actions,
             )
         });
-    let ai_launch_row = div()
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .pl_4()
-        .text_xs()
-        .child(icon_text_action(
-            icons::SPARKLES,
-            10.0,
-            "+ Claude",
-            0xb07d3a, // muted amber, subtle
-            (actions.on_launch_claude)(project.id.clone()),
-        ))
-        .child(icon_text_action(
-            icons::BOT,
-            10.0,
-            "+ Codex",
-            0x6a9c89, // muted teal, subtle
-            (actions.on_launch_codex)(project.id.clone()),
-        ));
+    let ai_launch_row = actions.mutations_allowed.then(|| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .pl_4()
+            .text_xs()
+            .child(icon_text_action(
+                icons::SPARKLES,
+                10.0,
+                "+ Claude",
+                0xb07d3a, // muted amber, subtle
+                (actions.on_launch_claude)(project.id.clone()),
+            ))
+            .child(icon_text_action(
+                icons::BOT,
+                10.0,
+                "+ Codex",
+                0x6a9c89, // muted teal, subtle
+                (actions.on_launch_codex)(project.id.clone()),
+            ))
+    });
 
     let menu_open = matches!(
         actions.open_context_menu,
@@ -384,22 +398,25 @@ fn render_project_group(
                                 (actions.on_open_project_notes)(project.id.clone()),
                             )
                         }))
-                        .children(can_move_up.then(|| {
+                        .children((actions.mutations_allowed && can_move_up).then(|| {
                             row_icon_action(
                                 icons::CHEVRON_UP,
                                 (actions.on_move_project_up)(project.id.clone()),
                             )
                         }))
-                        .children(can_move_down.then(|| {
+                        .children((actions.mutations_allowed && can_move_down).then(|| {
                             row_icon_action(
                                 icons::CHEVRON_DOWN,
                                 (actions.on_move_project_down)(project.id.clone()),
                             )
                         }))
-                        .child(row_icon_action(
-                            icons::PLUS,
-                            (actions.on_add_folder)(project.id.clone()),
-                        ))
+                        .children(actions.mutations_allowed.then(|| {
+                            row_icon_action(
+                                icons::PLUS,
+                                (actions.on_add_folder)(project.id.clone()),
+                            )
+                            .into_any_element()
+                        }))
                         .child(row_icon_action(
                             icons::MORE_HORIZONTAL,
                             (actions.on_toggle_context_menu)(SidebarContextMenu::Project {
@@ -409,15 +426,17 @@ fn render_project_group(
                 ),
         )
         .children(menu_open.then(|| {
-            let mut items: Vec<AnyElement> = vec![
-                context_menu_item(
-                    "Edit Project",
-                    (actions.on_edit_project)(project.id.clone()),
-                )
-                .into_any_element(),
-                context_menu_item("Add Folder", (actions.on_add_folder)(project.id.clone()))
-                    .into_any_element(),
-            ];
+            let mut items: Vec<AnyElement> = vec![context_menu_item(
+                "Edit Project",
+                (actions.on_edit_project)(project.id.clone()),
+            )
+            .into_any_element()];
+            if actions.mutations_allowed {
+                items.push(
+                    context_menu_item("Add Folder", (actions.on_add_folder)(project.id.clone()))
+                        .into_any_element(),
+                );
+            }
             if project.notes.is_some() {
                 items.push(
                     context_menu_item(
@@ -427,13 +446,15 @@ fn render_project_group(
                     .into_any_element(),
                 );
             }
-            items.push(
-                context_menu_danger_item(
-                    "Delete Project",
-                    (actions.on_delete_project)(project.id.clone()),
-                )
-                .into_any_element(),
-            );
+            if actions.mutations_allowed {
+                items.push(
+                    context_menu_danger_item(
+                        "Delete Project",
+                        (actions.on_delete_project)(project.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+            }
             context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
         }));
 
@@ -446,7 +467,7 @@ fn render_project_group(
             .children(folder_rows)
             .children(claude_rows)
             .children(codex_rows)
-            .child(ai_launch_row);
+            .children(ai_launch_row);
     }
 
     group
@@ -486,6 +507,7 @@ fn render_ai_row(
 
     let mut row = div()
         .group("ai-row")
+        .w_full()
         .flex()
         .items_center()
         .justify_between()
@@ -508,9 +530,12 @@ fn render_ai_row(
 
     row.child(
         div()
+            .flex_1()
+            .min_w(px(0.0))
             .flex()
             .items_center()
             .gap(px(5.0))
+            .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
                 (actions.on_select_ai_tab)(tab.id.clone()),
@@ -565,10 +590,10 @@ fn render_ai_row(
                     .gap(px(4.0))
                     .opacity(0.0)
                     .group_hover("ai-row", |s| s.opacity(1.0))
-                    .children(session.is_some().then(|| {
+                    .children((actions.mutations_allowed && session.is_some()).then(|| {
                         row_icon_action(icons::X, (actions.on_close_ai_tab)(tab.id.clone()))
                     }))
-                    .children(session.is_none().then(|| {
+                    .children((actions.mutations_allowed && session.is_none()).then(|| {
                         row_icon_action(icons::PLAY, (actions.on_restart_ai_tab)(tab.id.clone()))
                     })),
             ),
@@ -636,6 +661,7 @@ fn render_folder_group(
                 .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
                 .child(
                     div()
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap(px(4.0))
@@ -654,10 +680,13 @@ fn render_folder_group(
                         .gap(px(4.0))
                         .opacity(if menu_open { 1.0 } else { 0.0 })
                         .group_hover("folder-group-row", |s| s.opacity(1.0))
-                        .child(row_icon_action(
-                            icons::PLUS,
-                            (actions.on_add_command)(project.id.clone(), folder.id.clone()),
-                        ))
+                        .children(actions.mutations_allowed.then(|| {
+                            row_icon_action(
+                                icons::PLUS,
+                                (actions.on_add_command)(project.id.clone(), folder.id.clone()),
+                            )
+                            .into_any_element()
+                        }))
                         .child(row_icon_action(
                             icons::MORE_HORIZONTAL,
                             (actions.on_toggle_context_menu)(SidebarContextMenu::Folder {
@@ -668,23 +697,27 @@ fn render_folder_group(
                 ),
         )
         .children(menu_open.then(|| {
-            let items: Vec<AnyElement> = vec![
-                context_menu_item(
-                    "Edit Folder",
-                    (actions.on_edit_folder)(project.id.clone(), folder.id.clone()),
-                )
-                .into_any_element(),
-                context_menu_item(
-                    "Add Command",
-                    (actions.on_add_command)(project.id.clone(), folder.id.clone()),
-                )
-                .into_any_element(),
-                context_menu_danger_item(
-                    "Remove Folder",
-                    (actions.on_delete_folder)(project.id.clone(), folder.id.clone()),
-                )
-                .into_any_element(),
-            ];
+            let mut items: Vec<AnyElement> = vec![context_menu_item(
+                "Edit Folder",
+                (actions.on_edit_folder)(project.id.clone(), folder.id.clone()),
+            )
+            .into_any_element()];
+            if actions.mutations_allowed {
+                items.push(
+                    context_menu_item(
+                        "Add Command",
+                        (actions.on_add_command)(project.id.clone(), folder.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+                items.push(
+                    context_menu_danger_item(
+                        "Remove Folder",
+                        (actions.on_delete_folder)(project.id.clone(), folder.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+            }
             context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
         }))
         .children(
@@ -724,6 +757,7 @@ fn render_single_command_folder_row(
 
     let mut inner_row = div()
         .group("folder-row")
+        .w_full()
         .flex()
         .items_center()
         .justify_between()
@@ -751,9 +785,12 @@ fn render_single_command_folder_row(
             inner_row
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
                         .gap(px(5.0))
+                        .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
                             (actions.on_select_server_tab)(command.id.clone()),
@@ -785,18 +822,22 @@ fn render_single_command_folder_row(
                                 .gap(px(4.0))
                                 .opacity(if menu_open { 1.0 } else { 0.0 })
                                 .group_hover("folder-row", |s| s.opacity(1.0))
-                                .children((!status.is_live()).then(|| {
-                                    row_icon_action(
-                                        icons::PLAY,
-                                        (actions.on_start_server)(command.id.clone()),
-                                    )
-                                }))
-                                .children(status.is_live().then(|| {
-                                    row_icon_action(
-                                        icons::SQUARE,
-                                        (actions.on_stop_server)(command.id.clone()),
-                                    )
-                                }))
+                                .children((actions.mutations_allowed && !status.is_live()).then(
+                                    || {
+                                        row_icon_action(
+                                            icons::PLAY,
+                                            (actions.on_start_server)(command.id.clone()),
+                                        )
+                                    },
+                                ))
+                                .children((actions.mutations_allowed && status.is_live()).then(
+                                    || {
+                                        row_icon_action(
+                                            icons::SQUARE,
+                                            (actions.on_stop_server)(command.id.clone()),
+                                        )
+                                    },
+                                ))
                                 .child(row_icon_action(
                                     icons::MORE_HORIZONTAL,
                                     (actions.on_toggle_context_menu)(
@@ -823,13 +864,13 @@ fn render_single_command_folder_row(
                 )
                 .into_any_element(),
             ];
-            if !status.is_live() {
+            if actions.mutations_allowed && !status.is_live() {
                 items.push(
                     context_menu_item("Start", (actions.on_start_server)(command.id.clone()))
                         .into_any_element(),
                 );
             }
-            if status.is_live() {
+            if actions.mutations_allowed && status.is_live() {
                 items.push(
                     context_menu_item("Restart", (actions.on_restart_server)(command.id.clone()))
                         .into_any_element(),
@@ -839,13 +880,15 @@ fn render_single_command_folder_row(
                         .into_any_element(),
                 );
             }
-            items.push(
-                context_menu_danger_item(
-                    "Remove Folder",
-                    (actions.on_delete_folder)(project.id.clone(), folder.id.clone()),
-                )
-                .into_any_element(),
-            );
+            if actions.mutations_allowed {
+                items.push(
+                    context_menu_danger_item(
+                        "Remove Folder",
+                        (actions.on_delete_folder)(project.id.clone(), folder.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+            }
             context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
         }))
 }
@@ -885,6 +928,7 @@ fn render_command_row(
 
     let mut cmd_row = div()
         .group("command-row")
+        .w_full()
         .flex()
         .items_center()
         .justify_between()
@@ -912,9 +956,12 @@ fn render_command_row(
             cmd_row
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
                         .gap(px(5.0))
+                        .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
                             (actions.on_select_server_tab)(command.id.clone()),
@@ -968,18 +1015,22 @@ fn render_command_row(
                                 .gap(px(4.0))
                                 .opacity(if menu_open { 1.0 } else { 0.0 })
                                 .group_hover("command-row", |s| s.opacity(1.0))
-                                .children((!status.is_live()).then(|| {
-                                    row_icon_action(
-                                        icons::PLAY,
-                                        (actions.on_start_server)(command.id.clone()),
-                                    )
-                                }))
-                                .children(status.is_live().then(|| {
-                                    row_icon_action(
-                                        icons::SQUARE,
-                                        (actions.on_stop_server)(command.id.clone()),
-                                    )
-                                }))
+                                .children((actions.mutations_allowed && !status.is_live()).then(
+                                    || {
+                                        row_icon_action(
+                                            icons::PLAY,
+                                            (actions.on_start_server)(command.id.clone()),
+                                        )
+                                    },
+                                ))
+                                .children((actions.mutations_allowed && status.is_live()).then(
+                                    || {
+                                        row_icon_action(
+                                            icons::SQUARE,
+                                            (actions.on_stop_server)(command.id.clone()),
+                                        )
+                                    },
+                                ))
                                 .child(row_icon_action(
                                     icons::MORE_HORIZONTAL,
                                     (actions.on_toggle_context_menu)(SidebarContextMenu::Command {
@@ -995,13 +1046,13 @@ fn render_command_row(
                 (actions.on_edit_command)(command.id.clone()),
             )
             .into_any_element()];
-            if !status.is_live() {
+            if actions.mutations_allowed && !status.is_live() {
                 items.push(
                     context_menu_item("Start", (actions.on_start_server)(command.id.clone()))
                         .into_any_element(),
                 );
             }
-            if status.is_live() {
+            if actions.mutations_allowed && status.is_live() {
                 items.push(
                     context_menu_item("Restart", (actions.on_restart_server)(command.id.clone()))
                         .into_any_element(),
@@ -1011,13 +1062,15 @@ fn render_command_row(
                         .into_any_element(),
                 );
             }
-            items.push(
-                context_menu_danger_item(
-                    "Delete Command",
-                    (actions.on_delete_command)(command.id.clone()),
-                )
-                .into_any_element(),
-            );
+            if actions.mutations_allowed {
+                items.push(
+                    context_menu_danger_item(
+                        "Delete Command",
+                        (actions.on_delete_command)(command.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+            }
             context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
         }))
 }
@@ -1050,6 +1103,7 @@ fn render_ssh_row(
         .child(
             div()
                 .group("ssh-row")
+                .w_full()
                 .flex()
                 .items_start()
                 .justify_between()
@@ -1071,6 +1125,7 @@ fn render_ssh_row(
                         .flex()
                         .items_start()
                         .gap(px(6.0))
+                        .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
                             (actions.on_open_ssh_tab)(connection.id.clone()),
@@ -1131,18 +1186,21 @@ fn render_ssh_row(
                         .gap(px(4.0))
                         .opacity(if menu_open || is_active { 1.0 } else { 0.0 })
                         .group_hover("ssh-row", |s| s.opacity(1.0))
-                        .child(row_icon_action(
-                            if is_connected {
-                                icons::SQUARE
-                            } else {
-                                icons::PLAY
-                            },
-                            if is_connected {
-                                (actions.on_disconnect_ssh)(connection.id.clone())
-                            } else {
-                                (actions.on_connect_ssh)(connection.id.clone())
-                            },
-                        ))
+                        .children(actions.mutations_allowed.then(|| {
+                            row_icon_action(
+                                if is_connected {
+                                    icons::SQUARE
+                                } else {
+                                    icons::PLAY
+                                },
+                                if is_connected {
+                                    (actions.on_disconnect_ssh)(connection.id.clone())
+                                } else {
+                                    (actions.on_connect_ssh)(connection.id.clone())
+                                },
+                            )
+                            .into_any_element()
+                        }))
                         .child(row_icon_action(
                             icons::SETTINGS,
                             (actions.on_edit_ssh)(connection.id.clone()),
@@ -1161,7 +1219,7 @@ fn render_ssh_row(
                     context_menu_item("Edit SSH", (actions.on_edit_ssh)(connection.id.clone()))
                         .into_any_element(),
                 ];
-            if is_connected {
+            if actions.mutations_allowed && is_connected {
                 items.push(
                     context_menu_item("Restart", (actions.on_restart_ssh)(connection.id.clone()))
                         .into_any_element(),
@@ -1173,19 +1231,21 @@ fn render_ssh_row(
                     )
                     .into_any_element(),
                 );
-            } else {
+            } else if actions.mutations_allowed {
                 items.push(
                     context_menu_item("Connect", (actions.on_connect_ssh)(connection.id.clone()))
                         .into_any_element(),
                 );
             }
-            items.push(
-                context_menu_danger_item(
-                    "Delete SSH",
-                    (actions.on_delete_ssh)(connection.id.clone()),
-                )
-                .into_any_element(),
-            );
+            if actions.mutations_allowed {
+                items.push(
+                    context_menu_danger_item(
+                        "Delete SSH",
+                        (actions.on_delete_ssh)(connection.id.clone()),
+                    )
+                    .into_any_element(),
+                );
+            }
             context_menu_panel(items, (actions.on_dismiss_context_menu)()).into_any_element()
         }))
 }

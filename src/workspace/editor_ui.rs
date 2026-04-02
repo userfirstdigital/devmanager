@@ -326,6 +326,11 @@ impl FormActionGroup {
         }
     }
 
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
     pub fn action(mut self, action: FormAction) -> Self {
         self.actions.push(action);
         self
@@ -458,8 +463,8 @@ pub(super) fn render_editor_toolbar(
     title: &str,
     subtitle: &str,
     accent: u32,
-    save_label: &str,
-    on_save: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    save_label: Option<&str>,
+    on_save: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     on_delete: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     on_close: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
@@ -508,11 +513,14 @@ pub(super) fn render_editor_toolbar(
                         .flex()
                         .items_center()
                         .gap(px(8.0))
-                        .child(render_surface_action_button(
-                            save_label,
-                            SurfaceActionButtonStyle::Primary,
-                            on_save,
-                        ))
+                        .children(save_label.zip(on_save).map(|(save_label, on_save)| {
+                            render_surface_action_button(
+                                save_label,
+                                SurfaceActionButtonStyle::Primary,
+                                on_save,
+                            )
+                            .into_any_element()
+                        }))
                         .children(on_delete.map(|on_delete| {
                             render_surface_action_button(
                                 "Delete",
