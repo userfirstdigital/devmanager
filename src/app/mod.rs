@@ -3855,6 +3855,24 @@ impl NativeShell {
                     cx.notify();
                 }
             }
+            EditorAction::CopyRemotePairingToken => {
+                let token = self
+                    .editor_panel
+                    .as_ref()
+                    .and_then(|panel| match panel {
+                        EditorPanel::Settings(draft) => Some(draft.remote_pairing_token.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if token.trim().is_empty() {
+                    self.editor_notice =
+                        Some("Generate or enable hosting before copying a pair token.".to_string());
+                } else {
+                    cx.write_to_clipboard(ClipboardItem::new_string(token));
+                    self.editor_notice = Some("Copied pair token to the clipboard.".to_string());
+                }
+                cx.notify();
+            }
             EditorAction::ConnectRemoteHost => {
                 let Some((
                     remote_connect_in_flight,
@@ -3953,18 +3971,32 @@ impl NativeShell {
                 if let (Some(host), Some(EditorPanel::Settings(draft))) =
                     (host, self.editor_panel.as_mut())
                 {
-                    let host_label = host.label.clone();
                     let host_address = host.address.clone();
-                    let host_port = host.port;
                     draft.remote_connect_address = host_address.clone();
                     draft.remote_connect_port = host.port.to_string();
                     draft.remote_connect_token.clear();
-                    draft.remote_connect_in_flight = false;
-                    draft.remote_connect_status = Some(format!(
-                        "Loaded saved host `{host_label}` ({host_address}:{host_port}). Click Connect to open it."
-                    ));
-                    draft.remote_connect_status_is_error = false;
                     draft.open_picker = None;
+                }
+                if let Some(host) = self
+                    .remote_machine_state
+                    .known_hosts
+                    .iter()
+                    .find(|host| host.server_id == server_id)
+                    .cloned()
+                {
+                    self.editor_notice = None;
+                    match self.begin_connect_remote_host(host.address.clone(), host.port, None, cx)
+                    {
+                        Ok(()) => {}
+                        Err(error) => {
+                            self.editor_notice = Some(error.clone());
+                            if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                                draft.remote_connect_in_flight = false;
+                                draft.remote_connect_status = Some(error);
+                                draft.remote_connect_status_is_error = true;
+                            }
+                        }
+                    }
                 }
                 cx.notify();
             }

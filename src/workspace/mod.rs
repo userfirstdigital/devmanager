@@ -1361,6 +1361,7 @@ pub enum EditorAction {
     ToggleTerminalReadOnly,
     ToggleRemoteHosting,
     RegenerateRemotePairingToken,
+    CopyRemotePairingToken,
     ConnectRemoteHost,
     DisconnectRemoteHost,
     TakeRemoteControl,
@@ -1601,6 +1602,7 @@ fn render_settings_panel(
     let on_toggle_remote_hosting = (actions.on_action)(EditorAction::ToggleRemoteHosting);
     let on_regenerate_remote_pairing =
         (actions.on_action)(EditorAction::RegenerateRemotePairingToken);
+    let on_copy_remote_pairing = (actions.on_action)(EditorAction::CopyRemotePairingToken);
     let on_connect_remote = (actions.on_action)(EditorAction::ConnectRemoteHost);
     let on_disconnect_remote = (actions.on_action)(EditorAction::DisconnectRemoteHost);
     let on_take_remote_control = (actions.on_action)(EditorAction::TakeRemoteControl);
@@ -1894,305 +1896,359 @@ fn render_settings_panel(
         }));
     }
 
-    sections.push(
-        FormSection::new("Remote").fields(if draft.remote_connected {
-            {
-                let mut fields = Vec::new();
-                if let Some(status) = draft.remote_connect_status.as_ref() {
-                    fields.push(FormField::notice(
-                        status.clone(),
-                        if draft.remote_connect_status_is_error {
-                            SurfaceTone::Danger
-                        } else {
-                            SurfaceTone::Accent
-                        },
-                    ));
-                }
-                fields.extend(vec![
-                    FormField::info(
-                        "Remote host",
-                        draft
-                            .remote_connected_label
-                            .clone()
-                            .unwrap_or_else(|| "Unknown host".to_string()),
-                        Some(
-                            "This app is rendering the workspace, terminals, and servers from that machine."
-                                .to_string(),
-                        ),
-                    ),
-                    FormField::info(
-                        "Session mode",
-                        if draft.remote_has_control {
-                            "Controller"
-                        } else {
-                            "Viewer"
-                        },
-                        Some(
-                            if draft.remote_has_control {
-                                "Typing, editing, and server actions are enabled for this client."
-                            } else {
-                                "This client can inspect the host, but cannot type or mutate anything until it takes control."
-                            }
-                            .to_string(),
-                        ),
-                    ),
-                    FormField::info(
-                        "Reconnect",
-                        draft
-                            .remote_connected_label
-                            .clone()
-                            .unwrap_or_else(|| "Unknown host".to_string()),
-                        Some(
-                            "This connection is remembered with the host fingerprint and a saved client token."
-                                .to_string(),
-                        ),
-                    ),
-                ]);
-                let mut session_actions = FormActionGroup::new("Remote session").action(
-                    FormAction::new(
-                        "Disconnect from the current remote host",
-                        "Disconnect",
-                        on_disconnect_remote,
-                    )
-                    .description("Return this app to its local workspace."),
-                );
-                session_actions = if draft.remote_has_control {
-                    session_actions.action(
-                        FormAction::new(
-                            "Release control back to viewers",
-                            "Release control",
-                            on_release_remote_control,
-                        )
-                        .description("Stay connected, but stop typing and mutating the host."),
-                    )
+    if draft.remote_connected {
+        let mut fields = Vec::new();
+        if let Some(status) = draft.remote_connect_status.as_ref() {
+            fields.push(FormField::notice(
+                status.clone(),
+                if draft.remote_connect_status_is_error {
+                    SurfaceTone::Danger
                 } else {
-                    session_actions.action(
-                        FormAction::new(
-                            "Take control of the connected host",
-                            "Take control",
-                            on_take_remote_control,
-                        )
-                        .description(
-                            "Allow this client to type, edit, and manage host processes.",
-                        ),
-                    )
-                };
-                fields.push(FormField::action_group(session_actions));
-                fields
-            }
-        } else {
-            let mut fields = vec![
-                FormField::notice(
-                    draft.remote_connect_status.clone().unwrap_or_else(|| {
-                        "Enter a host, port, and pair token to start the first connection."
-                            .to_string()
-                    }),
-                    if draft.remote_connect_in_flight {
-                        SurfaceTone::Accent
-                    } else if draft.remote_connect_status_is_error {
-                        SurfaceTone::Danger
+                    SurfaceTone::Accent
+                },
+            ));
+        }
+        fields.extend([
+            FormField::info(
+                "Connected host",
+                draft
+                    .remote_connected_label
+                    .clone()
+                    .unwrap_or_else(|| "Unknown host".to_string()),
+                Some(
+                    "This window is showing the workspace, terminals, and servers from that machine."
+                        .to_string(),
+                ),
+            ),
+            FormField::info(
+                "Role",
+                if draft.remote_has_control {
+                    "Controller"
+                } else {
+                    "Viewer"
+                },
+                Some(
+                    if draft.remote_has_control {
+                        "Typing, editing, and start or stop actions are enabled here."
                     } else {
-                        SurfaceTone::Muted
-                    },
+                        "This window can inspect the host, but cannot type or change anything until it takes control."
+                    }
+                    .to_string(),
                 ),
-                FormField::toggle(
-                    "Enable remote hosting",
-                    draft.remote_host_enabled,
-                    "Listen for another DevManager client on this machine.",
-                    on_toggle_remote_hosting,
+            ),
+            FormField::info(
+                "Reconnect",
+                "Saved",
+                Some(
+                    "This host is remembered with its fingerprint and a saved client token for quick reconnects."
+                        .to_string(),
                 ),
-                FormField::custom(
-                    render_settings_text_input(
-                        "Bind address",
-                        "Address the host listener binds to on this machine.",
-                        draft.remote_bind_address.as_str(),
-                        EditorField::Settings(SettingsField::RemoteBindAddress),
-                        model,
-                        actions,
-                        Some(200.0),
-                        "0.0.0.0",
-                    )
-                    .into_any_element(),
-                ),
-                FormField::custom(
-                    render_settings_text_input(
-                        "Port",
-                        "TCP port used by DevManager remote hosting.",
-                        draft.remote_port.as_str(),
-                        EditorField::Settings(SettingsField::RemotePort),
-                        model,
-                        actions,
-                        Some(120.0),
-                        "43871",
-                    )
-                    .into_any_element(),
-                ),
-                FormField::action_group(
-                    FormActionGroup::new("Pairing")
-                        .action(
-                            FormAction::new(
-                                "Pairing token",
-                                draft.remote_pairing_token.as_str(),
-                                on_regenerate_remote_pairing,
-                            )
-                            .description("Regenerate the one-time token shown to a new client."),
-                        )
-                        .action({
-                            let mut action = FormAction::new(
-                                "Connect to remote host",
-                                if draft.remote_connect_in_flight {
-                                    "Connecting..."
-                                } else {
-                                    "Connect"
-                                },
-                                on_connect_remote,
-                            )
-                            .description("Open a remote DevManager session from another machine.");
-                            if draft.remote_connect_in_flight {
-                                action =
-                                    action.badge(SurfaceBadge::new("Busy", SurfaceTone::Accent));
-                            }
-                            action
-                        }),
-                ),
-                FormField::custom(
-                    render_settings_text_input(
-                        "Remote address",
-                        "Host or IP for the remote DevManager instance.",
-                        draft.remote_connect_address.as_str(),
-                        EditorField::Settings(SettingsField::RemoteConnectAddress),
-                        model,
-                        actions,
-                        None,
-                        "192.168.0.20",
-                    )
-                    .into_any_element(),
-                ),
-                FormField::custom(
-                    render_settings_text_input(
-                        "Remote port",
-                        "Port for the remote DevManager host.",
-                        draft.remote_connect_port.as_str(),
-                        EditorField::Settings(SettingsField::RemoteConnectPort),
-                        model,
-                        actions,
-                        Some(120.0),
-                        "43871",
-                    )
-                    .into_any_element(),
-                ),
-                FormField::custom(
-                    render_settings_text_input(
-                        "Pair token",
-                        "Only needed the first time this client pairs with a host.",
-                        draft.remote_connect_token.as_str(),
-                        EditorField::Settings(SettingsField::RemoteConnectToken),
-                        model,
-                        actions,
-                        Some(180.0),
-                        "ABC123",
-                    )
-                    .into_any_element(),
-                ),
-                FormField::notice(
-                    format!(
-                        "Hosting is {} with {} connected client(s).",
-                        if !draft.remote_host_enabled {
-                            "disabled"
-                        } else if draft.remote_host_listening {
-                            "listening"
-                        } else {
-                            "enabled but not listening"
-                        },
-                        draft.remote_host_clients
-                    ),
-                    if draft.remote_host_enabled && !draft.remote_host_listening {
-                        SurfaceTone::Danger
-                    } else {
-                        SurfaceTone::Muted
-                    },
-                ),
-            ];
-            if let Some(error) = draft.remote_host_error.as_ref() {
-                fields.push(FormField::notice(error.clone(), SurfaceTone::Danger));
-            }
-            if let Some(note) = draft.remote_host_last_note.as_ref() {
-                fields.push(FormField::notice(
-                    note.clone(),
-                    if draft.remote_host_last_note_is_error {
-                        SurfaceTone::Danger
-                    } else {
-                        SurfaceTone::Muted
-                    },
-                ));
-            }
-            if let Some(controller_id) = draft.remote_host_controller_client_id.as_deref() {
-                fields.push(FormField::notice(
-                    format!("Remote client `{controller_id}` currently controls this host."),
-                    SurfaceTone::Accent,
-                ));
-                fields.push(FormField::action(
-                    FormAction::new(
-                        "Take local host control back from the active remote client",
-                        "Take local control",
-                        on_take_host_control,
-                    )
-                    .description(
-                        "Local edits and process actions will reclaim host control immediately.",
-                    ),
-                ));
-            }
-            fields
-        }),
-    );
-
-    if !draft.remote_connected && !draft.remote_known_hosts.is_empty() {
-        let fields = draft
-            .remote_known_hosts
-            .iter()
-            .map(|host| {
-                let hint = format_saved_host_hint(host);
-                FormField::action_group(
-                    FormActionGroup::new(host.label.clone())
-                        .hint(hint)
-                        .action(
-                            FormAction::new(
-                                "Use this saved host",
-                                "Use",
-                                (actions.on_action)(EditorAction::UseKnownRemoteHost(
-                                    host.server_id.clone(),
-                                )),
-                            )
-                            .description("Fill the connect fields from this saved host."),
-                        )
-                        .action(
-                            FormAction::new(
-                                "Forget this saved host",
-                                "Forget",
-                                (actions.on_action)(EditorAction::ForgetKnownRemoteHost(
-                                    host.server_id.clone(),
-                                )),
-                            )
-                            .description("Remove the saved host fingerprint and client token.")
-                            .style(SurfaceActionButtonStyle::Danger),
-                        ),
+            ),
+        ]);
+        let mut session_actions = FormActionGroup::new("Remote session").action(
+            FormAction::new(
+                "Disconnect from the current remote host",
+                "Disconnect",
+                on_disconnect_remote,
+            )
+            .description("Return this window to its local workspace.")
+            .style(SurfaceActionButtonStyle::Danger),
+        );
+        session_actions = if draft.remote_has_control {
+            session_actions.action(
+                FormAction::new(
+                    "Release control back to viewers",
+                    "Release control",
+                    on_release_remote_control,
                 )
-            })
-            .collect();
-        sections.push(FormSection::new("Saved Hosts").fields(fields));
-    }
+                .description("Stay connected, but stop typing and mutating the host."),
+            )
+        } else {
+            session_actions.action(
+                FormAction::new(
+                    "Take control of the connected host",
+                    "Take control",
+                    on_take_remote_control,
+                )
+                .description("Enable typing, editing, and process management on this client.")
+                .style(SurfaceActionButtonStyle::Primary),
+            )
+        };
+        fields.push(FormField::action_group(session_actions));
+        sections.push(
+            FormSection::new("Remote Session")
+                .hint("This app is currently connected to another DevManager host.")
+                .fields(fields),
+        );
+    } else {
+        let connect_fields = vec![
+            FormField::notice(
+                draft.remote_connect_status.clone().unwrap_or_else(|| {
+                    if draft.remote_known_hosts.is_empty() {
+                        "Enter a host, port, and pair token to make the first connection."
+                            .to_string()
+                    } else {
+                        "Reconnect from a saved host, or enter a host manually below.".to_string()
+                    }
+                }),
+                if draft.remote_connect_in_flight {
+                    SurfaceTone::Accent
+                } else if draft.remote_connect_status_is_error {
+                    SurfaceTone::Danger
+                } else {
+                    SurfaceTone::Muted
+                },
+            ),
+            FormField::custom(
+                render_settings_text_input(
+                    "Host or IP",
+                    "Address of the DevManager host you want to control.",
+                    draft.remote_connect_address.as_str(),
+                    EditorField::Settings(SettingsField::RemoteConnectAddress),
+                    model,
+                    actions,
+                    None,
+                    "192.168.0.20",
+                )
+                .into_any_element(),
+            ),
+            FormField::custom(
+                render_settings_text_input(
+                    "Port",
+                    "TCP port for that DevManager host.",
+                    draft.remote_connect_port.as_str(),
+                    EditorField::Settings(SettingsField::RemoteConnectPort),
+                    model,
+                    actions,
+                    Some(120.0),
+                    "43871",
+                )
+                .into_any_element(),
+            ),
+            FormField::custom(
+                render_settings_text_input(
+                    "Pair token",
+                    "Only needed the first time this client pairs with a host.",
+                    draft.remote_connect_token.as_str(),
+                    EditorField::Settings(SettingsField::RemoteConnectToken),
+                    model,
+                    actions,
+                    Some(180.0),
+                    "ABC123",
+                )
+                .into_any_element(),
+            ),
+            FormField::action_group(FormActionGroup::new("Connection").action({
+                let mut action = FormAction::new(
+                    "Connect to the remote DevManager host",
+                    if draft.remote_connect_in_flight {
+                        "Connecting..."
+                    } else {
+                        "Connect"
+                    },
+                    on_connect_remote,
+                )
+                .description("Open the remote workspace and take control right away.")
+                .style(SurfaceActionButtonStyle::Primary);
+                if draft.remote_connect_in_flight {
+                    action = action.badge(SurfaceBadge::new("Busy", SurfaceTone::Accent));
+                }
+                action
+            })),
+        ];
+        if !draft.remote_known_hosts.is_empty() {
+            let saved_host_fields = draft
+                .remote_known_hosts
+                .iter()
+                .map(|host| {
+                    let hint = format_saved_host_hint(host);
+                    FormField::action_group(
+                        FormActionGroup::new(host.label.clone())
+                            .hint(hint)
+                            .action(
+                                FormAction::new(
+                                    "Connect to this saved host",
+                                    "Connect",
+                                    (actions.on_action)(EditorAction::UseKnownRemoteHost(
+                                        host.server_id.clone(),
+                                    )),
+                                )
+                                .description(
+                                    "Reconnect immediately using the saved fingerprint and client token.",
+                                )
+                                .style(SurfaceActionButtonStyle::Primary),
+                            )
+                            .action(
+                                FormAction::new(
+                                    "Forget this saved host",
+                                    "Forget",
+                                    (actions.on_action)(EditorAction::ForgetKnownRemoteHost(
+                                        host.server_id.clone(),
+                                    )),
+                                )
+                                .description("Remove the saved host fingerprint and client token.")
+                                .style(SurfaceActionButtonStyle::Danger),
+                            ),
+                    )
+                })
+                .collect();
+            sections.push(
+                FormSection::new("Saved Hosts")
+                    .hint("Quick reconnects for hosts this device already trusts.")
+                    .fields(saved_host_fields),
+            );
+        }
+        sections.push(
+            FormSection::new("Connect To Another Device")
+                .hint("Use this app as a remote client.")
+                .fields(connect_fields),
+        );
 
-    if !draft.remote_connected && !draft.remote_paired_clients.is_empty() {
-        let controller_id = draft.remote_host_controller_client_id.as_deref();
-        let fields = draft
-            .remote_paired_clients
-            .iter()
-            .map(|client| {
-                let hint = format_paired_client_hint(client, controller_id);
-                FormField::action_group(
-                    FormActionGroup::new(client.label.clone())
-                        .hint(hint)
-                        .action(
+        let listener_value = if !draft.remote_host_enabled {
+            "Off".to_string()
+        } else if draft.remote_host_listening {
+            format!(
+                "Listening on {}:{}",
+                draft.remote_bind_address, draft.remote_port
+            )
+        } else {
+            "Enabled, but not listening".to_string()
+        };
+        let connected_clients_value = if draft.remote_host_clients == 1 {
+            "1 client".to_string()
+        } else {
+            format!("{} clients", draft.remote_host_clients)
+        };
+        let control_value = draft
+            .remote_host_controller_client_id
+            .as_ref()
+            .map(|client_id| format!("Remote client `{client_id}`"))
+            .unwrap_or_else(|| "This machine".to_string());
+
+        let mut host_fields = vec![
+            FormField::toggle(
+                "Enable hosting",
+                draft.remote_host_enabled,
+                "Allow another DevManager window to connect to this machine.",
+                on_toggle_remote_hosting,
+            ),
+            FormField::custom(
+                render_settings_text_input(
+                    "Bind address",
+                    "Address the host listener binds to on this machine.",
+                    draft.remote_bind_address.as_str(),
+                    EditorField::Settings(SettingsField::RemoteBindAddress),
+                    model,
+                    actions,
+                    Some(200.0),
+                    "0.0.0.0",
+                )
+                .into_any_element(),
+            ),
+            FormField::custom(
+                render_settings_text_input(
+                    "Port",
+                    "TCP port used by DevManager remote hosting.",
+                    draft.remote_port.as_str(),
+                    EditorField::Settings(SettingsField::RemotePort),
+                    model,
+                    actions,
+                    Some(120.0),
+                    "43871",
+                )
+                .into_any_element(),
+            ),
+            FormField::info(
+                "Listener",
+                listener_value,
+                Some("Another DevManager client connects to this address and port.".to_string()),
+            ),
+            FormField::info(
+                "Pair token",
+                if draft.remote_pairing_token.trim().is_empty() {
+                    "Unavailable".to_string()
+                } else {
+                    draft.remote_pairing_token.clone()
+                },
+                Some("Share this one-time token with a first-time client.".to_string()),
+            ),
+            FormField::action_group(
+                FormActionGroup::new("Pair token actions")
+                    .action(
+                        FormAction::new("Copy the host pair token", "Copy", on_copy_remote_pairing)
+                            .description("Copy the current one-time token to the clipboard.")
+                            .style(SurfaceActionButtonStyle::Primary),
+                    )
+                    .action(
+                        FormAction::new(
+                            "Regenerate the host pair token",
+                            "Regenerate",
+                            on_regenerate_remote_pairing,
+                        )
+                        .description("Invalidate the old one-time token and create a new one."),
+                    ),
+            ),
+            FormField::info(
+                "Connected clients",
+                connected_clients_value,
+                Some("Clients currently attached to this host.".to_string()),
+            ),
+            FormField::info(
+                "Current controller",
+                control_value,
+                Some(
+                    "Whoever has control can type into terminals and manage the host.".to_string(),
+                ),
+            ),
+        ];
+        if draft.remote_host_enabled && !draft.remote_host_listening {
+            host_fields.push(FormField::notice(
+                "Hosting is enabled, but this device is not currently listening. Check the bind address, port, or firewall state."
+                    .to_string(),
+                SurfaceTone::Danger,
+            ));
+        }
+        if let Some(error) = draft.remote_host_error.as_ref() {
+            host_fields.push(FormField::notice(error.clone(), SurfaceTone::Danger));
+        }
+        if let Some(note) = draft.remote_host_last_note.as_ref() {
+            host_fields.push(FormField::notice(
+                note.clone(),
+                if draft.remote_host_last_note_is_error {
+                    SurfaceTone::Danger
+                } else {
+                    SurfaceTone::Muted
+                },
+            ));
+        }
+        if draft.remote_host_controller_client_id.is_some() {
+            host_fields.push(FormField::action(
+                FormAction::new(
+                    "Take local host control back from the active remote client",
+                    "Take local control",
+                    on_take_host_control,
+                )
+                .description("Reclaim keyboard and mutation control for this machine.")
+                .style(SurfaceActionButtonStyle::Primary),
+            ));
+        }
+        sections.push(
+            FormSection::new("Host This Device")
+                .hint("Use this app as the machine another DevManager window connects to.")
+                .fields(host_fields),
+        );
+
+        if !draft.remote_paired_clients.is_empty() {
+            let controller_id = draft.remote_host_controller_client_id.as_deref();
+            let fields = draft
+                .remote_paired_clients
+                .iter()
+                .map(|client| {
+                    let hint = format_paired_client_hint(client, controller_id);
+                    FormField::action_group(
+                        FormActionGroup::new(client.label.clone())
+                            .hint(hint)
+                            .action(
                             FormAction::new(
                                 "Revoke this paired client",
                                 "Revoke",
@@ -2205,10 +2261,15 @@ fn render_settings_panel(
                             )
                             .style(SurfaceActionButtonStyle::Danger),
                         ),
-                )
-            })
-            .collect();
-        sections.push(FormSection::new("Paired Clients").fields(fields));
+                    )
+                })
+                .collect();
+            sections.push(
+                FormSection::new("Paired Clients")
+                    .hint("Devices this host already trusts.")
+                    .fields(fields),
+            );
+        }
     }
 
     sections.push(
