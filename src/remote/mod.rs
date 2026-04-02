@@ -467,6 +467,8 @@ pub struct RemoteHostStatus {
     pub pairing_token: String,
     pub connected_clients: usize,
     pub controller_client_id: Option<String>,
+    pub listening: bool,
+    pub listener_error: Option<String>,
 }
 
 pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceError> {
@@ -575,6 +577,8 @@ struct RemoteHostInner {
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
+    listener_running: AtomicBool,
+    listener_error: RwLock<Option<String>>,
     next_connection_id: AtomicU64,
     stop_flag: AtomicBool,
     listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -626,6 +630,8 @@ impl RemoteHostService {
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
                 controller_client_id: RwLock::new(None),
+                listener_running: AtomicBool::new(false),
+                listener_error: RwLock::new(None),
                 next_connection_id: AtomicU64::new(1),
                 stop_flag: AtomicBool::new(false),
                 listener_thread: Mutex::new(None),
@@ -729,6 +735,13 @@ impl RemoteHostService {
             .read()
             .map(|slot| slot.clone())
             .unwrap_or_default();
+        let listening = self.inner.listener_running.load(Ordering::Relaxed);
+        let listener_error = self
+            .inner
+            .listener_error
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or(None);
         RemoteHostStatus {
             enabled,
             bind_address,
@@ -736,6 +749,8 @@ impl RemoteHostService {
             pairing_token,
             connected_clients,
             controller_client_id,
+            listening,
+            listener_error,
         }
     }
 
@@ -797,6 +812,10 @@ impl RemoteHostService {
 
     fn restart_threads(&self) {
         self.inner.stop_flag.store(true, Ordering::SeqCst);
+        self.inner.listener_running.store(false, Ordering::Relaxed);
+        if let Ok(mut error) = self.inner.listener_error.write() {
+            *error = None;
+        }
         if let Ok(mut handle) = self.inner.listener_thread.lock() {
             if let Some(thread) = handle.take() {
                 let _ = thread.join();
@@ -1011,10 +1030,18 @@ fn run_listener(inner: Arc<RemoteHostInner>) {
     let listener = match TcpListener::bind(&bind) {
         Ok(listener) => listener,
         Err(error) => {
+            inner.listener_running.store(false, Ordering::Relaxed);
+            if let Ok(mut slot) = inner.listener_error.write() {
+                *slot = Some(format!("Could not listen on {bind}: {error}"));
+            }
             eprintln!("[remote] failed to bind {bind}: {error}");
             return;
         }
     };
+    inner.listener_running.store(true, Ordering::Relaxed);
+    if let Ok(mut slot) = inner.listener_error.write() {
+        *slot = None;
+    }
     let _ = listener.set_nonblocking(true);
 
     while !inner.stop_flag.load(Ordering::Relaxed) {
@@ -1032,6 +1059,7 @@ fn run_listener(inner: Arc<RemoteHostInner>) {
             Err(_) => thread::sleep(Duration::from_millis(120)),
         }
     }
+    inner.listener_running.store(false, Ordering::Relaxed);
 }
 
 fn run_broadcaster(inner: Arc<RemoteHostInner>) {
@@ -1170,7 +1198,10 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
         .unwrap_or_default();
     let mut stream = match transport::accept_tls(stream, &config) {
         Ok(stream) => stream,
-        Err(_) => return,
+        Err(error) => {
+            eprintln!("[remote] tls accept failed for connection {connection_id}: {error}");
+            return;
+        }
     };
     let mut read_buffer = Vec::new();
     let (tx, rx) = mpsc::channel::<ServerMessage>();

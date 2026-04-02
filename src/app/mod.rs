@@ -149,11 +149,21 @@ struct NativeShell {
     splash_image: Option<Arc<RenderImage>>,
     splash_fetch_in_flight: bool,
     native_dialog_blockers: Arc<AtomicUsize>,
+    remote_connect_request_id: u64,
     window_subscriptions: Vec<Subscription>,
 }
 
 struct NativeDialogPauseGuard {
     blockers: Arc<AtomicUsize>,
+}
+
+struct PreparedRemoteConnect {
+    address: String,
+    port: u16,
+    host_label: String,
+    auth: ClientAuth,
+    expected_fingerprint: Option<String>,
+    known_server_id: Option<String>,
 }
 
 impl Drop for NativeDialogPauseGuard {
@@ -386,6 +396,7 @@ impl NativeShell {
             splash_image: None,
             splash_fetch_in_flight: false,
             native_dialog_blockers,
+            remote_connect_request_id: 0,
             window_subscriptions: Vec::new(),
         };
 
@@ -741,6 +752,8 @@ impl NativeShell {
             draft.remote_connected = remote_connected;
             draft.remote_host_clients = remote_status.connected_clients;
             draft.remote_host_controller_client_id = remote_status.controller_client_id;
+            draft.remote_host_listening = remote_status.listening;
+            draft.remote_host_error = remote_status.listener_error;
             draft.remote_known_hosts = self.remote_machine_state.known_hosts.clone();
             draft.remote_paired_clients = self.remote_machine_state.host.paired_clients.clone();
             draft.remote_host_enabled = self.remote_machine_state.host.enabled;
@@ -750,6 +763,14 @@ impl NativeShell {
                     draft.remote_connect_address = host.address.clone();
                     draft.remote_connect_port = host.port.to_string();
                 }
+            }
+            if draft.remote_connected && draft.remote_connect_status.is_none() {
+                draft.remote_connect_status = draft
+                    .remote_connected_label
+                    .as_ref()
+                    .map(|label| format!("Connected to {label}."))
+                    .or_else(|| Some("Connected to remote host.".to_string()));
+                draft.remote_connect_status_is_error = false;
             }
         }
     }
@@ -789,12 +810,12 @@ impl NativeShell {
         self.last_remote_snapshot_sync_at = Some(now);
     }
 
-    fn connect_remote_host(
-        &mut self,
+    fn prepare_remote_connect(
+        &self,
         address: String,
         port: u16,
         pairing_token: Option<String>,
-    ) -> Result<(), String> {
+    ) -> Result<PreparedRemoteConnect, String> {
         let known_host = self
             .remote_machine_state
             .known_hosts
@@ -819,56 +840,29 @@ impl NativeShell {
             .as_ref()
             .map(|host| host.certificate_fingerprint.trim())
             .filter(|fingerprint| !fingerprint.is_empty());
-
-        let (
-            client,
-            pool_key,
-            snapshot,
-            server_id,
-            certificate_fingerprint,
-            client_id,
-            client_token,
-        ) = if let Some((pool_key, client)) = self.remote_client_pool.get_reusable(
-            &address,
+        Ok(PreparedRemoteConnect {
+            address,
             port,
-            known_host.as_ref().map(|host| host.server_id.as_str()),
-            expected_fingerprint,
-        ) {
-            (
-                client.clone(),
-                pool_key,
-                client.latest_snapshot().unwrap_or_default(),
-                client.server_id().to_string(),
-                client.certificate_fingerprint().to_string(),
-                client.client_id().to_string(),
-                client.client_token().to_string(),
-            )
-        } else {
-            let result = RemoteClientHandle::connect(
-                &address,
-                port,
-                "DevManager",
-                auth,
-                expected_fingerprint,
-            )?;
-            let pool_key = self.remote_client_pool.insert(
-                address.clone(),
-                port,
-                result.server_id.clone(),
-                result.certificate_fingerprint.clone(),
-                result.client.clone(),
-            );
-            (
-                result.client,
-                pool_key,
-                result.snapshot,
-                result.server_id,
-                result.certificate_fingerprint,
-                result.client_id,
-                result.client_token,
-            )
-        };
+            host_label,
+            auth,
+            expected_fingerprint: expected_fingerprint.map(str::to_string),
+            known_server_id: known_host.as_ref().map(|host| host.server_id.clone()),
+        })
+    }
 
+    fn apply_connected_remote_host(
+        &mut self,
+        address: String,
+        port: u16,
+        host_label: String,
+        client: RemoteClientHandle,
+        pool_key: String,
+        snapshot: remote::RemoteWorkspaceSnapshot,
+        server_id: String,
+        certificate_fingerprint: String,
+        client_id: String,
+        client_token: String,
+    ) {
         if self.local_state_backup.is_none() {
             self.local_state_backup = Some(self.state.clone());
         }
@@ -892,6 +886,134 @@ impl NativeShell {
         self.state = AppState::default();
         self.editor_notice = Some("Connected to remote host.".to_string());
         self.sync_settings_remote_draft();
+    }
+
+    fn begin_connect_remote_host(
+        &mut self,
+        address: String,
+        port: u16,
+        pairing_token: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let prepared = self.prepare_remote_connect(address, port, pairing_token)?;
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            if draft.remote_connect_in_flight {
+                return Ok(());
+            }
+            draft.remote_connect_in_flight = true;
+            draft.remote_connect_status = Some(format!("Connecting to {}...", prepared.host_label));
+            draft.remote_connect_status_is_error = false;
+        }
+
+        if let Some((pool_key, client)) = self.remote_client_pool.get_reusable(
+            &prepared.address,
+            prepared.port,
+            prepared.known_server_id.as_deref(),
+            prepared.expected_fingerprint.as_deref(),
+        ) {
+            self.apply_connected_remote_host(
+                prepared.address,
+                prepared.port,
+                prepared.host_label.clone(),
+                client.clone(),
+                pool_key,
+                client.latest_snapshot().unwrap_or_default(),
+                client.server_id().to_string(),
+                client.certificate_fingerprint().to_string(),
+                client.client_id().to_string(),
+                client.client_token().to_string(),
+            );
+            if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                draft.remote_connect_in_flight = false;
+                draft.remote_connect_token.clear();
+                draft.remote_connect_status =
+                    Some(format!("Connected to {}.", prepared.host_label));
+                draft.remote_connect_status_is_error = false;
+            }
+            self.sync_settings_remote_draft();
+            cx.notify();
+            return Ok(());
+        }
+
+        self.remote_connect_request_id = self.remote_connect_request_id.saturating_add(1);
+        let request_id = self.remote_connect_request_id;
+        let background_executor = cx.background_executor().clone();
+        let pool = self.remote_client_pool.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                let prepared = prepared;
+                async move {
+                    let address = prepared.address.clone();
+                    let port = prepared.port;
+                    let host_label = prepared.host_label.clone();
+                    let expected_fingerprint = prepared.expected_fingerprint.clone();
+                    let result = background_executor
+                        .spawn(async move {
+                            RemoteClientHandle::connect(
+                                &prepared.address,
+                                prepared.port,
+                                "DevManager",
+                                prepared.auth,
+                                expected_fingerprint.as_deref(),
+                            )
+                        })
+                        .await;
+                    let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        if request_id != this.remote_connect_request_id {
+                            return;
+                        }
+                        if let Some(EditorPanel::Settings(draft)) = this.editor_panel.as_mut() {
+                            draft.remote_connect_in_flight = false;
+                        }
+                        match result {
+                            Ok(result) => {
+                                let pool_key = pool.insert(
+                                    address.clone(),
+                                    port,
+                                    result.server_id.clone(),
+                                    result.certificate_fingerprint.clone(),
+                                    result.client.clone(),
+                                );
+                                this.apply_connected_remote_host(
+                                    address,
+                                    port,
+                                    host_label.clone(),
+                                    result.client,
+                                    pool_key,
+                                    result.snapshot,
+                                    result.server_id,
+                                    result.certificate_fingerprint,
+                                    result.client_id,
+                                    result.client_token,
+                                );
+                                if let Some(EditorPanel::Settings(draft)) =
+                                    this.editor_panel.as_mut()
+                                {
+                                    draft.remote_connect_token.clear();
+                                    draft.remote_connect_status =
+                                        Some(format!("Connected to {}.", host_label));
+                                    draft.remote_connect_status_is_error = false;
+                                }
+                            }
+                            Err(error) => {
+                                this.editor_notice = Some(error.clone());
+                                if let Some(EditorPanel::Settings(draft)) =
+                                    this.editor_panel.as_mut()
+                                {
+                                    draft.remote_connect_status = Some(error);
+                                    draft.remote_connect_status_is_error = true;
+                                }
+                            }
+                        }
+                        this.sync_settings_remote_draft();
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+        cx.notify();
         Ok(())
     }
 
@@ -906,6 +1028,11 @@ impl NativeShell {
         self.synced_session_id = None;
         self.last_dimensions = None;
         self.terminal_notice = message;
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            draft.remote_connect_in_flight = false;
+            draft.remote_connect_status = self.terminal_notice.clone();
+            draft.remote_connect_status_is_error = false;
+        }
         self.sync_settings_remote_draft();
     }
 
@@ -1972,11 +2099,16 @@ impl NativeShell {
                     .map(|host| host.port.to_string())
                     .unwrap_or_else(|| "43871".to_string()),
                 remote_connect_token: String::new(),
+                remote_connect_in_flight: false,
+                remote_connect_status: None,
+                remote_connect_status_is_error: false,
                 remote_connected_label,
                 remote_has_control: self.remote_has_control(),
                 remote_connected: self.remote_mode.is_some(),
                 remote_host_clients: remote_status.connected_clients,
                 remote_host_controller_client_id: remote_status.controller_client_id,
+                remote_host_listening: remote_status.listening,
+                remote_host_error: remote_status.listener_error,
                 remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
                 remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
                 open_picker: None,
@@ -3659,30 +3791,54 @@ impl NativeShell {
                 }
             }
             EditorAction::ConnectRemoteHost => {
-                let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_ref() else {
+                let Some((
+                    remote_connect_in_flight,
+                    remote_connect_address,
+                    remote_connect_port,
+                    remote_connect_token,
+                )) = self.editor_panel.as_ref().and_then(|panel| match panel {
+                    EditorPanel::Settings(draft) => Some((
+                        draft.remote_connect_in_flight,
+                        draft.remote_connect_address.clone(),
+                        draft.remote_connect_port.clone(),
+                        draft.remote_connect_token.clone(),
+                    )),
+                    _ => None,
+                })
+                else {
                     return;
                 };
-                let port = parse_optional_u16(&draft.remote_connect_port)
+                if remote_connect_in_flight {
+                    return;
+                }
+                let port = parse_optional_u16(&remote_connect_port)
                     .map_err(|error| {
                         self.editor_notice = Some(error);
+                        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                            draft.remote_connect_status = self.editor_notice.clone();
+                            draft.remote_connect_status_is_error = true;
+                            draft.remote_connect_in_flight = false;
+                        }
                         cx.notify();
                     })
                     .ok()
                     .flatten()
                     .unwrap_or(43871);
-                match self.connect_remote_host(
-                    draft.remote_connect_address.trim().to_string(),
+                self.editor_notice = None;
+                match self.begin_connect_remote_host(
+                    remote_connect_address.trim().to_string(),
                     port,
-                    normalize_optional_string(&draft.remote_connect_token),
+                    normalize_optional_string(&remote_connect_token),
+                    cx,
                 ) {
-                    Ok(()) => {
-                        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-                            draft.remote_connect_token.clear();
-                        }
-                        self.sync_settings_remote_draft();
-                    }
+                    Ok(()) => {}
                     Err(error) => {
                         self.editor_notice = Some(error);
+                        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                            draft.remote_connect_in_flight = false;
+                            draft.remote_connect_status = self.editor_notice.clone();
+                            draft.remote_connect_status_is_error = true;
+                        }
                     }
                 }
                 cx.notify();

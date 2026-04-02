@@ -21,6 +21,10 @@ const ACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(40);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_TLS_NAME: &str = "devmanager.remote";
 
+fn tls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
 #[derive(Debug)]
 pub struct TlsConnectResult {
     pub stream: ClientTlsStream,
@@ -29,11 +33,13 @@ pub struct TlsConnectResult {
 
 pub fn ensure_host_tls_material(config: &mut RemoteHostConfig) -> Result<(), String> {
     if !config.certificate_pem.trim().is_empty() && !config.private_key_pem.trim().is_empty() {
-        if config.certificate_fingerprint.trim().is_empty() {
-            config.certificate_fingerprint =
-                certificate_fingerprint_from_pem(&config.certificate_pem)?;
+        if validate_host_tls_material(config).is_ok() {
+            if config.certificate_fingerprint.trim().is_empty() {
+                config.certificate_fingerprint =
+                    certificate_fingerprint_from_pem(&config.certificate_pem)?;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     let mut subject_alt_names = vec![
@@ -103,7 +109,9 @@ pub fn connect_tls(
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
 
     let verifier = Arc::new(PinnedFingerprintVerifier::new(expected_fingerprint));
-    let config = ClientConfig::builder()
+    let config = ClientConfig::builder_with_provider(tls_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("Remote TLS config failed: {error}"))?
         .dangerous()
         .with_custom_certificate_verifier(verifier.clone())
         .with_no_client_auth();
@@ -141,11 +149,19 @@ pub fn certificate_fingerprint_from_pem(pem: &str) -> Result<String, String> {
 fn server_config(config: &RemoteHostConfig) -> Result<Arc<ServerConfig>, String> {
     let cert_chain = parse_cert_chain(&config.certificate_pem)?;
     let key_der = parse_private_key(&config.private_key_pem)?;
-    let server_config = ServerConfig::builder()
+    let server_config = ServerConfig::builder_with_provider(tls_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("Remote TLS config failed: {error}"))?
         .with_no_client_auth()
         .with_single_cert(cert_chain, key_der)
         .map_err(|error| format!("Remote TLS config failed: {error}"))?;
     Ok(Arc::new(server_config))
+}
+
+fn validate_host_tls_material(config: &RemoteHostConfig) -> Result<(), String> {
+    let _ = certificate_fingerprint_from_pem(&config.certificate_pem)?;
+    let _ = server_config(config)?;
+    Ok(())
 }
 
 fn parse_cert_chain(pem: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -197,7 +213,7 @@ impl PinnedFingerprintVerifier {
                 .map(|value| value.trim().to_ascii_lowercase())
                 .filter(|value| !value.is_empty()),
             observed_fingerprint: Arc::new(Mutex::new(None)),
-            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto_provider: tls_crypto_provider(),
         }
     }
 
@@ -264,5 +280,27 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
         self.crypto_provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_host_tls_material_regenerates_invalid_persisted_values() {
+        let mut config = RemoteHostConfig {
+            certificate_pem: "invalid cert".to_string(),
+            private_key_pem: "invalid key".to_string(),
+            certificate_fingerprint: String::new(),
+            ..RemoteHostConfig::default()
+        };
+
+        ensure_host_tls_material(&mut config).expect("tls material should regenerate");
+
+        assert!(config.certificate_pem.contains("BEGIN CERTIFICATE"));
+        assert!(config.private_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(!config.certificate_fingerprint.trim().is_empty());
+        validate_host_tls_material(&config).expect("regenerated tls material should validate");
     }
 }
