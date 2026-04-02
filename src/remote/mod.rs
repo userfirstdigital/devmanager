@@ -26,8 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const REMOTE_FILE_NAME: &str = "remote.json";
-const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(180);
-const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(750);
+const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
+const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -984,10 +984,24 @@ impl RemoteClientHandle {
     }
 
     pub fn take_control(&self) {
+        if let Ok(mut latest) = self.inner.latest_snapshot.write() {
+            if let Some(snapshot) = latest.as_mut() {
+                snapshot.controller_client_id = Some(self.inner.client_id.clone());
+                snapshot.you_have_control = true;
+            }
+        }
         let _ = self.inner.outgoing.send(ClientMessage::TakeControl);
     }
 
     pub fn release_control(&self) {
+        if let Ok(mut latest) = self.inner.latest_snapshot.write() {
+            if let Some(snapshot) = latest.as_mut() {
+                if snapshot.controller_client_id.as_deref() == Some(self.inner.client_id.as_str()) {
+                    snapshot.controller_client_id = None;
+                }
+                snapshot.you_have_control = false;
+            }
+        }
         let _ = self.inner.outgoing.send(ClientMessage::ReleaseControl);
     }
 
@@ -1095,9 +1109,9 @@ fn run_listener(inner: Arc<RemoteHostInner>) {
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(60));
+                thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => thread::sleep(Duration::from_millis(120)),
+            Err(_) => thread::sleep(Duration::from_millis(20)),
         }
     }
     inner.listener_running.store(false, Ordering::Relaxed);
@@ -1797,15 +1811,17 @@ fn apply_workspace_delta(snapshot: &mut RemoteWorkspaceSnapshot, delta: RemoteWo
 mod tests {
     use super::{
         apply_workspace_delta, current_controller_allows, format_handshake_stage_error,
-        generate_pairing_token, set_last_connection_note, upsert_known_host, PairedRemoteClient,
-        RemoteHostConfig, RemoteHostService, RemoteMachineState, RemoteWorkspaceDelta,
-        RemoteWorkspaceSnapshot, ClientAuth, RemoteClientHandle,
+        generate_pairing_token, set_last_connection_note, upsert_known_host, ClientAuth,
+        PairedRemoteClient, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
+        RemoteHostService, RemoteMachineState, RemoteWorkspaceDelta, RemoteWorkspaceSnapshot,
     };
     use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
     use std::collections::HashMap;
     use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{mpsc, Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2013,6 +2029,29 @@ mod tests {
         service.apply_config(config);
     }
 
+    #[test]
+    fn take_control_updates_client_snapshot_immediately() {
+        let handle = sample_remote_client_handle("client-1");
+
+        handle.take_control();
+
+        let snapshot = handle.latest_snapshot().expect("snapshot should exist");
+        assert!(snapshot.you_have_control);
+        assert_eq!(snapshot.controller_client_id.as_deref(), Some("client-1"));
+    }
+
+    #[test]
+    fn release_control_updates_client_snapshot_immediately() {
+        let handle = sample_remote_client_handle("client-1");
+        handle.take_control();
+
+        handle.release_control();
+
+        let snapshot = handle.latest_snapshot().expect("snapshot should exist");
+        assert!(!snapshot.you_have_control);
+        assert!(snapshot.controller_client_id.is_none());
+    }
+
     fn session_view(session_id: &str) -> TerminalSessionView {
         TerminalSessionView {
             runtime: SessionRuntimeState::new(
@@ -2045,5 +2084,25 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         panic!("{context}");
+    }
+
+    fn sample_remote_client_handle(client_id: &str) -> RemoteClientHandle {
+        let (tx, _rx) = mpsc::channel();
+        RemoteClientHandle {
+            inner: Arc::new(RemoteClientInner {
+                outgoing: tx,
+                pending: Mutex::new(HashMap::new()),
+                next_request_id: AtomicU64::new(1),
+                latest_snapshot: RwLock::new(Some(RemoteWorkspaceSnapshot {
+                    server_id: "host-1".to_string(),
+                    ..RemoteWorkspaceSnapshot::default()
+                })),
+                disconnected_message: RwLock::new(None),
+                client_id: client_id.to_string(),
+                client_token: "token-1".to_string(),
+                server_id: "host-1".to_string(),
+                certificate_fingerprint: "fingerprint-1".to_string(),
+            }),
+        }
     }
 }

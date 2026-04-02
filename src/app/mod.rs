@@ -44,8 +44,9 @@ const NOTICE_HEIGHT_PX: f32 = 26.0;
 const SEARCH_BAR_HEIGHT_PX: f32 = 34.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const REMOTE_HOST_SNAPSHOT_ACTIVE_INTERVAL: Duration = Duration::from_millis(120);
-const REMOTE_HOST_SNAPSHOT_IDLE_INTERVAL: Duration = Duration::from_millis(1500);
+const REMOTE_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(16);
+const REMOTE_HOST_SNAPSHOT_ACTIVE_INTERVAL: Duration = Duration::from_millis(33);
+const REMOTE_HOST_SNAPSHOT_IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const APP_WINDOW_TITLE: &str = "DevManager";
 const WINDOW_TITLE_SEPARATOR: &str = " • ";
 
@@ -554,16 +555,24 @@ impl NativeShell {
                 let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
                     loop {
-                        background_executor.timer(Duration::from_millis(120)).await;
+                        background_executor
+                            .timer(REMOTE_CLIENT_REFRESH_INTERVAL)
+                            .await;
                         while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                             background_executor.timer(Duration::from_millis(50)).await;
                         }
                         if this
                             .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
-                                let mut changed = shell.sync_remote_client_snapshot();
-                                if shell.remote_host_service.has_pending_requests() {
-                                    changed = true;
-                                }
+                                let changed = if shell.remote_mode.is_some() {
+                                    shell.sync_remote_client_snapshot()
+                                } else {
+                                    let changed = shell.pump_remote_host_requests(cx);
+                                    let local_runtime_snapshot =
+                                        shell.process_manager.runtime_state();
+                                    shell.sync_server_port_snapshot(&local_runtime_snapshot, cx);
+                                    shell.sync_remote_host_snapshot_if_due(&local_runtime_snapshot);
+                                    changed
+                                };
                                 if changed {
                                     cx.notify();
                                 }
@@ -766,12 +775,14 @@ impl NativeShell {
                     draft.remote_connect_port = host.port.to_string();
                 }
             }
-            if draft.remote_connected && draft.remote_connect_status.is_none() {
-                draft.remote_connect_status = draft
-                    .remote_connected_label
-                    .as_ref()
-                    .map(|label| format!("Connected to {label}."))
-                    .or_else(|| Some("Connected to remote host.".to_string()));
+            if draft.remote_connected && !draft.remote_connect_in_flight {
+                draft.remote_connect_status = draft.remote_connected_label.as_ref().map(|label| {
+                    if draft.remote_has_control {
+                        format!("Connected to {label}. This client controls the host.")
+                    } else {
+                        format!("Connected to {label}. This client is in viewer mode.")
+                    }
+                });
                 draft.remote_connect_status_is_error = false;
             }
         }
@@ -865,6 +876,8 @@ impl NativeShell {
         client_id: String,
         client_token: String,
     ) {
+        client.take_control();
+        let snapshot = client.latest_snapshot().unwrap_or(snapshot);
         if self.local_state_backup.is_none() {
             self.local_state_backup = Some(self.state.clone());
         }
@@ -881,12 +894,12 @@ impl NativeShell {
         self.persist_remote_machine_state();
         self.remote_mode = Some(RemoteModeState {
             client,
-            snapshot,
+            snapshot: snapshot.clone(),
             connected_label: host_label,
             pool_key,
         });
-        self.state = AppState::default();
-        self.editor_notice = Some("Connected to remote host.".to_string());
+        self.state = self.merge_remote_snapshot_into_state(&snapshot);
+        self.editor_notice = Some("Connected to remote host and took control.".to_string());
         self.sync_settings_remote_draft();
     }
 
@@ -928,8 +941,10 @@ impl NativeShell {
             if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                 draft.remote_connect_in_flight = false;
                 draft.remote_connect_token.clear();
-                draft.remote_connect_status =
-                    Some(format!("Connected to {}.", prepared.host_label));
+                draft.remote_connect_status = Some(format!(
+                    "Connected to {} and took control.",
+                    prepared.host_label
+                ));
                 draft.remote_connect_status_is_error = false;
             }
             self.sync_settings_remote_draft();
@@ -993,8 +1008,10 @@ impl NativeShell {
                                     this.editor_panel.as_mut()
                                 {
                                     draft.remote_connect_token.clear();
-                                    draft.remote_connect_status =
-                                        Some(format!("Connected to {}.", host_label));
+                                    draft.remote_connect_status = Some(format!(
+                                        "Connected to {} and took control.",
+                                        host_label
+                                    ));
                                     draft.remote_connect_status_is_error = false;
                                 }
                             }
@@ -1074,10 +1091,10 @@ impl NativeShell {
         self.process_manager.session_view(session_id)
     }
 
-    fn pump_remote_host_requests(&mut self, cx: &mut Context<Self>) {
+    fn pump_remote_host_requests(&mut self, cx: &mut Context<Self>) -> bool {
         let requests = self.remote_host_service.drain_requests();
         if requests.is_empty() {
-            return;
+            return false;
         }
 
         let mut did_change = false;
@@ -1574,8 +1591,10 @@ impl NativeShell {
         }
 
         if did_change {
+            self.last_remote_snapshot_sync_at = None;
             cx.notify();
         }
+        did_change
     }
 
     fn perform_managed_shutdown(&mut self) -> ManagedShutdownReport {
@@ -3855,12 +3874,23 @@ impl NativeShell {
                 if let Some(remote_mode) = self.remote_mode.as_ref() {
                     remote_mode.client.take_control();
                 }
+                self.editor_notice = Some("This client now controls the remote host.".to_string());
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.remote_connect_status = self.editor_notice.clone();
+                    draft.remote_connect_status_is_error = false;
+                }
                 self.sync_settings_remote_draft();
                 cx.notify();
             }
             EditorAction::ReleaseRemoteControl => {
                 if let Some(remote_mode) = self.remote_mode.as_ref() {
                     remote_mode.client.release_control();
+                }
+                self.editor_notice =
+                    Some("This client released control and is now a viewer.".to_string());
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.remote_connect_status = self.editor_notice.clone();
+                    draft.remote_connect_status_is_error = false;
                 }
                 self.sync_settings_remote_draft();
                 cx.notify();
@@ -7178,7 +7208,7 @@ impl Render for NativeShell {
         }
 
         if self.remote_mode.is_none() {
-            self.pump_remote_host_requests(cx);
+            let _ = self.pump_remote_host_requests(cx);
         }
 
         let local_runtime_snapshot = self.process_manager.runtime_state();

@@ -1910,64 +1910,74 @@ fn render_settings_panel(
                 }
                 fields.extend(vec![
                     FormField::info(
-                        "Connected host",
+                        "Remote host",
                         draft
                             .remote_connected_label
                             .clone()
                             .unwrap_or_else(|| "Unknown host".to_string()),
                         Some(
-                            "This client is rendering the host workspace and runtime.".to_string(),
-                        ),
-                    ),
-                    FormField::notice(
-                        if draft.remote_has_control {
-                            "This client currently controls the host."
-                        } else {
-                            "This client is connected in viewer mode."
-                        },
-                        SurfaceTone::Accent,
-                    ),
-                    FormField::info(
-                        "Known host id",
-                        draft
-                            .remote_connected_label
-                            .clone()
-                            .unwrap_or_else(|| "Unknown host".to_string()),
-                        Some(
-                            "Reconnect uses the saved host fingerprint and client token."
+                            "This app is rendering the workspace, terminals, and servers from that machine."
                                 .to_string(),
                         ),
                     ),
-                    FormField::action_group(
-                        FormActionGroup::new("Remote session")
-                            .action(
-                                FormAction::new(
-                                    "Disconnect from the current remote host",
-                                    "Disconnect",
-                                    on_disconnect_remote,
-                                )
-                                .description("Return this app to its local workspace."),
-                            )
-                            .action(
-                                FormAction::new(
-                                    "Take control of the connected host",
-                                    "Take control",
-                                    on_take_remote_control,
-                                )
-                                .description(
-                                    "Allow this client to type, edit, and manage host processes.",
-                                ),
-                            )
-                            .action(
-                                FormAction::new(
-                                    "Release control back to viewers",
-                                    "Release",
-                                    on_release_remote_control,
-                                )
-                                .description("Keep the session open but stop mutating the host."),
-                            ),
+                    FormField::info(
+                        "Session mode",
+                        if draft.remote_has_control {
+                            "Controller"
+                        } else {
+                            "Viewer"
+                        },
+                        Some(
+                            if draft.remote_has_control {
+                                "Typing, editing, and server actions are enabled for this client."
+                            } else {
+                                "This client can inspect the host, but cannot type or mutate anything until it takes control."
+                            }
+                            .to_string(),
+                        ),
+                    ),
+                    FormField::info(
+                        "Reconnect",
+                        draft
+                            .remote_connected_label
+                            .clone()
+                            .unwrap_or_else(|| "Unknown host".to_string()),
+                        Some(
+                            "This connection is remembered with the host fingerprint and a saved client token."
+                                .to_string(),
+                        ),
                     ),
                 ]);
+                let mut session_actions = FormActionGroup::new("Remote session").action(
+                    FormAction::new(
+                        "Disconnect from the current remote host",
+                        "Disconnect",
+                        on_disconnect_remote,
+                    )
+                    .description("Return this app to its local workspace."),
+                );
+                session_actions = if draft.remote_has_control {
+                    session_actions.action(
+                        FormAction::new(
+                            "Release control back to viewers",
+                            "Release control",
+                            on_release_remote_control,
+                        )
+                        .description("Stay connected, but stop typing and mutating the host."),
+                    )
+                } else {
+                    session_actions.action(
+                        FormAction::new(
+                            "Take control of the connected host",
+                            "Take control",
+                            on_take_remote_control,
+                        )
+                        .description(
+                            "Allow this client to type, edit, and manage host processes.",
+                        ),
+                    )
+                };
+                fields.push(FormField::action_group(session_actions));
                 fields
             }
         } else {
