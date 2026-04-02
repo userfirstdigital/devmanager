@@ -8,9 +8,10 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, ErrorKind};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 pub type ClientTlsStream = StreamOwned<ClientConnection, TcpStream>;
@@ -68,6 +69,9 @@ pub fn ensure_host_tls_material(config: &mut RemoteHostConfig) -> Result<(), Str
 pub fn accept_tls(stream: TcpStream, config: &RemoteHostConfig) -> Result<ServerTlsStream, String> {
     let mut socket = stream;
     socket
+        .set_nonblocking(false)
+        .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
+    socket
         .set_nodelay(true)
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
     socket
@@ -80,9 +84,18 @@ pub fn accept_tls(stream: TcpStream, config: &RemoteHostConfig) -> Result<Server
     let mut connection = ServerConnection::new(server_config(config)?)
         .map_err(|error| format!("Remote TLS setup failed: {error}"))?;
     while connection.is_handshaking() {
-        connection
-            .complete_io(&mut socket)
-            .map_err(|error| format!("Remote TLS handshake failed: {error}"))?;
+        match connection.complete_io(&mut socket) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(format!("Remote TLS handshake failed: {error}")),
+        }
     }
 
     socket
@@ -98,6 +111,9 @@ pub fn connect_tls(
 ) -> Result<TlsConnectResult, String> {
     let mut socket =
         TcpStream::connect((address, port)).map_err(|error| format!("Connect failed: {error}"))?;
+    socket
+        .set_nonblocking(false)
+        .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
     socket
         .set_nodelay(true)
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
@@ -120,9 +136,18 @@ pub fn connect_tls(
     let mut connection = ClientConnection::new(Arc::new(config), server_name)
         .map_err(|error| format!("Remote TLS setup failed: {error}"))?;
     while connection.is_handshaking() {
-        connection
-            .complete_io(&mut socket)
-            .map_err(|error| format!("Remote TLS handshake failed: {error}"))?;
+        match connection.complete_io(&mut socket) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(format!("Remote TLS handshake failed: {error}")),
+        }
     }
 
     let certificate_fingerprint = verifier

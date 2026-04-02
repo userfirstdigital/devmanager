@@ -1154,6 +1154,8 @@ pub struct SettingsDraft {
     pub remote_host_controller_client_id: Option<String>,
     pub remote_host_listening: bool,
     pub remote_host_error: Option<String>,
+    pub remote_host_last_note: Option<String>,
+    pub remote_host_last_note_is_error: bool,
     pub remote_known_hosts: Vec<KnownRemoteHost>,
     pub remote_paired_clients: Vec<PairedRemoteClient>,
     pub open_picker: Option<SettingsPicker>,
@@ -2103,6 +2105,16 @@ fn render_settings_panel(
             ];
             if let Some(error) = draft.remote_host_error.as_ref() {
                 fields.push(FormField::notice(error.clone(), SurfaceTone::Danger));
+            }
+            if let Some(note) = draft.remote_host_last_note.as_ref() {
+                fields.push(FormField::notice(
+                    note.clone(),
+                    if draft.remote_host_last_note_is_error {
+                        SurfaceTone::Danger
+                    } else {
+                        SurfaceTone::Muted
+                    },
+                ));
             }
             if let Some(controller_id) = draft.remote_host_controller_client_id.as_deref() {
                 fields.push(FormField::notice(
@@ -3427,6 +3439,10 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         remote_host_controller_client_id: Some("client-studio".to_string()),
         remote_host_listening: true,
         remote_host_error: None,
+        remote_host_last_note: Some(
+            "Remote client studio-laptop connected from 192.168.0.42:54012.".to_string(),
+        ),
+        remote_host_last_note_is_error: false,
         remote_known_hosts: vec![KnownRemoteHost {
             label: "studio-pc".to_string(),
             address: "192.168.0.20".to_string(),

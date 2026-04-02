@@ -469,6 +469,8 @@ pub struct RemoteHostStatus {
     pub controller_client_id: Option<String>,
     pub listening: bool,
     pub listener_error: Option<String>,
+    pub last_connection_note: Option<String>,
+    pub last_connection_is_error: bool,
 }
 
 pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceError> {
@@ -579,6 +581,8 @@ struct RemoteHostInner {
     controller_client_id: RwLock<Option<String>>,
     listener_running: AtomicBool,
     listener_error: RwLock<Option<String>>,
+    last_connection_note: RwLock<Option<String>>,
+    last_connection_is_error: AtomicBool,
     next_connection_id: AtomicU64,
     stop_flag: AtomicBool,
     listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -632,6 +636,8 @@ impl RemoteHostService {
                 controller_client_id: RwLock::new(None),
                 listener_running: AtomicBool::new(false),
                 listener_error: RwLock::new(None),
+                last_connection_note: RwLock::new(None),
+                last_connection_is_error: AtomicBool::new(false),
                 next_connection_id: AtomicU64::new(1),
                 stop_flag: AtomicBool::new(false),
                 listener_thread: Mutex::new(None),
@@ -742,6 +748,13 @@ impl RemoteHostService {
             .read()
             .map(|slot| slot.clone())
             .unwrap_or(None);
+        let last_connection_note = self
+            .inner
+            .last_connection_note
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or(None);
+        let last_connection_is_error = self.inner.last_connection_is_error.load(Ordering::Relaxed);
         RemoteHostStatus {
             enabled,
             bind_address,
@@ -751,6 +764,8 @@ impl RemoteHostService {
             controller_client_id,
             listening,
             listener_error,
+            last_connection_note,
+            last_connection_is_error,
         }
     }
 
@@ -816,6 +831,12 @@ impl RemoteHostService {
         if let Ok(mut error) = self.inner.listener_error.write() {
             *error = None;
         }
+        if let Ok(mut note) = self.inner.last_connection_note.write() {
+            *note = None;
+        }
+        self.inner
+            .last_connection_is_error
+            .store(false, Ordering::Relaxed);
         if let Ok(mut handle) = self.inner.listener_thread.lock() {
             if let Some(thread) = handle.take() {
                 let _ = thread.join();
@@ -875,9 +896,10 @@ impl RemoteClientHandle {
             client_label: client_label.to_string(),
             auth,
         };
-        write_message(&mut stream, &hello).map_err(|error| format!("Handshake failed: {error}"))?;
-        let response: ServerMessage =
-            read_message(&mut stream).map_err(|error| format!("Handshake failed: {error}"))?;
+        write_message(&mut stream, &hello)
+            .map_err(|error| format_handshake_stage_error(address, port, "write", &error))?;
+        let response: ServerMessage = read_message(&mut stream)
+            .map_err(|error| format_handshake_stage_error(address, port, "read", &error))?;
         let (server_id, client_id, client_token, controller_client_id, you_have_control, snapshot) =
             match response {
                 ServerMessage::HelloOk {
@@ -1020,6 +1042,20 @@ impl RemoteClientHandle {
     }
 }
 
+fn format_handshake_stage_error(address: &str, port: u16, stage: &str, error: &str) -> String {
+    let trimmed = error.trim();
+    let mut message = format!("Handshake failed: {trimmed}");
+    if matches!(stage, "write" | "read") {
+        message.push_str(&format!(
+            " The host at {address}:{port} accepted the socket but closed it before the DevManager handshake finished."
+        ));
+        message.push_str(
+            " Open Remote settings on the host and check the latest host-side error. If this is another local DevManager install, make sure it is updated to the same remote build as this app.",
+        );
+    }
+    message
+}
+
 fn run_listener(inner: Arc<RemoteHostInner>) {
     let config = inner
         .config
@@ -1034,6 +1070,11 @@ fn run_listener(inner: Arc<RemoteHostInner>) {
             if let Ok(mut slot) = inner.listener_error.write() {
                 *slot = Some(format!("Could not listen on {bind}: {error}"));
             }
+            set_last_connection_note(
+                &inner,
+                format!("Remote host could not start listening on {bind}: {error}"),
+                true,
+            );
             eprintln!("[remote] failed to bind {bind}: {error}");
             return;
         }
@@ -1191,6 +1232,10 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
 }
 
 fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, stream: TcpStream) {
+    let peer_label = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown client".to_string());
     let config = inner
         .config
         .read()
@@ -1199,6 +1244,11 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
     let mut stream = match transport::accept_tls(stream, &config) {
         Ok(stream) => stream,
         Err(error) => {
+            set_last_connection_note(
+                &inner,
+                format!("TLS handshake from {peer_label} failed: {error}"),
+                true,
+            );
             eprintln!("[remote] tls accept failed for connection {connection_id}: {error}");
             return;
         }
@@ -1208,12 +1258,32 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
 
     let hello = match read_message::<ClientMessage, _>(&mut stream) {
         Ok(message) => message,
-        Err(_) => return,
+        Err(error) => {
+            set_last_connection_note(
+                &inner,
+                format!(
+                    "Client {peer_label} disconnected before DevManager handshake completed: {error}"
+                ),
+                true,
+            );
+            eprintln!(
+                "[remote] handshake read failed for connection {connection_id} from {peer_label}: {error}"
+            );
+            return;
+        }
     };
 
     let (client_id, client_token) = match authenticate_client(&inner, hello) {
         Ok(auth) => auth,
         Err(message) => {
+            set_last_connection_note(
+                &inner,
+                format!("Rejected remote client from {peer_label}: {message}"),
+                true,
+            );
+            eprintln!(
+                "[remote] handshake rejected for connection {connection_id} from {peer_label}: {message}"
+            );
             let _ = write_message(&mut stream, &ServerMessage::HelloErr { message });
             return;
         }
@@ -1261,12 +1331,27 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
         you_have_control,
         snapshot,
     };
-    if write_message(&mut stream, &hello_ok).is_err() {
+    if let Err(error) = write_message(&mut stream, &hello_ok) {
+        set_last_connection_note(
+            &inner,
+            format!(
+                "Remote client {client_id} connected from {peer_label} but the host could not finish the handshake: {error}"
+            ),
+            true,
+        );
+        eprintln!(
+            "[remote] handshake reply failed for connection {connection_id} ({client_id} from {peer_label}): {error}"
+        );
         if let Ok(mut clients) = inner.clients.lock() {
             clients.remove(&connection_id);
         }
         return;
     }
+    set_last_connection_note(
+        &inner,
+        format!("Remote client {client_id} connected from {peer_label}."),
+        false,
+    );
 
     while !inner.stop_flag.load(Ordering::Relaxed) {
         let mut should_break = false;
@@ -1364,6 +1449,11 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
             *controller = None;
         }
     }
+    set_last_connection_note(
+        &inner,
+        format!("Remote client {client_id} disconnected from {peer_label}."),
+        false,
+    );
     if let Ok(mut config) = inner.config.write() {
         if let Some(client) = config
             .paired_clients
@@ -1436,6 +1526,15 @@ fn authenticate_client(
 
 fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
     inner.config_revision.fetch_add(1, Ordering::Relaxed);
+}
+
+fn set_last_connection_note(inner: &Arc<RemoteHostInner>, note: String, is_error: bool) {
+    if let Ok(mut slot) = inner.last_connection_note.write() {
+        *slot = Some(note);
+    }
+    inner
+        .last_connection_is_error
+        .store(is_error, Ordering::Relaxed);
 }
 
 fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {
@@ -1697,14 +1796,18 @@ fn apply_workspace_delta(snapshot: &mut RemoteWorkspaceSnapshot, delta: RemoteWo
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_workspace_delta, current_controller_allows, generate_pairing_token,
-        upsert_known_host, PairedRemoteClient, RemoteHostConfig, RemoteHostService,
-        RemoteMachineState, RemoteWorkspaceDelta, RemoteWorkspaceSnapshot,
+        apply_workspace_delta, current_controller_allows, format_handshake_stage_error,
+        generate_pairing_token, set_last_connection_note, upsert_known_host, PairedRemoteClient,
+        RemoteHostConfig, RemoteHostService, RemoteMachineState, RemoteWorkspaceDelta,
+        RemoteWorkspaceSnapshot, ClientAuth, RemoteClientHandle,
     };
     use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
     use std::collections::HashMap;
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn pairing_token_is_short_and_non_empty() {
@@ -1825,6 +1928,91 @@ mod tests {
         assert!(!current_controller_allows(&service.inner, "client-2"));
     }
 
+    #[test]
+    fn host_status_reports_last_connection_note() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        set_last_connection_note(
+            &service.inner,
+            "Client disconnected before handshake.".to_string(),
+            true,
+        );
+
+        let status = service.status();
+        assert_eq!(
+            status.last_connection_note.as_deref(),
+            Some("Client disconnected before handshake.")
+        );
+        assert!(status.last_connection_is_error);
+    }
+
+    #[test]
+    fn handshake_stage_error_explains_early_host_disconnects() {
+        let message = format_handshake_stage_error(
+            "127.0.0.1",
+            43871,
+            "write",
+            "Write failed: connection aborted",
+        );
+
+        assert!(message.contains("Handshake failed: Write failed: connection aborted"));
+        assert!(message.contains("127.0.0.1:43871"));
+        assert!(message.contains("host-side error"));
+        assert!(message.contains("same remote build"));
+    }
+
+    #[test]
+    fn loopback_host_and_client_complete_remote_handshake() {
+        let port = reserve_free_tcp_port();
+        let mut config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let expected_server_id = config.server_id.clone();
+        let service = RemoteHostService::new(config.clone());
+
+        wait_for(
+            || service.status().listening,
+            Duration::from_secs(3),
+            "remote host never started listening",
+        );
+
+        let result = RemoteClientHandle::connect(
+            "127.0.0.1",
+            port,
+            "Test Client",
+            ClientAuth::PairToken { token: pair_token },
+            None,
+        )
+        .expect("loopback remote connect should succeed");
+
+        assert_eq!(result.server_id, expected_server_id);
+        assert!(!result.client_id.trim().is_empty());
+        assert!(!result.client_token.trim().is_empty());
+        assert!(!result.certificate_fingerprint.trim().is_empty());
+        assert!(!result.you_have_control);
+        assert_eq!(result.snapshot.server_id, expected_server_id);
+
+        wait_for(
+            || service.status().connected_clients == 1,
+            Duration::from_secs(3),
+            "host never registered connected client",
+        );
+
+        result.client.disconnect();
+
+        wait_for(
+            || service.status().connected_clients == 0,
+            Duration::from_secs(3),
+            "host never observed client disconnect",
+        );
+
+        config.enabled = false;
+        service.apply_config(config);
+    }
+
     fn session_view(session_id: &str) -> TerminalSessionView {
         TerminalSessionView {
             runtime: SessionRuntimeState::new(
@@ -1835,5 +2023,27 @@ mod tests {
             ),
             screen: TerminalScreenSnapshot::default(),
         }
+    }
+
+    fn reserve_free_tcp_port() -> u16 {
+        TcpListener::bind(("127.0.0.1", 0))
+            .expect("should bind ephemeral port")
+            .local_addr()
+            .expect("listener should have a local address")
+            .port()
+    }
+
+    fn wait_for<F>(mut predicate: F, timeout: Duration, context: &str)
+    where
+        F: FnMut() -> bool,
+    {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if predicate() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("{context}");
     }
 }

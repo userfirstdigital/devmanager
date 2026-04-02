@@ -754,6 +754,8 @@ impl NativeShell {
             draft.remote_host_controller_client_id = remote_status.controller_client_id;
             draft.remote_host_listening = remote_status.listening;
             draft.remote_host_error = remote_status.listener_error;
+            draft.remote_host_last_note = remote_status.last_connection_note;
+            draft.remote_host_last_note_is_error = remote_status.last_connection_is_error;
             draft.remote_known_hosts = self.remote_machine_state.known_hosts.clone();
             draft.remote_paired_clients = self.remote_machine_state.host.paired_clients.clone();
             draft.remote_host_enabled = self.remote_machine_state.host.enabled;
@@ -2109,6 +2111,8 @@ impl NativeShell {
                 remote_host_controller_client_id: remote_status.controller_client_id,
                 remote_host_listening: remote_status.listening,
                 remote_host_error: remote_status.listener_error,
+                remote_host_last_note: remote_status.last_connection_note,
+                remote_host_last_note_is_error: remote_status.last_connection_is_error,
                 remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
                 remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
                 open_picker: None,
