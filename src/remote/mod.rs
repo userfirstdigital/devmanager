@@ -408,14 +408,38 @@ impl RemoteActionResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RemoteActionPayload {
-    SearchMatches { matches: Vec<TerminalSearchMatch> },
-    BrowsePath { path: Option<String> },
-    DirectoryEntries { entries: Vec<RemoteFsEntry> },
-    PathStat { entry: Option<RemoteFsEntry> },
-    TextFile { path: String, contents: String },
-    RootScan { entries: Vec<RootScanEntry> },
-    FolderScan { scan: ScanResult },
-    ExportText { text: String },
+    SearchMatches {
+        matches: Vec<TerminalSearchMatch>,
+    },
+    BrowsePath {
+        path: Option<String>,
+    },
+    DirectoryEntries {
+        entries: Vec<RemoteFsEntry>,
+    },
+    PathStat {
+        entry: Option<RemoteFsEntry>,
+    },
+    TextFile {
+        path: String,
+        contents: String,
+    },
+    RootScan {
+        entries: Vec<RootScanEntry>,
+    },
+    FolderScan {
+        scan: ScanResult,
+    },
+    AiTab {
+        tab_id: String,
+        project_id: String,
+        tab_type: TabType,
+        session_id: String,
+        label: Option<String>,
+    },
+    ExportText {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

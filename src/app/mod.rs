@@ -742,6 +742,39 @@ impl NativeShell {
         }
     }
 
+    fn apply_remote_ai_tab(
+        &mut self,
+        project_id: &str,
+        tab_type: TabType,
+        tab_id: &str,
+        session_id: &str,
+        label: Option<String>,
+    ) {
+        self.state.open_ai_tab(
+            project_id,
+            tab_type.clone(),
+            tab_id.to_string(),
+            session_id.to_string(),
+            label.clone(),
+        );
+        if let Some(remote_mode) = self.remote_mode.as_mut() {
+            remote_mode.snapshot.app_state.open_ai_tab(
+                project_id,
+                tab_type,
+                tab_id.to_string(),
+                session_id.to_string(),
+                label,
+            );
+            remote_mode
+                .client
+                .set_focused_session(Some(session_id.to_string()));
+        }
+        self.show_terminal_surface();
+        self.synced_session_id = Some(session_id.to_string());
+        self.last_dimensions = None;
+        self.terminal_notice = None;
+    }
+
     fn sync_settings_remote_draft(&mut self) {
         if !matches!(self.editor_panel, Some(EditorPanel::Settings(_))) {
             return;
@@ -1184,7 +1217,10 @@ impl NativeShell {
                     Ok(session_id) => {
                         did_change = true;
                         self.save_session_state();
-                        RemoteActionResult::ok(Some(format!("Opened {session_id}")), None)
+                        RemoteActionResult::ok(
+                            Some(format!("Opened {session_id}")),
+                            remote_ai_tab_payload(&self.state, &session_id),
+                        )
                     }
                     Err(error) => RemoteActionResult::error(error),
                 },
@@ -1192,10 +1228,13 @@ impl NativeShell {
                     .process_manager
                     .ensure_ai_session_for_tab(&mut self.state, &tab_id, dimensions, true, false)
                 {
-                    Ok(_) => {
+                    Ok(session_id) => {
                         did_change = true;
                         self.save_session_state();
-                        RemoteActionResult::ok(None, None)
+                        RemoteActionResult::ok(
+                            None,
+                            remote_ai_tab_payload(&self.state, &session_id),
+                        )
                     }
                     Err(error) => RemoteActionResult::error(error),
                 },
@@ -1203,10 +1242,13 @@ impl NativeShell {
                     .process_manager
                     .restart_ai_session(&mut self.state, &tab_id, dimensions)
                 {
-                    Ok(_) => {
+                    Ok(session_id) => {
                         did_change = true;
                         self.save_session_state();
-                        RemoteActionResult::ok(None, None)
+                        RemoteActionResult::ok(
+                            None,
+                            remote_ai_tab_payload(&self.state, &session_id),
+                        )
                     }
                     Err(error) => RemoteActionResult::error(error),
                 },
@@ -3911,9 +3953,17 @@ impl NativeShell {
                 if let (Some(host), Some(EditorPanel::Settings(draft))) =
                     (host, self.editor_panel.as_mut())
                 {
-                    draft.remote_connect_address = host.address;
+                    let host_label = host.label.clone();
+                    let host_address = host.address.clone();
+                    let host_port = host.port;
+                    draft.remote_connect_address = host_address.clone();
                     draft.remote_connect_port = host.port.to_string();
                     draft.remote_connect_token.clear();
+                    draft.remote_connect_in_flight = false;
+                    draft.remote_connect_status = Some(format!(
+                        "Loaded saved host `{host_label}` ({host_address}:{host_port}). Click Connect to open it."
+                    ));
+                    draft.remote_connect_status_is_error = false;
                     draft.open_picker = None;
                 }
                 cx.notify();
@@ -5931,10 +5981,27 @@ impl NativeShell {
                 tab_type,
                 dimensions,
             }) {
-                Ok(result) if result.ok => {
-                    self.show_terminal_surface();
-                    self.terminal_notice = None;
-                }
+                Ok(result) if result.ok => match result.payload {
+                    Some(RemoteActionPayload::AiTab {
+                        tab_id,
+                        project_id,
+                        tab_type,
+                        session_id,
+                        label,
+                    }) => {
+                        self.apply_remote_ai_tab(
+                            &project_id,
+                            tab_type,
+                            &tab_id,
+                            &session_id,
+                            label,
+                        );
+                    }
+                    _ => {
+                        self.show_terminal_surface();
+                        self.terminal_notice = None;
+                    }
+                },
                 Ok(result) => {
                     self.terminal_notice = Some(
                         result
@@ -5993,10 +6060,27 @@ impl NativeShell {
                 tab_id: tab_id.to_string(),
                 dimensions,
             }) {
-                Ok(result) if result.ok => {
-                    self.show_terminal_surface();
-                    self.terminal_notice = None;
-                }
+                Ok(result) if result.ok => match result.payload {
+                    Some(RemoteActionPayload::AiTab {
+                        tab_id,
+                        project_id,
+                        tab_type,
+                        session_id,
+                        label,
+                    }) => {
+                        self.apply_remote_ai_tab(
+                            &project_id,
+                            tab_type,
+                            &tab_id,
+                            &session_id,
+                            label,
+                        );
+                    }
+                    _ => {
+                        self.show_terminal_surface();
+                        self.terminal_notice = None;
+                    }
+                },
                 Ok(result) => {
                     self.terminal_notice = Some(
                         result
@@ -6046,10 +6130,27 @@ impl NativeShell {
                 tab_id: tab_id.to_string(),
                 dimensions,
             }) {
-                Ok(result) if result.ok => {
-                    self.show_terminal_surface();
-                    self.terminal_notice = None;
-                }
+                Ok(result) if result.ok => match result.payload {
+                    Some(RemoteActionPayload::AiTab {
+                        tab_id,
+                        project_id,
+                        tab_type,
+                        session_id,
+                        label,
+                    }) => {
+                        self.apply_remote_ai_tab(
+                            &project_id,
+                            tab_type,
+                            &tab_id,
+                            &session_id,
+                            label,
+                        );
+                    }
+                    _ => {
+                        self.show_terminal_surface();
+                        self.terminal_notice = None;
+                    }
+                },
                 Ok(result) => {
                     self.terminal_notice = Some(
                         result
@@ -8819,6 +8920,17 @@ fn current_window_title(state: &AppState, runtime: &crate::state::RuntimeState) 
     dedupe_adjacent_segments(segments).join(WINDOW_TITLE_SEPARATOR)
 }
 
+fn remote_ai_tab_payload(state: &AppState, session_id: &str) -> Option<RemoteActionPayload> {
+    let tab = state.find_ai_tab_by_session(session_id)?;
+    Some(RemoteActionPayload::AiTab {
+        tab_id: tab.id.clone(),
+        project_id: tab.project_id.clone(),
+        tab_type: tab.tab_type.clone(),
+        session_id: session_id.to_string(),
+        label: tab.label.clone(),
+    })
+}
+
 fn window_title_project_name(tab: &SessionTab, state: &AppState) -> Option<String> {
     if matches!(tab.tab_type, TabType::Ssh) {
         Some("SSH".to_string())
@@ -9704,6 +9816,38 @@ mod tests {
             port: 22,
             username: "dev".to_string(),
             password: None,
+        }
+    }
+
+    #[test]
+    fn remote_ai_tab_payload_uses_session_lookup_metadata() {
+        let mut state = AppState::default();
+        state.config.projects.push(sample_project());
+        state.open_ai_tab(
+            "project-1",
+            TabType::Claude,
+            "claude-tab".to_string(),
+            "claude-session".to_string(),
+            Some("Claude 1".to_string()),
+        );
+
+        let payload = remote_ai_tab_payload(&state, "claude-session");
+
+        match payload {
+            Some(RemoteActionPayload::AiTab {
+                tab_id,
+                project_id,
+                tab_type,
+                session_id,
+                label,
+            }) => {
+                assert_eq!(tab_id, "claude-tab");
+                assert_eq!(project_id, "project-1");
+                assert_eq!(tab_type, TabType::Claude);
+                assert_eq!(session_id, "claude-session");
+                assert_eq!(label.as_deref(), Some("Claude 1"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
         }
     }
 
