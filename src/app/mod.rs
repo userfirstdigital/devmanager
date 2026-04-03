@@ -8,12 +8,12 @@ use crate::models::{
 use crate::notifications;
 use crate::remote::{
     self, ClientAuth, PendingRemoteRequest, RemoteAction, RemoteActionPayload, RemoteActionResult,
-    RemoteClientHandle, RemoteClientPool, RemoteHostService, RemoteMachineState,
-    RemoteTerminalExport, RemoteTerminalInput,
+    RemoteClientHandle, RemoteClientPool, RemoteHostService, RemoteLatencyStats, RemoteMachineState,
+    RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
 };
 use crate::services::{
     env_service, pid_file, platform_service, ports_service, scanner_service, ConfigImportMode,
-    ManagedShutdownReport, ProcessManager, SessionManager,
+    ManagedShutdownReport, ProcessManager, RemoteSessionEvent, SessionManager,
 };
 use crate::sidebar;
 use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState, SessionStatus};
@@ -32,7 +32,7 @@ use gpui::{
     WindowOptions,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -124,6 +124,9 @@ struct NativeShell {
     local_state_backup: Option<AppState>,
     last_remote_host_config_revision: u64,
     last_remote_snapshot_sync_at: Option<Instant>,
+    last_remote_runtime_revision: u64,
+    last_remote_port_hash: u64,
+    remote_live_session_generations: HashMap<String, u64>,
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
     did_focus_terminal: bool,
@@ -304,6 +307,23 @@ struct RemoteModeState {
     snapshot: remote::RemoteWorkspaceSnapshot,
     connected_label: String,
     pool_key: String,
+    subscribed_session_ids: BTreeSet<String>,
+    last_snapshot_revision: u64,
+    last_session_stream_revision: u64,
+}
+
+fn format_remote_latency_summary(stats: &RemoteLatencyStats) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(ms) = stats.input_enqueue_to_host_write_ms {
+        parts.push(format!("write {ms} ms"));
+    }
+    if let Some(ms) = stats.output_host_to_client_ms {
+        parts.push(format!("host {ms} ms"));
+    }
+    if let Some(ms) = stats.output_client_to_paint_ms {
+        parts.push(format!("paint {ms} ms"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" • "))
 }
 
 impl NativeShell {
@@ -326,6 +346,55 @@ impl NativeShell {
         process_manager.set_log_buffer_size(state.config.settings.log_buffer_size as usize);
         let updater = UpdaterService::new();
         let remote_host_service = RemoteHostService::new(remote_machine_state.host.clone());
+        let bootstrap_manager = process_manager.clone();
+        remote_host_service.set_session_bootstrap_provider(Some(Arc::new(move |session_id| {
+            let session_view = bootstrap_manager.session_view(session_id)?;
+            let replay_bytes = bootstrap_manager.session_replay_bytes(session_id).ok()?;
+            Some(RemoteSessionBootstrap {
+                session_id: session_id.to_string(),
+                runtime: session_view.runtime,
+                screen: session_view.screen,
+                replay_bytes,
+            })
+        })));
+        let input_manager = process_manager.clone();
+        let input_host_service = remote_host_service.clone();
+        remote_host_service.set_terminal_input_handler(Some(Arc::new(
+            move |input, enqueued_at_epoch_ms| {
+                let result = match input {
+                    RemoteTerminalInput::Text { session_id, text } => {
+                        input_manager.write_to_session(&session_id, &text)
+                    }
+                    RemoteTerminalInput::Bytes { session_id, bytes } => {
+                        input_manager.write_bytes_to_session(&session_id, &bytes)
+                    }
+                    RemoteTerminalInput::Paste { session_id, text } => {
+                        input_manager.paste_to_session(&session_id, &text)
+                    }
+                };
+                if result.is_ok() {
+                    input_host_service.record_input_write_latency(enqueued_at_epoch_ms);
+                }
+            },
+        )));
+        let resize_manager = process_manager.clone();
+        remote_host_service.set_terminal_resize_handler(Some(Arc::new(
+            move |session_id, dimensions| {
+                let _ = resize_manager.resize_session(&session_id, dimensions);
+            },
+        )));
+        let event_host_service = remote_host_service.clone();
+        process_manager.set_remote_session_handler(Some(Arc::new(move |event| match event {
+            RemoteSessionEvent::Output { session_id, bytes } => {
+                event_host_service.push_session_output(&session_id, bytes);
+            }
+            RemoteSessionEvent::Runtime { session_id, runtime } => {
+                event_host_service.push_session_runtime(&session_id, runtime);
+            }
+            RemoteSessionEvent::Removed { session_id } => {
+                event_host_service.push_session_removed(&session_id);
+            }
+        })));
         let remote_client_pool = RemoteClientPool::default();
         let mut terminal_notice = None;
         let restore_enabled = state
@@ -371,6 +440,9 @@ impl NativeShell {
             local_state_backup: None,
             last_remote_host_config_revision: 0,
             last_remote_snapshot_sync_at: None,
+            last_remote_runtime_revision: 0,
+            last_remote_port_hash: 0,
+            remote_live_session_generations: HashMap::new(),
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
             did_focus_terminal: false,
@@ -570,6 +642,7 @@ impl NativeShell {
                                     let local_runtime_snapshot =
                                         shell.process_manager.runtime_state();
                                     shell.sync_server_port_snapshot(&local_runtime_snapshot, cx);
+                                    shell.sync_remote_host_live_sessions(&local_runtime_snapshot);
                                     shell.sync_remote_host_snapshot_if_due(&local_runtime_snapshot);
                                     changed
                                 };
@@ -644,22 +717,103 @@ impl NativeShell {
     }
 
     fn sync_remote_client_snapshot(&mut self) -> bool {
-        let Some(remote_mode) = self.remote_mode.as_mut() else {
+        let Some(client) = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.client.clone())
+        else {
             return false;
         };
 
-        if let Some(message) = remote_mode.client.disconnected_message() {
+        if let Some(message) = client.disconnected_message() {
             self.disconnect_remote_host(Some(message));
             return true;
         }
 
-        let Some(snapshot) = remote_mode.client.latest_snapshot() else {
-            return false;
+        let (last_snapshot_revision, last_session_stream_revision) = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| {
+                (
+                    remote_mode.last_snapshot_revision,
+                    remote_mode.last_session_stream_revision,
+                )
+            })
+            .unwrap_or((0, 0));
+
+        let mut changed = false;
+        let mut latest_snapshot = None;
+        let snapshot_revision = client.snapshot_revision();
+        if snapshot_revision != last_snapshot_revision {
+            let Some(snapshot) = client.latest_snapshot() else {
+                return false;
+            };
+            self.state = self.merge_remote_snapshot_into_state(&snapshot);
+            latest_snapshot = Some(snapshot);
+            changed = true;
+        }
+
+        let session_stream_revision = client.session_stream_revision();
+        if session_stream_revision != last_session_stream_revision {
+            changed = true;
+        }
+
+        if let Some(remote_mode) = self.remote_mode.as_mut() {
+            if let Some(snapshot) = latest_snapshot {
+                remote_mode.snapshot = snapshot;
+                remote_mode.last_snapshot_revision = snapshot_revision;
+            }
+            if session_stream_revision != remote_mode.last_session_stream_revision {
+                remote_mode.last_session_stream_revision = session_stream_revision;
+            }
+        }
+
+        if changed {
+            self.sync_remote_session_subscriptions();
+            self.sync_settings_remote_draft();
+        }
+
+        changed
+    }
+
+    fn desired_remote_session_subscriptions(&self) -> BTreeSet<String> {
+        self.state
+            .open_tabs
+            .iter()
+            .filter_map(|tab| match tab.tab_type {
+                TabType::Server => tab.command_id.clone(),
+                TabType::Claude | TabType::Codex | TabType::Ssh => tab
+                    .pty_session_id
+                    .clone()
+                    .or_else(|| tab.command_id.clone()),
+            })
+            .collect()
+    }
+
+    fn sync_remote_session_subscriptions(&mut self) {
+        let desired = self.desired_remote_session_subscriptions();
+        let Some(remote_mode) = self.remote_mode.as_mut() else {
+            return;
         };
-        remote_mode.snapshot = snapshot.clone();
-        self.state = self.merge_remote_snapshot_into_state(&snapshot);
-        self.sync_settings_remote_draft();
-        true
+
+        let to_subscribe = desired
+            .difference(&remote_mode.subscribed_session_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let to_unsubscribe = remote_mode
+            .subscribed_session_ids
+            .difference(&desired)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !to_subscribe.is_empty() {
+            remote_mode.client.subscribe_sessions(to_subscribe);
+        }
+        if !to_unsubscribe.is_empty() {
+            remote_mode.client.unsubscribe_sessions(to_unsubscribe);
+        }
+
+        remote_mode.subscribed_session_ids = desired;
     }
 
     fn merge_remote_snapshot_into_state(
@@ -749,6 +903,7 @@ impl NativeShell {
         tab_id: &str,
         session_id: &str,
         label: Option<String>,
+        session_view: Option<crate::terminal::session::TerminalSessionView>,
     ) {
         self.state.open_ai_tab(
             project_id,
@@ -765,6 +920,18 @@ impl NativeShell {
                 session_id.to_string(),
                 label,
             );
+            remote_mode.snapshot.runtime_state.active_session_id = Some(session_id.to_string());
+            if let Some(session_view) = session_view {
+                remote_mode
+                    .snapshot
+                    .runtime_state
+                    .sessions
+                    .insert(session_id.to_string(), session_view.runtime.clone());
+                remote_mode
+                    .snapshot
+                    .session_views
+                    .insert(session_id.to_string(), session_view);
+            }
             remote_mode
                 .client
                 .set_focused_session(Some(session_id.to_string()));
@@ -787,9 +954,15 @@ impl NativeShell {
         let remote_connected = self.remote_mode.is_some();
         let remote_has_control = self.remote_has_control();
         let remote_status = self.remote_host_service.status();
+        let remote_latency_summary = self
+            .remote_mode
+            .as_ref()
+            .and_then(|remote_mode| format_remote_latency_summary(&remote_mode.client.latency_stats()));
+        let remote_host_latency_summary = format_remote_latency_summary(&remote_status.latency);
 
         if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
             draft.remote_connected_label = connected_label;
+            draft.remote_latency_summary = remote_latency_summary;
             draft.remote_has_control = remote_has_control;
             draft.remote_connected = remote_connected;
             draft.remote_host_clients = remote_status.connected_clients;
@@ -798,6 +971,7 @@ impl NativeShell {
             draft.remote_host_error = remote_status.listener_error;
             draft.remote_host_last_note = remote_status.last_connection_note;
             draft.remote_host_last_note_is_error = remote_status.last_connection_is_error;
+            draft.remote_host_latency_summary = remote_host_latency_summary;
             draft.remote_known_hosts = self.remote_machine_state.known_hosts.clone();
             draft.remote_paired_clients = self.remote_machine_state.host.paired_clients.clone();
             draft.remote_host_enabled = self.remote_machine_state.host.enabled;
@@ -847,13 +1021,73 @@ impl NativeShell {
             return;
         }
 
+        let runtime_revision = remote_runtime_revision(runtime_state);
+        let port_hash = local_stable_hash(&self.server_port_snapshot.statuses);
+        let forced_sync = self.last_remote_snapshot_sync_at.is_none();
+        if !forced_sync
+            && runtime_revision == self.last_remote_runtime_revision
+            && port_hash == self.last_remote_port_hash
+            && !has_pending_requests
+        {
+            self.last_remote_snapshot_sync_at = Some(now);
+            return;
+        }
+
         self.remote_host_service.update_snapshot(
             self.state.clone(),
             runtime_state.clone(),
-            self.process_manager.all_session_views(),
             self.server_port_snapshot.statuses.clone(),
         );
+        self.last_remote_runtime_revision = runtime_revision;
+        self.last_remote_port_hash = port_hash;
         self.last_remote_snapshot_sync_at = Some(now);
+    }
+
+    fn sync_remote_host_live_sessions(&mut self, runtime_state: &RuntimeState) {
+        if self.remote_mode.is_some() {
+            return;
+        }
+
+        let remote_status = self.remote_host_service.status();
+        if !remote_status.enabled || remote_status.connected_clients == 0 {
+            self.remote_live_session_generations.clear();
+            let _ = self.process_manager.drain_remote_dirty_sessions();
+            return;
+        }
+
+        let dirty_sessions = self
+            .process_manager
+            .drain_remote_dirty_sessions()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let subscribed_session_ids = self.remote_host_service.subscribed_session_ids();
+
+        self.remote_live_session_generations
+            .retain(|session_id, _| subscribed_session_ids.contains(session_id));
+
+        for session_id in subscribed_session_ids {
+            let generation = runtime_state
+                .sessions
+                .get(&session_id)
+                .map(|session| session.dirty_generation);
+            let should_publish = dirty_sessions.contains(&session_id)
+                || generation
+                    != self
+                        .remote_live_session_generations
+                        .get(&session_id)
+                        .copied();
+
+            if !should_publish {
+                continue;
+            }
+
+            if let Some(generation) = generation {
+                self.remote_live_session_generations
+                    .insert(session_id.clone(), generation);
+            } else {
+                self.remote_live_session_generations.remove(&session_id);
+            }
+        }
     }
 
     fn prepare_remote_connect(
@@ -926,12 +1160,16 @@ impl NativeShell {
         );
         self.persist_remote_machine_state();
         self.remote_mode = Some(RemoteModeState {
+            subscribed_session_ids: BTreeSet::new(),
+            last_snapshot_revision: client.snapshot_revision(),
+            last_session_stream_revision: client.session_stream_revision(),
             client,
             snapshot: snapshot.clone(),
             connected_label: host_label,
             pool_key,
         });
         self.state = self.merge_remote_snapshot_into_state(&snapshot);
+        self.sync_remote_session_subscriptions();
         self.editor_notice = Some("Connected to remote host and took control.".to_string());
         self.sync_settings_remote_draft();
     }
@@ -1079,6 +1317,7 @@ impl NativeShell {
         }
         self.synced_session_id = None;
         self.last_dimensions = None;
+        self.remote_live_session_generations.clear();
         self.terminal_notice = message;
         if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
             draft.remote_connect_in_flight = false;
@@ -1102,14 +1341,45 @@ impl NativeShell {
             .unwrap_or_else(|| self.server_port_snapshot.statuses.clone())
     }
 
+    fn active_remote_terminal_session_id(&self) -> Option<String> {
+        let tab = self.state.active_tab()?;
+        match tab.tab_type {
+            TabType::Server => tab.command_id.clone(),
+            TabType::Claude | TabType::Codex | TabType::Ssh => tab
+                .pty_session_id
+                .clone()
+                .or_else(|| tab.command_id.clone()),
+        }
+    }
+
+    fn resolved_terminal_session_id(
+        &self,
+        active_session: Option<&crate::terminal::session::TerminalSessionView>,
+    ) -> Option<String> {
+        active_session
+            .map(|session| session.runtime.session_id.clone())
+            .or_else(|| {
+                if self.remote_mode.is_some() {
+                    self.active_remote_terminal_session_id()
+                } else {
+                    Some(self.state.active_terminal_spec().session_id)
+                }
+            })
+    }
+
     fn current_active_session_view(&self) -> Option<crate::terminal::session::TerminalSessionView> {
         if let Some(remote_mode) = self.remote_mode.as_ref() {
-            let active_session_id = self.state.active_terminal_spec().session_id;
+            let active_session_id = self.active_remote_terminal_session_id()?;
             return remote_mode
-                .snapshot
-                .session_views
-                .get(&active_session_id)
-                .cloned();
+                .client
+                .session_view(&active_session_id)
+                .or_else(|| {
+                    remote_mode
+                        .snapshot
+                        .session_views
+                        .get(&active_session_id)
+                        .cloned()
+                });
         }
         self.process_manager.active_session()
     }
@@ -1119,7 +1389,10 @@ impl NativeShell {
         session_id: &str,
     ) -> Option<crate::terminal::session::TerminalSessionView> {
         if let Some(remote_mode) = self.remote_mode.as_ref() {
-            return remote_mode.snapshot.session_views.get(session_id).cloned();
+            return remote_mode
+                .client
+                .session_view(session_id)
+                .or_else(|| remote_mode.snapshot.session_views.get(session_id).cloned());
         }
         self.process_manager.session_view(session_id)
     }
@@ -1140,21 +1413,6 @@ impl NativeShell {
             } = request;
 
             let result = match action {
-                RemoteAction::TerminalText { session_id, text } => self
-                    .process_manager
-                    .write_to_session(&session_id, &text)
-                    .map(|_| RemoteActionResult::ok(None, None))
-                    .unwrap_or_else(RemoteActionResult::error),
-                RemoteAction::TerminalBytes { session_id, bytes } => self
-                    .process_manager
-                    .write_bytes_to_session(&session_id, &bytes)
-                    .map(|_| RemoteActionResult::ok(None, None))
-                    .unwrap_or_else(RemoteActionResult::error),
-                RemoteAction::TerminalPaste { session_id, text } => self
-                    .process_manager
-                    .paste_to_session(&session_id, &text)
-                    .map(|_| RemoteActionResult::ok(None, None))
-                    .unwrap_or_else(RemoteActionResult::error),
                 RemoteAction::StartServer {
                     command_id,
                     focus,
@@ -1219,7 +1477,11 @@ impl NativeShell {
                         self.save_session_state();
                         RemoteActionResult::ok(
                             Some(format!("Opened {session_id}")),
-                            remote_ai_tab_payload(&self.state, &session_id),
+                            remote_ai_tab_payload(
+                                &self.state,
+                                &session_id,
+                                self.process_manager.session_view(&session_id),
+                            ),
                         )
                     }
                     Err(error) => RemoteActionResult::error(error),
@@ -1233,7 +1495,11 @@ impl NativeShell {
                         self.save_session_state();
                         RemoteActionResult::ok(
                             None,
-                            remote_ai_tab_payload(&self.state, &session_id),
+                            remote_ai_tab_payload(
+                                &self.state,
+                                &session_id,
+                                self.process_manager.session_view(&session_id),
+                            ),
                         )
                     }
                     Err(error) => RemoteActionResult::error(error),
@@ -1247,7 +1513,11 @@ impl NativeShell {
                         self.save_session_state();
                         RemoteActionResult::ok(
                             None,
-                            remote_ai_tab_payload(&self.state, &session_id),
+                            remote_ai_tab_payload(
+                                &self.state,
+                                &session_id,
+                                self.process_manager.session_view(&session_id),
+                            ),
                         )
                     }
                     Err(error) => RemoteActionResult::error(error),
@@ -1596,14 +1866,6 @@ impl NativeShell {
                 } => self
                     .process_manager
                     .scroll_session(&session_id, delta_lines)
-                    .map(|_| RemoteActionResult::ok(None, None))
-                    .unwrap_or_else(RemoteActionResult::error),
-                RemoteAction::ResizeSession {
-                    session_id,
-                    dimensions,
-                } => self
-                    .process_manager
-                    .resize_session(&session_id, dimensions)
                     .map(|_| RemoteActionResult::ok(None, None))
                     .unwrap_or_else(RemoteActionResult::error),
                 RemoteAction::ExportSessionText { session_id, export } => {
@@ -2120,6 +2382,11 @@ impl NativeShell {
             .remote_mode
             .as_ref()
             .map(|remote_mode| remote_mode.connected_label.clone());
+        let remote_latency_summary = self
+            .remote_mode
+            .as_ref()
+            .and_then(|remote_mode| format_remote_latency_summary(&remote_mode.client.latency_stats()));
+        let remote_host_latency_summary = format_remote_latency_summary(&remote_status.latency);
         self.open_editor(
             EditorPanel::Settings(SettingsDraft {
                 default_terminal: settings.default_terminal,
@@ -2166,6 +2433,7 @@ impl NativeShell {
                 remote_connect_status: None,
                 remote_connect_status_is_error: false,
                 remote_connected_label,
+                remote_latency_summary,
                 remote_has_control: self.remote_has_control(),
                 remote_connected: self.remote_mode.is_some(),
                 remote_host_clients: remote_status.connected_clients,
@@ -2174,6 +2442,7 @@ impl NativeShell {
                 remote_host_error: remote_status.listener_error,
                 remote_host_last_note: remote_status.last_connection_note,
                 remote_host_last_note_is_error: remote_status.last_connection_is_error,
+                remote_host_latency_summary,
                 remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
                 remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
                 open_picker: None,
@@ -4215,10 +4484,11 @@ impl NativeShell {
                 }
                 let dimensions = self.terminal_dimensions(window);
                 if self.last_dimensions != Some(dimensions) {
-                    self.remote_send_action(RemoteAction::ResizeSession {
-                        session_id: active_spec.session_id.clone(),
-                        dimensions,
-                    });
+                    if let Some(remote_mode) = self.remote_mode.as_ref() {
+                        remote_mode
+                            .client
+                            .send_terminal_resize(active_spec.session_id.clone(), dimensions);
+                    }
                     self.last_dimensions = Some(dimensions);
                 }
             } else if !self.state.open_tabs.is_empty() {
@@ -4565,8 +4835,13 @@ impl NativeShell {
     }
 
     fn focus_terminal(&mut self, window: &mut Window) {
-        let session_id = self.state.active_terminal_spec().session_id;
-        self.sync_terminal_focus(Some(session_id));
+        let session_id = if self.remote_mode.is_some() {
+            self.active_remote_terminal_session_id()
+                .or_else(|| Some(self.state.active_terminal_spec().session_id))
+        } else {
+            Some(self.state.active_terminal_spec().session_id)
+        };
+        self.sync_terminal_focus(session_id);
         window.focus(&self.terminal_focus);
         self.did_focus_terminal = true;
     }
@@ -5344,7 +5619,18 @@ impl NativeShell {
     }
 
     fn refresh_terminal_search_results(&mut self, cx: &mut Context<Self>) {
-        let session_id = self.state.active_terminal_spec().session_id;
+        let active_session = self.current_active_session_view();
+        let Some(session_id) = self.resolved_terminal_session_id(active_session.as_ref()) else {
+            self.terminal_search.matches.clear();
+            self.terminal_search.selected_index = None;
+            if self.remote_mode.is_some() {
+                self.terminal_notice = Some(
+                    "Remote terminal is still starting. Wait a moment and try again.".to_string(),
+                );
+            }
+            cx.notify();
+            return;
+        };
         let query = self.terminal_search.query.clone();
         self.terminal_search.matches = if self.remote_mode.is_some() {
             match self.remote_request(RemoteAction::SearchSession {
@@ -5395,7 +5681,10 @@ impl NativeShell {
         let Some(found) = self.terminal_search.matches.get(index) else {
             return;
         };
-        let session_id = self.state.active_terminal_spec().session_id;
+        let active_session = self.current_active_session_view();
+        let Some(session_id) = self.resolved_terminal_session_id(active_session.as_ref()) else {
+            return;
+        };
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::ScrollSessionToBufferLine {
                 session_id,
@@ -5481,7 +5770,16 @@ impl NativeShell {
         selection_only: bool,
         cx: &mut Context<Self>,
     ) {
-        let session_id = self.state.active_terminal_spec().session_id;
+        let active_session = self.current_active_session_view();
+        let Some(session_id) = self.resolved_terminal_session_id(active_session.as_ref()) else {
+            if self.remote_mode.is_some() {
+                self.terminal_notice = Some(
+                    "Remote terminal is still starting. Wait a moment and try again.".to_string(),
+                );
+            }
+            cx.notify();
+            return;
+        };
         let kind = if selection_only {
             "selection"
         } else if include_scrollback {
@@ -6020,6 +6318,7 @@ impl NativeShell {
                         tab_type,
                         session_id,
                         label,
+                        session_view,
                     }) => {
                         self.apply_remote_ai_tab(
                             &project_id,
@@ -6027,6 +6326,7 @@ impl NativeShell {
                             &tab_id,
                             &session_id,
                             label,
+                            session_view,
                         );
                     }
                     _ => {
@@ -6099,6 +6399,7 @@ impl NativeShell {
                         tab_type,
                         session_id,
                         label,
+                        session_view,
                     }) => {
                         self.apply_remote_ai_tab(
                             &project_id,
@@ -6106,6 +6407,7 @@ impl NativeShell {
                             &tab_id,
                             &session_id,
                             label,
+                            session_view,
                         );
                     }
                     _ => {
@@ -6169,6 +6471,7 @@ impl NativeShell {
                         tab_type,
                         session_id,
                         label,
+                        session_view,
                     }) => {
                         self.apply_remote_ai_tab(
                             &project_id,
@@ -6176,6 +6479,7 @@ impl NativeShell {
                             &tab_id,
                             &session_id,
                             label,
+                            session_view,
                         );
                     }
                     _ => {
@@ -6528,7 +6832,7 @@ impl NativeShell {
 
         let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
-        let session_id = self.state.active_terminal_spec().session_id;
+        let session_id = self.resolved_terminal_session_id(active_session.as_ref());
 
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
             self.terminal_selection = None;
@@ -6542,6 +6846,16 @@ impl NativeShell {
                     event.modifiers,
                     true,
                 ) {
+                    let Some(session_id) = session_id.clone() else {
+                        if self.remote_mode.is_some() {
+                            self.terminal_notice = Some(
+                                "Remote terminal is still starting. Wait a moment and try again."
+                                    .to_string(),
+                            );
+                            cx.notify();
+                        }
+                        return;
+                    };
                     if self.remote_mode.is_some() {
                         self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
                             session_id: session_id.clone(),
@@ -6640,7 +6954,11 @@ impl NativeShell {
                         event.pressed_button,
                         event.modifiers,
                     ) {
-                        let session_id = self.state.active_terminal_spec().session_id;
+                        let Some(session_id) =
+                            self.resolved_terminal_session_id(active_session.as_ref())
+                        else {
+                            return;
+                        };
                         if self.remote_mode.is_some() {
                             self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
                                 session_id,
@@ -6763,7 +7081,11 @@ impl NativeShell {
                     event.modifiers,
                     false,
                 ) {
-                    let session_id = self.state.active_terminal_spec().session_id;
+                    let Some(session_id) =
+                        self.resolved_terminal_session_id(active_session.as_ref())
+                    else {
+                        return;
+                    };
                     if self.remote_mode.is_some() {
                         self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
                             session_id,
@@ -6822,7 +7144,10 @@ impl NativeShell {
                 event.modifiers,
                 false,
             ) {
-                let session_id = self.state.active_terminal_spec().session_id;
+                let Some(session_id) = self.resolved_terminal_session_id(active_session.as_ref())
+                else {
+                    return;
+                };
                 if self.remote_mode.is_some() {
                     self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
                         session_id,
@@ -6922,8 +7247,8 @@ impl NativeShell {
             window.prevent_default();
             return;
         }
-        let session_id = self.state.active_terminal_spec().session_id;
         let active_session = self.current_active_session_view();
+        let session_id = self.resolved_terminal_session_id(active_session.as_ref());
         let mode = active_session
             .as_ref()
             .map(|session| session.screen.mode)
@@ -6947,7 +7272,10 @@ impl NativeShell {
                 if let Some(tab) = self.state.active_tab().cloned() {
                     self.close_tab_action(&tab.id, cx);
                 } else {
-                    let _ = self.process_manager.close_session(&session_id);
+                    let Some(session_id) = session_id.as_ref() else {
+                        return;
+                    };
+                    let _ = self.process_manager.close_session(session_id);
                 }
                 window.prevent_default();
             }
@@ -6966,6 +7294,17 @@ impl NativeShell {
                 if let Some(clipboard) = cx.read_from_clipboard() {
                     match terminal_clipboard_payload(&clipboard) {
                         Some(TerminalClipboardPayload::Text(text)) => {
+                            let Some(session_id) = session_id.clone() else {
+                                if self.remote_mode.is_some() {
+                                    self.terminal_notice = Some(
+                                        "Remote terminal is still starting. Wait a moment and try again."
+                                            .to_string(),
+                                    );
+                                    cx.notify();
+                                }
+                                window.prevent_default();
+                                return;
+                            };
                             if self.remote_mode.is_some() {
                                 self.remote_send_terminal_input(RemoteTerminalInput::Paste {
                                     session_id: session_id.clone(),
@@ -6976,6 +7315,17 @@ impl NativeShell {
                             }
                         }
                         Some(TerminalClipboardPayload::RawBytes(bytes)) => {
+                            let Some(session_id) = session_id.clone() else {
+                                if self.remote_mode.is_some() {
+                                    self.terminal_notice = Some(
+                                        "Remote terminal is still starting. Wait a moment and try again."
+                                            .to_string(),
+                                    );
+                                    cx.notify();
+                                }
+                                window.prevent_default();
+                                return;
+                            };
                             if self.remote_mode.is_some() {
                                 self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
                                     session_id: session_id.clone(),
@@ -7010,9 +7360,23 @@ impl NativeShell {
                         })
                     {
                         if self.remote_mode.is_none() {
+                            let Some(session_id) = session_id.as_ref() else {
+                                return;
+                            };
                             self.process_manager.note_server_interrupt(&session_id);
                         }
                     }
+                    let Some(session_id) = session_id.clone() else {
+                        if self.remote_mode.is_some() {
+                            self.terminal_notice = Some(
+                                "Remote terminal is still starting. Wait a moment and try again."
+                                    .to_string(),
+                            );
+                            cx.notify();
+                            window.prevent_default();
+                        }
+                        return;
+                    };
                     if self.remote_mode.is_some() {
                         self.remote_send_terminal_input(RemoteTerminalInput::Text {
                             session_id,
@@ -7041,8 +7405,10 @@ impl NativeShell {
             return;
         }
 
-        let session_id = self.state.active_terminal_spec().session_id;
         if let Some(session) = self.current_active_session_view() {
+            let Some(session_id) = self.resolved_terminal_session_id(Some(&session)) else {
+                return;
+            };
             if self.terminal_mouse_capture_active(session.screen.mode) {
                 if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                     if let Some(sequences) =
@@ -7326,17 +7692,22 @@ impl Render for NativeShell {
         let render_started = Instant::now();
         self.capture_window_bounds(window);
         self.sync_remote_host_config_from_service();
+        if self.remote_mode.is_some() {
+            self.sync_remote_session_subscriptions();
+        }
         if let Some(display_offset) = self.pending_terminal_display_offset.take() {
-            let session_id = self.state.active_terminal_spec().session_id;
-            if self.remote_mode.is_some() {
-                self.remote_send_action(RemoteAction::ScrollSessionToOffset {
-                    session_id,
-                    display_offset,
-                });
-            } else {
-                let _ = self
-                    .process_manager
-                    .scroll_session_to_offset(&session_id, display_offset);
+            let active_session = self.current_active_session_view();
+            if let Some(session_id) = self.resolved_terminal_session_id(active_session.as_ref()) {
+                if self.remote_mode.is_some() {
+                    self.remote_send_action(RemoteAction::ScrollSessionToOffset {
+                        session_id,
+                        display_offset,
+                    });
+                } else {
+                    let _ = self
+                        .process_manager
+                        .scroll_session_to_offset(&session_id, display_offset);
+                }
             }
         }
 
@@ -8928,6 +9299,23 @@ fn normalize_optional_string(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn remote_runtime_revision(runtime: &RuntimeState) -> u64 {
+    let mut entries = runtime
+        .sessions
+        .iter()
+        .map(|(session_id, session)| (session_id.clone(), session.dirty_generation))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    local_stable_hash(&(runtime.active_session_id.clone(), entries))
+}
+
+fn local_stable_hash<T: serde::Serialize>(value: &T) -> u64 {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&bytes, &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
 fn app_window_title() -> String {
     crate::persistence::app_instance_label()
         .map(|label| format!("{APP_WINDOW_TITLE} [{label}]"))
@@ -8952,7 +9340,11 @@ fn current_window_title(state: &AppState, runtime: &crate::state::RuntimeState) 
     dedupe_adjacent_segments(segments).join(WINDOW_TITLE_SEPARATOR)
 }
 
-fn remote_ai_tab_payload(state: &AppState, session_id: &str) -> Option<RemoteActionPayload> {
+fn remote_ai_tab_payload(
+    state: &AppState,
+    session_id: &str,
+    session_view: Option<crate::terminal::session::TerminalSessionView>,
+) -> Option<RemoteActionPayload> {
     let tab = state.find_ai_tab_by_session(session_id)?;
     Some(RemoteActionPayload::AiTab {
         tab_id: tab.id.clone(),
@@ -8960,6 +9352,7 @@ fn remote_ai_tab_payload(state: &AppState, session_id: &str) -> Option<RemoteAct
         tab_type: tab.tab_type.clone(),
         session_id: session_id.to_string(),
         label: tab.label.clone(),
+        session_view,
     })
 }
 
@@ -9863,7 +10256,7 @@ mod tests {
             Some("Claude 1".to_string()),
         );
 
-        let payload = remote_ai_tab_payload(&state, "claude-session");
+        let payload = remote_ai_tab_payload(&state, "claude-session", None);
 
         match payload {
             Some(RemoteActionPayload::AiTab {
@@ -9872,12 +10265,14 @@ mod tests {
                 tab_type,
                 session_id,
                 label,
+                session_view,
             }) => {
                 assert_eq!(tab_id, "claude-tab");
                 assert_eq!(project_id, "project-1");
                 assert_eq!(tab_type, TabType::Claude);
                 assert_eq!(session_id, "claude-session");
                 assert_eq!(label.as_deref(), Some("Claude 1"));
+                assert!(session_view.is_none());
             }
             other => panic!("unexpected payload: {other:?}"),
         }

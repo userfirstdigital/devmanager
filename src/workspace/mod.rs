@@ -1148,6 +1148,7 @@ pub struct SettingsDraft {
     pub remote_connect_status: Option<String>,
     pub remote_connect_status_is_error: bool,
     pub remote_connected_label: Option<String>,
+    pub remote_latency_summary: Option<String>,
     pub remote_has_control: bool,
     pub remote_connected: bool,
     pub remote_host_clients: usize,
@@ -1156,6 +1157,7 @@ pub struct SettingsDraft {
     pub remote_host_error: Option<String>,
     pub remote_host_last_note: Option<String>,
     pub remote_host_last_note_is_error: bool,
+    pub remote_host_latency_summary: Option<String>,
     pub remote_known_hosts: Vec<KnownRemoteHost>,
     pub remote_paired_clients: Vec<PairedRemoteClient>,
     pub open_picker: Option<SettingsPicker>,
@@ -1667,7 +1669,7 @@ fn render_settings_panel(
     }
 
     if draft.remote_connected {
-        sections.push(FormSection::new("Remote Session").fields(vec![
+        let mut remote_session_fields = vec![
             FormField::notice(
                 "Connected to a remote host. Host settings stay on the host; this panel only manages the connection from this client.",
                 SurfaceTone::Muted,
@@ -1688,7 +1690,15 @@ fn render_settings_panel(
                     .to_string(),
                 ),
             ),
-        ]));
+        ];
+        if let Some(latency_summary) = draft.remote_latency_summary.as_ref() {
+            remote_session_fields.push(FormField::info(
+                "Latency",
+                latency_summary.clone(),
+                Some("Recent transport and paint timings from this remote client.".to_string()),
+            ));
+        }
+        sections.push(FormSection::new("Remote Session").fields(remote_session_fields));
     } else {
         sections.push(FormSection::new("App").fields(vec![
             FormField::toggle(
@@ -2219,6 +2229,13 @@ fn render_settings_panel(
                 } else {
                     SurfaceTone::Muted
                 },
+            ));
+        }
+        if let Some(latency_summary) = draft.remote_host_latency_summary.as_ref() {
+            host_fields.push(FormField::info(
+                "Latency",
+                latency_summary.clone(),
+                Some("Recent terminal timing on this host.".to_string()),
             ));
         }
         if draft.remote_host_controller_client_id.is_some() {
@@ -3504,6 +3521,7 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         remote_connect_status: Some("Connected to studio-pc.".to_string()),
         remote_connect_status_is_error: false,
         remote_connected_label: Some("studio-pc".to_string()),
+        remote_latency_summary: Some("host 2 ms • paint 1 ms".to_string()),
         remote_has_control: true,
         remote_connected: true,
         remote_host_clients: 1,
@@ -3514,6 +3532,7 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
             "Remote client studio-laptop connected from 192.168.0.42:54012.".to_string(),
         ),
         remote_host_last_note_is_error: false,
+        remote_host_latency_summary: Some("write 1 ms".to_string()),
         remote_known_hosts: vec![KnownRemoteHost {
             label: "studio-pc".to_string(),
             address: "192.168.0.20".to_string(),

@@ -10,6 +10,6 @@ pub use env_service::*;
 pub use pid_file::*;
 pub use platform_service::*;
 pub use ports_service::*;
-pub use process_manager::{ManagedShutdownReport, ProcessManager};
+pub use process_manager::{ManagedShutdownReport, ProcessManager, RemoteSessionEvent};
 pub use scanner_service::*;
 pub use session_manager::{ConfigImportMode, SessionManager};

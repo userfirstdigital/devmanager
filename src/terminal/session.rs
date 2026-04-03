@@ -24,6 +24,9 @@ use std::thread;
 use std::time::Duration;
 
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const MAX_REMOTE_REPLAY_BYTES: usize = 4 * 1024 * 1024;
+type SessionStateNotifier = Arc<dyn Fn() + Send + Sync>;
+type SessionOutputNotifier = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TerminalBackend {
@@ -138,6 +141,16 @@ pub struct TerminalSessionView {
     pub screen: TerminalScreenSnapshot,
 }
 
+#[derive(Clone)]
+pub struct TerminalReplica {
+    session_id: String,
+    term: Arc<Mutex<Term<SessionEventProxy>>>,
+    runtime_state: Arc<RwLock<RuntimeState>>,
+    dimensions: Arc<Mutex<SessionDimensions>>,
+    parser: Arc<Mutex<Processor<StdSyncHandler>>>,
+    shell_sequences: Arc<Mutex<ShellSequenceParser>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TerminalSize {
     cols: usize,
@@ -171,6 +184,7 @@ struct SessionEventProxy {
     runtime_state: Arc<RwLock<RuntimeState>>,
     dimensions: Arc<Mutex<SessionDimensions>>,
     debug_enabled: bool,
+    state_notifier: Option<SessionStateNotifier>,
 }
 
 impl SessionEventProxy {
@@ -205,6 +219,12 @@ impl SessionEventProxy {
     fn debug_log(&self, message: impl AsRef<str>) {
         if self.debug_enabled {
             eprintln!("[terminal:{}] {}", self.session_id, message.as_ref());
+        }
+    }
+
+    fn notify_state_change(&self) {
+        if let Some(notifier) = self.state_notifier.as_ref() {
+            notifier();
         }
     }
 }
@@ -277,6 +297,7 @@ impl EventListener for SessionEventProxy {
                 self.write_to_pty(&response);
             }
         }
+        self.notify_state_change();
     }
 }
 
@@ -291,6 +312,8 @@ pub struct TerminalSession {
     event_proxy: SessionEventProxy,
     backend: TerminalBackend,
     scrolling_history: Arc<RwLock<usize>>,
+    replay_buffer: Arc<Mutex<Vec<u8>>>,
+    output_notifier: Option<SessionOutputNotifier>,
 }
 
 impl TerminalSession {
@@ -303,6 +326,8 @@ impl TerminalSession {
         scrolling_history: usize,
         runtime_state: Arc<RwLock<RuntimeState>>,
         debug_enabled: bool,
+        state_notifier: Option<SessionStateNotifier>,
+        output_notifier: Option<SessionOutputNotifier>,
     ) -> Result<Self, String> {
         let session_id = session_id.into();
         let backend = TerminalBackend::PortablePtyFeedingAlacritty;
@@ -324,6 +349,8 @@ impl TerminalSession {
                 debug_enabled,
                 backend,
                 true,
+                state_notifier.clone(),
+                output_notifier.clone(),
             ) {
                 Ok(session) => return Ok(session),
                 Err(error) => last_error = Some(format!("{}: {}", candidate.program, error)),
@@ -344,6 +371,8 @@ impl TerminalSession {
         log_file_path: Option<PathBuf>,
         runtime_state: Arc<RwLock<RuntimeState>>,
         debug_enabled: bool,
+        state_notifier: Option<SessionStateNotifier>,
+        output_notifier: Option<SessionOutputNotifier>,
     ) -> Result<Self, String> {
         let session_id = session_id.into();
         spawn_with_command(
@@ -359,6 +388,8 @@ impl TerminalSession {
             debug_enabled,
             TerminalBackend::PortablePtyFeedingAlacritty,
             true,
+            state_notifier,
+            output_notifier,
         )
     }
 
@@ -442,6 +473,7 @@ impl TerminalSession {
                 session.note_resize(dimensions);
             }
         }
+        self.event_proxy.notify_state_change();
 
         Ok(())
     }
@@ -461,6 +493,7 @@ impl TerminalSession {
                 session.note_scroll(display_offset);
             }
         }
+        self.event_proxy.notify_state_change();
 
         Ok(())
     }
@@ -491,6 +524,7 @@ impl TerminalSession {
                     session.note_scroll(clamped_offset);
                 }
             }
+            self.event_proxy.notify_state_change();
         }
 
         Ok(())
@@ -702,6 +736,10 @@ impl TerminalSession {
             }
         }
 
+        if let Ok(mut replay) = self.replay_buffer.lock() {
+            replay.clear();
+        }
+
         spawn_reader_thread(
             self.session_id.clone(),
             reader,
@@ -709,6 +747,9 @@ impl TerminalSession {
             log_writer,
             self.runtime_state.clone(),
             self.event_proxy.debug_enabled,
+            self.event_proxy.state_notifier.clone(),
+            self.output_notifier.clone(),
+            self.replay_buffer.clone(),
         );
         spawn_wait_thread(
             self.session_id.clone(),
@@ -716,6 +757,7 @@ impl TerminalSession {
             pid,
             self.runtime_state.clone(),
             self.event_proxy.debug_enabled,
+            self.event_proxy.state_notifier.clone(),
         );
 
         self.event_proxy.debug_log(format!("respawned {}", program));
@@ -790,6 +832,103 @@ impl TerminalSession {
             Err(error) => error.into_inner(),
         };
         snapshot_term(&term)
+    }
+
+    pub fn replay_bytes(&self) -> Vec<u8> {
+        self.replay_buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl TerminalReplica {
+    pub fn from_bootstrap(
+        session_id: impl Into<String>,
+        runtime: SessionRuntimeState,
+        replay_bytes: &[u8],
+    ) -> Self {
+        let session_id = session_id.into();
+        let runtime_state = Arc::new(RwLock::new(RuntimeState::default()));
+        if let Ok(mut runtime_slot) = runtime_state.write() {
+            runtime_slot.sessions.insert(session_id.clone(), runtime.clone());
+        }
+        let dimensions = Arc::new(Mutex::new(runtime.dimensions));
+        let event_proxy = SessionEventProxy {
+            session_id: session_id.clone(),
+            writer: Arc::new(Mutex::new(Box::new(std::io::sink()) as Box<dyn Write + Send>)),
+            runtime_state: runtime_state.clone(),
+            dimensions: dimensions.clone(),
+            debug_enabled: false,
+            state_notifier: None,
+        };
+        let term = Arc::new(Mutex::new(Term::new(
+            configured_term(10_000),
+            &TerminalSize::new(runtime.dimensions.cols as usize, runtime.dimensions.rows as usize),
+            event_proxy,
+        )));
+        let replica = Self {
+            session_id: session_id.clone(),
+            term,
+            runtime_state,
+            dimensions,
+            parser: Arc::new(Mutex::new(Processor::<StdSyncHandler>::new())),
+            shell_sequences: Arc::new(Mutex::new(ShellSequenceParser::default())),
+        };
+        if !replay_bytes.is_empty() {
+            replica.apply_output_bytes(replay_bytes);
+        }
+        replica.apply_runtime(runtime);
+        replica
+    }
+
+    pub fn apply_output_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Ok(mut parser) = self.parser.lock() else {
+            return;
+        };
+        let Ok(mut shell_sequences) = self.shell_sequences.lock() else {
+            return;
+        };
+        apply_terminal_output_chunk(
+            &self.session_id,
+            bytes,
+            &self.term,
+            &mut parser,
+            &mut shell_sequences,
+            &self.runtime_state,
+        );
+    }
+
+    pub fn apply_runtime(&self, runtime: SessionRuntimeState) {
+        if let Ok(mut dimensions) = self.dimensions.lock() {
+            *dimensions = runtime.dimensions;
+        }
+        if let Ok(mut term) = self.term.lock() {
+            term.resize(TerminalSize::new(
+                runtime.dimensions.cols as usize,
+                runtime.dimensions.rows as usize,
+            ));
+            apply_display_offset_to_term(&mut term, runtime.display_offset);
+        }
+        if let Ok(mut runtime_state) = self.runtime_state.write() {
+            runtime_state
+                .sessions
+                .insert(self.session_id.clone(), runtime.clone());
+            runtime_state.active_session_id = Some(self.session_id.clone());
+        }
+    }
+
+    pub fn view(&self) -> Option<TerminalSessionView> {
+        let runtime = self
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|runtime| runtime.sessions.get(&self.session_id).cloned())?;
+        let screen = self.term.lock().ok().map(|term| snapshot_term(&term))?;
+        Some(TerminalSessionView { runtime, screen })
     }
 }
 
@@ -1222,6 +1361,9 @@ fn spawn_reader_thread(
     mut log_writer: Option<LogWriter>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     debug_enabled: bool,
+    state_notifier: Option<SessionStateNotifier>,
+    output_notifier: Option<SessionOutputNotifier>,
+    replay_buffer: Arc<Mutex<Vec<u8>>>,
 ) {
     thread::spawn(move || {
         let mut parser = Processor::<StdSyncHandler>::new();
@@ -1237,26 +1379,25 @@ fn spawn_reader_thread(
                     break;
                 }
                 Ok(bytes_read) => {
-                    let parsed_sequences = shell_sequences.push_chunk(&buffer[..bytes_read]);
-                    let cursor_buffer_line = {
-                        let mut term = match term.lock() {
-                            Ok(term) => term,
-                            Err(error) => error.into_inner(),
-                        };
-                        parser.advance(&mut *term, &buffer[..bytes_read]);
-                        terminal_cursor_buffer_line(&term)
-                    };
+                    apply_terminal_output_chunk(
+                        &session_id,
+                        &buffer[..bytes_read],
+                        &term,
+                        &mut parser,
+                        &mut shell_sequences,
+                        &runtime_state,
+                    );
+                    append_replay_bytes(&replay_buffer, &buffer[..bytes_read]);
 
                     if let Some(writer) = log_writer.as_mut() {
                         writer.write_chunk(&buffer[..bytes_read]);
                     }
 
-                    if let Ok(mut runtime) = runtime_state.write() {
-                        if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                            session.record_pty_bytes(bytes_read);
-                            session.note_output_activity();
-                            apply_shell_sequences(session, &parsed_sequences, cursor_buffer_line);
-                        }
+                    if let Some(notifier) = output_notifier.as_ref() {
+                        notifier(buffer[..bytes_read].to_vec());
+                    }
+                    if let Some(notifier) = state_notifier.as_ref() {
+                        notifier();
                     }
                 }
                 Err(error) => {
@@ -1276,6 +1417,9 @@ fn spawn_reader_thread(
                             );
                         }
                     }
+                    if let Some(notifier) = state_notifier.as_ref() {
+                        notifier();
+                    }
                     break;
                 }
             }
@@ -1293,6 +1437,7 @@ fn spawn_wait_thread(
     pid: Option<u32>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     debug_enabled: bool,
+    state_notifier: Option<SessionStateNotifier>,
 ) {
     thread::spawn(move || match child.wait() {
         Ok(status) => {
@@ -1324,6 +1469,9 @@ fn spawn_wait_thread(
                     );
                 }
             }
+            if let Some(notifier) = state_notifier.as_ref() {
+                notifier();
+            }
             if let Some(pid) = pid {
                 let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
             }
@@ -1348,6 +1496,9 @@ fn spawn_wait_thread(
                     );
                 }
             }
+            if let Some(notifier) = state_notifier.as_ref() {
+                notifier();
+            }
             if let Some(pid) = pid {
                 let _ = pid_file::release_session_root(&session_id, pid, surviving_descendants);
             }
@@ -1368,6 +1519,8 @@ fn spawn_with_command(
     debug_enabled: bool,
     backend: TerminalBackend,
     track_pid: bool,
+    state_notifier: Option<SessionStateNotifier>,
+    output_notifier: Option<SessionOutputNotifier>,
 ) -> Result<TerminalSession, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -1411,12 +1564,14 @@ fn spawn_with_command(
     let master = Arc::new(Mutex::new(pair.master));
     let killer = Arc::new(Mutex::new(child.clone_killer()));
     let dimensions_state = Arc::new(Mutex::new(dimensions));
+    let replay_buffer = Arc::new(Mutex::new(Vec::new()));
     let event_proxy = SessionEventProxy {
         session_id: session_id.to_string(),
         writer: writer.clone(),
         runtime_state: runtime_state.clone(),
         dimensions: dimensions_state.clone(),
         debug_enabled,
+        state_notifier: state_notifier.clone(),
     };
 
     let term = Arc::new(Mutex::new(Term::new(
@@ -1450,6 +1605,9 @@ fn spawn_with_command(
         log_writer,
         runtime_state.clone(),
         debug_enabled,
+        state_notifier.clone(),
+        output_notifier.clone(),
+        replay_buffer.clone(),
     );
 
     spawn_wait_thread(
@@ -1458,6 +1616,7 @@ fn spawn_with_command(
         pid,
         runtime_state.clone(),
         debug_enabled,
+        state_notifier,
     );
 
     event_proxy.debug_log(format!("spawned {}", program));
@@ -1473,6 +1632,8 @@ fn spawn_with_command(
         event_proxy,
         backend,
         scrolling_history,
+        replay_buffer,
+        output_notifier,
     })
 }
 
@@ -1971,6 +2132,58 @@ fn terminal_cursor_buffer_line(term: &Term<SessionEventProxy>) -> usize {
     history_size.saturating_add(content.cursor.point.line.0.max(0) as usize)
 }
 
+fn apply_terminal_output_chunk(
+    session_id: &str,
+    bytes: &[u8],
+    term: &Arc<Mutex<Term<SessionEventProxy>>>,
+    parser: &mut Processor<StdSyncHandler>,
+    shell_sequences: &mut ShellSequenceParser,
+    runtime_state: &Arc<RwLock<RuntimeState>>,
+) {
+    let parsed_sequences = shell_sequences.push_chunk(bytes);
+    let cursor_buffer_line = {
+        let mut term = match term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        parser.advance(&mut *term, bytes);
+        terminal_cursor_buffer_line(&term)
+    };
+
+    if let Ok(mut runtime) = runtime_state.write() {
+        if let Some(session) = runtime.sessions.get_mut(session_id) {
+            session.record_pty_bytes(bytes.len());
+            session.note_output_activity();
+            apply_shell_sequences(session, &parsed_sequences, cursor_buffer_line);
+        }
+    }
+}
+
+fn append_replay_bytes(buffer: &Arc<Mutex<Vec<u8>>>, bytes: &[u8]) {
+    let Ok(mut replay) = buffer.lock() else {
+        return;
+    };
+    replay.extend_from_slice(bytes);
+    if replay.len() > MAX_REMOTE_REPLAY_BYTES {
+        let overflow = replay.len().saturating_sub(MAX_REMOTE_REPLAY_BYTES);
+        replay.drain(0..overflow);
+    }
+}
+
+fn apply_display_offset_to_term(term: &mut Term<SessionEventProxy>, target: usize) {
+    let history_size = term
+        .grid()
+        .total_lines()
+        .saturating_sub(term.grid().screen_lines());
+    let target = target.min(history_size);
+    let current = term.grid().display_offset();
+    if target == current {
+        return;
+    }
+    let delta = target as i32 - current as i32;
+    term.scroll_display(Scroll::Delta(delta));
+}
+
 fn apply_shell_sequences(
     session: &mut SessionRuntimeState,
     sequences: &[ShellSequence],
@@ -2005,6 +2218,7 @@ mod tests {
             runtime_state: Arc::new(RwLock::new(RuntimeState::default())),
             dimensions: Arc::new(Mutex::new(dimensions)),
             debug_enabled: false,
+            state_notifier: None,
         }
     }
 

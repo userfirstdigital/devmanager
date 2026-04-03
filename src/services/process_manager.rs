@@ -13,7 +13,7 @@ use crate::terminal::session::{
     bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalSession,
     TerminalSessionView,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,6 +27,15 @@ pub struct ProcessManager {
     inner: Arc<ProcessManagerInner>,
 }
 
+#[derive(Clone)]
+pub enum RemoteSessionEvent {
+    Output { session_id: String, bytes: Vec<u8> },
+    Runtime { session_id: String, runtime: SessionRuntimeState },
+    Removed { session_id: String },
+}
+
+type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
+
 struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
@@ -36,6 +45,8 @@ struct ProcessManagerInner {
     restart_backoffs: Mutex<HashMap<String, RestartBackoff>>,
     notification_sound: RwLock<Option<String>>,
     scrollback_lines: RwLock<usize>,
+    remote_dirty_sessions: Arc<Mutex<BTreeSet<String>>>,
+    remote_session_handler: RwLock<Option<RemoteSessionEventHandler>>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -95,6 +106,8 @@ impl ProcessManager {
             restart_backoffs: Mutex::new(HashMap::new()),
             notification_sound: RwLock::new(None),
             scrollback_lines: RwLock::new(10_000),
+            remote_dirty_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            remote_session_handler: RwLock::new(None),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
         });
@@ -116,17 +129,34 @@ impl ProcessManager {
     }
 
     pub fn register_runtime_session(&self, session: SessionRuntimeState) {
+        let session_id = session.session_id.clone();
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
-            runtime.sessions.insert(session.session_id.clone(), session);
+            runtime.sessions.insert(session_id.clone(), session);
         }
+        emit_remote_runtime_snapshot(&self.inner, &session_id);
     }
 
     pub fn terminal_backend(&self) -> TerminalBackend {
         self.inner.terminal_backend
     }
 
+    pub fn drain_remote_dirty_sessions(&self) -> Vec<String> {
+        let Ok(mut dirty) = self.inner.remote_dirty_sessions.lock() else {
+            return Vec::new();
+        };
+        let values = dirty.iter().cloned().collect();
+        dirty.clear();
+        values
+    }
+
     pub fn debug_enabled(&self) -> bool {
         self.inner.debug_enabled
+    }
+
+    pub fn set_remote_session_handler(&self, handler: Option<RemoteSessionEventHandler>) {
+        if let Ok(mut slot) = self.inner.remote_session_handler.write() {
+            *slot = handler;
+        }
     }
 
     pub fn set_notification_sound(&self, sound_id: Option<String>) {
@@ -163,11 +193,17 @@ impl ProcessManager {
 
     pub fn set_active_session(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
+        let mut cleared_unseen_ready = false;
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
             runtime.active_session_id = Some(session_id.clone());
             if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                cleared_unseen_ready = session.unseen_ready;
                 session.clear_unseen_ready();
             }
+        }
+        if cleared_unseen_ready {
+            mark_remote_session_dirty(&self.inner, &session_id);
+            emit_remote_runtime_snapshot(&self.inner, &session_id);
         }
     }
 
@@ -198,6 +234,14 @@ impl ProcessManager {
             self.log_buffer_size(),
             self.inner.runtime_state.clone(),
             self.inner.debug_enabled,
+            Some(session_change_notifier(
+                self.inner.clone(),
+                session_id.clone(),
+            )),
+            Some(session_output_notifier(
+                self.inner.clone(),
+                session_id.clone(),
+            )),
         ) {
             Ok(session) => {
                 self.inner
@@ -323,6 +367,11 @@ impl ProcessManager {
     pub fn session_scrollback_text(&self, session_id: &str) -> Result<String, String> {
         let session = self.get_session(session_id)?;
         Ok(session.scrollback_text())
+    }
+
+    pub fn session_replay_bytes(&self, session_id: &str) -> Result<Vec<u8>, String> {
+        let session = self.get_session(session_id)?;
+        Ok(session.replay_bytes())
     }
 
     pub fn search_session(
@@ -1408,12 +1457,16 @@ impl ProcessManager {
                 f(session);
             }
         }
+        mark_remote_session_dirty(&self.inner, session_id);
+        emit_remote_runtime_snapshot(&self.inner, session_id);
     }
 
     fn forget_session(&self, session_id: &str) {
         if let Ok(mut sessions) = self.inner.sessions.lock() {
             sessions.remove(session_id);
         }
+        mark_remote_session_dirty(&self.inner, session_id);
+        emit_remote_session_removed(&self.inner, session_id);
     }
 
     fn ensure_runtime_entry(&self, session_id: &str, cwd: PathBuf, dimensions: SessionDimensions) {
@@ -1430,6 +1483,8 @@ impl ProcessManager {
                     )
                 });
         }
+        mark_remote_session_dirty(&self.inner, session_id);
+        emit_remote_runtime_snapshot(&self.inner, session_id);
     }
 
     fn spawn_server_session(
@@ -1490,6 +1545,14 @@ impl ProcessManager {
             None,
             self.inner.runtime_state.clone(),
             self.inner.debug_enabled,
+            Some(session_change_notifier(
+                self.inner.clone(),
+                session_id.to_string(),
+            )),
+            Some(session_output_notifier(
+                self.inner.clone(),
+                session_id.to_string(),
+            )),
         )
         .map_err(|error| {
             self.update_session_state(session_id, |state| {
@@ -1544,6 +1607,14 @@ impl ProcessManager {
             None,
             self.inner.runtime_state.clone(),
             self.inner.debug_enabled,
+            Some(session_change_notifier(
+                self.inner.clone(),
+                session_id.to_string(),
+            )),
+            Some(session_output_notifier(
+                self.inner.clone(),
+                session_id.to_string(),
+            )),
         )
         .map_err(|error| {
             self.update_session_state(session_id, |state| {
@@ -1702,13 +1773,18 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         snapshots.push((session_id, snapshot, awaiting_external_editor));
     }
 
+    let mut touched_sessions = Vec::new();
     if let Ok(mut runtime) = inner.runtime_state.write() {
         for (session_id, snapshot, awaiting_external_editor) in snapshots {
             if let Some(session) = runtime.sessions.get_mut(&session_id) {
                 session.note_resource_sample(snapshot);
                 session.note_external_editor_wait(awaiting_external_editor);
+                touched_sessions.push(session_id);
             }
         }
+    }
+    for session_id in touched_sessions {
+        emit_remote_runtime_snapshot(inner, &session_id);
     }
 }
 
@@ -1758,7 +1834,7 @@ fn collect_process_tree_ids(system: &sysinfo::System, root_pid: sysinfo::Pid) ->
     process_ids
 }
 
-fn reconcile_exit_states(inner: &ProcessManagerInner) {
+fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
     #[derive(Debug)]
     enum ExitReconciliation {
         RestoreInterruptedServer {
@@ -1831,6 +1907,7 @@ fn reconcile_exit_states(inner: &ProcessManagerInner) {
                             session.mark_dirty();
                         }
                     }
+                    emit_remote_runtime_snapshot(inner, &session_id);
                 }
             }
             ExitReconciliation::MarkStopped { session_id } => {
@@ -1841,6 +1918,7 @@ fn reconcile_exit_states(inner: &ProcessManagerInner) {
                         session.mark_dirty();
                     }
                 }
+                emit_remote_runtime_snapshot(inner, &session_id);
             }
             ExitReconciliation::MarkCrashed { session_id } => {
                 if let Ok(mut runtime) = inner.runtime_state.write() {
@@ -1850,12 +1928,13 @@ fn reconcile_exit_states(inner: &ProcessManagerInner) {
                         session.mark_dirty();
                     }
                 }
+                emit_remote_runtime_snapshot(inner, &session_id);
             }
         }
     }
 }
 
-fn reconcile_ai_activity(inner: &ProcessManagerInner) {
+fn reconcile_ai_activity(inner: &Arc<ProcessManagerInner>) {
     let notification_sound = inner
         .notification_sound
         .read()
@@ -1866,8 +1945,10 @@ fn reconcile_ai_activity(inner: &ProcessManagerInner) {
 
     if let Ok(mut runtime) = inner.runtime_state.write() {
         let active_session_id = runtime.active_session_id.clone();
-        for (_session_id, session) in &mut runtime.sessions {
+        let mut touched_sessions = Vec::new();
+        for (session_id, session) in &mut runtime.sessions {
             session.reconcile_ai_idle(active_session_id.as_deref(), now);
+            touched_sessions.push(session_id.clone());
 
             match session.check_pending_notification(now) {
                 AiIdleTransition::BackgroundReady | AiIdleTransition::ForegroundReady => {
@@ -1875,6 +1956,10 @@ fn reconcile_ai_activity(inner: &ProcessManagerInner) {
                 }
                 AiIdleTransition::NoChange => {}
             }
+        }
+        drop(runtime);
+        for session_id in touched_sessions {
+            emit_remote_runtime_snapshot(inner, &session_id);
         }
     }
 
@@ -1935,6 +2020,7 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
                 session.mark_dirty();
             }
         }
+        emit_remote_runtime_snapshot(&inner, &launch_id);
 
         let launch_clone = launch.clone();
         let inner_clone = inner.clone();
@@ -1960,6 +2046,7 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
                         session.mark_dirty();
                     }
                 }
+                emit_remote_runtime_snapshot(&inner_clone, &launch_clone.command_id);
             }
         });
     }
@@ -2261,6 +2348,11 @@ fn spawn_server_session_with_inner(
         launch.log_file_path.clone(),
         inner.runtime_state.clone(),
         inner.debug_enabled,
+        Some(session_change_notifier(
+            inner.clone(),
+            session_id.clone(),
+        )),
+        Some(session_output_notifier(inner.clone(), session_id.clone())),
     )?;
 
     if let Ok(mut sessions) = inner.sessions.lock() {
@@ -2277,7 +2369,7 @@ fn spawn_server_session_with_inner(
 }
 
 fn restore_interrupted_server_prompt(
-    inner: &ProcessManagerInner,
+    inner: &Arc<ProcessManagerInner>,
     session_id: &str,
     cwd: PathBuf,
     dimensions: SessionDimensions,
@@ -2316,6 +2408,14 @@ fn restore_interrupted_server_prompt(
             None,
             inner.runtime_state.clone(),
             inner.debug_enabled,
+            Some(session_change_notifier(
+                inner.clone(),
+                session_id.to_string(),
+            )),
+            Some(session_output_notifier(
+                inner.clone(),
+                session_id.to_string(),
+            )),
         )?;
         inner
             .sessions
@@ -2334,8 +2434,73 @@ fn restore_interrupted_server_prompt(
             );
         }
     }
+    emit_remote_runtime_snapshot(inner, session_id);
 
     Ok(())
+}
+
+fn mark_remote_session_dirty(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+    if let Ok(mut dirty) = inner.remote_dirty_sessions.lock() {
+        dirty.insert(session_id.to_string());
+    }
+}
+
+fn session_change_notifier(
+    inner: Arc<ProcessManagerInner>,
+    session_id: String,
+) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        mark_remote_session_dirty(&inner, &session_id);
+        emit_remote_runtime_snapshot(&inner, &session_id);
+    })
+}
+
+fn session_output_notifier(
+    inner: Arc<ProcessManagerInner>,
+    session_id: String,
+) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
+    Arc::new(move |bytes| {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Ok(handler) = inner.remote_session_handler.read() {
+            if let Some(handler) = handler.as_ref() {
+                handler(RemoteSessionEvent::Output {
+                    session_id: session_id.clone(),
+                    bytes,
+                });
+            }
+        }
+    })
+}
+
+fn emit_remote_runtime_snapshot(inner: &ProcessManagerInner, session_id: &str) {
+    let runtime = inner
+        .runtime_state
+        .read()
+        .ok()
+        .and_then(|runtime| runtime.sessions.get(session_id).cloned());
+    let Some(runtime) = runtime else {
+        return;
+    };
+    if let Ok(handler) = inner.remote_session_handler.read() {
+        if let Some(handler) = handler.as_ref() {
+            handler(RemoteSessionEvent::Runtime {
+                session_id: session_id.to_string(),
+                runtime,
+            });
+        }
+    }
+}
+
+fn emit_remote_session_removed(inner: &ProcessManagerInner, session_id: &str) {
+    if let Ok(handler) = inner.remote_session_handler.read() {
+        if let Some(handler) = handler.as_ref() {
+            handler(RemoteSessionEvent::Removed {
+                session_id: session_id.to_string(),
+            });
+        }
+    }
 }
 
 fn next_ai_session_id(tab_type: &TabType) -> String {
