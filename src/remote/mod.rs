@@ -36,6 +36,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler = Arc<dyn Fn(RemoteTerminalInput, u64) + Send + Sync>;
 type TerminalResizeHandler = Arc<dyn Fn(String, SessionDimensions) + Send + Sync>;
+type FocusedSessionHandler = Arc<dyn Fn(String) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
@@ -680,6 +681,7 @@ struct RemoteHostInner {
     session_bootstrap_provider: RwLock<Option<SessionBootstrapProvider>>,
     terminal_input_handler: RwLock<Option<TerminalInputHandler>>,
     terminal_resize_handler: RwLock<Option<TerminalResizeHandler>>,
+    focused_session_handler: RwLock<Option<FocusedSessionHandler>>,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
@@ -735,6 +737,7 @@ struct RemoteClientInner {
     session_stream_revision: AtomicU64,
     latency: RwLock<RemoteLatencyStats>,
     pending_paint_received_at_epoch_ms: AtomicU64,
+    pending_notification_count: AtomicU64,
     client_id: String,
     client_token: String,
     server_id: String,
@@ -775,6 +778,7 @@ impl RemoteHostService {
                 session_bootstrap_provider: RwLock::new(None),
                 terminal_input_handler: RwLock::new(None),
                 terminal_resize_handler: RwLock::new(None),
+                focused_session_handler: RwLock::new(None),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
                 controller_client_id: RwLock::new(None),
@@ -848,6 +852,12 @@ impl RemoteHostService {
 
     pub fn set_terminal_resize_handler(&self, handler: Option<TerminalResizeHandler>) {
         if let Ok(mut slot) = self.inner.terminal_resize_handler.write() {
+            *slot = handler;
+        }
+    }
+
+    pub fn set_focused_session_handler(&self, handler: Option<FocusedSessionHandler>) {
+        if let Ok(mut slot) = self.inner.focused_session_handler.write() {
             *slot = handler;
         }
     }
@@ -1287,6 +1297,7 @@ impl RemoteClientHandle {
             session_stream_revision: AtomicU64::new(1),
             latency: RwLock::new(RemoteLatencyStats::default()),
             pending_paint_received_at_epoch_ms: AtomicU64::new(0),
+            pending_notification_count: AtomicU64::new(0),
             client_id: client_id.clone(),
             client_token: client_token.clone(),
             server_id: server_id.clone(),
@@ -1416,6 +1427,12 @@ impl RemoteClientHandle {
 
     pub fn session_stream_revision(&self) -> u64 {
         self.inner.session_stream_revision.load(Ordering::Relaxed)
+    }
+
+    pub fn drain_pending_notifications(&self) -> u64 {
+        self.inner
+            .pending_notification_count
+            .swap(0, Ordering::Relaxed)
     }
 
     pub fn session_view(&self, session_id: &str) -> Option<TerminalSessionView> {
@@ -2206,7 +2223,14 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
             Ok(Some(ClientMessage::SetFocusedSession { session_id })) => {
                 if let Ok(mut clients) = inner.clients.lock() {
                     if let Some(client) = clients.get_mut(&connection_id) {
-                        client.focused_session_id = session_id;
+                        client.focused_session_id = session_id.clone();
+                    }
+                }
+                if let Some(session_id) = session_id {
+                    if let Ok(handler) = inner.focused_session_handler.read() {
+                        if let Some(handler) = handler.as_ref() {
+                            handler(session_id);
+                        }
                     }
                 }
             }
@@ -2576,6 +2600,9 @@ fn requires_control(action: &RemoteAction) -> bool {
     !matches!(
         action,
         RemoteAction::SearchSession { .. }
+            | RemoteAction::ScrollSession { .. }
+            | RemoteAction::ScrollSessionToBufferLine { .. }
+            | RemoteAction::ScrollSessionToOffset { .. }
             | RemoteAction::BrowsePath { .. }
             | RemoteAction::ListDirectory { .. }
             | RemoteAction::StatPath { .. }
@@ -2705,6 +2732,22 @@ fn run_client_connection(
                         session_id,
                         runtime,
                     } => {
+                        let fire_notification = {
+                            if let Ok(latest) = inner.latest_snapshot.read() {
+                                latest
+                                    .as_ref()
+                                    .and_then(|s| s.runtime_state.sessions.get(&session_id))
+                                    .map(|s| runtime.notification_count > s.notification_count)
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        };
+                        if fire_notification {
+                            inner
+                                .pending_notification_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         if let Ok(replicas) = inner.session_replicas.read() {
                             if let Some(replica) = replicas.get(&session_id) {
                                 replica.apply_runtime(runtime.clone());
@@ -3651,6 +3694,7 @@ mod tests {
                 session_stream_revision: AtomicU64::new(1),
                 latency: RwLock::new(RemoteLatencyStats::default()),
                 pending_paint_received_at_epoch_ms: AtomicU64::new(0),
+                pending_notification_count: AtomicU64::new(0),
                 client_id: client_id.to_string(),
                 client_token: "token-1".to_string(),
                 server_id: "host-1".to_string(),

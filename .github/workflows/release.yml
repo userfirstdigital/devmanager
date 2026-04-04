@@ -162,6 +162,9 @@ jobs:
           - runner: windows-latest
             platform: windows-x86_64
             formats: nsis,wix
+          - runner: windows-11-arm
+            platform: windows-aarch64
+            formats: nsis
           - runner: macos-15
             platform: darwin-aarch64
             formats: app,dmg
@@ -205,7 +208,7 @@ jobs:
         run: choco install nsis -y --no-progress
 
       - name: Ensure WiX Toolset
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.platform == 'windows-x86_64'
         shell: powershell
         run: |
           $requiredTools = @("candle.exe", "light.exe")
@@ -290,6 +293,10 @@ jobs:
                   "pattern": "*_x64-setup.exe",
                   "format": "nsis",
               },
+              "windows-aarch64": {
+                  "pattern": "*_arm64-setup.exe",
+                  "format": "nsis",
+              },
               "darwin-aarch64": {
                   "pattern": "*.app.tar.gz",
                   "format": "app",
@@ -348,5 +355,6 @@ jobs:
           generate_release_notes: true
           files: |
             release-artifacts/windows-x86_64/*
+            release-artifacts/windows-aarch64/*
             release-artifacts/darwin-aarch64/*
             latest.json

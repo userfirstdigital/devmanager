@@ -413,6 +413,12 @@ impl NativeShell {
                 let _ = resize_manager.resize_session(&session_id, dimensions);
             },
         )));
+        let focus_manager = process_manager.clone();
+        remote_host_service.set_focused_session_handler(Some(Arc::new(
+            move |session_id| {
+                focus_manager.set_active_session(session_id);
+            },
+        )));
         let event_host_service = remote_host_service.clone();
         process_manager.set_remote_session_handler(Some(Arc::new(move |event| match event {
             RemoteSessionEvent::Output { session_id, bytes } => {
@@ -811,6 +817,11 @@ impl NativeShell {
             if session_stream_revision != remote_mode.last_session_stream_revision {
                 remote_mode.last_session_stream_revision = session_stream_revision;
             }
+        }
+
+        if client.drain_pending_notifications() > 0 {
+            let sound_id = self.state.config.settings.notification_sound.as_deref();
+            notifications::play_notification_sound(sound_id);
         }
 
         let forward_changed = self.sync_remote_port_forwards();
@@ -4793,17 +4804,23 @@ impl NativeShell {
                     active_session.as_ref(),
                     dimensions,
                 ) {
-                    if let Some(remote_mode) = self.remote_mode.as_ref() {
-                        remote_mode
-                            .client
-                            .apply_local_terminal_resize(&active_spec.session_id, dimensions);
-                        if self.remote_has_control() {
+                    if self.remote_has_control() {
+                        if let Some(remote_mode) = self.remote_mode.as_ref() {
                             remote_mode
                                 .client
-                                .send_terminal_resize(active_spec.session_id.clone(), dimensions);
+                                .apply_local_terminal_resize(
+                                    &active_spec.session_id,
+                                    dimensions,
+                                );
+                            remote_mode
+                                .client
+                                .send_terminal_resize(
+                                    active_spec.session_id.clone(),
+                                    dimensions,
+                                );
                         }
+                        self.last_dimensions = Some(dimensions);
                     }
-                    self.last_dimensions = Some(dimensions);
                 }
             } else if !self.state.open_tabs.is_empty() {
                 self.ensure_splash_image(cx);

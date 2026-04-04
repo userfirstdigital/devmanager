@@ -1018,30 +1018,41 @@ impl ProcessManager {
         }
 
         let remaining_tracked_pids = pid_file::active_tracked_pids_for_session(command_id);
-        self.update_session_state(command_id, |state| {
-            state.status = SessionStatus::Failed;
-            state.pid = None;
-            state.resources = ResourceSnapshot {
-                process_count: remaining_tracked_pids.len() as u32,
-                process_ids: remaining_tracked_pids.clone(),
-                last_sample_at: Some(Instant::now()),
-                ..ResourceSnapshot::default()
-            };
-            state.exit = Some(SessionExitState {
-                code: None,
-                signal: None,
-                closed_by_user: true,
-                summary: if remaining_tracked_pids.is_empty() {
-                    "Managed process did not stop cleanly.".to_string()
-                } else {
-                    format!(
+        if remaining_tracked_pids.is_empty() {
+            self.update_session_state(command_id, |state| {
+                state.status = SessionStatus::Stopped;
+                state.pid = None;
+                state.resources = ResourceSnapshot::default();
+                state.exit = Some(SessionExitState {
+                    code: None,
+                    signal: None,
+                    closed_by_user: true,
+                    summary: "Managed process did not stop cleanly.".to_string(),
+                });
+                state.mark_dirty();
+            });
+        } else {
+            self.update_session_state(command_id, |state| {
+                state.status = SessionStatus::Failed;
+                state.pid = None;
+                state.resources = ResourceSnapshot {
+                    process_count: remaining_tracked_pids.len() as u32,
+                    process_ids: remaining_tracked_pids.clone(),
+                    last_sample_at: Some(Instant::now()),
+                    ..ResourceSnapshot::default()
+                };
+                state.exit = Some(SessionExitState {
+                    code: None,
+                    signal: None,
+                    closed_by_user: true,
+                    summary: format!(
                         "Managed process left {} tracked child process(es) running.",
                         remaining_tracked_pids.len()
-                    )
-                },
+                    ),
+                });
+                state.mark_dirty();
             });
-            state.mark_dirty();
-        });
+        }
         false
     }
 
@@ -1955,14 +1966,21 @@ fn reconcile_ai_activity(inner: &Arc<ProcessManagerInner>) {
         let active_session_id = runtime.active_session_id.clone();
         let mut touched_sessions = Vec::new();
         for (session_id, session) in &mut runtime.sessions {
+            let gen_before = session.dirty_generation;
             session.reconcile_ai_idle(active_session_id.as_deref(), now);
-            touched_sessions.push(session_id.clone());
+            let mut changed = session.dirty_generation != gen_before;
 
             match session.check_pending_notification(now) {
                 AiIdleTransition::BackgroundReady | AiIdleTransition::ForegroundReady => {
                     should_notify = true;
+                    session.notification_count += 1;
+                    changed = true;
                 }
                 AiIdleTransition::NoChange => {}
+            }
+
+            if changed {
+                touched_sessions.push(session_id.clone());
             }
         }
         drop(runtime);

@@ -244,6 +244,8 @@ pub struct SessionRuntimeState {
     #[serde(skip, default)]
     pub thinking_since: Option<Instant>,
     pub unseen_ready: bool,
+    #[serde(default)]
+    pub notification_count: u64,
     #[serde(skip, default)]
     last_user_interrupt_at: Option<Instant>,
     #[serde(skip, default)]
@@ -305,6 +307,7 @@ impl SessionRuntimeState {
             last_output_at: None,
             thinking_since: None,
             unseen_ready: false,
+            notification_count: 0,
             last_user_interrupt_at: None,
             last_user_stop_request_at: None,
             suppress_activity_until: None,
