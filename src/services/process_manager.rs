@@ -29,9 +29,17 @@ pub struct ProcessManager {
 
 #[derive(Clone)]
 pub enum RemoteSessionEvent {
-    Output { session_id: String, bytes: Vec<u8> },
-    Runtime { session_id: String, runtime: SessionRuntimeState },
-    Removed { session_id: String },
+    Output {
+        session_id: String,
+        bytes: Vec<u8>,
+    },
+    Runtime {
+        session_id: String,
+        runtime: SessionRuntimeState,
+    },
+    Removed {
+        session_id: String,
+    },
 }
 
 type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
@@ -2348,10 +2356,7 @@ fn spawn_server_session_with_inner(
         launch.log_file_path.clone(),
         inner.runtime_state.clone(),
         inner.debug_enabled,
-        Some(session_change_notifier(
-            inner.clone(),
-            session_id.clone(),
-        )),
+        Some(session_change_notifier(inner.clone(), session_id.clone())),
         Some(session_output_notifier(inner.clone(), session_id.clone())),
     )?;
 

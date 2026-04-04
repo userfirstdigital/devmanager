@@ -7,8 +7,9 @@ use crate::models::{
 };
 use crate::notifications;
 use crate::remote::{
-    self, ClientAuth, PendingRemoteRequest, RemoteAction, RemoteActionPayload, RemoteActionResult,
-    RemoteClientHandle, RemoteClientPool, RemoteHostService, RemoteLatencyStats, RemoteMachineState,
+    self, ClientAuth, LocalPortForwardManager, PendingRemoteRequest, RemoteAction,
+    RemoteActionPayload, RemoteActionResult, RemoteClientHandle, RemoteClientPool,
+    RemoteHostService, RemoteLatencyStats, RemoteMachineState, RemotePortForwardState,
     RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
 };
 use crate::services::{
@@ -22,7 +23,7 @@ use crate::theme;
 use crate::updater::UpdaterService;
 use crate::workspace::{
     self, CommandDraft, EditorAction, EditorField, EditorPaneModel, EditorPanel, FolderDraft,
-    ProjectDraft, SettingsDraft, SshDraft, UiPreviewDraft,
+    ProjectDraft, RemotePortForwardDraft, SettingsDraft, SshDraft, UiPreviewDraft,
 };
 use gpui::{
     div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
@@ -47,6 +48,8 @@ const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(16);
 const REMOTE_HOST_SNAPSHOT_ACTIVE_INTERVAL: Duration = Duration::from_millis(33);
 const REMOTE_HOST_SNAPSHOT_IDLE_INTERVAL: Duration = Duration::from_millis(250);
+const REMOTE_RECONNECT_BASE_INTERVAL: Duration = Duration::from_millis(350);
+const REMOTE_RECONNECT_MAX_INTERVAL: Duration = Duration::from_secs(5);
 const APP_WINDOW_TITLE: &str = "DevManager";
 const WINDOW_TITLE_SEPARATOR: &str = " • ";
 
@@ -127,6 +130,7 @@ struct NativeShell {
     last_remote_runtime_revision: u64,
     last_remote_port_hash: u64,
     remote_live_session_generations: HashMap<String, u64>,
+    local_viewer_replicas: HashMap<String, LocalViewerReplicaState>,
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
     did_focus_terminal: bool,
@@ -301,15 +305,41 @@ struct SshPasswordPromptMatch {
     fingerprint: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSelectionRange {
+    start_row: usize,
+    start_column: usize,
+    end_row: usize,
+    end_column: usize,
+}
+
 #[derive(Clone)]
 struct RemoteModeState {
     client: RemoteClientHandle,
+    port_forwards: LocalPortForwardManager,
     snapshot: remote::RemoteWorkspaceSnapshot,
     connected_label: String,
+    address: String,
+    port: u16,
     pool_key: String,
     subscribed_session_ids: BTreeSet<String>,
     last_snapshot_revision: u64,
     last_session_stream_revision: u64,
+    reconnect: Option<RemoteReconnectState>,
+}
+
+#[derive(Clone)]
+struct RemoteReconnectState {
+    attempts: u32,
+    next_attempt_at: Instant,
+    in_flight: bool,
+    last_disconnect_message: Option<String>,
+    last_error: Option<String>,
+}
+
+struct LocalViewerReplicaState {
+    dirty_generation: u64,
+    replica: crate::terminal::session::TerminalReplica,
 }
 
 fn format_remote_latency_summary(stats: &RemoteLatencyStats) -> Option<String> {
@@ -388,7 +418,10 @@ impl NativeShell {
             RemoteSessionEvent::Output { session_id, bytes } => {
                 event_host_service.push_session_output(&session_id, bytes);
             }
-            RemoteSessionEvent::Runtime { session_id, runtime } => {
+            RemoteSessionEvent::Runtime {
+                session_id,
+                runtime,
+            } => {
                 event_host_service.push_session_runtime(&session_id, runtime);
             }
             RemoteSessionEvent::Removed { session_id } => {
@@ -443,6 +476,7 @@ impl NativeShell {
             last_remote_runtime_revision: 0,
             last_remote_port_hash: 0,
             remote_live_session_generations: HashMap::new(),
+            local_viewer_replicas: HashMap::new(),
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
             did_focus_terminal: false,
@@ -636,7 +670,7 @@ impl NativeShell {
                         if this
                             .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
                                 let changed = if shell.remote_mode.is_some() {
-                                    shell.sync_remote_client_snapshot()
+                                    shell.sync_remote_client_snapshot(cx)
                                 } else {
                                     let changed = shell.pump_remote_host_requests(cx);
                                     let local_runtime_snapshot =
@@ -716,7 +750,7 @@ impl NativeShell {
         self.last_remote_host_config_revision = latest_revision;
     }
 
-    fn sync_remote_client_snapshot(&mut self) -> bool {
+    fn sync_remote_client_snapshot(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(client) = self
             .remote_mode
             .as_ref()
@@ -725,8 +759,19 @@ impl NativeShell {
             return false;
         };
 
+        if self
+            .remote_mode
+            .as_ref()
+            .and_then(|remote_mode| remote_mode.reconnect.as_ref())
+            .is_some()
+        {
+            let changed = self.try_begin_remote_reconnect(cx);
+            self.sync_settings_remote_draft();
+            return changed;
+        }
+
         if let Some(message) = client.disconnected_message() {
-            self.disconnect_remote_host(Some(message));
+            self.begin_remote_reconnect(message, cx);
             return true;
         }
 
@@ -768,12 +813,13 @@ impl NativeShell {
             }
         }
 
-        if changed {
+        let forward_changed = self.sync_remote_port_forwards();
+        if changed || forward_changed {
             self.sync_remote_session_subscriptions();
             self.sync_settings_remote_draft();
         }
 
-        changed
+        changed || forward_changed
     }
 
     fn desired_remote_session_subscriptions(&self) -> BTreeSet<String> {
@@ -854,7 +900,24 @@ impl NativeShell {
 
     fn ensure_remote_control(&mut self, cx: &mut Context<Self>) -> bool {
         if self.remote_mode.is_none() || self.remote_has_control() {
-            return true;
+            if self
+                .remote_mode
+                .as_ref()
+                .and_then(|remote_mode| remote_mode.reconnect.as_ref())
+                .is_none()
+            {
+                return true;
+            }
+        }
+        if self
+            .remote_mode
+            .as_ref()
+            .and_then(|remote_mode| remote_mode.reconnect.as_ref())
+            .is_some()
+        {
+            self.editor_notice = Some("Reconnecting to remote host...".to_string());
+            cx.notify();
+            return false;
         }
         self.editor_notice =
             Some("This remote client is in viewer mode. Take control first.".to_string());
@@ -881,17 +944,26 @@ impl NativeShell {
         let Some(remote_mode) = self.remote_mode.as_ref() else {
             return Err("Remote host is not connected.".to_string());
         };
+        if remote_mode.reconnect.is_some() {
+            return Err("Reconnecting to remote host...".to_string());
+        }
         remote_mode.client.request(action)
     }
 
     fn remote_send_terminal_input(&mut self, input: RemoteTerminalInput) {
         if let Some(remote_mode) = self.remote_mode.as_ref() {
+            if remote_mode.reconnect.is_some() {
+                return;
+            }
             remote_mode.client.send_terminal_input(input);
         }
     }
 
     fn remote_send_action(&mut self, action: RemoteAction) {
         if let Some(remote_mode) = self.remote_mode.as_ref() {
+            if remote_mode.reconnect.is_some() {
+                return;
+            }
             remote_mode.client.send_action(action);
         }
     }
@@ -951,13 +1023,17 @@ impl NativeShell {
             .remote_mode
             .as_ref()
             .map(|remote_mode| remote_mode.connected_label.clone());
+        let remote_reconnect = self
+            .remote_mode
+            .as_ref()
+            .and_then(|remote_mode| remote_mode.reconnect.clone());
         let remote_connected = self.remote_mode.is_some();
         let remote_has_control = self.remote_has_control();
         let remote_status = self.remote_host_service.status();
-        let remote_latency_summary = self
-            .remote_mode
-            .as_ref()
-            .and_then(|remote_mode| format_remote_latency_summary(&remote_mode.client.latency_stats()));
+        let remote_latency_summary = self.remote_mode.as_ref().and_then(|remote_mode| {
+            format_remote_latency_summary(&remote_mode.client.latency_stats())
+        });
+        let remote_port_forwards = self.remote_port_forward_rows();
         let remote_host_latency_summary = format_remote_latency_summary(&remote_status.latency);
 
         if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
@@ -972,6 +1048,7 @@ impl NativeShell {
             draft.remote_host_last_note = remote_status.last_connection_note;
             draft.remote_host_last_note_is_error = remote_status.last_connection_is_error;
             draft.remote_host_latency_summary = remote_host_latency_summary;
+            draft.remote_port_forwards = remote_port_forwards;
             draft.remote_known_hosts = self.remote_machine_state.known_hosts.clone();
             draft.remote_paired_clients = self.remote_machine_state.host.paired_clients.clone();
             draft.remote_host_enabled = self.remote_machine_state.host.enabled;
@@ -983,13 +1060,28 @@ impl NativeShell {
                 }
             }
             if draft.remote_connected && !draft.remote_connect_in_flight {
-                draft.remote_connect_status = draft.remote_connected_label.as_ref().map(|label| {
-                    if draft.remote_has_control {
-                        format!("Connected to {label}. This client controls the host.")
-                    } else {
-                        format!("Connected to {label}. This client is in viewer mode.")
-                    }
-                });
+                if let Some(reconnect) = remote_reconnect.as_ref() {
+                    draft.remote_connect_status =
+                        draft.remote_connected_label.as_ref().map(|label| {
+                            let mut status = format!("Reconnecting to {label}...");
+                            if let Some(error) = reconnect.last_error.as_ref() {
+                                status.push_str(&format!(" Last error: {error}"));
+                            } else if let Some(message) = reconnect.last_disconnect_message.as_ref()
+                            {
+                                status.push_str(&format!(" {message}"));
+                            }
+                            status
+                        });
+                } else {
+                    draft.remote_connect_status =
+                        draft.remote_connected_label.as_ref().map(|label| {
+                            if draft.remote_has_control {
+                                format!("Connected to {label}. This client controls the host.")
+                            } else {
+                                format!("Connected to {label}. This client is in viewer mode.")
+                            }
+                        });
+                }
                 draft.remote_connect_status_is_error = false;
             }
         }
@@ -1145,8 +1237,15 @@ impl NativeShell {
     ) {
         client.take_control();
         let snapshot = client.latest_snapshot().unwrap_or(snapshot);
+        let address_for_mode = address.clone();
+        let replacing_remote = self.remote_mode.is_some();
         if self.local_state_backup.is_none() {
             self.local_state_backup = Some(self.state.clone());
+        }
+        if let Some(existing) = self.remote_mode.take() {
+            existing.port_forwards.shutdown();
+            self.remote_client_pool.remove(&existing.pool_key);
+            existing.client.disconnect();
         }
         remote::upsert_known_host(
             &mut self.remote_machine_state,
@@ -1159,19 +1258,161 @@ impl NativeShell {
             client_token,
         );
         self.persist_remote_machine_state();
+        let port_forwards = LocalPortForwardManager::new(client.clone());
         self.remote_mode = Some(RemoteModeState {
             subscribed_session_ids: BTreeSet::new(),
             last_snapshot_revision: client.snapshot_revision(),
             last_session_stream_revision: client.session_stream_revision(),
             client,
+            port_forwards,
             snapshot: snapshot.clone(),
             connected_label: host_label,
+            address: address_for_mode,
+            port,
             pool_key,
+            reconnect: None,
         });
         self.state = self.merge_remote_snapshot_into_state(&snapshot);
+        let _ = self.sync_remote_port_forwards();
         self.sync_remote_session_subscriptions();
-        self.editor_notice = Some("Connected to remote host and took control.".to_string());
+        self.editor_notice =
+            (!replacing_remote).then_some("Connected to remote host and took control.".to_string());
+        self.terminal_notice = None;
         self.sync_settings_remote_draft();
+    }
+
+    fn begin_remote_reconnect(&mut self, message: String, cx: &mut Context<Self>) {
+        let Some(remote_mode) = self.remote_mode.as_mut() else {
+            return;
+        };
+        let mut pool_key_to_remove = None;
+        let mut client_to_disconnect = None;
+        if remote_mode.reconnect.is_none() {
+            remote_mode.port_forwards.shutdown();
+            pool_key_to_remove = Some(remote_mode.pool_key.clone());
+            client_to_disconnect = Some(remote_mode.client.clone());
+            remote_mode.reconnect = Some(RemoteReconnectState {
+                attempts: 0,
+                next_attempt_at: Instant::now(),
+                in_flight: false,
+                last_disconnect_message: Some(message),
+                last_error: None,
+            });
+        } else if let Some(reconnect) = remote_mode.reconnect.as_mut() {
+            reconnect.last_disconnect_message = Some(message);
+        }
+        if let Some(pool_key) = pool_key_to_remove {
+            self.remote_client_pool.remove(&pool_key);
+        }
+        if let Some(client) = client_to_disconnect {
+            client.disconnect();
+        }
+        self.terminal_notice = Some("Reconnecting to remote host...".to_string());
+        self.sync_settings_remote_draft();
+        self.try_begin_remote_reconnect(cx);
+    }
+
+    fn try_begin_remote_reconnect(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((address, port)) = self.remote_mode.as_ref().and_then(|remote_mode| {
+            let reconnect = remote_mode.reconnect.as_ref()?;
+            if reconnect.in_flight || Instant::now() < reconnect.next_attempt_at {
+                return None;
+            }
+            Some((remote_mode.address.clone(), remote_mode.port))
+        }) else {
+            return false;
+        };
+
+        let prepared = match self.prepare_remote_connect(address, port, None) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.disconnect_remote_host(Some(error));
+                return true;
+            }
+        };
+
+        if let Some(remote_mode) = self.remote_mode.as_mut() {
+            if let Some(reconnect) = remote_mode.reconnect.as_mut() {
+                reconnect.in_flight = true;
+                reconnect.last_error = None;
+            }
+        }
+        self.remote_connect_request_id = self.remote_connect_request_id.saturating_add(1);
+        let request_id = self.remote_connect_request_id;
+        let background_executor = cx.background_executor().clone();
+        let pool = self.remote_client_pool.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                let prepared = prepared;
+                async move {
+                    let address = prepared.address.clone();
+                    let port = prepared.port;
+                    let host_label = prepared.host_label.clone();
+                    let expected_fingerprint = prepared.expected_fingerprint.clone();
+                    let result = background_executor
+                        .spawn(async move {
+                            RemoteClientHandle::connect(
+                                &prepared.address,
+                                prepared.port,
+                                "DevManager",
+                                prepared.auth,
+                                expected_fingerprint.as_deref(),
+                            )
+                        })
+                        .await;
+                    let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        if request_id != this.remote_connect_request_id {
+                            return;
+                        }
+                        match result {
+                            Ok(result) => {
+                                let pool_key = pool.insert(
+                                    address.clone(),
+                                    port,
+                                    result.server_id.clone(),
+                                    result.certificate_fingerprint.clone(),
+                                    result.client.clone(),
+                                );
+                                this.apply_connected_remote_host(
+                                    address,
+                                    port,
+                                    host_label,
+                                    result.client,
+                                    pool_key,
+                                    result.snapshot,
+                                    result.server_id,
+                                    result.certificate_fingerprint,
+                                    result.client_id,
+                                    result.client_token,
+                                );
+                                this.terminal_notice = None;
+                            }
+                            Err(error) => {
+                                if fatal_remote_reconnect_error(&error) {
+                                    this.disconnect_remote_host(Some(error));
+                                    cx.notify();
+                                    return;
+                                }
+                                if let Some(remote_mode) = this.remote_mode.as_mut() {
+                                    if let Some(reconnect) = remote_mode.reconnect.as_mut() {
+                                        reconnect.in_flight = false;
+                                        reconnect.attempts = reconnect.attempts.saturating_add(1);
+                                        reconnect.last_error = Some(error);
+                                        reconnect.next_attempt_at = Instant::now()
+                                            + remote_reconnect_backoff(reconnect.attempts);
+                                    }
+                                }
+                                this.sync_settings_remote_draft();
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+        true
     }
 
     fn begin_connect_remote_host(
@@ -1308,7 +1549,9 @@ impl NativeShell {
     }
 
     fn disconnect_remote_host(&mut self, message: Option<String>) {
+        self.remote_connect_request_id = self.remote_connect_request_id.saturating_add(1);
         if let Some(remote_mode) = self.remote_mode.take() {
+            remote_mode.port_forwards.shutdown();
             self.remote_client_pool.remove(&remote_mode.pool_key);
             remote_mode.client.disconnect();
         }
@@ -1334,11 +1577,67 @@ impl NativeShell {
             .unwrap_or_else(|| self.process_manager.runtime_state())
     }
 
+    fn local_viewer_session_view(
+        &mut self,
+        session_id: &str,
+        dimensions: SessionDimensions,
+    ) -> Option<crate::terminal::session::TerminalSessionView> {
+        let live_view = self.process_manager.session_view(session_id)?;
+        let dirty_generation = live_view.runtime.dirty_generation;
+        let should_rebuild = self
+            .local_viewer_replicas
+            .get(session_id)
+            .map(|state| state.dirty_generation != dirty_generation)
+            .unwrap_or(true);
+
+        if should_rebuild {
+            let replay_bytes = self.process_manager.session_replay_bytes(session_id).ok()?;
+            self.local_viewer_replicas.insert(
+                session_id.to_string(),
+                LocalViewerReplicaState {
+                    dirty_generation,
+                    replica: crate::terminal::session::TerminalReplica::from_bootstrap(
+                        session_id.to_string(),
+                        live_view.runtime.clone(),
+                        &replay_bytes,
+                    ),
+                },
+            );
+        }
+
+        let state = self.local_viewer_replicas.get_mut(session_id)?;
+        state.replica.apply_local_resize(dimensions);
+        state.replica.view()
+    }
+
     fn current_port_statuses(&self) -> HashMap<u16, PortStatus> {
         self.remote_mode
             .as_ref()
             .map(|remote_mode| remote_mode.snapshot.port_statuses.clone())
             .unwrap_or_else(|| self.server_port_snapshot.statuses.clone())
+    }
+
+    fn sync_remote_port_forwards(&mut self) -> bool {
+        let Some(remote_mode) = self.remote_mode.as_ref() else {
+            return false;
+        };
+        remote_mode
+            .port_forwards
+            .sync_ports(&remote_forwardable_ports(&remote_mode.snapshot))
+    }
+
+    fn remote_port_forward_state(&self, port: u16) -> Option<RemotePortForwardState> {
+        self.remote_mode
+            .as_ref()
+            .and_then(|remote_mode| remote_mode.port_forwards.state_for(port))
+    }
+
+    fn remote_port_forward_rows(&self) -> Vec<RemotePortForwardDraft> {
+        let Some(remote_mode) = self.remote_mode.as_ref() else {
+            return Vec::new();
+        };
+        let statuses = remote_mode.port_forwards.statuses();
+        remote_port_forward_rows(&remote_mode.snapshot, &statuses)
     }
 
     fn active_remote_terminal_session_id(&self) -> Option<String> {
@@ -2382,10 +2681,10 @@ impl NativeShell {
             .remote_mode
             .as_ref()
             .map(|remote_mode| remote_mode.connected_label.clone());
-        let remote_latency_summary = self
-            .remote_mode
-            .as_ref()
-            .and_then(|remote_mode| format_remote_latency_summary(&remote_mode.client.latency_stats()));
+        let remote_latency_summary = self.remote_mode.as_ref().and_then(|remote_mode| {
+            format_remote_latency_summary(&remote_mode.client.latency_stats())
+        });
+        let remote_port_forwards = self.remote_port_forward_rows();
         let remote_host_latency_summary = format_remote_latency_summary(&remote_status.latency);
         self.open_editor(
             EditorPanel::Settings(SettingsDraft {
@@ -2443,6 +2742,7 @@ impl NativeShell {
                 remote_host_last_note: remote_status.last_connection_note,
                 remote_host_last_note_is_error: remote_status.last_connection_is_error,
                 remote_host_latency_summary,
+                remote_port_forwards,
                 remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
                 remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
                 open_picker: None,
@@ -4470,6 +4770,11 @@ impl NativeShell {
             let active_tab = self.state.active_tab().cloned();
             let active_tab_type = active_tab.as_ref().map(|tab| tab.tab_type.clone());
             let active_session = self.current_active_session_view();
+            let reconnecting = self
+                .remote_mode
+                .as_ref()
+                .and_then(|remote_mode| remote_mode.reconnect.as_ref())
+                .is_some();
 
             if active_tab_type.is_some() {
                 self.splash_image = None;
@@ -4483,11 +4788,20 @@ impl NativeShell {
                     remote_mode.client.set_focused_session(next_focused);
                 }
                 let dimensions = self.terminal_dimensions(window);
-                if self.last_dimensions != Some(dimensions) {
+                if terminal_view_needs_resize(
+                    self.last_dimensions,
+                    active_session.as_ref(),
+                    dimensions,
+                ) {
                     if let Some(remote_mode) = self.remote_mode.as_ref() {
                         remote_mode
                             .client
-                            .send_terminal_resize(active_spec.session_id.clone(), dimensions);
+                            .apply_local_terminal_resize(&active_spec.session_id, dimensions);
+                        if self.remote_has_control() {
+                            remote_mode
+                                .client
+                                .send_terminal_resize(active_spec.session_id.clone(), dimensions);
+                        }
                     }
                     self.last_dimensions = Some(dimensions);
                 }
@@ -4495,18 +4809,22 @@ impl NativeShell {
                 self.ensure_splash_image(cx);
             }
 
-            self.terminal_notice = match active_tab_type {
-                Some(TabType::Server) if active_session.is_none() => {
-                    Some("Remote server session is not available yet.".to_string())
+            self.terminal_notice = if reconnecting {
+                Some("Reconnecting to remote host...".to_string())
+            } else {
+                match active_tab_type {
+                    Some(TabType::Server) if active_session.is_none() => {
+                        Some("Remote server session is not available yet.".to_string())
+                    }
+                    Some(TabType::Ssh) if active_session.is_none() => {
+                        Some("Remote SSH session is disconnected.".to_string())
+                    }
+                    Some(TabType::Claude) | Some(TabType::Codex) if active_session.is_none() => {
+                        Some("Remote AI session is not available yet.".to_string())
+                    }
+                    Some(_) => None,
+                    None => self.terminal_notice.clone(),
                 }
-                Some(TabType::Ssh) if active_session.is_none() => {
-                    Some("Remote SSH session is disconnected.".to_string())
-                }
-                Some(TabType::Claude) | Some(TabType::Codex) if active_session.is_none() => {
-                    Some("Remote AI session is not available yet.".to_string())
-                }
-                Some(_) => None,
-                None => self.terminal_notice.clone(),
             };
 
             if active_tab_type == Some(TabType::Ssh) {
@@ -4524,7 +4842,7 @@ impl NativeShell {
 
             let selection = active_session
                 .as_ref()
-                .and_then(|session| self.selection_snapshot(session.screen.cols));
+                .and_then(|session| self.selection_snapshot(&session.screen));
             let runtime_controls = self.runtime_controls_model(
                 active_tab_type.clone(),
                 &active_spec,
@@ -4579,6 +4897,7 @@ impl NativeShell {
         let active_tab = self.state.active_tab().cloned();
         let active_tab_type = active_tab.as_ref().map(|tab| tab.tab_type.clone());
         let mut active_session = None;
+        let local_has_resize_control = self.local_host_has_control();
 
         if active_tab_type.is_some() {
             self.splash_image = None;
@@ -4610,7 +4929,17 @@ impl NativeShell {
                     .unwrap_or(false);
                 if session_live || interactive_prompt {
                     let dimensions = self.terminal_dimensions(window);
-                    if self.last_dimensions != Some(dimensions)
+                    let current_view = if local_has_resize_control {
+                        self.process_manager.session_view(&active_spec.session_id)
+                    } else {
+                        self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                    };
+                    if local_has_resize_control
+                        && terminal_view_needs_resize(
+                            self.last_dimensions,
+                            current_view.as_ref(),
+                            dimensions,
+                        )
                         && self
                             .process_manager
                             .resize_session(&active_spec.session_id, dimensions)
@@ -4619,7 +4948,11 @@ impl NativeShell {
                         self.last_dimensions = Some(dimensions);
                     }
                     self.terminal_notice = None;
-                    active_session = self.process_manager.session_view(&active_spec.session_id);
+                    active_session = if local_has_resize_control {
+                        self.process_manager.session_view(&active_spec.session_id)
+                    } else {
+                        self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                    };
                 } else if self.terminal_notice.is_none() {
                     self.terminal_notice = Some(
                         "Server session is not running. Start it from the sidebar.".to_string(),
@@ -4670,7 +5003,17 @@ impl NativeShell {
                     self.last_dimensions = None;
                 }
 
-                if self.last_dimensions != Some(dimensions)
+                let current_view = if local_has_resize_control {
+                    self.process_manager.active_session()
+                } else {
+                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                };
+                if local_has_resize_control
+                    && terminal_view_needs_resize(
+                        self.last_dimensions,
+                        current_view.as_ref(),
+                        dimensions,
+                    )
                     && self
                         .process_manager
                         .resize_session(&active_spec.session_id, dimensions)
@@ -4678,7 +5021,11 @@ impl NativeShell {
                 {
                     self.last_dimensions = Some(dimensions);
                 }
-                active_session = self.process_manager.active_session();
+                active_session = if local_has_resize_control {
+                    self.process_manager.active_session()
+                } else {
+                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                };
             }
             Some(TabType::Ssh) => {
                 if let Some(active_tab) = active_tab.as_ref() {
@@ -4710,7 +5057,17 @@ impl NativeShell {
                         }
 
                         let dimensions = self.terminal_dimensions(window);
-                        if self.last_dimensions != Some(dimensions)
+                        let current_view = if local_has_resize_control {
+                            self.process_manager.session_view(&active_spec.session_id)
+                        } else {
+                            self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                        };
+                        if local_has_resize_control
+                            && terminal_view_needs_resize(
+                                self.last_dimensions,
+                                current_view.as_ref(),
+                                dimensions,
+                            )
                             && self
                                 .process_manager
                                 .resize_session(&active_spec.session_id, dimensions)
@@ -4720,7 +5077,11 @@ impl NativeShell {
                         }
 
                         self.terminal_notice = None;
-                        active_session = self.process_manager.session_view(&active_spec.session_id);
+                        active_session = if local_has_resize_control {
+                            self.process_manager.session_view(&active_spec.session_id)
+                        } else {
+                            self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                        };
                     } else {
                         if self.synced_session_id.as_deref() != Some(active_tab.id.as_str()) {
                             self.synced_session_id = Some(active_tab.id.clone());
@@ -4756,7 +5117,17 @@ impl NativeShell {
                 }
 
                 let dimensions = self.terminal_dimensions(window);
-                if self.last_dimensions != Some(dimensions)
+                let current_view = if local_has_resize_control {
+                    self.process_manager.active_session()
+                } else {
+                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                };
+                if local_has_resize_control
+                    && terminal_view_needs_resize(
+                        self.last_dimensions,
+                        current_view.as_ref(),
+                        dimensions,
+                    )
                     && self
                         .process_manager
                         .resize_session(&active_spec.session_id, dimensions)
@@ -4764,7 +5135,11 @@ impl NativeShell {
                 {
                     self.last_dimensions = Some(dimensions);
                 }
-                active_session = self.process_manager.active_session();
+                active_session = if local_has_resize_control {
+                    self.process_manager.active_session()
+                } else {
+                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                };
             }
         }
 
@@ -4783,7 +5158,7 @@ impl NativeShell {
 
         let selection = active_session
             .as_ref()
-            .and_then(|session| self.selection_snapshot(session.screen.cols));
+            .and_then(|session| self.selection_snapshot(&session.screen));
         let runtime_controls = self.runtime_controls_model(
             active_tab_type.clone(),
             &active_spec,
@@ -5436,7 +5811,7 @@ impl NativeShell {
                 can_jump_next_prompt: false,
                 can_export_screen: active_session.is_some(),
                 can_export_scrollback: active_session.is_some(),
-                can_export_selection: self.selection_snapshot(session.screen.cols).is_some(),
+                can_export_selection: self.selection_range(session.screen.cols).is_some(),
                 mouse_override_enabled: self.state.settings().terminal_mouse_override,
                 read_only_enabled: self.state.settings().terminal_read_only,
             });
@@ -5473,7 +5848,7 @@ impl NativeShell {
                     .is_some(),
                 can_export_screen: true,
                 can_export_scrollback: true,
-                can_export_selection: self.selection_snapshot(session.screen.cols).is_some(),
+                can_export_selection: self.selection_range(session.screen.cols).is_some(),
                 mouse_override_enabled: self.state.settings().terminal_mouse_override,
                 read_only_enabled: self.state.settings().terminal_read_only,
             });
@@ -5483,6 +5858,10 @@ impl NativeShell {
             let lookup = self.state.find_command(&active_spec.session_id)?;
             (lookup.command.id.clone(), lookup.command.port)
         };
+        let remote_url_available = remote
+            && port
+                .and_then(|value| self.remote_port_forward_state(value))
+                .is_some_and(|state| state.listener_active);
         let port_status = if remote {
             self.active_port_state = None;
             port.and_then(|port| self.current_port_statuses().get(&port).cloned())
@@ -5560,10 +5939,11 @@ impl NativeShell {
             can_restart: allow_mutation && status.is_live(),
             can_clear: active_session.is_some() && !remote,
             can_kill_port: !remote && port.is_some() && has_port_conflict,
-            can_open_url: !remote
-                && port.is_some()
-                && status == crate::state::SessionStatus::Running
-                && !has_port_conflict,
+            can_open_url: (remote && remote_url_available)
+                || (!remote
+                    && port.is_some()
+                    && status == crate::state::SessionStatus::Running
+                    && !has_port_conflict),
             kill_label,
             kill_color,
             prompt_action_label: None,
@@ -5591,7 +5971,7 @@ impl NativeShell {
             can_export_screen: active_session.is_some(),
             can_export_scrollback: active_session.is_some(),
             can_export_selection: active_session
-                .and_then(|session| self.selection_snapshot(session.screen.cols))
+                .and_then(|session| self.selection_range(session.screen.cols))
                 .is_some(),
             mouse_override_enabled: self.state.settings().terminal_mouse_override,
             read_only_enabled: self.state.settings().terminal_read_only,
@@ -6147,6 +6527,30 @@ impl NativeShell {
             cx.notify();
             return;
         };
+
+        if self.remote_mode.is_some() {
+            match self.remote_port_forward_state(port) {
+                Some(state) if state.listener_active => {}
+                Some(state) => {
+                    self.terminal_notice = Some(
+                        state.message.unwrap_or_else(|| {
+                            format!(
+                                "Could not open localhost:{port} because this client is not forwarding that host port."
+                            )
+                        }),
+                    );
+                    cx.notify();
+                    return;
+                }
+                None => {
+                    self.terminal_notice = Some(format!(
+                        "Could not open localhost:{port} because the host server is not currently mirrored onto this client."
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
 
         let url = format!("http://localhost:{port}");
         match platform_service::open_url(&url) {
@@ -7256,7 +7660,7 @@ impl NativeShell {
         let binding_context = TerminalBindingContext {
             has_selection: active_session
                 .as_ref()
-                .and_then(|session| self.selection_snapshot(session.screen.cols))
+                .and_then(|session| self.selection_range(session.screen.cols))
                 .is_some(),
             bracketed_paste: mode.bracketed_paste,
         };
@@ -7395,7 +7799,7 @@ impl NativeShell {
         &mut self,
         event: &ScrollWheelEvent,
         window: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let Some(delta_lines) = self.determine_terminal_scroll_lines(event, window) else {
             return;
@@ -7408,6 +7812,21 @@ impl NativeShell {
         if let Some(session) = self.current_active_session_view() {
             let Some(session_id) = self.resolved_terminal_session_id(Some(&session)) else {
                 return;
+            };
+            let target_display_offset = session
+                .screen
+                .display_offset
+                .saturating_add_signed(delta_lines as isize)
+                .min(session.screen.history_size);
+            let selection_endpoint = if self.is_selecting_terminal {
+                self.terminal_selection_endpoint_for_mouse_with_display_offset(
+                    event.position,
+                    window,
+                    true,
+                    target_display_offset,
+                )
+            } else {
+                None
             };
             if self.terminal_mouse_capture_active(session.screen.mode) {
                 if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
@@ -7456,6 +7875,15 @@ impl NativeShell {
                         .scroll_session(&session_id, delta_lines);
                 }
             }
+            if let (Some(selection), Some(endpoint)) =
+                (self.terminal_selection.as_mut(), selection_endpoint)
+            {
+                if selection.head != endpoint {
+                    selection.head = endpoint;
+                    selection.moved = selection.anchor != endpoint;
+                    cx.notify();
+                }
+            }
         } else {
         }
         window.prevent_default();
@@ -7480,8 +7908,27 @@ impl NativeShell {
         clamp_to_terminal: bool,
     ) -> Option<TerminalSelectionEndpoint> {
         let session = self.current_active_session_view()?;
+        self.terminal_selection_endpoint_for_mouse_with_display_offset(
+            position,
+            window,
+            clamp_to_terminal,
+            session.screen.display_offset,
+        )
+    }
+
+    fn terminal_selection_endpoint_for_mouse_with_display_offset(
+        &self,
+        position: Point<Pixels>,
+        window: &Window,
+        clamp_to_terminal: bool,
+        display_offset: usize,
+    ) -> Option<TerminalSelectionEndpoint> {
+        let session = self.current_active_session_view()?;
         let bounds = self.terminal_text_bounds(window, &session)?;
-        terminal_endpoint_for_mouse(position, bounds, clamp_to_terminal)
+        let mut endpoint = terminal_endpoint_for_mouse(position, bounds, clamp_to_terminal)?;
+        endpoint.position.row =
+            buffer_line_for_viewport_row(&session.screen, display_offset, endpoint.position.row);
+        Some(endpoint)
     }
 
     fn determine_terminal_scroll_lines(
@@ -7599,7 +8046,7 @@ impl NativeShell {
         })
     }
 
-    fn selection_snapshot(&self, screen_cols: usize) -> Option<view::TerminalSelectionSnapshot> {
+    fn selection_range(&self, screen_cols: usize) -> Option<TerminalSelectionRange> {
         let selection = self.terminal_selection?;
         if !selection.moved {
             return None;
@@ -7612,7 +8059,7 @@ impl NativeShell {
             return None;
         }
 
-        Some(view::TerminalSelectionSnapshot {
+        Some(TerminalSelectionRange {
             start_row: start.position.row,
             start_column,
             end_row: end.position.row,
@@ -7620,14 +8067,58 @@ impl NativeShell {
         })
     }
 
+    fn selection_snapshot(
+        &self,
+        screen: &crate::terminal::session::TerminalScreenSnapshot,
+    ) -> Option<view::TerminalSelectionSnapshot> {
+        let range = self.selection_range(screen.cols)?;
+        let visible_top = top_visible_buffer_line(screen);
+        let visible_bottom = visible_top.saturating_add(screen.rows.saturating_sub(1));
+        if range.end_row < visible_top || range.start_row > visible_bottom {
+            return None;
+        }
+
+        let start_row = range.start_row.max(visible_top) - visible_top;
+        let end_row = range.end_row.min(visible_bottom) - visible_top;
+        let start_column = if range.start_row < visible_top {
+            0
+        } else {
+            range.start_column
+        };
+        let end_column = if range.end_row > visible_bottom {
+            screen.cols
+        } else {
+            range.end_column
+        };
+        if start_row == end_row && start_column == end_column {
+            return None;
+        }
+
+        Some(view::TerminalSelectionSnapshot {
+            start_row,
+            start_column,
+            end_row,
+            end_column,
+        })
+    }
+
     fn selected_text(&self) -> Option<String> {
         let session = self.current_active_session_view()?;
-        let selection = self.selection_snapshot(session.screen.cols)?;
-        let mut lines = Vec::new();
+        let selection = self.selection_range(session.screen.cols)?;
+        let session_id = self.resolved_terminal_session_id(Some(&session))?;
+        let scrollback = if let Some(remote_mode) = self.remote_mode.as_ref() {
+            remote_mode.client.session_scrollback_text(&session_id)?
+        } else {
+            self.process_manager
+                .session_scrollback_text(&session_id)
+                .ok()?
+        };
+        let lines = scrollback.split('\n').collect::<Vec<_>>();
+        let mut selected = Vec::new();
 
         for row in selection.start_row..=selection.end_row {
-            let line = session.screen.lines.get(row)?;
-            let characters: Vec<char> = line.iter().map(|cell| cell.character).collect();
+            let line = lines.get(row).copied().unwrap_or_default();
+            let characters: Vec<char> = line.chars().collect();
             let start = if row == selection.start_row {
                 selection.start_column.min(characters.len())
             } else {
@@ -7638,17 +8129,14 @@ impl NativeShell {
             } else {
                 characters.len()
             };
-
             let mut segment: String = characters[start..end].iter().collect();
-
             while segment.ends_with(' ') {
                 segment.pop();
             }
-
-            lines.push(segment);
+            selected.push(segment);
         }
 
-        Some(lines.join("\n"))
+        Some(selected.join("\n"))
     }
 
     fn copy_terminal_selection_to_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
@@ -8625,7 +9113,11 @@ fn terminal_selection_for_click(
     position: TerminalGridPosition,
     mode: TerminalSelectionMode,
 ) -> Option<TerminalSelection> {
-    let row = position.row.min(screen.lines.len().saturating_sub(1));
+    let visible_top = top_visible_buffer_line(screen);
+    let viewport_row = position
+        .row
+        .saturating_sub(visible_top)
+        .min(screen.lines.len().saturating_sub(1));
     match mode {
         TerminalSelectionMode::Simple => Some(TerminalSelection {
             anchor: TerminalSelectionEndpoint {
@@ -8640,22 +9132,42 @@ fn terminal_selection_for_click(
             mode,
         }),
         TerminalSelectionMode::Semantic => {
-            let line = screen.lines.get(row)?;
+            let line = screen.lines.get(viewport_row)?;
             let (start, end) = semantic_selection_bounds(line, position.column, screen.cols);
             Some(TerminalSelection {
-                anchor: endpoint_at_boundary(row, start, screen.cols),
-                head: endpoint_at_boundary(row, end, screen.cols),
+                anchor: endpoint_at_boundary(position.row, start, screen.cols),
+                head: endpoint_at_boundary(position.row, end, screen.cols),
                 moved: start != end,
                 mode,
             })
         }
         TerminalSelectionMode::Lines => Some(TerminalSelection {
-            anchor: endpoint_at_boundary(row, 0, screen.cols),
-            head: endpoint_at_boundary(row, screen.cols, screen.cols),
+            anchor: endpoint_at_boundary(position.row, 0, screen.cols),
+            head: endpoint_at_boundary(position.row, screen.cols, screen.cols),
             moved: screen.cols > 0,
             mode,
         }),
     }
+}
+
+fn top_visible_buffer_line(screen: &crate::terminal::session::TerminalScreenSnapshot) -> usize {
+    screen
+        .total_lines
+        .saturating_sub(screen.rows.max(1))
+        .saturating_sub(screen.display_offset)
+}
+
+fn buffer_line_for_viewport_row(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    display_offset: usize,
+    viewport_row: usize,
+) -> usize {
+    let top = screen
+        .total_lines
+        .saturating_sub(screen.rows.max(1))
+        .saturating_sub(display_offset);
+    top.saturating_add(viewport_row.min(screen.rows.saturating_sub(1)))
+        .min(screen.total_lines.saturating_sub(1))
 }
 
 fn semantic_selection_bounds(
@@ -9219,6 +9731,103 @@ fn live_server_ports(state: &AppState, runtime: &RuntimeState) -> Vec<u16> {
     ports.sort_unstable();
     ports.dedup();
     ports
+}
+
+fn tracked_server_ports(state: &AppState) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for project in state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                if let Some(port) = command.port {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn remote_forwardable_ports(snapshot: &remote::RemoteWorkspaceSnapshot) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for project in snapshot.app_state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                let Some(port) = command.port else {
+                    continue;
+                };
+                let Some(session) = snapshot.runtime_state.sessions.get(&command.id) else {
+                    continue;
+                };
+                let Some(status) = snapshot.port_statuses.get(&port) else {
+                    continue;
+                };
+                if session.status.is_live() && status.in_use && runtime_owns_port(session, status) {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn remote_port_forward_rows(
+    snapshot: &remote::RemoteWorkspaceSnapshot,
+    states: &HashMap<u16, RemotePortForwardState>,
+) -> Vec<RemotePortForwardDraft> {
+    let live_ports = remote_forwardable_ports(snapshot)
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    tracked_server_ports(&snapshot.app_state)
+        .into_iter()
+        .map(|port| {
+            let label = format!("localhost:{port}");
+            match states.get(&port) {
+                Some(state) if state.listener_active => RemotePortForwardDraft {
+                    label,
+                    status: "Forwarded".to_string(),
+                    detail: state
+                        .message
+                        .clone()
+                        .or_else(|| Some("Open URL uses this local mirror.".to_string())),
+                    is_error: false,
+                },
+                Some(state) if state.local_port_busy => RemotePortForwardDraft {
+                    label,
+                    status: "Local port busy".to_string(),
+                    detail: state.message.clone(),
+                    is_error: true,
+                },
+                Some(state) => RemotePortForwardDraft {
+                    label,
+                    status: if live_ports.contains(&port) {
+                        "Forward unavailable".to_string()
+                    } else {
+                        "Host server not live".to_string()
+                    },
+                    detail: state.message.clone(),
+                    is_error: live_ports.contains(&port),
+                },
+                None if live_ports.contains(&port) => RemotePortForwardDraft {
+                    label,
+                    status: "Preparing forward".to_string(),
+                    detail: Some("DevManager is setting up a local localhost mirror.".to_string()),
+                    is_error: false,
+                },
+                None => RemotePortForwardDraft {
+                    label,
+                    status: "Host server not live".to_string(),
+                    detail: Some(
+                        "The host is not currently serving this tracked port.".to_string(),
+                    ),
+                    is_error: false,
+                },
+            }
+        })
+        .collect()
 }
 
 fn derive_server_indicator_states(
@@ -10123,6 +10732,29 @@ fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -
     }
 }
 
+fn terminal_view_needs_resize(
+    last_dimensions: Option<SessionDimensions>,
+    active_session: Option<&crate::terminal::session::TerminalSessionView>,
+    dimensions: SessionDimensions,
+) -> bool {
+    last_dimensions != Some(dimensions)
+        || active_session.map(|session| session.runtime.dimensions) != Some(dimensions)
+}
+
+fn remote_reconnect_backoff(attempts: u32) -> Duration {
+    let multiplier = 1_u32.checked_shl(attempts.min(4)).unwrap_or(16);
+    (REMOTE_RECONNECT_BASE_INTERVAL * multiplier).min(REMOTE_RECONNECT_MAX_INTERVAL)
+}
+
+fn fatal_remote_reconnect_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("protocol mismatch")
+        || error.contains("saved remote credentials are no longer valid")
+        || error.contains("pair with a host token")
+        || error.contains("fingerprint")
+        || error.contains("different host identity")
+}
+
 fn config_has_project(config: &AppConfig, project_id: &str) -> bool {
     config
         .projects
@@ -10285,6 +10917,52 @@ mod tests {
         assert_eq!(display_offset_for_scrollbar_ratio(1.0, 120), 0);
         assert_eq!(display_offset_for_scrollbar_ratio(0.0, 120), 120);
         assert_eq!(display_offset_for_scrollbar_ratio(0.5, 120), 60);
+    }
+
+    #[test]
+    fn terminal_view_needs_resize_when_live_session_dimensions_do_not_match() {
+        let expected = SessionDimensions {
+            cols: 120,
+            rows: 28,
+            cell_width: 8,
+            cell_height: 18,
+        };
+        let mut session = ssh_terminal_view(&["hello"]);
+        session.runtime.dimensions = SessionDimensions {
+            cols: 100,
+            rows: 30,
+            cell_width: 8,
+            cell_height: 18,
+        };
+
+        assert!(terminal_view_needs_resize(
+            Some(expected),
+            Some(&session),
+            expected
+        ));
+    }
+
+    #[test]
+    fn remote_reconnect_backoff_caps_at_max_interval() {
+        assert_eq!(remote_reconnect_backoff(0), REMOTE_RECONNECT_BASE_INTERVAL);
+        assert_eq!(
+            remote_reconnect_backoff(1),
+            REMOTE_RECONNECT_BASE_INTERVAL * 2
+        );
+        assert_eq!(remote_reconnect_backoff(8), REMOTE_RECONNECT_MAX_INTERVAL);
+    }
+
+    #[test]
+    fn fatal_remote_reconnect_error_detects_unrecoverable_failures() {
+        assert!(fatal_remote_reconnect_error(
+            "Protocol mismatch. Host uses 4, client uses 3."
+        ));
+        assert!(fatal_remote_reconnect_error(
+            "Saved remote credentials are no longer valid."
+        ));
+        assert!(!fatal_remote_reconnect_error(
+            "Connect failed: Connection refused."
+        ));
     }
 
     #[test]
@@ -10734,6 +11412,29 @@ mod tests {
     }
 
     #[test]
+    fn buffer_line_for_viewport_row_accounts_for_display_offset() {
+        let screen = TerminalScreenSnapshot {
+            rows: 3,
+            cols: 4,
+            total_lines: 12,
+            history_size: 9,
+            display_offset: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(top_visible_buffer_line(&screen), 7);
+        assert_eq!(
+            buffer_line_for_viewport_row(&screen, screen.display_offset, 0),
+            7
+        );
+        assert_eq!(
+            buffer_line_for_viewport_row(&screen, screen.display_offset, 2),
+            9
+        );
+        assert_eq!(buffer_line_for_viewport_row(&screen, 0, 0), 9);
+    }
+
+    #[test]
     fn semantic_selection_selects_whole_non_whitespace_run() {
         let line: Vec<TerminalCellSnapshot> = "cargo test".chars().map(snapshot_cell).collect();
         let screen = TerminalScreenSnapshot {
@@ -10761,6 +11462,30 @@ mod tests {
 
         assert_eq!(snapshot.start_column, 0);
         assert_eq!(snapshot.end_column, 5);
+    }
+
+    #[test]
+    fn semantic_selection_keeps_buffer_row_when_scrolled_back() {
+        let line: Vec<TerminalCellSnapshot> = "cargo test".chars().map(snapshot_cell).collect();
+        let screen = TerminalScreenSnapshot {
+            lines: vec![line],
+            cols: 10,
+            rows: 1,
+            total_lines: 8,
+            history_size: 7,
+            display_offset: 3,
+            ..Default::default()
+        };
+
+        let selection = terminal_selection_for_click(
+            &screen,
+            TerminalGridPosition { row: 4, column: 2 },
+            TerminalSelectionMode::Semantic,
+        )
+        .unwrap();
+
+        assert_eq!(selection.anchor.position.row, 4);
+        assert_eq!(selection.head.position.row, 4);
     }
 
     #[test]

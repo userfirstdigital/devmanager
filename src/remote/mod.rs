@@ -24,13 +24,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 const REMOTE_FILE_NAME: &str = "remote.json";
 const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler = Arc<dyn Fn(RemoteTerminalInput, u64) + Send + Sync>;
@@ -196,6 +197,13 @@ pub enum ClientMessage {
         client_label: String,
         auth: ClientAuth,
     },
+    PortForwardHello {
+        protocol_version: u32,
+        server_id: String,
+        client_id: String,
+        auth_token: String,
+        requested_port: u16,
+    },
     SetFocusedSession {
         session_id: Option<String>,
     },
@@ -210,6 +218,7 @@ pub enum ClientMessage {
     },
     TakeControl,
     ReleaseControl,
+    Ping,
     Request {
         request_id: u64,
         action: RemoteAction,
@@ -250,9 +259,11 @@ pub enum ServerMessage {
         you_have_control: bool,
         snapshot: RemoteWorkspaceSnapshot,
     },
+    PortForwardOk,
     HelloErr {
         message: String,
     },
+    Pong,
     Snapshot {
         snapshot: RemoteWorkspaceSnapshot,
     },
@@ -542,6 +553,14 @@ pub struct RemoteLatencyStats {
     pub output_client_to_paint_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RemotePortForwardState {
+    pub port: u16,
+    pub listener_active: bool,
+    pub local_port_busy: bool,
+    pub message: Option<String>,
+}
+
 pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceError> {
     let path = remote_state_path()?;
     if !path.exists() {
@@ -681,6 +700,7 @@ struct ConnectedRemoteClient {
     client_id: String,
     sender: mpsc::Sender<ServerMessage>,
     subscribed_session_ids: HashSet<String>,
+    bootstrapped_session_ids: HashSet<String>,
     focused_session_id: Option<String>,
     last_app_hash: u64,
     last_runtime_hash: u64,
@@ -692,6 +712,16 @@ struct ConnectedRemoteClient {
 #[derive(Clone)]
 pub struct RemoteClientHandle {
     inner: Arc<RemoteClientInner>,
+}
+
+fn sync_screen_snapshot_dimensions(
+    screen: &mut TerminalScreenSnapshot,
+    dimensions: SessionDimensions,
+) {
+    screen.rows = dimensions.rows as usize;
+    screen.cols = dimensions.cols as usize;
+    screen.history_size = screen.total_lines.saturating_sub(screen.rows);
+    screen.display_offset = screen.display_offset.min(screen.history_size);
 }
 
 struct RemoteClientInner {
@@ -709,6 +739,25 @@ struct RemoteClientInner {
     client_token: String,
     server_id: String,
     certificate_fingerprint: String,
+    address: String,
+    port: u16,
+}
+
+#[derive(Clone)]
+pub struct LocalPortForwardManager {
+    inner: Arc<LocalPortForwardManagerInner>,
+}
+
+struct LocalPortForwardManagerInner {
+    client: RemoteClientHandle,
+    entries: Mutex<HashMap<u16, LocalPortForwardEntry>>,
+    statuses: RwLock<HashMap<u16, RemotePortForwardState>>,
+}
+
+struct LocalPortForwardEntry {
+    stop: Option<Arc<AtomicBool>>,
+    handle: Option<thread::JoinHandle<()>>,
+    retry_after_epoch_ms: u64,
 }
 
 impl RemoteHostService {
@@ -823,10 +872,70 @@ impl RemoteHostService {
             .unwrap_or_default()
     }
 
+    fn try_bootstrap_session(&self, session_id: &str) -> Option<RemoteSessionBootstrap> {
+        self.inner
+            .session_bootstrap_provider
+            .read()
+            .ok()
+            .and_then(|provider| provider.as_ref().cloned())
+            .and_then(|provider| provider(session_id))
+    }
+
+    fn auto_bootstrap_subscribed_clients(&self, session_id: &str) {
+        let needs_bootstrap = {
+            let Ok(clients) = self.inner.clients.lock() else {
+                return;
+            };
+            clients.values().any(|client| {
+                client.subscribed_session_ids.contains(session_id)
+                    && !client.bootstrapped_session_ids.contains(session_id)
+            })
+        };
+        if !needs_bootstrap {
+            return;
+        }
+
+        let Some(bootstrap) = self.try_bootstrap_session(session_id) else {
+            return;
+        };
+
+        let Ok(mut clients) = self.inner.clients.lock() else {
+            return;
+        };
+        let mut dead_connections = Vec::new();
+        for (connection_id, client) in clients.iter_mut() {
+            if !client.subscribed_session_ids.contains(session_id)
+                || client.bootstrapped_session_ids.contains(session_id)
+            {
+                continue;
+            }
+
+            if client
+                .sender
+                .send(ServerMessage::SessionStream {
+                    event: RemoteSessionStreamEvent::Bootstrap {
+                        bootstrap: bootstrap.clone(),
+                    },
+                })
+                .is_ok()
+            {
+                client
+                    .bootstrapped_session_ids
+                    .insert(session_id.to_string());
+            } else {
+                dead_connections.push(*connection_id);
+            }
+        }
+        for connection_id in dead_connections {
+            clients.remove(&connection_id);
+        }
+    }
+
     pub fn push_session_output(&self, session_id: &str, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
+        self.auto_bootstrap_subscribed_clients(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
         };
@@ -838,7 +947,10 @@ impl RemoteHostService {
             let message = ServerMessage::SessionStream {
                 event: RemoteSessionStreamEvent::Output {
                     session_id: session_id.to_string(),
-                    chunk_seq: self.inner.next_output_chunk_seq.fetch_add(1, Ordering::Relaxed),
+                    chunk_seq: self
+                        .inner
+                        .next_output_chunk_seq
+                        .fetch_add(1, Ordering::Relaxed),
                     emitted_at_epoch_ms: now_epoch_ms(),
                     bytes: bytes.clone(),
                 },
@@ -853,6 +965,7 @@ impl RemoteHostService {
     }
 
     pub fn push_session_runtime(&self, session_id: &str, runtime: SessionRuntimeState) {
+        self.auto_bootstrap_subscribed_clients(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
         };
@@ -860,6 +973,9 @@ impl RemoteHostService {
         for (connection_id, client) in clients.iter_mut() {
             if !client.subscribed_session_ids.contains(session_id) {
                 continue;
+            }
+            if !runtime.status.is_live() {
+                client.bootstrapped_session_ids.remove(session_id);
             }
             let event = if runtime.status.is_live() {
                 RemoteSessionStreamEvent::RuntimePatch {
@@ -894,6 +1010,7 @@ impl RemoteHostService {
             if !client.subscribed_session_ids.contains(session_id) {
                 continue;
             }
+            client.bootstrapped_session_ids.remove(session_id);
             if client
                 .sender
                 .send(ServerMessage::SessionStream {
@@ -1174,6 +1291,8 @@ impl RemoteClientHandle {
             client_token: client_token.clone(),
             server_id: server_id.clone(),
             certificate_fingerprint: certificate_fingerprint.clone(),
+            address: address.to_string(),
+            port,
         });
 
         let reader_inner = inner.clone();
@@ -1224,13 +1343,10 @@ impl RemoteClientHandle {
     }
 
     pub fn send_terminal_input(&self, input: RemoteTerminalInput) {
-        let _ = self
-            .inner
-            .outgoing
-            .send(ClientMessage::TerminalInput {
-                input,
-                enqueued_at_epoch_ms: now_epoch_ms(),
-            });
+        let _ = self.inner.outgoing.send(ClientMessage::TerminalInput {
+            input,
+            enqueued_at_epoch_ms: now_epoch_ms(),
+        });
     }
 
     pub fn send_terminal_resize(&self, session_id: String, dimensions: SessionDimensions) {
@@ -1315,6 +1431,58 @@ impl RemoteClientHandle {
         view
     }
 
+    pub fn apply_local_terminal_resize(&self, session_id: &str, dimensions: SessionDimensions) {
+        let mut changed = false;
+
+        if let Ok(replicas) = self.inner.session_replicas.read() {
+            if let Some(replica) = replicas.get(session_id) {
+                replica.apply_local_resize(dimensions);
+                changed = true;
+            }
+        }
+
+        if let Ok(mut latest) = self.inner.latest_snapshot.write() {
+            if let Some(snapshot) = latest.as_mut() {
+                if let Some(runtime) = snapshot.runtime_state.sessions.get_mut(session_id) {
+                    runtime.dimensions = dimensions;
+                    changed = true;
+                }
+                if let Some(view) = snapshot.session_views.get_mut(session_id) {
+                    view.runtime.dimensions = dimensions;
+                    sync_screen_snapshot_dimensions(&mut view.screen, dimensions);
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .session_stream_revision
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn session_screen_text(&self, session_id: &str) -> Option<String> {
+        self.inner
+            .session_replicas
+            .read()
+            .ok()
+            .and_then(|replicas| replicas.get(session_id).map(TerminalReplica::screen_text))
+    }
+
+    pub fn session_scrollback_text(&self, session_id: &str) -> Option<String> {
+        self.inner
+            .session_replicas
+            .read()
+            .ok()
+            .and_then(|replicas| {
+                replicas
+                    .get(session_id)
+                    .map(TerminalReplica::scrollback_text)
+            })
+    }
+
     pub fn latency_stats(&self) -> RemoteLatencyStats {
         self.inner
             .latency
@@ -1347,6 +1515,43 @@ impl RemoteClientHandle {
         &self.inner.certificate_fingerprint
     }
 
+    pub fn open_port_forward(
+        &self,
+        requested_port: u16,
+    ) -> Result<transport::ClientTlsStream, String> {
+        let transport::TlsConnectResult {
+            mut stream,
+            certificate_fingerprint,
+        } = transport::connect_tls(
+            &self.inner.address,
+            self.inner.port,
+            Some(&self.inner.certificate_fingerprint),
+        )?;
+        if certificate_fingerprint != self.inner.certificate_fingerprint {
+            return Err(
+                "Remote TLS fingerprint changed while opening the forwarded port.".to_string(),
+            );
+        }
+        write_message(
+            &mut stream,
+            &ClientMessage::PortForwardHello {
+                protocol_version: PROTOCOL_VERSION,
+                server_id: self.inner.server_id.clone(),
+                client_id: self.inner.client_id.clone(),
+                auth_token: self.inner.client_token.clone(),
+                requested_port,
+            },
+        )
+        .map_err(|error| format!("Port forward handshake failed: {error}"))?;
+        match read_message::<ServerMessage, _>(&mut stream)
+            .map_err(|error| format!("Port forward handshake failed: {error}"))?
+        {
+            ServerMessage::PortForwardOk => Ok(stream),
+            ServerMessage::HelloErr { message } => Err(message),
+            other => Err(format!("Unexpected port forward response: {other:?}")),
+        }
+    }
+
     fn note_output_received(&self, emitted_at_epoch_ms: u64) {
         let now_ms = now_epoch_ms();
         if let Ok(mut latency) = self.inner.latency.write() {
@@ -1372,6 +1577,139 @@ impl RemoteClientHandle {
     }
 }
 
+impl LocalPortForwardManager {
+    pub fn new(client: RemoteClientHandle) -> Self {
+        Self {
+            inner: Arc::new(LocalPortForwardManagerInner {
+                client,
+                entries: Mutex::new(HashMap::new()),
+                statuses: RwLock::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub fn sync_ports(&self, desired_ports: &[u16]) -> bool {
+        let desired = desired_ports.iter().copied().collect::<HashSet<_>>();
+        let now_epoch_ms = now_epoch_ms();
+        let mut changed = false;
+
+        let Ok(mut entries) = self.inner.entries.lock() else {
+            return false;
+        };
+
+        let existing_ports = entries.keys().copied().collect::<Vec<_>>();
+        for port in existing_ports {
+            if desired.contains(&port) {
+                continue;
+            }
+            if let Some(mut entry) = entries.remove(&port) {
+                stop_local_port_forward_entry(&mut entry);
+            }
+            if let Ok(mut statuses) = self.inner.statuses.write() {
+                statuses.remove(&port);
+            }
+            changed = true;
+        }
+
+        for &port in &desired {
+            let listener_active = self
+                .inner
+                .statuses
+                .read()
+                .ok()
+                .and_then(|statuses| statuses.get(&port).map(|state| state.listener_active))
+                .unwrap_or(false);
+            let should_start = match entries.get(&port) {
+                Some(entry) => {
+                    (!listener_active)
+                        || (entry.stop.is_none() && now_epoch_ms >= entry.retry_after_epoch_ms)
+                }
+                None => true,
+            };
+            if !should_start {
+                continue;
+            }
+            if let Some(mut old_entry) = entries.remove(&port) {
+                stop_local_port_forward_entry(&mut old_entry);
+            }
+            match start_local_port_forward_listener(self.inner.clone(), port) {
+                Ok(entry) => {
+                    entries.insert(port, entry);
+                    set_port_forward_state(
+                        &self.inner,
+                        RemotePortForwardState {
+                            port,
+                            listener_active: true,
+                            local_port_busy: false,
+                            message: Some(format!(
+                                "Forwarding http://localhost:{port} to the remote host."
+                            )),
+                        },
+                    );
+                }
+                Err(error) => {
+                    entries.insert(
+                        port,
+                        LocalPortForwardEntry {
+                            stop: None,
+                            handle: None,
+                            retry_after_epoch_ms: now_epoch_ms.saturating_add(1000),
+                        },
+                    );
+                    let local_port_busy = error.contains("already in use");
+                    set_port_forward_state(
+                        &self.inner,
+                        RemotePortForwardState {
+                            port,
+                            listener_active: false,
+                            local_port_busy,
+                            message: Some(error),
+                        },
+                    );
+                }
+            }
+            changed = true;
+        }
+
+        changed
+    }
+
+    pub fn shutdown(&self) {
+        let Ok(mut entries) = self.inner.entries.lock() else {
+            return;
+        };
+        for entry in entries.values_mut() {
+            stop_local_port_forward_entry(entry);
+        }
+        entries.clear();
+        if let Ok(mut statuses) = self.inner.statuses.write() {
+            statuses.clear();
+        }
+    }
+
+    pub fn statuses(&self) -> HashMap<u16, RemotePortForwardState> {
+        self.inner
+            .statuses
+            .read()
+            .map(|statuses| statuses.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn state_for(&self, port: u16) -> Option<RemotePortForwardState> {
+        self.inner
+            .statuses
+            .read()
+            .ok()
+            .and_then(|statuses| statuses.get(&port).cloned())
+    }
+
+    pub fn is_active(&self, port: u16) -> bool {
+        self.state_for(port)
+            .map(|state| state.listener_active)
+            .unwrap_or(false)
+    }
+}
+
 fn format_handshake_stage_error(address: &str, port: u16, stage: &str, error: &str) -> String {
     let trimmed = error.trim();
     let mut message = format!("Handshake failed: {trimmed}");
@@ -1384,6 +1722,189 @@ fn format_handshake_stage_error(address: &str, port: u16, stage: &str, error: &s
         );
     }
     message
+}
+
+fn set_port_forward_state(
+    inner: &Arc<LocalPortForwardManagerInner>,
+    state: RemotePortForwardState,
+) {
+    if let Ok(mut statuses) = inner.statuses.write() {
+        statuses.insert(state.port, state);
+    }
+}
+
+fn stop_local_port_forward_entry(entry: &mut LocalPortForwardEntry) {
+    if let Some(stop) = entry.stop.take() {
+        stop.store(true, Ordering::SeqCst);
+    }
+    if let Some(handle) = entry.handle.take() {
+        let _ = handle.join();
+    }
+}
+
+fn start_local_port_forward_listener(
+    inner: Arc<LocalPortForwardManagerInner>,
+    port: u16,
+) -> Result<LocalPortForwardEntry, String> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
+        if error.kind() == ErrorKind::AddrInUse {
+            format!("Local port {port} is already in use on this machine.")
+        } else {
+            format!("Could not bind localhost:{port}: {error}")
+        }
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("Could not configure localhost:{port}: {error}"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let thread_inner = inner.clone();
+    let handle = thread::spawn(move || {
+        run_local_port_forward_listener(thread_inner, port, listener, stop_flag)
+    });
+    Ok(LocalPortForwardEntry {
+        stop: Some(stop),
+        handle: Some(handle),
+        retry_after_epoch_ms: 0,
+    })
+}
+
+fn run_local_port_forward_listener(
+    inner: Arc<LocalPortForwardManagerInner>,
+    port: u16,
+    listener: TcpListener,
+    stop_flag: Arc<AtomicBool>,
+) {
+    set_port_forward_state(
+        &inner,
+        RemotePortForwardState {
+            port,
+            listener_active: true,
+            local_port_busy: false,
+            message: Some(format!(
+                "Forwarding http://localhost:{port} to the remote host."
+            )),
+        },
+    );
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((socket, _)) => {
+                let connection_inner = inner.clone();
+                let client = inner.client.clone();
+                thread::spawn(move || {
+                    handle_local_port_forward_connection(connection_inner, client, port, socket)
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(12));
+            }
+            Err(error) => {
+                set_port_forward_state(
+                    &inner,
+                    RemotePortForwardState {
+                        port,
+                        listener_active: false,
+                        local_port_busy: false,
+                        message: Some(format!("Local forward listener on {port} failed: {error}")),
+                    },
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn handle_local_port_forward_connection(
+    inner: Arc<LocalPortForwardManagerInner>,
+    client: RemoteClientHandle,
+    port: u16,
+    mut local_socket: TcpStream,
+) {
+    let _ = local_socket.set_nodelay(true);
+    let _ = local_socket.set_read_timeout(Some(Duration::from_millis(40)));
+    let _ = local_socket.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut remote_stream = match client.open_port_forward(port) {
+        Ok(stream) => stream,
+        Err(error) => {
+            set_port_forward_state(
+                &inner,
+                RemotePortForwardState {
+                    port,
+                    listener_active: true,
+                    local_port_busy: false,
+                    message: Some(format!("Tunnel error on localhost:{port}: {error}")),
+                },
+            );
+            let _ = local_socket.shutdown(Shutdown::Both);
+            return;
+        }
+    };
+
+    if let Err(error) = copy_bidirectional(&mut local_socket, &mut remote_stream) {
+        set_port_forward_state(
+            &inner,
+            RemotePortForwardState {
+                port,
+                listener_active: true,
+                local_port_busy: false,
+                message: Some(format!("Tunnel error on localhost:{port}: {error}")),
+            },
+        );
+    }
+    let _ = local_socket.shutdown(Shutdown::Both);
+    let _ = remote_stream.sock.shutdown(Shutdown::Both);
+}
+
+fn copy_bidirectional<L: Read + Write, R: Read + Write>(
+    left: &mut L,
+    right: &mut R,
+) -> Result<(), String> {
+    let mut left_buf = [0_u8; 16 * 1024];
+    let mut right_buf = [0_u8; 16 * 1024];
+    loop {
+        let mut made_progress = false;
+        match left.read(&mut left_buf) {
+            Ok(0) => break,
+            Ok(read) => {
+                right
+                    .write_all(&left_buf[..read])
+                    .map_err(|error| format!("Write failed: {error}"))?;
+                right
+                    .flush()
+                    .map_err(|error| format!("Flush failed: {error}"))?;
+                made_progress = true;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(format!("Read failed: {error}")),
+        }
+
+        match right.read(&mut right_buf) {
+            Ok(0) => break,
+            Ok(read) => {
+                left.write_all(&right_buf[..read])
+                    .map_err(|error| format!("Write failed: {error}"))?;
+                left.flush()
+                    .map_err(|error| format!("Flush failed: {error}"))?;
+                made_progress = true;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(format!("Read failed: {error}")),
+        }
+
+        if !made_progress {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    Ok(())
 }
 
 fn run_listener(inner: Arc<RemoteHostInner>) {
@@ -1553,7 +2074,6 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
         }
     };
     let mut read_buffer = Vec::new();
-    let (tx, rx) = mpsc::channel::<ServerMessage>();
 
     let hello = match read_message::<ClientMessage, _>(&mut stream) {
         Ok(message) => message,
@@ -1571,6 +2091,22 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
             return;
         }
     };
+
+    if matches!(hello, ClientMessage::PortForwardHello { .. }) {
+        if let Err(message) =
+            handle_port_forward_connection(&inner, &peer_label, &mut stream, hello, &config)
+        {
+            set_last_connection_note(
+                &inner,
+                format!("Rejected port forward from {peer_label}: {message}"),
+                true,
+            );
+            let _ = write_message(&mut stream, &ServerMessage::HelloErr { message });
+        }
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel::<ServerMessage>();
 
     let (client_id, client_token) = match authenticate_client(&inner, hello) {
         Ok(auth) => auth,
@@ -1606,6 +2142,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 client_id: client_id.clone(),
                 sender: tx.clone(),
                 subscribed_session_ids: initial_subscriptions,
+                bootstrapped_session_ids: snapshot.session_views.keys().cloned().collect(),
                 focused_session_id: snapshot.runtime_state.active_session_id.clone(),
                 last_app_hash: app_hash,
                 last_runtime_hash: runtime_hash,
@@ -1682,7 +2219,10 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                     .map(|provider| {
                         session_ids
                             .iter()
-                            .filter_map(|session_id| provider(session_id))
+                            .filter_map(|session_id| {
+                                provider(session_id)
+                                    .map(|bootstrap| (session_id.clone(), bootstrap))
+                            })
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
@@ -1693,12 +2233,23 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                         }
                     }
                 }
-                for bootstrap in bootstraps {
-                    let _ = tx.send(ServerMessage::SessionStream {
-                        event: RemoteSessionStreamEvent::Bootstrap {
-                            bootstrap,
-                        },
-                    });
+                let mut bootstrapped_session_ids = Vec::new();
+                for (session_id, bootstrap) in bootstraps {
+                    if tx
+                        .send(ServerMessage::SessionStream {
+                            event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
+                        })
+                        .is_ok()
+                    {
+                        bootstrapped_session_ids.push(session_id);
+                    }
+                }
+                if let Ok(mut clients) = inner.clients.lock() {
+                    if let Some(client) = clients.get_mut(&connection_id) {
+                        for session_id in bootstrapped_session_ids {
+                            client.bootstrapped_session_ids.insert(session_id);
+                        }
+                    }
                 }
             }
             Ok(Some(ClientMessage::UnsubscribeSessions { session_ids })) => {
@@ -1706,6 +2257,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                     if let Some(client) = clients.get_mut(&connection_id) {
                         for session_id in &session_ids {
                             client.subscribed_session_ids.remove(session_id);
+                            client.bootstrapped_session_ids.remove(session_id);
                         }
                     }
                 }
@@ -1732,6 +2284,11 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                     if controller.as_deref() == Some(client_id.as_str()) {
                         *controller = None;
                     }
+                }
+            }
+            Ok(Some(ClientMessage::Ping)) => {
+                if write_message(&mut stream, &ServerMessage::Pong).is_err() {
+                    break;
                 }
             }
             Ok(Some(ClientMessage::TerminalInput {
@@ -1783,7 +2340,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 let _ = tx.send(ServerMessage::Response { request_id, result });
             }
             Ok(Some(ClientMessage::Disconnect)) => break,
-            Ok(Some(ClientMessage::Hello { .. })) => break,
+            Ok(Some(ClientMessage::Hello { .. } | ClientMessage::PortForwardHello { .. })) => break,
             Ok(None) => {
                 thread::sleep(Duration::from_millis(12));
             }
@@ -1875,6 +2432,112 @@ fn authenticate_client(
     }
 }
 
+fn handle_port_forward_connection(
+    inner: &Arc<RemoteHostInner>,
+    peer_label: &str,
+    stream: &mut transport::ServerTlsStream,
+    hello: ClientMessage,
+    config: &RemoteHostConfig,
+) -> Result<(), String> {
+    let (client_id, requested_port) = authenticate_port_forward(inner, hello, config)?;
+    let mut upstream = TcpStream::connect(("127.0.0.1", requested_port))
+        .or_else(|_| TcpStream::connect(("::1", requested_port)))
+        .map_err(|error| {
+            format!("Could not connect to host localhost:{requested_port}: {error}")
+        })?;
+    let _ = upstream.set_nodelay(true);
+    let _ = upstream.set_read_timeout(Some(Duration::from_millis(40)));
+    let _ = upstream.set_write_timeout(Some(Duration::from_secs(5)));
+    write_message(stream, &ServerMessage::PortForwardOk)
+        .map_err(|error| format!("Could not start port forward: {error}"))?;
+    if let Err(error) = copy_bidirectional(&mut upstream, stream) {
+        eprintln!(
+            "[remote] port forward {requested_port} for {client_id} from {peer_label} ended with error: {error}"
+        );
+    }
+    let _ = upstream.shutdown(Shutdown::Both);
+    let _ = stream.sock.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn authenticate_port_forward(
+    inner: &Arc<RemoteHostInner>,
+    hello: ClientMessage,
+    config: &RemoteHostConfig,
+) -> Result<(String, u16), String> {
+    let ClientMessage::PortForwardHello {
+        protocol_version,
+        server_id,
+        client_id,
+        auth_token,
+        requested_port,
+    } = hello
+    else {
+        return Err("Expected a port-forward handshake.".to_string());
+    };
+
+    if protocol_version != PROTOCOL_VERSION {
+        return Err(format!(
+            "Protocol mismatch. Host uses {}, client uses {protocol_version}.",
+            PROTOCOL_VERSION
+        ));
+    }
+    if server_id != config.server_id {
+        return Err("This client targeted a different host identity.".to_string());
+    }
+    if !config
+        .paired_clients
+        .iter()
+        .any(|client| client.client_id == client_id && client.auth_token == auth_token)
+    {
+        return Err("Saved remote credentials are no longer valid.".to_string());
+    }
+    if !host_can_forward_port(inner, requested_port) {
+        return Err(format!(
+            "Port {requested_port} is not a live DevManager server port on this host."
+        ));
+    }
+    Ok((client_id, requested_port))
+}
+
+fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> bool {
+    let app_state = inner
+        .shared_state
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    let runtime_state = inner
+        .runtime_state
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+    let port_statuses = inner
+        .port_statuses
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or_default();
+
+    for project in app_state.projects() {
+        for folder in &project.folders {
+            for command in &folder.commands {
+                if command.port != Some(requested_port) {
+                    continue;
+                }
+                let Some(session) = runtime_state.sessions.get(&command.id) else {
+                    continue;
+                };
+                let Some(status) = port_statuses.get(&requested_port) else {
+                    continue;
+                };
+                if session.status.is_live() && status.in_use && runtime_owns_port(session, status) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
     inner.config_revision.fetch_add(1, Ordering::Relaxed);
 }
@@ -1897,6 +2560,18 @@ fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id: &str) -> b
         .is_some_and(|controller| controller == client_id)
 }
 
+fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool {
+    let Some(pid) = status.pid else {
+        return false;
+    };
+
+    if session.pid == Some(pid) {
+        return true;
+    }
+
+    session.resources.process_ids.contains(&pid)
+}
+
 fn requires_control(action: &RemoteAction) -> bool {
     !matches!(
         action,
@@ -1917,6 +2592,7 @@ fn run_client_connection(
     inner: Arc<RemoteClientInner>,
 ) {
     let mut read_buffer = Vec::new();
+    let mut last_heartbeat_at = Instant::now();
 
     while inner
         .disconnected_message
@@ -1943,6 +2619,16 @@ fn run_client_connection(
         }
         if should_break {
             break;
+        }
+
+        if last_heartbeat_at.elapsed() >= HEARTBEAT_INTERVAL {
+            if write_message(&mut stream, &ClientMessage::Ping).is_err() {
+                if let Ok(mut disconnected) = inner.disconnected_message.write() {
+                    *disconnected = Some("Remote host connection was lost.".to_string());
+                }
+                break;
+            }
+            last_heartbeat_at = Instant::now();
         }
 
         match try_read_message::<ServerMessage, _>(&mut stream, &mut read_buffer) {
@@ -1981,15 +2667,13 @@ fn run_client_connection(
                         }
                         if let Ok(mut latest) = inner.latest_snapshot.write() {
                             if let Some(snapshot) = latest.as_mut() {
-                                snapshot
-                                    .session_views
-                                    .insert(
-                                        session_id.clone(),
-                                        TerminalSessionView {
-                                            runtime: bootstrap.runtime.clone(),
-                                            screen: bootstrap.screen.clone(),
-                                        },
-                                    );
+                                snapshot.session_views.insert(
+                                    session_id.clone(),
+                                    TerminalSessionView {
+                                        runtime: bootstrap.runtime.clone(),
+                                        screen: bootstrap.screen.clone(),
+                                    },
+                                );
                                 snapshot
                                     .runtime_state
                                     .sessions
@@ -2013,8 +2697,14 @@ fn run_client_connection(
                             }
                         }
                     }
-                    RemoteSessionStreamEvent::RuntimePatch { session_id, runtime }
-                    | RemoteSessionStreamEvent::Closed { session_id, runtime } => {
+                    RemoteSessionStreamEvent::RuntimePatch {
+                        session_id,
+                        runtime,
+                    }
+                    | RemoteSessionStreamEvent::Closed {
+                        session_id,
+                        runtime,
+                    } => {
                         if let Ok(replicas) = inner.session_replicas.read() {
                             if let Some(replica) = replicas.get(&session_id) {
                                 replica.apply_runtime(runtime.clone());
@@ -2022,6 +2712,13 @@ fn run_client_connection(
                         }
                         if let Ok(mut latest) = inner.latest_snapshot.write() {
                             if let Some(snapshot) = latest.as_mut() {
+                                if let Some(view) = snapshot.session_views.get_mut(&session_id) {
+                                    view.runtime = runtime.clone();
+                                    sync_screen_snapshot_dimensions(
+                                        &mut view.screen,
+                                        runtime.dimensions,
+                                    );
+                                }
                                 snapshot
                                     .runtime_state
                                     .sessions
@@ -2058,7 +2755,12 @@ fn run_client_connection(
                 }
                 break;
             }
-            Ok(Some(ServerMessage::HelloOk { .. } | ServerMessage::HelloErr { .. })) => {}
+            Ok(Some(
+                ServerMessage::HelloOk { .. }
+                | ServerMessage::PortForwardOk
+                | ServerMessage::HelloErr { .. }
+                | ServerMessage::Pong,
+            )) => {}
             Ok(None) => thread::sleep(Duration::from_millis(12)),
             Err(_) => {
                 if let Ok(mut disconnected) = inner.disconnected_message.write() {
@@ -2234,20 +2936,20 @@ mod tests {
     use super::{
         apply_workspace_delta, current_controller_allows, current_snapshot,
         format_handshake_stage_error, generate_pairing_token, now_epoch_ms,
-        set_last_connection_note,
-        upsert_known_host, ClientAuth, ConnectedRemoteClient, PairedRemoteClient,
-        RemoteClientHandle, RemoteClientInner, RemoteHostConfig, RemoteHostService,
-        RemoteLatencyStats,
-        RemoteMachineState, RemoteSessionBootstrap, RemoteSessionStreamEvent,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
+        set_last_connection_note, upsert_known_host, ClientAuth, ConnectedRemoteClient,
+        LocalPortForwardManager, PairedRemoteClient, RemoteClientHandle, RemoteClientInner,
+        RemoteHostConfig, RemoteHostService, RemoteLatencyStats, RemoteMachineState,
+        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteWorkspaceDelta,
+        RemoteWorkspaceSnapshot, ServerMessage,
     };
-    use crate::models::{SessionTab, TabType};
+    use crate::models::{PortStatus, SessionTab, TabType};
     use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
     use std::collections::{HashMap, HashSet};
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{mpsc, Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2373,6 +3075,7 @@ mod tests {
                     client_id: "client-1".to_string(),
                     sender: subscribed_tx,
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
+                    bootstrapped_session_ids: HashSet::new(),
                     focused_session_id: Some("alpha".to_string()),
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -2387,6 +3090,7 @@ mod tests {
                     client_id: "client-2".to_string(),
                     sender: idle_tx,
                     subscribed_session_ids: HashSet::from(["beta".to_string()]),
+                    bootstrapped_session_ids: HashSet::new(),
                     focused_session_id: Some("beta".to_string()),
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -2401,9 +3105,10 @@ mod tests {
 
         match subscribed_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(ServerMessage::SessionStream {
-                event: RemoteSessionStreamEvent::Output {
-                    session_id, bytes, ..
-                },
+                event:
+                    RemoteSessionStreamEvent::Output {
+                        session_id, bytes, ..
+                    },
             }) => {
                 assert_eq!(session_id, "alpha");
                 assert_eq!(bytes, b"hello".to_vec());
@@ -2428,6 +3133,7 @@ mod tests {
                     client_id: "client-1".to_string(),
                     sender: tx,
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
+                    bootstrapped_session_ids: HashSet::new(),
                     focused_session_id: Some("alpha".to_string()),
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -2443,13 +3149,97 @@ mod tests {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(ServerMessage::SessionStream {
                 event:
-                    RemoteSessionStreamEvent::Closed { session_id, runtime }
-                    | RemoteSessionStreamEvent::RuntimePatch { session_id, runtime },
+                    RemoteSessionStreamEvent::Closed {
+                        session_id,
+                        runtime,
+                    }
+                    | RemoteSessionStreamEvent::RuntimePatch {
+                        session_id,
+                        runtime,
+                    },
             }) => {
                 assert_eq!(session_id, "alpha");
                 assert_eq!(runtime.session_id, "alpha");
             }
             other => panic!("expected runtime stream event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_session_output_auto_bootstraps_subscribed_client_once_session_is_ready() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut clients) = service.inner.clients.lock() {
+            clients.insert(
+                1,
+                ConnectedRemoteClient {
+                    client_id: "client-1".to_string(),
+                    sender: tx,
+                    subscribed_session_ids: HashSet::from(["alpha".to_string()]),
+                    bootstrapped_session_ids: HashSet::new(),
+                    focused_session_id: Some("alpha".to_string()),
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                },
+            );
+        }
+
+        service.push_session_output("alpha", b"before-ready".to_vec());
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ServerMessage::SessionStream {
+                event:
+                    RemoteSessionStreamEvent::Output {
+                        session_id, bytes, ..
+                    },
+            }) => {
+                assert_eq!(session_id, "alpha");
+                assert_eq!(bytes, b"before-ready".to_vec());
+            }
+            other => panic!("expected pre-bootstrap output event, got {other:?}"),
+        }
+
+        service.set_session_bootstrap_provider(Some(Arc::new(|session_id| {
+            Some(RemoteSessionBootstrap {
+                session_id: session_id.to_string(),
+                runtime: session_view(session_id).runtime,
+                screen: session_view(session_id).screen,
+                replay_bytes: format!("{session_id}\r\n").into_bytes(),
+            })
+        })));
+
+        service.push_session_output("alpha", b"after-ready".to_vec());
+
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ServerMessage::SessionStream {
+                event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
+            }) => assert_eq!(bootstrap.session_id, "alpha"),
+            other => panic!("expected bootstrap event, got {other:?}"),
+        }
+
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ServerMessage::SessionStream {
+                event:
+                    RemoteSessionStreamEvent::Output {
+                        session_id, bytes, ..
+                    },
+            }) => {
+                assert_eq!(session_id, "alpha");
+                assert_eq!(bytes, b"after-ready".to_vec());
+            }
+            other => panic!("expected output event after bootstrap, got {other:?}"),
+        }
+
+        {
+            let clients = service
+                .inner
+                .clients
+                .lock()
+                .expect("client map should be available");
+            let client = clients.get(&1).expect("client should remain connected");
+            assert!(client.bootstrapped_session_ids.contains("alpha"));
         }
     }
 
@@ -2631,6 +3421,148 @@ mod tests {
         assert!(latency.output_client_to_paint_ms.is_some());
     }
 
+    #[test]
+    fn port_forward_tunnels_bytes_to_a_live_managed_server_port() {
+        let host_port = reserve_free_tcp_port();
+        let server_port = reserve_free_tcp_port();
+        let server_ready = Arc::new(AtomicBool::new(false));
+        let server_ready_signal = server_ready.clone();
+        thread::spawn(move || {
+            let listener =
+                TcpListener::bind(("127.0.0.1", server_port)).expect("echo server should bind");
+            server_ready_signal.store(true, Ordering::SeqCst);
+            let (mut socket, _) = listener.accept().expect("echo server should accept");
+            let mut buf = [0_u8; 4];
+            socket
+                .read_exact(&mut buf)
+                .expect("echo server should read ping");
+            assert_eq!(&buf, b"ping");
+            socket
+                .write_all(b"pong")
+                .expect("echo server should write pong");
+        });
+        wait_for(
+            || server_ready.load(Ordering::Relaxed),
+            Duration::from_secs(3),
+            "echo server never started",
+        );
+
+        let mut config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port: host_port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config.clone());
+        service.update_snapshot(
+            managed_server_state(server_port),
+            managed_server_runtime("command-web", 4242),
+            HashMap::from([(
+                server_port,
+                PortStatus {
+                    port: server_port,
+                    in_use: true,
+                    pid: Some(4242),
+                    process_name: Some("node".to_string()),
+                },
+            )]),
+        );
+
+        wait_for(
+            || service.status().listening,
+            Duration::from_secs(3),
+            "remote host never started listening",
+        );
+
+        let client = RemoteClientHandle::connect(
+            "127.0.0.1",
+            host_port,
+            "Test Client",
+            ClientAuth::PairToken { token: pair_token },
+            None,
+        )
+        .expect("remote client should connect");
+
+        let mut forwarded = client
+            .client
+            .open_port_forward(server_port)
+            .expect("port forward should open");
+        forwarded
+            .write_all(b"ping")
+            .expect("forwarded stream should write");
+        let mut buf = [0_u8; 4];
+        forwarded
+            .read_exact(&mut buf)
+            .expect("forwarded stream should read");
+        assert_eq!(&buf, b"pong");
+
+        client.client.disconnect();
+        config.enabled = false;
+        service.apply_config(config);
+    }
+
+    #[test]
+    fn local_port_forward_manager_reports_busy_local_port() {
+        let occupied_port = reserve_free_tcp_port();
+        let _occupied = TcpListener::bind(("127.0.0.1", occupied_port))
+            .expect("test should occupy a localhost port");
+        let manager = LocalPortForwardManager::new(sample_remote_client_handle("client-1"));
+
+        assert!(manager.sync_ports(&[occupied_port]));
+
+        let state = manager
+            .state_for(occupied_port)
+            .expect("busy port should produce a status");
+        assert!(!state.listener_active);
+        assert!(state.local_port_busy);
+        assert!(state
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("already in use")));
+    }
+
+    #[test]
+    fn apply_local_terminal_resize_updates_snapshot_session_view_metadata() {
+        let handle = sample_remote_client_handle("client-1");
+        let mut snapshot = handle.latest_snapshot().expect("snapshot should exist");
+        let mut view = session_view("alpha");
+        view.screen.rows = 40;
+        view.screen.cols = 120;
+        view.screen.total_lines = 200;
+        view.screen.history_size = 160;
+        view.screen.display_offset = 99;
+        snapshot
+            .runtime_state
+            .sessions
+            .insert("alpha".to_string(), view.runtime.clone());
+        snapshot
+            .session_views
+            .insert("alpha".to_string(), view.clone());
+        if let Ok(mut latest) = handle.inner.latest_snapshot.write() {
+            *latest = Some(snapshot);
+        }
+
+        let dimensions = SessionDimensions {
+            cols: 90,
+            rows: 20,
+            cell_width: 8,
+            cell_height: 18,
+        };
+        handle.apply_local_terminal_resize("alpha", dimensions);
+
+        let snapshot = handle.latest_snapshot().expect("snapshot should exist");
+        let updated = snapshot
+            .session_views
+            .get("alpha")
+            .expect("session view should remain present");
+        assert_eq!(updated.runtime.dimensions, dimensions);
+        assert_eq!(updated.screen.rows, 20);
+        assert_eq!(updated.screen.cols, 90);
+        assert_eq!(updated.screen.history_size, 180);
+        assert_eq!(updated.screen.display_offset, 99);
+    }
+
     fn session_view(session_id: &str) -> TerminalSessionView {
         TerminalSessionView {
             runtime: SessionRuntimeState::new(
@@ -2665,6 +3597,43 @@ mod tests {
         panic!("{context}");
     }
 
+    fn managed_server_state(port: u16) -> AppState {
+        let mut state = AppState::default();
+        state.config.projects = vec![crate::models::Project {
+            id: "project-web".to_string(),
+            name: "Web".to_string(),
+            folders: vec![crate::models::ProjectFolder {
+                id: "folder-web".to_string(),
+                name: "web".to_string(),
+                commands: vec![crate::models::RunCommand {
+                    id: "command-web".to_string(),
+                    label: "web".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        state
+    }
+
+    fn managed_server_runtime(command_id: &str, pid: u32) -> RuntimeState {
+        let mut runtime = RuntimeState::default();
+        let mut session = SessionRuntimeState::new(
+            command_id.to_string(),
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = crate::state::SessionStatus::Running;
+        session.pid = Some(pid);
+        session.command_id = Some(command_id.to_string());
+        session.resources.process_ids.push(pid);
+        runtime.sessions.insert(command_id.to_string(), session);
+        runtime
+    }
+
     fn sample_remote_client_handle(client_id: &str) -> RemoteClientHandle {
         let (tx, _rx) = mpsc::channel();
         RemoteClientHandle {
@@ -2686,6 +3655,8 @@ mod tests {
                 client_token: "token-1".to_string(),
                 server_id: "host-1".to_string(),
                 certificate_fingerprint: "fingerprint-1".to_string(),
+                address: "127.0.0.1".to_string(),
+                port: 43871,
             }),
         }
     }

@@ -851,12 +851,16 @@ impl TerminalReplica {
         let session_id = session_id.into();
         let runtime_state = Arc::new(RwLock::new(RuntimeState::default()));
         if let Ok(mut runtime_slot) = runtime_state.write() {
-            runtime_slot.sessions.insert(session_id.clone(), runtime.clone());
+            runtime_slot
+                .sessions
+                .insert(session_id.clone(), runtime.clone());
         }
         let dimensions = Arc::new(Mutex::new(runtime.dimensions));
         let event_proxy = SessionEventProxy {
             session_id: session_id.clone(),
-            writer: Arc::new(Mutex::new(Box::new(std::io::sink()) as Box<dyn Write + Send>)),
+            writer: Arc::new(Mutex::new(
+                Box::new(std::io::sink()) as Box<dyn Write + Send>
+            )),
             runtime_state: runtime_state.clone(),
             dimensions: dimensions.clone(),
             debug_enabled: false,
@@ -864,7 +868,10 @@ impl TerminalReplica {
         };
         let term = Arc::new(Mutex::new(Term::new(
             configured_term(10_000),
-            &TerminalSize::new(runtime.dimensions.cols as usize, runtime.dimensions.rows as usize),
+            &TerminalSize::new(
+                runtime.dimensions.cols as usize,
+                runtime.dimensions.rows as usize,
+            ),
             event_proxy,
         )));
         let replica = Self {
@@ -921,6 +928,39 @@ impl TerminalReplica {
         }
     }
 
+    pub fn apply_local_resize(&self, dimensions: SessionDimensions) {
+        if let Ok(mut dimensions_slot) = self.dimensions.lock() {
+            *dimensions_slot = dimensions;
+        }
+
+        let display_offset = self
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|runtime_state| {
+                runtime_state
+                    .sessions
+                    .get(&self.session_id)
+                    .map(|session| session.display_offset)
+            })
+            .unwrap_or(0);
+
+        if let Ok(mut term) = self.term.lock() {
+            term.resize(TerminalSize::new(
+                dimensions.cols as usize,
+                dimensions.rows as usize,
+            ));
+            apply_display_offset_to_term(&mut term, display_offset);
+        }
+
+        if let Ok(mut runtime_state) = self.runtime_state.write() {
+            if let Some(session) = runtime_state.sessions.get_mut(&self.session_id) {
+                session.dimensions = dimensions;
+            }
+            runtime_state.active_session_id = Some(self.session_id.clone());
+        }
+    }
+
     pub fn view(&self) -> Option<TerminalSessionView> {
         let runtime = self
             .runtime_state
@@ -929,6 +969,30 @@ impl TerminalReplica {
             .and_then(|runtime| runtime.sessions.get(&self.session_id).cloned())?;
         let screen = self.term.lock().ok().map(|term| snapshot_term(&term))?;
         Some(TerminalSessionView { runtime, screen })
+    }
+
+    pub fn screen_text(&self) -> String {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        terminal_buffer_lines(&term)
+            .into_iter()
+            .skip(
+                term.grid()
+                    .total_lines()
+                    .saturating_sub(term.screen_lines()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn scrollback_text(&self) -> String {
+        let term = match self.term.lock() {
+            Ok(term) => term,
+            Err(error) => error.into_inner(),
+        };
+        terminal_buffer_lines(&term).join("\n")
     }
 }
 

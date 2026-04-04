@@ -1158,9 +1158,18 @@ pub struct SettingsDraft {
     pub remote_host_last_note: Option<String>,
     pub remote_host_last_note_is_error: bool,
     pub remote_host_latency_summary: Option<String>,
+    pub remote_port_forwards: Vec<RemotePortForwardDraft>,
     pub remote_known_hosts: Vec<KnownRemoteHost>,
     pub remote_paired_clients: Vec<PairedRemoteClient>,
     pub open_picker: Option<SettingsPicker>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemotePortForwardDraft {
+    pub label: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1699,6 +1708,41 @@ fn render_settings_panel(
             ));
         }
         sections.push(FormSection::new("Remote Session").fields(remote_session_fields));
+
+        let forward_fields = if draft.remote_port_forwards.is_empty() {
+            vec![FormField::info(
+                "Forwarded ports",
+                "None",
+                Some(
+                    "No live host server ports are currently mirrored onto this client."
+                        .to_string(),
+                ),
+            )]
+        } else {
+            draft
+                .remote_port_forwards
+                .iter()
+                .map(|forward| {
+                    if forward.is_error {
+                        FormField::notice(
+                            format!("{} â€” {}", forward.label, forward.status),
+                            SurfaceTone::Warning,
+                        )
+                    } else {
+                        FormField::info(
+                            forward.label.clone(),
+                            forward.status.clone(),
+                            forward.detail.clone(),
+                        )
+                    }
+                })
+                .collect()
+        };
+        sections.push(
+            FormSection::new("Forwarded Server Ports")
+                .hint("Remote host servers exposed on this client's localhost.")
+                .fields(forward_fields),
+        );
     } else {
         sections.push(FormSection::new("App").fields(vec![
             FormField::toggle(
@@ -3533,6 +3577,20 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         ),
         remote_host_last_note_is_error: false,
         remote_host_latency_summary: Some("write 1 ms".to_string()),
+        remote_port_forwards: vec![
+            RemotePortForwardDraft {
+                label: "localhost:5173".to_string(),
+                status: "Forwarded".to_string(),
+                detail: Some("Open URL uses this local mirror.".to_string()),
+                is_error: false,
+            },
+            RemotePortForwardDraft {
+                label: "localhost:4000".to_string(),
+                status: "Local port busy".to_string(),
+                detail: Some("Local port 4000 is already in use on this machine.".to_string()),
+                is_error: true,
+            },
+        ],
         remote_known_hosts: vec![KnownRemoteHost {
             label: "studio-pc".to_string(),
             address: "192.168.0.20".to_string(),
