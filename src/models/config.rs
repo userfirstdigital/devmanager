@@ -133,6 +133,7 @@ pub struct Settings {
     pub shell_integration_enabled: bool,
     pub terminal_mouse_override: bool,
     pub terminal_read_only: bool,
+    pub github_token: Option<String>,
 }
 
 impl Default for Settings {
@@ -156,6 +157,7 @@ impl Default for Settings {
             shell_integration_enabled: true,
             terminal_mouse_override: false,
             terminal_read_only: false,
+            github_token: None,
         }
     }
 }

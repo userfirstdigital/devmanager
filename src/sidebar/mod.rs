@@ -95,6 +95,7 @@ pub struct SidebarActions<'a> {
     pub on_dismiss_context_menu:
         &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub open_context_menu: &'a Option<SidebarContextMenu>,
+    pub on_open_git: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 }
 
 pub fn sidebar_width_px(collapsed: bool) -> f32 {
@@ -256,9 +257,10 @@ fn render_expanded_sidebar(
                         .items_center()
                         .gap(px(4.0))
                         .children(actions.mutations_allowed.then(|| {
-                            primary_button("+ Add Project", (actions.on_add_project)())
-                                .into_any_element()
+                            icon_button(icons::PLUS, (actions.on_add_project)()).into_any_element()
                         }))
+                        .child(icon_button(icons::GIT_BRANCH, (actions.on_open_git)()))
+                        .child(div().flex_1())
                         .children(actions.mutations_allowed.then(|| {
                             icon_button(icons::SQUARE, (actions.on_stop_all_servers)())
                                 .into_any_element()
@@ -1323,24 +1325,6 @@ fn icon_text_action(
                 .text_color(rgb(color))
                 .child(SharedString::from(label.to_string())),
         )
-        .on_mouse_down(MouseButton::Left, on_click)
-}
-
-fn primary_button(
-    label: &str,
-    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
-) -> impl IntoElement {
-    div()
-        .flex_1()
-        .px_2()
-        .py(px(5.0))
-        .rounded_sm()
-        .bg(rgb(theme::PRIMARY))
-        .text_xs()
-        .text_color(rgb(theme::SELECTION_TEXT))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme::PRIMARY_HOVER)))
-        .child(SharedString::from(label.to_string()))
         .on_mouse_down(MouseButton::Left, on_click)
 }
 

@@ -688,7 +688,13 @@ pub enum EditorPanel {
 impl EditorPanel {
     pub fn title(&self) -> &'static str {
         match self {
-            Self::Settings(_) => "Settings",
+            Self::Settings(draft) => {
+                if draft.remote_focus_only {
+                    "Remote"
+                } else {
+                    "Settings"
+                }
+            }
             Self::UiPreview(_) => "UI Preview",
             Self::Project(_) => "Edit Project",
             Self::Folder(draft) => {
@@ -717,7 +723,13 @@ impl EditorPanel {
 
     pub fn subtitle(&self) -> &'static str {
         match self {
-            Self::Settings(_) => "Workspace defaults for terminals, AI tools, and data handling.",
+            Self::Settings(draft) => {
+                if draft.remote_focus_only {
+                    "Connection, control, and hosting for DevManager remote mode."
+                } else {
+                    "Workspace defaults for terminals, AI tools, and data handling."
+                }
+            }
             Self::UiPreview(_) => {
                 "Read-only stories for iterating on native UI without touching live data."
             }
@@ -743,7 +755,13 @@ impl EditorPanel {
 
     pub fn headline(&self) -> String {
         match self {
-            Self::Settings(_) => "Workspace settings".to_string(),
+            Self::Settings(draft) => {
+                if draft.remote_focus_only {
+                    "Remote management".to_string()
+                } else {
+                    "Workspace settings".to_string()
+                }
+            }
             Self::UiPreview(_) => "Native UI preview lab".to_string(),
             Self::Project(draft) => fallback_editor_label(draft.name.as_str(), "Untitled project"),
             Self::Folder(draft) => fallback_editor_label(
@@ -978,6 +996,9 @@ impl EditorPanel {
             (Self::Settings(draft), EditorField::Settings(SettingsField::TerminalFontSize)) => {
                 Some(&draft.terminal_font_size)
             }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::GitHubToken)) => {
+                Some(&draft.github_token)
+            }
             (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteBindAddress)) => {
                 Some(&draft.remote_bind_address)
             }
@@ -1052,6 +1073,9 @@ impl EditorPanel {
             (Self::Settings(draft), EditorField::Settings(SettingsField::TerminalFontSize)) => {
                 Some(&mut draft.terminal_font_size)
             }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::GitHubToken)) => {
+                Some(&mut draft.github_token)
+            }
             (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteBindAddress)) => {
                 Some(&mut draft.remote_bind_address)
             }
@@ -1119,6 +1143,7 @@ impl EditorPanel {
 
 #[derive(Debug, Clone)]
 pub struct SettingsDraft {
+    pub remote_focus_only: bool,
     pub default_terminal: DefaultTerminal,
     pub mac_terminal_profile: MacTerminalProfile,
     pub theme: String,
@@ -1137,9 +1162,11 @@ pub struct SettingsDraft {
     pub shell_integration_enabled: bool,
     pub terminal_mouse_override: bool,
     pub terminal_read_only: bool,
+    pub github_token: String,
     pub remote_host_enabled: bool,
     pub remote_bind_address: String,
     pub remote_port: String,
+    pub remote_keep_hosting_in_background: bool,
     pub remote_pairing_token: String,
     pub remote_connect_address: String,
     pub remote_connect_port: String,
@@ -1272,6 +1299,7 @@ pub enum SettingsField {
     ClaudeCommand,
     CodexCommand,
     TerminalFontSize,
+    GitHubToken,
     RemoteBindAddress,
     RemotePort,
     RemoteConnectAddress,
@@ -1371,6 +1399,7 @@ pub enum EditorAction {
     ToggleTerminalMouseOverride,
     ToggleTerminalReadOnly,
     ToggleRemoteHosting,
+    ToggleRemoteKeepHostingInBackground,
     RegenerateRemotePairingToken,
     CopyRemotePairingToken,
     ConnectRemoteHost,
@@ -1556,11 +1585,15 @@ fn render_settings_editor_surface(
                 .border_b_1()
                 .border_color(rgb(theme::BORDER_PRIMARY))
                 .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme::TEXT_PRIMARY))
-                        .child("Settings"),
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(if draft.remote_focus_only {
+                                "Remote"
+                            } else {
+                                "Settings"
+                            }),
                 )
                 .child(render_settings_close_button(on_close)),
         )
@@ -1611,6 +1644,8 @@ fn render_settings_panel(
     ));
     let on_open_ui_preview = (actions.on_action)(EditorAction::OpenUiPreview);
     let on_toggle_remote_hosting = (actions.on_action)(EditorAction::ToggleRemoteHosting);
+    let on_toggle_remote_background =
+        (actions.on_action)(EditorAction::ToggleRemoteKeepHostingInBackground);
     let on_regenerate_remote_pairing =
         (actions.on_action)(EditorAction::RegenerateRemotePairingToken);
     let on_copy_remote_pairing = (actions.on_action)(EditorAction::CopyRemotePairingToken);
@@ -1677,73 +1712,7 @@ fn render_settings_panel(
         );
     }
 
-    if draft.remote_connected {
-        let mut remote_session_fields = vec![
-            FormField::notice(
-                "Connected to a remote host. Host settings stay on the host; this panel only manages the connection from this client.",
-                SurfaceTone::Muted,
-            ),
-            FormField::info(
-                "Control",
-                if draft.remote_has_control {
-                    "Controller"
-                } else {
-                    "Viewer"
-                },
-                Some(
-                    if draft.remote_has_control {
-                        "This client can type, edit, and manage the host."
-                    } else {
-                        "Take control to type, edit, or start and stop host processes."
-                    }
-                    .to_string(),
-                ),
-            ),
-        ];
-        if let Some(latency_summary) = draft.remote_latency_summary.as_ref() {
-            remote_session_fields.push(FormField::info(
-                "Latency",
-                latency_summary.clone(),
-                Some("Recent transport and paint timings from this remote client.".to_string()),
-            ));
-        }
-        sections.push(FormSection::new("Remote Session").fields(remote_session_fields));
-
-        let forward_fields = if draft.remote_port_forwards.is_empty() {
-            vec![FormField::info(
-                "Forwarded ports",
-                "None",
-                Some(
-                    "No live host server ports are currently mirrored onto this client."
-                        .to_string(),
-                ),
-            )]
-        } else {
-            draft
-                .remote_port_forwards
-                .iter()
-                .map(|forward| {
-                    if forward.is_error {
-                        FormField::notice(
-                            format!("{} â€” {}", forward.label, forward.status),
-                            SurfaceTone::Warning,
-                        )
-                    } else {
-                        FormField::info(
-                            forward.label.clone(),
-                            forward.status.clone(),
-                            forward.detail.clone(),
-                        )
-                    }
-                })
-                .collect()
-        };
-        sections.push(
-            FormSection::new("Forwarded Server Ports")
-                .hint("Remote host servers exposed on this client's localhost.")
-                .fields(forward_fields),
-        );
-    } else {
+    if !draft.remote_connected && !draft.remote_focus_only {
         sections.push(FormSection::new("App").fields(vec![
             FormField::toggle(
                 "Confirm before closing",
@@ -1752,7 +1721,7 @@ fn render_settings_panel(
                 on_toggle_confirm,
             ),
             FormField::toggle(
-                "Minimize to tray",
+                "Minimize instead of close",
                 draft.minimize_to_tray,
                 minimize_to_tray_hint(),
                 on_toggle_tray,
@@ -1902,6 +1871,19 @@ fn render_settings_panel(
                     )
                     .into_any_element(),
                 ),
+                FormField::custom(
+                    render_settings_text_input(
+                        "GitHub token",
+                        "Personal access token for AI commit messages and GitHub API.",
+                        draft.github_token.as_str(),
+                        EditorField::Settings(SettingsField::GitHubToken),
+                        model,
+                        actions,
+                        None,
+                        "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                    )
+                    .into_any_element(),
+                ),
             ]));
 
         sections.push(
@@ -1975,30 +1957,53 @@ fn render_settings_panel(
                 ),
             ),
             FormField::info(
-                "Role",
-                if draft.remote_has_control {
-                    "Controller"
+                "Session mode",
+                if draft
+                    .remote_connect_status
+                    .as_ref()
+                    .is_some_and(|status| status.starts_with("Reconnecting to "))
+                {
+                    "Reconnecting"
                 } else {
-                    "Viewer"
+                    if draft.remote_has_control {
+                        "Controller"
+                    } else {
+                        "Viewer"
+                    }
                 },
                 Some(
-                    if draft.remote_has_control {
+                    if draft
+                        .remote_connect_status
+                        .as_ref()
+                        .is_some_and(|status| status.starts_with("Reconnecting to "))
+                    {
+                        "This window is holding the remote workspace in place while the connection retries in the background."
+                            .to_string()
+                    } else if draft.remote_has_control {
                         "Typing, editing, and start or stop actions are enabled here."
+                            .to_string()
                     } else {
                         "This window can inspect the host, but cannot type or change anything until it takes control."
+                            .to_string()
                     }
-                    .to_string(),
                 ),
             ),
             FormField::info(
                 "Reconnect",
-                "Saved",
+                "Automatic",
                 Some(
-                    "This host is remembered with its fingerprint and a saved client token for quick reconnects."
+                    "This host is remembered with its fingerprint and a saved client token, and transient drops retry automatically."
                         .to_string(),
                 ),
             ),
         ]);
+        if let Some(latency_summary) = draft.remote_latency_summary.as_ref() {
+            fields.push(FormField::info(
+                "Latency",
+                latency_summary.clone(),
+                Some("Recent transport and paint timings from this remote client.".to_string()),
+            ));
+        }
         let mut session_actions = FormActionGroup::new("Remote session").action(
             FormAction::new(
                 "Disconnect from the current remote host",
@@ -2031,8 +2036,43 @@ fn render_settings_panel(
         fields.push(FormField::action_group(session_actions));
         sections.push(
             FormSection::new("Remote Session")
-                .hint("This app is currently connected to another DevManager host.")
+                .hint("This app is currently showing the workspace, terminals, and servers from another DevManager host.")
                 .fields(fields),
+        );
+
+        let forward_fields = if draft.remote_port_forwards.is_empty() {
+            vec![FormField::info(
+                "Forwarded ports",
+                "None",
+                Some(
+                    "No live host server ports are currently mirrored onto this client."
+                        .to_string(),
+                ),
+            )]
+        } else {
+            draft
+                .remote_port_forwards
+                .iter()
+                .map(|forward| {
+                    if forward.is_error {
+                        FormField::notice(
+                            format!("{} — {}", forward.label, forward.status),
+                            SurfaceTone::Warning,
+                        )
+                    } else {
+                        FormField::info(
+                            forward.label.clone(),
+                            forward.status.clone(),
+                            forward.detail.clone(),
+                        )
+                    }
+                })
+                .collect()
+        };
+        sections.push(
+            FormSection::new("Forwarded Server Ports")
+                .hint("Remote host servers exposed on this client's localhost.")
+                .fields(forward_fields),
         );
     } else {
         let connect_fields = vec![
@@ -2186,6 +2226,12 @@ fn render_settings_panel(
                 "Allow another DevManager window to connect to this machine.",
                 on_toggle_remote_hosting,
             ),
+            FormField::toggle(
+                "Keep hosting in background",
+                draft.remote_keep_hosting_in_background,
+                "When the close button is used, keep DevManager alive in the background so remote clients can reconnect. Reopen it from the taskbar.",
+                on_toggle_remote_background,
+            ),
             FormField::custom(
                 render_settings_text_input(
                     "Bind address",
@@ -2333,15 +2379,17 @@ fn render_settings_panel(
         }
     }
 
-    sections.push(
-        FormSection::new("Developer").field(FormField::action(
-            FormAction::new("Open UI preview", "Open", on_open_ui_preview)
-                .description(
-                    "Inspect seeded editor and settings states without touching live data.",
-                )
-                .badge(SurfaceBadge::new("Read-only", SurfaceTone::Muted)),
-        )),
-    );
+    if !draft.remote_focus_only {
+        sections.push(
+            FormSection::new("Developer").field(FormField::action(
+                FormAction::new("Open UI preview", "Open", on_open_ui_preview)
+                    .description(
+                        "Inspect seeded editor and settings states without touching live data.",
+                    )
+                    .badge(SurfaceBadge::new("Read-only", SurfaceTone::Muted)),
+            )),
+        );
+    }
 
     return render_form_sections(sections, model, actions);
 
@@ -2481,6 +2529,16 @@ fn render_settings_panel(
                         actions,
                         None,
                         "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+                    ))
+                    .child(render_settings_text_input(
+                        "GitHub token",
+                        "Personal access token for AI commit messages and GitHub API",
+                        draft.github_token.as_str(),
+                        EditorField::Settings(SettingsField::GitHubToken),
+                        model,
+                        actions,
+                        None,
+                        "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
                     ))
                     .into_any_element(),
             ))
@@ -3534,6 +3592,7 @@ fn sample_ssh_draft() -> SshDraft {
 
 fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
     SettingsDraft {
+        remote_focus_only: false,
         default_terminal: DefaultTerminal::Powershell,
         mac_terminal_profile: MacTerminalProfile::Zsh,
         theme: "dark".to_string(),
@@ -3554,9 +3613,11 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         shell_integration_enabled: true,
         terminal_mouse_override: false,
         terminal_read_only: false,
+        github_token: String::new(),
         remote_host_enabled: false,
         remote_bind_address: "0.0.0.0".to_string(),
         remote_port: "43871".to_string(),
+        remote_keep_hosting_in_background: false,
         remote_pairing_token: "ABC123".to_string(),
         remote_connect_address: "192.168.0.20".to_string(),
         remote_connect_port: "43871".to_string(),
@@ -4059,7 +4120,7 @@ fn render_ssh_panel(
 }
 
 fn minimize_to_tray_hint() -> &'static str {
-    "Keep DevManager running when the window is closed"
+    "Keep DevManager running in the taskbar when the window close button is used"
 }
 
 fn render_folder_scan_panel(

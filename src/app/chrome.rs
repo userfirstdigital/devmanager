@@ -9,13 +9,43 @@ use time::{format_description, OffsetDateTime};
 
 pub const STATUS_BAR_HEIGHT_PX: f32 = 22.0;
 
+#[derive(Clone, Copy)]
+pub enum StatusBarTone {
+    Muted,
+    Accent,
+    Success,
+    Warning,
+    Danger,
+}
+
+pub struct StatusBarQuickAction {
+    pub label: String,
+    pub tone: StatusBarTone,
+}
+
+pub struct RemoteStatusBarModel {
+    pub label: String,
+    pub tone: StatusBarTone,
+    pub primary_action: Option<StatusBarQuickAction>,
+    pub secondary_action: Option<StatusBarQuickAction>,
+    pub tertiary_action: Option<StatusBarQuickAction>,
+}
+
 pub struct StatusBarActions<'a> {
     pub on_install_update: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_open_remote: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_remote_primary:
+        Option<&'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_remote_secondary:
+        Option<&'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_remote_tertiary:
+        Option<&'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
 }
 
 pub fn render_status_bar(
     runtime: &RuntimeState,
     updater: &UpdaterSnapshot,
+    remote: Option<&RemoteStatusBarModel>,
     actions: StatusBarActions<'_>,
 ) -> impl IntoElement {
     let (open_terminals, total_memory_bytes) = running_terminal_metrics(runtime);
@@ -69,6 +99,9 @@ pub fn render_status_bar(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
+                .children(
+                    remote.map(|remote| render_remote_status(remote, &actions).into_any_element()),
+                )
                 .child(update_content)
                 .child(
                     div()
@@ -148,6 +181,128 @@ fn render_updater_status(
                 ))
         }
         _ => div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(""),
+    }
+}
+
+fn render_remote_status(
+    remote: &RemoteStatusBarModel,
+    actions: &StatusBarActions<'_>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .px(px(6.0))
+                .h(px(16.0))
+                .rounded_full()
+                .bg(rgb(status_bar_tone_bg(remote.tone)))
+                .border_1()
+                .border_color(rgb(status_bar_tone_border(remote.tone)))
+                .text_xs()
+                .text_color(rgb(status_bar_tone_text(remote.tone)))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(status_bar_tone_hover_bg(remote.tone))))
+                .child(icons::app_icon(
+                    icons::SERVER,
+                    10.0,
+                    status_bar_tone_text(remote.tone),
+                ))
+                .child(SharedString::from(remote.label.clone()))
+                .on_mouse_down(MouseButton::Left, (actions.on_open_remote)()),
+        )
+        .children(
+            remote
+                .primary_action
+                .as_ref()
+                .zip(actions.on_remote_primary)
+                .map(|(action, handler)| {
+                    render_status_bar_action(action, handler).into_any_element()
+                }),
+        )
+        .children(
+            remote
+                .secondary_action
+                .as_ref()
+                .zip(actions.on_remote_secondary)
+                .map(|(action, handler)| {
+                    render_status_bar_action(action, handler).into_any_element()
+                }),
+        )
+        .children(
+            remote
+                .tertiary_action
+                .as_ref()
+                .zip(actions.on_remote_tertiary)
+                .map(|(action, handler)| {
+                    render_status_bar_action(action, handler).into_any_element()
+                }),
+        )
+}
+
+fn render_status_bar_action(
+    action: &StatusBarQuickAction,
+    handler: &dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(6.0))
+        .h(px(16.0))
+        .rounded_full()
+        .bg(rgb(status_bar_tone_bg(action.tone)))
+        .border_1()
+        .border_color(rgb(status_bar_tone_border(action.tone)))
+        .text_xs()
+        .text_color(rgb(status_bar_tone_text(action.tone)))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(status_bar_tone_hover_bg(action.tone))))
+        .child(SharedString::from(action.label.clone()))
+        .on_mouse_down(MouseButton::Left, handler())
+}
+
+fn status_bar_tone_bg(tone: StatusBarTone) -> u32 {
+    match tone {
+        StatusBarTone::Muted => theme::TOPBAR_BG,
+        StatusBarTone::Accent => theme::PRIMARY_MUTED,
+        StatusBarTone::Success => theme::SUCCESS_BG,
+        StatusBarTone::Warning => 0x2a2211,
+        StatusBarTone::Danger => 0x2b161c,
+    }
+}
+
+fn status_bar_tone_hover_bg(tone: StatusBarTone) -> u32 {
+    match tone {
+        StatusBarTone::Muted => theme::ROW_HOVER_BG,
+        StatusBarTone::Accent => 0x3730a3,
+        StatusBarTone::Success => 0x19301f,
+        StatusBarTone::Warning => 0x3a2d11,
+        StatusBarTone::Danger => 0x3a1d25,
+    }
+}
+
+fn status_bar_tone_border(tone: StatusBarTone) -> u32 {
+    match tone {
+        StatusBarTone::Muted => theme::BORDER_PRIMARY,
+        StatusBarTone::Accent => theme::PRIMARY,
+        StatusBarTone::Success => 0x1c3b27,
+        StatusBarTone::Warning => 0x4f3b0d,
+        StatusBarTone::Danger => 0x5a2630,
+    }
+}
+
+fn status_bar_tone_text(tone: StatusBarTone) -> u32 {
+    match tone {
+        StatusBarTone::Muted => theme::TEXT_MUTED,
+        StatusBarTone::Accent => 0xc7d2fe,
+        StatusBarTone::Success => theme::SUCCESS_TEXT,
+        StatusBarTone::Warning => theme::WARNING_TEXT,
+        StatusBarTone::Danger => theme::DANGER_TEXT,
     }
 }
 
