@@ -437,12 +437,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                this.github_token = None;
-                                this.github_username = None;
-                                GitWindow::persist_github_token(None);
-                                this.operation_result =
-                                    Some((true, "Logged out".to_string()));
-                                cx.notify();
+                                this.logout_github(cx);
                             }),
                         ),
                 )

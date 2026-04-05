@@ -1,6 +1,7 @@
 mod chrome;
 
 use crate::assets::AppAssets;
+use crate::git::git_service;
 use crate::models::{
     AppConfig, DependencyStatus, MacTerminalProfile, PortStatus, Project, ProjectFolder,
     RunCommand, SSHConnection, SessionState, SessionTab, TabType,
@@ -8,7 +9,7 @@ use crate::models::{
 use crate::notifications;
 use crate::remote::{
     self, ClientAuth, LocalPortForwardManager, PendingRemoteRequest, RemoteAction,
-    RemoteActionPayload, RemoteActionResult, RemoteClientHandle, RemoteClientPool,
+    RemoteActionPayload, RemoteActionResult, RemoteClientHandle, RemoteClientPool, RemoteGitRepo,
     RemoteHostService, RemoteLatencyStats, RemoteMachineState, RemotePortForwardState,
     RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
 };
@@ -991,6 +992,32 @@ impl NativeShell {
         true
     }
 
+    fn terminal_input_block_reason(&self) -> Option<String> {
+        if let Some(remote_mode) = self.remote_mode.as_ref() {
+            if remote_mode.reconnect.is_some() {
+                return Some(
+                    "Reconnecting to the remote host. Input will resume automatically.".to_string(),
+                );
+            }
+            if !remote_mode.snapshot.you_have_control {
+                return Some(
+                    "Viewer mode is active. Take control to type or send terminal input."
+                        .to_string(),
+                );
+            }
+            return None;
+        }
+
+        if !self.local_host_has_control() {
+            return Some(
+                "Another remote client controls this host. Take local control to type here."
+                    .to_string(),
+            );
+        }
+
+        None
+    }
+
     fn remote_request(&mut self, action: RemoteAction) -> Result<RemoteActionResult, String> {
         let Some(remote_mode) = self.remote_mode.as_ref() else {
             return Err("Remote host is not connected.".to_string());
@@ -1074,6 +1101,18 @@ impl NativeShell {
             .remote_mode
             .as_ref()
             .map(|remote_mode| remote_mode.connected_label.clone());
+        let connected_endpoint = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| format!("{}:{}", remote_mode.address, remote_mode.port));
+        let connected_server_id = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.client.server_id().to_string());
+        let connected_fingerprint = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.client.certificate_fingerprint().to_string());
         let remote_reconnect = self
             .remote_mode
             .as_ref()
@@ -1089,7 +1128,17 @@ impl NativeShell {
 
         if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
             draft.remote_connected_label = connected_label;
+            draft.remote_connected_endpoint = connected_endpoint;
+            draft.remote_connected_server_id = connected_server_id;
+            draft.remote_connected_fingerprint = connected_fingerprint;
             draft.remote_latency_summary = remote_latency_summary;
+            draft.remote_reconnect_attempts = remote_reconnect
+                .as_ref()
+                .map(|reconnect| reconnect.attempts)
+                .unwrap_or(0);
+            draft.remote_reconnect_last_error = remote_reconnect
+                .as_ref()
+                .and_then(|reconnect| reconnect.last_error.clone());
             draft.remote_has_control = remote_has_control;
             draft.remote_connected = remote_connected;
             draft.remote_host_clients = remote_status.connected_clients;
@@ -1099,6 +1148,12 @@ impl NativeShell {
             draft.remote_host_last_note = remote_status.last_connection_note;
             draft.remote_host_last_note_is_error = remote_status.last_connection_is_error;
             draft.remote_host_latency_summary = remote_host_latency_summary;
+            draft.remote_host_server_id = self.remote_machine_state.host.server_id.clone();
+            draft.remote_host_fingerprint = self
+                .remote_machine_state
+                .host
+                .certificate_fingerprint
+                .clone();
             draft.remote_port_forwards = remote_port_forwards;
             draft.remote_known_hosts = self.remote_machine_state.known_hosts.clone();
             draft.remote_paired_clients = self.remote_machine_state.host.paired_clients.clone();
@@ -1451,12 +1506,7 @@ impl NativeShell {
                     },
                     tone: chrome::StatusBarTone::Accent,
                 }),
-                secondary_action: preferred_host
-                    .as_ref()
-                    .map(|_| chrome::StatusBarQuickAction {
-                        label: "Manage".to_string(),
-                        tone: chrome::StatusBarTone::Muted,
-                    }),
+                secondary_action: None,
                 tertiary_action: None,
             };
         }
@@ -1475,12 +1525,7 @@ impl NativeShell {
                 },
                 tone: chrome::StatusBarTone::Accent,
             }),
-            secondary_action: preferred_host
-                .as_ref()
-                .map(|_| chrome::StatusBarQuickAction {
-                    label: "Manage".to_string(),
-                    tone: chrome::StatusBarTone::Muted,
-                }),
+            secondary_action: None,
             tertiary_action: None,
         }
     }
@@ -1611,12 +1656,7 @@ impl NativeShell {
                         },
                         tone: chrome::StatusBarTone::Accent,
                     }),
-                    secondary_action: preferred_host.as_ref().map(|_| {
-                        chrome::StatusBarQuickAction {
-                            label: "Manage".to_string(),
-                            tone: chrome::StatusBarTone::Muted,
-                        }
-                    }),
+                    secondary_action: None,
                     tertiary_action: None,
                 },
                 primary_action: Some(if preferred_host.is_some() {
@@ -1624,9 +1664,7 @@ impl NativeShell {
                 } else {
                     RemoteStatusBarAction::OpenRemoteSettings
                 }),
-                secondary_action: preferred_host
-                    .as_ref()
-                    .map(|_| RemoteStatusBarAction::OpenRemoteSettings),
+                secondary_action: None,
                 tertiary_action: None,
             };
         }
@@ -1646,12 +1684,7 @@ impl NativeShell {
                     },
                     tone: chrome::StatusBarTone::Accent,
                 }),
-                secondary_action: preferred_host
-                    .as_ref()
-                    .map(|_| chrome::StatusBarQuickAction {
-                        label: "Manage".to_string(),
-                        tone: chrome::StatusBarTone::Muted,
-                    }),
+                secondary_action: None,
                 tertiary_action: None,
             },
             primary_action: Some(if preferred_host.is_some() {
@@ -1659,9 +1692,7 @@ impl NativeShell {
             } else {
                 RemoteStatusBarAction::OpenRemoteSettings
             }),
-            secondary_action: preferred_host
-                .as_ref()
-                .map(|_| RemoteStatusBarAction::OpenRemoteSettings),
+            secondary_action: None,
             tertiary_action: None,
         }
     }
@@ -2194,6 +2225,392 @@ impl NativeShell {
         self.process_manager.session_view(session_id)
     }
 
+    fn spawn_remote_git_request_if_needed(
+        &mut self,
+        action: &RemoteAction,
+        response: Option<std::sync::mpsc::Sender<RemoteActionResult>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        #[derive(Debug)]
+        enum GitHostMutation {
+            SetGithubToken(Option<String>),
+        }
+
+        let action = match action {
+            RemoteAction::GitListRepos
+            | RemoteAction::GitStatus { .. }
+            | RemoteAction::GitLog { .. }
+            | RemoteAction::GitDiffFile { .. }
+            | RemoteAction::GitDiffCommit { .. }
+            | RemoteAction::GitBranches { .. }
+            | RemoteAction::GitStage { .. }
+            | RemoteAction::GitUnstage { .. }
+            | RemoteAction::GitStageAll { .. }
+            | RemoteAction::GitUnstageAll { .. }
+            | RemoteAction::GitCommit { .. }
+            | RemoteAction::GitPush { .. }
+            | RemoteAction::GitPushSetUpstream { .. }
+            | RemoteAction::GitPull { .. }
+            | RemoteAction::GitFetch { .. }
+            | RemoteAction::GitSwitchBranch { .. }
+            | RemoteAction::GitCreateBranch { .. }
+            | RemoteAction::GitDeleteBranch { .. }
+            | RemoteAction::GitGetGithubAuthStatus
+            | RemoteAction::GitRequestDeviceCode
+            | RemoteAction::GitPollForToken { .. }
+            | RemoteAction::GitLogout
+            | RemoteAction::GitGenerateCommitMessage { .. } => action.clone(),
+            _ => return false,
+        };
+
+        let projects = self.state.projects().to_vec();
+        let host_token = self
+            .state
+            .settings()
+            .github_token
+            .clone()
+            .filter(|token| !token.trim().is_empty());
+
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                let (result, mutation) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        match action {
+                            RemoteAction::GitListRepos => (
+                                RemoteActionResult::ok(
+                                    None,
+                                    Some(RemoteActionPayload::GitRepos {
+                                        repos: collect_git_repositories_from_projects(&projects),
+                                    }),
+                                ),
+                                None,
+                            ),
+                            RemoteAction::GitStatus { repo_path } => (
+                                match git_service::status(&repo_path) {
+                                    Ok(status) => RemoteActionResult::ok(
+                                        None,
+                                        Some(RemoteActionPayload::GitStatus { status }),
+                                    ),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitLog {
+                                repo_path,
+                                limit,
+                                skip,
+                            } => (
+                                match git_service::log(&repo_path, limit, skip) {
+                                    Ok(entries) => RemoteActionResult::ok(
+                                        None,
+                                        Some(RemoteActionPayload::GitLogEntries { entries }),
+                                    ),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitDiffFile {
+                                repo_path,
+                                file_path,
+                                staged,
+                            } => (
+                                match git_service::diff_file(&repo_path, &file_path, staged) {
+                                    Ok(diff) => RemoteActionResult::ok(
+                                        None,
+                                        Some(RemoteActionPayload::GitDiff { diff }),
+                                    ),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitDiffCommit { repo_path, hash } => (
+                                match git_service::diff_commit(&repo_path, &hash) {
+                                    Ok(diff) => RemoteActionResult::ok(
+                                        None,
+                                        Some(RemoteActionPayload::GitDiff { diff }),
+                                    ),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitBranches { repo_path } => (
+                                match git_service::branches(&repo_path) {
+                                    Ok(branches) => RemoteActionResult::ok(
+                                        None,
+                                        Some(RemoteActionPayload::GitBranches { branches }),
+                                    ),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitStage { repo_path, files } => {
+                                let file_refs =
+                                    files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
+                                (
+                                    match git_service::stage(&repo_path, &file_refs) {
+                                        Ok(()) => RemoteActionResult::ok(None, None),
+                                        Err(error) => RemoteActionResult::error(error),
+                                    },
+                                    None,
+                                )
+                            }
+                            RemoteAction::GitUnstage { repo_path, files } => {
+                                let file_refs =
+                                    files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
+                                (
+                                    match git_service::unstage(&repo_path, &file_refs) {
+                                        Ok(()) => RemoteActionResult::ok(None, None),
+                                        Err(error) => RemoteActionResult::error(error),
+                                    },
+                                    None,
+                                )
+                            }
+                            RemoteAction::GitStageAll { repo_path } => (
+                                match git_service::stage_all(&repo_path) {
+                                    Ok(()) => RemoteActionResult::ok(None, None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitUnstageAll { repo_path } => (
+                                match git_service::unstage_all(&repo_path) {
+                                    Ok(()) => RemoteActionResult::ok(None, None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitCommit {
+                                repo_path,
+                                summary,
+                                body,
+                            } => (
+                                match git_service::commit(&repo_path, &summary, body.as_deref()) {
+                                    Ok(hash) => RemoteActionResult::ok(
+                                        None,
+                                        Some(RemoteActionPayload::GitCommit { hash }),
+                                    ),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitPush { repo_path } => (
+                                match git_service::push(&repo_path) {
+                                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitPushSetUpstream { repo_path, branch } => (
+                                match git_service::push_set_upstream(&repo_path, &branch) {
+                                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitPull { repo_path } => (
+                                match git_service::pull(&repo_path) {
+                                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitFetch { repo_path } => (
+                                match git_service::fetch(&repo_path) {
+                                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitSwitchBranch { repo_path, name } => (
+                                match git_service::switch_branch(&repo_path, &name) {
+                                    Ok(()) => RemoteActionResult::ok(None, None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitCreateBranch { repo_path, name } => (
+                                match git_service::create_branch(&repo_path, &name) {
+                                    Ok(()) => RemoteActionResult::ok(None, None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitDeleteBranch { repo_path, name } => (
+                                match git_service::delete_branch(&repo_path, &name) {
+                                    Ok(()) => RemoteActionResult::ok(None, None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitGetGithubAuthStatus => {
+                                if let Some(token) = host_token.clone() {
+                                    let username = git_service::get_github_username(&token).ok();
+                                    (
+                                        RemoteActionResult::ok(
+                                            None,
+                                            Some(RemoteActionPayload::GitAuthStatus {
+                                                has_token: true,
+                                                username,
+                                            }),
+                                        ),
+                                        None,
+                                    )
+                                } else {
+                                    (
+                                        RemoteActionResult::ok(
+                                            None,
+                                            Some(RemoteActionPayload::GitAuthStatus {
+                                                has_token: false,
+                                                username: None,
+                                            }),
+                                        ),
+                                        None,
+                                    )
+                                }
+                            }
+                            RemoteAction::GitRequestDeviceCode => {
+                                if let Some(client_id) = git_service::get_github_client_id() {
+                                    (
+                                        match git_service::request_device_code(&client_id) {
+                                            Ok(device_code) => RemoteActionResult::ok(
+                                                None,
+                                                Some(RemoteActionPayload::GitDeviceCode {
+                                                    device_code,
+                                                }),
+                                            ),
+                                            Err(error) => RemoteActionResult::error(error),
+                                        },
+                                        None,
+                                    )
+                                } else {
+                                    (
+                                        RemoteActionResult::error(
+                                            "Set DEVMANAGER_GITHUB_CLIENT_ID on the host, or use the built-in default GitHub OAuth app.",
+                                        ),
+                                        None,
+                                    )
+                                }
+                            }
+                            RemoteAction::GitPollForToken { device_code } => {
+                                if let Some(client_id) = git_service::get_github_client_id() {
+                                    match git_service::poll_for_token(&client_id, &device_code) {
+                                        Ok(Some(token_resp)) => {
+                                            let username = git_service::get_github_username(
+                                                &token_resp.access_token,
+                                            )
+                                            .ok();
+                                            (
+                                                RemoteActionResult::ok(
+                                                    None,
+                                                    Some(RemoteActionPayload::GitTokenPoll {
+                                                        completed: true,
+                                                        username,
+                                                    }),
+                                                ),
+                                                Some(GitHostMutation::SetGithubToken(Some(
+                                                    token_resp.access_token,
+                                                ))),
+                                            )
+                                        }
+                                        Ok(None) => (
+                                            RemoteActionResult::ok(
+                                                None,
+                                                Some(RemoteActionPayload::GitTokenPoll {
+                                                    completed: false,
+                                                    username: None,
+                                                }),
+                                            ),
+                                            None,
+                                        ),
+                                        Err(error) => (RemoteActionResult::error(error), None),
+                                    }
+                                } else {
+                                    (
+                                        RemoteActionResult::error(
+                                            "Set DEVMANAGER_GITHUB_CLIENT_ID on the host, or use the built-in default GitHub OAuth app.",
+                                        ),
+                                        None,
+                                    )
+                                }
+                            }
+                            RemoteAction::GitLogout => (
+                                RemoteActionResult::ok(None, None),
+                                Some(GitHostMutation::SetGithubToken(None)),
+                            ),
+                            RemoteAction::GitGenerateCommitMessage { repo_path } => {
+                                if let Some(token) = host_token.clone() {
+                                    match git_service::get_staged_diff(&repo_path) {
+                                        Ok(diff) if diff.trim().is_empty() => (
+                                            RemoteActionResult::error(
+                                                "No staged changes to summarize",
+                                            ),
+                                            None,
+                                        ),
+                                        Ok(diff) => match git_service::generate_commit_message(
+                                            &token, &diff,
+                                        ) {
+                                            Ok(message) => (
+                                                RemoteActionResult::ok(
+                                                    None,
+                                                    Some(
+                                                        RemoteActionPayload::GitCommitMessage {
+                                                            message,
+                                                        },
+                                                    ),
+                                                ),
+                                                None,
+                                            ),
+                                            Err(error) => (
+                                                RemoteActionResult::error(format!("AI: {error}")),
+                                                None,
+                                            ),
+                                        },
+                                        Err(error) => (RemoteActionResult::error(error), None),
+                                    }
+                                } else {
+                                    (
+                                        RemoteActionResult::error(
+                                            "GitHub token not configured on the host.",
+                                        ),
+                                        None,
+                                    )
+                                }
+                            }
+                            _ => unreachable!("non-git action dispatched to git worker"),
+                        }
+                    })
+                    .await;
+
+                if let Some(mutation) = mutation {
+                    let _ = this.update(&mut cx, |this, cx| {
+                        match mutation {
+                            GitHostMutation::SetGithubToken(token) => {
+                                let mut settings = this.state.settings().clone();
+                                settings.github_token = token;
+                                this.state.update_settings(settings);
+                                this.save_config_state();
+                                this.last_remote_snapshot_sync_at = None;
+                                this.sync_settings_remote_draft();
+                                cx.notify();
+                            }
+                        }
+                    });
+                }
+
+                if let Some(response) = response {
+                    let _ = response.send(result);
+                }
+                }
+            },
+        )
+        .detach();
+
+        true
+    }
+
     fn pump_remote_host_requests(&mut self, cx: &mut Context<Self>) -> bool {
         let requests = self.remote_host_service.drain_requests();
         if requests.is_empty() {
@@ -2208,6 +2625,10 @@ impl NativeShell {
                 action,
                 response,
             } = request;
+
+            if self.spawn_remote_git_request_if_needed(&action, response.clone(), cx) {
+                continue;
+            }
 
             let result = match action {
                 RemoteAction::StartServer {
@@ -2682,6 +3103,232 @@ impl NativeShell {
                         ),
                         Ok(_) => RemoteActionResult::error("Nothing to export from this terminal."),
                         Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitListRepos => RemoteActionResult::ok(
+                    None,
+                    Some(RemoteActionPayload::GitRepos {
+                        repos: collect_git_repositories(&self.state),
+                    }),
+                ),
+                RemoteAction::GitStatus { repo_path } => match git_service::status(&repo_path) {
+                    Ok(status) => RemoteActionResult::ok(
+                        None,
+                        Some(RemoteActionPayload::GitStatus { status }),
+                    ),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitLog {
+                    repo_path,
+                    limit,
+                    skip,
+                } => match git_service::log(&repo_path, limit, skip) {
+                    Ok(entries) => RemoteActionResult::ok(
+                        None,
+                        Some(RemoteActionPayload::GitLogEntries { entries }),
+                    ),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitDiffFile {
+                    repo_path,
+                    file_path,
+                    staged,
+                } => match git_service::diff_file(&repo_path, &file_path, staged) {
+                    Ok(diff) => {
+                        RemoteActionResult::ok(None, Some(RemoteActionPayload::GitDiff { diff }))
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitDiffCommit { repo_path, hash } => {
+                    match git_service::diff_commit(&repo_path, &hash) {
+                        Ok(diff) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitDiff { diff }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitBranches { repo_path } => {
+                    match git_service::branches(&repo_path) {
+                        Ok(branches) => RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitBranches { branches }),
+                        ),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitStage { repo_path, files } => {
+                    let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
+                    match git_service::stage(&repo_path, &file_refs) {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitUnstage { repo_path, files } => {
+                    let file_refs = files.iter().map(|file| file.as_str()).collect::<Vec<_>>();
+                    match git_service::unstage(&repo_path, &file_refs) {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitStageAll { repo_path } => match git_service::stage_all(&repo_path)
+                {
+                    Ok(()) => RemoteActionResult::ok(None, None),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitUnstageAll { repo_path } => {
+                    match git_service::unstage_all(&repo_path) {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitCommit {
+                    repo_path,
+                    summary,
+                    body,
+                } => match git_service::commit(&repo_path, &summary, body.as_deref()) {
+                    Ok(hash) => {
+                        RemoteActionResult::ok(None, Some(RemoteActionPayload::GitCommit { hash }))
+                    }
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitPush { repo_path } => match git_service::push(&repo_path) {
+                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitPushSetUpstream { repo_path, branch } => {
+                    match git_service::push_set_upstream(&repo_path, &branch) {
+                        Ok(message) => RemoteActionResult::ok(Some(message), None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitPull { repo_path } => match git_service::pull(&repo_path) {
+                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitFetch { repo_path } => match git_service::fetch(&repo_path) {
+                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitSwitchBranch { repo_path, name } => {
+                    match git_service::switch_branch(&repo_path, &name) {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitCreateBranch { repo_path, name } => {
+                    match git_service::create_branch(&repo_path, &name) {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitDeleteBranch { repo_path, name } => {
+                    match git_service::delete_branch(&repo_path, &name) {
+                        Ok(()) => RemoteActionResult::ok(None, None),
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::GitGetGithubAuthStatus => {
+                    let token = self.state.settings().github_token.clone();
+                    if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
+                        let username = git_service::get_github_username(&token).ok();
+                        RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitAuthStatus {
+                                has_token: true,
+                                username,
+                            }),
+                        )
+                    } else {
+                        RemoteActionResult::ok(
+                            None,
+                            Some(RemoteActionPayload::GitAuthStatus {
+                                has_token: false,
+                                username: None,
+                            }),
+                        )
+                    }
+                }
+                RemoteAction::GitRequestDeviceCode => {
+                    if let Some(client_id) = git_service::get_github_client_id() {
+                        match git_service::request_device_code(&client_id) {
+                            Ok(device_code) => RemoteActionResult::ok(
+                                None,
+                                Some(RemoteActionPayload::GitDeviceCode { device_code }),
+                            ),
+                            Err(error) => RemoteActionResult::error(error),
+                        }
+                    } else {
+                        RemoteActionResult::error(
+                            "Set DEVMANAGER_GITHUB_CLIENT_ID on the host, or use the built-in default GitHub OAuth app.",
+                        )
+                    }
+                }
+                RemoteAction::GitPollForToken { device_code } => {
+                    if let Some(client_id) = git_service::get_github_client_id() {
+                        match git_service::poll_for_token(&client_id, &device_code) {
+                            Ok(Some(token_resp)) => {
+                                let username =
+                                    git_service::get_github_username(&token_resp.access_token).ok();
+                                let mut settings = self.state.settings().clone();
+                                settings.github_token = Some(token_resp.access_token);
+                                self.state.update_settings(settings);
+                                self.save_config_state();
+                                did_change = true;
+                                RemoteActionResult::ok(
+                                    None,
+                                    Some(RemoteActionPayload::GitTokenPoll {
+                                        completed: true,
+                                        username,
+                                    }),
+                                )
+                            }
+                            Ok(None) => RemoteActionResult::ok(
+                                None,
+                                Some(RemoteActionPayload::GitTokenPoll {
+                                    completed: false,
+                                    username: None,
+                                }),
+                            ),
+                            Err(error) => RemoteActionResult::error(error),
+                        }
+                    } else {
+                        RemoteActionResult::error(
+                            "Set DEVMANAGER_GITHUB_CLIENT_ID on the host, or use the built-in default GitHub OAuth app.",
+                        )
+                    }
+                }
+                RemoteAction::GitLogout => {
+                    let mut settings = self.state.settings().clone();
+                    settings.github_token = None;
+                    self.state.update_settings(settings);
+                    self.save_config_state();
+                    did_change = true;
+                    RemoteActionResult::ok(None, None)
+                }
+                RemoteAction::GitGenerateCommitMessage { repo_path } => {
+                    if let Some(token) = self
+                        .state
+                        .settings()
+                        .github_token
+                        .clone()
+                        .filter(|token| !token.trim().is_empty())
+                    {
+                        match git_service::get_staged_diff(&repo_path) {
+                            Ok(diff) if diff.trim().is_empty() => {
+                                RemoteActionResult::error("No staged changes to summarize")
+                            }
+                            Ok(diff) => match git_service::generate_commit_message(&token, &diff) {
+                                Ok(message) => RemoteActionResult::ok(
+                                    None,
+                                    Some(RemoteActionPayload::GitCommitMessage { message }),
+                                ),
+                                Err(error) => RemoteActionResult::error(format!("AI: {error}")),
+                            },
+                            Err(error) => RemoteActionResult::error(error),
+                        }
+                    } else {
+                        RemoteActionResult::error("GitHub token not configured on the host.")
                     }
                 }
             };
@@ -3209,6 +3856,24 @@ impl NativeShell {
             .remote_mode
             .as_ref()
             .map(|remote_mode| remote_mode.connected_label.clone());
+        let remote_connected_endpoint = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| format!("{}:{}", remote_mode.address, remote_mode.port));
+        let remote_connected_server_id = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.client.server_id().to_string());
+        let remote_connected_fingerprint = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.client.certificate_fingerprint().to_string());
+        let (remote_reconnect_attempts, remote_reconnect_last_error) = self
+            .remote_mode
+            .as_ref()
+            .and_then(|remote_mode| remote_mode.reconnect.as_ref())
+            .map(|reconnect| (reconnect.attempts, reconnect.last_error.clone()))
+            .unwrap_or((0, None));
         let remote_latency_summary = self.remote_mode.as_ref().and_then(|remote_mode| {
             format_remote_latency_summary(&remote_mode.client.latency_stats())
         });
@@ -3269,7 +3934,12 @@ impl NativeShell {
                     .map(|notice| notice.is_error)
                     .unwrap_or(false),
                 remote_connected_label,
+                remote_connected_endpoint,
+                remote_connected_server_id,
+                remote_connected_fingerprint,
                 remote_latency_summary,
+                remote_reconnect_attempts,
+                remote_reconnect_last_error,
                 remote_has_control: self.remote_has_control(),
                 remote_connected: self.remote_mode.is_some(),
                 remote_host_clients: remote_status.connected_clients,
@@ -3279,6 +3949,12 @@ impl NativeShell {
                 remote_host_last_note: remote_status.last_connection_note,
                 remote_host_last_note_is_error: remote_status.last_connection_is_error,
                 remote_host_latency_summary,
+                remote_host_server_id: self.remote_machine_state.host.server_id.clone(),
+                remote_host_fingerprint: self
+                    .remote_machine_state
+                    .host
+                    .certificate_fingerprint
+                    .clone(),
                 remote_port_forwards,
                 remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
                 remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
@@ -3289,31 +3965,84 @@ impl NativeShell {
     }
 
     fn open_git_window(&mut self, cx: &mut Context<Self>) {
-        // Scan all folders across all projects for git repos
-        let mut repos: Vec<(String, String)> = Vec::new(); // (label, path)
-        for project in self.state.projects() {
-            // Check the project root itself
-            if crate::git::git_service::is_repo(&project.root_path) {
-                repos.push((project.name.clone(), project.root_path.clone()));
-            }
-            // Check each folder
-            for folder in &project.folders {
-                if !folder.folder_path.is_empty()
-                    && crate::git::git_service::is_repo(&folder.folder_path)
-                {
-                    let label = format!("{} / {}", project.name, folder.name);
-                    // Avoid duplicates (folder_path == root_path)
-                    if !repos.iter().any(|(_, p)| p == &folder.folder_path) {
-                        repos.push((label, folder.folder_path.clone()));
+        let remote_client = self
+            .remote_mode
+            .as_ref()
+            .map(|remote_mode| remote_mode.client.clone());
+        if let Some(client) = remote_client {
+            self.editor_notice = Some("Loading remote Git repositories...".to_string());
+            cx.notify();
+            let open_client = client.clone();
+            cx.spawn(
+                move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move { client.request(RemoteAction::GitListRepos) })
+                            .await;
+                        let _ = this.update(&mut cx, |this, cx| match result {
+                            Ok(result) if result.ok => match result.payload {
+                                Some(RemoteActionPayload::GitRepos { repos }) => {
+                                    let repos = repos
+                                        .into_iter()
+                                        .map(|repo| (repo.label, repo.path))
+                                        .collect::<Vec<_>>();
+                                    this.open_git_window_with_repos(
+                                        repos,
+                                        Some(open_client.clone()),
+                                        cx,
+                                    );
+                                }
+                                _ => {
+                                    this.editor_notice = Some(
+                                        "Remote host did not return any Git repositories."
+                                            .to_string(),
+                                    );
+                                    cx.notify();
+                                }
+                            },
+                            Ok(result) => {
+                                this.editor_notice = Some(result.message.unwrap_or_else(|| {
+                                    "Could not load remote Git repositories.".to_string()
+                                }));
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                this.editor_notice = Some(format!(
+                                    "Could not load remote Git repositories: {error}"
+                                ));
+                                cx.notify();
+                            }
+                        });
                     }
-                }
-            }
-        }
-
-        if repos.is_empty() {
+                },
+            )
+            .detach();
             return;
         }
 
+        let repos = collect_git_repositories(&self.state)
+            .into_iter()
+            .map(|repo| (repo.label, repo.path))
+            .collect::<Vec<_>>();
+
+        self.open_git_window_with_repos(repos, None, cx);
+    }
+
+    fn open_git_window_with_repos(
+        &mut self,
+        repos: Vec<(String, String)>,
+        remote_client: Option<RemoteClientHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if repos.is_empty() {
+            self.editor_notice = Some("No Git repositories were found.".to_string());
+            cx.notify();
+            return;
+        }
+
+        self.editor_notice = None;
         let bounds = gpui::Bounds::centered(None, gpui::size(px(1024.0), px(700.0)), cx);
         cx.open_window(
             WindowOptions {
@@ -3325,7 +4054,15 @@ impl NativeShell {
                 ..Default::default()
             },
             |_window, cx| {
-                cx.new(|cx| crate::git::GitWindow::new(repos, cx))
+                let repos = repos.clone();
+                let remote_client = remote_client.clone();
+                cx.new(move |cx| {
+                    if let Some(client) = remote_client.clone() {
+                        crate::git::GitWindow::new_remote(repos, client, cx)
+                    } else {
+                        crate::git::GitWindow::new(repos, cx)
+                    }
+                })
             },
         )
         .ok();
@@ -5388,7 +6125,8 @@ impl NativeShell {
                 }
             };
 
-            if active_tab_type == Some(TabType::Ssh) {
+            if active_tab_type == Some(TabType::Ssh) && self.terminal_input_block_reason().is_none()
+            {
                 self.maybe_auto_submit_ssh_password(active_session.as_ref());
             } else {
                 self.ssh_password_prompt_state = None;
@@ -5410,11 +6148,13 @@ impl NativeShell {
                 active_session.as_ref(),
             );
             let terminal_metrics = self.terminal_render_metrics(window);
-            let blocking_notice = active_session.as_ref().and_then(|session| {
-                session
-                    .runtime
-                    .awaiting_external_editor
-                    .then_some("Save and close text editor to continue...".to_string())
+            let blocking_notice = self.terminal_input_block_reason().or_else(|| {
+                active_session.as_ref().and_then(|session| {
+                    session
+                        .runtime
+                        .awaiting_external_editor
+                        .then_some("Save and close text editor to continue...".to_string())
+                })
             });
 
             let search_highlight = self.current_search_highlight(active_session.as_ref());
@@ -5704,7 +6444,7 @@ impl NativeShell {
             }
         }
 
-        if active_tab_type == Some(TabType::Ssh) {
+        if active_tab_type == Some(TabType::Ssh) && self.terminal_input_block_reason().is_none() {
             self.maybe_auto_submit_ssh_password(active_session.as_ref());
         } else {
             self.ssh_password_prompt_state = None;
@@ -5726,11 +6466,13 @@ impl NativeShell {
             active_session.as_ref(),
         );
         let terminal_metrics = self.terminal_render_metrics(window);
-        let blocking_notice = active_session.as_ref().and_then(|session| {
-            session
-                .runtime
-                .awaiting_external_editor
-                .then_some("Save and close text editor to continue...".to_string())
+        let blocking_notice = self.terminal_input_block_reason().or_else(|| {
+            active_session.as_ref().and_then(|session| {
+                session
+                    .runtime
+                    .awaiting_external_editor
+                    .then_some("Save and close text editor to continue...".to_string())
+            })
         });
 
         let search_highlight = self.current_search_highlight(active_session.as_ref());
@@ -6423,6 +7165,11 @@ impl NativeShell {
             && port
                 .and_then(|value| self.remote_port_forward_state(value))
                 .is_some_and(|state| state.listener_active);
+        let remote_forward_state = if remote {
+            port.and_then(|value| self.remote_port_forward_state(value))
+        } else {
+            None
+        };
         let port_status = if remote {
             self.active_port_state = None;
             port.and_then(|port| self.current_port_statuses().get(&port).cloned())
@@ -6450,7 +7197,7 @@ impl NativeShell {
             && port_status.as_ref().is_some_and(|status| !status.in_use);
         let port_label = port.map(|port| {
             if let Some(status) = port_status.as_ref() {
-                if probe_disagrees_with_live_session {
+                let base = if probe_disagrees_with_live_session {
                     format!("port {port} • probing")
                 } else if status.in_use {
                     if is_managed_port_owner(active_session, status) {
@@ -6467,6 +7214,18 @@ impl NativeShell {
                     }
                 } else {
                     format!("port {port} • free")
+                };
+
+                if let Some(forward_state) = remote_forward_state.as_ref() {
+                    if forward_state.listener_active {
+                        format!("{base} • mirrored locally")
+                    } else if forward_state.local_port_busy {
+                        format!("{base} • local port busy")
+                    } else {
+                        base
+                    }
+                } else {
+                    base
                 }
             } else {
                 format!("port {port} • checking")
@@ -7798,8 +8557,11 @@ impl NativeShell {
         let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         let session_id = self.resolved_terminal_session_id(active_session.as_ref());
+        let terminal_input_blocked = self.terminal_input_block_reason().is_some();
 
-        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
+            && !terminal_input_blocked
+        {
             self.terminal_selection = None;
             self.is_selecting_terminal = false;
             self.last_terminal_mouse_report = None;
@@ -7909,7 +8671,10 @@ impl NativeShell {
 
         let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
-        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
+        let terminal_input_blocked = self.terminal_input_block_reason().is_some();
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
+            && !terminal_input_blocked
+        {
             if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                 let report_key = (cell, event.pressed_button);
                 if self.last_terminal_mouse_report != Some(report_key) {
@@ -8037,7 +8802,10 @@ impl NativeShell {
 
         let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
-        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
+        let terminal_input_blocked = self.terminal_input_block_reason().is_some();
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
+            && !terminal_input_blocked
+        {
             if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                 if let Some(sequence) = mouse_button_report(
                     session_mode.unwrap_or_default(),
@@ -8098,7 +8866,10 @@ impl NativeShell {
 
         let active_session = self.current_active_session_view();
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
-        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode)) {
+        let terminal_input_blocked = self.terminal_input_block_reason().is_some();
+        if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
+            && !terminal_input_blocked
+        {
             let cell = self
                 .grid_position_for_mouse(event.position, window, true)
                 .unwrap_or(TerminalGridPosition { row: 0, column: 0 });
@@ -8250,6 +9021,12 @@ impl NativeShell {
                 }
             }
             TerminalKeyAction::Paste => {
+                if let Some(reason) = self.terminal_input_block_reason() {
+                    self.terminal_notice = Some(reason);
+                    cx.notify();
+                    window.prevent_default();
+                    return;
+                }
                 if self.state.settings().terminal_read_only {
                     self.terminal_notice =
                         Some("Terminal is read-only. Disable it to paste.".to_string());
@@ -8308,6 +9085,12 @@ impl NativeShell {
                 window.prevent_default();
             }
             TerminalKeyAction::SendInput(input) => {
+                if let Some(reason) = self.terminal_input_block_reason() {
+                    self.terminal_notice = Some(reason);
+                    cx.notify();
+                    window.prevent_default();
+                    return;
+                }
                 if self.state.settings().terminal_read_only {
                     self.terminal_notice =
                         Some("Terminal is read-only. Disable it to type.".to_string());
@@ -8374,6 +9157,7 @@ impl NativeShell {
             let Some(session_id) = self.resolved_terminal_session_id(Some(&session)) else {
                 return;
             };
+            let terminal_input_blocked = self.terminal_input_block_reason().is_some();
             let target_display_offset = session
                 .screen
                 .display_offset
@@ -8389,7 +9173,7 @@ impl NativeShell {
             } else {
                 None
             };
-            if self.terminal_mouse_capture_active(session.screen.mode) {
+            if self.terminal_mouse_capture_active(session.screen.mode) && !terminal_input_blocked {
                 if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                     if let Some(sequences) =
                         mouse_scroll_report(session.screen.mode, cell, delta_lines, event)
@@ -8412,6 +9196,7 @@ impl NativeShell {
             } else if session.screen.mode.alternate_screen
                 && session.screen.mode.alternate_scroll
                 && !event.modifiers.shift
+                && !terminal_input_blocked
             {
                 let sequence = alt_scroll_bytes(delta_lines);
                 if self.remote_mode.is_some() {
@@ -11113,6 +11898,40 @@ fn remote_fs_entry_from_metadata(
             .and_then(|metadata| (!metadata.is_dir()).then_some(metadata.len())),
         modified_epoch_ms,
     }
+}
+
+fn collect_git_repositories(state: &AppState) -> Vec<RemoteGitRepo> {
+    collect_git_repositories_from_projects(state.projects())
+}
+
+fn collect_git_repositories_from_projects(projects: &[Project]) -> Vec<RemoteGitRepo> {
+    let mut repos = Vec::new();
+
+    for project in projects {
+        if git_service::is_repo(&project.root_path) {
+            repos.push(RemoteGitRepo {
+                label: project.name.clone(),
+                path: project.root_path.clone(),
+            });
+        }
+
+        for folder in &project.folders {
+            if folder.folder_path.is_empty() || !git_service::is_repo(&folder.folder_path) {
+                continue;
+            }
+
+            if repos.iter().any(|repo| repo.path == folder.folder_path) {
+                continue;
+            }
+
+            repos.push(RemoteGitRepo {
+                label: format!("{} / {}", project.name, folder.name),
+                path: folder.folder_path.clone(),
+            });
+        }
+    }
+
+    repos
 }
 
 fn system_time_to_epoch_ms(time: SystemTime) -> Option<u64> {

@@ -1175,7 +1175,12 @@ pub struct SettingsDraft {
     pub remote_connect_status: Option<String>,
     pub remote_connect_status_is_error: bool,
     pub remote_connected_label: Option<String>,
+    pub remote_connected_endpoint: Option<String>,
+    pub remote_connected_server_id: Option<String>,
+    pub remote_connected_fingerprint: Option<String>,
     pub remote_latency_summary: Option<String>,
+    pub remote_reconnect_attempts: u32,
+    pub remote_reconnect_last_error: Option<String>,
     pub remote_has_control: bool,
     pub remote_connected: bool,
     pub remote_host_clients: usize,
@@ -1185,6 +1190,8 @@ pub struct SettingsDraft {
     pub remote_host_last_note: Option<String>,
     pub remote_host_last_note_is_error: bool,
     pub remote_host_latency_summary: Option<String>,
+    pub remote_host_server_id: String,
+    pub remote_host_fingerprint: String,
     pub remote_port_forwards: Vec<RemotePortForwardDraft>,
     pub remote_known_hosts: Vec<KnownRemoteHost>,
     pub remote_paired_clients: Vec<PairedRemoteClient>,
@@ -1585,15 +1592,15 @@ fn render_settings_editor_surface(
                 .border_b_1()
                 .border_color(rgb(theme::BORDER_PRIMARY))
                 .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT_PRIMARY))
-                            .child(if draft.remote_focus_only {
-                                "Remote"
-                            } else {
-                                "Settings"
-                            }),
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .child(if draft.remote_focus_only {
+                            "Remote"
+                        } else {
+                            "Settings"
+                        }),
                 )
                 .child(render_settings_close_button(on_close)),
         )
@@ -1712,7 +1719,7 @@ fn render_settings_panel(
         );
     }
 
-    if !draft.remote_connected && !draft.remote_focus_only {
+    if !draft.remote_focus_only {
         sections.push(FormSection::new("App").fields(vec![
             FormField::toggle(
                 "Confirm before closing",
@@ -1841,7 +1848,7 @@ fn render_settings_panel(
         ),
     ]);
 
-    if !draft.remote_connected {
+    if !draft.remote_focus_only {
         sections.push(FormSection::new("Terminal").fields(terminal_fields));
 
         sections.push(FormSection::new("AI").fields(vec![
@@ -1932,7 +1939,7 @@ fn render_settings_panel(
         }));
     }
 
-    if draft.remote_connected {
+    if draft.remote_focus_only && draft.remote_connected {
         let mut fields = Vec::new();
         if let Some(status) = draft.remote_connect_status.as_ref() {
             fields.push(FormField::notice(
@@ -2002,6 +2009,42 @@ fn render_settings_panel(
                 "Latency",
                 latency_summary.clone(),
                 Some("Recent transport and paint timings from this remote client.".to_string()),
+            ));
+        }
+        if let Some(endpoint) = draft.remote_connected_endpoint.as_ref() {
+            fields.push(FormField::info(
+                "Endpoint",
+                endpoint.clone(),
+                Some("Address this client is currently connected to.".to_string()),
+            ));
+        }
+        if let Some(server_id) = draft.remote_connected_server_id.as_ref() {
+            fields.push(FormField::info(
+                "Host server id",
+                server_id.clone(),
+                Some("Stable identity for the connected DevManager host.".to_string()),
+            ));
+        }
+        if let Some(fingerprint) = draft.remote_connected_fingerprint.as_ref() {
+            fields.push(FormField::info(
+                "Host fingerprint",
+                fingerprint.clone(),
+                Some("Pinned TLS fingerprint for this host.".to_string()),
+            ));
+        }
+        if draft.remote_reconnect_attempts > 0 {
+            fields.push(FormField::info(
+                "Reconnect attempts",
+                draft.remote_reconnect_attempts.to_string(),
+                Some(
+                    "Automatic reconnect retries since the last successful connection.".to_string(),
+                ),
+            ));
+        }
+        if let Some(error) = draft.remote_reconnect_last_error.as_ref() {
+            fields.push(FormField::notice(
+                format!("Last transient error: {error}"),
+                SurfaceTone::Warning,
             ));
         }
         let mut session_actions = FormActionGroup::new("Remote session").action(
@@ -2074,7 +2117,9 @@ fn render_settings_panel(
                 .hint("Remote host servers exposed on this client's localhost.")
                 .fields(forward_fields),
         );
-    } else {
+    }
+
+    if draft.remote_focus_only && !draft.remote_connected {
         let connect_fields = vec![
             FormField::notice(
                 draft.remote_connect_status.clone().unwrap_or_else(|| {
@@ -2300,7 +2345,24 @@ fn render_settings_panel(
                     "Whoever has control can type into terminals and manage the host.".to_string(),
                 ),
             ),
+            FormField::info(
+                "Host server id",
+                draft.remote_host_server_id.clone(),
+                Some("Stable identity for this host when clients reconnect.".to_string()),
+            ),
+            FormField::info(
+                "TLS fingerprint",
+                draft.remote_host_fingerprint.clone(),
+                Some("Clients pin this fingerprint after pairing.".to_string()),
+            ),
         ];
+        if draft.remote_keep_hosting_in_background {
+            host_fields.push(FormField::notice(
+                "Closing the main window keeps hosting alive in the background. Reopen DevManager from the taskbar when you want the host window again."
+                    .to_string(),
+                SurfaceTone::Muted,
+            ));
+        }
         if draft.remote_host_enabled && !draft.remote_host_listening {
             host_fields.push(FormField::notice(
                 "Hosting is enabled, but this device is not currently listening. Check the bind address, port, or firewall state."
@@ -3626,6 +3688,13 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         remote_connect_status: Some("Connected to studio-pc.".to_string()),
         remote_connect_status_is_error: false,
         remote_connected_label: Some("studio-pc".to_string()),
+        remote_connected_endpoint: Some("192.168.0.20:43871".to_string()),
+        remote_connected_server_id: Some("host-studio".to_string()),
+        remote_connected_fingerprint: Some("fingerprint".to_string()),
+        remote_reconnect_attempts: 1,
+        remote_reconnect_last_error: Some(
+            "Connection reset during sleep recovery; reconnected automatically.".to_string(),
+        ),
         remote_latency_summary: Some("host 2 ms • paint 1 ms".to_string()),
         remote_has_control: true,
         remote_connected: true,
@@ -3638,6 +3707,8 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         ),
         remote_host_last_note_is_error: false,
         remote_host_latency_summary: Some("write 1 ms".to_string()),
+        remote_host_server_id: "host-studio".to_string(),
+        remote_host_fingerprint: "fingerprint".to_string(),
         remote_port_forwards: vec![
             RemotePortForwardDraft {
                 label: "localhost:5173".to_string(),

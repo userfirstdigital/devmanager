@@ -2,6 +2,7 @@ pub mod git_service;
 mod git_ui;
 
 use crate::persistence;
+use crate::remote::{RemoteAction, RemoteActionPayload, RemoteClientHandle};
 use crate::theme;
 use git_service::{GitBranch, GitDiffResult, GitLogEntry, GitStatusEntry, GitStatusResult};
 use gpui::{
@@ -50,6 +51,7 @@ pub struct LoginState {
 // ── GitWindow ───────────────────────────────────────────────────────────────
 
 pub struct GitWindow {
+    backend: GitBackend,
     pub repos: Vec<RepoEntry>,
     pub active_repo: usize,
     pub show_repo_dropdown: bool,
@@ -83,6 +85,12 @@ pub struct GitWindow {
     pub operation_result: Option<(bool, String)>,
 }
 
+#[derive(Clone)]
+enum GitBackend {
+    Local,
+    Remote(RemoteClientHandle),
+}
+
 macro_rules! git_spawn {
     ($cx:expr, |$this:ident, $acx:ident| $body:block) => {
         $cx.spawn(move |$this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -95,6 +103,22 @@ macro_rules! git_spawn {
 
 impl GitWindow {
     pub fn new(repos: Vec<(String, String)>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_backend(repos, GitBackend::Local, cx)
+    }
+
+    pub fn new_remote(
+        repos: Vec<(String, String)>,
+        client: RemoteClientHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_backend(repos, GitBackend::Remote(client), cx)
+    }
+
+    fn new_with_backend(
+        repos: Vec<(String, String)>,
+        backend: GitBackend,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         let repos: Vec<RepoEntry> = repos
             .into_iter()
@@ -106,6 +130,7 @@ impl GitWindow {
             })
             .collect();
         let mut win = Self {
+            backend,
             repos,
             active_repo: 0,
             show_repo_dropdown: false,
@@ -138,7 +163,9 @@ impl GitWindow {
             last_fetch_at: None,
             operation_result: None,
         };
-        win.load_persisted_token();
+        if matches!(win.backend, GitBackend::Local) {
+            win.load_persisted_token();
+        }
         win.fetch_github_username(cx);
         win.refresh_status(cx);
         win
@@ -150,6 +177,83 @@ impl GitWindow {
 
     pub fn repo_label(&self) -> &str {
         &self.repos[self.active_repo].label
+    }
+
+    fn remote_client(&self) -> Option<RemoteClientHandle> {
+        match &self.backend {
+            GitBackend::Local => None,
+            GitBackend::Remote(client) => Some(client.clone()),
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self.backend, GitBackend::Remote(_))
+    }
+
+    fn set_remote_auth_state(&mut self, has_token: bool, username: Option<String>) {
+        self.github_token = has_token.then(|| "__remote_host__".to_string());
+        self.github_username = username;
+    }
+
+    fn has_mutation_control(&self) -> bool {
+        self.remote_client()
+            .and_then(|client| client.latest_snapshot())
+            .map(|snapshot| snapshot.you_have_control)
+            .unwrap_or(true)
+    }
+
+    fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.has_mutation_control() {
+            return true;
+        }
+        self.operation_result = Some((
+            false,
+            "Take control before changing Git state on the remote host.".to_string(),
+        ));
+        cx.notify();
+        false
+    }
+
+    fn logout_github(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if let Some(client) = self.remote_client() {
+            git_spawn!(cx, |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { client.request(RemoteAction::GitLogout) })
+                    .await;
+                let _ = this.update(&mut cx, |this, cx| {
+                    match result {
+                        Ok(result) if result.ok => {
+                            this.github_token = None;
+                            this.github_username = None;
+                            this.operation_result = Some((true, "Logged out".to_string()));
+                        }
+                        Ok(result) => {
+                            this.operation_result = Some((
+                                false,
+                                result.message.unwrap_or_else(|| {
+                                    "Could not log out from GitHub.".to_string()
+                                }),
+                            ));
+                        }
+                        Err(error) => {
+                            this.operation_result = Some((false, error));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+            return;
+        }
+
+        self.github_token = None;
+        self.github_username = None;
+        Self::persist_github_token(None);
+        self.operation_result = Some((true, "Logged out".to_string()));
+        cx.notify();
     }
 
     pub fn switch_repo(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -183,25 +287,45 @@ impl GitWindow {
             .map(|(i, r)| (i, r.path.clone()))
             .collect();
 
+        let remote_client = self.remote_client();
+
         git_spawn!(cx, |this, cx| {
-            let results: Vec<(usize, bool, u32)> = cx
-                .background_executor()
-                .spawn(async move {
-                    paths
-                        .into_iter()
-                        .map(|(i, path)| {
-                            let status = git_service::status(&path);
-                            match status {
-                                Ok(s) => {
-                                    let has_changes = !s.entries.is_empty();
-                                    (i, has_changes, s.behind)
+            let results: Vec<(usize, bool, u32)> =
+                cx.background_executor()
+                    .spawn(async move {
+                        paths
+                            .into_iter()
+                            .map(|(i, path)| {
+                                let status = if let Some(client) = remote_client.clone() {
+                                    match client.request(RemoteAction::GitStatus {
+                                        repo_path: path.clone(),
+                                    }) {
+                                        Ok(result) if result.ok => match result.payload {
+                                            Some(RemoteActionPayload::GitStatus { status }) => {
+                                                Ok(status)
+                                            }
+                                            _ => Err("Remote host did not return Git status."
+                                                .to_string()),
+                                        },
+                                        Ok(result) => Err(result.message.unwrap_or_else(|| {
+                                            "Could not load remote Git status.".to_string()
+                                        })),
+                                        Err(error) => Err(error),
+                                    }
+                                } else {
+                                    git_service::status(&path)
+                                };
+                                match status {
+                                    Ok(s) => {
+                                        let has_changes = !s.entries.is_empty();
+                                        (i, has_changes, s.behind)
+                                    }
+                                    Err(_) => (i, false, 0),
                                 }
-                                Err(_) => (i, false, 0),
-                            }
-                        })
-                        .collect()
-                })
-                .await;
+                            })
+                            .collect()
+                    })
+                    .await;
             let _ = this.update(&mut cx, |this, cx| {
                 for (i, has_changes, behind) in results {
                     if let Some(repo) = this.repos.get_mut(i) {
@@ -222,19 +346,45 @@ impl GitWindow {
 
     fn refresh_status_inner(&mut self, auto_stage: bool, cx: &mut Context<Self>) {
         let repo = self.repo_path().to_string();
+        let remote_client = self.remote_client();
         self.is_loading = true;
         git_spawn!(cx, |this, cx| {
             // Auto-stage all files so they appear checked by default (like GitHub Desktop)
             if auto_stage {
-                let repo2 = repo.clone();
-                let _ = cx
-                    .background_executor()
-                    .spawn(async move { git_service::stage_all(&repo2) })
-                    .await;
+                if let Some(client) = remote_client.clone() {
+                    let repo2 = repo.clone();
+                    let _ = cx
+                        .background_executor()
+                        .spawn(async move {
+                            client.request(RemoteAction::GitStageAll { repo_path: repo2 })
+                        })
+                        .await;
+                } else {
+                    let repo2 = repo.clone();
+                    let _ = cx
+                        .background_executor()
+                        .spawn(async move { git_service::stage_all(&repo2) })
+                        .await;
+                }
             }
             let status = cx
                 .background_executor()
-                .spawn(async move { git_service::status(&repo) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitStatus { repo_path: repo }) {
+                            Ok(result) if result.ok => match result.payload {
+                                Some(RemoteActionPayload::GitStatus { status }) => Ok(status),
+                                _ => Err("Remote host did not return Git status.".to_string()),
+                            },
+                            Ok(result) => Err(result.message.unwrap_or_else(|| {
+                                "Could not load remote Git status.".to_string()
+                            })),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::status(&repo)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 this.is_loading = false;
@@ -260,10 +410,26 @@ impl GitWindow {
 
     pub fn load_branches(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo_path().to_string();
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
             let branches = cx
                 .background_executor()
-                .spawn(async move { git_service::branches(&repo) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitBranches { repo_path: repo }) {
+                            Ok(result) if result.ok => match result.payload {
+                                Some(RemoteActionPayload::GitBranches { branches }) => Ok(branches),
+                                _ => Err("Remote host did not return branch data.".to_string()),
+                            },
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not load remote branches.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::branches(&repo)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 if let Ok(b) = branches {
@@ -277,10 +443,30 @@ impl GitWindow {
     pub fn load_history(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo_path().to_string();
         let skip = self.log_page * 50;
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
             let entries = cx
                 .background_executor()
-                .spawn(async move { git_service::log(&repo, 50, skip) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitLog {
+                            repo_path: repo,
+                            limit: 50,
+                            skip,
+                        }) {
+                            Ok(result) if result.ok => match result.payload {
+                                Some(RemoteActionPayload::GitLogEntries { entries }) => Ok(entries),
+                                _ => Err("Remote host did not return Git history.".to_string()),
+                            },
+                            Ok(result) => Err(result.message.unwrap_or_else(|| {
+                                "Could not load remote Git history.".to_string()
+                            })),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::log(&repo, 50, skip)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 if let Ok(e) = entries {
@@ -302,6 +488,7 @@ impl GitWindow {
         self.file_diff = None;
         let repo = self.repo_path().to_string();
         let file_path = path.to_string();
+        let remote_client = self.remote_client();
         let staged = self
             .status
             .as_ref()
@@ -312,7 +499,26 @@ impl GitWindow {
         git_spawn!(cx, |this, cx| {
             let diff = cx
                 .background_executor()
-                .spawn(async move { git_service::diff_file(&repo, &file_path, staged) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitDiffFile {
+                            repo_path: repo,
+                            file_path,
+                            staged,
+                        }) {
+                            Ok(result) if result.ok => match result.payload {
+                                Some(RemoteActionPayload::GitDiff { diff }) => Ok(diff),
+                                _ => Err("Remote host did not return a file diff.".to_string()),
+                            },
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not load remote file diff.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::diff_file(&repo, &file_path, staged)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 match diff {
@@ -329,11 +535,30 @@ impl GitWindow {
         self.commit_diff = None;
         let repo = self.repo_path().to_string();
         let hash = hash.to_string();
+        let remote_client = self.remote_client();
 
         git_spawn!(cx, |this, cx| {
             let diff = cx
                 .background_executor()
-                .spawn(async move { git_service::diff_commit(&repo, &hash) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitDiffCommit {
+                            repo_path: repo,
+                            hash,
+                        }) {
+                            Ok(result) if result.ok => match result.payload {
+                                Some(RemoteActionPayload::GitDiff { diff }) => Ok(diff),
+                                _ => Err("Remote host did not return a commit diff.".to_string()),
+                            },
+                            Ok(result) => Err(result.message.unwrap_or_else(|| {
+                                "Could not load remote commit diff.".to_string()
+                            })),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::diff_commit(&repo, &hash)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 match diff {
@@ -348,54 +573,136 @@ impl GitWindow {
     // ── Staging ─────────────────────────────────────────────────────────
 
     pub fn stage_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
         let file_path = path.to_string();
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
-            let _ = cx
+            let result = cx
                 .background_executor()
-                .spawn(async move { git_service::stage(&repo, &[file_path.as_str()]) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitStage {
+                            repo_path: repo,
+                            files: vec![file_path],
+                        }) {
+                            Ok(result) if result.ok => Ok(()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not stage file.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::stage(&repo, &[file_path.as_str()])
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if let Err(error) = result {
+                    this.operation_result = Some((false, error));
+                }
                 this.refresh_status(cx);
             });
         });
     }
 
     pub fn unstage_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
         let file_path = path.to_string();
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
-            let _ = cx
+            let result = cx
                 .background_executor()
-                .spawn(async move { git_service::unstage(&repo, &[file_path.as_str()]) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitUnstage {
+                            repo_path: repo,
+                            files: vec![file_path],
+                        }) {
+                            Ok(result) if result.ok => Ok(()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not unstage file.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::unstage(&repo, &[file_path.as_str()])
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if let Err(error) = result {
+                    this.operation_result = Some((false, error));
+                }
                 this.refresh_status(cx);
             });
         });
     }
 
     pub fn stage_all(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
-            let _ = cx
+            let result = cx
                 .background_executor()
-                .spawn(async move { git_service::stage_all(&repo) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitStageAll { repo_path: repo }) {
+                            Ok(result) if result.ok => Ok(()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not stage all files.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::stage_all(&repo)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if let Err(error) = result {
+                    this.operation_result = Some((false, error));
+                }
                 this.refresh_status(cx);
             });
         });
     }
 
     pub fn unstage_all(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
-            let _ = cx
+            let result = cx
                 .background_executor()
-                .spawn(async move { git_service::unstage_all(&repo) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitUnstageAll { repo_path: repo }) {
+                            Ok(result) if result.ok => Ok(()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not unstage all files.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::unstage_all(&repo)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if let Err(error) = result {
+                    this.operation_result = Some((false, error));
+                }
                 this.refresh_status(cx);
             });
         });
@@ -424,6 +731,41 @@ impl GitWindow {
     }
 
     fn fetch_github_username(&mut self, cx: &mut Context<Self>) {
+        if let Some(client) = self.remote_client() {
+            git_spawn!(cx, |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { client.request(RemoteAction::GitGetGithubAuthStatus) })
+                    .await;
+                let _ = this.update(&mut cx, |this, cx| {
+                    match result {
+                        Ok(result) if result.ok => {
+                            if let Some(RemoteActionPayload::GitAuthStatus {
+                                has_token,
+                                username,
+                            }) = result.payload
+                            {
+                                this.set_remote_auth_state(has_token, username);
+                            }
+                        }
+                        Ok(result) => {
+                            this.operation_result = Some((
+                                false,
+                                result.message.unwrap_or_else(|| {
+                                    "Could not load remote GitHub auth state.".to_string()
+                                }),
+                            ));
+                        }
+                        Err(error) => {
+                            this.operation_result = Some((false, error));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+            return;
+        }
+
         let Some(ref token) = self.github_token else {
             return;
         };
@@ -445,6 +787,53 @@ impl GitWindow {
     // ── GitHub login ─────────────────────────────────────────────────
 
     pub fn start_github_login(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if let Some(client) = self.remote_client() {
+            git_spawn!(cx, |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { client.request(RemoteAction::GitRequestDeviceCode) })
+                    .await;
+                let _ = this.update(&mut cx, |this, cx| {
+                    match result {
+                        Ok(result) if result.ok => match result.payload {
+                            Some(RemoteActionPayload::GitDeviceCode { device_code }) => {
+                                let _ = crate::services::open_url(&device_code.verification_uri);
+                                this.login_state = Some(LoginState {
+                                    user_code: device_code.user_code,
+                                    verification_uri: device_code.verification_uri,
+                                    device_code: device_code.device_code,
+                                    is_polling: true,
+                                });
+                                this.poll_github_login(String::new(), cx);
+                            }
+                            _ => {
+                                this.operation_result = Some((
+                                    false,
+                                    "Remote host did not return a GitHub device code.".to_string(),
+                                ));
+                            }
+                        },
+                        Ok(result) => {
+                            this.operation_result = Some((
+                                false,
+                                result.message.unwrap_or_else(|| {
+                                    "Could not start remote GitHub login.".to_string()
+                                }),
+                            ));
+                        }
+                        Err(error) => {
+                            this.operation_result = Some((false, error));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+            return;
+        }
+
         let client_id = match git_service::get_github_client_id() {
             Some(id) => id,
             None => {
@@ -492,97 +881,152 @@ impl GitWindow {
         };
         let device_code = state.device_code.clone();
         let cid = client_id.clone();
+        let remote_client = self.remote_client();
 
-        cx.spawn(move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                // Poll every 5 seconds, up to 60 attempts (5 minutes)
-                for _ in 0..60 {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(5))
-                        .await;
-                    let cid2 = cid.clone();
-                    let dc = device_code.clone();
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move { git_service::poll_for_token(&cid2, &dc) })
-                        .await;
-                    let should_stop = this
-                        .update(&mut cx, |this, cx| {
-                            match result {
-                                Ok(Some(token_resp)) => {
-                                    // Fetch username
-                                    let username = git_service::get_github_username(
-                                        &token_resp.access_token,
-                                    )
-                                    .ok();
-                                    this.github_token =
-                                        Some(token_resp.access_token.clone());
-                                    this.github_username = username;
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    // Poll every 5 seconds, up to 60 attempts (5 minutes)
+                    for _ in 0..60 {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(5))
+                            .await;
+                        let dc = device_code.clone();
+                        let remote_client = remote_client.clone();
+                        let cid = cid.clone();
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move {
+                                if let Some(client) = remote_client.clone() {
+                                    match client
+                                        .request(RemoteAction::GitPollForToken { device_code: dc })
+                                    {
+                                        Ok(result) if result.ok => match result.payload {
+                                            Some(RemoteActionPayload::GitTokenPoll {
+                                                completed,
+                                                username,
+                                            }) => Ok((completed, username, None)),
+                                            _ => Err(
+                                                "Remote host did not return GitHub login state."
+                                                    .to_string(),
+                                            ),
+                                        },
+                                        Ok(result) => Err(result.message.unwrap_or_else(|| {
+                                            "Remote GitHub login failed.".to_string()
+                                        })),
+                                        Err(error) => Err(error),
+                                    }
+                                } else {
+                                    let cid2 = cid.clone();
+                                    match git_service::poll_for_token(&cid2, &dc) {
+                                        Ok(Some(token_resp)) => Ok((
+                                            true,
+                                            git_service::get_github_username(
+                                                &token_resp.access_token,
+                                            )
+                                            .ok(),
+                                            Some(token_resp.access_token),
+                                        )),
+                                        Ok(None) => Ok((false, None, None)),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                            })
+                            .await;
+                        let should_stop = this
+                            .update(&mut cx, |this, cx| match result {
+                                Ok((true, username, token)) => {
+                                    if this.is_remote() {
+                                        this.set_remote_auth_state(true, username);
+                                    } else {
+                                        if let Some(token) = token {
+                                            this.github_token = Some(token.clone());
+                                            Self::persist_github_token(Some(token));
+                                        }
+                                        this.github_username = username;
+                                    }
                                     this.login_state = None;
                                     this.operation_result =
                                         Some((true, "Logged in to GitHub".to_string()));
-                                    // Persist token to config
-                                    Self::persist_github_token(
-                                        Some(token_resp.access_token),
-                                    );
                                     cx.notify();
-                                    return true; // stop polling
+                                    return true;
                                 }
-                                Ok(None) => {
-                                    // Still waiting
+                                Ok((false, _, _)) => {
                                     return false;
                                 }
                                 Err(e) => {
                                     this.login_state = None;
                                     this.operation_result = Some((false, e));
                                     cx.notify();
-                                    return true; // stop polling
+                                    return true;
                                 }
-                            }
-                        })
-                        .unwrap_or(true);
-                    if should_stop {
-                        return;
+                            })
+                            .unwrap_or(true);
+                        if should_stop {
+                            return;
+                        }
                     }
+                    // Timed out
+                    let _ = this.update(&mut cx, |this, cx| {
+                        this.login_state = None;
+                        this.operation_result =
+                            Some((false, "Login timed out. Please try again.".to_string()));
+                        cx.notify();
+                    });
                 }
-                // Timed out
-                let _ = this.update(&mut cx, |this, cx| {
-                    this.login_state = None;
-                    this.operation_result =
-                        Some((false, "Login timed out. Please try again.".to_string()));
-                    cx.notify();
-                });
-            }
-        })
+            },
+        )
         .detach();
     }
 
     // ── AI commit message ─────────────────────────────────────────────
 
     pub fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
-        let Some(ref token) = self.github_token else {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        if self.github_token.is_none() {
             self.operation_result =
                 Some((false, "GitHub token not configured in Settings".to_string()));
             cx.notify();
             return;
-        };
+        }
         let repo = self.repo_path().to_string();
-        let token = token.clone();
+        let remote_client = self.remote_client();
+        let token = self.github_token.clone().unwrap_or_default();
         self.is_generating_message = true;
         cx.notify();
 
         git_spawn!(cx, |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let diff = git_service::get_staged_diff(&repo)?;
-                    if diff.trim().is_empty() {
-                        return Err("No staged changes to summarize".to_string());
-                    }
-                    git_service::generate_commit_message(&token, &diff)
-                })
-                .await;
+            let result =
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Some(client) = remote_client {
+                            match client
+                                .request(RemoteAction::GitGenerateCommitMessage { repo_path: repo })
+                            {
+                                Ok(result) if result.ok => match result.payload {
+                                    Some(RemoteActionPayload::GitCommitMessage { message }) => {
+                                        Ok(message)
+                                    }
+                                    _ => Err("Remote host did not return an AI commit message."
+                                        .to_string()),
+                                },
+                                Ok(result) => Err(result
+                                    .message
+                                    .unwrap_or_else(|| "AI: request failed".to_string())),
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            let diff = git_service::get_staged_diff(&repo)?;
+                            if diff.trim().is_empty() {
+                                return Err("No staged changes to summarize".to_string());
+                            }
+                            git_service::generate_commit_message(&token, &diff)
+                        }
+                    })
+                    .await;
             let _ = this.update(&mut cx, |this, cx| {
                 this.is_generating_message = false;
                 match result {
@@ -602,6 +1046,9 @@ impl GitWindow {
     // ── Commit ──────────────────────────────────────────────────────────
 
     pub fn commit_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         if self.commit_summary.trim().is_empty() {
             self.operation_result = Some((false, "Summary is required".to_string()));
             cx.notify();
@@ -614,11 +1061,31 @@ impl GitWindow {
         } else {
             Some(self.commit_description.clone())
         };
+        let remote_client = self.remote_client();
 
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { git_service::commit(&repo, &summary, body.as_deref()) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitCommit {
+                            repo_path: repo,
+                            summary,
+                            body,
+                        }) {
+                            Ok(result) if result.ok => match result.payload {
+                                Some(RemoteActionPayload::GitCommit { hash }) => Ok(hash),
+                                _ => Err("Remote host did not return a commit hash.".to_string()),
+                            },
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not create remote commit.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::commit(&repo, &summary, body.as_deref())
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 match result {
@@ -640,6 +1107,9 @@ impl GitWindow {
     // ── Push / Pull / Fetch ─────────────────────────────────────────────
 
     pub fn push_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
         let has_upstream = self
             .status
@@ -651,6 +1121,7 @@ impl GitWindow {
             .as_ref()
             .and_then(|s| s.branch.clone())
             .unwrap_or_default();
+        let remote_client = self.remote_client();
         self.is_pushing = true;
         cx.notify();
 
@@ -658,10 +1129,28 @@ impl GitWindow {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    if has_upstream {
-                        git_service::push(&repo)
+                    if let Some(client) = remote_client {
+                        let action = if has_upstream {
+                            RemoteAction::GitPush { repo_path: repo }
+                        } else {
+                            RemoteAction::GitPushSetUpstream {
+                                repo_path: repo,
+                                branch,
+                            }
+                        };
+                        match client.request(action) {
+                            Ok(result) if result.ok => Ok(result.message.unwrap_or_default()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not push remote branch.".to_string())),
+                            Err(error) => Err(error),
+                        }
                     } else {
-                        git_service::push_set_upstream(&repo, &branch)
+                        if has_upstream {
+                            git_service::push(&repo)
+                        } else {
+                            git_service::push_set_upstream(&repo, &branch)
+                        }
                     }
                 })
                 .await;
@@ -687,13 +1176,29 @@ impl GitWindow {
     }
 
     pub fn pull_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
+        let remote_client = self.remote_client();
         self.is_pulling = true;
         cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { git_service::pull(&repo) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitPull { repo_path: repo }) {
+                            Ok(result) if result.ok => Ok(result.message.unwrap_or_default()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not pull remote branch.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::pull(&repo)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 this.is_pulling = false;
@@ -717,13 +1222,29 @@ impl GitWindow {
     }
 
     pub fn fetch_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
+        let remote_client = self.remote_client();
         self.is_fetching = true;
         cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { git_service::fetch(&repo) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitFetch { repo_path: repo }) {
+                            Ok(result) if result.ok => Ok(result.message.unwrap_or_default()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not fetch remote branch.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::fetch(&repo)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 this.is_fetching = false;
@@ -740,13 +1261,32 @@ impl GitWindow {
     // ── Branch operations ───────────────────────────────────────────────
 
     pub fn switch_branch_action(&mut self, name: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
         let branch = name.to_string();
+        let remote_client = self.remote_client();
         self.show_branch_dropdown = false;
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { git_service::switch_branch(&repo, &branch) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitSwitchBranch {
+                            repo_path: repo,
+                            name: branch,
+                        }) {
+                            Ok(result) if result.ok => Ok(()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not switch remote branch.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::switch_branch(&repo, &branch)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 match result {
@@ -768,6 +1308,9 @@ impl GitWindow {
     }
 
     pub fn create_branch_action(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         if self.new_branch_name.trim().is_empty() {
             return;
         }
@@ -775,10 +1318,26 @@ impl GitWindow {
         let name = self.new_branch_name.trim().to_string();
         self.new_branch_name.clear();
         self.show_branch_dropdown = false;
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { git_service::create_branch(&repo, &name) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitCreateBranch {
+                            repo_path: repo,
+                            name,
+                        }) {
+                            Ok(result) if result.ok => Ok(()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not create remote branch.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::create_branch(&repo, &name)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 match result {
@@ -791,12 +1350,31 @@ impl GitWindow {
     }
 
     pub fn delete_branch_action(&mut self, name: &str, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
         let repo = self.repo_path().to_string();
         let branch = name.to_string();
+        let remote_client = self.remote_client();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { git_service::delete_branch(&repo, &branch) })
+                .spawn(async move {
+                    if let Some(client) = remote_client {
+                        match client.request(RemoteAction::GitDeleteBranch {
+                            repo_path: repo,
+                            name: branch,
+                        }) {
+                            Ok(result) if result.ok => Ok(()),
+                            Ok(result) => Err(result
+                                .message
+                                .unwrap_or_else(|| "Could not delete remote branch.".to_string())),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        git_service::delete_branch(&repo, &branch)
+                    }
+                })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
                 match result {

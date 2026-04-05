@@ -3,6 +3,9 @@ mod transport;
 
 pub use client_pool::RemoteClientPool;
 
+use crate::git::git_service::{
+    AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
+};
 use crate::models::{
     PortStatus, Project, ProjectFolder, RootScanEntry, RunCommand, SSHConnection, ScanResult,
     Settings, TabType,
@@ -26,7 +29,7 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 const REMOTE_FILE_NAME: &str = "remote.json";
 const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
@@ -419,6 +422,80 @@ pub enum RemoteAction {
         session_id: String,
         export: RemoteTerminalExport,
     },
+    GitListRepos,
+    GitStatus {
+        repo_path: String,
+    },
+    GitLog {
+        repo_path: String,
+        limit: u32,
+        skip: u32,
+    },
+    GitDiffFile {
+        repo_path: String,
+        file_path: String,
+        staged: bool,
+    },
+    GitDiffCommit {
+        repo_path: String,
+        hash: String,
+    },
+    GitBranches {
+        repo_path: String,
+    },
+    GitStage {
+        repo_path: String,
+        files: Vec<String>,
+    },
+    GitUnstage {
+        repo_path: String,
+        files: Vec<String>,
+    },
+    GitStageAll {
+        repo_path: String,
+    },
+    GitUnstageAll {
+        repo_path: String,
+    },
+    GitCommit {
+        repo_path: String,
+        summary: String,
+        body: Option<String>,
+    },
+    GitPush {
+        repo_path: String,
+    },
+    GitPushSetUpstream {
+        repo_path: String,
+        branch: String,
+    },
+    GitPull {
+        repo_path: String,
+    },
+    GitFetch {
+        repo_path: String,
+    },
+    GitSwitchBranch {
+        repo_path: String,
+        name: String,
+    },
+    GitCreateBranch {
+        repo_path: String,
+        name: String,
+    },
+    GitDeleteBranch {
+        repo_path: String,
+        name: String,
+    },
+    GitGetGithubAuthStatus,
+    GitRequestDeviceCode,
+    GitPollForToken {
+        device_code: String,
+    },
+    GitLogout,
+    GitGenerateCommitMessage {
+        repo_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +568,38 @@ pub enum RemoteActionPayload {
     ExportText {
         text: String,
     },
+    GitRepos {
+        repos: Vec<RemoteGitRepo>,
+    },
+    GitStatus {
+        status: GitStatusResult,
+    },
+    GitLogEntries {
+        entries: Vec<GitLogEntry>,
+    },
+    GitDiff {
+        diff: GitDiffResult,
+    },
+    GitBranches {
+        branches: Vec<GitBranch>,
+    },
+    GitCommit {
+        hash: String,
+    },
+    GitAuthStatus {
+        has_token: bool,
+        username: Option<String>,
+    },
+    GitDeviceCode {
+        device_code: DeviceCodeResponse,
+    },
+    GitTokenPoll {
+        completed: bool,
+        username: Option<String>,
+    },
+    GitCommitMessage {
+        message: AiCommitMessage,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,6 +610,13 @@ pub struct RemoteFsEntry {
     pub is_dir: bool,
     pub size_bytes: Option<u64>,
     pub modified_epoch_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemoteGitRepo {
+    pub label: String,
+    pub path: String,
 }
 
 impl Default for RemoteFsEntry {
@@ -2612,6 +2728,13 @@ fn requires_control(action: &RemoteAction) -> bool {
             | RemoteAction::ScanFolder { .. }
             | RemoteAction::ScanRoot { .. }
             | RemoteAction::ExportSessionText { .. }
+            | RemoteAction::GitListRepos
+            | RemoteAction::GitStatus { .. }
+            | RemoteAction::GitLog { .. }
+            | RemoteAction::GitDiffFile { .. }
+            | RemoteAction::GitDiffCommit { .. }
+            | RemoteAction::GitBranches { .. }
+            | RemoteAction::GitGetGithubAuthStatus
     )
 }
 

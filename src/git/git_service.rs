@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 
@@ -9,7 +10,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitFileStatus {
     Modified,
     Added,
@@ -20,7 +21,7 @@ pub enum GitFileStatus {
     Conflicted,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitStatusEntry {
     pub path: String,
     pub status: GitFileStatus,
@@ -28,7 +29,7 @@ pub struct GitStatusEntry {
     pub original_path: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitStatusResult {
     pub branch: Option<String>,
     pub upstream: Option<String>,
@@ -40,7 +41,7 @@ pub struct GitStatusResult {
     pub is_rebasing: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitLogEntry {
     pub hash: String,
     pub full_hash: String,
@@ -51,7 +52,7 @@ pub struct GitLogEntry {
     pub refs: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitBranch {
     pub name: String,
     pub is_current: bool,
@@ -59,7 +60,7 @@ pub struct GitBranch {
     pub last_commit: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffLineKind {
     Add,
     Delete,
@@ -67,7 +68,7 @@ pub enum DiffLineKind {
     HunkHeader,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDiffLine {
     pub kind: DiffLineKind,
     pub content: String,
@@ -75,13 +76,13 @@ pub struct GitDiffLine {
     pub new_lineno: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDiffHunk {
     pub header: String,
     pub lines: Vec<GitDiffLine>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDiffResult {
     pub hunks: Vec<GitDiffHunk>,
     pub is_binary: bool,
@@ -704,6 +705,7 @@ pub fn has_commits(repo_path: &str) -> bool {
 // for both GitHub API access and Copilot token exchange without a paid subscription.
 const DEFAULT_GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceCodeResponse {
     pub device_code: String,
     pub user_code: String,
@@ -793,10 +795,7 @@ pub fn poll_for_token(
     if let Some(token) = resp["access_token"].as_str() {
         Ok(Some(OAuthTokenResponse {
             access_token: token.to_string(),
-            token_type: resp["token_type"]
-                .as_str()
-                .unwrap_or("bearer")
-                .to_string(),
+            token_type: resp["token_type"].as_str().unwrap_or("bearer").to_string(),
             scope: resp["scope"].as_str().unwrap_or("").to_string(),
         }))
     } else {
@@ -841,6 +840,7 @@ Your response must be a JSON object with the attributes "title" and "description
   "description": "The login form was not submitting correctly. This commit fixes that issue by adding a missing `name` attribute to the submit button."
 }"#;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiCommitMessage {
     pub title: String,
     pub description: String,
@@ -900,16 +900,15 @@ pub fn generate_commit_message(
         "max_tokens": 500
     });
 
-    let resp_json: serde_json::Value =
-        ureq::post("https://api.githubcopilot.com/chat/completions")
-            .header("Authorization", &format!("Bearer {}", copilot_token))
-            .header("Copilot-Integration-Id", "vscode-chat")
-            .header("Editor-Version", "DevManager/1.0")
-            .send_json(&body)
-            .map_err(|e| format!("Copilot API request failed: {e}"))?
-            .into_body()
-            .read_json()
-            .map_err(|e| format!("Failed to parse Copilot response: {e}"))?;
+    let resp_json: serde_json::Value = ureq::post("https://api.githubcopilot.com/chat/completions")
+        .header("Authorization", &format!("Bearer {}", copilot_token))
+        .header("Copilot-Integration-Id", "vscode-chat")
+        .header("Editor-Version", "DevManager/1.0")
+        .send_json(&body)
+        .map_err(|e| format!("Copilot API request failed: {e}"))?
+        .into_body()
+        .read_json()
+        .map_err(|e| format!("Failed to parse Copilot response: {e}"))?;
 
     let content = resp_json["choices"][0]["message"]["content"]
         .as_str()
