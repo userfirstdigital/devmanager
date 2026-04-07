@@ -1,14 +1,33 @@
-use super::{
-    display_text_with_cursor, EditorAction, EditorActions, EditorField, EditorPaneModel,
-    EditorPanel,
-};
-use crate::theme;
+use super::{EditorActions, EditorField, EditorPaneModel, EditorPanel};
+use crate::{terminal, theme};
 use gpui::{
-    div, px, rgb, AnyElement, App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    canvas, div, fill, point, px, rgb, size, AnyElement, App, Bounds, CursorStyle, DispatchPhase,
+    Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, TextRun, Window,
 };
 
 pub(super) type ClickHandler = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
+
+const EDITOR_FIELD_FONT_SIZE_PX: f32 = 12.0;
+const EDITOR_FIELD_LINE_HEIGHT_PX: f32 = 18.0;
+const EDITOR_FIELD_CURSOR_WIDTH_PX: f32 = 2.0;
+
+#[derive(Clone)]
+struct EditableFieldLine {
+    display_text: SharedString,
+    editable_text: String,
+    char_start: usize,
+    cursor_col: Option<usize>,
+    placeholder: bool,
+}
+
+struct EditableFieldLinePaintState {
+    hitbox: Hitbox,
+    shaped_line: gpui::ShapedLine,
+    editable_text: String,
+    char_start: usize,
+    cursor_x: Option<Pixels>,
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum SurfaceActionButtonStyle {
@@ -798,7 +817,7 @@ pub(super) fn render_editor_section(
 pub(super) fn render_form_sections(
     sections: Vec<FormSection>,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> AnyElement {
     div()
         .flex()
@@ -828,7 +847,7 @@ pub(super) fn render_static_form_sections(sections: Vec<FormSection>) -> AnyElem
 pub(super) fn render_form_fields(
     fields: Vec<FormField>,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> AnyElement {
     div()
         .flex()
@@ -867,7 +886,7 @@ pub(super) fn render_preview_stories(stories: Vec<PreviewStory>) -> AnyElement {
 fn render_form_section(
     section: FormSection,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     render_editor_section(
         section.title.as_str(),
@@ -887,7 +906,7 @@ fn render_static_form_section(section: FormSection) -> impl IntoElement {
 fn render_form_field(
     field: FormField,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> AnyElement {
     match field {
         FormField::Text(field) => render_text_field(
@@ -1344,19 +1363,10 @@ pub(super) fn render_text_field(
     value: &str,
     field: EditorField,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let hint = (!hint.trim().is_empty()).then_some(hint);
     let focused = model.active_field == Some(field);
-    let display_value = if focused {
-        display_text_with_cursor(value, model.cursor)
-    } else if value.is_empty() {
-        "Not set".to_string()
-    } else {
-        value.to_string()
-    };
-
-    let on_focus = (actions.on_action)(EditorAction::FocusField(field));
 
     div()
         .flex()
@@ -1393,28 +1403,9 @@ pub(super) fn render_text_field(
                     render_inline_state_badge("Editing", theme::PRIMARY).into_any_element()
                 })),
         )
-        .child(
-            div()
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(if focused {
-                    theme::PRIMARY
-                } else {
-                    theme::BORDER_PRIMARY
-                }))
-                .text_sm()
-                .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_DIM
-                } else {
-                    theme::TEXT_PRIMARY
-                }))
-                .cursor_text()
-                .child(SharedString::from(display_value))
-                .on_mouse_down(MouseButton::Left, on_focus),
-        )
+        .child(render_text_input_surface(
+            value, field, model, actions, "Not set", false, None,
+        ))
 }
 
 pub(super) fn render_multiline_field(
@@ -1424,20 +1415,11 @@ pub(super) fn render_multiline_field(
     field: EditorField,
     height: Option<f32>,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let hint = (!hint.trim().is_empty()).then_some(hint);
     let height = height.unwrap_or(140.0);
     let focused = model.active_field == Some(field);
-    let display_value = if focused {
-        display_text_with_cursor(value, model.cursor)
-    } else if value.is_empty() {
-        "Not set".to_string()
-    } else {
-        value.to_string()
-    };
-
-    let on_focus = (actions.on_action)(EditorAction::FocusField(field));
 
     div()
         .flex()
@@ -1474,32 +1456,291 @@ pub(super) fn render_multiline_field(
                     render_inline_state_badge("Editing", theme::PRIMARY).into_any_element()
                 })),
         )
+        .child(render_text_input_surface(
+            value,
+            field,
+            model,
+            actions,
+            "Not set",
+            true,
+            Some(height),
+        ))
+}
+
+pub(super) fn render_compact_text_input(
+    label: &str,
+    hint: &str,
+    value: &str,
+    field: EditorField,
+    model: &EditorPaneModel,
+    actions: &EditorActions,
+    width: Option<f32>,
+    placeholder: &str,
+) -> impl IntoElement {
+    let mut input =
+        render_text_input_surface(value, field, model, actions, placeholder, false, None);
+    if let Some(width) = width {
+        input = input.w(px(width));
+    } else {
+        input = input.w_full();
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
         .child(
             div()
-                .id(("multiline", label.as_ptr() as usize))
-                .h(px(height))
-                .overflow_y_scroll()
-                .scrollbar_width(px(6.0))
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(if focused {
-                    theme::PRIMARY
-                } else {
-                    theme::BORDER_PRIMARY
-                }))
-                .text_sm()
-                .text_color(rgb(if value.is_empty() && !focused {
-                    theme::TEXT_DIM
-                } else {
-                    theme::TEXT_PRIMARY
-                }))
-                .cursor_text()
-                .child(SharedString::from(display_value))
-                .on_mouse_down(MouseButton::Left, on_focus),
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(label.to_string())),
         )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(hint.to_string())),
+        )
+        .child(input)
+}
+
+fn render_text_input_surface(
+    value: &str,
+    field: EditorField,
+    model: &EditorPaneModel,
+    actions: &EditorActions,
+    placeholder: &str,
+    multiline: bool,
+    min_height: Option<f32>,
+) -> gpui::Div {
+    let focused = model.active_field == Some(field);
+    let text_color = if value.is_empty() && !focused {
+        theme::TEXT_DIM
+    } else {
+        theme::TEXT_PRIMARY
+    };
+    let lines = editable_field_lines(value, model.cursor, focused, multiline, placeholder);
+
+    let mut surface = div()
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::EDITOR_FIELD_BG))
+        .border_1()
+        .border_color(rgb(if focused {
+            theme::PRIMARY
+        } else {
+            theme::BORDER_PRIMARY
+        }))
+        .overflow_hidden()
+        .cursor_text()
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(lines.into_iter().map(|line| {
+                    render_editable_field_line(line, field, actions, text_color).into_any_element()
+                })),
+        );
+
+    if multiline {
+        surface = surface.min_h(px(min_height.unwrap_or(140.0)));
+    }
+
+    surface
+}
+
+fn render_editable_field_line(
+    line: EditableFieldLine,
+    field: EditorField,
+    actions: &EditorActions,
+    text_color: u32,
+) -> impl IntoElement {
+    let on_focus_at = actions.on_focus_at.clone();
+    let display_text = line.display_text;
+    let editable_text = line.editable_text;
+    let char_start = line.char_start;
+    let cursor_col = line.cursor_col;
+    let placeholder = line.placeholder;
+
+    canvas(
+        move |bounds, window, _cx| {
+            let paint_text: SharedString = if display_text.is_empty() {
+                SharedString::from(" ")
+            } else {
+                display_text.clone()
+            };
+            let shaped_line = window.text_system().shape_line(
+                paint_text,
+                px(EDITOR_FIELD_FONT_SIZE_PX),
+                &[TextRun {
+                    len: if display_text.is_empty() {
+                        1
+                    } else {
+                        display_text.len()
+                    },
+                    font: terminal::terminal_font(),
+                    color: field_text_color(text_color, placeholder),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            let cursor_x = cursor_col.map(|cursor_col| {
+                let cursor_byte = byte_index_for_char(editable_text.as_str(), cursor_col);
+                shaped_line.x_for_index(cursor_byte)
+            });
+
+            EditableFieldLinePaintState {
+                hitbox: window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                shaped_line,
+                editable_text,
+                char_start,
+                cursor_x,
+            }
+        },
+        move |bounds, state, window, cx| {
+            let hitbox = state.hitbox.clone();
+            let shaped_line = state.shaped_line.clone();
+            let editable_text = state.editable_text.clone();
+            let char_start = state.char_start;
+            let on_focus_at = on_focus_at.clone();
+
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    let cursor_index = if editable_text.is_empty() {
+                        char_start
+                    } else {
+                        let local_x = (event.position.x - hitbox.bounds.origin.x).max(Pixels::ZERO);
+                        let byte_index = shaped_line.closest_index_for_x(local_x);
+                        char_start + char_count_for_byte(editable_text.as_str(), byte_index)
+                    };
+                    let on_focus = on_focus_at(field, cursor_index);
+                    on_focus(event, window, cx);
+                }
+            });
+
+            if state.hitbox.is_hovered(window) {
+                window.set_cursor_style(CursorStyle::IBeam, &state.hitbox);
+            }
+
+            let _ =
+                state
+                    .shaped_line
+                    .paint(bounds.origin, px(EDITOR_FIELD_LINE_HEIGHT_PX), window, cx);
+
+            if let Some(cursor_x) = state.cursor_x {
+                let cursor_bounds = Bounds::new(
+                    point(bounds.origin.x + cursor_x, bounds.origin.y + px(1.0)),
+                    size(
+                        px(EDITOR_FIELD_CURSOR_WIDTH_PX),
+                        px((EDITOR_FIELD_LINE_HEIGHT_PX - 2.0).max(1.0)),
+                    ),
+                );
+                window.paint_quad(fill(cursor_bounds, rgb(theme::TEXT_PRIMARY)));
+            }
+        },
+    )
+    .w_full()
+    .h(px(EDITOR_FIELD_LINE_HEIGHT_PX))
+}
+
+fn editable_field_lines(
+    value: &str,
+    cursor: usize,
+    focused: bool,
+    multiline: bool,
+    placeholder: &str,
+) -> Vec<EditableFieldLine> {
+    if !focused && value.is_empty() {
+        return vec![EditableFieldLine {
+            display_text: SharedString::from(placeholder.to_string()),
+            editable_text: String::new(),
+            char_start: 0,
+            cursor_col: None,
+            placeholder: true,
+        }];
+    }
+
+    if !multiline {
+        return vec![EditableFieldLine {
+            display_text: SharedString::from(value.to_string()),
+            editable_text: value.to_string(),
+            char_start: 0,
+            cursor_col: focused.then_some(cursor.min(value.chars().count())),
+            placeholder: false,
+        }];
+    }
+
+    let mut lines = Vec::new();
+    let mut char_start = 0usize;
+    let (cursor_line, cursor_column) = cursor_line_and_column(value, cursor);
+    let mut split_lines: Vec<&str> = value.split('\n').collect();
+    if split_lines.is_empty() {
+        split_lines.push("");
+    }
+
+    for (line_index, line) in split_lines.into_iter().enumerate() {
+        lines.push(EditableFieldLine {
+            display_text: SharedString::from(line.to_string()),
+            editable_text: line.to_string(),
+            char_start,
+            cursor_col: (focused && line_index == cursor_line).then_some(cursor_column),
+            placeholder: false,
+        });
+        char_start += line.chars().count() + 1;
+    }
+
+    if lines.is_empty() {
+        lines.push(EditableFieldLine {
+            display_text: SharedString::new(""),
+            editable_text: String::new(),
+            char_start: 0,
+            cursor_col: focused.then_some(0),
+            placeholder: false,
+        });
+    }
+
+    lines
+}
+
+fn cursor_line_and_column(value: &str, cursor: usize) -> (usize, usize) {
+    let mut remaining = cursor.min(value.chars().count());
+    for (line_index, line) in value.split('\n').enumerate() {
+        let line_len = line.chars().count();
+        if remaining <= line_len {
+            return (line_index, remaining);
+        }
+        remaining = remaining.saturating_sub(line_len + 1);
+    }
+    (value.split('\n').count().saturating_sub(1), remaining)
+}
+
+fn byte_index_for_char(value: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
+}
+
+fn char_count_for_byte(value: &str, byte_index: usize) -> usize {
+    value[..byte_index.min(value.len())].chars().count()
+}
+
+fn field_text_color(text_color: u32, placeholder: bool) -> Hsla {
+    if placeholder {
+        rgb(theme::TEXT_DIM).into()
+    } else {
+        rgb(text_color).into()
+    }
 }
 
 pub(super) fn render_choice_row(

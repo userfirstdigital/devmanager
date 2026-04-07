@@ -1,12 +1,12 @@
 mod editor_ui;
 
 use self::editor_ui::{
-    render_choice_row, render_display_field, render_editor_intro, render_editor_section,
-    render_editor_toolbar, render_form_fields, render_form_sections, render_info_row,
-    render_notice_row, render_preview_stories, render_selection_row, render_static_form_fields,
-    render_static_form_sections, render_surface_action_button, FormAction, FormActionGroup,
-    FormField, FormSection, FormSelectionList, FormSelectionRow, PreviewState, PreviewStory,
-    SurfaceActionButtonStyle, SurfaceBadge, SurfaceTone,
+    render_choice_row, render_compact_text_input, render_display_field, render_editor_intro,
+    render_editor_section, render_editor_toolbar, render_form_fields, render_form_sections,
+    render_info_row, render_notice_row, render_preview_stories, render_selection_row,
+    render_static_form_fields, render_static_form_sections, render_surface_action_button,
+    FormAction, FormActionGroup, FormField, FormSection, FormSelectionList, FormSelectionRow,
+    PreviewState, PreviewStory, SurfaceActionButtonStyle, SurfaceBadge, SurfaceTone,
 };
 use crate::models::{
     DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult, ScannedPort,
@@ -20,7 +20,10 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     Window,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 // ── Add Project Wizard ──────────────────────────────────────────────────────
 
@@ -1424,11 +1427,13 @@ pub enum EditorAction {
     ToggleCommandClearLogs,
 }
 
-pub struct EditorActions<'a> {
-    pub on_action: &'a dyn Fn(EditorAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+pub struct EditorActions {
+    pub on_action: Arc<dyn Fn(EditorAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_focus_at:
+        Arc<dyn Fn(EditorField, usize) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
 }
 
-pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions<'_>) -> AnyElement {
+pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions) -> AnyElement {
     if let EditorPanel::Settings(draft) = &model.panel {
         return render_settings_editor_surface(draft, model, &actions).into_any_element();
     }
@@ -1570,7 +1575,7 @@ pub fn next_notification_sound(current: &str) -> String {
 fn render_settings_editor_surface(
     draft: &SettingsDraft,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let on_close = (actions.on_action)(EditorAction::Close);
 
@@ -1628,7 +1633,7 @@ fn render_settings_editor_surface(
 fn render_settings_panel(
     draft: &SettingsDraft,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let is_mac = cfg!(target_os = "macos");
     let on_toggle_terminal_picker =
@@ -2725,70 +2730,20 @@ fn render_settings_text_input(
     value: &str,
     field: EditorField,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
     width: Option<f32>,
     placeholder: &str,
 ) -> impl IntoElement {
-    let focused = model.active_field == Some(field);
-    let display_value = if focused {
-        display_text_with_cursor(value, model.cursor)
-    } else if value.is_empty() {
-        placeholder.to_string()
-    } else {
-        value.to_string()
-    };
-    let on_focus = (actions.on_action)(EditorAction::FocusField(field));
-
-    let mut input = div()
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded_sm()
-        .bg(rgb(if focused {
-            0x1e1e22
-        } else {
-            theme::PANEL_HEADER_BG
-        }))
-        .border_1()
-        .border_color(rgb(if focused {
-            theme::PRIMARY
-        } else {
-            theme::BORDER_SECONDARY
-        }))
-        .text_xs()
-        .text_color(rgb(if value.is_empty() && !focused {
-            theme::TEXT_SUBTLE
-        } else {
-            theme::TEXT_PRIMARY
-        }))
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .cursor_text()
-        .child(SharedString::from(display_value))
-        .on_mouse_down(MouseButton::Left, on_focus);
-    if let Some(width) = width {
-        input = input.w(px(width));
-    } else {
-        input = input.w_full();
-    }
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(4.0))
-        .child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(label.to_string())),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SUBTLE))
-                .child(SharedString::from(hint.to_string())),
-        )
-        .child(input)
+    render_compact_text_input(
+        label,
+        hint,
+        value,
+        field,
+        model,
+        actions,
+        width,
+        placeholder,
+    )
 }
 
 fn render_settings_select_row(
@@ -2916,7 +2871,7 @@ fn render_settings_dropdown_option(
 
 fn render_settings_font_size_row(
     draft: &SettingsDraft,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let current = settings_font_size_value(draft);
 
@@ -3097,10 +3052,11 @@ fn path_leaf(path: &str) -> &str {
 fn render_ui_preview_panel(
     _: &UiPreviewDraft,
     model: &EditorPaneModel,
-    _: &EditorActions<'_>,
+    _: &EditorActions,
 ) -> impl IntoElement {
     let preview_actions = EditorActions {
-        on_action: &preview_editor_action_handler,
+        on_action: Arc::new(preview_editor_action_handler),
+        on_focus_at: Arc::new(preview_editor_focus_handler),
     };
     let preview_wizard_actions = WizardActions {
         on_action: &preview_wizard_action_handler,
@@ -3496,6 +3452,13 @@ fn preview_editor_action_handler(
     Box::new(|_, _, _| {})
 }
 
+fn preview_editor_focus_handler(
+    _: EditorField,
+    _: usize,
+) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+    Box::new(|_, _, _| {})
+}
+
 fn preview_wizard_action_handler(
     _: WizardAction,
 ) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
@@ -3878,7 +3841,7 @@ fn sample_wizard(step: u8) -> AddProjectWizard {
 fn render_project_panel(
     draft: &ProjectDraft,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let on_toggle_pinned = (actions.on_action)(EditorAction::ToggleProjectPinned);
     let on_toggle_save_logs = (actions.on_action)(EditorAction::ToggleProjectSaveLogs);
@@ -3934,7 +3897,7 @@ fn render_project_panel(
 fn render_folder_panel(
     draft: &FolderDraft,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let on_toggle_hidden = (actions.on_action)(EditorAction::ToggleFolderHidden);
     let on_pick_folder = (actions.on_action)(EditorAction::PickFolderPath);
@@ -4041,18 +4004,21 @@ fn render_folder_panel(
             draft.env_file_path.clone(),
             EditorField::Folder(FolderField::EnvFilePath),
         ),
-        FormField::action(
-            FormAction::new(
-                "Load env file",
-                if draft.env_file_loaded {
-                    "Reload"
-                } else {
-                    "Load"
-                },
-                on_load_env,
-            )
-            .description("Load the env file for inline editing."),
-        ),
+        FormField::action_group({
+            let actions_group = FormActionGroup::new("Env file actions").action(
+                FormAction::new(
+                    "Load env file",
+                    if draft.env_file_loaded {
+                        "Reload"
+                    } else {
+                        "Load"
+                    },
+                    on_load_env,
+                )
+                .description("Load the env file for inline editing."),
+            );
+            actions_group
+        }),
         FormField::text(
             "Default port env var",
             "Env var used for the folder port.",
@@ -4084,7 +4050,7 @@ fn render_folder_panel(
 fn render_command_panel(
     draft: &CommandDraft,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let on_toggle_restart = (actions.on_action)(EditorAction::ToggleCommandAutoRestart);
     let on_toggle_clear_logs = (actions.on_action)(EditorAction::ToggleCommandClearLogs);
@@ -4148,7 +4114,7 @@ fn render_command_panel(
 fn render_ssh_panel(
     draft: &SshDraft,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     render_form_sections(
         vec![
@@ -4198,7 +4164,7 @@ fn render_folder_scan_panel(
     draft: &FolderDraft,
     scan_result: &ScanResult,
     model: &EditorPaneModel,
-    actions: &EditorActions<'_>,
+    actions: &EditorActions,
 ) -> impl IntoElement {
     let script_summary = format!(
         "{} commands found, {} selected",

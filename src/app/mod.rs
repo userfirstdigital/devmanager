@@ -24,7 +24,7 @@ use crate::theme;
 use crate::updater::UpdaterService;
 use crate::workspace::{
     self, CommandDraft, EditorAction, EditorField, EditorPaneModel, EditorPanel, FolderDraft,
-    ProjectDraft, RemotePortForwardDraft, SettingsDraft, SshDraft, UiPreviewDraft,
+    FolderField, ProjectDraft, RemotePortForwardDraft, SettingsDraft, SshDraft, UiPreviewDraft,
 };
 use gpui::{
     div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
@@ -4631,7 +4631,46 @@ impl NativeShell {
                 }
             }
         }
+        self.editor_active_field = Some(EditorField::Folder(FolderField::EnvContents));
+        self.editor_cursor = self
+            .editor_panel
+            .as_ref()
+            .and_then(|panel| panel.text_value(EditorField::Folder(FolderField::EnvContents)))
+            .map(|value| value.chars().count())
+            .unwrap_or(0);
+        self.editor_needs_focus = true;
         cx.notify();
+    }
+
+    fn save_folder_env_contents(
+        &mut self,
+        folder_path: &str,
+        env_file_path: &str,
+        contents: &str,
+    ) -> Result<(), String> {
+        let full_path = std::path::Path::new(folder_path)
+            .join(env_file_path)
+            .to_string_lossy()
+            .to_string();
+        if self.remote_mode.is_some() {
+            match self.remote_request(RemoteAction::WriteTextFile {
+                path: full_path,
+                contents: contents.to_string(),
+            }) {
+                Ok(result) if result.ok => Ok(()),
+                Ok(result) => Err(result
+                    .message
+                    .unwrap_or_else(|| "Could not save env file.".to_string())),
+                Err(error) => Err(format!("Could not save env file: {error}")),
+            }
+        } else {
+            env_service::write_env_text(
+                std::path::Path::new(folder_path)
+                    .join(env_file_path)
+                    .as_path(),
+                contents,
+            )
+        }
     }
 
     fn open_folder_external_terminal_action(&mut self, cx: &mut Context<Self>) {
@@ -4925,10 +4964,11 @@ impl NativeShell {
                     return;
                 }
                 if draft.env_file_loaded && !draft.env_file_path.trim().is_empty() {
-                    let env_file_path = std::path::Path::new(draft.folder_path.trim())
-                        .join(draft.env_file_path.trim());
+                    let folder_path = draft.folder_path.trim().to_string();
+                    let env_file_path = draft.env_file_path.trim().to_string();
+                    let env_contents = draft.env_file_contents.clone();
                     if let Err(error) =
-                        env_service::write_env_text(&env_file_path, &draft.env_file_contents)
+                        self.save_folder_env_contents(&folder_path, &env_file_path, &env_contents)
                     {
                         self.editor_notice = Some(error);
                         cx.notify();
@@ -5526,17 +5566,33 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-            draft.open_picker = None;
-        }
         let cursor = self
             .editor_panel
             .as_ref()
             .and_then(|panel| panel.text_value(field))
             .map(|value| value.chars().count())
             .unwrap_or(0);
+        self.focus_editor_field_at(field, cursor, window, cx);
+    }
+
+    fn focus_editor_field_at(
+        &mut self,
+        field: EditorField,
+        cursor: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            draft.open_picker = None;
+        }
+        let clamped_cursor = self
+            .editor_panel
+            .as_ref()
+            .and_then(|panel| panel.text_value(field))
+            .map(|value| cursor.min(value.chars().count()))
+            .unwrap_or(cursor);
         self.editor_active_field = Some(field);
-        self.editor_cursor = cursor;
+        self.editor_cursor = clamped_cursor;
         self.focus_editor(window);
         cx.notify();
     }
@@ -10102,12 +10158,35 @@ impl Render for NativeShell {
                     this.install_update_action(cx);
                 }))
             };
-        let make_editor_action_handler =
-            |action: EditorAction| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
-                Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    this.apply_editor_action(action.clone(), window, cx);
-                }))
-            };
+        let editor_entity = cx.weak_entity();
+        let make_editor_action_handler = {
+            let editor_entity = editor_entity.clone();
+            Arc::new(
+                move |action: EditorAction| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                    let editor_entity = editor_entity.clone();
+                    Box::new(move |_, window, app| {
+                        let _ = editor_entity.update(app, |this, cx| {
+                            this.apply_editor_action(action.clone(), window, cx);
+                        });
+                    })
+                },
+            )
+        };
+        let make_editor_focus_handler = {
+            let editor_entity = editor_entity.clone();
+            Arc::new(
+                move |field: EditorField,
+                      cursor: usize|
+                      -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                    let editor_entity = editor_entity.clone();
+                    Box::new(move |_, window, app| {
+                        let _ = editor_entity.update(app, |this, cx| {
+                            this.focus_editor_field_at(field, cursor, window, cx);
+                        });
+                    })
+                },
+            )
+        };
 
         if let Some(model) = terminal_model.as_ref() {
             if model
@@ -10287,7 +10366,8 @@ impl Render for NativeShell {
                             .child(workspace::render_editor_surface(
                                 model,
                                 workspace::EditorActions {
-                                    on_action: &make_editor_action_handler,
+                                    on_action: make_editor_action_handler.clone(),
+                                    on_focus_at: make_editor_focus_handler.clone(),
                                 },
                             ))
                     } else {
@@ -12008,6 +12088,20 @@ fn apply_text_key_to_string(
             *cursor = (*cursor + 1).min(chars.len());
             return true;
         }
+        "up" => {
+            if allow_newlines {
+                *cursor = move_cursor_vertically(value, *cursor, -1);
+                return true;
+            }
+            return false;
+        }
+        "down" => {
+            if allow_newlines {
+                *cursor = move_cursor_vertically(value, *cursor, 1);
+                return true;
+            }
+            return false;
+        }
         "home" => {
             *cursor = 0;
             return true;
@@ -12087,6 +12181,42 @@ fn filter_editor_text_input(value: &str, numeric_only: bool, allow_newlines: boo
             .filter(|character| *character != '\r' && (allow_newlines || *character != '\n'))
             .collect()
     }
+}
+
+fn move_cursor_vertically(value: &str, cursor: usize, direction: isize) -> usize {
+    let lines: Vec<&str> = value.split('\n').collect();
+    if lines.is_empty() {
+        return 0;
+    }
+
+    let mut line_index = 0usize;
+    let mut remaining = cursor.min(value.chars().count());
+    for (index, line) in lines.iter().enumerate() {
+        let line_len = line.chars().count();
+        if remaining <= line_len {
+            line_index = index;
+            break;
+        }
+        remaining = remaining.saturating_sub(line_len + 1);
+    }
+
+    let target_line_index = if direction.is_negative() {
+        line_index.saturating_sub(direction.unsigned_abs())
+    } else {
+        (line_index + direction as usize).min(lines.len().saturating_sub(1))
+    };
+
+    if target_line_index == line_index {
+        return cursor.min(value.chars().count());
+    }
+
+    let target_line_start = lines
+        .iter()
+        .take(target_line_index)
+        .map(|line| line.chars().count() + 1)
+        .sum::<usize>();
+    let target_column = remaining.min(lines[target_line_index].chars().count());
+    target_line_start + target_column
 }
 
 fn ssh_password_prompt(
@@ -12346,6 +12476,24 @@ mod tests {
             username: "dev".to_string(),
             password: None,
         }
+    }
+
+    #[test]
+    fn multiline_editor_cursor_moves_between_lines() {
+        let value = "abc\nde\nfghi";
+
+        assert_eq!(move_cursor_vertically(value, 2, 1), 6);
+        assert_eq!(move_cursor_vertically(value, 6, 1), 9);
+        assert_eq!(move_cursor_vertically(value, 9, -1), 6);
+    }
+
+    #[test]
+    fn multiline_editor_cursor_clamps_to_shorter_lines() {
+        let value = "abcdef\nxy\nmnop";
+
+        assert_eq!(move_cursor_vertically(value, 5, 1), 9);
+        assert_eq!(move_cursor_vertically(value, 9, 1), 12);
+        assert_eq!(move_cursor_vertically(value, 12, -1), 9);
     }
 
     #[test]
