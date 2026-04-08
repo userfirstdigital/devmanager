@@ -152,6 +152,8 @@ struct NativeShell {
     editor_panel: Option<EditorPanel>,
     editor_active_field: Option<EditorField>,
     editor_cursor: usize,
+    editor_selection_anchor: Option<usize>,
+    is_selecting_editor: bool,
     sidebar_context_menu: Option<sidebar::SidebarContextMenu>,
     add_project_wizard: Option<workspace::AddProjectWizard>,
     last_window_title: Option<String>,
@@ -536,6 +538,8 @@ impl NativeShell {
             editor_panel: None,
             editor_active_field: None,
             editor_cursor: 0,
+            editor_selection_anchor: None,
+            is_selecting_editor: false,
             sidebar_context_menu: None,
             add_project_wizard: None,
             last_window_title: None,
@@ -3792,6 +3796,8 @@ impl NativeShell {
         self.editor_panel = Some(panel);
         self.editor_active_field = None;
         self.editor_cursor = 0;
+        self.editor_selection_anchor = None;
+        self.is_selecting_editor = false;
         self.editor_notice = None;
         self.editor_needs_focus = true;
         self.did_focus_terminal = false;
@@ -3823,6 +3829,8 @@ impl NativeShell {
         self.editor_panel = None;
         self.editor_active_field = None;
         self.editor_cursor = 0;
+        self.editor_selection_anchor = None;
+        self.is_selecting_editor = false;
         self.editor_notice = None;
         self.editor_needs_focus = false;
         self.did_focus_terminal = false;
@@ -5572,13 +5580,14 @@ impl NativeShell {
             .and_then(|panel| panel.text_value(field))
             .map(|value| value.chars().count())
             .unwrap_or(0);
-        self.focus_editor_field_at(field, cursor, window, cx);
+        self.focus_editor_field_at(field, cursor, false, window, cx);
     }
 
     fn focus_editor_field_at(
         &mut self,
         field: EditorField,
         cursor: usize,
+        shift: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5591,9 +5600,40 @@ impl NativeShell {
             .and_then(|panel| panel.text_value(field))
             .map(|value| cursor.min(value.chars().count()))
             .unwrap_or(cursor);
+        if shift && self.editor_active_field == Some(field) {
+            // Extend selection: anchor stays (or is set to current cursor)
+            if self.editor_selection_anchor.is_none() {
+                self.editor_selection_anchor = Some(self.editor_cursor);
+            }
+        } else {
+            self.editor_selection_anchor = None;
+        }
         self.editor_active_field = Some(field);
         self.editor_cursor = clamped_cursor;
+        self.is_selecting_editor = true;
         self.focus_editor(window);
+        cx.notify();
+    }
+
+    fn drag_editor_field_to(
+        &mut self,
+        field: EditorField,
+        cursor: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_selecting_editor || self.editor_active_field != Some(field) {
+            return;
+        }
+        let clamped_cursor = self
+            .editor_panel
+            .as_ref()
+            .and_then(|panel| panel.text_value(field))
+            .map(|value| cursor.min(value.chars().count()))
+            .unwrap_or(cursor);
+        if self.editor_selection_anchor.is_none() {
+            self.editor_selection_anchor = Some(self.editor_cursor);
+        }
+        self.editor_cursor = clamped_cursor;
         cx.notify();
     }
 
@@ -5990,6 +6030,15 @@ impl NativeShell {
         self.focus_editor(window);
     }
 
+    fn handle_editor_mouse_up(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.is_selecting_editor = false;
+    }
+
     fn handle_wizard_key(
         &mut self,
         event: &KeyDownEvent,
@@ -6039,6 +6088,7 @@ impl NativeShell {
         let changed = apply_text_key_to_string(
             &mut wizard.name,
             &mut wizard.cursor,
+            &mut None,
             event,
             paste_text.as_deref(),
             false,
@@ -6084,6 +6134,59 @@ impl NativeShell {
             return;
         };
 
+        // Copy selected text
+        if secondary && key == "c" {
+            if let Some(anchor) = self.editor_selection_anchor {
+                if let Some(panel) = self.editor_panel.as_ref() {
+                    if let Some(value) = panel.text_value(field) {
+                        let (start, end) = if anchor < self.editor_cursor {
+                            (anchor, self.editor_cursor)
+                        } else {
+                            (self.editor_cursor, anchor)
+                        };
+                        if start != end {
+                            let selected: String =
+                                value.chars().skip(start).take(end - start).collect();
+                            cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                        }
+                    }
+                }
+            }
+            window.prevent_default();
+            return;
+        }
+
+        // Cut selected text
+        if secondary && key == "x" {
+            if let Some(anchor) = self.editor_selection_anchor {
+                if let Some(panel) = self.editor_panel.as_ref() {
+                    if let Some(value) = panel.text_value(field) {
+                        let (start, end) = if anchor < self.editor_cursor {
+                            (anchor, self.editor_cursor)
+                        } else {
+                            (self.editor_cursor, anchor)
+                        };
+                        if start != end {
+                            let selected: String =
+                                value.chars().skip(start).take(end - start).collect();
+                            cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                        }
+                    }
+                }
+            }
+            if let Some(panel) = self.editor_panel.as_mut() {
+                if let Some(value) = panel.text_value_mut(field) {
+                    let mut chars: Vec<char> = value.chars().collect();
+                    delete_selection(&mut chars, &mut self.editor_cursor, &mut self.editor_selection_anchor);
+                    *value = chars.into_iter().collect();
+                }
+            }
+            self.editor_notice = None;
+            cx.notify();
+            window.prevent_default();
+            return;
+        }
+
         let paste_text = if secondary && key == "v" {
             cx.read_from_clipboard().and_then(|item| item.text())
         } else {
@@ -6095,6 +6198,7 @@ impl NativeShell {
                 changed = apply_text_key_to_string(
                     value,
                     &mut self.editor_cursor,
+                    &mut self.editor_selection_anchor,
                     event,
                     paste_text.as_deref(),
                     field.is_numeric(),
@@ -9628,6 +9732,7 @@ impl Render for NativeShell {
             panel,
             active_field: self.editor_active_field,
             cursor: self.editor_cursor,
+            selection_anchor: self.editor_selection_anchor,
             notice: self.editor_notice.clone(),
             updater: updater_snapshot.clone(),
         });
@@ -10179,9 +10284,25 @@ impl Render for NativeShell {
                       cursor: usize|
                       -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                     let editor_entity = editor_entity.clone();
-                    Box::new(move |_, window, app| {
+                    Box::new(move |event, window, app| {
+                        let shift = event.modifiers.shift;
                         let _ = editor_entity.update(app, |this, cx| {
-                            this.focus_editor_field_at(field, cursor, window, cx);
+                            this.focus_editor_field_at(field, cursor, shift, window, cx);
+                        });
+                    })
+                },
+            )
+        };
+        let make_editor_drag_handler = {
+            let editor_entity = editor_entity.clone();
+            Arc::new(
+                move |field: EditorField,
+                      cursor: usize|
+                      -> Box<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)> {
+                    let editor_entity = editor_entity.clone();
+                    Box::new(move |_, _window, app| {
+                        let _ = editor_entity.update(app, |this, cx| {
+                            this.drag_editor_field_to(field, cursor, cx);
                         });
                     })
                 },
@@ -10363,11 +10484,20 @@ impl Render for NativeShell {
                                 cx.listener(Self::handle_editor_mouse_down),
                             )
                             .on_key_down(cx.listener(Self::handle_editor_key))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(Self::handle_editor_mouse_up),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(Self::handle_editor_mouse_up),
+                            )
                             .child(workspace::render_editor_surface(
                                 model,
                                 workspace::EditorActions {
                                     on_action: make_editor_action_handler.clone(),
                                     on_focus_at: make_editor_focus_handler.clone(),
+                                    on_drag_to: make_editor_drag_handler.clone(),
                                 },
                             ))
                     } else {
@@ -12065,9 +12195,25 @@ fn write_terminal_export(kind: &str, text: &str) -> Result<std::path::PathBuf, S
     Ok(path)
 }
 
+fn selection_range(cursor: usize, anchor: Option<usize>) -> Option<(usize, usize)> {
+    anchor.and_then(|a| {
+        let (start, end) = if a < cursor { (a, cursor) } else { (cursor, a) };
+        if start == end { None } else { Some((start, end)) }
+    })
+}
+
+fn delete_selection(chars: &mut Vec<char>, cursor: &mut usize, anchor: &mut Option<usize>) {
+    if let Some((start, end)) = selection_range(*cursor, *anchor) {
+        chars.drain(start..end);
+        *cursor = start;
+        *anchor = None;
+    }
+}
+
 fn apply_text_key_to_string(
     value: &mut String,
     cursor: &mut usize,
+    selection_anchor: &mut Option<usize>,
     event: &KeyDownEvent,
     paste_text: Option<&str>,
     numeric_only: bool,
@@ -12076,50 +12222,122 @@ fn apply_text_key_to_string(
     let key = event.keystroke.key.to_ascii_lowercase();
     let modifiers = event.keystroke.modifiers;
     let secondary = modifiers.control || modifiers.platform;
+    let shift = modifiers.shift;
     let mut chars: Vec<char> = value.chars().collect();
     *cursor = (*cursor).min(chars.len());
 
+    // Select all
+    if secondary && key == "a" {
+        *selection_anchor = Some(0);
+        *cursor = chars.len();
+        return true;
+    }
+
+    // Navigation keys with selection support
     match key.as_str() {
         "left" => {
-            *cursor = (*cursor).saturating_sub(1);
+            if shift {
+                if selection_anchor.is_none() {
+                    *selection_anchor = Some(*cursor);
+                }
+                *cursor = (*cursor).saturating_sub(1);
+            } else if let Some(_) = selection_range(*cursor, *selection_anchor) {
+                let start = (*cursor).min(selection_anchor.unwrap_or(*cursor));
+                *cursor = start;
+                *selection_anchor = None;
+            } else {
+                *cursor = (*cursor).saturating_sub(1);
+                *selection_anchor = None;
+            }
             return true;
         }
         "right" => {
-            *cursor = (*cursor + 1).min(chars.len());
+            if shift {
+                if selection_anchor.is_none() {
+                    *selection_anchor = Some(*cursor);
+                }
+                *cursor = (*cursor + 1).min(chars.len());
+            } else if let Some(_) = selection_range(*cursor, *selection_anchor) {
+                let end = (*cursor).max(selection_anchor.unwrap_or(*cursor));
+                *cursor = end;
+                *selection_anchor = None;
+            } else {
+                *cursor = (*cursor + 1).min(chars.len());
+                *selection_anchor = None;
+            }
             return true;
         }
         "up" => {
-            if allow_newlines {
-                *cursor = move_cursor_vertically(value, *cursor, -1);
-                return true;
+            if !allow_newlines {
+                return false;
             }
-            return false;
+            if shift {
+                if selection_anchor.is_none() {
+                    *selection_anchor = Some(*cursor);
+                }
+            } else {
+                *selection_anchor = None;
+            }
+            *cursor = move_cursor_vertically(value, *cursor, -1);
+            return true;
         }
         "down" => {
-            if allow_newlines {
-                *cursor = move_cursor_vertically(value, *cursor, 1);
-                return true;
+            if !allow_newlines {
+                return false;
             }
-            return false;
+            if shift {
+                if selection_anchor.is_none() {
+                    *selection_anchor = Some(*cursor);
+                }
+            } else {
+                *selection_anchor = None;
+            }
+            *cursor = move_cursor_vertically(value, *cursor, 1);
+            return true;
         }
         "home" => {
+            if shift {
+                if selection_anchor.is_none() {
+                    *selection_anchor = Some(*cursor);
+                }
+            } else {
+                *selection_anchor = None;
+            }
             *cursor = 0;
             return true;
         }
         "end" => {
+            if shift {
+                if selection_anchor.is_none() {
+                    *selection_anchor = Some(*cursor);
+                }
+            } else {
+                *selection_anchor = None;
+            }
             *cursor = chars.len();
             return true;
         }
+        _ => {}
+    }
+
+    // Editing keys — delete selection first if present
+    match key.as_str() {
         "enter" => {
-            if allow_newlines {
-                chars.insert(*cursor, '\n');
-                *cursor += 1;
+            if !allow_newlines {
+                return false;
+            }
+            delete_selection(&mut chars, cursor, selection_anchor);
+            chars.insert(*cursor, '\n');
+            *cursor += 1;
+            *value = chars.into_iter().collect();
+            return true;
+        }
+        "backspace" => {
+            if selection_range(*cursor, *selection_anchor).is_some() {
+                delete_selection(&mut chars, cursor, selection_anchor);
                 *value = chars.into_iter().collect();
                 return true;
             }
-            return false;
-        }
-        "backspace" => {
             if *cursor > 0 {
                 chars.remove(*cursor - 1);
                 *cursor -= 1;
@@ -12129,12 +12347,27 @@ fn apply_text_key_to_string(
             return false;
         }
         "delete" => {
+            if selection_range(*cursor, *selection_anchor).is_some() {
+                delete_selection(&mut chars, cursor, selection_anchor);
+                *value = chars.into_iter().collect();
+                return true;
+            }
             if *cursor < chars.len() {
                 chars.remove(*cursor);
                 *value = chars.into_iter().collect();
                 return true;
             }
             return false;
+        }
+        "space" => {
+            if numeric_only || secondary {
+                return false;
+            }
+            delete_selection(&mut chars, cursor, selection_anchor);
+            chars.insert(*cursor, ' ');
+            *cursor += 1;
+            *value = chars.into_iter().collect();
+            return true;
         }
         _ => {}
     }
@@ -12145,6 +12378,7 @@ fn apply_text_key_to_string(
             if filtered.is_empty() {
                 return false;
             }
+            delete_selection(&mut chars, cursor, selection_anchor);
             let insertion: Vec<char> = filtered.chars().collect();
             chars.splice(*cursor..*cursor, insertion.clone());
             *cursor += insertion.len();
@@ -12159,6 +12393,7 @@ fn apply_text_key_to_string(
         if filtered.is_empty() {
             return false;
         }
+        delete_selection(&mut chars, cursor, selection_anchor);
         let insertion: Vec<char> = filtered.chars().collect();
         chars.splice(*cursor..*cursor, insertion.clone());
         *cursor += insertion.len();

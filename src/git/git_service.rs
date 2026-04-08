@@ -903,7 +903,10 @@ pub fn generate_commit_message(
     let resp_json: serde_json::Value = ureq::post("https://api.githubcopilot.com/chat/completions")
         .header("Authorization", &format!("Bearer {}", copilot_token))
         .header("Copilot-Integration-Id", "vscode-chat")
-        .header("Editor-Version", "DevManager/1.0")
+        .header("Editor-Version", "vscode/1.96.0")
+        .header("Editor-Plugin-Version", "copilot-chat/0.24.0")
+        .header("Openai-Intent", "commit-message")
+        .header("Content-Type", "application/json")
         .send_json(&body)
         .map_err(|e| format!("Copilot API request failed: {e}"))?
         .into_body()

@@ -3,7 +3,8 @@ use crate::{terminal, theme};
 use gpui::{
     canvas, div, fill, point, px, rgb, size, AnyElement, App, Bounds, CursorStyle, DispatchPhase,
     Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, TextRun, Window,
+    MouseMoveEvent, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled,
+    TextRun, Window,
 };
 
 pub(super) type ClickHandler = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
@@ -18,6 +19,7 @@ struct EditableFieldLine {
     editable_text: String,
     char_start: usize,
     cursor_col: Option<usize>,
+    selection_cols: Option<(usize, usize)>,
     placeholder: bool,
 }
 
@@ -27,6 +29,7 @@ struct EditableFieldLinePaintState {
     editable_text: String,
     char_start: usize,
     cursor_x: Option<Pixels>,
+    selection_x: Option<(Pixels, Pixels)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1520,7 +1523,7 @@ fn render_text_input_surface(
     } else {
         theme::TEXT_PRIMARY
     };
-    let lines = editable_field_lines(value, model.cursor, focused, multiline, placeholder);
+    let lines = editable_field_lines(value, model.cursor, model.selection_anchor, focused, multiline, placeholder);
 
     let mut surface = div()
         .px(px(12.0))
@@ -1560,10 +1563,12 @@ fn render_editable_field_line(
     text_color: u32,
 ) -> impl IntoElement {
     let on_focus_at = actions.on_focus_at.clone();
+    let on_drag_to = actions.on_drag_to.clone();
     let display_text = line.display_text;
     let editable_text = line.editable_text;
     let char_start = line.char_start;
     let cursor_col = line.cursor_col;
+    let selection_cols = line.selection_cols;
     let placeholder = line.placeholder;
 
     canvas(
@@ -1594,6 +1599,14 @@ fn render_editable_field_line(
                 let cursor_byte = byte_index_for_char(editable_text.as_str(), cursor_col);
                 shaped_line.x_for_index(cursor_byte)
             });
+            let selection_x = selection_cols.map(|(start_col, end_col)| {
+                let start_byte = byte_index_for_char(editable_text.as_str(), start_col);
+                let end_byte = byte_index_for_char(editable_text.as_str(), end_col);
+                (
+                    shaped_line.x_for_index(start_byte),
+                    shaped_line.x_for_index(end_byte),
+                )
+            });
 
             EditableFieldLinePaintState {
                 hitbox: window.insert_hitbox(bounds, HitboxBehavior::Normal),
@@ -1601,6 +1614,7 @@ fn render_editable_field_line(
                 editable_text,
                 char_start,
                 cursor_x,
+                selection_x,
             }
         },
         move |bounds, state, window, cx| {
@@ -1610,22 +1624,66 @@ fn render_editable_field_line(
             let char_start = state.char_start;
             let on_focus_at = on_focus_at.clone();
 
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                    let cursor_index = if editable_text.is_empty() {
-                        char_start
-                    } else {
-                        let local_x = (event.position.x - hitbox.bounds.origin.x).max(Pixels::ZERO);
-                        let byte_index = shaped_line.closest_index_for_x(local_x);
-                        char_start + char_count_for_byte(editable_text.as_str(), byte_index)
-                    };
-                    let on_focus = on_focus_at(field, cursor_index);
-                    on_focus(event, window, cx);
-                }
-            });
+            // Mouse down → position cursor
+            {
+                let hitbox = hitbox.clone();
+                let shaped_line = shaped_line.clone();
+                let editable_text = editable_text.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                        let cursor_index = if editable_text.is_empty() {
+                            char_start
+                        } else {
+                            let local_x =
+                                (event.position.x - hitbox.bounds.origin.x).max(Pixels::ZERO);
+                            let byte_index = shaped_line.closest_index_for_x(local_x);
+                            char_start + char_count_for_byte(editable_text.as_str(), byte_index)
+                        };
+                        let on_focus = on_focus_at(field, cursor_index);
+                        on_focus(event, window, cx);
+                    }
+                });
+            }
+
+            // Mouse move → drag selection
+            {
+                let hitbox = hitbox.clone();
+                let shaped_line = shaped_line.clone();
+                let editable_text = editable_text.clone();
+                let on_drag_to = on_drag_to.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble
+                        && hitbox.is_hovered(window)
+                        && event.dragging()
+                    {
+                        let cursor_index = if editable_text.is_empty() {
+                            char_start
+                        } else {
+                            let local_x =
+                                (event.position.x - hitbox.bounds.origin.x).max(Pixels::ZERO);
+                            let byte_index = shaped_line.closest_index_for_x(local_x);
+                            char_start + char_count_for_byte(editable_text.as_str(), byte_index)
+                        };
+                        let on_drag = on_drag_to(field, cursor_index);
+                        on_drag(event, window, cx);
+                    }
+                });
+            }
 
             if state.hitbox.is_hovered(window) {
                 window.set_cursor_style(CursorStyle::IBeam, &state.hitbox);
+            }
+
+            // Paint selection highlight
+            if let Some((sel_start_x, sel_end_x)) = state.selection_x {
+                let sel_bounds = Bounds::new(
+                    point(bounds.origin.x + sel_start_x, bounds.origin.y),
+                    size(
+                        sel_end_x - sel_start_x,
+                        px(EDITOR_FIELD_LINE_HEIGHT_PX),
+                    ),
+                );
+                window.paint_quad(fill(sel_bounds, rgb(theme::SELECTION_BG)));
             }
 
             let _ =
@@ -1649,29 +1707,66 @@ fn render_editable_field_line(
     .h(px(EDITOR_FIELD_LINE_HEIGHT_PX))
 }
 
+fn line_selection_cols(
+    sel_start: usize,
+    sel_end: usize,
+    char_start: usize,
+    line_char_count: usize,
+) -> Option<(usize, usize)> {
+    if sel_start == sel_end {
+        return None;
+    }
+    let line_end = char_start + line_char_count;
+    let s = sel_start.max(char_start).min(line_end);
+    let e = sel_end.max(char_start).min(line_end);
+    if s < e {
+        Some((s - char_start, e - char_start))
+    } else {
+        None
+    }
+}
+
 fn editable_field_lines(
     value: &str,
     cursor: usize,
+    selection_anchor: Option<usize>,
     focused: bool,
     multiline: bool,
     placeholder: &str,
 ) -> Vec<EditableFieldLine> {
+    let sel_range = if focused {
+        selection_anchor.and_then(|anchor| {
+            let (s, e) = if anchor < cursor {
+                (anchor, cursor)
+            } else {
+                (cursor, anchor)
+            };
+            if s == e { None } else { Some((s, e)) }
+        })
+    } else {
+        None
+    };
+
     if !focused && value.is_empty() {
         return vec![EditableFieldLine {
             display_text: SharedString::from(placeholder.to_string()),
             editable_text: String::new(),
             char_start: 0,
             cursor_col: None,
+            selection_cols: None,
             placeholder: true,
         }];
     }
 
     if !multiline {
+        let char_count = value.chars().count();
         return vec![EditableFieldLine {
             display_text: SharedString::from(value.to_string()),
             editable_text: value.to_string(),
             char_start: 0,
-            cursor_col: focused.then_some(cursor.min(value.chars().count())),
+            cursor_col: focused.then_some(cursor.min(char_count)),
+            selection_cols: sel_range
+                .and_then(|(s, e)| line_selection_cols(s, e, 0, char_count)),
             placeholder: false,
         }];
     }
@@ -1685,14 +1780,17 @@ fn editable_field_lines(
     }
 
     for (line_index, line) in split_lines.into_iter().enumerate() {
+        let line_char_count = line.chars().count();
         lines.push(EditableFieldLine {
             display_text: SharedString::from(line.to_string()),
             editable_text: line.to_string(),
             char_start,
             cursor_col: (focused && line_index == cursor_line).then_some(cursor_column),
+            selection_cols: sel_range
+                .and_then(|(s, e)| line_selection_cols(s, e, char_start, line_char_count)),
             placeholder: false,
         });
-        char_start += line.chars().count() + 1;
+        char_start += line_char_count + 1;
     }
 
     if lines.is_empty() {
@@ -1701,6 +1799,7 @@ fn editable_field_lines(
             editable_text: String::new(),
             char_start: 0,
             cursor_col: focused.then_some(0),
+            selection_cols: None,
             placeholder: false,
         });
     }

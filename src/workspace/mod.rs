@@ -17,7 +17,8 @@ use crate::theme;
 use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use gpui::{
     anchored, deferred, div, px, rgb, AnyElement, App, Corner, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled,
     Window,
 };
 use std::{
@@ -1365,6 +1366,7 @@ pub struct EditorPaneModel {
     pub panel: EditorPanel,
     pub active_field: Option<EditorField>,
     pub cursor: usize,
+    pub selection_anchor: Option<usize>,
     pub notice: Option<String>,
     pub updater: UpdaterSnapshot,
     pub allow_mutation: bool,
@@ -1431,6 +1433,8 @@ pub struct EditorActions {
     pub on_action: Arc<dyn Fn(EditorAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_focus_at:
         Arc<dyn Fn(EditorField, usize) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_drag_to:
+        Arc<dyn Fn(EditorField, usize) -> Box<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)>>,
 }
 
 pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions) -> AnyElement {
@@ -3057,6 +3061,7 @@ fn render_ui_preview_panel(
     let preview_actions = EditorActions {
         on_action: Arc::new(preview_editor_action_handler),
         on_focus_at: Arc::new(preview_editor_focus_handler),
+        on_drag_to: Arc::new(preview_editor_drag_handler),
     };
     let preview_wizard_actions = WizardActions {
         on_action: &preview_wizard_action_handler,
@@ -3423,6 +3428,7 @@ fn preview_editor_model(panel: EditorPanel, model: &EditorPaneModel) -> EditorPa
         panel,
         active_field: None,
         cursor: 0,
+        selection_anchor: None,
         notice: None,
         updater: model.updater.clone(),
         allow_mutation: true,
@@ -3440,6 +3446,7 @@ fn preview_editor_model_with_state(
         panel,
         active_field,
         cursor,
+        selection_anchor: None,
         notice,
         updater: model.updater.clone(),
         allow_mutation: true,
@@ -3456,6 +3463,13 @@ fn preview_editor_focus_handler(
     _: EditorField,
     _: usize,
 ) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+    Box::new(|_, _, _| {})
+}
+
+fn preview_editor_drag_handler(
+    _: EditorField,
+    _: usize,
+) -> Box<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)> {
     Box::new(|_, _, _| {})
 }
 
