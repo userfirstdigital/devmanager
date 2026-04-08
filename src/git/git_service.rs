@@ -847,7 +847,7 @@ pub struct AiCommitMessage {
 }
 
 pub fn get_staged_diff(repo_path: &str) -> Result<String, String> {
-    run_git(repo_path, &["diff", "--cached"])
+    run_git(repo_path, &["diff", "--cached", "--no-ext-diff", "--no-color"])
 }
 
 /// Exchange a GitHub OAuth token for a short-lived Copilot API token.
@@ -879,17 +879,34 @@ pub fn generate_commit_message(
     github_token: &str,
     diff_text: &str,
 ) -> Result<AiCommitMessage, String> {
-    // Truncate diff to ~100KB to stay within token limits
-    let truncated = if diff_text.len() > 100_000 {
-        &diff_text[..100_000]
+    // Strip control characters (from binary diffs) that would produce invalid JSON,
+    // but keep normal whitespace (newlines, tabs, carriage returns).
+    let sanitized: String = diff_text
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
+        .collect();
+
+    // Truncate to ~250KB on a char boundary to stay within token limits.
+    // GitHub Desktop allows up to 10MB but errors beyond that; we use a lower
+    // limit to keep latency reasonable.
+    let max_len = 250_000;
+    let truncated = if sanitized.len() > max_len {
+        match sanitized
+            .char_indices()
+            .take_while(|(i, _)| *i < max_len)
+            .last()
+        {
+            Some((i, c)) => &sanitized[..i + c.len_utf8()],
+            None => &sanitized,
+        }
     } else {
-        diff_text
+        &sanitized
     };
 
     // Step 1: Exchange OAuth token for Copilot token
     let copilot_token = get_copilot_token(github_token)?;
 
-    // Step 2: Call Copilot chat completions (same as GitHub Desktop)
+    // Step 2: Call Copilot chat completions
     let body = serde_json::json!({
         "model": "gpt-4o-mini",
         "messages": [
@@ -897,7 +914,8 @@ pub fn generate_commit_message(
             {"role": "user", "content": truncated}
         ],
         "temperature": 0.3,
-        "max_tokens": 500
+        "max_tokens": 500,
+        "response_format": { "type": "json_object" }
     });
 
     let resp_json: serde_json::Value = ureq::post("https://api.githubcopilot.com/chat/completions")
@@ -908,7 +926,18 @@ pub fn generate_commit_message(
         .header("Openai-Intent", "commit-message")
         .header("Content-Type", "application/json")
         .send_json(&body)
-        .map_err(|e| format!("Copilot API request failed: {e}"))?
+        .map_err(|e| {
+            let msg = format!("{e}");
+            if msg.contains("402") {
+                "Copilot usage quota exceeded. Please try again later.".to_string()
+            } else if msg.contains("429") {
+                "Rate limited by Copilot. Please wait a moment and try again.".to_string()
+            } else if msg.contains("401") || msg.contains("403") {
+                "Copilot access denied. Check your GitHub Copilot subscription.".to_string()
+            } else {
+                format!("Copilot API request failed: {e}")
+            }
+        })?
         .into_body()
         .read_json()
         .map_err(|e| format!("Failed to parse Copilot response: {e}"))?;
