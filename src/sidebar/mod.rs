@@ -3,11 +3,12 @@ use crate::state::{AppState, RuntimeState, SessionRuntimeState, SessionStatus};
 use crate::{icons, theme};
 use gpui::{
     anchored, deferred, div, px, rgb, AnyElement, App, Corner, Div, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString, Styled, Window,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 use std::collections::HashMap;
 
-const SIDEBAR_WIDTH_PX: f32 = 220.0;
+const SIDEBAR_WIDTH_PX: f32 = 228.0;
 const SIDEBAR_COLLAPSED_WIDTH_PX: f32 = 40.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +214,9 @@ fn render_expanded_sidebar(
         .child(
             div()
                 .flex_1()
+                .id("sidebar-scroll")
+                .overflow_y_scroll()
+                .scrollbar_width(px(6.0))
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
