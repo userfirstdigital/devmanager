@@ -475,6 +475,9 @@ pub enum RemoteAction {
     GitFetch {
         repo_path: String,
     },
+    GitSync {
+        repo_path: String,
+    },
     GitSwitchBranch {
         repo_path: String,
         name: String,

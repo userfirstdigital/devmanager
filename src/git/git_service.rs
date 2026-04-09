@@ -654,6 +654,28 @@ pub fn pull(repo_path: &str) -> Result<String, String> {
     }
 }
 
+pub fn pull_rebase(repo_path: &str) -> Result<String, String> {
+    let (stdout, stderr) = run_git_allow_failure(repo_path, &["pull", "--rebase"])?;
+    if stderr.contains("error:") || stderr.contains("fatal:") || stderr.contains("CONFLICT") {
+        Err(stderr.trim().to_string())
+    } else {
+        Ok(stdout.trim().to_string())
+    }
+}
+
+/// Try to push; if rejected because the remote has diverged, pull --rebase
+/// and retry the push once.
+pub fn sync(repo_path: &str) -> Result<String, String> {
+    match push(repo_path) {
+        Ok(msg) => Ok(msg),
+        Err(e) if e.contains("[rejected]") || e.contains("fetch first") => {
+            pull_rebase(repo_path)?;
+            push(repo_path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub fn fetch(repo_path: &str) -> Result<String, String> {
     let (stdout, stderr) = run_git_allow_failure(repo_path, &["fetch", "--all"])?;
     if stderr.contains("error:") || stderr.contains("fatal:") {

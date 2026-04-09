@@ -192,7 +192,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
 
     // Sync button label and state
     let (sync_label, sync_detail) = if state.is_pushing {
-        ("Pushing...".to_string(), String::new())
+        ("Syncing...".to_string(), String::new())
     } else if state.is_pulling {
         ("Pulling...".to_string(), String::new())
     } else if state.is_fetching {
@@ -201,7 +201,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
         ("Publish branch".to_string(), String::new())
     } else if ahead > 0 && behind > 0 {
         (
-            format!("Push origin"),
+            format!("Sync"),
             format!("\u{2191}{} \u{2193}{}", ahead, behind),
         )
     } else if ahead > 0 {
@@ -355,10 +355,10 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                         }
                         if !has_upstream {
                             this.push_action(cx);
-                        } else if behind > 0 {
-                            this.pull_action(cx);
                         } else if ahead > 0 {
                             this.push_action(cx);
+                        } else if behind > 0 {
+                            this.pull_action(cx);
                         } else {
                             this.fetch_action(cx);
                         }

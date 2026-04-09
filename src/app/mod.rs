@@ -2256,6 +2256,7 @@ impl NativeShell {
             | RemoteAction::GitPushSetUpstream { .. }
             | RemoteAction::GitPull { .. }
             | RemoteAction::GitFetch { .. }
+            | RemoteAction::GitSync { .. }
             | RemoteAction::GitSwitchBranch { .. }
             | RemoteAction::GitCreateBranch { .. }
             | RemoteAction::GitDeleteBranch { .. }
@@ -2423,6 +2424,13 @@ impl NativeShell {
                             ),
                             RemoteAction::GitFetch { repo_path } => (
                                 match git_service::fetch(&repo_path) {
+                                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                                    Err(error) => RemoteActionResult::error(error),
+                                },
+                                None,
+                            ),
+                            RemoteAction::GitSync { repo_path } => (
+                                match git_service::sync(&repo_path) {
                                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                                     Err(error) => RemoteActionResult::error(error),
                                 },
@@ -3211,6 +3219,10 @@ impl NativeShell {
                     Err(error) => RemoteActionResult::error(error),
                 },
                 RemoteAction::GitFetch { repo_path } => match git_service::fetch(&repo_path) {
+                    Ok(message) => RemoteActionResult::ok(Some(message), None),
+                    Err(error) => RemoteActionResult::error(error),
+                },
+                RemoteAction::GitSync { repo_path } => match git_service::sync(&repo_path) {
                     Ok(message) => RemoteActionResult::ok(Some(message), None),
                     Err(error) => RemoteActionResult::error(error),
                 },

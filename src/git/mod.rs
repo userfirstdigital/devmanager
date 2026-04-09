@@ -1131,7 +1131,7 @@ impl GitWindow {
                 .spawn(async move {
                     if let Some(client) = remote_client {
                         let action = if has_upstream {
-                            RemoteAction::GitPush { repo_path: repo }
+                            RemoteAction::GitSync { repo_path: repo }
                         } else {
                             RemoteAction::GitPushSetUpstream {
                                 repo_path: repo,
@@ -1147,7 +1147,7 @@ impl GitWindow {
                         }
                     } else {
                         if has_upstream {
-                            git_service::push(&repo)
+                            git_service::sync(&repo)
                         } else {
                             git_service::push_set_upstream(&repo, &branch)
                         }
