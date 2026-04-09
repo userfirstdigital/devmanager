@@ -1081,15 +1081,15 @@ fn shell_candidates(
                 },
                 ShellCandidate {
                     program: "bash".to_string(),
-                    args: Vec::new(),
+                    args: bash_shell_args(shell_integration_enabled),
                 },
                 ShellCandidate {
                     program: "zsh".to_string(),
-                    args: Vec::new(),
+                    args: vec!["-l".to_string()],
                 },
                 ShellCandidate {
                     program: "sh".to_string(),
-                    args: Vec::new(),
+                    args: vec!["-l".to_string()],
                 },
             ],
             _ => {
@@ -1113,7 +1113,7 @@ fn shell_candidates(
                     vec![
                         ShellCandidate {
                             program: "zsh".to_string(),
-                            args: Vec::new(),
+                            args: vec!["-l".to_string()],
                         },
                         ShellCandidate {
                             program: "bash".to_string(),
@@ -1121,7 +1121,7 @@ fn shell_candidates(
                         },
                         ShellCandidate {
                             program: "sh".to_string(),
-                            args: Vec::new(),
+                            args: vec!["-l".to_string()],
                         },
                         ShellCandidate {
                             program: "pwsh".to_string(),
@@ -1136,11 +1136,11 @@ fn shell_candidates(
                         },
                         ShellCandidate {
                             program: "zsh".to_string(),
-                            args: Vec::new(),
+                            args: vec!["-l".to_string()],
                         },
                         ShellCandidate {
                             program: "sh".to_string(),
-                            args: Vec::new(),
+                            args: vec!["-l".to_string()],
                         },
                         ShellCandidate {
                             program: "pwsh".to_string(),
@@ -1168,11 +1168,7 @@ pub fn bash_shell_args(shell_integration_enabled: bool) -> Vec<String> {
         }
     }
 
-    if cfg!(target_os = "windows") {
-        vec!["--login".to_string()]
-    } else {
-        Vec::new()
-    }
+    vec!["--login".to_string()]
 }
 
 pub fn preferred_windows_bash_program() -> String {
@@ -2383,6 +2379,12 @@ mod tests {
             .ends_with("shell-integration\\bash\\devmanager.bashrc")
             || value.ends_with("shell-integration/bash/devmanager.bashrc")));
         assert_eq!(args.get(2).map(String::as_str), Some("-i"));
+    }
+
+    #[test]
+    fn bash_shell_args_returns_login_flag_when_integration_disabled() {
+        let args = bash_shell_args(false);
+        assert_eq!(args, vec!["--login"]);
     }
 
     #[test]

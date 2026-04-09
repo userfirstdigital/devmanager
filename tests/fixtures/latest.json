@@ -8,7 +8,7 @@
       "signature": "windows-signature-placeholder",
       "url": "https://github.com/example/devmanager/releases/download/v0.2.2/DevManager_0.2.2_x64-setup.exe"
     },
-    "darwin-aarch64": {
+    "macos-aarch64": {
       "format": "app",
       "signature": "mac-signature-placeholder",
       "url": "https://github.com/example/devmanager/releases/download/v0.2.2/DevManager_0.2.2_aarch64.app.tar.gz"

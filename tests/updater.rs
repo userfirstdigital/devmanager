@@ -99,7 +99,7 @@ fn manifest_fixture_parses_expected_platform_assets() {
 
     let mac = manifest
         .platforms
-        .get("darwin-aarch64")
+        .get("macos-aarch64")
         .expect("mac updater entry");
     assert_eq!(mac.format, "app");
     assert!(mac.url.ends_with(".app.tar.gz"));

@@ -2241,7 +2241,7 @@ fn build_interactive_shell_command(settings: &Settings) -> (String, Vec<String>)
         ),
         _ => {
             let shell = resolve_shell_path(settings);
-            (shell, Vec::new())
+            (shell, vec!["-l".to_string()])
         }
     }
 }

@@ -166,7 +166,7 @@ jobs:
             platform: windows-aarch64
             formats: nsis
           - runner: macos-15
-            platform: darwin-aarch64
+            platform: macos-aarch64
             formats: app,dmg
     runs-on: ${{ matrix.runner }}
 
@@ -297,7 +297,7 @@ jobs:
                   "pattern": "*_arm64-setup.exe",
                   "format": "nsis",
               },
-              "darwin-aarch64": {
+              "macos-aarch64": {
                   "pattern": "*.app.tar.gz",
                   "format": "app",
               },
@@ -356,5 +356,5 @@ jobs:
           files: |
             release-artifacts/windows-x86_64/*
             release-artifacts/windows-aarch64/*
-            release-artifacts/darwin-aarch64/*
+            release-artifacts/macos-aarch64/*
             latest.json
