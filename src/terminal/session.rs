@@ -1,4 +1,4 @@
-use crate::models::DefaultTerminal;
+use crate::models::{DefaultTerminal, MacTerminalProfile};
 use crate::services::{pid_file, platform_service};
 use crate::state::{
     PromptMarkKind, RuntimeState, SessionDimensions, SessionExitState, SessionKind,
@@ -322,6 +322,7 @@ impl TerminalSession {
         cwd: PathBuf,
         dimensions: SessionDimensions,
         preferred_terminal: Option<DefaultTerminal>,
+        mac_terminal_profile: Option<MacTerminalProfile>,
         shell_integration_enabled: bool,
         scrolling_history: usize,
         runtime_state: Arc<RwLock<RuntimeState>>,
@@ -332,7 +333,11 @@ impl TerminalSession {
         let session_id = session_id.into();
         let backend = TerminalBackend::PortablePtyFeedingAlacritty;
 
-        let candidates = shell_candidates(preferred_terminal.as_ref(), shell_integration_enabled);
+        let candidates = shell_candidates(
+            preferred_terminal.as_ref(),
+            mac_terminal_profile.as_ref(),
+            shell_integration_enabled,
+        );
         let mut last_error = None;
 
         for candidate in candidates {
@@ -1010,6 +1015,7 @@ struct ShellCandidate {
 
 fn shell_candidates(
     preferred_terminal: Option<&DefaultTerminal>,
+    mac_profile: Option<&MacTerminalProfile>,
     shell_integration_enabled: bool,
 ) -> Vec<ShellCandidate> {
     let preferred_terminal = preferred_terminal.cloned().unwrap_or_default();
@@ -1086,24 +1092,63 @@ fn shell_candidates(
                     args: Vec::new(),
                 },
             ],
-            _ => vec![
-                ShellCandidate {
-                    program: "bash".to_string(),
-                    args: bash_shell_args(shell_integration_enabled),
-                },
-                ShellCandidate {
-                    program: "zsh".to_string(),
-                    args: Vec::new(),
-                },
-                ShellCandidate {
-                    program: "sh".to_string(),
-                    args: Vec::new(),
-                },
-                ShellCandidate {
-                    program: "pwsh".to_string(),
-                    args: Vec::new(),
-                },
-            ],
+            _ => {
+                let prefer_zsh = if cfg!(target_os = "macos") {
+                    match mac_profile {
+                        Some(MacTerminalProfile::Bash) => false,
+                        Some(MacTerminalProfile::Zsh) => true,
+                        _ => {
+                            // System default: check $SHELL, default to zsh
+                            // (macOS ships bash 3.2; zsh is the modern default)
+                            !std::env::var("SHELL")
+                                .unwrap_or_default()
+                                .ends_with("/bash")
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                if prefer_zsh {
+                    vec![
+                        ShellCandidate {
+                            program: "zsh".to_string(),
+                            args: Vec::new(),
+                        },
+                        ShellCandidate {
+                            program: "bash".to_string(),
+                            args: bash_shell_args(shell_integration_enabled),
+                        },
+                        ShellCandidate {
+                            program: "sh".to_string(),
+                            args: Vec::new(),
+                        },
+                        ShellCandidate {
+                            program: "pwsh".to_string(),
+                            args: Vec::new(),
+                        },
+                    ]
+                } else {
+                    vec![
+                        ShellCandidate {
+                            program: "bash".to_string(),
+                            args: bash_shell_args(shell_integration_enabled),
+                        },
+                        ShellCandidate {
+                            program: "zsh".to_string(),
+                            args: Vec::new(),
+                        },
+                        ShellCandidate {
+                            program: "sh".to_string(),
+                            args: Vec::new(),
+                        },
+                        ShellCandidate {
+                            program: "pwsh".to_string(),
+                            args: Vec::new(),
+                        },
+                    ]
+                }
+            }
         }
     }
 }

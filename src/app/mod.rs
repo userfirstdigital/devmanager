@@ -6567,6 +6567,7 @@ impl NativeShell {
                         &active_spec.cwd,
                         SessionDimensions::default(),
                         Some(self.state.settings().default_terminal.clone()),
+                        self.state.settings().mac_terminal_profile.clone(),
                     ) {
                         self.terminal_notice =
                             Some(format!("Failed to start shell session: {error}"));

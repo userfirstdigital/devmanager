@@ -137,7 +137,26 @@ After the first push to `native`, verify:
 - `latest.json` points at the uploaded asset names and includes the expected platform entries
 - the app detects the release, downloads it, and shows the restart/install prompt
 
+## macOS Installation
+
+The macOS build is not yet signed with an Apple Developer ID certificate or notarized, so macOS Gatekeeper may show **"DevManager is damaged and can't be opened"** when you try to open the app from the DMG.
+
+To work around this, open Terminal and remove the quarantine attribute:
+
+```bash
+xattr -cr /Applications/DevManager.app
+```
+
+If the DMG itself won't open, run this first:
+
+```bash
+xattr -cr ~/Downloads/DevManager*.dmg
+```
+
+Alternatively, you can right-click the app in Finder, choose **Open**, and click **Open** in the confirmation dialog. This bypasses Gatekeeper for that specific app.
+
+This workaround is needed until proper Apple code signing and notarization are added to the release workflow.
+
 ## Notes
 
 - The archived Tauri release path is intentionally not used anymore.
-- Full Apple notarization and broader release hardening are still out of scope for this slice.

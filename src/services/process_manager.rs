@@ -221,6 +221,7 @@ impl ProcessManager {
         cwd: &Path,
         dimensions: SessionDimensions,
         default_terminal: Option<crate::models::DefaultTerminal>,
+        mac_terminal_profile: Option<crate::models::MacTerminalProfile>,
     ) -> Result<(), String> {
         let session_id = session_id.into();
         self.set_active_session(session_id.clone());
@@ -234,6 +235,7 @@ impl ProcessManager {
             cwd.to_path_buf(),
             dimensions,
             default_terminal,
+            mac_terminal_profile,
             self.inner
                 .settings
                 .read()
@@ -2566,7 +2568,7 @@ mod tests {
         let session_id = "test-shell";
 
         manager
-            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None)
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None, None)
             .unwrap();
         manager
             .write_virtual_text(session_id, "hello world\r\n")
@@ -2657,7 +2659,7 @@ mod tests {
         let session_id = "shell-session";
 
         manager
-            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None)
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None, None)
             .unwrap();
         wait_for_live_session(&manager, session_id);
         wait_for_tracked_process(session_id);
