@@ -886,10 +886,10 @@ pub fn generate_commit_message(
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
         .collect();
 
-    // Truncate to ~250KB on a char boundary to stay within token limits.
-    // GitHub Desktop allows up to 10MB but errors beyond that; we use a lower
-    // limit to keep latency reasonable.
-    let max_len = 250_000;
+    // Truncate on a char boundary to stay within gpt-4o-mini's 12,288 token
+    // prompt limit.  Code diffs average ~3 chars per token; 24,000 chars ≈ 8K
+    // tokens, leaving ~4K headroom for the system prompt and response.
+    let max_len = 24_000;
     let truncated = if sanitized.len() > max_len {
         match sanitized
             .char_indices()
@@ -915,38 +915,98 @@ pub fn generate_commit_message(
         ],
         "temperature": 0.3,
         "max_tokens": 500,
-        "response_format": { "type": "json_object" }
     });
 
-    let resp_json: serde_json::Value = ureq::post("https://api.githubcopilot.com/chat/completions")
-        .header("Authorization", &format!("Bearer {}", copilot_token))
-        .header("Copilot-Integration-Id", "vscode-chat")
-        .header("Editor-Version", "vscode/1.96.0")
-        .header("Editor-Plugin-Version", "copilot-chat/0.24.0")
-        .header("Openai-Intent", "commit-message")
-        .header("Content-Type", "application/json")
-        .send_json(&body)
-        .map_err(|e| {
-            let msg = format!("{e}");
-            if msg.contains("402") {
-                "Copilot usage quota exceeded. Please try again later.".to_string()
-            } else if msg.contains("429") {
-                "Rate limited by Copilot. Please wait a moment and try again.".to_string()
-            } else if msg.contains("401") || msg.contains("403") {
-                "Copilot access denied. Check your GitHub Copilot subscription.".to_string()
-            } else {
-                format!("Copilot API request failed: {e}")
-            }
-        })?
-        .into_body()
-        .read_json()
-        .map_err(|e| format!("Failed to parse Copilot response: {e}"))?;
+    let resp_json = call_copilot_chat(&copilot_token, &body)?;
 
     let content = resp_json["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| "No content in Copilot response".to_string())?;
 
     parse_commit_message_json(content)
+}
+
+/// Call the Copilot chat completions API, with one retry for transient 400 errors.
+fn call_copilot_chat(
+    copilot_token: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut last_err = String::new();
+
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        let result = ureq::post("https://api.githubcopilot.com/chat/completions")
+            .header("Authorization", &format!("Bearer {}", copilot_token))
+            .header("Copilot-Integration-Id", "vscode-chat")
+            .header("Editor-Version", "vscode/1.96.0")
+            .header("Editor-Plugin-Version", "copilot-chat/0.24.0")
+            .header("Openai-Intent", "commit-message")
+            .header("Content-Type", "application/json")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send_json(body);
+
+        let mut resp = match result {
+            Ok(resp) => resp,
+            Err(e) => return Err(format!("Copilot API request failed: {e}")),
+        };
+
+        let status = resp.status().as_u16();
+
+        if (200..300).contains(&status) {
+            let json: serde_json::Value = resp
+                .body_mut()
+                .read_json()
+                .map_err(|e| format!("Failed to parse Copilot response: {e}"))?;
+            return Ok(json);
+        }
+
+        let error_body = resp.body_mut().read_to_string().unwrap_or_default();
+
+        match status {
+            400 => {
+                last_err = format!(
+                    "Copilot API returned 400: {}",
+                    if error_body.is_empty() {
+                        "(no details)".to_string()
+                    } else {
+                        error_body
+                    }
+                );
+                continue;
+            }
+            402 => {
+                return Err("Copilot usage quota exceeded. Please try again later.".to_string());
+            }
+            429 => {
+                return Err(
+                    "Rate limited by Copilot. Please wait a moment and try again.".to_string(),
+                );
+            }
+            401 | 403 => {
+                return Err(
+                    "Copilot access denied. Check your GitHub Copilot subscription.".to_string(),
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "Copilot API request failed (HTTP {}): {}",
+                    status,
+                    if error_body.is_empty() {
+                        "(no details)".to_string()
+                    } else {
+                        error_body
+                    }
+                ));
+            }
+        }
+    }
+
+    Err(last_err)
 }
 
 fn parse_commit_message_json(content: &str) -> Result<AiCommitMessage, String> {
