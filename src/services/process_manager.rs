@@ -2234,6 +2234,14 @@ fn build_interactive_shell_command(settings: &Settings) -> (String, Vec<String>)
         };
     }
 
+    if cfg!(target_os = "macos") {
+        // On macOS the default_terminal setting (Bash/Powershell/Cmd) doesn't apply.
+        // resolve_shell_path honors mac_terminal_profile and falls back to $SHELL/zsh,
+        // avoiding the bundled bash 3.2.
+        let shell = resolve_shell_path(settings);
+        return (shell, vec!["-l".to_string()]);
+    }
+
     match settings.default_terminal.clone() {
         crate::models::DefaultTerminal::Bash => (
             "bash".to_string(),
