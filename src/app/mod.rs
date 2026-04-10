@@ -6275,7 +6275,7 @@ impl NativeShell {
                         self.last_dimensions = Some(dimensions);
                     }
                 }
-            } else if !self.state.open_tabs.is_empty() {
+            } else {
                 self.ensure_splash_image(cx);
             }
 
@@ -6566,54 +6566,10 @@ impl NativeShell {
                     }
                 }
             }
-            _ if !self.state.open_tabs.is_empty() => {
-                // Tabs exist but none is selected — show splash image.
-                self.ensure_splash_image(cx);
-            }
             _ => {
-                self.process_manager
-                    .set_active_session(active_spec.session_id.clone());
-                if self.synced_session_id.as_deref() != Some(active_spec.session_id.as_str()) {
-                    if let Err(error) = self.process_manager.spawn_shell_session(
-                        active_spec.session_id.clone(),
-                        &active_spec.cwd,
-                        SessionDimensions::default(),
-                        Some(self.state.settings().default_terminal.clone()),
-                        self.state.settings().mac_terminal_profile.clone(),
-                    ) {
-                        self.terminal_notice =
-                            Some(format!("Failed to start shell session: {error}"));
-                    } else {
-                        self.terminal_notice = None;
-                    }
-                    self.synced_session_id = Some(active_spec.session_id.clone());
-                    self.last_dimensions = None;
-                }
-
-                let dimensions = self.terminal_dimensions(window);
-                let current_view = if local_has_resize_control {
-                    self.process_manager.active_session()
-                } else {
-                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                };
-                if local_has_resize_control
-                    && terminal_view_needs_resize(
-                        self.last_dimensions,
-                        current_view.as_ref(),
-                        dimensions,
-                    )
-                    && self
-                        .process_manager
-                        .resize_session(&active_spec.session_id, dimensions)
-                        .is_ok()
-                {
-                    self.last_dimensions = Some(dimensions);
-                }
-                active_session = if local_has_resize_control {
-                    self.process_manager.active_session()
-                } else {
-                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                };
+                // No tab is selected — show splash image regardless of whether
+                // any tabs exist. Startup never auto-spawns a shell.
+                self.ensure_splash_image(cx);
             }
         }
 

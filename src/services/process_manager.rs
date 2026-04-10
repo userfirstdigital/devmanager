@@ -2142,19 +2142,11 @@ fn build_server_launch_command(settings: &Settings, command: &RunCommand) -> (St
     }
 
     let shell = resolve_shell_path(settings);
-    let args = if cfg!(target_os = "macos") {
-        vec![
-            "-l".to_string(),
-            "-c".to_string(),
-            build_shell_command_line(command),
-        ]
-    } else {
-        vec![
-            "-l".to_string(),
-            "-c".to_string(),
-            build_shell_command_line(command),
-        ]
-    };
+    let args = vec![
+        "-l".to_string(),
+        "-c".to_string(),
+        build_shell_command_line(command),
+    ];
 
     (shell, args)
 }
