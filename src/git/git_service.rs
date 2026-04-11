@@ -129,7 +129,6 @@ fn run_git_allow_failure(repo_path: &str, args: &[&str]) -> Result<(String, Stri
 
 pub fn is_repo(path: &str) -> bool {
     Path::new(path).join(".git").exists()
-        || run_git(path, &["rev-parse", "--is-inside-work-tree"]).is_ok()
 }
 
 pub fn git_available() -> bool {
