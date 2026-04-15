@@ -49,7 +49,7 @@ export function StatusBar() {
   }
 
   return (
-    <footer className="flex items-center justify-between px-3 py-1 bg-zinc-950 border-t border-zinc-800 text-[11px] text-zinc-500 shrink-0">
+    <footer className="flex items-center justify-between px-2 md:px-3 py-0.5 md:py-1 bg-zinc-950 border-t border-zinc-800 text-[10px] md:text-[11px] text-zinc-500 shrink-0">
       <div className="flex items-center gap-4 min-w-0">
         <span className={`flex items-center gap-1.5 ${tone}`}>
           <Icon className="size-3" />

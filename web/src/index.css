@@ -29,11 +29,8 @@ body,
   background: #52525b;
 }
 
-/* xterm.js overrides: pad the viewport + snap the font-stack to the same
- * family the archived InteractiveTerminal.tsx used. */
-.xterm {
-  padding: 6px 8px;
-}
+/* xterm.js overrides: snap the font-stack to the same family the archived
+ * InteractiveTerminal.tsx used. */
 .xterm .xterm-viewport,
 .xterm .xterm-screen {
   font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas,
@@ -50,10 +47,14 @@ body,
 
 .dm-terminal-host {
   min-height: 100%;
+  flex: 1 1 auto;
 }
 
 .dm-terminal-shell .xterm {
+  box-sizing: border-box;
+  height: 100%;
   min-height: 100%;
+  padding: 6px 8px;
 }
 
 .dm-terminal-shell[data-terminal-pan="true"] .xterm {
@@ -70,6 +71,12 @@ body,
 .dm-terminal-shell .xterm .xterm-viewport {
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 767px) {
+  .dm-terminal-shell .xterm {
+    padding: 2px 4px;
+  }
 }
 
 /* Pulse animation used on "live" status dots so they subtly breathe while

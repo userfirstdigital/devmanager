@@ -1,5 +1,5 @@
 export const DESKTOP_TERMINAL_FONT_SIZE = 13;
-export const MOBILE_TERMINAL_MIN_FONT_SIZE = 9;
+export const MOBILE_TERMINAL_MIN_FONT_SIZE = 8;
 const MOBILE_TERMINAL_BREAKPOINT_PX = 768;
 
 export interface ResponsiveTerminalLayoutInput {

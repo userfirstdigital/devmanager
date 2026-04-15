@@ -2950,6 +2950,21 @@ impl NativeShell {
                         RemoteActionResult::ok(None, None)
                     }
                 }
+                RemoteAction::StopAllServers => {
+                    let stopped = self.process_manager.stop_all_servers();
+                    if stopped > 0 {
+                        did_change = true;
+                        self.save_session_state();
+                    }
+                    let message = if stopped == 0 {
+                        "No running servers to stop.".to_string()
+                    } else {
+                        format!("Stopping {stopped} running server tab(s).")
+                    };
+                    self.terminal_notice = Some(message.clone());
+                    cx.notify();
+                    RemoteActionResult::ok(Some(message), None)
+                }
                 RemoteAction::SaveProject { project } => {
                     self.state.upsert_project(project);
                     did_change = true;
@@ -6230,19 +6245,16 @@ impl NativeShell {
 
         // Copy selected text
         if secondary && key == "c" {
-            if let Some(anchor) = self.editor_selection_anchor {
-                if let Some(panel) = self.editor_panel.as_ref() {
-                    if let Some(value) = panel.text_value(field) {
-                        let (start, end) = if anchor < self.editor_cursor {
-                            (anchor, self.editor_cursor)
-                        } else {
-                            (self.editor_cursor, anchor)
-                        };
-                        if start != end {
-                            let selected: String =
-                                value.chars().skip(start).take(end - start).collect();
-                            cx.write_to_clipboard(ClipboardItem::new_string(selected));
-                        }
+            if let Some(panel) = self.editor_panel.as_ref() {
+                if let Some(value) = panel.text_value(field) {
+                    if let Some((start, end)) = selection_range(
+                        self.editor_cursor,
+                        self.editor_selection_anchor,
+                        value.chars().count(),
+                    ) {
+                        let selected: String =
+                            value.chars().skip(start).take(end - start).collect();
+                        cx.write_to_clipboard(ClipboardItem::new_string(selected));
                     }
                 }
             }
@@ -6252,19 +6264,16 @@ impl NativeShell {
 
         // Cut selected text
         if secondary && key == "x" {
-            if let Some(anchor) = self.editor_selection_anchor {
-                if let Some(panel) = self.editor_panel.as_ref() {
-                    if let Some(value) = panel.text_value(field) {
-                        let (start, end) = if anchor < self.editor_cursor {
-                            (anchor, self.editor_cursor)
-                        } else {
-                            (self.editor_cursor, anchor)
-                        };
-                        if start != end {
-                            let selected: String =
-                                value.chars().skip(start).take(end - start).collect();
-                            cx.write_to_clipboard(ClipboardItem::new_string(selected));
-                        }
+            if let Some(panel) = self.editor_panel.as_ref() {
+                if let Some(value) = panel.text_value(field) {
+                    if let Some((start, end)) = selection_range(
+                        self.editor_cursor,
+                        self.editor_selection_anchor,
+                        value.chars().count(),
+                    ) {
+                        let selected: String =
+                            value.chars().skip(start).take(end - start).collect();
+                        cx.write_to_clipboard(ClipboardItem::new_string(selected));
                     }
                 }
             }
@@ -12290,9 +12299,19 @@ fn write_terminal_export(kind: &str, text: &str) -> Result<std::path::PathBuf, S
     Ok(path)
 }
 
-fn selection_range(cursor: usize, anchor: Option<usize>) -> Option<(usize, usize)> {
+fn selection_range(
+    cursor: usize,
+    anchor: Option<usize>,
+    char_len: usize,
+) -> Option<(usize, usize)> {
     anchor.and_then(|a| {
-        let (start, end) = if a < cursor { (a, cursor) } else { (cursor, a) };
+        let clamped_cursor = cursor.min(char_len);
+        let clamped_anchor = a.min(char_len);
+        let (start, end) = if clamped_anchor < clamped_cursor {
+            (clamped_anchor, clamped_cursor)
+        } else {
+            (clamped_cursor, clamped_anchor)
+        };
         if start == end {
             None
         } else {
@@ -12301,8 +12320,19 @@ fn selection_range(cursor: usize, anchor: Option<usize>) -> Option<(usize, usize
     })
 }
 
+fn normalize_selection_bounds(cursor: &mut usize, anchor: &mut Option<usize>, char_len: usize) {
+    *cursor = (*cursor).min(char_len);
+    if let Some(current_anchor) = anchor.as_mut() {
+        *current_anchor = (*current_anchor).min(char_len);
+    }
+    if matches!(anchor, Some(current_anchor) if *current_anchor == *cursor) {
+        *anchor = None;
+    }
+}
+
 fn delete_selection(chars: &mut Vec<char>, cursor: &mut usize, anchor: &mut Option<usize>) {
-    if let Some((start, end)) = selection_range(*cursor, *anchor) {
+    normalize_selection_bounds(cursor, anchor, chars.len());
+    if let Some((start, end)) = selection_range(*cursor, *anchor, chars.len()) {
         chars.drain(start..end);
         *cursor = start;
         *anchor = None;
@@ -12323,7 +12353,7 @@ fn apply_text_key_to_string(
     let secondary = modifiers.control || modifiers.platform;
     let shift = modifiers.shift;
     let mut chars: Vec<char> = value.chars().collect();
-    *cursor = (*cursor).min(chars.len());
+    normalize_selection_bounds(cursor, selection_anchor, chars.len());
 
     // Select all
     if secondary && key == "a" {
@@ -12340,8 +12370,9 @@ fn apply_text_key_to_string(
                     *selection_anchor = Some(*cursor);
                 }
                 *cursor = (*cursor).saturating_sub(1);
-            } else if let Some(_) = selection_range(*cursor, *selection_anchor) {
-                let start = (*cursor).min(selection_anchor.unwrap_or(*cursor));
+            } else if let Some((start, _)) =
+                selection_range(*cursor, *selection_anchor, chars.len())
+            {
                 *cursor = start;
                 *selection_anchor = None;
             } else {
@@ -12356,8 +12387,8 @@ fn apply_text_key_to_string(
                     *selection_anchor = Some(*cursor);
                 }
                 *cursor = (*cursor + 1).min(chars.len());
-            } else if let Some(_) = selection_range(*cursor, *selection_anchor) {
-                let end = (*cursor).max(selection_anchor.unwrap_or(*cursor));
+            } else if let Some((_, end)) = selection_range(*cursor, *selection_anchor, chars.len())
+            {
                 *cursor = end;
                 *selection_anchor = None;
             } else {
@@ -12432,7 +12463,7 @@ fn apply_text_key_to_string(
             return true;
         }
         "backspace" => {
-            if selection_range(*cursor, *selection_anchor).is_some() {
+            if selection_range(*cursor, *selection_anchor, chars.len()).is_some() {
                 delete_selection(&mut chars, cursor, selection_anchor);
                 *value = chars.into_iter().collect();
                 return true;
@@ -12446,7 +12477,7 @@ fn apply_text_key_to_string(
             return false;
         }
         "delete" => {
-            if selection_range(*cursor, *selection_anchor).is_some() {
+            if selection_range(*cursor, *selection_anchor, chars.len()).is_some() {
                 delete_selection(&mut chars, cursor, selection_anchor);
                 *value = chars.into_iter().collect();
                 return true;
@@ -12853,6 +12884,36 @@ mod tests {
         assert_eq!(move_cursor_vertically(value, 5, 1), 9);
         assert_eq!(move_cursor_vertically(value, 9, 1), 12);
         assert_eq!(move_cursor_vertically(value, 12, -1), 9);
+    }
+
+    #[test]
+    fn editor_text_input_clamps_stale_selection_anchor_before_delete() {
+        let mut value = "300".to_string();
+        let mut cursor = 3usize;
+        let mut selection_anchor = Some(4usize);
+        let event = KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers::default(),
+                key: "1".to_string(),
+                key_char: Some("1".to_string()),
+            },
+            is_held: false,
+        };
+
+        let changed = apply_text_key_to_string(
+            &mut value,
+            &mut cursor,
+            &mut selection_anchor,
+            &event,
+            None,
+            true,
+            false,
+        );
+
+        assert!(changed);
+        assert_eq!(value, "3001");
+        assert_eq!(cursor, 4);
+        assert_eq!(selection_anchor, None);
     }
 
     #[test]

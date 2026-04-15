@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { DEFAULT_DIMENSIONS } from "../api/types";
 import type {
   RemoteActionResult,
   RemoteWorkspaceSnapshot,
@@ -58,6 +59,28 @@ function makeSnapshot(): RemoteWorkspaceSnapshot {
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
         ],
+        settings: {
+          theme: "dark",
+          logBufferSize: 10_000,
+          confirmOnClose: true,
+          minimizeToTray: false,
+          restoreSessionOnStart: true,
+          defaultTerminal: "bash",
+          macTerminalProfile: "system",
+          claudeCommand: null,
+          codexCommand: null,
+          notificationSound: null,
+          terminalFontSize: null,
+          optionAsMeta: false,
+          copyOnSelect: false,
+          keepSelectionOnCopy: true,
+          showTerminalScrollbar: true,
+          shellIntegrationEnabled: true,
+          terminalMouseOverride: false,
+          terminalReadOnly: false,
+          githubToken: null,
+        },
+        sshConnections: [],
       },
       open_tabs: [],
       active_tab_id: null,
@@ -160,6 +183,7 @@ describe("web AI tab actions", () => {
       lastError: null,
       client: null,
       terminalSubscribers: new Map(),
+      pendingTerminalFrames: new Map(),
       bootstrapSubscribers: new Map(),
       pendingBootstraps: new Map(),
       pendingLaunches: [],
@@ -280,5 +304,33 @@ describe("web AI tab actions", () => {
     expect(Array.from(seen[0] ?? new Uint8Array())).toEqual([65, 66, 67]);
 
     unsubscribe();
+  });
+
+  it("connectSsh sends the typed SSH action with default dimensions", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+
+    useStore.getState().connectSsh("ssh-1");
+
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "action",
+      action: {
+        type: "connectSsh",
+        connection_id: "ssh-1",
+        dimensions: DEFAULT_DIMENSIONS,
+      },
+    });
+  });
+
+  it("stopAllServers sends the archive footer action", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+
+    useStore.getState().stopAllServers();
+
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "action",
+      action: { type: "stopAllServers" },
+    });
   });
 });

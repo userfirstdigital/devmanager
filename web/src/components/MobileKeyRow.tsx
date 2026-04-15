@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
+import { pickMobileKeysForWidth } from "./mobileKeyLayout";
 
 interface MobileKeyRowProps {
   sessionId: string;
@@ -17,6 +18,10 @@ interface MobileKeyRowProps {
 export function MobileKeyRow({ sessionId }: MobileKeyRowProps) {
   const sendInput = useStore((s) => s.sendInput);
   const [ctrlArmed, setCtrlArmed] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [availableWidth, setAvailableWidth] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth : 0,
+  );
 
   const send = (text: string) => sendInput(sessionId, text);
 
@@ -35,90 +40,59 @@ export function MobileKeyRow({ sessionId }: MobileKeyRowProps) {
   };
 
   const btnBase =
-    "h-10 min-w-[36px] px-2 rounded text-xs font-mono text-zinc-100 bg-zinc-700 active:bg-zinc-600";
+    "h-8 min-w-[28px] px-1 rounded text-[10px] font-mono whitespace-nowrap text-zinc-100 bg-zinc-700 active:bg-zinc-600 shrink-0";
+
+  useEffect(() => {
+    const element = rowRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateWidth = (nextWidth?: number) => {
+      const measured = nextWidth ?? element.clientWidth;
+      setAvailableWidth(Math.round(measured));
+    };
+
+    updateWidth();
+
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver((entries) => {
+        updateWidth(entries[0]?.contentRect.width);
+      });
+      observer.observe(element);
+      return () => observer.disconnect();
+    }
+
+    const onResize = () => updateWidth();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const keys = pickMobileKeysForWidth(availableWidth);
 
   return (
-    <div className="md:hidden flex items-center gap-1 overflow-x-auto px-2 py-2 bg-zinc-800 border-t border-zinc-700 scrollbar-none">
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Esc", "\u001b")}
-      >
-        Esc
-      </button>
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Tab", "\t")}
-      >
-        Tab
-      </button>
-      <button
-        type="button"
-        className={`${btnBase} ${ctrlArmed ? "bg-indigo-600" : ""}`}
-        onClick={() => onKey("Ctrl", "")}
-      >
-        Ctrl
-      </button>
-      {["C", "D", "Z", "L"].map((letter) => (
+    <div
+      ref={rowRef}
+      className="md:hidden flex items-center justify-between gap-0.5 overflow-hidden px-1 py-1.5 bg-zinc-800 border-t border-zinc-700"
+    >
+      {keys.map((key) => (
         <button
-          key={letter}
+          key={key.label}
           type="button"
-          className={btnBase}
-          onClick={() => onKey(letter, letter.toLowerCase())}
+          className={`${btnBase} ${
+            key.label === "Ctrl" && ctrlArmed ? "bg-indigo-600" : ""
+          } ${key.label === "Enter" ? "min-w-[38px]" : ""}`}
+          onClick={() => onKey(key.label, key.payload)}
         >
-          {letter}
+          {key.label === "Up"
+            ? "↑"
+            : key.label === "Down"
+              ? "↓"
+              : key.label === "Right"
+                ? "→"
+              : key.label}
         </button>
       ))}
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Up", "\u001bOA")}
-      >
-        ↑
-      </button>
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Down", "\u001bOB")}
-      >
-        ↓
-      </button>
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Left", "\u001bOD")}
-      >
-        ←
-      </button>
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Right", "\u001bOC")}
-      >
-        →
-      </button>
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Pipe", "|")}
-      >
-        |
-      </button>
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Slash", "/")}
-      >
-        /
-      </button>
-      <button
-        type="button"
-        className={btnBase}
-        onClick={() => onKey("Tilde", "~")}
-      >
-        ~
-      </button>
     </div>
   );
 }

@@ -80,7 +80,12 @@ interface StoreState {
   launchAiTab(projectId: string, tabType: "claude" | "codex"): Promise<void>;
   openAiTab(tabId: string): Promise<void>;
   restartAiTab(tabId: string): Promise<void>;
-  /** Close the currently-active tab on the host (AI only) and hide it. */
+  openSshTab(connectionId: string): void;
+  connectSsh(connectionId: string): void;
+  restartSsh(connectionId: string): void;
+  disconnectSsh(connectionId: string): void;
+  stopAllServers(): void;
+  /** Close the currently-active tab on the host and hide it. */
   closeActiveTab(): void;
 }
 
@@ -557,23 +562,20 @@ export const useStore = create<StoreState>((set, get) => {
       const sid = t.ptySessionId ?? t.commandId ?? t.id;
       return sid === sessionId;
     });
-    // For Claude/Codex tabs, dispatch `closeAiTab` so the host removes the
-    // SessionTab from `open_tabs` — the sidebar row disappears on the next
-    // delta. Server rows aren't "closed" from a web-UI perspective (the
-    // command config stays configured in the project), so we just hide the
-    // terminal view.
-    if (tab && (tab.type === "claude" || tab.type === "codex")) {
-      // The host's CloseAiTab handler gates on `requires_control` — if the
-      // web client isn't currently holding control, the action is silently
-      // dropped and the tab stays alive on the native side. Claim control
-      // first so the close always lands. WS frames are processed in order
-      // by the bridge, so the controller bit flips BEFORE the action is
-      // evaluated in the pending_requests queue.
+    // For AI/SSH tabs, ask the host to remove the SessionTab from `open_tabs`
+    // so the sidebar row disappears on the next delta. Server rows aren't
+    // "closed" from a web-UI perspective (the command config stays configured
+    // in the project), so we just hide the terminal view.
+    if (tab && (tab.type === "claude" || tab.type === "codex" || tab.type === "ssh")) {
       const youHaveControl = state.snapshot?.youHaveControl ?? false;
       if (!youHaveControl) {
         state.client?.send({ type: "takeControl" });
       }
-      state.sendAction({ type: "closeAiTab", tab_id: tab.id });
+      state.sendAction(
+        tab.type === "claude" || tab.type === "codex"
+          ? { type: "closeAiTab", tab_id: tab.id }
+          : { type: "closeTab", tab_id: tab.id },
+      );
     }
     // Hide the view immediately for snappy UX. The delta removing the tab
     // from `open_tabs` will clean up the sidebar row within ~33ms.
@@ -603,6 +605,34 @@ export const useStore = create<StoreState>((set, get) => {
       tab_id: tabId,
       dimensions: DEFAULT_DIMENSIONS,
     });
+  },
+
+  openSshTab(connectionId) {
+    get().sendAction({ type: "openSshTab", connection_id: connectionId });
+  },
+
+  connectSsh(connectionId) {
+    get().sendAction({
+      type: "connectSsh",
+      connection_id: connectionId,
+      dimensions: DEFAULT_DIMENSIONS,
+    });
+  },
+
+  restartSsh(connectionId) {
+    get().sendAction({
+      type: "restartSsh",
+      connection_id: connectionId,
+      dimensions: DEFAULT_DIMENSIONS,
+    });
+  },
+
+  disconnectSsh(connectionId) {
+    get().sendAction({ type: "disconnectSsh", connection_id: connectionId });
+  },
+
+  stopAllServers() {
+    get().sendAction({ type: "stopAllServers" });
   },
   };
 });

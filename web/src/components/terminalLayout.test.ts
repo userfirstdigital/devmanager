@@ -45,4 +45,17 @@ describe("computeResponsiveTerminalLayout", () => {
       allowHorizontalPan: true,
     });
   });
+
+  it("fits slightly narrower phone layouts before giving up to horizontal pan", () => {
+    expect(
+      computeResponsiveTerminalLayout({
+        containerWidth: 360,
+        measuredTerminalWidth: 580,
+        currentFontSize: DESKTOP_TERMINAL_FONT_SIZE,
+      }),
+    ).toEqual({
+      fontSize: 8,
+      allowHorizontalPan: false,
+    });
+  });
 });

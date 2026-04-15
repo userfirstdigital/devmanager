@@ -348,6 +348,7 @@ pub enum RemoteAction {
     CloseTab {
         tab_id: String,
     },
+    StopAllServers,
     SaveProject {
         project: Project,
     },

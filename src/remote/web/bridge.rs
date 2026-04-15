@@ -839,6 +839,46 @@ mod tests {
     }
 
     #[test]
+    fn viewer_mode_stop_all_requests_get_error_responses_without_disconnect() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 12;
+        let client_id = "web-viewer";
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, connection_id, client_id, std_tx);
+
+        let (tokio_tx, mut tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::Request {
+                id: 29,
+                action: RemoteAction::StopAllServers,
+            },
+            &tokio_tx,
+        );
+
+        match tokio_rx.try_recv().expect("response frame") {
+            ServerMessage::Response { request_id, result } => {
+                assert_eq!(request_id, 29);
+                assert!(!result.ok);
+                assert_eq!(
+                    result.message.as_deref(),
+                    Some("This client is in viewer mode. Take control first."),
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let requests = service
+            .inner
+            .pending_requests
+            .lock()
+            .expect("pending requests lock");
+        assert!(requests.is_empty(), "viewer mode must not queue host work");
+    }
+
+    #[test]
     fn subscribe_marks_session_before_eager_bootstrap_lookup() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let (entered_tx, entered_rx) = std_mpsc::channel::<()>();

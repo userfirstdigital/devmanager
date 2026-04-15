@@ -65,14 +65,50 @@ export interface Project {
   color?: string | null;
   pinned?: boolean | null;
   notes?: string | null;
+  saveLogFiles?: boolean | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type DefaultTerminal = "bash" | "powershell" | "cmd";
+export type MacTerminalProfile = "system" | "zsh" | "bash";
+
+export interface Settings {
+  theme: string;
+  logBufferSize: number;
+  confirmOnClose: boolean;
+  minimizeToTray: boolean;
+  restoreSessionOnStart?: boolean | null;
+  defaultTerminal: DefaultTerminal;
+  macTerminalProfile?: MacTerminalProfile | null;
+  claudeCommand?: string | null;
+  codexCommand?: string | null;
+  notificationSound?: string | null;
+  terminalFontSize?: number | null;
+  optionAsMeta: boolean;
+  copyOnSelect: boolean;
+  keepSelectionOnCopy: boolean;
+  showTerminalScrollbar: boolean;
+  shellIntegrationEnabled: boolean;
+  terminalMouseOverride: boolean;
+  terminalReadOnly: boolean;
+  githubToken?: string | null;
+}
+
+export interface SSHConnection {
+  id: string;
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  password?: string | null;
 }
 
 export interface AppConfig {
   version: number;
   projects: Project[];
-  // settings, sshConnections, etc. — we don't touch them in Phase 3.
+  settings: Settings;
+  sshConnections: SSHConnection[];
 }
 
 /** Serialized with lowercase variant names. */
@@ -233,7 +269,44 @@ export type RemoteAction =
       dimensions: SessionDimensions;
     }
   | { type: "closeAiTab"; tab_id: string }
-  | { type: "closeTab"; tab_id: string };
+  | { type: "openSshTab"; connection_id: string }
+  | {
+      type: "connectSsh";
+      connection_id: string;
+      dimensions: SessionDimensions;
+    }
+  | {
+      type: "restartSsh";
+      connection_id: string;
+      dimensions: SessionDimensions;
+    }
+  | { type: "disconnectSsh"; connection_id: string }
+  | { type: "closeTab"; tab_id: string }
+  | { type: "stopAllServers" }
+  | { type: "saveProject"; project: Project }
+  | { type: "deleteProject"; project_id: string }
+  | {
+      type: "saveFolder";
+      project_id: string;
+      folder: ProjectFolder;
+      env_file_contents?: string | null;
+    }
+  | { type: "deleteFolder"; project_id: string; folder_id: string }
+  | {
+      type: "saveCommand";
+      project_id: string;
+      folder_id: string;
+      command: RunCommand;
+    }
+  | {
+      type: "deleteCommand";
+      project_id: string;
+      folder_id: string;
+      command_id: string;
+    }
+  | { type: "saveSsh"; connection: SSHConnection }
+  | { type: "deleteSsh"; connection_id: string }
+  | { type: "saveSettings"; settings: Settings };
 
 export interface RemoteAiTabPayload {
   type: "aiTab";

@@ -472,12 +472,12 @@ export function TerminalView({ sessionId }: TerminalProps) {
   return (
     <div
       ref={shellRef}
-      className="dm-terminal-shell flex-1 min-h-0 min-w-0 bg-[#09090b]"
+      className="dm-terminal-shell flex flex-1 min-h-0 min-w-0 bg-[#09090b]"
       data-terminal-pan={responsiveLayout.allowHorizontalPan ? "true" : "false"}
     >
       <div
         ref={containerRef}
-        className="dm-terminal-host h-full"
+        className="dm-terminal-host flex-1 h-full min-w-0"
         style={{ padding: 0 }}
       />
     </div>

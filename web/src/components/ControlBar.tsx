@@ -20,7 +20,7 @@ export function ControlBar({ session, onClose }: ControlBarProps) {
   const releaseControl = useStore((s) => s.releaseControl);
 
   return (
-    <div className="flex items-center gap-3 px-3 h-9 shrink-0 bg-zinc-800/60 border-b border-zinc-700/60">
+    <div className="flex items-center gap-2 px-2 md:px-3 h-8 md:h-9 shrink-0 bg-zinc-800/60 border-b border-zinc-700/60">
       <span className="text-xs font-medium text-zinc-200 truncate">
         {session.title || session.session_id}
       </span>
@@ -32,7 +32,7 @@ export function ControlBar({ session, onClose }: ControlBarProps) {
         <button
           type="button"
           onClick={releaseControl}
-          className="flex items-center gap-1.5 text-[11px] px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/30"
+          className="flex items-center gap-1.5 text-[10px] md:text-[11px] px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/30"
         >
           <KeyRound className="size-3" />
           <span>You have control</span>
@@ -41,7 +41,7 @@ export function ControlBar({ session, onClose }: ControlBarProps) {
         <button
           type="button"
           onClick={takeControl}
-          className="flex items-center gap-1.5 text-[11px] px-2 py-1 rounded bg-amber-600/20 text-amber-300 hover:bg-amber-600/30"
+          className="flex items-center gap-1.5 text-[10px] md:text-[11px] px-2 py-1 rounded bg-amber-600/20 text-amber-300 hover:bg-amber-600/30"
         >
           <Eye className="size-3" />
           <span>View only — take control</span>
