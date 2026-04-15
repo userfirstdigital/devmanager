@@ -1,0 +1,4 @@
+node_modules/
+bundle/*
+!bundle/index.html
+*.log

@@ -14,8 +14,9 @@ use crate::remote::{
     RemoteSessionBootstrap, RemoteTerminalExport, RemoteTerminalInput,
 };
 use crate::services::{
-    env_service, pid_file, platform_service, ports_service, scanner_service, ConfigImportMode,
-    ManagedShutdownReport, ProcessManager, RemoteSessionEvent, SessionManager,
+    ai_session_needs_restore, env_service, pid_file, platform_service, ports_service,
+    scanner_service, ConfigImportMode, ManagedShutdownReport, ProcessManager, RemoteSessionEvent,
+    SessionManager,
 };
 use crate::sidebar;
 use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState, SessionStatus};
@@ -51,6 +52,7 @@ const REMOTE_HOST_SNAPSHOT_ACTIVE_INTERVAL: Duration = Duration::from_millis(33)
 const REMOTE_HOST_SNAPSHOT_IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const REMOTE_RECONNECT_BASE_INTERVAL: Duration = Duration::from_millis(350);
 const REMOTE_RECONNECT_MAX_INTERVAL: Duration = Duration::from_secs(5);
+const AI_LOCAL_RENDER_GUARD_WINDOW: Duration = Duration::from_secs(30);
 const APP_WINDOW_TITLE: &str = "DevManager";
 const WINDOW_TITLE_SEPARATOR: &str = " • ";
 
@@ -128,10 +130,10 @@ struct NativeShell {
     local_state_backup: Option<AppState>,
     last_remote_host_config_revision: u64,
     last_remote_snapshot_sync_at: Option<Instant>,
+    last_remote_app_revision: u64,
     last_remote_runtime_revision: u64,
     last_remote_port_hash: u64,
     remote_live_session_generations: HashMap<String, u64>,
-    local_viewer_replicas: HashMap<String, LocalViewerReplicaState>,
     terminal_focus: FocusHandle,
     editor_focus: FocusHandle,
     did_focus_terminal: bool,
@@ -366,11 +368,6 @@ struct RemoteReconnectState {
     last_error: Option<String>,
 }
 
-struct LocalViewerReplicaState {
-    dirty_generation: u64,
-    replica: crate::terminal::session::TerminalReplica,
-}
-
 fn format_remote_latency_summary(stats: &RemoteLatencyStats) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(ms) = stats.input_enqueue_to_host_write_ms {
@@ -416,7 +413,9 @@ impl NativeShell {
         let bootstrap_manager = process_manager.clone();
         remote_host_service.set_session_bootstrap_provider(Some(Arc::new(move |session_id| {
             let session_view = bootstrap_manager.session_view(session_id)?;
-            let replay_bytes = bootstrap_manager.session_replay_bytes(session_id).ok()?;
+            let replay_bytes = bootstrap_manager
+                .session_replay_bytes(session_id)
+                .unwrap_or_default();
             Some(RemoteSessionBootstrap {
                 session_id: session_id.to_string(),
                 runtime: session_view.runtime,
@@ -450,10 +449,6 @@ impl NativeShell {
                 let _ = resize_manager.resize_session(&session_id, dimensions);
             },
         )));
-        let focus_manager = process_manager.clone();
-        remote_host_service.set_focused_session_handler(Some(Arc::new(move |session_id| {
-            focus_manager.set_active_session(session_id);
-        })));
         let event_host_service = remote_host_service.clone();
         process_manager.set_remote_session_handler(Some(Arc::new(move |event| match event {
             RemoteSessionEvent::Output { session_id, bytes } => {
@@ -468,6 +463,10 @@ impl NativeShell {
             RemoteSessionEvent::Removed { session_id } => {
                 event_host_service.push_session_removed(&session_id);
             }
+        })));
+        let focus_manager = process_manager.clone();
+        remote_host_service.set_focused_session_handler(Some(Arc::new(move |session_id| {
+            focus_manager.set_active_session(session_id);
         })));
         let remote_client_pool = RemoteClientPool::default();
         let mut terminal_notice = None;
@@ -514,10 +513,10 @@ impl NativeShell {
             local_state_backup: None,
             last_remote_host_config_revision: 0,
             last_remote_snapshot_sync_at: None,
+            last_remote_app_revision: 0,
             last_remote_runtime_revision: 0,
             last_remote_port_hash: 0,
             remote_live_session_generations: HashMap::new(),
-            local_viewer_replicas: HashMap::new(),
             terminal_focus: cx.focus_handle(),
             editor_focus: cx.focus_handle(),
             did_focus_terminal: false,
@@ -1164,6 +1163,13 @@ impl NativeShell {
             draft.remote_host_enabled = self.remote_machine_state.host.enabled;
             draft.remote_keep_hosting_in_background =
                 self.remote_machine_state.host.keep_hosting_in_background;
+            draft.remote_web_enabled = self.remote_machine_state.host.web.enabled;
+            draft.remote_web_pairing_token =
+                self.remote_machine_state.host.web.pairing_token.clone();
+            draft.remote_web_listener_url =
+                Some(self.remote_machine_state.host.web.display_url());
+            draft.remote_web_paired_clients =
+                self.remote_machine_state.host.web.paired_clients.len();
 
             if !draft.remote_connected && draft.remote_connect_address.trim().is_empty() {
                 if let Some(host) = draft.remote_known_hosts.first() {
@@ -1215,7 +1221,7 @@ impl NativeShell {
         }
 
         let remote_status = self.remote_host_service.status();
-        if !remote_status.enabled {
+        if !remote_status.any_transport_enabled() {
             self.last_remote_snapshot_sync_at = None;
             return;
         }
@@ -1235,23 +1241,29 @@ impl NativeShell {
             return;
         }
 
-        let runtime_revision = remote_runtime_revision(runtime_state);
+        let app_revision = self.state.revision();
+        let runtime_revision = self.process_manager.runtime_revision();
         let port_hash = local_stable_hash(&self.server_port_snapshot.statuses);
         let forced_sync = self.last_remote_snapshot_sync_at.is_none();
+        let app_changed = forced_sync || app_revision != self.last_remote_app_revision;
+        let runtime_changed = forced_sync || runtime_revision != self.last_remote_runtime_revision;
+        let port_changed = forced_sync || port_hash != self.last_remote_port_hash;
         if !forced_sync
-            && runtime_revision == self.last_remote_runtime_revision
-            && port_hash == self.last_remote_port_hash
+            && !app_changed
+            && !runtime_changed
+            && !port_changed
             && !has_pending_requests
         {
             self.last_remote_snapshot_sync_at = Some(now);
             return;
         }
 
-        self.remote_host_service.update_snapshot(
-            self.state.clone(),
-            runtime_state.clone(),
-            self.server_port_snapshot.statuses.clone(),
+        self.remote_host_service.update_snapshot_parts(
+            app_changed.then(|| self.state.clone()),
+            runtime_changed.then(|| runtime_state.clone()),
+            port_changed.then(|| self.server_port_snapshot.statuses.clone()),
         );
+        self.last_remote_app_revision = app_revision;
         self.last_remote_runtime_revision = runtime_revision;
         self.last_remote_port_hash = port_hash;
         self.last_remote_snapshot_sync_at = Some(now);
@@ -1263,7 +1275,7 @@ impl NativeShell {
         }
 
         let remote_status = self.remote_host_service.status();
-        if !remote_status.enabled || remote_status.connected_clients == 0 {
+        if !remote_status.any_transport_enabled() || remote_status.connected_clients == 0 {
             self.remote_live_session_generations.clear();
             let _ = self.process_manager.drain_remote_dirty_sessions();
             return;
@@ -2115,32 +2127,14 @@ impl NativeShell {
         session_id: &str,
         dimensions: SessionDimensions,
     ) -> Option<crate::terminal::session::TerminalSessionView> {
-        let live_view = self.process_manager.session_view(session_id)?;
-        let dirty_generation = live_view.runtime.dirty_generation;
-        let should_rebuild = self
-            .local_viewer_replicas
-            .get(session_id)
-            .map(|state| state.dirty_generation != dirty_generation)
-            .unwrap_or(true);
-
-        if should_rebuild {
-            let replay_bytes = self.process_manager.session_replay_bytes(session_id).ok()?;
-            self.local_viewer_replicas.insert(
-                session_id.to_string(),
-                LocalViewerReplicaState {
-                    dirty_generation,
-                    replica: crate::terminal::session::TerminalReplica::from_bootstrap(
-                        session_id.to_string(),
-                        live_view.runtime.clone(),
-                        &replay_bytes,
-                    ),
-                },
-            );
-        }
-
-        let state = self.local_viewer_replicas.get_mut(session_id)?;
-        state.replica.apply_local_resize(dimensions);
-        state.replica.view()
+        let _ = dimensions;
+        // When another remote client controls the host, this desktop becomes
+        // a passive viewer. Rebuilding a fresh `TerminalReplica` from the
+        // entire replay buffer on every dirty generation is especially costly
+        // for Claude/Codex full-screen TUIs and can stall or crash the native
+        // window while selecting those tabs. Viewer mode should mirror the
+        // host's exact current screen, not synthesize a locally-resized copy.
+        self.process_manager.session_view(session_id)
     }
 
     fn current_port_statuses(&self) -> HashMap<u16, PortStatus> {
@@ -2213,7 +2207,10 @@ impl NativeShell {
                         .cloned()
                 });
         }
-        self.process_manager.active_session()
+        let active_spec = self.state.active_terminal_spec();
+        self.process_manager
+            .session_view(&active_spec.session_id)
+            .or_else(|| self.process_manager.active_session())
     }
 
     fn current_session_view(
@@ -2227,6 +2224,17 @@ impl NativeShell {
                 .or_else(|| remote_mode.snapshot.session_views.get(session_id).cloned());
         }
         self.process_manager.session_view(session_id)
+    }
+
+    fn ai_tab_session_needs_restore(&self, tab: &crate::models::SessionTab) -> bool {
+        let Some(session_id) = tab.pty_session_id.as_deref() else {
+            return true;
+        };
+        let runtime = self.process_manager.runtime_state();
+        let session_runtime = runtime.sessions.get(session_id).cloned();
+        let session_attached = self.process_manager.session_attached(session_id);
+
+        ai_session_needs_restore(session_runtime.as_ref(), session_attached, Instant::now())
     }
 
     fn spawn_remote_git_request_if_needed(
@@ -2696,29 +2704,34 @@ impl NativeShell {
                     project_id,
                     tab_type,
                     dimensions,
-                } => match self.process_manager.start_ai_session(
-                    &mut self.state,
-                    &project_id,
-                    tab_type,
-                    dimensions,
-                ) {
-                    Ok(session_id) => {
-                        did_change = true;
-                        self.save_session_state();
-                        RemoteActionResult::ok(
-                            Some(format!("Opened {session_id}")),
-                            remote_ai_tab_payload(
+                } => {
+                    // Pass activate=false so the native UI doesn't yank its
+                    // focus onto the brand-new AI tab. The remote client
+                    // already has its own active-session tracking.
+                    let start_result = self.process_manager.start_ai_session_activate(
+                        &mut self.state,
+                        &project_id,
+                        tab_type,
+                        dimensions,
+                        false,
+                    );
+                    match start_result {
+                        Ok(session_id) => {
+                            did_change = true;
+                            self.save_session_state();
+                            let payload = remote_ai_tab_payload(
                                 &self.state,
                                 &session_id,
                                 self.process_manager.session_view(&session_id),
-                            ),
-                        )
+                            );
+                            RemoteActionResult::ok(Some(format!("Opened {session_id}")), payload)
+                        }
+                        Err(error) => RemoteActionResult::error(error),
                     }
-                    Err(error) => RemoteActionResult::error(error),
-                },
+                }
                 RemoteAction::OpenAiTab { tab_id, dimensions } => match self
                     .process_manager
-                    .ensure_ai_session_for_tab(&mut self.state, &tab_id, dimensions, true, false)
+                    .ensure_ai_session_for_tab(&mut self.state, &tab_id, dimensions, false, false)
                 {
                     Ok(session_id) => {
                         did_change = true;
@@ -2736,7 +2749,7 @@ impl NativeShell {
                 },
                 RemoteAction::RestartAiTab { tab_id, dimensions } => match self
                     .process_manager
-                    .restart_ai_session(&mut self.state, &tab_id, dimensions)
+                    .restart_ai_session_activate(&mut self.state, &tab_id, dimensions, false)
                 {
                     Ok(session_id) => {
                         did_change = true;
@@ -3689,6 +3702,7 @@ impl NativeShell {
             .collect();
 
         self.state.config = config;
+        self.state.mark_dirty();
 
         for tab_id in removed_ai_tabs {
             let _ = self
@@ -3978,6 +3992,23 @@ impl NativeShell {
                 remote_port_forwards,
                 remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
                 remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
+                remote_web_enabled: self.remote_machine_state.host.web.enabled,
+                remote_web_pairing_token: self
+                    .remote_machine_state
+                    .host
+                    .web
+                    .pairing_token
+                    .clone(),
+                remote_web_listener_url: Some(
+                    self.remote_machine_state.host.web.display_url(),
+                ),
+                remote_web_listener_error: None,
+                remote_web_paired_clients: self
+                    .remote_machine_state
+                    .host
+                    .web
+                    .paired_clients
+                    .len(),
                 open_picker: None,
             }),
             cx,
@@ -5869,6 +5900,50 @@ impl NativeShell {
             EditorAction::CopyRemotePairingToken => {
                 self.copy_remote_pairing_token_action(cx);
             }
+            EditorAction::ToggleRemoteWebHosting => {
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.remote_web_enabled = !draft.remote_web_enabled;
+                    self.remote_machine_state.host.web.enabled = draft.remote_web_enabled;
+                    self.remote_machine_state.host.web.ensure_secrets();
+                    self.remote_host_service
+                        .apply_config(self.remote_machine_state.host.clone());
+                    self.persist_remote_machine_state();
+                    self.sync_settings_remote_draft();
+                    cx.notify();
+                }
+            }
+            EditorAction::RegenerateRemoteWebPairingToken => {
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    let token = remote::web::generate_web_pairing_token();
+                    draft.remote_web_pairing_token = token.clone();
+                    self.remote_machine_state.host.web.pairing_token = token;
+                    self.remote_host_service
+                        .apply_config(self.remote_machine_state.host.clone());
+                    self.persist_remote_machine_state();
+                    self.sync_settings_remote_draft();
+                    cx.notify();
+                }
+            }
+            EditorAction::CopyRemoteWebPairingToken => {
+                let token = self.remote_machine_state.host.web.pairing_token.clone();
+                if token.trim().is_empty() {
+                    self.editor_notice = Some(
+                        "Enable the web UI first to generate a pair token.".to_string(),
+                    );
+                } else {
+                    cx.write_to_clipboard(ClipboardItem::new_string(token));
+                    self.editor_notice =
+                        Some("Copied web pair token to the clipboard.".to_string());
+                }
+                self.sync_settings_remote_draft();
+                cx.notify();
+            }
             EditorAction::ConnectRemoteHost => {
                 let Some((
                     remote_connect_in_flight,
@@ -6402,7 +6477,7 @@ impl NativeShell {
                     .unwrap_or(false);
                 if session_live || interactive_prompt {
                     let dimensions = self.terminal_dimensions(window);
-                    let current_view = if local_has_resize_control {
+                    let mut current_view = if local_has_resize_control {
                         self.process_manager.session_view(&active_spec.session_id)
                     } else {
                         self.local_viewer_session_view(&active_spec.session_id, dimensions)
@@ -6419,13 +6494,10 @@ impl NativeShell {
                             .is_ok()
                     {
                         self.last_dimensions = Some(dimensions);
+                        current_view = self.process_manager.session_view(&active_spec.session_id);
                     }
                     self.terminal_notice = None;
-                    active_session = if local_has_resize_control {
-                        self.process_manager.session_view(&active_spec.session_id)
-                    } else {
-                        self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                    };
+                    active_session = current_view;
                 } else if self.terminal_notice.is_none() {
                     self.terminal_notice = Some(
                         "Server session is not running. Start it from the sidebar.".to_string(),
@@ -6435,20 +6507,24 @@ impl NativeShell {
             Some(TabType::Claude) | Some(TabType::Codex) => {
                 let dimensions = self.terminal_dimensions(window);
                 if let Some(active_tab) = active_tab.as_ref() {
-                    let session_live = active_tab
+                    let runtime = self.process_manager.runtime_state();
+                    let (session_runtime, session_attached) = active_tab
                         .pty_session_id
                         .as_deref()
-                        .and_then(|session_id| {
-                            self.process_manager
-                                .runtime_state()
-                                .sessions
-                                .get(session_id)
-                                .cloned()
+                        .map(|session_id| {
+                            (
+                                runtime.sessions.get(session_id).cloned(),
+                                self.process_manager.session_attached(session_id),
+                            )
                         })
-                        .map(|session| session.status.is_live())
-                        .unwrap_or(false);
+                        .unwrap_or((None, false));
+                    let needs_restore = ai_session_needs_restore(
+                        session_runtime.as_ref(),
+                        session_attached,
+                        Instant::now(),
+                    );
 
-                    if !session_live {
+                    if needs_restore {
                         match self.process_manager.ensure_ai_session_for_tab(
                             &mut self.state,
                             &active_tab.id,
@@ -6469,36 +6545,56 @@ impl NativeShell {
                     }
                 }
 
-                self.process_manager
-                    .set_active_session(active_spec.session_id.clone());
                 if self.synced_session_id.as_deref() != Some(active_spec.session_id.as_str()) {
                     self.synced_session_id = Some(active_spec.session_id.clone());
                     self.last_dimensions = None;
                 }
 
-                let current_view = if local_has_resize_control {
-                    self.process_manager.active_session()
-                } else {
-                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                };
+                let session_runtime = self
+                    .process_manager
+                    .runtime_state()
+                    .sessions
+                    .get(&active_spec.session_id)
+                    .cloned();
+                let session_attached = self.process_manager.session_attached(&active_spec.session_id);
                 if local_has_resize_control
-                    && terminal_view_needs_resize(
-                        self.last_dimensions,
-                        current_view.as_ref(),
-                        dimensions,
+                    && native_ai_render_should_wait(
+                        session_runtime.as_ref(),
+                        session_attached,
+                        Instant::now(),
                     )
-                    && self
-                        .process_manager
-                        .resize_session(&active_spec.session_id, dimensions)
-                        .is_ok()
                 {
-                    self.last_dimensions = Some(dimensions);
-                }
-                active_session = if local_has_resize_control {
-                    self.process_manager.active_session()
+                    self.terminal_notice = Some(
+                        "AI session is still starting in background. Wait a moment before opening it locally."
+                            .to_string(),
+                    );
+                    active_session = None;
                 } else {
-                    self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                };
+                    let mut current_view = if local_has_resize_control {
+                        self.process_manager.session_view(&active_spec.session_id)
+                    } else {
+                        self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                    };
+                    if local_has_resize_control && current_view.is_some() {
+                        self.process_manager
+                            .set_active_session(active_spec.session_id.clone());
+                    }
+                    if local_has_resize_control
+                        && terminal_view_needs_resize(
+                            self.last_dimensions,
+                            current_view.as_ref(),
+                            dimensions,
+                        )
+                        && self
+                            .process_manager
+                            .resize_session(&active_spec.session_id, dimensions)
+                            .is_ok()
+                    {
+                        self.last_dimensions = Some(dimensions);
+                        current_view = self.process_manager.session_view(&active_spec.session_id);
+                    }
+                    active_session = current_view;
+                }
             }
             Some(TabType::Ssh) => {
                 if let Some(active_tab) = active_tab.as_ref() {
@@ -6530,7 +6626,7 @@ impl NativeShell {
                         }
 
                         let dimensions = self.terminal_dimensions(window);
-                        let current_view = if local_has_resize_control {
+                        let mut current_view = if local_has_resize_control {
                             self.process_manager.session_view(&active_spec.session_id)
                         } else {
                             self.local_viewer_session_view(&active_spec.session_id, dimensions)
@@ -6547,14 +6643,11 @@ impl NativeShell {
                                 .is_ok()
                         {
                             self.last_dimensions = Some(dimensions);
+                            current_view = self.process_manager.session_view(&active_spec.session_id);
                         }
 
                         self.terminal_notice = None;
-                        active_session = if local_has_resize_control {
-                            self.process_manager.session_view(&active_spec.session_id)
-                        } else {
-                            self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                        };
+                        active_session = current_view;
                     } else {
                         if self.synced_session_id.as_deref() != Some(active_tab.id.as_str()) {
                             self.synced_session_id = Some(active_tab.id.clone());
@@ -8283,27 +8376,48 @@ impl NativeShell {
             return;
         }
 
-        if !self.ensure_mutation_control(cx) {
+        let Some(tab) = self.state.find_ai_tab(tab_id).cloned() else {
+            cx.notify();
             return;
-        }
-        let dimensions = self.terminal_dimensions(window);
-        match self.process_manager.ensure_ai_session_for_tab(
-            &mut self.state,
-            tab_id,
-            dimensions,
-            true,
-            false,
-        ) {
-            Ok(session_id) => {
-                self.show_terminal_surface();
-                self.synced_session_id = Some(session_id);
-                self.terminal_notice = None;
+        };
+
+        self.state.select_tab(tab_id);
+        self.show_terminal_surface();
+        self.synced_session_id = tab.pty_session_id.clone();
+        self.last_dimensions = None;
+
+        if self.ai_tab_session_needs_restore(&tab) {
+            if !self.local_host_has_control() {
+                self.terminal_notice = Some(
+                    "Another remote client controls this host. Take local control to reopen this AI session."
+                        .to_string(),
+                );
                 self.save_session_state();
+                cx.notify();
+                return;
             }
-            Err(error) => {
-                self.terminal_notice = Some(format!("Failed to open AI tab: {error}"));
+
+            let dimensions = self.terminal_dimensions(window);
+            match self.process_manager.ensure_ai_session_for_tab(
+                &mut self.state,
+                tab_id,
+                dimensions,
+                true,
+                false,
+            ) {
+                Ok(session_id) => {
+                    self.synced_session_id = Some(session_id);
+                    self.terminal_notice = None;
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to open AI tab: {error}"));
+                }
             }
+        } else {
+            self.terminal_notice = None;
         }
+
+        self.save_session_state();
         cx.notify();
     }
 
@@ -9640,14 +9754,29 @@ impl NativeShell {
         let wb = window.window_bounds();
         let bounds = wb.get_bounds();
         let maximized = matches!(wb, WindowBounds::Maximized(_));
-        self.state.window_bounds = Some(crate::models::WindowBoundsState {
-            x: f32::from(bounds.origin.x),
-            y: f32::from(bounds.origin.y),
-            width: f32::from(bounds.size.width),
-            height: f32::from(bounds.size.height),
-            maximized,
-        });
+        apply_window_bounds_state(
+            &mut self.state,
+            crate::models::WindowBoundsState {
+                x: f32::from(bounds.origin.x),
+                y: f32::from(bounds.origin.y),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+                maximized,
+            },
+        );
     }
+}
+
+fn apply_window_bounds_state(
+    state: &mut AppState,
+    next: crate::models::WindowBoundsState,
+) -> bool {
+    if state.window_bounds == Some(next) {
+        return false;
+    }
+    state.window_bounds = Some(next);
+    state.mark_dirty();
+    true
 }
 
 impl Render for NativeShell {
@@ -9678,13 +9807,17 @@ impl Render for NativeShell {
             let _ = self.pump_remote_host_requests(cx);
         }
 
-        let local_runtime_snapshot = self.process_manager.runtime_state();
-        if self.remote_mode.is_none() {
-            self.sync_server_port_snapshot(&local_runtime_snapshot, cx);
-            self.sync_remote_host_snapshot_if_due(&local_runtime_snapshot);
+        let local_runtime_snapshot = if self.remote_mode.is_none() {
+            Some(self.process_manager.runtime_state())
+        } else {
+            None
+        };
+        if let Some(runtime) = local_runtime_snapshot.as_ref() {
+            self.sync_server_port_snapshot(runtime, cx);
+            self.sync_remote_host_snapshot_if_due(runtime);
         }
 
-        let runtime_snapshot = self.current_runtime_snapshot();
+        let runtime_snapshot = local_runtime_snapshot.unwrap_or_else(|| self.current_runtime_snapshot());
         self.sync_window_title(window, &runtime_snapshot);
         let server_indicators = derive_server_indicator_states(
             &self.state,
@@ -11525,16 +11658,6 @@ fn normalize_optional_string(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn remote_runtime_revision(runtime: &RuntimeState) -> u64 {
-    let mut entries = runtime
-        .sessions
-        .iter()
-        .map(|(session_id, session)| (session_id.clone(), session.dirty_generation))
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    local_stable_hash(&(runtime.active_session_id.clone(), entries))
-}
-
 fn local_stable_hash<T: serde::Serialize>(value: &T) -> u64 {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -12547,6 +12670,29 @@ fn terminal_view_needs_resize(
         || active_session.map(|session| session.runtime.dimensions) != Some(dimensions)
 }
 
+fn native_ai_render_should_wait(
+    session: Option<&crate::state::SessionRuntimeState>,
+    session_attached: bool,
+    now: Instant,
+) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    if !session_attached {
+        return false;
+    }
+    if session.status == crate::state::SessionStatus::Starting {
+        return true;
+    }
+    session.session_kind.is_ai()
+        && session.status.is_live()
+        && !session.at_prompt
+        && session
+            .started_at
+            .map(|started_at| now.saturating_duration_since(started_at) <= AI_LOCAL_RENDER_GUARD_WINDOW)
+            .unwrap_or(false)
+}
+
 fn remote_reconnect_backoff(attempts: u32) -> Duration {
     let multiplier = 1_u32.checked_shl(attempts.min(4)).unwrap_or(16);
     (REMOTE_RECONNECT_BASE_INTERVAL * multiplier).min(REMOTE_RECONNECT_MAX_INTERVAL)
@@ -12764,6 +12910,55 @@ mod tests {
             Some(&session),
             expected
         ));
+    }
+
+    #[test]
+    fn native_ai_render_waits_for_fresh_attached_ai_startup_sessions() {
+        let now = Instant::now();
+        let mut session = SessionRuntimeState::new(
+            "claude-session",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.session_kind = crate::state::SessionKind::Claude;
+        session.status = crate::state::SessionStatus::Starting;
+        session.started_at = Some(now);
+
+        assert!(native_ai_render_should_wait(Some(&session), true, now));
+        assert!(!native_ai_render_should_wait(Some(&session), false, now));
+
+        session.status = crate::state::SessionStatus::Running;
+        assert!(native_ai_render_should_wait(Some(&session), true, now));
+
+        session.at_prompt = true;
+        assert!(!native_ai_render_should_wait(Some(&session), true, now));
+
+        session.at_prompt = false;
+        session.started_at = Some(now - AI_LOCAL_RENDER_GUARD_WINDOW - Duration::from_secs(1));
+        assert!(!native_ai_render_should_wait(Some(&session), true, now));
+
+        assert!(!native_ai_render_should_wait(None, true, now));
+    }
+
+    #[test]
+    fn apply_window_bounds_state_only_marks_dirty_when_bounds_change() {
+        let mut state = AppState::default();
+        let bounds = crate::models::WindowBoundsState {
+            x: 10.0,
+            y: 20.0,
+            width: 800.0,
+            height: 600.0,
+            maximized: false,
+        };
+
+        let initial_revision = state.revision();
+        assert!(apply_window_bounds_state(&mut state, bounds));
+        let after_first = state.revision();
+        assert!(after_first > initial_revision);
+
+        assert!(!apply_window_bounds_state(&mut state, bounds));
+        assert_eq!(state.revision(), after_first);
     }
 
     #[test]

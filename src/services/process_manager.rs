@@ -22,6 +22,33 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) const AI_SESSION_ATTACH_GRACE_WINDOW: Duration = Duration::from_secs(30);
+
+pub(crate) fn ai_session_needs_restore(
+    session: Option<&SessionRuntimeState>,
+    session_attached: bool,
+    now: Instant,
+) -> bool {
+    let Some(session) = session else {
+        return true;
+    };
+
+    if session.session_kind.is_ai() && !session_attached {
+        if session.status == SessionStatus::Starting {
+            return false;
+        }
+        if session.status == SessionStatus::Running
+            && session.started_at.is_some_and(|started_at| {
+                now.saturating_duration_since(started_at) <= AI_SESSION_ATTACH_GRACE_WINDOW
+            })
+        {
+            return false;
+        }
+    }
+
+    !session.status.is_live() || !session_attached
+}
+
 #[derive(Clone)]
 pub struct ProcessManager {
     inner: Arc<ProcessManagerInner>,
@@ -47,6 +74,8 @@ type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
 struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
+    runtime_revision: AtomicU64,
+    observed_runtime_generations: Mutex<HashMap<String, u64>>,
     settings: RwLock<Settings>,
     terminal_backend: TerminalBackend,
     debug_enabled: bool,
@@ -108,6 +137,8 @@ impl ProcessManager {
         let inner = Arc::new(ProcessManagerInner {
             sessions: Mutex::new(HashMap::new()),
             runtime_state: Arc::new(RwLock::new(RuntimeState::new(debug_enabled))),
+            runtime_revision: AtomicU64::new(1),
+            observed_runtime_generations: Mutex::new(HashMap::new()),
             settings: RwLock::new(Settings::default()),
             terminal_backend: TerminalBackend::PortablePtyFeedingAlacritty,
             debug_enabled,
@@ -136,12 +167,17 @@ impl ProcessManager {
             .unwrap_or_default()
     }
 
+    pub fn runtime_revision(&self) -> u64 {
+        self.inner.runtime_revision.load(Ordering::Relaxed)
+    }
+
     pub fn register_runtime_session(&self, session: SessionRuntimeState) {
         let session_id = session.session_id.clone();
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
             runtime.sessions.insert(session_id.clone(), session);
         }
-        emit_remote_runtime_snapshot(&self.inner, &session_id);
+        bump_runtime_revision(&self.inner);
+        emit_tracked_remote_runtime_snapshot(&self.inner, &session_id);
     }
 
     pub fn terminal_backend(&self) -> TerminalBackend {
@@ -202,16 +238,23 @@ impl ProcessManager {
     pub fn set_active_session(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
         let mut cleared_unseen_ready = false;
+        let mut active_changed = false;
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
-            runtime.active_session_id = Some(session_id.clone());
+            active_changed = runtime.active_session_id.as_deref() != Some(session_id.as_str());
+            if active_changed {
+                runtime.active_session_id = Some(session_id.clone());
+            }
             if let Some(session) = runtime.sessions.get_mut(&session_id) {
                 cleared_unseen_ready = session.unseen_ready;
                 session.clear_unseen_ready();
             }
         }
+        if active_changed || cleared_unseen_ready {
+            bump_runtime_revision(&self.inner);
+        }
         if cleared_unseen_ready {
             mark_remote_session_dirty(&self.inner, &session_id);
-            emit_remote_runtime_snapshot(&self.inner, &session_id);
+            emit_tracked_remote_runtime_snapshot(&self.inner, &session_id);
         }
     }
 
@@ -451,6 +494,25 @@ impl ProcessManager {
         tab_type: TabType,
         dimensions: SessionDimensions,
     ) -> Result<String, String> {
+        self.start_ai_session_activate(app_state, project_id, tab_type, dimensions, true)
+    }
+
+    /// Same as `start_ai_session` but lets the caller decide whether to
+    /// force the new tab to become the native UI's active tab. Remote
+    /// clients should pass `activate = false` so a browser launching a new
+    /// AI session doesn't yank the desktop window's focus onto a
+    /// mid-spawn terminal — that path triggers a heavy GPUI render of a
+    /// PTY being flooded with Claude Code's boot banner and stalls the
+    /// main thread badly enough for Windows to mark the window
+    /// "(Not Responding)".
+    pub fn start_ai_session_activate(
+        &self,
+        app_state: &mut AppState,
+        project_id: &str,
+        tab_type: TabType,
+        dimensions: SessionDimensions,
+        activate: bool,
+    ) -> Result<String, String> {
         if app_state.find_project(project_id).is_none() {
             return Err(format!("Unknown project `{project_id}`"));
         }
@@ -458,15 +520,16 @@ impl ProcessManager {
         let session_id = next_ai_session_id(&tab_type);
         let tab_id = session_id.clone();
 
-        app_state.open_ai_tab(
+        app_state.open_ai_tab_with_activation(
             project_id,
             tab_type,
             tab_id.clone(),
             session_id,
             Some(label),
+            activate,
         );
 
-        self.ensure_ai_session_for_tab(app_state, &tab_id, dimensions, true, false)
+        self.ensure_ai_session_for_tab(app_state, &tab_id, dimensions, activate, false)
     }
 
     pub fn ensure_ai_session_for_tab(
@@ -488,17 +551,24 @@ impl ProcessManager {
             .ok_or_else(|| format!("Unknown project `{}`", tab.project_id))?;
 
         if let Some(existing_session_id) = tab.pty_session_id.as_deref() {
-            let session_live = self
+            let existing_runtime = self
                 .runtime_state()
                 .sessions
                 .get(existing_session_id)
-                .map(|session| session.status.is_live())
-                .unwrap_or(false)
-                && self.get_session(existing_session_id).is_ok();
-            if session_live && !force_new_session {
+                .cloned();
+            let session_attached = self.get_session(existing_session_id).is_ok();
+            if !force_new_session
+                && !ai_session_needs_restore(
+                    existing_runtime.as_ref(),
+                    session_attached,
+                    Instant::now(),
+                )
+            {
                 if activate_tab {
                     let _ = app_state.select_tab(&tab.id);
-                    self.set_active_session(existing_session_id.to_string());
+                    if session_attached {
+                        self.set_active_session(existing_session_id.to_string());
+                    }
                 }
                 return Ok(existing_session_id.to_string());
             }
@@ -536,6 +606,20 @@ impl ProcessManager {
         tab_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<String, String> {
+        self.restart_ai_session_activate(app_state, tab_id, dimensions, true)
+    }
+
+    /// Same as `restart_ai_session` but lets the caller keep the native UI's
+    /// current tab/session active. Remote-triggered AI restarts use this to
+    /// recycle the PTY without yanking the desktop window onto the restarted
+    /// terminal.
+    pub fn restart_ai_session_activate(
+        &self,
+        app_state: &mut AppState,
+        tab_id: &str,
+        dimensions: SessionDimensions,
+        activate_tab: bool,
+    ) -> Result<String, String> {
         let existing_session_id = app_state
             .find_ai_tab(tab_id)
             .and_then(|tab| tab.pty_session_id.clone());
@@ -544,7 +628,7 @@ impl ProcessManager {
             self.forget_session(&session_id);
         }
 
-        self.ensure_ai_session_for_tab(app_state, tab_id, dimensions, true, true)
+        self.ensure_ai_session_for_tab(app_state, tab_id, dimensions, activate_tab, true)
     }
 
     pub fn close_ai_session(&self, app_state: &mut AppState, tab_id: &str) -> Result<(), String> {
@@ -552,11 +636,22 @@ impl ProcessManager {
             .find_ai_tab(tab_id)
             .and_then(|tab| tab.pty_session_id.clone());
 
-        if let Some(session_id) = session_id {
-            let _ = self.close_session(&session_id);
-            self.forget_session(&session_id);
-        }
+        // Update visible UI state synchronously so the tab disappears
+        // immediately from the sidebar — but push the actual PTY teardown
+        // to a background thread. Claude Code spawns a tree of npx/node/
+        // tar/git child processes, and signalling that whole tree with
+        // taskkill /F on Windows can take multiple seconds to return. The
+        // main thread processes remote-host actions and GPUI rendering,
+        // so blocking it on a slow process-tree kill is exactly what made
+        // the window go "(Not Responding)" when a web client closed a tab.
         app_state.remove_tab(tab_id);
+        if let Some(session_id) = session_id {
+            let manager = self.clone();
+            std::thread::spawn(move || {
+                let _ = manager.close_session(&session_id);
+                manager.forget_session(&session_id);
+            });
+        }
         Ok(())
     }
 
@@ -648,9 +743,13 @@ impl ProcessManager {
         let recovered = self.reconcile_saved_ai_tabs(app_state);
         report.reattached += recovered;
 
-        app_state.active_tab_id = active_tab_id
+        let next_active = active_tab_id
             .filter(|tab_id| app_state.find_tab(tab_id).is_some())
             .or_else(|| app_state.open_tabs.first().map(|tab| tab.id.clone()));
+        if app_state.active_tab_id != next_active {
+            app_state.active_tab_id = next_active;
+            app_state.mark_dirty();
+        }
 
         report
     }
@@ -861,9 +960,13 @@ impl ProcessManager {
         }
 
         report.recovered = self.reconcile_saved_ssh_tabs(app_state);
-        app_state.active_tab_id = active_tab_id
+        let next_active = active_tab_id
             .filter(|tab_id| app_state.find_tab(tab_id).is_some())
             .or_else(|| app_state.open_tabs.first().map(|tab| tab.id.clone()));
+        if app_state.active_tab_id != next_active {
+            app_state.active_tab_id = next_active;
+            app_state.mark_dirty();
+        }
 
         report
     }
@@ -1353,9 +1456,13 @@ impl ProcessManager {
             }
         }
 
-        app_state.active_tab_id = active_tab_id
+        let next_active = active_tab_id
             .filter(|tab_id| app_state.find_tab(tab_id).is_some())
             .or_else(|| app_state.open_tabs.first().map(|tab| tab.id.clone()));
+        if app_state.active_tab_id != next_active {
+            app_state.active_tab_id = next_active;
+            app_state.mark_dirty();
+        }
 
         restored
     }
@@ -1382,6 +1489,15 @@ impl ProcessManager {
                 .ok()
                 .map(|sessions| sessions.contains_key(session_id))
                 .unwrap_or(false)
+    }
+
+    pub fn session_attached(&self, session_id: &str) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .ok()
+            .map(|sessions| sessions.contains_key(session_id))
+            .unwrap_or(false)
     }
 
     fn get_session(&self, session_id: &str) -> Result<Arc<TerminalSession>, String> {
@@ -1473,13 +1589,19 @@ impl ProcessManager {
     }
 
     fn update_session_state(&self, session_id: &str, f: impl FnOnce(&mut SessionRuntimeState)) {
+        let mut runtime_changed = false;
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
             if let Some(session) = runtime.sessions.get_mut(session_id) {
+                let dirty_before = session.dirty_generation;
                 f(session);
+                runtime_changed = session.dirty_generation != dirty_before;
             }
         }
-        mark_remote_session_dirty(&self.inner, session_id);
-        emit_remote_runtime_snapshot(&self.inner, session_id);
+        if runtime_changed {
+            bump_runtime_revision(&self.inner);
+            mark_remote_session_dirty(&self.inner, session_id);
+            emit_tracked_remote_runtime_snapshot(&self.inner, session_id);
+        }
     }
 
     fn forget_session(&self, session_id: &str) {
@@ -1491,11 +1613,13 @@ impl ProcessManager {
     }
 
     fn ensure_runtime_entry(&self, session_id: &str, cwd: PathBuf, dimensions: SessionDimensions) {
+        let mut inserted = false;
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
             runtime
                 .sessions
                 .entry(session_id.to_string())
                 .or_insert_with(|| {
+                    inserted = true;
                     SessionRuntimeState::new(
                         session_id.to_string(),
                         cwd,
@@ -1504,8 +1628,11 @@ impl ProcessManager {
                     )
                 });
         }
-        mark_remote_session_dirty(&self.inner, session_id);
-        emit_remote_runtime_snapshot(&self.inner, session_id);
+        if inserted {
+            bump_runtime_revision(&self.inner);
+            mark_remote_session_dirty(&self.inner, session_id);
+            emit_tracked_remote_runtime_snapshot(&self.inner, session_id);
+        }
     }
 
     fn spawn_server_session(
@@ -1538,8 +1665,15 @@ impl ProcessManager {
     }
 
     fn restore_active_session(&self, active_session_id: Option<String>) {
+        let mut changed = false;
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
-            runtime.active_session_id = active_session_id;
+            if runtime.active_session_id != active_session_id {
+                runtime.active_session_id = active_session_id;
+                changed = true;
+            }
+        }
+        if changed {
+            bump_runtime_revision(&self.inner);
         }
     }
 
@@ -1549,55 +1683,73 @@ impl ProcessManager {
         session_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<(), String> {
-        self.set_active_session(session_id.to_string());
-
         if self.session_exists(session_id) {
             return Ok(());
         }
 
-        let session = TerminalSession::spawn_command(
-            session_id.to_string(),
-            launch.cwd.clone(),
-            dimensions,
-            launch.shell_program.clone(),
-            launch.shell_args.clone(),
-            HashMap::new(),
-            self.log_buffer_size(),
-            None,
-            self.inner.runtime_state.clone(),
-            self.inner.debug_enabled,
-            Some(session_change_notifier(
-                self.inner.clone(),
-                session_id.to_string(),
-            )),
-            Some(session_output_notifier(
-                self.inner.clone(),
-                session_id.to_string(),
-            )),
-        )
-        .map_err(|error| {
-            self.update_session_state(session_id, |state| {
-                state.status = SessionStatus::Failed;
-                state.exit = Some(SessionExitState {
-                    code: None,
-                    signal: None,
-                    closed_by_user: false,
-                    summary: error.clone(),
-                });
-                state.mark_dirty();
-            });
-            error
-        })?;
-
-        let session = Arc::new(session);
-        self.inner
-            .sessions
-            .lock()
-            .map_err(|_| "Session store poisoned".to_string())?
-            .insert(session_id.to_string(), session.clone());
-
-        let startup_command = launch.startup_command.clone();
+        // Offload the PTY spawn to a background thread. On Windows,
+        // `TerminalSession::spawn_command` has to create a ConPTY handle,
+        // fork the shell (cmd.exe / bash.exe), and wait for it to initialise
+        // before it returns. That can take several seconds and would
+        // otherwise block the GPUI main thread, making the window appear
+        // "(Not Responding)" to the OS.
+        //
+        // The session is already marked `Starting` in `runtime_state` by
+        // `ensure_ai_session_for_tab` before we get here, so the sidebar
+        // shows the new tab immediately. Activation is owned by the caller:
+        // remote-triggered launches must be able to spawn the PTY without
+        // redirecting the native UI onto it. When the spawn completes in the
+        // background, the session registers in the `sessions` map and its
+        // status transitions via the normal output-notifier path.
+        let manager = self.clone();
+        let launch_clone = launch.clone();
+        let session_id_owned = session_id.to_string();
         thread::spawn(move || {
+            let result = TerminalSession::spawn_command(
+                session_id_owned.clone(),
+                launch_clone.cwd.clone(),
+                dimensions,
+                launch_clone.shell_program.clone(),
+                launch_clone.shell_args.clone(),
+                HashMap::new(),
+                manager.log_buffer_size(),
+                None,
+                manager.inner.runtime_state.clone(),
+                manager.inner.debug_enabled,
+                Some(session_change_notifier(
+                    manager.inner.clone(),
+                    session_id_owned.clone(),
+                )),
+                Some(session_output_notifier(
+                    manager.inner.clone(),
+                    session_id_owned.clone(),
+                )),
+            );
+            let session = match result {
+                Ok(session) => session,
+                Err(error) => {
+                    manager.update_session_state(&session_id_owned, |state| {
+                        state.status = SessionStatus::Failed;
+                        state.exit = Some(SessionExitState {
+                            code: None,
+                            signal: None,
+                            closed_by_user: false,
+                            summary: error.clone(),
+                        });
+                        state.mark_dirty();
+                    });
+                    return;
+                }
+            };
+
+            let session = Arc::new(session);
+            if let Ok(mut sessions) = manager.inner.sessions.lock() {
+                sessions.insert(session_id_owned.clone(), session.clone());
+            }
+
+            // Fire the startup command after the usual injection delay so
+            // the shell has time to show its prompt first.
+            let startup_command = launch_clone.startup_command.clone();
             thread::sleep(Duration::from_millis(AI_COMMAND_INJECTION_DELAY_MS));
             let _ = session.write_text(&(startup_command + "\r\n"));
         });
@@ -1798,14 +1950,20 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     if let Ok(mut runtime) = inner.runtime_state.write() {
         for (session_id, snapshot, awaiting_external_editor) in snapshots {
             if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                let dirty_before = session.dirty_generation;
                 session.note_resource_sample(snapshot);
                 session.note_external_editor_wait(awaiting_external_editor);
-                touched_sessions.push(session_id);
+                if session.dirty_generation != dirty_before {
+                    touched_sessions.push(session_id);
+                }
             }
         }
     }
+    if !touched_sessions.is_empty() {
+        bump_runtime_revision(inner);
+    }
     for session_id in touched_sessions {
-        emit_remote_runtime_snapshot(inner, &session_id);
+        emit_tracked_remote_runtime_snapshot(inner, &session_id);
     }
 }
 
@@ -1921,35 +2079,53 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 dimensions,
             } => {
                 if restore_interrupted_server_prompt(inner, &session_id, cwd, dimensions).is_err() {
+                    let mut changed = false;
                     if let Ok(mut runtime) = inner.runtime_state.write() {
                         if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                            let dirty_before = session.dirty_generation;
                             session.status = SessionStatus::Stopped;
                             session.clear_user_exit_requests();
                             session.mark_dirty();
+                            changed = session.dirty_generation != dirty_before;
                         }
                     }
-                    emit_remote_runtime_snapshot(inner, &session_id);
+                    if changed {
+                        bump_runtime_revision(inner);
+                        emit_tracked_remote_runtime_snapshot(inner, &session_id);
+                    }
                 }
             }
             ExitReconciliation::MarkStopped { session_id } => {
+                let mut changed = false;
                 if let Ok(mut runtime) = inner.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                        let dirty_before = session.dirty_generation;
                         session.status = SessionStatus::Stopped;
                         session.clear_user_exit_requests();
                         session.mark_dirty();
+                        changed = session.dirty_generation != dirty_before;
                     }
                 }
-                emit_remote_runtime_snapshot(inner, &session_id);
+                if changed {
+                    bump_runtime_revision(inner);
+                    emit_tracked_remote_runtime_snapshot(inner, &session_id);
+                }
             }
             ExitReconciliation::MarkCrashed { session_id } => {
+                let mut changed = false;
                 if let Ok(mut runtime) = inner.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&session_id) {
+                        let dirty_before = session.dirty_generation;
                         session.status = SessionStatus::Crashed;
                         session.clear_user_exit_requests();
                         session.mark_dirty();
+                        changed = session.dirty_generation != dirty_before;
                     }
                 }
-                emit_remote_runtime_snapshot(inner, &session_id);
+                if changed {
+                    bump_runtime_revision(inner);
+                    emit_tracked_remote_runtime_snapshot(inner, &session_id);
+                }
             }
         }
     }
@@ -1986,8 +2162,11 @@ fn reconcile_ai_activity(inner: &Arc<ProcessManagerInner>) {
             }
         }
         drop(runtime);
+        if !touched_sessions.is_empty() {
+            bump_runtime_revision(inner);
+        }
         for session_id in touched_sessions {
-            emit_remote_runtime_snapshot(inner, &session_id);
+            emit_tracked_remote_runtime_snapshot(inner, &session_id);
         }
     }
 
@@ -2036,8 +2215,10 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
         };
 
         let launch_id = launch.command_id.clone();
+        let mut changed = false;
         if let Ok(mut runtime) = inner.runtime_state.write() {
             if let Some(session) = runtime.sessions.get_mut(&launch_id) {
+                let dirty_before = session.dirty_generation;
                 session.status = SessionStatus::Starting;
                 session.exit = Some(SessionExitState {
                     code: None,
@@ -2046,9 +2227,13 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
                     summary: format!("Auto-restarting in {}s", delay.as_secs().max(1)),
                 });
                 session.mark_dirty();
+                changed = session.dirty_generation != dirty_before;
             }
         }
-        emit_remote_runtime_snapshot(&inner, &launch_id);
+        if changed {
+            bump_runtime_revision(&inner);
+            emit_tracked_remote_runtime_snapshot(&inner, &launch_id);
+        }
 
         let launch_clone = launch.clone();
         let inner_clone = inner.clone();
@@ -2062,8 +2247,10 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
                 &launch_clone,
                 SessionDimensions::default(),
             ) {
+                let mut changed = false;
                 if let Ok(mut runtime) = inner_clone.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&launch_clone.command_id) {
+                        let dirty_before = session.dirty_generation;
                         session.status = SessionStatus::Failed;
                         session.exit = Some(SessionExitState {
                             code: None,
@@ -2072,9 +2259,13 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
                             summary: format!("Auto-restart failed: {error}"),
                         });
                         session.mark_dirty();
+                        changed = session.dirty_generation != dirty_before;
                     }
                 }
-                emit_remote_runtime_snapshot(&inner_clone, &launch_clone.command_id);
+                if changed {
+                    bump_runtime_revision(&inner_clone);
+                    emit_tracked_remote_runtime_snapshot(&inner_clone, &launch_clone.command_id);
+                }
             }
         });
     }
@@ -2384,10 +2575,15 @@ fn spawn_server_session_with_inner(
         sessions.insert(session_id.clone(), Arc::new(session));
     }
 
+    let mut active_changed = false;
     if let Ok(mut runtime) = inner.runtime_state.write() {
         if runtime.active_session_id.is_none() {
             runtime.active_session_id = Some(session_id);
+            active_changed = true;
         }
+    }
+    if active_changed {
+        bump_runtime_revision(inner);
     }
 
     Ok(())
@@ -2449,17 +2645,23 @@ fn restore_interrupted_server_prompt(
             .insert(session_id.to_string(), Arc::new(session));
     }
 
+    let mut changed = false;
     if let Ok(mut runtime) = inner.runtime_state.write() {
         if let Some(session) = runtime.sessions.get_mut(session_id) {
+            let dirty_before = session.dirty_generation;
             session.cwd = cwd;
             session.dimensions = dimensions;
             session.activate_interactive_shell(
                 shell_program,
                 "Server interrupted with Ctrl+C. Terminal ready.",
             );
+            changed = session.dirty_generation != dirty_before;
         }
     }
-    emit_remote_runtime_snapshot(inner, session_id);
+    if changed {
+        bump_runtime_revision(inner);
+        emit_tracked_remote_runtime_snapshot(inner, session_id);
+    }
 
     Ok(())
 }
@@ -2470,13 +2672,65 @@ fn mark_remote_session_dirty(inner: &Arc<ProcessManagerInner>, session_id: &str)
     }
 }
 
+fn bump_runtime_revision(inner: &ProcessManagerInner) {
+    inner.runtime_revision.fetch_add(1, Ordering::Relaxed);
+}
+
+fn current_runtime_generation(inner: &ProcessManagerInner, session_id: &str) -> Option<u64> {
+    inner
+        .runtime_state
+        .read()
+        .ok()
+        .and_then(|runtime| runtime.sessions.get(session_id).map(|session| session.dirty_generation))
+}
+
+fn remember_runtime_generation(inner: &ProcessManagerInner, session_id: &str, generation: u64) {
+    if let Ok(mut observed) = inner.observed_runtime_generations.lock() {
+        observed.insert(session_id.to_string(), generation);
+    }
+}
+
+fn remember_current_runtime_generation(inner: &ProcessManagerInner, session_id: &str) {
+    if let Some(generation) = current_runtime_generation(inner, session_id) {
+        remember_runtime_generation(inner, session_id, generation);
+    }
+}
+
+fn note_runtime_generation_change(inner: &ProcessManagerInner, session_id: &str) -> bool {
+    let Some(generation) = current_runtime_generation(inner, session_id) else {
+        return false;
+    };
+    let changed = inner
+        .observed_runtime_generations
+        .lock()
+        .map(|mut observed| {
+            if observed.get(session_id).copied() == Some(generation) {
+                return false;
+            }
+            observed.insert(session_id.to_string(), generation);
+            true
+        })
+        .unwrap_or(true);
+    if changed {
+        bump_runtime_revision(inner);
+    }
+    changed
+}
+
+fn emit_tracked_remote_runtime_snapshot(inner: &ProcessManagerInner, session_id: &str) {
+    remember_current_runtime_generation(inner, session_id);
+    emit_remote_runtime_snapshot(inner, session_id);
+}
+
 fn session_change_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
 ) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || {
-        mark_remote_session_dirty(&inner, &session_id);
-        emit_remote_runtime_snapshot(&inner, &session_id);
+        if note_runtime_generation_change(&inner, &session_id) {
+            mark_remote_session_dirty(&inner, &session_id);
+            emit_remote_runtime_snapshot(&inner, &session_id);
+        }
     })
 }
 
@@ -2714,6 +2968,31 @@ mod tests {
     }
 
     #[test]
+    fn ai_session_does_not_need_restore_during_fresh_unattached_startup_gap() {
+        let now = Instant::now();
+        let mut session = SessionRuntimeState::new(
+            "claude-session",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.session_kind = SessionKind::Claude;
+        session.status = SessionStatus::Starting;
+
+        assert!(!ai_session_needs_restore(Some(&session), false, now));
+
+        session.status = SessionStatus::Running;
+        session.started_at = Some(now);
+        assert!(!ai_session_needs_restore(Some(&session), false, now));
+
+        session.started_at = Some(now - Duration::from_secs(31));
+        assert!(ai_session_needs_restore(Some(&session), false, now));
+
+        assert!(!ai_session_needs_restore(Some(&session), true, now));
+        assert!(ai_session_needs_restore(None, false, now));
+    }
+
+    #[test]
     fn detects_blocking_external_editor_children() {
         let descendants = vec![
             platform_service::ProcessIdentity {
@@ -2779,19 +3058,89 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
-        AppState {
-            config: AppConfig {
-                version: crate::models::CURRENT_CONFIG_VERSION,
-                projects: vec![project],
-                settings: Settings::default(),
-                ssh_connections: Vec::new(),
-            },
-            open_tabs: Vec::new(),
-            active_tab_id: None,
-            sidebar_collapsed: false,
-            collapsed_projects: std::collections::BTreeSet::new(),
-            window_bounds: None,
+        let mut state = AppState::default();
+        state.config = AppConfig {
+            version: crate::models::CURRENT_CONFIG_VERSION,
+            projects: vec![project],
+            settings: Settings::default(),
+            ssh_connections: Vec::new(),
+        };
+        state.mark_dirty();
+        state
+    }
+
+    #[test]
+    fn runtime_revision_tracks_semantic_changes_but_not_frame_metrics() {
+        let manager = ProcessManager::new();
+        let initial_revision = manager.runtime_revision();
+        manager.register_runtime_session(SessionRuntimeState::new(
+            "alpha",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        ));
+        let after_register = manager.runtime_revision();
+        assert!(after_register > initial_revision);
+
+        let runtime_events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let event_counter = runtime_events.clone();
+        manager.set_remote_session_handler(Some(std::sync::Arc::new(move |event| {
+            if matches!(event, RemoteSessionEvent::Runtime { .. }) {
+                event_counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })));
+        runtime_events.store(0, Ordering::SeqCst);
+
+        manager.record_frame("alpha", Duration::from_millis(4));
+        assert_eq!(runtime_events.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.runtime_revision(), after_register);
+
+        manager.set_active_session("alpha");
+        let after_active = manager.runtime_revision();
+        assert!(after_active > after_register);
+
+        manager.set_active_session("alpha");
+        assert_eq!(manager.runtime_revision(), after_active);
+    }
+
+    #[test]
+    fn session_change_notifier_only_emits_when_dirty_generation_advances() {
+        let manager = ProcessManager::new();
+        manager.register_runtime_session(SessionRuntimeState::new(
+            "alpha",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        ));
+        let runtime_events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let event_counter = runtime_events.clone();
+        manager.set_remote_session_handler(Some(std::sync::Arc::new(move |event| {
+            if matches!(event, RemoteSessionEvent::Runtime { .. }) {
+                event_counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })));
+        runtime_events.store(0, Ordering::SeqCst);
+
+        let notifier = session_change_notifier(manager.inner.clone(), "alpha".to_string());
+        let initial_revision = manager.runtime_revision();
+        notifier();
+        assert_eq!(runtime_events.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.runtime_revision(), initial_revision);
+
+        if let Ok(mut runtime) = manager.inner.runtime_state.write() {
+            if let Some(session) = runtime.sessions.get_mut("alpha") {
+                session.note_title(Some("ready".to_string()));
+            }
         }
+
+        notifier();
+        let after_change = manager.runtime_revision();
+        assert_eq!(runtime_events.load(Ordering::SeqCst), 1);
+        assert!(after_change > initial_revision);
+
+        notifier();
+        assert_eq!(runtime_events.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.runtime_revision(), after_change);
     }
 
     fn wait_for_live_session(manager: &ProcessManager, session_id: &str) {

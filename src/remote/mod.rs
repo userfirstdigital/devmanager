@@ -1,7 +1,9 @@
 mod client_pool;
 mod transport;
+pub mod web;
 
 pub use client_pool::RemoteClientPool;
+pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
 
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
@@ -33,7 +35,7 @@ pub const PROTOCOL_VERSION: u32 = 5;
 const REMOTE_FILE_NAME: &str = "remote.json";
 const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
@@ -70,6 +72,7 @@ pub struct RemoteHostConfig {
     pub private_key_pem: String,
     pub certificate_fingerprint: String,
     pub paired_clients: Vec<PairedRemoteClient>,
+    pub web: WebConfig,
 }
 
 impl Default for RemoteHostConfig {
@@ -85,6 +88,7 @@ impl Default for RemoteHostConfig {
             private_key_pem: String::new(),
             certificate_fingerprint: String::new(),
             paired_clients: Vec::new(),
+            web: WebConfig::default(),
         };
         let _ = transport::ensure_host_tls_material(&mut config);
         config
@@ -656,6 +660,7 @@ pub struct PendingRemoteRequest {
 #[derive(Debug, Clone)]
 pub struct RemoteHostStatus {
     pub enabled: bool,
+    pub web_enabled: bool,
     pub bind_address: String,
     pub port: u16,
     pub pairing_token: String,
@@ -666,6 +671,15 @@ pub struct RemoteHostStatus {
     pub last_connection_note: Option<String>,
     pub last_connection_is_error: bool,
     pub latency: RemoteLatencyStats,
+}
+
+impl RemoteHostStatus {
+    /// `true` when any transport (TCP host or browser web UI) is enabled,
+    /// meaning the GPUI app should push state updates into `RemoteHostInner`
+    /// so connected clients see live data.
+    pub fn any_transport_enabled(&self) -> bool {
+        self.enabled || self.web_enabled
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -792,7 +806,7 @@ pub struct RemoteHostService {
     inner: Arc<RemoteHostInner>,
 }
 
-struct RemoteHostInner {
+pub(crate) struct RemoteHostInner {
     config: RwLock<RemoteHostConfig>,
     config_revision: AtomicU64,
     snapshot_revision: AtomicU64,
@@ -816,6 +830,12 @@ struct RemoteHostInner {
     stop_flag: AtomicBool,
     listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
     broadcaster_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    // Both fields are written on lifecycle transitions and (Phase 1b+)
+    // surfaced through the settings panel; suppress the transient warning.
+    #[allow(dead_code)]
+    web_listener: Mutex<Option<WebListenerHandle>>,
+    #[allow(dead_code)]
+    web_listener_error: RwLock<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -913,6 +933,8 @@ impl RemoteHostService {
                 stop_flag: AtomicBool::new(false),
                 listener_thread: Mutex::new(None),
                 broadcaster_thread: Mutex::new(None),
+                web_listener: Mutex::new(None),
+                web_listener_error: RwLock::new(None),
             }),
         };
         service.apply_config(config);
@@ -935,16 +957,37 @@ impl RemoteHostService {
         runtime_state: RuntimeState,
         port_statuses: HashMap<u16, PortStatus>,
     ) {
-        if let Ok(mut slot) = self.inner.shared_state.write() {
-            *slot = app_state;
+        self.update_snapshot_parts(Some(app_state), Some(runtime_state), Some(port_statuses));
+    }
+
+    pub fn update_snapshot_parts(
+        &self,
+        app_state: Option<AppState>,
+        runtime_state: Option<RuntimeState>,
+        port_statuses: Option<HashMap<u16, PortStatus>>,
+    ) {
+        let mut changed = false;
+        if let Some(app_state) = app_state {
+            if let Ok(mut slot) = self.inner.shared_state.write() {
+                *slot = app_state;
+                changed = true;
+            }
         }
-        if let Ok(mut slot) = self.inner.runtime_state.write() {
-            *slot = runtime_state;
+        if let Some(runtime_state) = runtime_state {
+            if let Ok(mut slot) = self.inner.runtime_state.write() {
+                *slot = runtime_state;
+                changed = true;
+            }
         }
-        if let Ok(mut slot) = self.inner.port_statuses.write() {
-            *slot = port_statuses;
+        if let Some(port_statuses) = port_statuses {
+            if let Ok(mut slot) = self.inner.port_statuses.write() {
+                *slot = port_statuses;
+                changed = true;
+            }
         }
-        self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
+        if changed {
+            self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn config(&self) -> RemoteHostConfig {
@@ -1175,13 +1218,14 @@ impl RemoteHostService {
     }
 
     pub fn status(&self) -> RemoteHostStatus {
-        let (enabled, bind_address, port, pairing_token) = self
+        let (enabled, web_enabled, bind_address, port, pairing_token) = self
             .inner
             .config
             .read()
             .map(|config| {
                 (
                     config.enabled,
+                    config.web.enabled,
                     config.bind_address.clone(),
                     config.port,
                     config.pairing_token.clone(),
@@ -1222,6 +1266,7 @@ impl RemoteHostService {
             .unwrap_or_default();
         RemoteHostStatus {
             enabled,
+            web_enabled,
             bind_address,
             port,
             pairing_token,
@@ -1313,6 +1358,16 @@ impl RemoteHostService {
                 let _ = thread.join();
             }
         }
+        // Tear down the web listener independently of the TCP listener so
+        // rebinding one does not require tearing down the other.
+        if let Ok(mut slot) = self.inner.web_listener.lock() {
+            if let Some(handle) = slot.take() {
+                handle.shutdown();
+            }
+        }
+        if let Ok(mut error) = self.inner.web_listener_error.write() {
+            *error = None;
+        }
         self.inner.stop_flag.store(false, Ordering::SeqCst);
 
         let config = self
@@ -1321,20 +1376,43 @@ impl RemoteHostService {
             .read()
             .map(|slot| slot.clone())
             .unwrap_or_default();
-        if !config.enabled {
-            return;
+
+        if config.enabled {
+            let listener_inner = self.inner.clone();
+            let listener_thread = thread::spawn(move || run_listener(listener_inner));
+            if let Ok(mut handle) = self.inner.listener_thread.lock() {
+                *handle = Some(listener_thread);
+            }
         }
 
-        let listener_inner = self.inner.clone();
-        let listener_thread = thread::spawn(move || run_listener(listener_inner));
-        if let Ok(mut handle) = self.inner.listener_thread.lock() {
-            *handle = Some(listener_thread);
+        // The broadcaster drives snapshot/delta fan-out to every connected
+        // client, regardless of transport. Run it whenever any listener is
+        // enabled — the native TCP one, the browser web one, or both —
+        // otherwise web clients would connect and never see a single delta.
+        if config.enabled || config.web.enabled {
+            let broadcaster_inner = self.inner.clone();
+            let broadcaster_thread = thread::spawn(move || run_broadcaster(broadcaster_inner));
+            if let Ok(mut handle) = self.inner.broadcaster_thread.lock() {
+                *handle = Some(broadcaster_thread);
+            }
         }
 
-        let broadcaster_inner = self.inner.clone();
-        let broadcaster_thread = thread::spawn(move || run_broadcaster(broadcaster_inner));
-        if let Ok(mut handle) = self.inner.broadcaster_thread.lock() {
-            *handle = Some(broadcaster_thread);
+        // Web listener runs independently of the native TCP listener: users
+        // can enable just the web UI if they only care about browser access,
+        // or vice versa.
+        if config.web.enabled {
+            match WebListenerHandle::start(self.inner.clone(), config.web.clone()) {
+                Ok(handle) => {
+                    if let Ok(mut slot) = self.inner.web_listener.lock() {
+                        *slot = Some(handle);
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut error_slot) = self.inner.web_listener_error.write() {
+                        *error_slot = Some(error);
+                    }
+                }
+            }
         }
     }
 }
@@ -2696,7 +2774,7 @@ fn set_last_connection_note(inner: &Arc<RemoteHostInner>, note: String, is_error
         .store(is_error, Ordering::Relaxed);
 }
 
-fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {
+pub(crate) fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {
     inner
         .controller_client_id
         .read()
@@ -2717,7 +2795,7 @@ fn runtime_owns_port(session: &SessionRuntimeState, status: &PortStatus) -> bool
     session.resources.process_ids.contains(&pid)
 }
 
-fn requires_control(action: &RemoteAction) -> bool {
+pub(crate) fn requires_control(action: &RemoteAction) -> bool {
     !matches!(
         action,
         RemoteAction::SearchSession { .. }
@@ -3021,14 +3099,17 @@ fn try_decode_message<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("Parse failed: {error}"))
 }
 
-fn stable_hash<T: Serialize>(value: &T) -> u64 {
+pub(crate) fn stable_hash<T: Serialize>(value: &T) -> u64 {
     let bytes = to_vec_named(value).unwrap_or_default();
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
 }
 
-fn current_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> RemoteWorkspaceSnapshot {
+pub(crate) fn current_snapshot(
+    inner: &Arc<RemoteHostInner>,
+    client_id: &str,
+) -> RemoteWorkspaceSnapshot {
     let app_state = inner
         .shared_state
         .read()
@@ -3412,6 +3493,67 @@ mod tests {
             let client = clients.get(&1).expect("client should remain connected");
             assert!(client.bootstrapped_session_ids.contains("alpha"));
         }
+    }
+
+    #[test]
+    fn update_snapshot_parts_only_replaces_changed_sections() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app_state = AppState::default();
+        app_state.sidebar_collapsed = true;
+        let runtime_state = RuntimeState::default();
+        let port_statuses = HashMap::from([(
+            3000,
+            PortStatus {
+                port: 3000,
+                in_use: true,
+                pid: Some(42),
+                process_name: Some("node".to_string()),
+            },
+        )]);
+        service.update_snapshot(app_state.clone(), runtime_state.clone(), port_statuses.clone());
+
+        let mut next_runtime = runtime_state;
+        next_runtime.active_session_id = Some("server-session".to_string());
+
+        let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
+        service.update_snapshot_parts(None, Some(next_runtime.clone()), None);
+
+        let stored_app = service
+            .inner
+            .shared_state
+            .read()
+            .expect("shared state lock")
+            .clone();
+        let stored_runtime = service
+            .inner
+            .runtime_state
+            .read()
+            .expect("runtime state lock")
+            .clone();
+        let stored_ports = service
+            .inner
+            .port_statuses
+            .read()
+            .expect("port statuses lock")
+            .clone();
+
+        assert!(stored_app.sidebar_collapsed);
+        assert_eq!(stored_runtime.active_session_id, next_runtime.active_session_id);
+        assert_eq!(stored_ports, port_statuses);
+        assert!(service.inner.snapshot_revision.load(Ordering::Relaxed) > before_revision);
+    }
+
+    #[test]
+    fn update_snapshot_parts_ignores_empty_updates() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
+
+        service.update_snapshot_parts(None, None, None);
+
+        assert_eq!(
+            service.inner.snapshot_revision.load(Ordering::Relaxed),
+            before_revision
+        );
     }
 
     #[test]

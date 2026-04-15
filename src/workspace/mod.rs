@@ -1199,6 +1199,11 @@ pub struct SettingsDraft {
     pub remote_port_forwards: Vec<RemotePortForwardDraft>,
     pub remote_known_hosts: Vec<KnownRemoteHost>,
     pub remote_paired_clients: Vec<PairedRemoteClient>,
+    pub remote_web_enabled: bool,
+    pub remote_web_pairing_token: String,
+    pub remote_web_listener_url: Option<String>,
+    pub remote_web_listener_error: Option<String>,
+    pub remote_web_paired_clients: usize,
     pub open_picker: Option<SettingsPicker>,
 }
 
@@ -1413,6 +1418,9 @@ pub enum EditorAction {
     ToggleRemoteHosting,
     ToggleRemoteKeepHostingInBackground,
     RegenerateRemotePairingToken,
+    ToggleRemoteWebHosting,
+    RegenerateRemoteWebPairingToken,
+    CopyRemoteWebPairingToken,
     CopyRemotePairingToken,
     ConnectRemoteHost,
     DisconnectRemoteHost,
@@ -1665,6 +1673,12 @@ fn render_settings_panel(
     let on_regenerate_remote_pairing =
         (actions.on_action)(EditorAction::RegenerateRemotePairingToken);
     let on_copy_remote_pairing = (actions.on_action)(EditorAction::CopyRemotePairingToken);
+    let on_toggle_remote_web_hosting =
+        (actions.on_action)(EditorAction::ToggleRemoteWebHosting);
+    let on_regenerate_remote_web_pairing =
+        (actions.on_action)(EditorAction::RegenerateRemoteWebPairingToken);
+    let on_copy_remote_web_pairing =
+        (actions.on_action)(EditorAction::CopyRemoteWebPairingToken);
     let on_connect_remote = (actions.on_action)(EditorAction::ConnectRemoteHost);
     let on_disconnect_remote = (actions.on_action)(EditorAction::DisconnectRemoteHost);
     let on_take_remote_control = (actions.on_action)(EditorAction::TakeRemoteControl);
@@ -2414,6 +2428,82 @@ fn render_settings_panel(
             FormSection::new("Host This Device")
                 .hint("Use this app as the machine another DevManager window connects to.")
                 .fields(host_fields),
+        );
+
+        let web_listener_value = draft
+            .remote_web_listener_url
+            .clone()
+            .unwrap_or_else(|| "Not running".to_string());
+        let web_pair_token_display = if draft.remote_web_pairing_token.trim().is_empty() {
+            "Unavailable".to_string()
+        } else {
+            draft.remote_web_pairing_token.clone()
+        };
+        let web_paired_clients_value = if draft.remote_web_paired_clients == 0 {
+            "None paired".to_string()
+        } else if draft.remote_web_paired_clients == 1 {
+            "1 browser".to_string()
+        } else {
+            format!("{} browsers", draft.remote_web_paired_clients)
+        };
+
+        let mut web_fields = vec![
+            FormField::toggle(
+                "Enable web UI",
+                draft.remote_web_enabled,
+                "Serve a browser-based DevManager client on this machine. Phones and laptops on the same network can open it with no install.",
+                on_toggle_remote_web_hosting,
+            ),
+            FormField::info(
+                "Open in a browser",
+                web_listener_value,
+                Some("Type this URL into a phone or laptop browser on the same network.".to_string()),
+            ),
+            FormField::info(
+                "Web pair token",
+                web_pair_token_display,
+                Some("Append this as ?t=<token> to the URL the first time you pair a browser.".to_string()),
+            ),
+            FormField::action_group(
+                FormActionGroup::new("Web pair token actions")
+                    .action(
+                        FormAction::new(
+                            "Copy the web pair token",
+                            "Copy",
+                            on_copy_remote_web_pairing,
+                        )
+                        .description("Copy the current web pair token to the clipboard.")
+                        .style(SurfaceActionButtonStyle::Primary),
+                    )
+                    .action(
+                        FormAction::new(
+                            "Regenerate the web pair token",
+                            "Regenerate",
+                            on_regenerate_remote_web_pairing,
+                        )
+                        .description("Invalidate the current token and issue a new one."),
+                    ),
+            ),
+            FormField::info(
+                "Paired browsers",
+                web_paired_clients_value,
+                Some("Each browser that completes pairing gets a long-lived cookie.".to_string()),
+            ),
+        ];
+        if let Some(error) = draft.remote_web_listener_error.as_ref() {
+            web_fields.push(FormField::notice(error.clone(), SurfaceTone::Danger));
+        }
+        if draft.remote_web_enabled {
+            web_fields.push(FormField::notice(
+                "Web UI ships over plain HTTP on the LAN. For remote access beyond your network, tunnel it through Tailscale or Cloudflare."
+                    .to_string(),
+                SurfaceTone::Muted,
+            ));
+        }
+        sections.push(
+            FormSection::new("Browser Web UI")
+                .hint("Let browsers on any device connect to this DevManager.")
+                .fields(web_fields),
         );
 
         if !draft.remote_paired_clients.is_empty() {
@@ -3716,6 +3806,11 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
             auth_token: "token".to_string(),
             last_seen_epoch_ms: Some(1_710_000_000_000),
         }],
+        remote_web_enabled: false,
+        remote_web_pairing_token: "AB23CD45".to_string(),
+        remote_web_listener_url: Some("http://192.168.0.20:43872".to_string()),
+        remote_web_listener_error: None,
+        remote_web_paired_clients: 0,
         open_picker,
     }
 }

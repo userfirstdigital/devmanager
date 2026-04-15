@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #09090b;
+  color: #e4e4e7;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Match the archived zinc-based dark scrollbar so the new web UI feels
+ * identical to the native app. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* xterm.js overrides: pad the viewport + snap the font-stack to the same
+ * family the archived InteractiveTerminal.tsx used. */
+.xterm {
+  padding: 6px 8px;
+}
+.xterm .xterm-viewport,
+.xterm .xterm-screen {
+  font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas,
+    monospace !important;
+}
+
+/* Pulse animation used on "live" status dots so they subtly breathe while
+ * a managed server is running. */
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.dot-live {
+  animation: dot-pulse 1.8s ease-in-out infinite;
+}

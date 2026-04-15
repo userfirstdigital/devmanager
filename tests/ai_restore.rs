@@ -149,6 +149,122 @@ fn restart_ai_session_updates_pty_session_id_without_duplicate_tabs() {
 }
 
 #[test]
+fn background_ai_launch_preserves_active_session_and_tab() {
+    let mut state = state_with_temp_paths();
+    let original_active_tab_id = state.active_tab_id.clone();
+    let manager = ProcessManager::new();
+    manager.register_runtime_session(live_ai_runtime("existing-session", "existing-tab"));
+    manager.set_active_session("existing-session");
+
+    let session_id = manager
+        .start_ai_session_activate(
+            &mut state,
+            "project-userfirst",
+            TabType::Claude,
+            SessionDimensions::default(),
+            false,
+        )
+        .expect("launch background claude tab");
+
+    let runtime = manager.runtime_state();
+    assert_eq!(
+        runtime.active_session_id.as_deref(),
+        Some("existing-session")
+    );
+    assert_eq!(state.active_tab_id, original_active_tab_id);
+
+    let tab_id = state
+        .find_ai_tab_by_session(&session_id)
+        .map(|tab| tab.id.clone())
+        .expect("launched claude tab");
+    manager
+        .close_ai_session(&mut state, &tab_id)
+        .expect("close background claude tab");
+}
+
+#[test]
+fn background_ai_restart_preserves_active_session_and_tab() {
+    let mut state = state_with_temp_paths();
+    let original_active_tab_id = state.active_tab_id.clone();
+    let manager = ProcessManager::new();
+
+    let first_session_id = manager
+        .ensure_ai_session_for_tab(
+            &mut state,
+            "claude-1",
+            SessionDimensions::default(),
+            false,
+            true,
+        )
+        .expect("launch initial claude tab");
+    wait_for_ai_startup_command(&manager, &first_session_id, "echo claude-ready");
+
+    manager.register_runtime_session(live_ai_runtime("existing-session", "existing-tab"));
+    manager.set_active_session("existing-session");
+
+    let second_session_id = manager
+        .restart_ai_session_activate(
+            &mut state,
+            "claude-1",
+            SessionDimensions::default(),
+            false,
+        )
+        .expect("restart background claude tab");
+
+    let runtime = manager.runtime_state();
+    assert_ne!(first_session_id, second_session_id);
+    assert_eq!(
+        runtime.active_session_id.as_deref(),
+        Some("existing-session")
+    );
+    assert_eq!(state.active_tab_id, original_active_tab_id);
+    assert_eq!(
+        state
+            .find_ai_tab("claude-1")
+            .and_then(|tab| tab.pty_session_id.as_deref()),
+        Some(second_session_id.as_str())
+    );
+
+    manager
+        .close_ai_session(&mut state, "claude-1")
+        .expect("close restarted background claude tab");
+}
+
+#[test]
+fn selecting_starting_ai_tab_reuses_inflight_spawn_without_replacing_session_id() {
+    let mut state = state_with_temp_paths();
+    let manager = ProcessManager::new();
+    let original_session_id = "claude-starting".to_string();
+
+    let mut starting_session = live_ai_runtime(&original_session_id, "claude-1");
+    starting_session.status = SessionStatus::Starting;
+    starting_session.pid = None;
+    manager.register_runtime_session(starting_session);
+    assert!(
+        state.update_ai_tab_session("claude-1", original_session_id.clone()),
+        "expected fixture claude tab"
+    );
+
+    let resolved_session_id = manager
+        .ensure_ai_session_for_tab(
+            &mut state,
+            "claude-1",
+            SessionDimensions::default(),
+            true,
+            false,
+        )
+        .expect("reuse inflight claude tab");
+
+    assert_eq!(resolved_session_id, original_session_id);
+    assert_eq!(
+        state
+            .find_ai_tab("claude-1")
+            .and_then(|tab| tab.pty_session_id.as_deref()),
+        Some(original_session_id.as_str())
+    );
+}
+
+#[test]
 fn set_active_session_clears_unseen_ready() {
     let manager = ProcessManager::new();
     let mut session = live_ai_runtime("claude-live", "claude-1");

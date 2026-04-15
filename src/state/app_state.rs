@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+fn initial_app_state_revision() -> u64 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveTerminalSpec {
     pub session_id: String,
@@ -29,6 +33,8 @@ pub struct FolderLookup<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
+    #[serde(skip, default = "initial_app_state_revision")]
+    revision: u64,
     pub config: AppConfig,
     pub open_tabs: Vec<SessionTab>,
     pub active_tab_id: Option<String>,
@@ -48,6 +54,7 @@ impl AppState {
         let session = snapshot.session.normalize();
 
         Self {
+            revision: initial_app_state_revision(),
             config: snapshot.config.migrate(),
             open_tabs: session.open_tabs,
             active_tab_id: session.active_tab_id,
@@ -67,10 +74,19 @@ impl AppState {
         }
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
     pub fn toggle_project_collapsed(&mut self, project_id: &str) {
         if !self.collapsed_projects.remove(project_id) {
             self.collapsed_projects.insert(project_id.to_string());
         }
+        self.mark_dirty();
     }
 
     pub fn is_project_collapsed(&self, project_id: &str) -> bool {
@@ -214,7 +230,10 @@ impl AppState {
 
     pub fn select_tab(&mut self, tab_id: &str) -> bool {
         if self.open_tabs.iter().any(|tab| tab.id == tab_id) {
-            self.active_tab_id = Some(tab_id.to_string());
+            if self.active_tab_id.as_deref() != Some(tab_id) {
+                self.active_tab_id = Some(tab_id.to_string());
+                self.mark_dirty();
+            }
             true
         } else {
             false
@@ -222,11 +241,15 @@ impl AppState {
     }
 
     pub fn set_sidebar_collapsed(&mut self, collapsed: bool) {
-        self.sidebar_collapsed = collapsed;
+        if self.sidebar_collapsed != collapsed {
+            self.sidebar_collapsed = collapsed;
+            self.mark_dirty();
+        }
     }
 
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.mark_dirty();
     }
 
     pub fn ensure_server_tab(
@@ -254,6 +277,7 @@ impl AppState {
                 ssh_connection_id: None,
             });
         }
+        self.mark_dirty();
         tab_id
     }
 
@@ -264,7 +288,10 @@ impl AppState {
         label: Option<String>,
     ) -> String {
         let tab_id = self.ensure_server_tab(project_id, command_id, label);
-        self.active_tab_id = Some(tab_id.clone());
+        if self.active_tab_id.as_deref() != Some(tab_id.as_str()) {
+            self.active_tab_id = Some(tab_id.clone());
+            self.mark_dirty();
+        }
         tab_id
     }
 
@@ -275,6 +302,32 @@ impl AppState {
         tab_id: String,
         pty_session_id: String,
         label: Option<String>,
+    ) -> String {
+        self.open_ai_tab_with_activation(
+            project_id,
+            tab_type,
+            tab_id,
+            pty_session_id,
+            label,
+            true,
+        )
+    }
+
+    /// Same as `open_ai_tab` but lets callers decide whether this tab
+    /// should become the currently-focused UI tab. Remote-triggered
+    /// launches pass `activate = false` so a browser creating an AI
+    /// session doesn't yank the native window's focus onto a mid-spawn
+    /// terminal — the GPUI render of that terminal under a fresh Claude
+    /// Code output flood stalls the main thread badly enough to produce
+    /// "(Not Responding)".
+    pub fn open_ai_tab_with_activation(
+        &mut self,
+        project_id: &str,
+        tab_type: TabType,
+        tab_id: String,
+        pty_session_id: String,
+        label: Option<String>,
+        activate: bool,
     ) -> String {
         if !matches!(tab_type, TabType::Claude | TabType::Codex) {
             return tab_id;
@@ -299,7 +352,12 @@ impl AppState {
             });
         }
 
-        self.active_tab_id = Some(tab_id.clone());
+        if activate {
+            if self.active_tab_id.as_deref() != Some(tab_id.as_str()) {
+                self.active_tab_id = Some(tab_id.clone());
+            }
+        }
+        self.mark_dirty();
         tab_id
     }
 
@@ -308,6 +366,7 @@ impl AppState {
             tab.id == tab_id && matches!(tab.tab_type, TabType::Claude | TabType::Codex)
         }) {
             tab.pty_session_id = Some(pty_session_id);
+            self.mark_dirty();
             true
         } else {
             false
@@ -343,7 +402,10 @@ impl AppState {
             });
         }
 
-        self.active_tab_id = Some(tab_id.clone());
+        if self.active_tab_id.as_deref() != Some(tab_id.as_str()) {
+            self.active_tab_id = Some(tab_id.clone());
+        }
+        self.mark_dirty();
         tab_id
     }
 
@@ -354,6 +416,7 @@ impl AppState {
             .find(|tab| tab.id == tab_id && matches!(tab.tab_type, TabType::Ssh))
         {
             tab.pty_session_id = pty_session_id;
+            self.mark_dirty();
             true
         } else {
             false
@@ -372,11 +435,15 @@ impl AppState {
         {
             self.active_tab_id = None;
         }
+        if removed {
+            self.mark_dirty();
+        }
         removed
     }
 
     pub fn merge_recovered_server_tabs(&mut self, recovered_tabs: Vec<SessionTab>) -> usize {
         let mut added = 0;
+        let previous_active = self.active_tab_id.clone();
         for tab in recovered_tabs {
             if !self.open_tabs.iter().any(|existing| existing.id == tab.id) {
                 self.open_tabs.push(tab);
@@ -390,11 +457,15 @@ impl AppState {
         {
             self.active_tab_id = self.open_tabs.first().map(|tab| tab.id.clone());
         }
+        if added > 0 || previous_active != self.active_tab_id {
+            self.mark_dirty();
+        }
         added
     }
 
     pub fn merge_recovered_ai_tabs(&mut self, recovered_tabs: Vec<SessionTab>) -> usize {
         let mut added = 0;
+        let previous_active = self.active_tab_id.clone();
         for tab in recovered_tabs {
             if !matches!(tab.tab_type, TabType::Claude | TabType::Codex) {
                 continue;
@@ -411,11 +482,15 @@ impl AppState {
         {
             self.active_tab_id = self.open_tabs.first().map(|tab| tab.id.clone());
         }
+        if added > 0 || previous_active != self.active_tab_id {
+            self.mark_dirty();
+        }
         added
     }
 
     pub fn merge_recovered_ssh_tabs(&mut self, recovered_tabs: Vec<SessionTab>) -> usize {
         let mut added = 0;
+        let previous_active = self.active_tab_id.clone();
         for tab in recovered_tabs {
             if !matches!(tab.tab_type, TabType::Ssh) {
                 continue;
@@ -431,6 +506,9 @@ impl AppState {
             .is_none_or(|active| !self.open_tabs.iter().any(|tab| &tab.id == active))
         {
             self.active_tab_id = self.open_tabs.first().map(|tab| tab.id.clone());
+        }
+        if added > 0 || previous_active != self.active_tab_id {
+            self.mark_dirty();
         }
         added
     }
@@ -450,6 +528,7 @@ impl AppState {
 
     pub fn update_settings(&mut self, settings: Settings) {
         self.config.settings = settings;
+        self.mark_dirty();
     }
 
     pub fn upsert_project(&mut self, project: Project) -> String {
@@ -463,6 +542,7 @@ impl AppState {
         } else {
             self.config.projects.push(project.clone());
         }
+        self.mark_dirty();
         project.id
     }
 
@@ -475,6 +555,7 @@ impl AppState {
             return false;
         }
         self.config.projects.swap(index, new_index as usize);
+        self.mark_dirty();
         true
     }
 
@@ -487,6 +568,7 @@ impl AppState {
         if removed {
             self.open_tabs.retain(|tab| tab.project_id != project_id);
             self.repair_active_tab();
+            self.mark_dirty();
         }
         removed
     }
@@ -510,6 +592,7 @@ impl AppState {
         } else {
             project.folders.push(folder);
         }
+        self.mark_dirty();
         true
     }
 
@@ -548,6 +631,7 @@ impl AppState {
                 !is_removed_server_tab
             });
             self.repair_active_tab();
+            self.mark_dirty();
         }
         removed
     }
@@ -583,6 +667,7 @@ impl AppState {
         } else {
             folder.commands.push(command);
         }
+        self.mark_dirty();
         true
     }
 
@@ -611,6 +696,7 @@ impl AppState {
                 !(tab.tab_type == TabType::Server && tab.command_id.as_deref() == Some(command_id))
             });
             self.repair_active_tab();
+            self.mark_dirty();
         }
         removed
     }
@@ -626,6 +712,7 @@ impl AppState {
         } else {
             self.config.ssh_connections.push(connection.clone());
         }
+        self.mark_dirty();
         connection.id
     }
 
@@ -641,6 +728,7 @@ impl AppState {
                     && tab.ssh_connection_id.as_deref() == Some(connection_id))
             });
             self.repair_active_tab();
+            self.mark_dirty();
         }
         removed
     }
@@ -788,5 +876,21 @@ mod tests {
         let spec = state.active_terminal_spec();
 
         assert!(spec.session_id.starts_with("phase1-shell-project-1-"));
+    }
+
+    #[test]
+    fn mutating_state_bumps_revision_but_missing_selection_does_not() {
+        let mut state = AppState::default();
+        let initial = state.revision();
+
+        state.toggle_sidebar();
+        let after_toggle = state.revision();
+        assert!(after_toggle > initial);
+
+        assert!(!state.select_tab("missing-tab"));
+        assert_eq!(state.revision(), after_toggle);
+
+        state.ensure_server_tab("project-1", "server-cmd", Some("Web".to_string()));
+        assert!(state.revision() > after_toggle);
     }
 }
