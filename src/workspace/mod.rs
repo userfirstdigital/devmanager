@@ -18,8 +18,7 @@ use crate::updater::{UpdaterSnapshot, UpdaterStage};
 use gpui::{
     anchored, deferred, div, px, rgb, AnyElement, App, Corner, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled,
-    Window,
+    StatefulInteractiveElement, Styled, Window,
 };
 use std::{
     collections::{BTreeSet, HashMap},
@@ -1673,12 +1672,10 @@ fn render_settings_panel(
     let on_regenerate_remote_pairing =
         (actions.on_action)(EditorAction::RegenerateRemotePairingToken);
     let on_copy_remote_pairing = (actions.on_action)(EditorAction::CopyRemotePairingToken);
-    let on_toggle_remote_web_hosting =
-        (actions.on_action)(EditorAction::ToggleRemoteWebHosting);
+    let on_toggle_remote_web_hosting = (actions.on_action)(EditorAction::ToggleRemoteWebHosting);
     let on_regenerate_remote_web_pairing =
         (actions.on_action)(EditorAction::RegenerateRemoteWebPairingToken);
-    let on_copy_remote_web_pairing =
-        (actions.on_action)(EditorAction::CopyRemoteWebPairingToken);
+    let on_copy_remote_web_pairing = (actions.on_action)(EditorAction::CopyRemoteWebPairingToken);
     let on_connect_remote = (actions.on_action)(EditorAction::ConnectRemoteHost);
     let on_disconnect_remote = (actions.on_action)(EditorAction::DisconnectRemoteHost);
     let on_take_remote_control = (actions.on_action)(EditorAction::TakeRemoteControl);

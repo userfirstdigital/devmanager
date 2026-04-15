@@ -203,12 +203,7 @@ fn background_ai_restart_preserves_active_session_and_tab() {
     manager.set_active_session("existing-session");
 
     let second_session_id = manager
-        .restart_ai_session_activate(
-            &mut state,
-            "claude-1",
-            SessionDimensions::default(),
-            false,
-        )
+        .restart_ai_session_activate(&mut state, "claude-1", SessionDimensions::default(), false)
         .expect("restart background claude tab");
 
     let runtime = manager.runtime_state();

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { CanvasAddon } from "@xterm/addon-canvas";
@@ -9,6 +9,11 @@ import type {
   TerminalScreenSnapshot,
 } from "../api/types";
 import type { SessionBootstrapFrame, SessionOutputFrame } from "../api/ws";
+import {
+  DESKTOP_TERMINAL_FONT_SIZE,
+  computeResponsiveTerminalLayout,
+  type ResponsiveTerminalLayout,
+} from "./terminalLayout";
 
 interface TerminalProps {
   sessionId: string;
@@ -146,9 +151,37 @@ function applyBootstrapToTerminal(
   terminal.write(bootstrapPayload, () => refreshTerminal(terminal));
 }
 
+type ResponsiveXTerm = XTerm & {
+  element?: HTMLElement | null;
+  options: {
+    fontSize?: number;
+  };
+};
+
+function measureTerminalWidth(terminal: XTerm): number {
+  const element = (terminal as ResponsiveXTerm).element;
+  if (!element) {
+    return 0;
+  }
+
+  const canvas = element.querySelector(".xterm-screen canvas");
+  if (canvas instanceof HTMLElement) {
+    return canvas.getBoundingClientRect().width;
+  }
+
+  const screen = element.querySelector(".xterm-screen");
+  if (screen instanceof HTMLElement) {
+    return Math.max(screen.getBoundingClientRect().width, screen.scrollWidth);
+  }
+
+  return element.getBoundingClientRect().width;
+}
+
 export function TerminalView({ sessionId }: TerminalProps) {
+  const shellRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerm | null>(null);
+  const scheduleLayoutRef = useRef<() => void>(() => {});
   const client = useStore((s) => s.client);
   const subscribeTerminal = useStore((s) => s.subscribeTerminal);
   const subscribeBootstrap = useStore((s) => s.subscribeBootstrap);
@@ -170,6 +203,11 @@ export function TerminalView({ sessionId }: TerminalProps) {
     (s) =>
       s.snapshot?.runtimeState?.sessions?.[sessionId]?.dimensions?.rows ?? 30,
   );
+  const [responsiveLayout, setResponsiveLayout] =
+    useState<ResponsiveTerminalLayout>({
+      fontSize: DESKTOP_TERMINAL_FONT_SIZE,
+      allowHorizontalPan: false,
+    });
   const controlRef = useRef(youHaveControl);
   controlRef.current = youHaveControl;
 
@@ -177,6 +215,8 @@ export function TerminalView({ sessionId }: TerminalProps) {
     let cancelled = false;
     let cleanup: (() => void) | null = null;
     let retryTimer: number | null = null;
+    let layoutFrame: number | null = null;
+    let layoutRetryTimer: number | null = null;
 
     // Effects run AFTER React commits, so the container is already in the
     // DOM and measurable. We don't need requestAnimationFrame — that's only
@@ -201,7 +241,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
       const terminal = new XTerm({
         theme: XTERM_THEME,
         fontFamily: FONT_FAMILY,
-        fontSize: 13,
+        fontSize: DESKTOP_TERMINAL_FONT_SIZE,
         lineHeight: 1.3,
         scrollback: 10000,
         cursorStyle: "bar",
@@ -224,6 +264,75 @@ export function TerminalView({ sessionId }: TerminalProps) {
       try {
         terminal.loadAddon(new CanvasAddon());
       } catch {}
+
+      const scheduleResponsiveLayout = () => {
+        if (layoutFrame !== null) {
+          cancelAnimationFrame(layoutFrame);
+        }
+        layoutFrame = requestAnimationFrame(() => {
+          layoutFrame = null;
+          const shell = shellRef.current;
+          if (!shell) {
+            return;
+          }
+
+          const terminalWithLayout = terminal as ResponsiveXTerm;
+          const measuredTerminalWidth = measureTerminalWidth(terminal);
+          if (measuredTerminalWidth <= 0) {
+            if (layoutRetryTimer !== null) {
+              clearTimeout(layoutRetryTimer);
+            }
+            layoutRetryTimer = window.setTimeout(() => {
+              scheduleResponsiveLayout();
+            }, 50);
+            return;
+          }
+          const nextLayout = computeResponsiveTerminalLayout({
+            containerWidth: shell.clientWidth,
+            measuredTerminalWidth,
+            currentFontSize:
+              terminalWithLayout.options.fontSize ?? DESKTOP_TERMINAL_FONT_SIZE,
+          });
+
+          if (terminalWithLayout.options.fontSize !== nextLayout.fontSize) {
+            terminalWithLayout.options.fontSize = nextLayout.fontSize;
+            refreshTerminal(terminal);
+            scheduleResponsiveLayout();
+          }
+          setResponsiveLayout((current) =>
+            current.fontSize === nextLayout.fontSize &&
+            current.allowHorizontalPan === nextLayout.allowHorizontalPan
+              ? current
+              : nextLayout,
+          );
+        });
+      };
+      scheduleLayoutRef.current = scheduleResponsiveLayout;
+
+      if (typeof ResizeObserver !== "undefined") {
+        const resizeObserver = new ResizeObserver(() => {
+          scheduleResponsiveLayout();
+        });
+        resizeObserver.observe(container);
+        if (shellRef.current) {
+          resizeObserver.observe(shellRef.current);
+        }
+        const previousCleanup = cleanup;
+        cleanup = () => {
+          resizeObserver.disconnect();
+          previousCleanup?.();
+        };
+      } else {
+        const handleResize = () => {
+          scheduleResponsiveLayout();
+        };
+        window.addEventListener("resize", handleResize);
+        const previousCleanup = cleanup;
+        cleanup = () => {
+          window.removeEventListener("resize", handleResize);
+          previousCleanup?.();
+        };
+      }
 
       // Suppress xterm's automatic replies to terminal-query CSI sequences.
       // The host replays raw PTY bytes including things like `\x1b[6n`
@@ -306,14 +415,23 @@ export function TerminalView({ sessionId }: TerminalProps) {
         if (!cancelled) terminal.focus();
       }, 50);
 
+      const previousCleanup = cleanup;
       cleanup = () => {
         clearTimeout(focusTimer);
+        if (layoutFrame !== null) {
+          cancelAnimationFrame(layoutFrame);
+        }
+        if (layoutRetryTimer !== null) {
+          clearTimeout(layoutRetryTimer);
+        }
+        previousCleanup?.();
         unsubscribeBootstrap();
         unsubscribe();
         dataDisposable.dispose();
         terminal.dispose();
         terminalRef.current = null;
       };
+      scheduleResponsiveLayout();
     };
 
     mount();
@@ -322,6 +440,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
       cancelled = true;
       if (retryTimer !== null) clearTimeout(retryTimer);
       cleanup?.();
+      scheduleLayoutRef.current = () => {};
     };
     // We deliberately do NOT put `hostCols`/`hostRows` in this dep array;
     // resizing is handled by a separate effect below so we don't tear down
@@ -347,13 +466,20 @@ export function TerminalView({ sessionId }: TerminalProps) {
         terminal.resize(hostCols, hostRows);
       } catch {}
     }
+    scheduleLayoutRef.current();
   }, [hostCols, hostRows]);
 
   return (
     <div
-      ref={containerRef}
-      className="flex-1 min-h-0 bg-[#09090b]"
-      style={{ padding: 0 }}
-    />
+      ref={shellRef}
+      className="dm-terminal-shell flex-1 min-h-0 min-w-0 bg-[#09090b]"
+      data-terminal-pan={responsiveLayout.allowHorizontalPan ? "true" : "false"}
+    >
+      <div
+        ref={containerRef}
+        className="dm-terminal-host h-full"
+        style={{ padding: 0 }}
+      />
+    </div>
   );
 }

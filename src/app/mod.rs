@@ -721,8 +721,8 @@ impl NativeShell {
                         while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                             background_executor.timer(Duration::from_millis(50)).await;
                         }
-                        let run_host_housekeeping =
-                            last_host_housekeeping_at.elapsed() >= REMOTE_HOST_HOUSEKEEPING_INTERVAL;
+                        let run_host_housekeeping = last_host_housekeeping_at.elapsed()
+                            >= REMOTE_HOST_HOUSEKEEPING_INTERVAL;
                         if this
                             .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
                                 let mut next = REMOTE_CLIENT_REFRESH_INTERVAL;
@@ -730,7 +730,10 @@ impl NativeShell {
                                 let changed = if shell.remote_mode.is_some() {
                                     shell.sync_remote_client_snapshot(cx)
                                 } else {
-                                    next = if shell.remote_host_service.status().any_transport_enabled()
+                                    next = if shell
+                                        .remote_host_service
+                                        .status()
+                                        .any_transport_enabled()
                                         || shell.remote_host_service.has_pending_requests()
                                     {
                                         REMOTE_HOST_REQUEST_POLL_INTERVAL
@@ -1187,8 +1190,7 @@ impl NativeShell {
             draft.remote_web_enabled = self.remote_machine_state.host.web.enabled;
             draft.remote_web_pairing_token =
                 self.remote_machine_state.host.web.pairing_token.clone();
-            draft.remote_web_listener_url =
-                Some(self.remote_machine_state.host.web.display_url());
+            draft.remote_web_listener_url = Some(self.remote_machine_state.host.web.display_url());
             draft.remote_web_paired_clients =
                 self.remote_machine_state.host.web.paired_clients.len();
 
@@ -4021,22 +4023,10 @@ impl NativeShell {
                 remote_known_hosts: self.remote_machine_state.known_hosts.clone(),
                 remote_paired_clients: self.remote_machine_state.host.paired_clients.clone(),
                 remote_web_enabled: self.remote_machine_state.host.web.enabled,
-                remote_web_pairing_token: self
-                    .remote_machine_state
-                    .host
-                    .web
-                    .pairing_token
-                    .clone(),
-                remote_web_listener_url: Some(
-                    self.remote_machine_state.host.web.display_url(),
-                ),
+                remote_web_pairing_token: self.remote_machine_state.host.web.pairing_token.clone(),
+                remote_web_listener_url: Some(self.remote_machine_state.host.web.display_url()),
                 remote_web_listener_error: None,
-                remote_web_paired_clients: self
-                    .remote_machine_state
-                    .host
-                    .web
-                    .paired_clients
-                    .len(),
+                remote_web_paired_clients: self.remote_machine_state.host.web.paired_clients.len(),
                 open_picker: None,
             }),
             cx,
@@ -5686,12 +5676,7 @@ impl NativeShell {
         cx.notify();
     }
 
-    fn drag_editor_field_to(
-        &mut self,
-        field: EditorField,
-        cursor: usize,
-        cx: &mut Context<Self>,
-    ) {
+    fn drag_editor_field_to(&mut self, field: EditorField, cursor: usize, cx: &mut Context<Self>) {
         if !self.is_selecting_editor || self.editor_active_field != Some(field) {
             return;
         }
@@ -5961,9 +5946,8 @@ impl NativeShell {
             EditorAction::CopyRemoteWebPairingToken => {
                 let token = self.remote_machine_state.host.web.pairing_token.clone();
                 if token.trim().is_empty() {
-                    self.editor_notice = Some(
-                        "Enable the web UI first to generate a pair token.".to_string(),
-                    );
+                    self.editor_notice =
+                        Some("Enable the web UI first to generate a pair token.".to_string());
                 } else {
                     cx.write_to_clipboard(ClipboardItem::new_string(token));
                     self.editor_notice =
@@ -6145,12 +6129,7 @@ impl NativeShell {
         self.focus_editor(window);
     }
 
-    fn handle_editor_mouse_up(
-        &mut self,
-        _: &MouseUpEvent,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) {
+    fn handle_editor_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting_editor = false;
     }
 
@@ -6292,7 +6271,11 @@ impl NativeShell {
             if let Some(panel) = self.editor_panel.as_mut() {
                 if let Some(value) = panel.text_value_mut(field) {
                     let mut chars: Vec<char> = value.chars().collect();
-                    delete_selection(&mut chars, &mut self.editor_cursor, &mut self.editor_selection_anchor);
+                    delete_selection(
+                        &mut chars,
+                        &mut self.editor_cursor,
+                        &mut self.editor_selection_anchor,
+                    );
                     *value = chars.into_iter().collect();
                 }
             }
@@ -6490,7 +6473,10 @@ impl NativeShell {
                     self.active_port_state = None;
                 }
 
-                let server_runtime = runtime_snapshot.sessions.get(&active_spec.session_id).cloned();
+                let server_runtime = runtime_snapshot
+                    .sessions
+                    .get(&active_spec.session_id)
+                    .cloned();
                 let session_live = server_runtime
                     .as_ref()
                     .map(|session| session.status.is_live())
@@ -6574,8 +6560,13 @@ impl NativeShell {
                     self.last_dimensions = None;
                 }
 
-                let session_runtime = runtime_snapshot.sessions.get(&active_spec.session_id).cloned();
-                let session_attached = self.process_manager.session_attached(&active_spec.session_id);
+                let session_runtime = runtime_snapshot
+                    .sessions
+                    .get(&active_spec.session_id)
+                    .cloned();
+                let session_attached = self
+                    .process_manager
+                    .session_attached(&active_spec.session_id);
                 if local_has_resize_control
                     && native_ai_render_should_wait(
                         session_runtime.as_ref(),
@@ -6640,8 +6631,10 @@ impl NativeShell {
 
                         let dimensions = self.terminal_dimensions(window);
                         let mut current_view = if local_has_resize_control {
-                            self.process_manager
-                                .session_view_from_runtime(runtime_snapshot, &active_spec.session_id)
+                            self.process_manager.session_view_from_runtime(
+                                runtime_snapshot,
+                                &active_spec.session_id,
+                            )
                         } else {
                             self.local_viewer_session_view(&active_spec.session_id, dimensions)
                         };
@@ -6657,7 +6650,8 @@ impl NativeShell {
                                 .is_ok()
                         {
                             self.last_dimensions = Some(dimensions);
-                            current_view = self.process_manager.session_view(&active_spec.session_id);
+                            current_view =
+                                self.process_manager.session_view(&active_spec.session_id);
                         }
 
                         self.terminal_notice = None;
@@ -9781,10 +9775,7 @@ impl NativeShell {
     }
 }
 
-fn apply_window_bounds_state(
-    state: &mut AppState,
-    next: crate::models::WindowBoundsState,
-) -> bool {
+fn apply_window_bounds_state(state: &mut AppState, next: crate::models::WindowBoundsState) -> bool {
     if state.window_bounds == Some(next) {
         return false;
     }
@@ -9828,7 +9819,8 @@ impl Render for NativeShell {
             None
         };
 
-        let runtime_snapshot = local_runtime_snapshot.unwrap_or_else(|| self.current_runtime_snapshot());
+        let runtime_snapshot =
+            local_runtime_snapshot.unwrap_or_else(|| self.current_runtime_snapshot());
         self.sync_window_title(window, &runtime_snapshot);
         let server_indicators = derive_server_indicator_states(
             &self.state,
@@ -12301,7 +12293,11 @@ fn write_terminal_export(kind: &str, text: &str) -> Result<std::path::PathBuf, S
 fn selection_range(cursor: usize, anchor: Option<usize>) -> Option<(usize, usize)> {
     anchor.and_then(|a| {
         let (start, end) = if a < cursor { (a, cursor) } else { (cursor, a) };
-        if start == end { None } else { Some((start, end)) }
+        if start == end {
+            None
+        } else {
+            Some((start, end))
+        }
     })
 }
 
@@ -12700,7 +12696,9 @@ fn native_ai_render_should_wait(
         && !session.at_prompt
         && session
             .started_at
-            .map(|started_at| now.saturating_duration_since(started_at) <= AI_LOCAL_RENDER_GUARD_WINDOW)
+            .map(|started_at| {
+                now.saturating_duration_since(started_at) <= AI_LOCAL_RENDER_GUARD_WINDOW
+            })
             .unwrap_or(false)
 }
 

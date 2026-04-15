@@ -14,7 +14,11 @@ use crate::terminal::session::TerminalScreenSnapshot;
 
 /// Messages the browser sends to the host over the `/api/ws` text channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum WsInbound {
     SubscribeSessions {
         session_ids: Vec<String>,
@@ -51,7 +55,11 @@ pub enum WsInbound {
 /// `bridge::encode_session_output_frame`) to avoid base64 overhead in the hot
 /// terminal stream path. Everything else is plain JSON.
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum WsOutbound {
     Hello {
         client_id: String,

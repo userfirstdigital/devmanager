@@ -1523,7 +1523,14 @@ fn render_text_input_surface(
     } else {
         theme::TEXT_PRIMARY
     };
-    let lines = editable_field_lines(value, model.cursor, model.selection_anchor, focused, multiline, placeholder);
+    let lines = editable_field_lines(
+        value,
+        model.cursor,
+        model.selection_anchor,
+        focused,
+        multiline,
+        placeholder,
+    );
 
     let mut surface = div()
         .px(px(12.0))
@@ -1678,10 +1685,7 @@ fn render_editable_field_line(
             if let Some((sel_start_x, sel_end_x)) = state.selection_x {
                 let sel_bounds = Bounds::new(
                     point(bounds.origin.x + sel_start_x, bounds.origin.y),
-                    size(
-                        sel_end_x - sel_start_x,
-                        px(EDITOR_FIELD_LINE_HEIGHT_PX),
-                    ),
+                    size(sel_end_x - sel_start_x, px(EDITOR_FIELD_LINE_HEIGHT_PX)),
                 );
                 window.paint_quad(fill(sel_bounds, rgb(theme::SELECTION_BG)));
             }
@@ -1741,7 +1745,11 @@ fn editable_field_lines(
             } else {
                 (cursor, anchor)
             };
-            if s == e { None } else { Some((s, e)) }
+            if s == e {
+                None
+            } else {
+                Some((s, e))
+            }
         })
     } else {
         None
@@ -1765,8 +1773,7 @@ fn editable_field_lines(
             editable_text: value.to_string(),
             char_start: 0,
             cursor_col: focused.then_some(cursor.min(char_count)),
-            selection_cols: sel_range
-                .and_then(|(s, e)| line_selection_cols(s, e, 0, char_count)),
+            selection_cols: sel_range.and_then(|(s, e)| line_selection_cols(s, e, 0, char_count)),
             placeholder: false,
         }];
     }

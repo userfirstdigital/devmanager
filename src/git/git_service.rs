@@ -868,7 +868,10 @@ pub struct AiCommitMessage {
 }
 
 pub fn get_staged_diff(repo_path: &str) -> Result<String, String> {
-    run_git(repo_path, &["diff", "--cached", "--no-ext-diff", "--no-color"])
+    run_git(
+        repo_path,
+        &["diff", "--cached", "--no-ext-diff", "--no-color"],
+    )
 }
 
 /// Exchange a GitHub OAuth token for a short-lived Copilot API token.

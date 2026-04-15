@@ -3510,7 +3510,11 @@ mod tests {
                 process_name: Some("node".to_string()),
             },
         )]);
-        service.update_snapshot(app_state.clone(), runtime_state.clone(), port_statuses.clone());
+        service.update_snapshot(
+            app_state.clone(),
+            runtime_state.clone(),
+            port_statuses.clone(),
+        );
 
         let mut next_runtime = runtime_state;
         next_runtime.active_session_id = Some("server-session".to_string());
@@ -3538,7 +3542,10 @@ mod tests {
             .clone();
 
         assert!(stored_app.sidebar_collapsed);
-        assert_eq!(stored_runtime.active_session_id, next_runtime.active_session_id);
+        assert_eq!(
+            stored_runtime.active_session_id,
+            next_runtime.active_session_id
+        );
         assert_eq!(stored_ports, port_statuses);
         assert!(service.inner.snapshot_revision.load(Ordering::Relaxed) > before_revision);
     }

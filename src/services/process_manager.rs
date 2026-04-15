@@ -2698,11 +2698,12 @@ fn bump_runtime_revision(inner: &ProcessManagerInner) {
 }
 
 fn current_runtime_generation(inner: &ProcessManagerInner, session_id: &str) -> Option<u64> {
-    inner
-        .runtime_state
-        .read()
-        .ok()
-        .and_then(|runtime| runtime.sessions.get(session_id).map(|session| session.dirty_generation))
+    inner.runtime_state.read().ok().and_then(|runtime| {
+        runtime
+            .sessions
+            .get(session_id)
+            .map(|session| session.dirty_generation)
+    })
 }
 
 fn remember_runtime_generation(inner: &ProcessManagerInner, session_id: &str, generation: u64) {

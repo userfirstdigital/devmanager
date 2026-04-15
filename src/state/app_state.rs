@@ -303,14 +303,7 @@ impl AppState {
         pty_session_id: String,
         label: Option<String>,
     ) -> String {
-        self.open_ai_tab_with_activation(
-            project_id,
-            tab_type,
-            tab_id,
-            pty_session_id,
-            label,
-            true,
-        )
+        self.open_ai_tab_with_activation(project_id, tab_type, tab_id, pty_session_id, label, true)
     }
 
     /// Same as `open_ai_tab` but lets callers decide whether this tab

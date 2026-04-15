@@ -116,10 +116,7 @@ pub struct WebListenerHandle {
 }
 
 impl WebListenerHandle {
-    pub(crate) fn start(
-        inner: Arc<RemoteHostInner>,
-        config: WebConfig,
-    ) -> Result<Self, String> {
+    pub(crate) fn start(inner: Arc<RemoteHostInner>, config: WebConfig) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -142,11 +139,14 @@ impl WebListenerHandle {
             match tokio::net::TcpListener::bind(&bind).await {
                 Ok(listener) => {
                     let _ = bind_result_tx.send(Ok(()));
-                    let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                        .with_graceful_shutdown(async {
-                            let _ = shutdown_rx.await;
-                        })
-                        .await;
+                    let _ = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
                 }
                 Err(error) => {
                     let _ = bind_result_tx.send(Err(format!("bind {bind}: {error}")));
@@ -347,9 +347,7 @@ fn response_with_retry_after(
     let seconds = retry_after.as_secs().max(1);
     let mut response = (status, message).into_response();
     if let Ok(value) = seconds.to_string().parse() {
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, value);
+        response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
 }

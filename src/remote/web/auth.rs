@@ -244,7 +244,10 @@ mod tests {
     #[test]
     fn extract_cookie_finds_named_entry() {
         let header = "other=1; dm_web=AAA.BBB; another=xyz";
-        assert_eq!(extract_cookie(header, WEB_COOKIE_NAME), Some("AAA.BBB".to_string()));
+        assert_eq!(
+            extract_cookie(header, WEB_COOKIE_NAME),
+            Some("AAA.BBB".to_string())
+        );
     }
 
     #[test]

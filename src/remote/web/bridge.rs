@@ -27,13 +27,13 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::super::{
-    current_controller_allows, now_epoch_ms, requires_control, stable_hash, REQUEST_TIMEOUT,
-    ConnectedRemoteClient, PendingRemoteRequest, RemoteHostInner, RemoteSessionStreamEvent,
-    RemoteActionResult, RemoteTerminalInput, RemoteWorkspaceSnapshot, ServerMessage,
+    current_controller_allows, now_epoch_ms, requires_control, stable_hash, ConnectedRemoteClient,
+    PendingRemoteRequest, RemoteActionResult, RemoteHostInner, RemoteSessionStreamEvent,
+    RemoteTerminalInput, RemoteWorkspaceSnapshot, ServerMessage, REQUEST_TIMEOUT,
 };
-use crate::state::SessionDimensions;
-use super::{authenticate_request, WebState};
 use super::wire::{WsInbound, WsOutbound};
+use super::{authenticate_request, WebState};
+use crate::state::SessionDimensions;
 
 /// Frame type byte prefixed to binary WS frames carrying terminal output.
 const BINARY_FRAME_SESSION_OUTPUT: u8 = 0x01;
@@ -86,20 +86,18 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // so shutdown is prompt when the WS task drops its side.
     let drainer_inner = inner.clone();
     let drainer_tokio_tx = tokio_tx.clone();
-    let drainer_handle = tokio::task::spawn_blocking(move || {
-        loop {
-            if drainer_inner.stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            match std_rx.recv_timeout(Duration::from_millis(150)) {
-                Ok(message) => {
-                    if drainer_tokio_tx.send(message).is_err() {
-                        break;
-                    }
+    let drainer_handle = tokio::task::spawn_blocking(move || loop {
+        if drainer_inner.stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        match std_rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(message) => {
+                if drainer_tokio_tx.send(message).is_err() {
+                    break;
                 }
-                Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
     });
 
@@ -316,8 +314,7 @@ fn handle_inbound(
                     session_ids
                         .iter()
                         .filter_map(|session_id| {
-                            provider(session_id)
-                                .map(|bootstrap| (session_id.clone(), bootstrap))
+                            provider(session_id).map(|bootstrap| (session_id.clone(), bootstrap))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -485,18 +482,21 @@ fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
             result: result.clone(),
         }),
         ServerMessage::SessionStream { event } => encode_session_stream(event),
-        ServerMessage::HelloOk { .. } | ServerMessage::PortForwardOk | ServerMessage::HelloErr { .. } => None,
+        ServerMessage::HelloOk { .. }
+        | ServerMessage::PortForwardOk
+        | ServerMessage::HelloErr { .. } => None,
     }
 }
 
 fn encode_session_stream(event: &RemoteSessionStreamEvent) -> Option<EncodedFrame> {
     match event {
         RemoteSessionStreamEvent::Output {
-            session_id, chunk_seq, bytes, ..
-        } => Some(EncodedFrame::Binary(encode_session_output_frame(
             session_id,
-            *chunk_seq,
+            chunk_seq,
             bytes,
+            ..
+        } => Some(EncodedFrame::Binary(encode_session_output_frame(
+            session_id, *chunk_seq, bytes,
         ))),
         RemoteSessionStreamEvent::Bootstrap { bootstrap } => {
             use base64::engine::general_purpose::STANDARD;
@@ -549,9 +549,7 @@ pub(crate) fn encode_session_output_frame(
 }
 
 fn serialize_text(value: &WsOutbound) -> Option<EncodedFrame> {
-    serde_json::to_string(value)
-        .ok()
-        .map(EncodedFrame::Text)
+    serde_json::to_string(value).ok().map(EncodedFrame::Text)
 }
 
 #[cfg(test)]
@@ -559,8 +557,7 @@ mod tests {
     use super::*;
     use crate::models::TabType;
     use crate::remote::{
-        PROTOCOL_VERSION, RemoteAction, RemoteHostConfig, RemoteHostService,
-        RemoteSessionBootstrap,
+        RemoteAction, RemoteHostConfig, RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
     };
     use crate::state::{SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot};
@@ -619,8 +616,8 @@ mod tests {
         // only affects the `type` tag) but no `rename_all_fields`. Confirm
         // the variant fields keep their Rust snake_case names so we know
         // exactly what the browser SPA must send.
-        use crate::state::SessionDimensions;
         use crate::remote::RemoteAction;
+        use crate::state::SessionDimensions;
         let action = RemoteAction::StartServer {
             command_id: "cmd-1".to_string(),
             focus: true,
@@ -779,7 +776,10 @@ mod tests {
             &tokio_tx,
         );
 
-        assert!(tokio_rx.try_recv().is_err(), "request should not disconnect");
+        assert!(
+            tokio_rx.try_recv().is_err(),
+            "request should not disconnect"
+        );
 
         let requests = service
             .inner
@@ -788,7 +788,10 @@ mod tests {
             .expect("pending requests lock");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].client_id, client_id);
-        assert!(requests[0].response.is_some(), "request must carry response channel");
+        assert!(
+            requests[0].response.is_some(),
+            "request must carry response channel"
+        );
     }
 
     #[test]

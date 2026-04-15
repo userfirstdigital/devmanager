@@ -40,6 +40,38 @@ body,
     monospace !important;
 }
 
+.dm-terminal-shell {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
+}
+
+.dm-terminal-host {
+  min-height: 100%;
+}
+
+.dm-terminal-shell .xterm {
+  min-height: 100%;
+}
+
+.dm-terminal-shell[data-terminal-pan="true"] .xterm {
+  width: max-content;
+  min-width: 100%;
+}
+
+.dm-terminal-shell .xterm,
+.dm-terminal-shell .xterm *,
+.dm-terminal-shell .xterm .xterm-viewport {
+  touch-action: pan-x pan-y;
+}
+
+.dm-terminal-shell .xterm .xterm-viewport {
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
 /* Pulse animation used on "live" status dots so they subtly breathe while
  * a managed server is running. */
 @keyframes dot-pulse {
