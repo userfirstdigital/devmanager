@@ -48,6 +48,9 @@ const SEARCH_BAR_HEIGHT_PX: f32 = 34.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_millis(16);
+const REMOTE_HOST_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const REMOTE_HOST_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const REMOTE_HOST_HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(100);
 const REMOTE_HOST_SNAPSHOT_ACTIVE_INTERVAL: Duration = Duration::from_millis(33);
 const REMOTE_HOST_SNAPSHOT_IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const REMOTE_RECONNECT_BASE_INTERVAL: Duration = Duration::from_millis(350);
@@ -710,28 +713,46 @@ impl NativeShell {
                 let mut async_cx = cx.clone();
                 let native_dialog_blockers = native_dialog_blockers.clone();
                 async move {
+                    let mut next_interval = REMOTE_CLIENT_REFRESH_INTERVAL;
+                    let mut last_host_housekeeping_at =
+                        Instant::now() - REMOTE_HOST_HOUSEKEEPING_INTERVAL;
                     loop {
-                        background_executor
-                            .timer(REMOTE_CLIENT_REFRESH_INTERVAL)
-                            .await;
+                        background_executor.timer(next_interval).await;
                         while native_dialog_blockers.load(Ordering::Acquire) > 0 {
                             background_executor.timer(Duration::from_millis(50)).await;
                         }
+                        let run_host_housekeeping =
+                            last_host_housekeeping_at.elapsed() >= REMOTE_HOST_HOUSEKEEPING_INTERVAL;
                         if this
                             .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
+                                let mut next = REMOTE_CLIENT_REFRESH_INTERVAL;
+                                let mut ran_host_housekeeping = false;
                                 let changed = if shell.remote_mode.is_some() {
                                     shell.sync_remote_client_snapshot(cx)
                                 } else {
+                                    next = if shell.remote_host_service.status().any_transport_enabled()
+                                        || shell.remote_host_service.has_pending_requests()
+                                    {
+                                        REMOTE_HOST_REQUEST_POLL_INTERVAL
+                                    } else {
+                                        REMOTE_HOST_IDLE_POLL_INTERVAL
+                                    };
                                     let changed = shell.pump_remote_host_requests(cx);
-                                    let local_runtime_snapshot =
-                                        shell.process_manager.runtime_state();
-                                    shell.sync_server_port_snapshot(&local_runtime_snapshot, cx);
-                                    shell.sync_remote_host_live_sessions(&local_runtime_snapshot);
-                                    shell.sync_remote_host_snapshot_if_due(&local_runtime_snapshot);
+                                    if run_host_housekeeping || changed {
+                                        shell.refresh_remote_host_maintenance(cx);
+                                        ran_host_housekeeping = true;
+                                    }
                                     changed
                                 };
                                 if changed {
                                     cx.notify();
+                                }
+                                (next, ran_host_housekeeping)
+                            })
+                            .map(|(next, ran_host_housekeeping)| {
+                                next_interval = next;
+                                if ran_host_housekeeping {
+                                    last_host_housekeeping_at = Instant::now();
                                 }
                             })
                             .is_err()
@@ -1259,7 +1280,7 @@ impl NativeShell {
         }
 
         self.remote_host_service.update_snapshot_parts(
-            app_changed.then(|| self.state.clone()),
+            app_changed.then(|| remote_shared_app_state(&self.state)),
             runtime_changed.then(|| runtime_state.clone()),
             port_changed.then(|| self.server_port_snapshot.statuses.clone()),
         );
@@ -1267,6 +1288,13 @@ impl NativeShell {
         self.last_remote_runtime_revision = runtime_revision;
         self.last_remote_port_hash = port_hash;
         self.last_remote_snapshot_sync_at = Some(now);
+    }
+
+    fn refresh_remote_host_maintenance(&mut self, cx: &mut Context<Self>) {
+        let runtime_state = self.process_manager.runtime_state();
+        self.sync_server_port_snapshot(&runtime_state, cx);
+        self.sync_remote_host_live_sessions(&runtime_state);
+        self.sync_remote_host_snapshot_if_due(&runtime_state);
     }
 
     fn sync_remote_host_live_sessions(&mut self, runtime_state: &RuntimeState) {
@@ -6308,6 +6336,7 @@ impl NativeShell {
     fn sync_terminal_session(
         &mut self,
         window: &mut Window,
+        runtime_snapshot: &RuntimeState,
         cx: &mut Context<Self>,
     ) -> view::TerminalPaneModel {
         if self.remote_mode.is_some() {
@@ -6461,12 +6490,7 @@ impl NativeShell {
                     self.active_port_state = None;
                 }
 
-                let server_runtime = self
-                    .process_manager
-                    .runtime_state()
-                    .sessions
-                    .get(&active_spec.session_id)
-                    .cloned();
+                let server_runtime = runtime_snapshot.sessions.get(&active_spec.session_id).cloned();
                 let session_live = server_runtime
                     .as_ref()
                     .map(|session| session.status.is_live())
@@ -6478,7 +6502,8 @@ impl NativeShell {
                 if session_live || interactive_prompt {
                     let dimensions = self.terminal_dimensions(window);
                     let mut current_view = if local_has_resize_control {
-                        self.process_manager.session_view(&active_spec.session_id)
+                        self.process_manager
+                            .session_view_from_runtime(runtime_snapshot, &active_spec.session_id)
                     } else {
                         self.local_viewer_session_view(&active_spec.session_id, dimensions)
                     };
@@ -6507,13 +6532,12 @@ impl NativeShell {
             Some(TabType::Claude) | Some(TabType::Codex) => {
                 let dimensions = self.terminal_dimensions(window);
                 if let Some(active_tab) = active_tab.as_ref() {
-                    let runtime = self.process_manager.runtime_state();
                     let (session_runtime, session_attached) = active_tab
                         .pty_session_id
                         .as_deref()
                         .map(|session_id| {
                             (
-                                runtime.sessions.get(session_id).cloned(),
+                                runtime_snapshot.sessions.get(session_id).cloned(),
                                 self.process_manager.session_attached(session_id),
                             )
                         })
@@ -6550,12 +6574,7 @@ impl NativeShell {
                     self.last_dimensions = None;
                 }
 
-                let session_runtime = self
-                    .process_manager
-                    .runtime_state()
-                    .sessions
-                    .get(&active_spec.session_id)
-                    .cloned();
+                let session_runtime = runtime_snapshot.sessions.get(&active_spec.session_id).cloned();
                 let session_attached = self.process_manager.session_attached(&active_spec.session_id);
                 if local_has_resize_control
                     && native_ai_render_should_wait(
@@ -6601,13 +6620,7 @@ impl NativeShell {
                     let session_live = active_tab
                         .pty_session_id
                         .as_deref()
-                        .and_then(|session_id| {
-                            self.process_manager
-                                .runtime_state()
-                                .sessions
-                                .get(session_id)
-                                .cloned()
-                        })
+                        .and_then(|session_id| runtime_snapshot.sessions.get(session_id).cloned())
                         .map(|session| {
                             session.status.is_live()
                                 && matches!(session.session_kind, crate::state::SessionKind::Ssh)
@@ -6627,7 +6640,8 @@ impl NativeShell {
 
                         let dimensions = self.terminal_dimensions(window);
                         let mut current_view = if local_has_resize_control {
-                            self.process_manager.session_view(&active_spec.session_id)
+                            self.process_manager
+                                .session_view_from_runtime(runtime_snapshot, &active_spec.session_id)
                         } else {
                             self.local_viewer_session_view(&active_spec.session_id, dimensions)
                         };
@@ -9775,8 +9789,13 @@ fn apply_window_bounds_state(
         return false;
     }
     state.window_bounds = Some(next);
-    state.mark_dirty();
     true
+}
+
+fn remote_shared_app_state(state: &AppState) -> AppState {
+    let mut next = state.clone();
+    next.window_bounds = None;
+    next
 }
 
 impl Render for NativeShell {
@@ -9803,19 +9822,11 @@ impl Render for NativeShell {
             }
         }
 
-        if self.remote_mode.is_none() {
-            let _ = self.pump_remote_host_requests(cx);
-        }
-
         let local_runtime_snapshot = if self.remote_mode.is_none() {
             Some(self.process_manager.runtime_state())
         } else {
             None
         };
-        if let Some(runtime) = local_runtime_snapshot.as_ref() {
-            self.sync_server_port_snapshot(runtime, cx);
-            self.sync_remote_host_snapshot_if_due(runtime);
-        }
 
         let runtime_snapshot = local_runtime_snapshot.unwrap_or_else(|| self.current_runtime_snapshot());
         self.sync_window_title(window, &runtime_snapshot);
@@ -9839,7 +9850,7 @@ impl Render for NativeShell {
             updater: updater_snapshot.clone(),
         });
         let terminal_model = if editor_model.is_none() {
-            Some(self.sync_terminal_session(window, cx))
+            Some(self.sync_terminal_session(window, &runtime_snapshot, cx))
         } else {
             None
         };
@@ -12942,7 +12953,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_window_bounds_state_only_marks_dirty_when_bounds_change() {
+    fn apply_window_bounds_state_updates_bounds_without_bumping_revision() {
         let mut state = AppState::default();
         let bounds = crate::models::WindowBoundsState {
             x: 10.0,
@@ -12955,10 +12966,28 @@ mod tests {
         let initial_revision = state.revision();
         assert!(apply_window_bounds_state(&mut state, bounds));
         let after_first = state.revision();
-        assert!(after_first > initial_revision);
+        assert_eq!(after_first, initial_revision);
+        assert_eq!(state.window_bounds, Some(bounds));
 
         assert!(!apply_window_bounds_state(&mut state, bounds));
         assert_eq!(state.revision(), after_first);
+    }
+
+    #[test]
+    fn remote_shared_app_state_omits_window_bounds() {
+        let mut state = AppState::default();
+        state.window_bounds = Some(crate::models::WindowBoundsState {
+            x: 10.0,
+            y: 20.0,
+            width: 800.0,
+            height: 600.0,
+            maximized: false,
+        });
+
+        let shared = remote_shared_app_state(&state);
+
+        assert_eq!(shared.window_bounds, None);
+        assert_eq!(shared.revision(), state.revision());
     }
 
     #[test]

@@ -454,8 +454,11 @@ impl ProcessManager {
         })
     }
 
-    pub fn session_view(&self, session_id: &str) -> Option<TerminalSessionView> {
-        let runtime = self.runtime_state();
+    pub fn session_view_from_runtime(
+        &self,
+        runtime: &RuntimeState,
+        session_id: &str,
+    ) -> Option<TerminalSessionView> {
         let runtime_session = runtime.sessions.get(session_id)?.clone();
         let session = self.get_session(session_id).ok()?;
 
@@ -463,6 +466,11 @@ impl ProcessManager {
             runtime: runtime_session,
             screen: session.snapshot(),
         })
+    }
+
+    pub fn session_view(&self, session_id: &str) -> Option<TerminalSessionView> {
+        let runtime = self.runtime_state();
+        self.session_view_from_runtime(&runtime, session_id)
     }
 
     pub fn all_session_views(&self) -> HashMap<String, TerminalSessionView> {
@@ -484,7 +492,20 @@ impl ProcessManager {
 
     pub fn record_frame(&self, session_id: &str, render_duration: Duration) {
         let render_micros = render_duration.as_micros() as u64;
-        self.update_session_state(session_id, |state| state.record_frame(render_micros));
+        match self.inner.runtime_state.try_write() {
+            Ok(mut runtime) => {
+                if let Some(session) = runtime.sessions.get_mut(session_id) {
+                    session.record_frame(render_micros);
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let mut runtime = error.into_inner();
+                if let Some(session) = runtime.sessions.get_mut(session_id) {
+                    session.record_frame(render_micros);
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
     }
 
     pub fn start_ai_session(
@@ -3141,6 +3162,38 @@ mod tests {
         notifier();
         assert_eq!(runtime_events.load(Ordering::SeqCst), 1);
         assert_eq!(manager.runtime_revision(), after_change);
+    }
+
+    #[test]
+    fn record_frame_does_not_block_on_busy_runtime_lock() {
+        let manager = ProcessManager::new();
+        manager.register_runtime_session(SessionRuntimeState::new(
+            "alpha",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        ));
+
+        let runtime_guard = manager
+            .inner
+            .runtime_state
+            .read()
+            .expect("runtime read lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = manager.clone();
+        let handle = thread::spawn(move || {
+            worker.record_frame("alpha", Duration::from_millis(1));
+            tx.send(()).expect("record_frame completion");
+        });
+
+        let completed_while_locked = rx.recv_timeout(Duration::from_millis(50));
+        drop(runtime_guard);
+        handle.join().expect("record_frame thread joined");
+
+        assert!(
+            completed_while_locked.is_ok(),
+            "record_frame blocked on runtime lock"
+        );
     }
 
     fn wait_for_live_session(manager: &ProcessManager, session_id: &str) {
