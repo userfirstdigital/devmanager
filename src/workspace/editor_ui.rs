@@ -269,6 +269,7 @@ pub(super) struct FormInfoField {
     pub value: String,
     pub hint: Option<String>,
     pub badge: Option<SurfaceBadge>,
+    pub actions: Vec<FormAction>,
 }
 
 impl FormInfoField {
@@ -278,7 +279,18 @@ impl FormInfoField {
             value: value.into(),
             hint,
             badge: None,
+            actions: Vec::new(),
         }
+    }
+
+    pub fn badge(mut self, badge: SurfaceBadge) -> Self {
+        self.badge = Some(badge);
+        self
+    }
+
+    pub fn action(mut self, action: FormAction) -> Self {
+        self.actions.push(action);
+        self
     }
 }
 
@@ -565,7 +577,49 @@ pub(super) fn render_surface_action_button(
     style: SurfaceActionButtonStyle,
     on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
 ) -> impl IntoElement {
-    let (bg, border, text, hover_bg) = match style {
+    let (bg, border, text, hover_bg) = surface_action_button_colors(style);
+
+    div()
+        .px(px(12.0))
+        .py(px(6.0))
+        .rounded_sm()
+        .bg(rgb(bg))
+        .border_1()
+        .border_color(rgb(border))
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(rgb(text))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(hover_bg)))
+        .child(SharedString::from(label.to_string()))
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn render_compact_surface_action_button(
+    label: &str,
+    style: SurfaceActionButtonStyle,
+    on_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let (bg, border, text, hover_bg) = surface_action_button_colors(style);
+
+    div()
+        .px(px(9.0))
+        .py(px(4.0))
+        .rounded_sm()
+        .bg(rgb(bg))
+        .border_1()
+        .border_color(rgb(border))
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(rgb(text))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(hover_bg)))
+        .child(SharedString::from(label.to_string()))
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+fn surface_action_button_colors(style: SurfaceActionButtonStyle) -> (u32, u32, u32, u32) {
+    match style {
         SurfaceActionButtonStyle::Primary => (
             theme::PRIMARY,
             theme::PRIMARY,
@@ -584,22 +638,7 @@ pub(super) fn render_surface_action_button(
             theme::TEXT_MUTED,
             theme::ROW_HOVER_BG,
         ),
-    };
-
-    div()
-        .px(px(12.0))
-        .py(px(6.0))
-        .rounded_sm()
-        .bg(rgb(bg))
-        .border_1()
-        .border_color(rgb(border))
-        .text_xs()
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(rgb(text))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(hover_bg)))
-        .child(SharedString::from(label.to_string()))
-        .on_mouse_down(MouseButton::Left, on_click)
+    }
 }
 
 pub(super) fn render_display_field(
@@ -950,6 +989,7 @@ fn render_form_field(
             field.value.as_str(),
             field.hint,
             field.badge,
+            field.actions,
         )
         .into_any_element(),
         FormField::Notice(field) => {
@@ -1000,6 +1040,7 @@ fn render_static_form_field(field: FormField) -> AnyElement {
             field.value.as_str(),
             field.hint,
             field.badge,
+            field.actions,
         )
         .into_any_element(),
         FormField::Notice(field) => {
@@ -2110,6 +2151,7 @@ pub(super) fn render_info_row(label: &str, value: &str, hint: Option<&str>) -> i
         value,
         hint.map(|value| value.to_string()),
         Some(SurfaceBadge::new("Detected", SurfaceTone::Muted)),
+        Vec::new(),
     )
 }
 
@@ -2118,6 +2160,7 @@ fn render_info_row_with_badge(
     value: &str,
     hint: Option<String>,
     badge: Option<SurfaceBadge>,
+    actions: Vec<FormAction>,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -2160,9 +2203,36 @@ fn render_info_row_with_badge(
                 .bg(rgb(theme::EDITOR_FIELD_BG))
                 .border_1()
                 .border_color(rgb(theme::BORDER_PRIMARY))
-                .text_sm()
-                .text_color(rgb(theme::TEXT_PRIMARY))
-                .child(SharedString::from(value.to_string())),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_sm()
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child(SharedString::from(value.to_string())),
+                        )
+                        .children((!actions.is_empty()).then(|| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .flex_shrink_0()
+                                .children(actions.into_iter().map(|action| {
+                                    render_compact_surface_action_button(
+                                        action.value.as_str(),
+                                        action.style,
+                                        action.on_click,
+                                    )
+                                    .into_any_element()
+                                }))
+                                .into_any_element()
+                        })),
+                ),
         )
 }
 

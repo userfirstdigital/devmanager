@@ -6,6 +6,7 @@ import {
   type RemoteWorkspaceDelta,
   type RemoteWorkspaceSnapshot,
   type SessionTab,
+  type WebImagePastePayload,
   type WsOutbound,
 } from "../api/types";
 import type {
@@ -75,6 +76,7 @@ interface StoreState {
   takeControl(): void;
   releaseControl(): void;
   sendInput(sessionId: string, text: string): void;
+  pasteImage(sessionId: string, payload: WebImagePastePayload): void;
   sendResize(sessionId: string, rows: number, cols: number): void;
   /** Issue a launchAi request and activate the returned tab/session. */
   launchAiTab(projectId: string, tabType: "claude" | "codex"): Promise<void>;
@@ -406,7 +408,20 @@ export const useStore = create<StoreState>((set, get) => {
             break;
           }
           case "disconnected": {
-            set({ lastError: message.message });
+            const requiresPairing =
+              message.message.includes("no longer trusted") ||
+              message.message.includes("revoked");
+            if (requiresPairing) {
+              get().client?.stop();
+            }
+            set({
+              lastError: message.message,
+              status: requiresPairing
+                ? { kind: "unauthorized" }
+                : { kind: "closed", reason: message.message },
+              snapshot: requiresPairing ? null : get().snapshot,
+              activeSessionId: requiresPairing ? null : get().activeSessionId,
+            });
             break;
           }
           default:
@@ -547,6 +562,21 @@ export const useStore = create<StoreState>((set, get) => {
 
   sendInput(sessionId, text) {
     get().client?.send({ type: "input", sessionId, text });
+  },
+
+  pasteImage(sessionId, payload) {
+    const ok = get().client?.send({
+      type: "pasteImage",
+      sessionId,
+      mimeType: payload.mimeType,
+      fileName: payload.fileName ?? null,
+      dataBase64: payload.dataBase64,
+    });
+    if (!ok) {
+      set({ lastError: "WebSocket is not connected." });
+      return;
+    }
+    set({ lastError: null });
   },
 
   sendResize(sessionId, rows, cols) {

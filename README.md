@@ -165,8 +165,8 @@ DevManager can host a second client over plain HTTP so any browser on the same L
 
 1. In the desktop app, open **Settings → Browser Web UI**.
 2. Flip **Enable web UI**. The panel shows the listener URL (defaults to `http://<your-lan-ip>:43872`) and the web pair token.
-3. On another device, visit `http://<your-lan-ip>:43872/pair?t=<web-pair-token>`. The host sets a long-lived `HttpOnly` cookie and redirects to `/`.
-4. Subsequent visits to `http://<your-lan-ip>:43872/` from the paired browser load directly — no token required.
+3. On another device, visit `http://<your-lan-ip>:43872/pair?t=<web-pair-token>`. The host sets a long-lived `HttpOnly` cookie for that DevManager instance and redirects to `/`.
+4. Subsequent visits to that same DevManager from the paired browser load directly — no token required. If you run multiple DevManager web listeners on the same host, each instance now keeps its own remembered browser auth.
 
 ### Usage
 

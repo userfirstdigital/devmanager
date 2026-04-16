@@ -326,6 +326,12 @@ export interface RemoteActionResult {
   payload?: RemoteActionPayload | null;
 }
 
+export interface WebImagePastePayload {
+  mimeType: "image/png" | "image/jpeg";
+  fileName?: string | null;
+  dataBase64: string;
+}
+
 // ── Wire frames ───────────────────────────────────────────────────────────
 
 export type WsInbound =
@@ -333,6 +339,13 @@ export type WsInbound =
   | { type: "unsubscribeSessions"; sessionIds: string[] }
   | { type: "focusSession"; sessionId: string }
   | { type: "input"; sessionId: string; text: string }
+  | {
+      type: "pasteImage";
+      sessionId: string;
+      mimeType: "image/png" | "image/jpeg";
+      fileName?: string | null;
+      dataBase64: string;
+    }
   | { type: "resize"; sessionId: string; rows: number; cols: number }
   | { type: "action"; action: RemoteAction }
   | { type: "request"; id: number; action: RemoteAction }

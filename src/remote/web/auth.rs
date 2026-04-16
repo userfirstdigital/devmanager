@@ -10,8 +10,18 @@ use std::time::{Duration, Instant};
 use super::super::now_epoch_ms;
 
 pub const WEB_COOKIE_NAME: &str = "dm_web";
+const WEB_COOKIE_NAME_PREFIX: &str = "dm_web_";
 const PAIRING_BACKOFF_STEPS_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const PAIRING_LOCKOUT_SECS: u64 = 60;
+
+pub fn cookie_name_for_server_id(server_id: &str) -> String {
+    if server_id.trim().is_empty() {
+        return WEB_COOKIE_NAME.to_string();
+    }
+    use sha2::Digest;
+    let digest = Sha256::digest(server_id.as_bytes());
+    format!("{WEB_COOKIE_NAME_PREFIX}{}", hex_encode(&digest[..8]))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]

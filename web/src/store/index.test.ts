@@ -333,4 +333,47 @@ describe("web AI tab actions", () => {
       action: { type: "stopAllServers" },
     });
   });
+
+  it("pasteImage sends the typed web image-paste frame", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+
+    useStore.getState().pasteImage("claude-session-2", {
+      mimeType: "image/png",
+      fileName: "clip.png",
+      dataBase64: "AQID",
+    });
+
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "pasteImage",
+      sessionId: "claude-session-2",
+      mimeType: "image/png",
+      fileName: "clip.png",
+      dataBase64: "AQID",
+    });
+  });
+
+  it("revoked browser disconnect falls back to pairing", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+
+    useStore.setState({
+      snapshot: makeSnapshot(),
+      activeSessionId: "claude-session-old",
+      status: { kind: "open" },
+      lastError: null,
+    });
+
+    client?.callbacks.onMessage({
+      type: "disconnected",
+      message: "This browser invite was revoked. Pair again to reconnect.",
+    });
+
+    const state = useStore.getState();
+    expect(client?.stop).toHaveBeenCalled();
+    expect(state.status).toEqual({ kind: "unauthorized" });
+    expect(state.snapshot).toBeNull();
+    expect(state.activeSessionId).toBeNull();
+    expect(state.lastError).toBe("This browser invite was revoked. Pair again to reconnect.");
+  });
 });

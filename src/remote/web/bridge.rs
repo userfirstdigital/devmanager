@@ -23,13 +23,16 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::super::{
     current_controller_allows, now_epoch_ms, requires_control, stable_hash, ConnectedRemoteClient,
-    PendingRemoteRequest, RemoteActionResult, RemoteHostInner, RemoteSessionStreamEvent,
-    RemoteTerminalInput, RemoteWorkspaceSnapshot, ServerMessage, REQUEST_TIMEOUT,
+    PendingRemoteRequest, RemoteActionResult, RemoteHostInner, RemoteImageAttachment,
+    RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot, ServerMessage,
+    REQUEST_TIMEOUT,
 };
 use super::wire::{WsInbound, WsOutbound};
 use super::{authenticate_request, WebState};
@@ -44,7 +47,7 @@ pub(crate) async fn ws_handler(
     headers: HeaderMap,
 ) -> Response {
     let Some(client_id) = authenticate_request(&state, &headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid dm_web cookie").into_response();
+        return (StatusCode::UNAUTHORIZED, "missing or invalid web auth cookie").into_response();
     };
     let inner = state.inner.clone();
     ws.on_upgrade(move |socket| run_session(socket, inner, client_id))
@@ -278,6 +281,20 @@ fn unregister_client(inner: &Arc<RemoteHostInner>, connection_id: u64, client_id
     }
 }
 
+fn web_client_is_still_paired(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {
+    inner
+        .config
+        .read()
+        .map(|config| {
+            config
+                .web
+                .paired_clients
+                .iter()
+                .any(|client| client.client_id == client_id)
+        })
+        .unwrap_or(false)
+}
+
 fn handle_inbound(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
@@ -285,6 +302,21 @@ fn handle_inbound(
     message: WsInbound,
     tokio_tx: &tokio_mpsc::UnboundedSender<ServerMessage>,
 ) {
+    if !web_client_is_still_paired(inner, client_id) {
+        if let Ok(mut clients) = inner.clients.lock() {
+            clients.remove(&connection_id);
+        }
+        if let Ok(mut controller) = inner.controller_client_id.write() {
+            if controller.as_deref() == Some(client_id) {
+                *controller = None;
+            }
+        }
+        let _ = tokio_tx.send(ServerMessage::Disconnected {
+            message: "This browser is no longer trusted. Pair again to reconnect.".to_string(),
+        });
+        return;
+    }
+
     match message {
         WsInbound::Ping => {
             let _ = tokio_tx.send(ServerMessage::Pong);
@@ -361,10 +393,54 @@ fn handle_inbound(
                 .ok()
                 .and_then(|slot| slot.as_ref().cloned());
             if let Some(handler) = handler {
-                handler(
+                if let Err(error) = handler(
                     RemoteTerminalInput::Text { session_id, text },
                     now_epoch_ms(),
-                );
+                ) {
+                    let _ = tokio_tx.send(ServerMessage::Error { message: error });
+                }
+            }
+        }
+        WsInbound::PasteImage {
+            session_id,
+            mime_type,
+            file_name,
+            data_base64,
+        } => {
+            if !current_controller_allows(inner, client_id) {
+                let _ = tokio_tx.send(ServerMessage::Error {
+                    message: "This client is in viewer mode. Take control first.".to_string(),
+                });
+                return;
+            }
+            let bytes = match BASE64.decode(data_base64.as_bytes()) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = tokio_tx.send(ServerMessage::Error {
+                        message: format!("Invalid pasted image payload: {error}"),
+                    });
+                    return;
+                }
+            };
+            let handler = inner
+                .terminal_input_handler
+                .read()
+                .ok()
+                .and_then(|slot| slot.as_ref().cloned());
+            if let Some(handler) = handler {
+                if let Err(error) = handler(
+                    RemoteTerminalInput::Image {
+                        session_id,
+                        attachment: RemoteImageAttachment {
+                            mime_type,
+                            file_name,
+                            bytes,
+                        },
+                    },
+                    now_epoch_ms(),
+                ) {
+                    let _ = tokio_tx.send(ServerMessage::Error { message: error });
+                }
             }
         }
         WsInbound::Resize {
@@ -474,6 +550,9 @@ fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
             delta: delta.clone(),
         }),
         ServerMessage::Pong => serialize_text(&WsOutbound::Pong),
+        ServerMessage::Error { message } => serialize_text(&WsOutbound::Error {
+            message: message.clone(),
+        }),
         ServerMessage::Disconnected { message } => serialize_text(&WsOutbound::Disconnected {
             message: message.clone(),
         }),
@@ -876,6 +955,89 @@ mod tests {
             .lock()
             .expect("pending requests lock");
         assert!(requests.is_empty(), "viewer mode must not queue host work");
+    }
+
+    #[test]
+    fn viewer_mode_paste_image_reports_error_without_disconnect() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 13;
+        let client_id = "web-viewer";
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, connection_id, client_id, std_tx);
+
+        let (tokio_tx, mut tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::PasteImage {
+                session_id: "claude-1".to_string(),
+                mime_type: "image/png".to_string(),
+                file_name: Some("clip.png".to_string()),
+                data_base64: "AQID".to_string(),
+            },
+            &tokio_tx,
+        );
+
+        match tokio_rx.try_recv().expect("error frame") {
+            ServerMessage::Error { message } => {
+                assert_eq!(
+                    message,
+                    "This client is in viewer mode. Take control first."
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_image_decodes_base64_and_forwards_binary_attachment() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 14;
+        let client_id = "web-client";
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, connection_id, client_id, std_tx);
+        *service
+            .inner
+            .controller_client_id
+            .write()
+            .expect("controller lock") = Some(client_id.to_string());
+
+        let (seen_tx, seen_rx) = std_mpsc::channel::<RemoteTerminalInput>();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            seen_tx.send(input).expect("forwarded input");
+            Ok(())
+        })));
+
+        let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::PasteImage {
+                session_id: "claude-1".to_string(),
+                mime_type: "image/png".to_string(),
+                file_name: Some("clip.png".to_string()),
+                data_base64: "AQID".to_string(),
+            },
+            &tokio_tx,
+        );
+
+        match seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("image forwarded")
+        {
+            RemoteTerminalInput::Image {
+                session_id,
+                attachment,
+            } => {
+                assert_eq!(session_id, "claude-1");
+                assert_eq!(attachment.mime_type, "image/png");
+                assert_eq!(attachment.file_name.as_deref(), Some("clip.png"));
+                assert_eq!(attachment.bytes, vec![1, 2, 3]);
+            }
+            other => panic!("unexpected input: {other:?}"),
+        }
     }
 
     #[test]

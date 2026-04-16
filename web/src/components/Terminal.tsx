@@ -14,6 +14,11 @@ import {
   computeResponsiveTerminalLayout,
   type ResponsiveTerminalLayout,
 } from "./terminalLayout";
+import {
+  buildImagePastePayload,
+  inspectClipboardImageItems,
+  isAiSessionKind,
+} from "./imagePaste";
 
 interface TerminalProps {
   sessionId: string;
@@ -187,8 +192,12 @@ export function TerminalView({ sessionId }: TerminalProps) {
   const subscribeBootstrap = useStore((s) => s.subscribeBootstrap);
   const drainBootstrap = useStore((s) => s.drainBootstrap);
   const sendInput = useStore((s) => s.sendInput);
+  const pasteImage = useStore((s) => s.pasteImage);
   const youHaveControl = useStore(
     (s) => s.snapshot?.youHaveControl ?? false,
+  );
+  const sessionKind = useStore(
+    (s) => s.snapshot?.runtimeState?.sessions?.[sessionId]?.session_kind,
   );
   // The host's PTY dimensions ARE the authoritative size. The browser xterm
   // mirrors them exactly — it never resizes the PTY — so the native desktop
@@ -210,6 +219,10 @@ export function TerminalView({ sessionId }: TerminalProps) {
     });
   const controlRef = useRef(youHaveControl);
   controlRef.current = youHaveControl;
+  const sessionKindRef = useRef(sessionKind);
+  sessionKindRef.current = sessionKind;
+  const pasteImageRef = useRef(pasteImage);
+  pasteImageRef.current = pasteImage;
 
   useEffect(() => {
     let cancelled = false;
@@ -379,6 +392,47 @@ export function TerminalView({ sessionId }: TerminalProps) {
         return true;
       });
 
+      const handlePaste = (event: ClipboardEvent) => {
+        const inspection = inspectClipboardImageItems(event.clipboardData?.items);
+        if (inspection.kind === "none") {
+          return;
+        }
+        event.preventDefault();
+
+        if (!controlRef.current) {
+          useStore.setState({
+            lastError: "This client is in viewer mode. Take control first.",
+          });
+          return;
+        }
+        if (!isAiSessionKind(sessionKindRef.current)) {
+          useStore.setState({
+            lastError: "Image paste is only supported in Claude and Codex terminals.",
+          });
+          return;
+        }
+        if (inspection.kind === "unsupported") {
+          useStore.setState({
+            lastError: `Unsupported pasted image type: ${inspection.mimeType}. Try PNG or JPEG.`,
+          });
+          return;
+        }
+
+        void buildImagePastePayload(inspection.file)
+          .then((payload) => {
+            pasteImageRef.current(sessionId, payload);
+          })
+          .catch((error) => {
+            useStore.setState({
+              lastError:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to encode pasted image.",
+            });
+          });
+      };
+      container.addEventListener("paste", handlePaste, true);
+
       // Forward user keystrokes to the host — but only when this client
       // holds control. Viewer-mode input silently drops.
       const dataDisposable = terminal.onData((text) => {
@@ -418,6 +472,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
       const previousCleanup = cleanup;
       cleanup = () => {
         clearTimeout(focusTimer);
+        container.removeEventListener("paste", handlePaste, true);
         if (layoutFrame !== null) {
           cancelAnimationFrame(layoutFrame);
         }

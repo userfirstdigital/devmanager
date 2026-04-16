@@ -39,7 +39,8 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
-type TerminalInputHandler = Arc<dyn Fn(RemoteTerminalInput, u64) + Send + Sync>;
+type TerminalInputHandler =
+    Arc<dyn Fn(RemoteTerminalInput, u64) -> Result<(), String> + Send + Sync>;
 type TerminalResizeHandler = Arc<dyn Fn(String, SessionDimensions) + Send + Sync>;
 type FocusedSessionHandler = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -287,17 +288,51 @@ pub enum ServerMessage {
         request_id: u64,
         result: RemoteActionResult,
     },
+    Error {
+        message: String,
+    },
     Disconnected {
         message: String,
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemoteImageAttachment {
+    pub mime_type: String,
+    pub file_name: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl Default for RemoteImageAttachment {
+    fn default() -> Self {
+        Self {
+            mime_type: String::new(),
+            file_name: None,
+            bytes: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RemoteTerminalInput {
-    Text { session_id: String, text: String },
-    Bytes { session_id: String, bytes: Vec<u8> },
-    Paste { session_id: String, text: String },
+    Text {
+        session_id: String,
+        text: String,
+    },
+    Bytes {
+        session_id: String,
+        bytes: Vec<u8>,
+    },
+    Paste {
+        session_id: String,
+        text: String,
+    },
+    Image {
+        session_id: String,
+        attachment: RemoteImageAttachment,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +704,7 @@ pub struct RemoteHostStatus {
     pub controller_client_id: Option<String>,
     pub listening: bool,
     pub listener_error: Option<String>,
+    pub web_listener_error: Option<String>,
     pub last_connection_note: Option<String>,
     pub last_connection_is_error: bool,
     pub latency: RemoteLatencyStats,
@@ -729,6 +765,40 @@ pub fn save_remote_machine_state(state: &RemoteMachineState) -> Result<(), Persi
     })?;
     fs::rename(&temp_path, &path).map_err(|source| PersistenceError::Io { path, source })?;
     Ok(())
+}
+
+fn persist_host_config_snapshot(config: &RemoteHostConfig) -> Result<(), PersistenceError> {
+    let mut state = load_remote_machine_state()?;
+    state.host = config.clone();
+    save_remote_machine_state(&state)
+}
+
+pub(crate) fn mutate_host_config<T>(
+    inner: &Arc<RemoteHostInner>,
+    mutate: impl FnOnce(&mut RemoteHostConfig) -> T,
+) -> Result<T, String> {
+    let _update_guard = inner
+        .config_update_lock
+        .lock()
+        .map_err(|_| "host config update unavailable".to_string())?;
+    let (result, snapshot, previous) = {
+        let Ok(mut config) = inner.config.write() else {
+            return Err("host config unavailable".to_string());
+        };
+        let previous = config.clone();
+        let result = mutate(&mut config);
+        (result, config.clone(), previous)
+    };
+
+    if let Err(error) = persist_host_config_snapshot(&snapshot) {
+        if let Ok(mut config) = inner.config.write() {
+            *config = previous;
+        }
+        return Err(error.to_string());
+    }
+
+    bump_host_config_revision(inner);
+    Ok(result)
 }
 
 pub fn remote_state_path() -> Result<PathBuf, PersistenceError> {
@@ -809,6 +879,7 @@ pub struct RemoteHostService {
 
 pub(crate) struct RemoteHostInner {
     config: RwLock<RemoteHostConfig>,
+    config_update_lock: Mutex<()>,
     config_revision: AtomicU64,
     snapshot_revision: AtomicU64,
     shared_state: RwLock<AppState>,
@@ -912,6 +983,7 @@ impl RemoteHostService {
         let service = Self {
             inner: Arc::new(RemoteHostInner {
                 config: RwLock::new(config.clone()),
+                config_update_lock: Mutex::new(()),
                 config_revision: AtomicU64::new(1),
                 snapshot_revision: AtomicU64::new(1),
                 shared_state: RwLock::new(AppState::default()),
@@ -945,6 +1017,9 @@ impl RemoteHostService {
     pub fn apply_config(&self, config: RemoteHostConfig) {
         let mut config = config;
         let _ = transport::ensure_host_tls_material(&mut config);
+        let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
+            return;
+        };
         if let Ok(mut slot) = self.inner.config.write() {
             *slot = config;
         }
@@ -1252,6 +1327,12 @@ impl RemoteHostService {
             .read()
             .map(|slot| slot.clone())
             .unwrap_or(None);
+        let web_listener_error = self
+            .inner
+            .web_listener_error
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or(None);
         let last_connection_note = self
             .inner
             .last_connection_note
@@ -1275,6 +1356,7 @@ impl RemoteHostService {
             controller_client_id,
             listening,
             listener_error,
+            web_listener_error,
             last_connection_note,
             last_connection_is_error,
             latency,
@@ -1283,6 +1365,9 @@ impl RemoteHostService {
 
     pub fn revoke_paired_client(&self, client_id: &str) -> bool {
         let mut removed = false;
+        let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
+            return false;
+        };
         if let Ok(mut config) = self.inner.config.write() {
             let before = config.paired_clients.len();
             config
@@ -1305,6 +1390,49 @@ impl RemoteHostService {
                 if let Some(client) = clients.remove(&connection_id) {
                     let _ = client.sender.send(ServerMessage::Disconnected {
                         message: "This host revoked the saved client token.".to_string(),
+                    });
+                }
+            }
+        }
+
+        if let Ok(mut controller) = self.inner.controller_client_id.write() {
+            if controller.as_deref() == Some(client_id) {
+                *controller = None;
+            }
+        }
+
+        removed
+    }
+
+    pub fn revoke_paired_web_client(&self, client_id: &str) -> bool {
+        let mut removed = false;
+        let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
+            return false;
+        };
+        if let Ok(mut config) = self.inner.config.write() {
+            let before = config.web.paired_clients.len();
+            config
+                .web
+                .paired_clients
+                .retain(|client| client.client_id != client_id);
+            removed = config.web.paired_clients.len() != before;
+        }
+        if removed {
+            self.bump_config_revision();
+        }
+
+        if let Ok(mut clients) = self.inner.clients.lock() {
+            let connection_ids: Vec<u64> = clients
+                .iter()
+                .filter_map(|(connection_id, client)| {
+                    (client.client_id == client_id).then_some(*connection_id)
+                })
+                .collect();
+            for connection_id in connection_ids {
+                if let Some(client) = clients.remove(&connection_id) {
+                    let _ = client.sender.send(ServerMessage::Disconnected {
+                        message: "This browser invite was revoked. Pair again to reconnect."
+                            .to_string(),
                     });
                 }
             }
@@ -2522,7 +2650,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 if current_controller_allows(&inner, &client_id) {
                     if let Ok(handler) = inner.terminal_input_handler.read() {
                         if let Some(handler) = handler.as_ref() {
-                            handler(input, enqueued_at_epoch_ms);
+                            let _ = handler(input, enqueued_at_epoch_ms);
                         }
                     }
                 }
@@ -2586,14 +2714,16 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
         format!("Remote client {client_id} disconnected from {peer_label}."),
         false,
     );
-    if let Ok(mut config) = inner.config.write() {
-        if let Some(client) = config
-            .paired_clients
-            .iter_mut()
-            .find(|client| client.client_id == client_id)
-        {
-            client.last_seen_epoch_ms = Some(now_epoch_ms());
-            bump_host_config_revision(&inner);
+    if let Ok(_update_guard) = inner.config_update_lock.lock() {
+        if let Ok(mut config) = inner.config.write() {
+            if let Some(client) = config
+                .paired_clients
+                .iter_mut()
+                .find(|client| client.client_id == client_id)
+            {
+                client.last_seen_epoch_ms = Some(now_epoch_ms());
+                bump_host_config_revision(&inner);
+            }
         }
     }
 }
@@ -2618,6 +2748,10 @@ fn authenticate_client(
         ));
     }
 
+    let _update_guard = inner
+        .config_update_lock
+        .lock()
+        .map_err(|_| "Host config update unavailable.".to_string())?;
     let mut config = inner
         .config
         .write()
@@ -3009,6 +3143,7 @@ fn run_client_connection(
                 ServerMessage::HelloOk { .. }
                 | ServerMessage::PortForwardOk
                 | ServerMessage::HelloErr { .. }
+                | ServerMessage::Error { .. }
                 | ServerMessage::Pong,
             )) => {}
             Ok(None) => thread::sleep(Duration::from_millis(12)),
@@ -3185,16 +3320,64 @@ fn apply_workspace_delta(snapshot: &mut RemoteWorkspaceSnapshot, delta: RemoteWo
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::{now_epoch_ms, remote_state_path};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_PROFILE_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct TestProfileGuard {
+        previous_profile: Option<String>,
+        remote_state_dir: PathBuf,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl TestProfileGuard {
+        pub(crate) fn new(label: &str) -> Self {
+            let lock = TEST_PROFILE_LOCK.lock().expect("profile lock");
+            let previous_profile = std::env::var("DEVMANAGER_PROFILE").ok();
+            let profile = format!("{label}-{}-{}", std::process::id(), now_epoch_ms());
+            std::env::set_var("DEVMANAGER_PROFILE", &profile);
+            let remote_state_dir = remote_state_path()
+                .expect("remote state path")
+                .parent()
+                .expect("remote state dir")
+                .to_path_buf();
+            let _ = std::fs::remove_dir_all(&remote_state_dir);
+            Self {
+                previous_profile,
+                remote_state_dir,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for TestProfileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.remote_state_dir);
+            if let Some(previous_profile) = self.previous_profile.as_ref() {
+                std::env::set_var("DEVMANAGER_PROFILE", previous_profile);
+            } else {
+                std::env::remove_var("DEVMANAGER_PROFILE");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         apply_workspace_delta, current_controller_allows, current_snapshot,
-        format_handshake_stage_error, generate_pairing_token, now_epoch_ms,
-        set_last_connection_note, upsert_known_host, ClientAuth, ConnectedRemoteClient,
-        LocalPortForwardManager, PairedRemoteClient, RemoteClientHandle, RemoteClientInner,
-        RemoteHostConfig, RemoteHostService, RemoteLatencyStats, RemoteMachineState,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteWorkspaceDelta,
-        RemoteWorkspaceSnapshot, ServerMessage,
+        format_handshake_stage_error, generate_pairing_token, load_remote_machine_state,
+        now_epoch_ms, save_remote_machine_state, set_last_connection_note,
+        upsert_known_host, ClientAuth, ConnectedRemoteClient, KnownRemoteHost,
+        LocalPortForwardManager, PairedRemoteClient, PairedWebClient, RemoteClientHandle,
+        RemoteClientInner, RemoteHostConfig, RemoteHostService, RemoteLatencyStats,
+        RemoteMachineState, RemoteSessionBootstrap, RemoteSessionStreamEvent,
+        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
     };
+    use super::test_support::TestProfileGuard;
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
@@ -3232,6 +3415,37 @@ mod tests {
     }
 
     #[test]
+    fn remote_machine_state_round_trips_web_pairing_fields() {
+        let _profile = TestProfileGuard::new("remote-web-config");
+        let mut state = RemoteMachineState::default();
+        state.known_hosts.push(KnownRemoteHost {
+            label: "Existing".to_string(),
+            address: "192.168.0.50".to_string(),
+            port: 43871,
+            server_id: "host-existing".to_string(),
+            certificate_fingerprint: "fp-existing".to_string(),
+            client_id: "client-existing".to_string(),
+            auth_token: "token-existing".to_string(),
+            last_connected_epoch_ms: Some(1),
+        });
+        state.host.web.cookie_secret_hex = "feedface".repeat(8);
+        state.host.web.paired_clients.push(PairedWebClient {
+            client_id: "web-client-1".to_string(),
+            label: "Phone".to_string(),
+            issued_at_epoch_ms: Some(10),
+            last_seen_epoch_ms: Some(20),
+        });
+
+        save_remote_machine_state(&state).expect("save remote machine state");
+        let reloaded = load_remote_machine_state().expect("reload remote machine state");
+
+        assert_eq!(reloaded.host.web.cookie_secret_hex, state.host.web.cookie_secret_hex);
+        assert_eq!(reloaded.host.web.paired_clients, state.host.web.paired_clients);
+        assert_eq!(reloaded.known_hosts.len(), 1);
+        assert_eq!(reloaded.known_hosts[0].server_id, "host-existing");
+    }
+
+    #[test]
     fn revoke_paired_client_removes_saved_token_and_control() {
         let mut config = RemoteHostConfig::default();
         config.paired_clients.push(PairedRemoteClient {
@@ -3248,6 +3462,50 @@ mod tests {
         assert!(service.revoke_paired_client("client-1"));
         assert!(service.config().paired_clients.is_empty());
         assert!(service.status().controller_client_id.is_none());
+    }
+
+    #[test]
+    fn revoke_paired_web_client_disconnects_live_browser_and_clears_control() {
+        let mut config = RemoteHostConfig::default();
+        config.web.paired_clients.push(PairedWebClient {
+            client_id: "web-client-1".to_string(),
+            label: "Browser".to_string(),
+            issued_at_epoch_ms: Some(1),
+            last_seen_epoch_ms: Some(1),
+        });
+        let service = RemoteHostService::new(config);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        if let Ok(mut clients) = service.inner.clients.lock() {
+            clients.insert(
+                1,
+                ConnectedRemoteClient {
+                    client_id: "web-client-1".to_string(),
+                    sender: tx,
+                    subscribed_session_ids: HashSet::new(),
+                    bootstrapped_session_ids: HashSet::new(),
+                    focused_session_id: None,
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                },
+            );
+        }
+        if let Ok(mut controller) = service.inner.controller_client_id.write() {
+            *controller = Some("web-client-1".to_string());
+        }
+
+        assert!(service.revoke_paired_web_client("web-client-1"));
+        assert!(service.config().web.paired_clients.is_empty());
+        assert!(service.status().controller_client_id.is_none());
+        match rx.recv().expect("disconnect message") {
+            ServerMessage::Disconnected { message } => {
+                assert!(message.contains("revoked"));
+            }
+            other => panic!("expected disconnected message, got {other:?}"),
+        }
     }
 
     #[test]

@@ -10,16 +10,17 @@ export function PairingGate() {
     event.preventDefault();
     const trimmed = token.trim();
     if (!trimmed) {
-      setError("Enter the pair token from the desktop app.");
+      setError("Enter the browser pair token from the desktop app.");
       return;
     }
     setSubmitting(true);
     setError(null);
     try {
-      // Hit /pair — the server validates the token, mints the dm_web
-      // cookie, and 303s to "/". fetch() with follow will land us back on
-      // the SPA with the cookie set. We then force a full navigation so
-      // the app reinitialises against the authenticated WS.
+      // Hit /pair — the server validates the token, mints the remembered
+      // auth cookie for this DevManager instance, and 303s to "/". fetch()
+      // with follow will land us back on the SPA with the cookie set. We
+      // then force a full navigation so the app reinitialises against the
+      // authenticated WS.
       const response = await fetch(
         `/pair?t=${encodeURIComponent(trimmed)}`,
         { credentials: "include" },
@@ -54,17 +55,15 @@ export function PairingGate() {
           <h1 className="text-lg font-semibold">DevManager Web</h1>
         </div>
         <p className="text-sm text-zinc-300 mb-4">
-          This browser is not paired with DevManager. Open the desktop app,
-          go to{" "}
-          <strong className="text-zinc-100">
-            Settings → Browser Web UI
-          </strong>
-          , copy the pair token, and paste it below.
+          This browser is not paired with DevManager. If someone sent you an
+          invite link, open that directly. Otherwise open the desktop app, go
+          to <strong className="text-zinc-100">Remote → Browser Access</strong>,
+          copy the browser pair token, and paste it below.
         </p>
         <form onSubmit={onSubmit} className="space-y-3">
           <label className="block">
             <span className="block text-xs font-medium text-zinc-400 mb-1">
-              Pair token
+              Browser pair token
             </span>
             <input
               type="text"
@@ -84,7 +83,7 @@ export function PairingGate() {
             disabled={submitting || token.trim().length === 0}
             className="w-full px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {submitting ? "Connecting…" : "Connect"}
+            {submitting ? "Pairing..." : "Pair browser"}
           </button>
         </form>
         {error && (
@@ -93,8 +92,9 @@ export function PairingGate() {
           </p>
         )}
         <p className="text-xs text-zinc-500 mt-4">
-          Pairing sets a long-lived cookie, so you only need to do this once
-          per browser.
+          Pairing is remembered for this browser on this DevManager instance,
+          so you usually only need to do this once unless you clear cookies or
+          the host revokes browser access.
         </p>
       </div>
     </div>

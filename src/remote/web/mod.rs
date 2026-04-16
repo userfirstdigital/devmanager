@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod auth;
 pub mod bridge;
+pub mod image_paste;
 pub mod wire;
 
 use self::auth::{PairingAttemptTracker, PairingThrottleStatus};
@@ -19,9 +20,11 @@ use tokio::sync::oneshot;
 use super::{now_epoch_ms, RemoteHostInner};
 
 pub use auth::{
-    extract_cookie, generate_cookie_secret_hex, generate_web_pairing_token, sign_cookie,
-    verify_cookie, PairedWebClient, WEB_COOKIE_NAME,
+    cookie_name_for_server_id, extract_cookie, generate_cookie_secret_hex,
+    generate_web_pairing_token, sign_cookie, verify_cookie, PairedWebClient, WEB_COOKIE_NAME,
 };
+
+const WEB_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 
 /// Persisted configuration for the web listener. Lives inside `RemoteHostConfig`
 /// and is serialized to `remote.json` via serde defaults.
@@ -248,7 +251,7 @@ async fn pair_handler(
     }
 
     // Read current config snapshot.
-    let (expected_token, cookie_secret_hex) = {
+    let (expected_token, cookie_secret_hex, cookie_name) = {
         let Ok(config) = state.inner.config.read() else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "config unavailable").into_response();
         };
@@ -258,6 +261,7 @@ async fn pair_handler(
         (
             config.web.pairing_token.clone(),
             config.web.cookie_secret_hex.clone(),
+            cookie_name_for_server_id(&config.server_id),
         )
     };
 
@@ -280,35 +284,28 @@ async fn pair_handler(
         .label
         .filter(|l| !l.is_empty())
         .unwrap_or_else(|| "Browser".to_string());
+    let now = now_epoch_ms();
 
-    // Persist the new paired client into the shared config. A later iteration
-    // will also nudge the outer persistence loop to flush this to disk; for
-    // now the in-memory record is enough to make subsequent requests work.
-    if let Ok(mut config) = state.inner.config.write() {
+    if let Err(error) = super::mutate_host_config(&state.inner, |config| {
         config.web.paired_clients.push(PairedWebClient {
             client_id: client_id.clone(),
-            label,
-            issued_at_epoch_ms: Some(now_epoch_ms()),
-            last_seen_epoch_ms: Some(now_epoch_ms()),
+            label: label.clone(),
+            issued_at_epoch_ms: Some(now),
+            last_seen_epoch_ms: Some(now),
         });
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to persist web pairing: {error}"),
+        )
+            .into_response();
     }
-    state
-        .inner
-        .config_revision
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let Some(signed) = sign_cookie(&cookie_secret_hex, &client_id) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "cookie signing failed").into_response();
     };
 
-    // HttpOnly + SameSite=Lax. `Secure` is intentionally omitted because MVP
-    // ships over plain HTTP on LAN; later TLS modes will add it conditionally.
-    let cookie = format!(
-        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
-        WEB_COOKIE_NAME,
-        signed,
-        60 * 60 * 24 * 30,
-    );
+    let cookie = auth_cookie_header(&cookie_name, &signed);
 
     let mut response = Redirect::to("/").into_response();
     response
@@ -352,17 +349,46 @@ fn response_with_retry_after(
     response
 }
 
+fn auth_cookie_header(cookie_name: &str, signed: &str) -> String {
+    // HttpOnly + SameSite=Lax. `Secure` is intentionally omitted because MVP
+    // ships over plain HTTP on LAN; later TLS modes will add it conditionally.
+    format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        cookie_name, signed, WEB_COOKIE_MAX_AGE_SECS,
+    )
+}
+
+fn request_auth_cookie(state: &WebState, headers: &HeaderMap) -> Option<(String, String)> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    let current_cookie_name = {
+        let config = state.inner.config.read().ok()?;
+        cookie_name_for_server_id(&config.server_id)
+    };
+    let cookie_value = extract_cookie(cookie_header, &current_cookie_name)
+        .or_else(|| extract_cookie(cookie_header, WEB_COOKIE_NAME))?;
+    Some((current_cookie_name, cookie_value))
+}
+
 /// `/api/me` — returns 200 with the paired-client id if the dm_web cookie is
 /// valid, 401 otherwise. Small endpoint used by the SPA on load to decide
 /// whether to show the "not paired yet" screen or start connecting.
 async fn me_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     match authenticate_request(&state, &headers) {
-        Some(client_id) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            format!(r#"{{"clientId":{:?},"ok":true}}"#, client_id),
-        )
-            .into_response(),
+        Some(client_id) => {
+            let mut response = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                format!(r#"{{"clientId":{:?},"ok":true}}"#, client_id),
+            )
+                .into_response();
+            if let Some((cookie_name, cookie_value)) = request_auth_cookie(&state, &headers) {
+                let cookie = auth_cookie_header(&cookie_name, &cookie_value);
+                if let Ok(value) = cookie.parse() {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+            }
+            response
+        }
         None => (
             StatusCode::UNAUTHORIZED,
             [(header::CONTENT_TYPE, "application/json")],
@@ -377,8 +403,7 @@ async fn me_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> R
 /// against the host's cookie secret. Used by `/api/me` and (later) the
 /// WebSocket upgrade handler.
 pub(crate) fn authenticate_request(state: &WebState, headers: &HeaderMap) -> Option<String> {
-    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
-    let cookie_value = extract_cookie(cookie_header, WEB_COOKIE_NAME)?;
+    let (_, cookie_value) = request_auth_cookie(state, headers)?;
 
     let (cookie_secret_hex, paired_ids) = {
         let config = state.inner.config.read().ok()?;
@@ -398,5 +423,324 @@ pub(crate) fn authenticate_request(state: &WebState, headers: &HeaderMap) -> Opt
     if !paired_ids.iter().any(|id| id == &client_id) {
         return None;
     }
+    let now = now_epoch_ms();
+    let _ = super::mutate_host_config(&state.inner, |config| {
+        if let Some(client) = config
+            .web
+            .paired_clients
+            .iter_mut()
+            .find(|client| client.client_id == client_id)
+        {
+            client.last_seen_epoch_ms = Some(now);
+        }
+    });
     Some(client_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::{
+        load_remote_machine_state, save_remote_machine_state, test_support::TestProfileGuard,
+        KnownRemoteHost, RemoteHostConfig, RemoteHostService, RemoteMachineState,
+    };
+
+    fn test_service(server_id: &str) -> RemoteHostService {
+        let mut config = RemoteHostConfig::default();
+        config.server_id = server_id.to_string();
+        config.web.enabled = true;
+        config.web.pairing_token = "PAIR1234".to_string();
+        RemoteHostService::new(config)
+    }
+
+    fn test_state(service: &RemoteHostService) -> Arc<WebState> {
+        Arc::new(WebState {
+            inner: service.inner.clone(),
+            pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
+        })
+    }
+
+    fn test_addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 43872))
+    }
+
+    #[test]
+    fn pair_handler_sets_effectively_permanent_cookie() {
+        let _profile = TestProfileGuard::new("web-cookie-max-age");
+        let service = test_service("host-a");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let response = runtime.block_on(async {
+            pair_handler(
+                State(state),
+                ConnectInfo(test_addr()),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: None,
+                }),
+            )
+            .await
+        });
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8");
+        assert!(
+            set_cookie.contains("Max-Age=315360000"),
+            "expected 10-year Max-Age, got: {set_cookie}"
+        );
+    }
+
+    #[test]
+    fn me_handler_refreshes_valid_cookie() {
+        let _profile = TestProfileGuard::new("web-cookie-refresh");
+        let service = test_service("host-a");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let pair_response = runtime.block_on(async {
+            pair_handler(
+                State(state.clone()),
+                ConnectInfo(test_addr()),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: None,
+                }),
+            )
+            .await
+        });
+        let cookie_header = pair_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8")
+            .split(';')
+            .next()
+            .expect("cookie name/value")
+            .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie_header.parse().expect("cookie header"));
+
+        let response = runtime.block_on(async { me_handler(State(state), headers).await });
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("me response should refresh auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8");
+        assert!(
+            set_cookie.contains("Max-Age=315360000"),
+            "expected refreshed 10-year Max-Age, got: {set_cookie}"
+        );
+    }
+
+    #[test]
+    fn pair_handler_uses_distinct_cookie_names_per_server_id() {
+        let _profile = TestProfileGuard::new("web-cookie-isolation");
+        let service_a = test_service("host-a");
+        let state_a = test_state(&service_a);
+        let service_b = test_service("host-b");
+        let state_b = test_state(&service_b);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let response_a = runtime.block_on(async {
+            pair_handler(
+                State(state_a),
+                ConnectInfo(test_addr()),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: None,
+                }),
+            )
+            .await
+        });
+        let response_b = runtime.block_on(async {
+            pair_handler(
+                State(state_b),
+                ConnectInfo(test_addr()),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: None,
+                }),
+            )
+            .await
+        });
+        drop(runtime);
+
+        let cookie_name_a = response_a
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set cookie for host a")
+            .to_str()
+            .expect("cookie should be utf-8")
+            .split('=')
+            .next()
+            .expect("cookie name")
+            .to_string();
+        let cookie_name_b = response_b
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set cookie for host b")
+            .to_str()
+            .expect("cookie should be utf-8")
+            .split('=')
+            .next()
+            .expect("cookie name")
+            .to_string();
+
+        assert_ne!(
+            cookie_name_a, cookie_name_b,
+            "different server ids should mint different cookie names"
+        );
+    }
+
+    #[test]
+    fn pair_handler_persists_paired_client_immediately() {
+        let _profile = TestProfileGuard::new("web-persist");
+        let mut disk_state = RemoteMachineState::default();
+        disk_state.host.web.enabled = true;
+        disk_state.host.web.pairing_token = "PAIR1234".to_string();
+        disk_state.known_hosts.push(KnownRemoteHost {
+            label: "Other host".to_string(),
+            address: "example.local".to_string(),
+            port: 43871,
+            server_id: "other-host".to_string(),
+            certificate_fingerprint: "fingerprint".to_string(),
+            client_id: "client-1".to_string(),
+            auth_token: "token-1".to_string(),
+            last_connected_epoch_ms: Some(1),
+        });
+        save_remote_machine_state(&disk_state).expect("seed remote state");
+
+        let service = RemoteHostService::new(disk_state.host.clone());
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let response = runtime.block_on(async {
+            pair_handler(
+                State(state),
+                ConnectInfo(test_addr()),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: Some("Phone".to_string()),
+                }),
+            )
+            .await
+        });
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let saved = load_remote_machine_state().expect("load persisted remote state");
+        assert_eq!(saved.host.web.paired_clients.len(), 1);
+        assert_eq!(saved.host.web.paired_clients[0].label, "Phone");
+        assert_eq!(saved.known_hosts.len(), 1);
+        assert_eq!(saved.known_hosts[0].server_id, "other-host");
+    }
+
+    #[test]
+    fn me_handler_rejects_cookie_when_paired_client_is_removed() {
+        let _profile = TestProfileGuard::new("web-cookie-revoke");
+        let service = test_service("host-a");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let pair_response = runtime.block_on(async {
+            pair_handler(
+                State(state.clone()),
+                ConnectInfo(test_addr()),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: None,
+                }),
+            )
+            .await
+        });
+        let cookie_header = pair_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8")
+            .split(';')
+            .next()
+            .expect("cookie name/value")
+            .to_string();
+        if let Ok(mut config) = state.inner.config.write() {
+            config.web.paired_clients.clear();
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie_header.parse().expect("cookie header"));
+        let response = runtime.block_on(async { me_handler(State(state), headers).await });
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn me_handler_rejects_cookie_from_different_server_id() {
+        let _profile = TestProfileGuard::new("web-cookie-cross-server");
+        let service_a = test_service("host-a");
+        let state_a = test_state(&service_a);
+        let service_b = test_service("host-b");
+        let state_b = test_state(&service_b);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let pair_response_b = runtime.block_on(async {
+            pair_handler(
+                State(state_b),
+                ConnectInfo(test_addr()),
+                Query(PairQuery {
+                    t: Some("PAIR1234".to_string()),
+                    label: None,
+                }),
+            )
+            .await
+        });
+        let cookie_header = pair_response_b
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8")
+            .split(';')
+            .next()
+            .expect("cookie name/value")
+            .to_string();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie_header.parse().expect("cookie header"));
+        let response = runtime.block_on(async { me_handler(State(state_a), headers).await });
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

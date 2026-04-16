@@ -72,9 +72,9 @@ export function decodeSessionOutputFrame(
 
 /**
  * Minimal WebSocket client with automatic reconnect and cookie-auth
- * awareness. A missing/invalid `dm_web` cookie results in a 401 during the
- * upgrade handshake; browsers surface that as a generic close event, so we
- * pre-check via `/api/me` before opening the WS and report `unauthorized`
+ * awareness. A missing/invalid remembered auth cookie results in a 401 during
+ * the upgrade handshake; browsers surface that as a generic close event, so
+ * we pre-check via `/api/me` before opening the WS and report `unauthorized`
  * up to the caller if that probe fails.
  */
 export class WsClient {
@@ -93,9 +93,10 @@ export class WsClient {
     this.cb.onStatus({ kind: "connecting" });
 
     // Authentication probe — cheap, one HTTP round trip, tells us whether
-    // the cookie is present AND signed by the current host. Without this
-    // step an invalid cookie would just look like "websocket closed" in
-    // Chrome devtools, which is hard to distinguish from a network blip.
+    // the remembered cookie is present AND signed by the current host.
+    // Without this step an invalid cookie would just look like "websocket
+    // closed" in Chrome devtools, which is hard to distinguish from a
+    // network blip.
     try {
       const meResp = await fetch("/api/me", { credentials: "include" });
       if (meResp.status === 401) {

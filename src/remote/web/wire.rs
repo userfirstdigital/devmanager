@@ -33,6 +33,12 @@ pub enum WsInbound {
         session_id: String,
         text: String,
     },
+    PasteImage {
+        session_id: String,
+        mime_type: String,
+        file_name: Option<String>,
+        data_base64: String,
+    },
     Resize {
         session_id: String,
         rows: u16,
@@ -137,6 +143,32 @@ mod tests {
             WsInbound::Input { session_id, text } => {
                 assert_eq!(session_id, "srv-1");
                 assert_eq!(text, "echo hi\n");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_paste_image_deserializes() {
+        let raw = json!({
+            "type": "pasteImage",
+            "sessionId": "claude-1",
+            "mimeType": "image/png",
+            "fileName": "clip.png",
+            "dataBase64": "AQID"
+        });
+        let parsed: WsInbound = serde_json::from_value(raw).expect("parse");
+        match parsed {
+            WsInbound::PasteImage {
+                session_id,
+                mime_type,
+                file_name,
+                data_base64,
+            } => {
+                assert_eq!(session_id, "claude-1");
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(file_name.as_deref(), Some("clip.png"));
+                assert_eq!(data_base64, "AQID");
             }
             other => panic!("unexpected: {other:?}"),
         }

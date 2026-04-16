@@ -440,10 +440,19 @@ impl NativeShell {
                     RemoteTerminalInput::Paste { session_id, text } => {
                         input_manager.paste_to_session(&session_id, &text)
                     }
+                    RemoteTerminalInput::Image {
+                        session_id,
+                        attachment,
+                    } => crate::remote::web::image_paste::handle_web_image_paste(
+                        &input_manager,
+                        &session_id,
+                        &attachment,
+                    ),
                 };
                 if result.is_ok() {
                     input_host_service.record_input_write_latency(enqueued_at_epoch_ms);
                 }
+                result
             },
         )));
         let resize_manager = process_manager.clone();
@@ -1191,8 +1200,11 @@ impl NativeShell {
             draft.remote_web_pairing_token =
                 self.remote_machine_state.host.web.pairing_token.clone();
             draft.remote_web_listener_url = Some(self.remote_machine_state.host.web.display_url());
+            draft.remote_web_listener_error = remote_status.web_listener_error;
             draft.remote_web_paired_clients =
                 self.remote_machine_state.host.web.paired_clients.len();
+            draft.remote_web_paired_clients_detail =
+                self.remote_machine_state.host.web.paired_clients.clone();
 
             if !draft.remote_connected && draft.remote_connect_address.trim().is_empty() {
                 if let Some(host) = draft.remote_known_hosts.first() {
@@ -1383,16 +1395,46 @@ impl NativeShell {
     fn copy_remote_pairing_token_action(&mut self, cx: &mut Context<Self>) {
         let token = self.remote_host_service.status().pairing_token;
         if token.trim().is_empty() {
-            self.editor_notice =
-                Some("Generate or enable hosting before copying a pair token.".to_string());
+            self.editor_notice = Some(
+                "Generate or enable hosting before copying a desktop pair token.".to_string(),
+            );
             self.set_remote_status_notice(
-                "Generate or enable hosting before copying a pair token.",
+                "Generate or enable hosting before copying a desktop pair token.",
                 true,
             );
         } else {
             cx.write_to_clipboard(ClipboardItem::new_string(token));
-            self.editor_notice = Some("Copied pair token to the clipboard.".to_string());
-            self.set_remote_status_notice("Copied pair token to the clipboard.", false);
+            self.editor_notice =
+                Some("Copied desktop pair token to the clipboard.".to_string());
+            self.set_remote_status_notice("Copied desktop pair token to the clipboard.", false);
+        }
+        self.sync_settings_remote_draft();
+        cx.notify();
+    }
+
+    fn copy_remote_web_invite_link_action(&mut self, cx: &mut Context<Self>) {
+        let status = self.remote_host_service.status();
+        let url = self.remote_machine_state.host.web.display_url();
+        let token = self.remote_machine_state.host.web.pairing_token.clone();
+        if !self.remote_machine_state.host.web.enabled {
+            self.editor_notice =
+                Some("Enable browser access before copying an invite link.".to_string());
+            self.set_remote_status_notice("Enable browser access before copying an invite link.", true);
+        } else if let Some(error) = status.web_listener_error {
+            self.editor_notice = Some(error.clone());
+            self.set_remote_status_notice(&error, true);
+        } else if token.trim().is_empty() {
+            self.editor_notice =
+                Some("Generate a browser pair token before copying an invite link.".to_string());
+            self.set_remote_status_notice(
+                "Generate a browser pair token before copying an invite link.",
+                true,
+            );
+        } else {
+            let invite = format!("{url}/pair?t={token}");
+            cx.write_to_clipboard(ClipboardItem::new_string(invite));
+            self.editor_notice = Some("Copied browser invite link to the clipboard.".to_string());
+            self.set_remote_status_notice("Copied browser invite link to the clipboard.", false);
         }
         self.sync_settings_remote_draft();
         cx.notify();
@@ -4040,8 +4082,14 @@ impl NativeShell {
                 remote_web_enabled: self.remote_machine_state.host.web.enabled,
                 remote_web_pairing_token: self.remote_machine_state.host.web.pairing_token.clone(),
                 remote_web_listener_url: Some(self.remote_machine_state.host.web.display_url()),
-                remote_web_listener_error: None,
+                remote_web_listener_error: remote_status.web_listener_error,
                 remote_web_paired_clients: self.remote_machine_state.host.web.paired_clients.len(),
+                remote_web_paired_clients_detail: self
+                    .remote_machine_state
+                    .host
+                    .web
+                    .paired_clients
+                    .clone(),
                 open_picker: None,
             }),
             cx,
@@ -5961,15 +6009,27 @@ impl NativeShell {
             EditorAction::CopyRemoteWebPairingToken => {
                 let token = self.remote_machine_state.host.web.pairing_token.clone();
                 if token.trim().is_empty() {
-                    self.editor_notice =
-                        Some("Enable the web UI first to generate a pair token.".to_string());
+                    self.editor_notice = Some(
+                        "Enable browser access first to generate a browser pair token.".to_string(),
+                    );
+                    self.set_remote_status_notice(
+                        "Enable browser access first to generate a browser pair token.",
+                        true,
+                    );
                 } else {
                     cx.write_to_clipboard(ClipboardItem::new_string(token));
                     self.editor_notice =
-                        Some("Copied web pair token to the clipboard.".to_string());
+                        Some("Copied browser pair token to the clipboard.".to_string());
+                    self.set_remote_status_notice(
+                        "Copied browser pair token to the clipboard.",
+                        false,
+                    );
                 }
                 self.sync_settings_remote_draft();
                 cx.notify();
+            }
+            EditorAction::CopyRemoteWebInviteLink => {
+                self.copy_remote_web_invite_link_action(cx);
             }
             EditorAction::ConnectRemoteHost => {
                 let Some((
@@ -6097,6 +6157,18 @@ impl NativeShell {
                 self.persist_remote_machine_state();
                 self.sync_settings_remote_draft();
                 self.editor_notice = Some("Revoked paired remote client.".to_string());
+                cx.notify();
+            }
+            EditorAction::RevokeRemoteWebClient(client_id) => {
+                self.remote_machine_state
+                    .host
+                    .web
+                    .paired_clients
+                    .retain(|client| client.client_id != client_id);
+                self.remote_host_service.revoke_paired_web_client(&client_id);
+                self.persist_remote_machine_state();
+                self.sync_settings_remote_draft();
+                self.editor_notice = Some("Revoked paired browser.".to_string());
                 cx.notify();
             }
             EditorAction::ToggleProjectPinned => {
