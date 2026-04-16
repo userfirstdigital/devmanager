@@ -6576,43 +6576,56 @@ impl NativeShell {
                 let session_attached = self
                     .process_manager
                     .session_attached(&active_spec.session_id);
-                if local_has_resize_control
-                    && native_ai_render_should_wait(
+                let passive_view = local_has_resize_control
+                    .then(|| self.local_viewer_session_view(&active_spec.session_id, dimensions))
+                    .flatten();
+                let render_mode = if local_has_resize_control {
+                    native_ai_render_mode(
                         session_runtime.as_ref(),
                         session_attached,
+                        passive_view.is_some(),
                         Instant::now(),
                     )
-                {
-                    self.terminal_notice = Some(
-                        "AI session is still starting in background. Wait a moment before opening it locally."
-                            .to_string(),
-                    );
-                    active_session = None;
                 } else {
-                    let mut current_view = if local_has_resize_control {
-                        self.process_manager.session_view(&active_spec.session_id)
-                    } else {
-                        self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                    };
-                    if local_has_resize_control && current_view.is_some() {
-                        self.process_manager
-                            .set_active_session(active_spec.session_id.clone());
+                    NativeAiRenderMode::PassiveView
+                };
+                match render_mode {
+                    NativeAiRenderMode::Wait => {
+                        self.terminal_notice = Some(
+                            "AI session is still starting in background. Wait a moment before opening it locally."
+                                .to_string(),
+                        );
+                        active_session = None;
                     }
-                    if local_has_resize_control
-                        && terminal_view_needs_resize(
+                    NativeAiRenderMode::PassiveView => {
+                        self.terminal_notice = None;
+                        active_session = passive_view.or_else(|| {
+                            self.local_viewer_session_view(&active_spec.session_id, dimensions)
+                        });
+                    }
+                    NativeAiRenderMode::ActiveControl => {
+                        let mut current_view =
+                            self.process_manager.session_view(&active_spec.session_id);
+                        if current_view.is_some() {
+                            self.process_manager
+                                .set_active_session(active_spec.session_id.clone());
+                        }
+                        if terminal_view_needs_resize(
                             self.last_dimensions,
                             current_view.as_ref(),
                             dimensions,
-                        )
-                        && self
+                        ) && self
                             .process_manager
                             .resize_session(&active_spec.session_id, dimensions)
                             .is_ok()
-                    {
-                        self.last_dimensions = Some(dimensions);
-                        current_view = self.process_manager.session_view(&active_spec.session_id);
+                        {
+                            self.last_dimensions = Some(dimensions);
+                            current_view =
+                                self.process_manager.session_view(&active_spec.session_id);
+                        }
+                        self.terminal_notice = None;
+                        active_session = current_view;
                     }
-                    active_session = current_view;
                 }
             }
             Some(TabType::Ssh) => {
@@ -12708,29 +12721,43 @@ fn terminal_view_needs_resize(
         || active_session.map(|session| session.runtime.dimensions) != Some(dimensions)
 }
 
-fn native_ai_render_should_wait(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeAiRenderMode {
+    Wait,
+    PassiveView,
+    ActiveControl,
+}
+
+fn native_ai_render_mode(
     session: Option<&crate::state::SessionRuntimeState>,
     session_attached: bool,
+    has_session_view: bool,
     now: Instant,
-) -> bool {
+) -> NativeAiRenderMode {
     let Some(session) = session else {
-        return false;
+        return NativeAiRenderMode::ActiveControl;
     };
     if !session_attached {
-        return false;
+        return NativeAiRenderMode::ActiveControl;
     }
-    if session.status == crate::state::SessionStatus::Starting {
-        return true;
+    let startup_guard_active = session.status == crate::state::SessionStatus::Starting
+        || (session.session_kind.is_ai()
+            && session.status.is_live()
+            && !session.at_prompt
+            && session
+                .started_at
+                .map(|started_at| {
+                    now.saturating_duration_since(started_at) <= AI_LOCAL_RENDER_GUARD_WINDOW
+                })
+                .unwrap_or(false));
+    if startup_guard_active {
+        return if has_session_view {
+            NativeAiRenderMode::PassiveView
+        } else {
+            NativeAiRenderMode::Wait
+        };
     }
-    session.session_kind.is_ai()
-        && session.status.is_live()
-        && !session.at_prompt
-        && session
-            .started_at
-            .map(|started_at| {
-                now.saturating_duration_since(started_at) <= AI_LOCAL_RENDER_GUARD_WINDOW
-            })
-            .unwrap_or(false)
+    NativeAiRenderMode::ActiveControl
 }
 
 fn remote_reconnect_backoff(attempts: u32) -> Duration {
@@ -12983,7 +13010,7 @@ mod tests {
     }
 
     #[test]
-    fn native_ai_render_waits_for_fresh_attached_ai_startup_sessions() {
+    fn native_ai_render_uses_passive_view_for_fresh_attached_ai_startup_sessions() {
         let now = Instant::now();
         let mut session = SessionRuntimeState::new(
             "claude-session",
@@ -12995,20 +13022,42 @@ mod tests {
         session.status = crate::state::SessionStatus::Starting;
         session.started_at = Some(now);
 
-        assert!(native_ai_render_should_wait(Some(&session), true, now));
-        assert!(!native_ai_render_should_wait(Some(&session), false, now));
+        assert_eq!(
+            native_ai_render_mode(Some(&session), true, true, now),
+            NativeAiRenderMode::PassiveView
+        );
+        assert_eq!(
+            native_ai_render_mode(Some(&session), true, false, now),
+            NativeAiRenderMode::Wait
+        );
+        assert_eq!(
+            native_ai_render_mode(Some(&session), false, true, now),
+            NativeAiRenderMode::ActiveControl
+        );
 
         session.status = crate::state::SessionStatus::Running;
-        assert!(native_ai_render_should_wait(Some(&session), true, now));
+        assert_eq!(
+            native_ai_render_mode(Some(&session), true, true, now),
+            NativeAiRenderMode::PassiveView
+        );
 
         session.at_prompt = true;
-        assert!(!native_ai_render_should_wait(Some(&session), true, now));
+        assert_eq!(
+            native_ai_render_mode(Some(&session), true, true, now),
+            NativeAiRenderMode::ActiveControl
+        );
 
         session.at_prompt = false;
         session.started_at = Some(now - AI_LOCAL_RENDER_GUARD_WINDOW - Duration::from_secs(1));
-        assert!(!native_ai_render_should_wait(Some(&session), true, now));
+        assert_eq!(
+            native_ai_render_mode(Some(&session), true, true, now),
+            NativeAiRenderMode::ActiveControl
+        );
 
-        assert!(!native_ai_render_should_wait(None, true, now));
+        assert_eq!(
+            native_ai_render_mode(None, true, false, now),
+            NativeAiRenderMode::ActiveControl
+        );
     }
 
     #[test]
