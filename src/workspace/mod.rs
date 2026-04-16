@@ -6,8 +6,8 @@ use self::editor_ui::{
     render_info_row, render_notice_row, render_preview_stories, render_selection_row,
     render_static_form_fields, render_static_form_sections, render_surface_action_button,
     FormAction, FormActionGroup, FormField, FormInfoField, FormSection, FormSelectionList,
-    FormSelectionRow,
-    PreviewState, PreviewStory, SurfaceActionButtonStyle, SurfaceBadge, SurfaceTone,
+    FormSelectionRow, PreviewState, PreviewStory, SurfaceActionButtonStyle, SurfaceBadge,
+    SurfaceTone,
 };
 use crate::models::{
     DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult, ScannedPort,
@@ -729,7 +729,7 @@ impl EditorPanel {
         match self {
             Self::Settings(draft) => {
                 if draft.remote_focus_only {
-                    "Connect to other devices, share this machine, and manage browser access."
+                    "Connect to other devices or host this machine for desktop and browser access."
                 } else {
                     "Workspace defaults for terminals, AI tools, and data handling."
                 }
@@ -1146,8 +1146,24 @@ impl EditorPanel {
 }
 
 #[derive(Debug, Clone)]
+pub enum RemoteTopTab {
+    Connect,
+    Host,
+}
+
+impl RemoteTopTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "Connect",
+            Self::Host => "Host",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SettingsDraft {
     pub remote_focus_only: bool,
+    pub remote_active_tab: RemoteTopTab,
     pub default_terminal: DefaultTerminal,
     pub mac_terminal_profile: MacTerminalProfile,
     pub theme: String,
@@ -1416,6 +1432,7 @@ pub enum EditorAction {
     ToggleShellIntegrationEnabled,
     ToggleTerminalMouseOverride,
     ToggleTerminalReadOnly,
+    SelectRemoteTopTab(RemoteTopTab),
     ToggleRemoteHosting,
     ToggleRemoteKeepHostingInBackground,
     RegenerateRemotePairingToken,
@@ -1947,7 +1964,7 @@ fn render_settings_panel(
     }
 
     if draft.remote_focus_only {
-        sections.extend(build_remote_dashboard_sections(draft, model, actions));
+        return render_remote_tabbed_panel(draft, model, actions);
     }
 
     if !draft.remote_focus_only {
@@ -1970,20 +1987,156 @@ fn build_remote_dashboard_sections(
     model: &EditorPaneModel,
     actions: &EditorActions,
 ) -> Vec<FormSection> {
-    vec![
-        build_remote_current_session_section(draft, model, actions),
-        build_remote_this_device_section(draft, actions),
-        build_remote_browser_access_section(draft, actions),
-        build_remote_trusted_access_section(draft, actions),
-        build_remote_advanced_section(draft, model, actions),
-    ]
+    let mut sections = build_remote_tab_sections(draft, RemoteTopTab::Connect, model, actions);
+    sections.extend(build_remote_tab_sections(
+        draft,
+        RemoteTopTab::Host,
+        model,
+        actions,
+    ));
+    sections
 }
 
-fn build_remote_current_session_section(
+fn build_remote_tab_sections(
+    draft: &SettingsDraft,
+    tab: RemoteTopTab,
+    model: &EditorPaneModel,
+    actions: &EditorActions,
+) -> Vec<FormSection> {
+    match tab {
+        RemoteTopTab::Connect => build_remote_current_session_sections(draft, model, actions),
+        RemoteTopTab::Host => vec![
+            build_remote_this_device_section(draft, actions),
+            build_remote_browser_access_section(draft, actions),
+            build_remote_trusted_access_section(draft, actions),
+            build_remote_advanced_section(draft, model, actions),
+        ],
+    }
+}
+
+fn render_remote_tabbed_panel(
     draft: &SettingsDraft,
     model: &EditorPaneModel,
     actions: &EditorActions,
-) -> FormSection {
+) -> AnyElement {
+    let sections =
+        build_remote_tab_sections(draft, draft.remote_active_tab.clone(), model, actions);
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(render_remote_top_tab_row(draft, actions))
+        .child(render_remote_status_summary(draft))
+        .child(render_form_sections(sections, model, actions))
+        .into_any_element()
+}
+
+fn render_remote_top_tab_row(draft: &SettingsDraft, actions: &EditorActions) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(8.0))
+        .child(render_surface_action_button(
+            RemoteTopTab::Connect.label(),
+            if matches!(draft.remote_active_tab, RemoteTopTab::Connect) {
+                SurfaceActionButtonStyle::Primary
+            } else {
+                SurfaceActionButtonStyle::Ghost
+            },
+            (actions.on_action)(EditorAction::SelectRemoteTopTab(RemoteTopTab::Connect)),
+        ))
+        .child(render_surface_action_button(
+            RemoteTopTab::Host.label(),
+            if matches!(draft.remote_active_tab, RemoteTopTab::Host) {
+                SurfaceActionButtonStyle::Primary
+            } else {
+                SurfaceActionButtonStyle::Ghost
+            },
+            (actions.on_action)(EditorAction::SelectRemoteTopTab(RemoteTopTab::Host)),
+        ))
+}
+
+fn render_remote_status_summary(draft: &SettingsDraft) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(10.0))
+        .child(render_remote_status_summary_item(
+            "Connection",
+            remote_connection_summary_value(draft),
+        ))
+        .child(render_remote_status_summary_item(
+            "Desktop host",
+            remote_host_summary_value(draft),
+        ))
+        .child(render_remote_status_summary_item(
+            "Browser access",
+            remote_browser_summary_value(draft),
+        ))
+}
+
+fn render_remote_status_summary_item(label: &str, value: String) -> impl IntoElement {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::EDITOR_FIELD_BG))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SECONDARY))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .child(SharedString::from(value)),
+        )
+}
+
+fn remote_connection_summary_value(draft: &SettingsDraft) -> String {
+    if draft.remote_connected {
+        draft
+            .remote_connected_label
+            .clone()
+            .unwrap_or_else(|| "Connected".to_string())
+    } else if draft.remote_connect_in_flight {
+        "Connecting...".to_string()
+    } else {
+        "Not connected".to_string()
+    }
+}
+
+fn remote_host_summary_value(draft: &SettingsDraft) -> String {
+    if draft.remote_host_enabled && draft.remote_host_listening {
+        "Ready".to_string()
+    } else if draft.remote_host_enabled {
+        "Attention".to_string()
+    } else {
+        "Off".to_string()
+    }
+}
+
+fn remote_browser_summary_value(draft: &SettingsDraft) -> String {
+    if draft.remote_web_enabled && draft.remote_web_listener_error.is_none() {
+        "On".to_string()
+    } else if draft.remote_web_enabled {
+        "Attention".to_string()
+    } else {
+        "Off".to_string()
+    }
+}
+
+fn build_remote_current_session_sections(
+    draft: &SettingsDraft,
+    model: &EditorPaneModel,
+    actions: &EditorActions,
+) -> Vec<FormSection> {
     let mut fields = Vec::new();
 
     if draft.remote_connected {
@@ -2124,135 +2277,134 @@ fn build_remote_current_session_section(
                 }),
         ));
     } else {
-        fields.push(FormField::notice(
-            draft.remote_connect_status.clone().unwrap_or_else(|| {
-                if draft.remote_known_hosts.is_empty() {
-                    "Enter a host, port, and desktop pair token to make the first connection."
-                        .to_string()
-                } else {
-                    "Connect to a saved host or enter a host manually.".to_string()
-                }
-            }),
-            if draft.remote_connect_in_flight {
-                SurfaceTone::Accent
-            } else if draft.remote_connect_status_is_error {
-                SurfaceTone::Danger
-            } else {
-                SurfaceTone::Muted
-            },
-        ));
-
-        fields.extend([
-            FormField::custom(
-                render_settings_text_input(
-                    "Host or IP",
-                    "Address of the DevManager host you want to control.",
-                    draft.remote_connect_address.as_str(),
-                    EditorField::Settings(SettingsField::RemoteConnectAddress),
-                    model,
-                    actions,
-                    None,
-                    "192.168.0.20",
-                )
-                .into_any_element(),
-            ),
-            FormField::custom(
-                render_settings_text_input(
-                    "Port",
-                    "TCP port for that DevManager host.",
-                    draft.remote_connect_port.as_str(),
-                    EditorField::Settings(SettingsField::RemoteConnectPort),
-                    model,
-                    actions,
-                    Some(120.0),
-                    "43871",
-                )
-                .into_any_element(),
-            ),
-            FormField::custom(
-                render_settings_text_input(
-                    "Desktop pair token",
-                    "Only needed the first time this device pairs with a host.",
-                    draft.remote_connect_token.as_str(),
-                    EditorField::Settings(SettingsField::RemoteConnectToken),
-                    model,
-                    actions,
-                    Some(180.0),
-                    "ABC123",
-                )
-                .into_any_element(),
-            ),
-            FormField::action_group(FormActionGroup::new("Connection").action({
-                let mut action = FormAction::new(
-                    "Connect to the remote DevManager host",
-                    if draft.remote_connect_in_flight {
-                        "Connecting..."
-                    } else {
-                        "Connect"
-                    },
-                    (actions.on_action)(EditorAction::ConnectRemoteHost),
-                )
-                .description("Open the remote workspace and take control right away.")
-                .style(SurfaceActionButtonStyle::Primary);
+        if let Some(status) = draft.remote_connect_status.clone() {
+            fields.push(FormField::notice(
+                status,
                 if draft.remote_connect_in_flight {
-                    action = action.badge(SurfaceBadge::new("Busy", SurfaceTone::Accent));
-                }
-                action
-            })),
-        ]);
-
-        if draft.remote_known_hosts.is_empty() {
-            fields.push(FormField::empty_state(
-                "No saved hosts yet",
-                "After you connect once, trusted hosts will appear here for quick reconnects.",
-                SurfaceTone::Muted,
-            ));
-        } else {
-            fields.push(FormField::info(
-                "Saved hosts",
-                if draft.remote_known_hosts.len() == 1 {
-                    "1 trusted host".to_string()
+                    SurfaceTone::Accent
+                } else if draft.remote_connect_status_is_error {
+                    SurfaceTone::Danger
                 } else {
-                    format!("{} trusted hosts", draft.remote_known_hosts.len())
+                    SurfaceTone::Muted
                 },
-                Some("Quick reconnects for hosts this device already trusts.".to_string()),
             ));
-
-            fields.extend(draft.remote_known_hosts.iter().map(|host| {
-                FormField::action_group(
-                    FormActionGroup::new(host.label.clone())
-                        .hint(format_saved_host_hint(host))
-                        .action(
-                            FormAction::new(
-                                "Connect to this saved host",
-                                "Connect",
-                                (actions.on_action)(EditorAction::UseKnownRemoteHost(
-                                    host.server_id.clone(),
-                                )),
-                            )
-                            .description(
-                                "Reconnect immediately using the saved fingerprint and client token.",
-                            )
-                            .style(SurfaceActionButtonStyle::Primary),
-                        )
-                        .action(
-                            FormAction::new(
-                                "Forget this saved host",
-                                "Forget",
-                                (actions.on_action)(EditorAction::ForgetKnownRemoteHost(
-                                    host.server_id.clone(),
-                                )),
-                            )
-                            .description("Remove the saved host fingerprint and client token.")
-                            .style(SurfaceActionButtonStyle::Danger),
-                        ),
-                )
-            }));
+        } else if draft.remote_connect_in_flight {
+            fields.push(FormField::notice("Connecting...", SurfaceTone::Accent));
         }
+
+        let host_input = render_settings_text_input(
+            "Host or IP",
+            "",
+            draft.remote_connect_address.as_str(),
+            EditorField::Settings(SettingsField::RemoteConnectAddress),
+            model,
+            actions,
+            None,
+            "192.168.0.20",
+        )
+        .into_any_element();
+        let port_input = render_settings_text_input(
+            "Port",
+            "",
+            draft.remote_connect_port.as_str(),
+            EditorField::Settings(SettingsField::RemoteConnectPort),
+            model,
+            actions,
+            None,
+            "43871",
+        )
+        .into_any_element();
+
+        fields.push(FormField::custom(
+            div()
+                .flex()
+                .gap(px(10.0))
+                .items_end()
+                .child(div().flex_1().min_w(px(0.0)).child(host_input))
+                .child(div().w(px(110.0)).child(port_input))
+                .into_any_element(),
+        ));
+        let token_input = render_settings_text_input(
+            "Desktop pair token",
+            "Only needed the first time this device pairs with a host.",
+            draft.remote_connect_token.as_str(),
+            EditorField::Settings(SettingsField::RemoteConnectToken),
+            model,
+            actions,
+            None,
+            "ABC123",
+        )
+        .into_any_element();
+        let connect_button = render_surface_action_button(
+            if draft.remote_connect_in_flight {
+                "Connecting..."
+            } else {
+                "Connect"
+            },
+            SurfaceActionButtonStyle::Primary,
+            (actions.on_action)(EditorAction::ConnectRemoteHost),
+        )
+        .into_any_element();
+        fields.push(FormField::custom(
+            div()
+                .flex()
+                .gap(px(10.0))
+                .items_end()
+                .child(div().flex_1().min_w(px(0.0)).child(token_input))
+                .child(connect_button)
+                .into_any_element(),
+        ));
     }
 
-    FormSection::new("Current Session")
+    let mut sections = vec![FormSection::new("Current Session")
         .hint("Connect to another DevManager host or manage the remote session you already have.")
+        .fields(fields)];
+
+    if !draft.remote_connected {
+        sections.push(build_remote_saved_hosts_section(draft, actions));
+    }
+
+    sections
+}
+
+fn build_remote_saved_hosts_section(draft: &SettingsDraft, actions: &EditorActions) -> FormSection {
+    let mut fields: Vec<FormField> = Vec::new();
+    if draft.remote_known_hosts.is_empty() {
+        fields.push(FormField::empty_state(
+            "No saved hosts yet",
+            "After you connect once, trusted hosts will appear here for quick reconnects.",
+            SurfaceTone::Muted,
+        ));
+    } else {
+        fields.extend(draft.remote_known_hosts.iter().map(|host| {
+            FormField::Info(
+                FormInfoField::new("", format_saved_host_hint(host), None)
+                    .action(
+                        FormAction::new(
+                            "Connect",
+                            "Connect",
+                            (actions.on_action)(EditorAction::UseKnownRemoteHost(
+                                host.server_id.clone(),
+                            )),
+                        )
+                        .style(SurfaceActionButtonStyle::Primary),
+                    )
+                    .action(
+                        FormAction::new(
+                            "Forget",
+                            "Forget",
+                            (actions.on_action)(EditorAction::ForgetKnownRemoteHost(
+                                host.server_id.clone(),
+                            )),
+                        )
+                        .style(SurfaceActionButtonStyle::Danger),
+                    ),
+            )
+        }));
+    }
+
+    FormSection::new("Saved hosts")
+        .hint("Quick reconnects for hosts this device already trusts.")
         .fields(fields)
 }
 
@@ -2302,9 +2454,7 @@ fn build_remote_this_device_section(draft: &SettingsDraft, actions: &EditorActio
         FormInfoField::new(
             "Desktop pairing token",
             remote_pairing_token_display(draft),
-            Some(
-                "First-time desktop clients enter this after the host and port.".to_string(),
-            ),
+            Some("First-time desktop clients enter this after the host and port.".to_string()),
         )
         .action(
             FormAction::new(
@@ -2447,7 +2597,7 @@ fn build_remote_browser_access_section(
                 (actions.on_action)(EditorAction::CopyRemoteWebInviteLink),
             )
             .style(SurfaceActionButtonStyle::Primary),
-        )
+        ),
     ));
 
     fields.push(FormField::Info(
@@ -2494,19 +2644,17 @@ fn build_remote_trusted_access_section(
     draft: &SettingsDraft,
     actions: &EditorActions,
 ) -> FormSection {
-    let mut fields = vec![
-        FormField::info(
-            "Trusted desktop clients",
-            if draft.remote_paired_clients.is_empty() {
-                "None".to_string()
-            } else if draft.remote_paired_clients.len() == 1 {
-                "1 trusted desktop".to_string()
-            } else {
-                format!("{} trusted desktops", draft.remote_paired_clients.len())
-            },
-            Some("Desktop apps this device already trusts.".to_string()),
-        ),
-    ];
+    let mut fields = vec![FormField::info(
+        "Trusted desktop clients",
+        if draft.remote_paired_clients.is_empty() {
+            "None".to_string()
+        } else if draft.remote_paired_clients.len() == 1 {
+            "1 trusted desktop".to_string()
+        } else {
+            format!("{} trusted desktops", draft.remote_paired_clients.len())
+        },
+        Some("Desktop apps this device already trusts.".to_string()),
+    )];
 
     if draft.remote_paired_clients.is_empty() {
         fields.push(FormField::empty_state(
@@ -2542,7 +2690,10 @@ fn build_remote_trusted_access_section(
         } else if draft.remote_web_paired_clients_detail.len() == 1 {
             "1 paired browser".to_string()
         } else {
-            format!("{} paired browsers", draft.remote_web_paired_clients_detail.len())
+            format!(
+                "{} paired browsers",
+                draft.remote_web_paired_clients_detail.len()
+            )
         },
         Some("Browsers that can reconnect using a saved cookie.".to_string()),
     ));
@@ -2566,7 +2717,9 @@ fn build_remote_trusted_access_section(
                                 client.client_id.clone(),
                             )),
                         )
-                        .description("Invalidate this browser pairing and require a new invite link.")
+                        .description(
+                            "Invalidate this browser pairing and require a new invite link.",
+                        )
                         .style(SurfaceActionButtonStyle::Danger),
                     ),
             )
@@ -2721,7 +2874,10 @@ fn remote_host_availability_value(draft: &SettingsDraft) -> String {
     if !draft.remote_host_enabled {
         "Sharing is off".to_string()
     } else if draft.remote_host_listening {
-        format!("Listening on {}:{}", draft.remote_bind_address, draft.remote_port)
+        format!(
+            "Listening on {}:{}",
+            draft.remote_bind_address, draft.remote_port
+        )
     } else {
         "Enabled, but not listening".to_string()
     }
@@ -3057,38 +3213,33 @@ fn remote_preview_story(model: &EditorPaneModel) -> PreviewStory {
         on_drag_to: Arc::new(preview_editor_drag_handler),
     };
     let disconnected = disconnected_remote_draft();
-    let connected = connected_remote_draft();
+    let mut host = browser_access_enabled_remote_draft();
+    host.remote_web_enabled = false;
+    host.remote_web_paired_clients = 0;
+    host.remote_web_paired_clients_detail.clear();
     let browser = browser_access_enabled_remote_draft();
     let disconnected_preview =
         preview_editor_model(EditorPanel::Settings(disconnected.clone()), model);
-    let connected_preview = preview_editor_model(EditorPanel::Settings(connected.clone()), model);
+    let host_preview = preview_editor_model(EditorPanel::Settings(host.clone()), model);
     let browser_preview = preview_editor_model(EditorPanel::Settings(browser.clone()), model);
 
     PreviewStory::new(
         "Remote Access",
-        "Remote session, controller availability, and browser sharing reference states.",
+        "Tabbed states for connecting to another device and hosting desktop or browser access.",
     )
-    .state(
-        PreviewState::new(
-            "Disconnected",
-            render_settings_panel(&disconnected, &disconnected_preview, &preview_actions)
-                .into_any_element(),
-        ),
-    )
-    .state(
-        PreviewState::new(
-            "Connected controller",
-            render_settings_panel(&connected, &connected_preview, &preview_actions)
-                .into_any_element(),
-        ),
-    )
-    .state(
-        PreviewState::new(
-            "Browser access enabled",
-            render_settings_panel(&browser, &browser_preview, &preview_actions)
-                .into_any_element(),
-        ),
-    )
+    .state(PreviewState::new(
+        "Connect tab",
+        render_settings_panel(&disconnected, &disconnected_preview, &preview_actions)
+            .into_any_element(),
+    ))
+    .state(PreviewState::new(
+        "Host tab",
+        render_settings_panel(&host, &host_preview, &preview_actions).into_any_element(),
+    ))
+    .state(PreviewState::new(
+        "Host tab with browser access",
+        render_settings_panel(&browser, &browser_preview, &preview_actions).into_any_element(),
+    ))
 }
 
 fn render_ui_preview_panel(
@@ -3599,6 +3750,7 @@ fn sample_ssh_draft() -> SshDraft {
 fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
     SettingsDraft {
         remote_focus_only: false,
+        remote_active_tab: RemoteTopTab::Connect,
         default_terminal: DefaultTerminal::Powershell,
         mac_terminal_profile: MacTerminalProfile::Zsh,
         theme: "dark".to_string(),
@@ -3696,6 +3848,7 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
 fn connected_remote_draft() -> SettingsDraft {
     let mut draft = sample_settings_draft(None);
     draft.remote_focus_only = true;
+    draft.remote_active_tab = RemoteTopTab::Connect;
     draft.remote_web_enabled = true;
     draft.remote_web_paired_clients = 1;
     draft.remote_web_paired_clients_detail = vec![PairedWebClient {
@@ -3709,6 +3862,7 @@ fn connected_remote_draft() -> SettingsDraft {
 
 fn disconnected_remote_draft() -> SettingsDraft {
     let mut draft = connected_remote_draft();
+    draft.remote_active_tab = RemoteTopTab::Connect;
     draft.remote_connected = false;
     draft.remote_has_control = false;
     draft.remote_connected_label = None;
@@ -3719,15 +3873,27 @@ fn disconnected_remote_draft() -> SettingsDraft {
     draft.remote_reconnect_attempts = 0;
     draft.remote_reconnect_last_error = None;
     draft.remote_port_forwards.clear();
+    draft.remote_host_enabled = false;
+    draft.remote_web_enabled = false;
+    draft.remote_web_paired_clients = 0;
+    draft.remote_web_paired_clients_detail.clear();
     draft.remote_connect_status = Some("Ready to connect to another device.".to_string());
     draft
 }
 
 fn browser_access_enabled_remote_draft() -> SettingsDraft {
     let mut draft = disconnected_remote_draft();
+    draft.remote_active_tab = RemoteTopTab::Host;
     draft.remote_host_enabled = true;
     draft.remote_host_listening = true;
     draft.remote_web_enabled = true;
+    draft.remote_web_paired_clients = 1;
+    draft.remote_web_paired_clients_detail = vec![PairedWebClient {
+        client_id: "browser-ipad".to_string(),
+        label: "Safari on iPad".to_string(),
+        issued_at_epoch_ms: Some(1_710_000_000_000),
+        last_seen_epoch_ms: Some(1_710_000_000_000),
+    }];
     draft.remote_host_error = None;
     draft
 }
@@ -3760,36 +3926,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_preview_story_includes_connected_and_disconnected_states() {
+    fn remote_preview_story_uses_connect_and_host_states() {
         let model = settings_model(sample_settings_draft(None));
         let story = remote_preview_story(&model);
         assert_eq!(story.title, "Remote Access");
         let labels: Vec<&str> = story.states.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(
             labels,
-            vec![
-                "Disconnected",
-                "Connected controller",
-                "Browser access enabled",
-            ]
+            vec!["Connect tab", "Host tab", "Host tab with browser access"]
         );
     }
 
     #[test]
-    fn remote_panel_uses_remote_access_language() {
+    fn remote_panel_uses_tabbed_remote_access_language() {
         let mut draft = disconnected_remote_draft();
         draft.remote_known_hosts.clear();
         draft.remote_connect_status = None;
         let model = settings_model(draft.clone());
         let actions = dummy_editor_actions();
 
-        let sections = build_remote_dashboard_sections(&draft, &model, &actions);
+        let sections = build_remote_tab_sections(&draft, RemoteTopTab::Connect, &model, &actions);
         let panel = EditorPanel::Settings(draft);
 
         assert_eq!(panel.headline(), "Remote access");
         assert_eq!(
             panel.subtitle(),
-            "Connect to other devices, share this machine, and manage browser access."
+            "Connect to other devices or host this machine for desktop and browser access."
         );
         let current = section(&sections, "Current Session");
         assert!(contains_notice(
@@ -3799,13 +3961,47 @@ mod tests {
     }
 
     #[test]
+    fn remote_tabs_group_sections_by_user_intent() {
+        let draft = disconnected_remote_draft();
+        let model = settings_model(draft.clone());
+        let actions = dummy_editor_actions();
+
+        let connect_sections =
+            build_remote_tab_sections(&draft, RemoteTopTab::Connect, &model, &actions);
+        let host_sections = build_remote_tab_sections(&draft, RemoteTopTab::Host, &model, &actions);
+
+        let connect_titles: Vec<&str> = connect_sections
+            .iter()
+            .map(|section| section.title.as_str())
+            .collect();
+        let host_titles: Vec<&str> = host_sections
+            .iter()
+            .map(|section| section.title.as_str())
+            .collect();
+
+        assert_eq!(connect_titles, vec!["Current Session"]);
+        assert_eq!(
+            host_titles,
+            vec![
+                "This Device",
+                "Browser Access",
+                "Trusted Access",
+                "Advanced Network and Security",
+            ]
+        );
+    }
+
+    #[test]
     fn remote_dashboard_uses_stable_primary_sections_when_disconnected() {
         let draft = disconnected_remote_draft();
         let model = settings_model(draft.clone());
         let actions = dummy_editor_actions();
 
         let sections = build_remote_dashboard_sections(&draft, &model, &actions);
-        let titles: Vec<&str> = sections.iter().map(|section| section.title.as_str()).collect();
+        let titles: Vec<&str> = sections
+            .iter()
+            .map(|section| section.title.as_str())
+            .collect();
 
         assert_eq!(
             titles,
@@ -3826,7 +4022,10 @@ mod tests {
         let actions = dummy_editor_actions();
 
         let sections = build_remote_dashboard_sections(&draft, &model, &actions);
-        let titles: Vec<&str> = sections.iter().map(|section| section.title.as_str()).collect();
+        let titles: Vec<&str> = sections
+            .iter()
+            .map(|section| section.title.as_str())
+            .collect();
 
         assert_eq!(
             titles,
@@ -3859,7 +4058,10 @@ mod tests {
         let actions = dummy_editor_actions();
 
         let sections = build_remote_dashboard_sections(&draft, &model, &actions);
-        let titles: Vec<&str> = sections.iter().map(|section| section.title.as_str()).collect();
+        let titles: Vec<&str> = sections
+            .iter()
+            .map(|section| section.title.as_str())
+            .collect();
 
         assert_eq!(
             titles,
@@ -3951,7 +4153,10 @@ mod tests {
             "Browser listener failed to bind"
         ));
         assert_eq!(
-            availability.badge.as_ref().map(|badge| badge.label.as_str()),
+            availability
+                .badge
+                .as_ref()
+                .map(|badge| badge.label.as_str()),
             Some("Attention")
         );
         assert_eq!(

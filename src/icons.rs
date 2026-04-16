@@ -15,6 +15,7 @@ pub const REFRESH_CW: &str = "icons/refresh-cw.svg";
 pub const X: &str = "icons/x.svg";
 pub const SETTINGS: &str = "icons/settings.svg";
 pub const SERVER: &str = "icons/server.svg";
+pub const GLOBE: &str = "icons/globe.svg";
 pub const ACTIVITY: &str = "icons/activity.svg";
 pub const GIT_BRANCH: &str = "icons/git-branch.svg";
 pub const CHEVRON_UP: &str = "icons/chevron-up.svg";

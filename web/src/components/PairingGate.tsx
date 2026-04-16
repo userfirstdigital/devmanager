@@ -57,8 +57,11 @@ export function PairingGate() {
         <p className="text-sm text-zinc-300 mb-4">
           This browser is not paired with DevManager. If someone sent you an
           invite link, open that directly. Otherwise open the desktop app, go
-          to <strong className="text-zinc-100">Remote → Browser Access</strong>,
-          copy the browser pair token, and paste it below.
+          to{" "}
+          <strong className="text-zinc-100">
+            Remote → Host → Browser Access
+          </strong>
+          , copy the browser pair token, and paste it below.
         </p>
         <form onSubmit={onSubmit} className="space-y-3">
           <label className="block">

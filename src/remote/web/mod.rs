@@ -532,7 +532,10 @@ mod tests {
             .expect("cookie name/value")
             .to_string();
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, cookie_header.parse().expect("cookie header"));
+        headers.insert(
+            header::COOKIE,
+            cookie_header.parse().expect("cookie header"),
+        );
 
         let response = runtime.block_on(async { me_handler(State(state), headers).await });
         drop(runtime);
@@ -695,7 +698,10 @@ mod tests {
         }
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, cookie_header.parse().expect("cookie header"));
+        headers.insert(
+            header::COOKIE,
+            cookie_header.parse().expect("cookie header"),
+        );
         let response = runtime.block_on(async { me_handler(State(state), headers).await });
         drop(runtime);
 
@@ -737,7 +743,10 @@ mod tests {
             .to_string();
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, cookie_header.parse().expect("cookie header"));
+        headers.insert(
+            header::COOKIE,
+            cookie_header.parse().expect("cookie header"),
+        );
         let response = runtime.block_on(async { me_handler(State(state_a), headers).await });
         drop(runtime);
 

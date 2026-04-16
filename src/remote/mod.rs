@@ -701,6 +701,8 @@ pub struct RemoteHostStatus {
     pub port: u16,
     pub pairing_token: String,
     pub connected_clients: usize,
+    pub connected_native_clients: usize,
+    pub connected_web_clients: usize,
     pub controller_client_id: Option<String>,
     pub listening: bool,
     pub listener_error: Option<String>,
@@ -1308,12 +1310,25 @@ impl RemoteHostService {
                 )
             })
             .unwrap_or_default();
-        let connected_clients = self
+        let (connected_clients, connected_native_clients, connected_web_clients) = self
             .inner
             .clients
             .lock()
-            .map(|clients| clients.len())
-            .unwrap_or(0);
+            .map(|clients| {
+                let connected_clients = clients.len();
+                let connected_web_clients = clients
+                    .values()
+                    .filter(|client| client.client_id.starts_with("web-"))
+                    .count();
+                let connected_native_clients =
+                    connected_clients.saturating_sub(connected_web_clients);
+                (
+                    connected_clients,
+                    connected_native_clients,
+                    connected_web_clients,
+                )
+            })
+            .unwrap_or((0, 0, 0));
         let controller_client_id = self
             .inner
             .controller_client_id
@@ -1353,6 +1368,8 @@ impl RemoteHostService {
             port,
             pairing_token,
             connected_clients,
+            connected_native_clients,
+            connected_web_clients,
             controller_client_id,
             listening,
             listener_error,
@@ -3367,17 +3384,17 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::TestProfileGuard;
     use super::{
         apply_workspace_delta, current_controller_allows, current_snapshot,
         format_handshake_stage_error, generate_pairing_token, load_remote_machine_state,
-        now_epoch_ms, save_remote_machine_state, set_last_connection_note,
-        upsert_known_host, ClientAuth, ConnectedRemoteClient, KnownRemoteHost,
-        LocalPortForwardManager, PairedRemoteClient, PairedWebClient, RemoteClientHandle,
-        RemoteClientInner, RemoteHostConfig, RemoteHostService, RemoteLatencyStats,
-        RemoteMachineState, RemoteSessionBootstrap, RemoteSessionStreamEvent,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
+        now_epoch_ms, save_remote_machine_state, set_last_connection_note, upsert_known_host,
+        ClientAuth, ConnectedRemoteClient, KnownRemoteHost, LocalPortForwardManager,
+        PairedRemoteClient, PairedWebClient, RemoteClientHandle, RemoteClientInner,
+        RemoteHostConfig, RemoteHostService, RemoteLatencyStats, RemoteMachineState,
+        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteWorkspaceDelta,
+        RemoteWorkspaceSnapshot, ServerMessage,
     };
-    use super::test_support::TestProfileGuard;
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
@@ -3439,8 +3456,14 @@ mod tests {
         save_remote_machine_state(&state).expect("save remote machine state");
         let reloaded = load_remote_machine_state().expect("reload remote machine state");
 
-        assert_eq!(reloaded.host.web.cookie_secret_hex, state.host.web.cookie_secret_hex);
-        assert_eq!(reloaded.host.web.paired_clients, state.host.web.paired_clients);
+        assert_eq!(
+            reloaded.host.web.cookie_secret_hex,
+            state.host.web.cookie_secret_hex
+        );
+        assert_eq!(
+            reloaded.host.web.paired_clients,
+            state.host.web.paired_clients
+        );
         assert_eq!(reloaded.known_hosts.len(), 1);
         assert_eq!(reloaded.known_hosts[0].server_id, "host-existing");
     }
@@ -3506,6 +3529,52 @@ mod tests {
             }
             other => panic!("expected disconnected message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn host_status_splits_live_native_and_web_clients() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (native_tx, _native_rx) = mpsc::channel();
+        let (web_tx, _web_rx) = mpsc::channel();
+
+        if let Ok(mut clients) = service.inner.clients.lock() {
+            clients.insert(
+                1,
+                ConnectedRemoteClient {
+                    client_id: "client-1".to_string(),
+                    sender: native_tx,
+                    subscribed_session_ids: HashSet::new(),
+                    bootstrapped_session_ids: HashSet::new(),
+                    focused_session_id: None,
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                },
+            );
+            clients.insert(
+                2,
+                ConnectedRemoteClient {
+                    client_id: "web-client-1".to_string(),
+                    sender: web_tx,
+                    subscribed_session_ids: HashSet::new(),
+                    bootstrapped_session_ids: HashSet::new(),
+                    focused_session_id: None,
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                },
+            );
+        }
+
+        let status = service.status();
+
+        assert_eq!(status.connected_clients, 2);
+        assert_eq!(status.connected_native_clients, 1);
+        assert_eq!(status.connected_web_clients, 1);
     }
 
     #[test]

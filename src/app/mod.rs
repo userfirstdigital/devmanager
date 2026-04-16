@@ -21,12 +21,13 @@ use crate::services::{
 use crate::sidebar;
 use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState, SessionStatus};
 use crate::terminal::{self, view};
-use crate::theme;
 use crate::updater::UpdaterService;
 use crate::workspace::{
     self, CommandDraft, EditorAction, EditorField, EditorPaneModel, EditorPanel, FolderDraft,
-    FolderField, ProjectDraft, RemotePortForwardDraft, SettingsDraft, SshDraft, UiPreviewDraft,
+    FolderField, ProjectDraft, RemotePortForwardDraft, RemoteTopTab, SettingsDraft, SshDraft,
+    UiPreviewDraft,
 };
+use crate::{icons, theme};
 use gpui::{
     div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
     ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Modifiers,
@@ -189,16 +190,15 @@ struct RemoteStatusNotice {
     is_error: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteStatusBarAction {
     ConnectPreferred,
+    OpenRemoteConnectTab,
+    OpenRemoteHostTab,
     RetryReconnect,
     DisconnectRemote,
     TakeRemoteControl,
-    ReleaseRemoteControl,
     TakeHostControl,
-    CopyPairToken,
-    OpenRemoteSettings,
 }
 
 struct RemoteStatusBarState {
@@ -206,6 +206,19 @@ struct RemoteStatusBarState {
     primary_action: Option<RemoteStatusBarAction>,
     secondary_action: Option<RemoteStatusBarAction>,
     tertiary_action: Option<RemoteStatusBarAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteStatusBarConnectionSnapshot {
+    connected_label: String,
+    has_control: bool,
+    reconnecting: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteStatusBarClientKind {
+    Desktop,
+    Browser,
 }
 
 impl Drop for NativeDialogPauseGuard {
@@ -385,11 +398,180 @@ fn format_remote_latency_summary(stats: &RemoteLatencyStats) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" • "))
 }
 
-fn remote_role_label(has_control: bool) -> &'static str {
-    if has_control {
-        "Controller"
+fn remote_status_bar_client_kind(client_id: &str) -> RemoteStatusBarClientKind {
+    if client_id.starts_with("web-") {
+        RemoteStatusBarClientKind::Browser
     } else {
-        "Viewer"
+        RemoteStatusBarClientKind::Desktop
+    }
+}
+
+fn remote_host_ready_transports(host_status: &remote::RemoteHostStatus) -> (bool, bool) {
+    (
+        host_status.enabled && host_status.listening,
+        host_status.web_enabled && host_status.web_listener_error.is_none(),
+    )
+}
+
+fn remote_status_bar_action_button(action: RemoteStatusBarAction) -> chrome::StatusBarQuickAction {
+    let (label, tone) = match action {
+        RemoteStatusBarAction::ConnectPreferred => {
+            ("Quick connect".to_string(), chrome::StatusBarTone::Accent)
+        }
+        RemoteStatusBarAction::OpenRemoteConnectTab => {
+            ("Connect...".to_string(), chrome::StatusBarTone::Accent)
+        }
+        RemoteStatusBarAction::OpenRemoteHostTab => {
+            ("Host".to_string(), chrome::StatusBarTone::Accent)
+        }
+        RemoteStatusBarAction::RetryReconnect => {
+            ("Retry".to_string(), chrome::StatusBarTone::Accent)
+        }
+        RemoteStatusBarAction::DisconnectRemote => {
+            ("Disconnect".to_string(), chrome::StatusBarTone::Danger)
+        }
+        RemoteStatusBarAction::TakeRemoteControl | RemoteStatusBarAction::TakeHostControl => {
+            ("Take control".to_string(), chrome::StatusBarTone::Accent)
+        }
+    };
+    chrome::StatusBarQuickAction { label, tone }
+}
+
+fn build_remote_status_bar_transport_toggle(
+    icon_path: &'static str,
+    enabled: bool,
+    ready: bool,
+    has_error: bool,
+    count: usize,
+    active_tone: chrome::StatusBarTone,
+) -> chrome::StatusBarTransportToggle {
+    chrome::StatusBarTransportToggle {
+        icon_path,
+        enabled,
+        tone: if !enabled {
+            chrome::StatusBarTone::Muted
+        } else if has_error {
+            chrome::StatusBarTone::Danger
+        } else if ready {
+            active_tone
+        } else {
+            chrome::StatusBarTone::Warning
+        },
+        count: (count > 0).then_some(count),
+    }
+}
+
+fn remote_status_bar_local_control_label(
+    host_status: &remote::RemoteHostStatus,
+    local_has_control: bool,
+) -> Option<&'static str> {
+    if local_has_control {
+        None
+    } else {
+        Some(
+            match host_status
+                .controller_client_id
+                .as_deref()
+                .map(remote_status_bar_client_kind)
+            {
+                Some(RemoteStatusBarClientKind::Desktop) => "Desktop controls",
+                Some(RemoteStatusBarClientKind::Browser) => "Browser controls",
+                None => "Remote controls",
+            },
+        )
+    }
+}
+
+fn build_remote_status_bar_state(
+    remote_connection: Option<&RemoteStatusBarConnectionSnapshot>,
+    host_status: &remote::RemoteHostStatus,
+    preferred_host: Option<&remote::KnownRemoteHost>,
+    local_has_control: bool,
+    remote_notice_is_error: bool,
+) -> RemoteStatusBarState {
+    let (desktop_ready, browser_ready) = remote_host_ready_transports(host_status);
+    let host_issue =
+        (host_status.enabled && !desktop_ready) || (host_status.web_enabled && !browser_ready);
+    let native_host = build_remote_status_bar_transport_toggle(
+        icons::SERVER,
+        host_status.enabled,
+        desktop_ready,
+        host_status.listener_error.is_some(),
+        host_status.connected_native_clients,
+        chrome::StatusBarTone::Success,
+    );
+    let web_host = build_remote_status_bar_transport_toggle(
+        icons::GLOBE,
+        host_status.web_enabled,
+        browser_ready,
+        host_status.web_listener_error.is_some(),
+        host_status.connected_web_clients,
+        chrome::StatusBarTone::Accent,
+    );
+
+    if let Some(remote_connection) = remote_connection {
+        let primary_action = Some(if remote_connection.reconnecting {
+            RemoteStatusBarAction::RetryReconnect
+        } else {
+            if remote_connection.has_control {
+                RemoteStatusBarAction::DisconnectRemote
+            } else {
+                RemoteStatusBarAction::TakeRemoteControl
+            }
+        });
+        return RemoteStatusBarState {
+            model: chrome::RemoteStatusBarModel {
+                label: format!("Remote • {}", remote_connection.connected_label),
+                tone: if remote_connection.reconnecting {
+                    chrome::StatusBarTone::Warning
+                } else if remote_connection.has_control {
+                    chrome::StatusBarTone::Accent
+                } else {
+                    chrome::StatusBarTone::Warning
+                },
+                native_host,
+                web_host,
+                primary_action: primary_action.map(remote_status_bar_action_button),
+                secondary_action: None,
+                tertiary_action: None,
+            },
+            primary_action,
+            secondary_action: None,
+            tertiary_action: None,
+        };
+    }
+
+    let label = remote_status_bar_local_control_label(host_status, local_has_control)
+        .map(|detail| format!("Local • {detail}"))
+        .unwrap_or_else(|| "Local".to_string());
+    let primary_action = Some(if !local_has_control {
+        RemoteStatusBarAction::TakeHostControl
+    } else if host_issue {
+        RemoteStatusBarAction::OpenRemoteHostTab
+    } else if preferred_host.is_some() {
+        RemoteStatusBarAction::ConnectPreferred
+    } else {
+        RemoteStatusBarAction::OpenRemoteConnectTab
+    });
+    RemoteStatusBarState {
+        model: chrome::RemoteStatusBarModel {
+            label,
+            tone: if !local_has_control {
+                chrome::StatusBarTone::Warning
+            } else if host_issue || remote_notice_is_error {
+                chrome::StatusBarTone::Danger
+            } else {
+                chrome::StatusBarTone::Muted
+            },
+            native_host,
+            web_host,
+            primary_action: primary_action.map(remote_status_bar_action_button),
+            secondary_action: None,
+            tertiary_action: None,
+        },
+        primary_action,
+        secondary_action: None,
+        tertiary_action: None,
     }
 }
 
@@ -1028,6 +1210,15 @@ impl NativeShell {
         true
     }
 
+    fn ensure_local_host_mutation_control(&mut self) -> bool {
+        if self.local_host_has_control() {
+            return true;
+        }
+        self.remote_host_service.take_local_control();
+        self.editor_notice = Some("This machine controls the host again.".to_string());
+        true
+    }
+
     fn terminal_input_block_reason(&self) -> Option<String> {
         if let Some(remote_mode) = self.remote_mode.as_ref() {
             if remote_mode.reconnect.is_some() {
@@ -1177,7 +1368,7 @@ impl NativeShell {
                 .and_then(|reconnect| reconnect.last_error.clone());
             draft.remote_has_control = remote_has_control;
             draft.remote_connected = remote_connected;
-            draft.remote_host_clients = remote_status.connected_clients;
+            draft.remote_host_clients = remote_status.connected_native_clients;
             draft.remote_host_controller_client_id = remote_status.controller_client_id;
             draft.remote_host_listening = remote_status.listening;
             draft.remote_host_error = remote_status.listener_error;
@@ -1370,11 +1561,38 @@ impl NativeShell {
     }
 
     fn preferred_known_remote_host(&self) -> Option<remote::KnownRemoteHost> {
+        let local_server_id = self.remote_machine_state.host.server_id.trim();
         self.remote_machine_state
             .known_hosts
             .iter()
+            .filter(|host| {
+                local_server_id.is_empty()
+                    || host.server_id.trim().is_empty()
+                    || host.server_id.trim() != local_server_id
+            })
             .max_by_key(|host| host.last_connected_epoch_ms.unwrap_or(0))
             .cloned()
+    }
+
+    fn status_bar_remote_tab(&self) -> RemoteTopTab {
+        RemoteTopTab::Connect
+    }
+
+    fn ensure_remote_settings_open_with_tab(&mut self, tab: RemoteTopTab, cx: &mut Context<Self>) {
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            if draft.remote_focus_only {
+                draft.remote_active_tab = tab;
+                self.sync_settings_remote_draft();
+                cx.notify();
+                return;
+            }
+        }
+        self.open_settings_panel(true, cx);
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            draft.remote_active_tab = tab;
+        }
+        self.sync_settings_remote_draft();
+        cx.notify();
     }
 
     fn ensure_remote_settings_open(&mut self, cx: &mut Context<Self>) {
@@ -1392,20 +1610,43 @@ impl NativeShell {
         self.open_settings_panel(true, cx);
     }
 
+    fn toggle_local_status_bar_hosting(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_local_host_mutation_control() {
+            return;
+        }
+        self.remote_machine_state.host.enabled = !self.remote_machine_state.host.enabled;
+        self.remote_host_service
+            .apply_config(self.remote_machine_state.host.clone());
+        self.persist_remote_machine_state();
+        self.sync_settings_remote_draft();
+        cx.notify();
+    }
+
+    fn toggle_local_status_bar_web_hosting(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_local_host_mutation_control() {
+            return;
+        }
+        self.remote_machine_state.host.web.enabled = !self.remote_machine_state.host.web.enabled;
+        self.remote_machine_state.host.web.ensure_secrets();
+        self.remote_host_service
+            .apply_config(self.remote_machine_state.host.clone());
+        self.persist_remote_machine_state();
+        self.sync_settings_remote_draft();
+        cx.notify();
+    }
+
     fn copy_remote_pairing_token_action(&mut self, cx: &mut Context<Self>) {
         let token = self.remote_host_service.status().pairing_token;
         if token.trim().is_empty() {
-            self.editor_notice = Some(
-                "Generate or enable hosting before copying a desktop pair token.".to_string(),
-            );
+            self.editor_notice =
+                Some("Generate or enable hosting before copying a desktop pair token.".to_string());
             self.set_remote_status_notice(
                 "Generate or enable hosting before copying a desktop pair token.",
                 true,
             );
         } else {
             cx.write_to_clipboard(ClipboardItem::new_string(token));
-            self.editor_notice =
-                Some("Copied desktop pair token to the clipboard.".to_string());
+            self.editor_notice = Some("Copied desktop pair token to the clipboard.".to_string());
             self.set_remote_status_notice("Copied desktop pair token to the clipboard.", false);
         }
         self.sync_settings_remote_draft();
@@ -1419,7 +1660,10 @@ impl NativeShell {
         if !self.remote_machine_state.host.web.enabled {
             self.editor_notice =
                 Some("Enable browser access before copying an invite link.".to_string());
-            self.set_remote_status_notice("Enable browser access before copying an invite link.", true);
+            self.set_remote_status_notice(
+                "Enable browser access before copying an invite link.",
+                true,
+            );
         } else if let Some(error) = status.web_listener_error {
             self.editor_notice = Some(error.clone());
             self.set_remote_status_notice(&error, true);
@@ -1490,299 +1734,29 @@ impl NativeShell {
 
     #[allow(dead_code)]
     fn remote_status_bar_model(&self) -> chrome::RemoteStatusBarModel {
-        let host_status = self.remote_host_service.status();
-        let preferred_host = self.preferred_known_remote_host();
-
-        if let Some(remote_mode) = self.remote_mode.as_ref() {
-            if remote_mode.reconnect.is_some() {
-                return chrome::RemoteStatusBarModel {
-                    label: format!("Reconnecting • {}", remote_mode.connected_label),
-                    tone: chrome::StatusBarTone::Warning,
-                    primary_action: Some(chrome::StatusBarQuickAction {
-                        label: "Retry now".to_string(),
-                        tone: chrome::StatusBarTone::Accent,
-                    }),
-                    secondary_action: Some(chrome::StatusBarQuickAction {
-                        label: "Disconnect".to_string(),
-                        tone: chrome::StatusBarTone::Danger,
-                    }),
-                    tertiary_action: None,
-                };
-            }
-
-            return chrome::RemoteStatusBarModel {
-                label: format!(
-                    "Connected • {} • {}",
-                    remote_role_label(remote_mode.snapshot.you_have_control),
-                    remote_mode.connected_label
-                ),
-                tone: if remote_mode.snapshot.you_have_control {
-                    chrome::StatusBarTone::Accent
-                } else {
-                    chrome::StatusBarTone::Warning
-                },
-                primary_action: Some(chrome::StatusBarQuickAction {
-                    label: if remote_mode.snapshot.you_have_control {
-                        "Release".to_string()
-                    } else {
-                        "Take control".to_string()
-                    },
-                    tone: if remote_mode.snapshot.you_have_control {
-                        chrome::StatusBarTone::Muted
-                    } else {
-                        chrome::StatusBarTone::Accent
-                    },
-                }),
-                secondary_action: Some(chrome::StatusBarQuickAction {
-                    label: "Disconnect".to_string(),
-                    tone: chrome::StatusBarTone::Danger,
-                }),
-                tertiary_action: None,
-            };
-        }
-
-        if host_status.enabled {
-            let (label, tone) = if !host_status.listening {
-                (
-                    format!(
-                        "Hosting issue • {}:{}",
-                        host_status.bind_address, host_status.port
-                    ),
-                    chrome::StatusBarTone::Danger,
-                )
-            } else if self.local_host_has_control() {
-                (
-                    format!("Hosting • Controller • {}", host_status.port),
-                    chrome::StatusBarTone::Success,
-                )
-            } else {
-                (
-                    format!("Hosting • Viewer • {}", host_status.port),
-                    chrome::StatusBarTone::Warning,
-                )
-            };
-            return chrome::RemoteStatusBarModel {
-                label,
-                tone,
-                primary_action: (!self.local_host_has_control()).then_some(
-                    chrome::StatusBarQuickAction {
-                        label: "Take local control".to_string(),
-                        tone: chrome::StatusBarTone::Accent,
-                    },
-                ),
-                secondary_action: Some(chrome::StatusBarQuickAction {
-                    label: "Copy token".to_string(),
-                    tone: chrome::StatusBarTone::Accent,
-                }),
-                tertiary_action: None,
-            };
-        }
-
-        if self
-            .remote_status_notice
-            .as_ref()
-            .is_some_and(|notice| notice.is_error)
-        {
-            return chrome::RemoteStatusBarModel {
-                label: "Remote error".to_string(),
-                tone: chrome::StatusBarTone::Danger,
-                primary_action: Some(chrome::StatusBarQuickAction {
-                    label: if preferred_host.is_some() {
-                        "Connect".to_string()
-                    } else {
-                        "Remote".to_string()
-                    },
-                    tone: chrome::StatusBarTone::Accent,
-                }),
-                secondary_action: None,
-                tertiary_action: None,
-            };
-        }
-
-        chrome::RemoteStatusBarModel {
-            label: preferred_host
-                .as_ref()
-                .map(|host| format!("Local • {}", host.label))
-                .unwrap_or_else(|| "Local".to_string()),
-            tone: chrome::StatusBarTone::Muted,
-            primary_action: Some(chrome::StatusBarQuickAction {
-                label: if preferred_host.is_some() {
-                    "Connect".to_string()
-                } else {
-                    "Remote".to_string()
-                },
-                tone: chrome::StatusBarTone::Accent,
-            }),
-            secondary_action: None,
-            tertiary_action: None,
-        }
+        self.remote_status_bar_state().model
     }
 
     fn remote_status_bar_state(&self) -> RemoteStatusBarState {
         let host_status = self.remote_host_service.status();
         let preferred_host = self.preferred_known_remote_host();
-
-        if let Some(remote_mode) = self.remote_mode.as_ref() {
-            if remote_mode.reconnect.is_some() {
-                return RemoteStatusBarState {
-                    model: chrome::RemoteStatusBarModel {
-                        label: format!("Reconnecting • {}", remote_mode.connected_label),
-                        tone: chrome::StatusBarTone::Warning,
-                        primary_action: Some(chrome::StatusBarQuickAction {
-                            label: "Retry now".to_string(),
-                            tone: chrome::StatusBarTone::Accent,
-                        }),
-                        secondary_action: Some(chrome::StatusBarQuickAction {
-                            label: "Disconnect".to_string(),
-                            tone: chrome::StatusBarTone::Danger,
-                        }),
-                        tertiary_action: None,
-                    },
-                    primary_action: Some(RemoteStatusBarAction::RetryReconnect),
-                    secondary_action: Some(RemoteStatusBarAction::DisconnectRemote),
-                    tertiary_action: None,
-                };
-            }
-
-            return RemoteStatusBarState {
-                model: chrome::RemoteStatusBarModel {
-                    label: format!(
-                        "Connected • {} • {}",
-                        remote_role_label(remote_mode.snapshot.you_have_control),
-                        remote_mode.connected_label
-                    ),
-                    tone: if remote_mode.snapshot.you_have_control {
-                        chrome::StatusBarTone::Accent
-                    } else {
-                        chrome::StatusBarTone::Warning
-                    },
-                    primary_action: Some(chrome::StatusBarQuickAction {
-                        label: if remote_mode.snapshot.you_have_control {
-                            "Release".to_string()
-                        } else {
-                            "Take control".to_string()
-                        },
-                        tone: if remote_mode.snapshot.you_have_control {
-                            chrome::StatusBarTone::Muted
-                        } else {
-                            chrome::StatusBarTone::Accent
-                        },
-                    }),
-                    secondary_action: Some(chrome::StatusBarQuickAction {
-                        label: "Disconnect".to_string(),
-                        tone: chrome::StatusBarTone::Danger,
-                    }),
-                    tertiary_action: None,
-                },
-                primary_action: Some(if remote_mode.snapshot.you_have_control {
-                    RemoteStatusBarAction::ReleaseRemoteControl
-                } else {
-                    RemoteStatusBarAction::TakeRemoteControl
-                }),
-                secondary_action: Some(RemoteStatusBarAction::DisconnectRemote),
-                tertiary_action: None,
-            };
-        }
-
-        if host_status.enabled {
-            let (label, tone) = if !host_status.listening {
-                (
-                    format!(
-                        "Hosting issue • {}:{}",
-                        host_status.bind_address, host_status.port
-                    ),
-                    chrome::StatusBarTone::Danger,
-                )
-            } else if self.local_host_has_control() {
-                (
-                    format!("Hosting • Controller • {}", host_status.port),
-                    chrome::StatusBarTone::Success,
-                )
-            } else {
-                (
-                    format!("Hosting • Viewer • {}", host_status.port),
-                    chrome::StatusBarTone::Warning,
-                )
-            };
-            return RemoteStatusBarState {
-                model: chrome::RemoteStatusBarModel {
-                    label,
-                    tone,
-                    primary_action: (!self.local_host_has_control()).then_some(
-                        chrome::StatusBarQuickAction {
-                            label: "Take local control".to_string(),
-                            tone: chrome::StatusBarTone::Accent,
-                        },
-                    ),
-                    secondary_action: Some(chrome::StatusBarQuickAction {
-                        label: "Copy token".to_string(),
-                        tone: chrome::StatusBarTone::Accent,
-                    }),
-                    tertiary_action: None,
-                },
-                primary_action: (!self.local_host_has_control())
-                    .then_some(RemoteStatusBarAction::TakeHostControl),
-                secondary_action: Some(RemoteStatusBarAction::CopyPairToken),
-                tertiary_action: None,
-            };
-        }
-
-        if self
-            .remote_status_notice
-            .as_ref()
-            .is_some_and(|notice| notice.is_error)
-        {
-            return RemoteStatusBarState {
-                model: chrome::RemoteStatusBarModel {
-                    label: "Remote error".to_string(),
-                    tone: chrome::StatusBarTone::Danger,
-                    primary_action: Some(chrome::StatusBarQuickAction {
-                        label: if preferred_host.is_some() {
-                            "Connect".to_string()
-                        } else {
-                            "Remote".to_string()
-                        },
-                        tone: chrome::StatusBarTone::Accent,
-                    }),
-                    secondary_action: None,
-                    tertiary_action: None,
-                },
-                primary_action: Some(if preferred_host.is_some() {
-                    RemoteStatusBarAction::ConnectPreferred
-                } else {
-                    RemoteStatusBarAction::OpenRemoteSettings
-                }),
-                secondary_action: None,
-                tertiary_action: None,
-            };
-        }
-
-        RemoteStatusBarState {
-            model: chrome::RemoteStatusBarModel {
-                label: preferred_host
-                    .as_ref()
-                    .map(|host| format!("Local • {}", host.label))
-                    .unwrap_or_else(|| "Local".to_string()),
-                tone: chrome::StatusBarTone::Muted,
-                primary_action: Some(chrome::StatusBarQuickAction {
-                    label: if preferred_host.is_some() {
-                        "Connect".to_string()
-                    } else {
-                        "Remote".to_string()
-                    },
-                    tone: chrome::StatusBarTone::Accent,
-                }),
-                secondary_action: None,
-                tertiary_action: None,
-            },
-            primary_action: Some(if preferred_host.is_some() {
-                RemoteStatusBarAction::ConnectPreferred
-            } else {
-                RemoteStatusBarAction::OpenRemoteSettings
-            }),
-            secondary_action: None,
-            tertiary_action: None,
-        }
+        let remote_connection =
+            self.remote_mode
+                .as_ref()
+                .map(|remote_mode| RemoteStatusBarConnectionSnapshot {
+                    connected_label: remote_mode.connected_label.clone(),
+                    has_control: remote_mode.snapshot.you_have_control,
+                    reconnecting: remote_mode.reconnect.is_some(),
+                });
+        build_remote_status_bar_state(
+            remote_connection.as_ref(),
+            &host_status,
+            preferred_host.as_ref(),
+            self.local_host_has_control(),
+            self.remote_status_notice
+                .as_ref()
+                .is_some_and(|notice| notice.is_error),
+        )
     }
 
     fn prepare_remote_connect(
@@ -4003,6 +3977,7 @@ impl NativeShell {
         self.open_editor(
             EditorPanel::Settings(SettingsDraft {
                 remote_focus_only,
+                remote_active_tab: RemoteTopTab::Connect,
                 default_terminal: settings.default_terminal,
                 mac_terminal_profile: settings.mac_terminal_profile.unwrap_or_default(),
                 theme: settings.theme,
@@ -4063,7 +4038,7 @@ impl NativeShell {
                 remote_reconnect_last_error,
                 remote_has_control: self.remote_has_control(),
                 remote_connected: self.remote_mode.is_some(),
-                remote_host_clients: remote_status.connected_clients,
+                remote_host_clients: remote_status.connected_native_clients,
                 remote_host_controller_client_id: remote_status.controller_client_id,
                 remote_host_listening: remote_status.listening,
                 remote_host_error: remote_status.listener_error,
@@ -5920,6 +5895,12 @@ impl NativeShell {
                     self.apply_settings_draft(cx);
                 }
             }
+            EditorAction::SelectRemoteTopTab(tab) => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.remote_active_tab = tab;
+                    cx.notify();
+                }
+            }
             EditorAction::ToggleRemoteHosting => {
                 if !self.ensure_mutation_control(cx) {
                     return;
@@ -6165,7 +6146,8 @@ impl NativeShell {
                     .web
                     .paired_clients
                     .retain(|client| client.client_id != client_id);
-                self.remote_host_service.revoke_paired_web_client(&client_id);
+                self.remote_host_service
+                    .revoke_paired_web_client(&client_id);
                 self.persist_remote_machine_state();
                 self.sync_settings_remote_draft();
                 self.editor_notice = Some("Revoked paired browser.".to_string());
@@ -9949,9 +9931,21 @@ impl Render for NativeShell {
             };
         let make_open_remote_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
             Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                this.ensure_remote_settings_open(cx);
+                this.ensure_remote_settings_open_with_tab(this.status_bar_remote_tab(), cx);
             }))
         };
+        let make_remote_native_toggle_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.toggle_local_status_bar_hosting(cx);
+                }))
+            };
+        let make_remote_web_toggle_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.toggle_local_status_bar_web_hosting(cx);
+                }))
+            };
         let make_remote_status_action_handler = |action: RemoteStatusBarAction| -> Box<
             dyn Fn(&MouseDownEvent, &mut Window, &mut App),
         > {
@@ -9959,6 +9953,12 @@ impl Render for NativeShell {
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| match action {
                     RemoteStatusBarAction::ConnectPreferred => {
                         this.connect_preferred_remote_host_action(cx);
+                    }
+                    RemoteStatusBarAction::OpenRemoteConnectTab => {
+                        this.ensure_remote_settings_open_with_tab(RemoteTopTab::Connect, cx);
+                    }
+                    RemoteStatusBarAction::OpenRemoteHostTab => {
+                        this.ensure_remote_settings_open_with_tab(RemoteTopTab::Host, cx);
                     }
                     RemoteStatusBarAction::RetryReconnect => {
                         this.force_remote_reconnect_now(cx);
@@ -9978,27 +9978,12 @@ impl Render for NativeShell {
                         this.sync_settings_remote_draft();
                         cx.notify();
                     }
-                    RemoteStatusBarAction::ReleaseRemoteControl => {
-                        if let Some(remote_mode) = this.remote_mode.as_ref() {
-                            remote_mode.client.release_control();
-                        }
-                        this.editor_notice =
-                            Some("This client released control and is now a viewer.".to_string());
-                        this.sync_settings_remote_draft();
-                        cx.notify();
-                    }
                     RemoteStatusBarAction::TakeHostControl => {
                         this.remote_host_service.take_local_control();
                         this.editor_notice =
                             Some("This machine controls the host again.".to_string());
                         this.sync_settings_remote_draft();
                         cx.notify();
-                    }
-                    RemoteStatusBarAction::CopyPairToken => {
-                        this.copy_remote_pairing_token_action(cx);
-                    }
-                    RemoteStatusBarAction::OpenRemoteSettings => {
-                        this.ensure_remote_settings_open(cx);
                     }
                 }),
             )
@@ -10752,6 +10737,8 @@ impl Render for NativeShell {
                         chrome::StatusBarActions {
                             on_install_update: &make_install_update_handler,
                             on_open_remote: &make_open_remote_handler,
+                            on_remote_native_toggle: &make_remote_native_toggle_handler,
+                            on_remote_web_toggle: &make_remote_web_toggle_handler,
                             on_remote_primary: remote_primary_handler.as_ref().map(|handler| {
                                 handler
                                     as &dyn Fn() -> Box<
@@ -12967,6 +12954,26 @@ mod tests {
         }
     }
 
+    fn sample_remote_host_status() -> remote::RemoteHostStatus {
+        remote::RemoteHostStatus {
+            enabled: false,
+            web_enabled: false,
+            bind_address: "127.0.0.1".to_string(),
+            port: 43871,
+            pairing_token: "PAIR1234".to_string(),
+            connected_clients: 0,
+            connected_native_clients: 0,
+            connected_web_clients: 0,
+            controller_client_id: None,
+            listening: false,
+            listener_error: None,
+            web_listener_error: None,
+            last_connection_note: None,
+            last_connection_is_error: false,
+            latency: RemoteLatencyStats::default(),
+        }
+    }
+
     #[test]
     fn multiline_editor_cursor_moves_between_lines() {
         let value = "abc\nde\nfghi";
@@ -13013,6 +13020,140 @@ mod tests {
         assert_eq!(value, "3001");
         assert_eq!(cursor, 4);
         assert_eq!(selection_anchor, None);
+    }
+
+    #[test]
+    fn remote_status_bar_idle_state_shows_local_with_transport_toggles() {
+        let status = sample_remote_host_status();
+        let preferred_host = remote::KnownRemoteHost {
+            label: "Studio".to_string(),
+            ..Default::default()
+        };
+
+        let state =
+            build_remote_status_bar_state(None, &status, Some(&preferred_host), true, false);
+
+        assert_eq!(state.model.label, "Local");
+        assert!(!state.model.native_host.enabled);
+        assert_eq!(state.model.native_host.count, None);
+        assert_eq!(state.model.native_host.tone, chrome::StatusBarTone::Muted);
+        assert!(!state.model.web_host.enabled);
+        assert_eq!(state.model.web_host.count, None);
+        assert_eq!(state.model.web_host.tone, chrome::StatusBarTone::Muted);
+        assert_eq!(
+            state.primary_action,
+            Some(RemoteStatusBarAction::ConnectPreferred)
+        );
+        assert_eq!(
+            state
+                .model
+                .primary_action
+                .as_ref()
+                .map(|action| action.label.as_str()),
+            Some("Quick connect")
+        );
+        assert_eq!(state.secondary_action, None);
+    }
+
+    #[test]
+    fn remote_status_bar_local_hosting_state_uses_transport_icons() {
+        let mut status = sample_remote_host_status();
+        status.enabled = true;
+        status.web_enabled = true;
+        status.listening = true;
+
+        let state = build_remote_status_bar_state(None, &status, None, true, false);
+
+        assert_eq!(state.model.label, "Local");
+        assert!(state.model.native_host.enabled);
+        assert_eq!(state.model.native_host.count, None);
+        assert_eq!(state.model.native_host.tone, chrome::StatusBarTone::Success);
+        assert!(state.model.web_host.enabled);
+        assert_eq!(state.model.web_host.count, None);
+        assert_eq!(state.model.web_host.tone, chrome::StatusBarTone::Accent);
+        assert_eq!(
+            state.primary_action,
+            Some(RemoteStatusBarAction::OpenRemoteConnectTab)
+        );
+        assert_eq!(
+            state
+                .model
+                .primary_action
+                .as_ref()
+                .map(|action| action.label.as_str()),
+            Some("Connect...")
+        );
+    }
+
+    #[test]
+    fn remote_status_bar_local_hosting_counts_show_on_transport_icons() {
+        let mut status = sample_remote_host_status();
+        status.enabled = true;
+        status.web_enabled = true;
+        status.listening = true;
+        status.connected_clients = 3;
+        status.connected_native_clients = 2;
+        status.connected_web_clients = 1;
+        status.controller_client_id = Some("web-1".to_string());
+
+        let state = build_remote_status_bar_state(None, &status, None, false, false);
+
+        assert_eq!(state.model.label, "Local • Browser controls");
+        assert_eq!(state.model.native_host.count, Some(2));
+        assert_eq!(state.model.web_host.count, Some(1));
+        assert_eq!(
+            state.primary_action,
+            Some(RemoteStatusBarAction::TakeHostControl)
+        );
+    }
+
+    #[test]
+    fn remote_status_bar_remote_connection_prioritizes_remote_label_but_keeps_local_host_icons() {
+        let mut status = sample_remote_host_status();
+        status.enabled = true;
+        status.web_enabled = true;
+        status.listening = true;
+        status.connected_clients = 1;
+        status.connected_native_clients = 0;
+        status.connected_web_clients = 1;
+        let remote_connection = RemoteStatusBarConnectionSnapshot {
+            connected_label: "Studio".to_string(),
+            has_control: false,
+            reconnecting: false,
+        };
+
+        let state =
+            build_remote_status_bar_state(Some(&remote_connection), &status, None, true, false);
+
+        assert_eq!(state.model.label, "Remote • Studio");
+        assert!(state.model.native_host.enabled);
+        assert_eq!(state.model.native_host.count, None);
+        assert_eq!(state.model.native_host.tone, chrome::StatusBarTone::Success);
+        assert!(state.model.web_host.enabled);
+        assert_eq!(state.model.web_host.count, Some(1));
+        assert_eq!(
+            state.primary_action,
+            Some(RemoteStatusBarAction::TakeRemoteControl)
+        );
+    }
+
+    #[test]
+    fn remote_status_bar_remote_reconnect_surfaces_retry_action() {
+        let status = sample_remote_host_status();
+        let remote_connection = RemoteStatusBarConnectionSnapshot {
+            connected_label: "Studio".to_string(),
+            has_control: true,
+            reconnecting: true,
+        };
+
+        let state =
+            build_remote_status_bar_state(Some(&remote_connection), &status, None, true, false);
+
+        assert_eq!(state.model.label, "Remote • Studio");
+        assert_eq!(
+            state.primary_action,
+            Some(RemoteStatusBarAction::RetryReconnect)
+        );
     }
 
     #[test]

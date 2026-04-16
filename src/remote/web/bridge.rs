@@ -47,7 +47,11 @@ pub(crate) async fn ws_handler(
     headers: HeaderMap,
 ) -> Response {
     let Some(client_id) = authenticate_request(&state, &headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid web auth cookie").into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid web auth cookie",
+        )
+            .into_response();
     };
     let inner = state.inner.clone();
     ws.on_upgrade(move |socket| run_session(socket, inner, client_id))

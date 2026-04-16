@@ -8,6 +8,7 @@ describe("PairingGate", () => {
     const html = renderToStaticMarkup(<PairingGate />);
 
     expect(html).toContain("Remote");
+    expect(html).toContain("Host");
     expect(html).toContain("Browser Access");
     expect(html).toContain("Browser pair token");
     expect(html).toContain("Pair browser");

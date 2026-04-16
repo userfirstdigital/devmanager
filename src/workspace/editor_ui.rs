@@ -1540,12 +1540,13 @@ pub(super) fn render_compact_text_input(
                 .text_color(rgb(theme::TEXT_PRIMARY))
                 .child(SharedString::from(label.to_string())),
         )
-        .child(
+        .children((!hint.is_empty()).then(|| {
             div()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_SUBTLE))
-                .child(SharedString::from(hint.to_string())),
-        )
+                .child(SharedString::from(hint.to_string()))
+                .into_any_element()
+        }))
         .child(input)
 }
 
@@ -2162,78 +2163,77 @@ fn render_info_row_with_badge(
     badge: Option<SurfaceBadge>,
     actions: Vec<FormAction>,
 ) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(label.to_string())),
-                        )
-                        .children(hint.map(|hint| {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SUBTLE))
-                                .child(SharedString::from(hint))
+    let header = (!label.is_empty() || hint.is_some() || badge.is_some()).then(|| {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .children((!label.is_empty()).then(|| {
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(SharedString::from(label.to_string()))
+                            .into_any_element()
+                    }))
+                    .children(hint.map(|hint| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_SUBTLE))
+                            .child(SharedString::from(hint))
+                            .into_any_element()
+                    })),
+            )
+            .children(badge.map(|badge| render_surface_badge(badge).into_any_element()))
+            .into_any_element()
+    });
+
+    div().flex().flex_col().gap(px(6.0)).children(header).child(
+        div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .rounded_md()
+            .bg(rgb(theme::EDITOR_FIELD_BG))
+            .border_1()
+            .border_color(rgb(theme::BORDER_PRIMARY))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_sm()
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(SharedString::from(value.to_string())),
+                    )
+                    .children((!actions.is_empty()).then(|| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .flex_shrink_0()
+                            .children(actions.into_iter().map(|action| {
+                                render_compact_surface_action_button(
+                                    action.value.as_str(),
+                                    action.style,
+                                    action.on_click,
+                                )
                                 .into_any_element()
-                        })),
-                )
-                .children(badge.map(|badge| render_surface_badge(badge).into_any_element())),
-        )
-        .child(
-            div()
-                .px(px(12.0))
-                .py(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
-                .border_1()
-                .border_color(rgb(theme::BORDER_PRIMARY))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .text_sm()
-                                .text_color(rgb(theme::TEXT_PRIMARY))
-                                .child(SharedString::from(value.to_string())),
-                        )
-                        .children((!actions.is_empty()).then(|| {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .flex_shrink_0()
-                                .children(actions.into_iter().map(|action| {
-                                    render_compact_surface_action_button(
-                                        action.value.as_str(),
-                                        action.style,
-                                        action.on_click,
-                                    )
-                                    .into_any_element()
-                                }))
-                                .into_any_element()
-                        })),
-                ),
-        )
+                            }))
+                            .into_any_element()
+                    })),
+            ),
+    )
 }
 
 fn tone_colors(tone: SurfaceTone) -> (u32, u32, u32) {

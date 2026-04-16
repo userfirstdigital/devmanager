@@ -9,7 +9,7 @@ use time::{format_description, OffsetDateTime};
 
 pub const STATUS_BAR_HEIGHT_PX: f32 = 22.0;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusBarTone {
     Muted,
     Accent,
@@ -23,9 +23,18 @@ pub struct StatusBarQuickAction {
     pub tone: StatusBarTone,
 }
 
+pub struct StatusBarTransportToggle {
+    pub icon_path: &'static str,
+    pub enabled: bool,
+    pub tone: StatusBarTone,
+    pub count: Option<usize>,
+}
+
 pub struct RemoteStatusBarModel {
     pub label: String,
     pub tone: StatusBarTone,
+    pub native_host: StatusBarTransportToggle,
+    pub web_host: StatusBarTransportToggle,
     pub primary_action: Option<StatusBarQuickAction>,
     pub secondary_action: Option<StatusBarQuickAction>,
     pub tertiary_action: Option<StatusBarQuickAction>,
@@ -34,6 +43,9 @@ pub struct RemoteStatusBarModel {
 pub struct StatusBarActions<'a> {
     pub on_install_update: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_open_remote: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_remote_native_toggle:
+        &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    pub on_remote_web_toggle: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_remote_primary:
         Option<&'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_remote_secondary:
@@ -215,6 +227,14 @@ fn render_remote_status(
                 .child(SharedString::from(remote.label.clone()))
                 .on_mouse_down(MouseButton::Left, (actions.on_open_remote)()),
         )
+        .child(render_status_bar_transport_toggle(
+            &remote.native_host,
+            (actions.on_remote_native_toggle)(),
+        ))
+        .child(render_status_bar_transport_toggle(
+            &remote.web_host,
+            (actions.on_remote_web_toggle)(),
+        ))
         .children(
             remote
                 .primary_action
@@ -242,6 +262,40 @@ fn render_remote_status(
                     render_status_bar_action(action, handler).into_any_element()
                 }),
         )
+}
+
+fn render_status_bar_transport_toggle(
+    toggle: &StatusBarTransportToggle,
+    handler: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+) -> impl IntoElement {
+    let count = if toggle.enabled { toggle.count } else { None };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(3.0))
+        .px(px(5.0))
+        .h(px(16.0))
+        .rounded_full()
+        .bg(rgb(status_bar_tone_bg(toggle.tone)))
+        .border_1()
+        .border_color(rgb(status_bar_tone_border(toggle.tone)))
+        .text_xs()
+        .text_color(rgb(status_bar_tone_text(toggle.tone)))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(status_bar_tone_hover_bg(toggle.tone))))
+        .child(icons::app_icon(
+            toggle.icon_path,
+            10.0,
+            status_bar_tone_text(toggle.tone),
+        ))
+        .children(count.map(|count| {
+            div()
+                .text_xs()
+                .text_color(rgb(status_bar_tone_text(toggle.tone)))
+                .child(SharedString::from(count.to_string()))
+                .into_any_element()
+        }))
+        .on_mouse_down(MouseButton::Left, handler)
 }
 
 fn render_status_bar_action(
