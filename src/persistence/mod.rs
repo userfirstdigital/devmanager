@@ -387,6 +387,7 @@ fn default_settings_object() -> Map<String, Value> {
 mod tests {
     use super::*;
     use crate::models::{AppConfig, Project};
+    use crate::remote::test_support::TestProfileEnvGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_test_dir(label: &str) -> PathBuf {
@@ -417,6 +418,7 @@ mod tests {
 
     #[test]
     fn app_config_dir_name_defaults_without_profile() {
+        let _profile = TestProfileEnvGuard::without_profile();
         assert_eq!(app_config_dir_name(), "com.userfirst.devmanager");
     }
 

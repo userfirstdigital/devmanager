@@ -360,11 +360,6 @@ impl FormActionGroup {
         }
     }
 
-    pub fn hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-
     pub fn action(mut self, action: FormAction) -> Self {
         self.actions.push(action);
         self
@@ -1425,6 +1420,7 @@ pub(super) fn render_text_field(
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .gap(px(3.0))
@@ -1478,6 +1474,7 @@ pub(super) fn render_multiline_field(
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .gap(px(3.0))
@@ -2004,6 +2001,7 @@ pub(super) fn render_toggle_row_with_hint(
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .gap(px(3.0))

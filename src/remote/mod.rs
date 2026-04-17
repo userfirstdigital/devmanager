@@ -1,7 +1,9 @@
+mod access_log;
 mod client_pool;
 mod transport;
 pub mod web;
 
+pub use access_log::{RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource};
 pub use client_pool::RemoteClientPool;
 pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
 
@@ -37,6 +39,7 @@ const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const REMOTE_ACCESS_LOG_LIMIT: usize = 100;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
@@ -804,6 +807,21 @@ pub(crate) fn mutate_host_config<T>(
     Ok(result)
 }
 
+pub(crate) fn append_remote_access_activity_event(
+    config: &mut RemoteHostConfig,
+    event: RemoteAccessActivityEvent,
+) {
+    config.web.activity_log.push(event);
+    if config.web.activity_log.len() > REMOTE_ACCESS_LOG_LIMIT {
+        let overflow = config
+            .web
+            .activity_log
+            .len()
+            .saturating_sub(REMOTE_ACCESS_LOG_LIMIT);
+        config.web.activity_log.drain(0..overflow);
+    }
+}
+
 pub fn remote_state_path() -> Result<PathBuf, PersistenceError> {
     Ok(persistence::app_config_dir()?.join(REMOTE_FILE_NAME))
 }
@@ -1387,21 +1405,20 @@ impl RemoteHostService {
     }
 
     pub fn revoke_paired_web_client(&self, client_id: &str) -> bool {
-        let mut removed = false;
-        let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
-            return false;
-        };
-        if let Ok(mut config) = self.inner.config.write() {
+        let removed = match mutate_host_config(&self.inner, |config| {
             let before = config.web.paired_clients.len();
             config
                 .web
                 .paired_clients
                 .retain(|client| client.client_id != client_id);
-            removed = config.web.paired_clients.len() != before;
-        }
-        if removed {
-            self.bump_config_revision();
-        }
+            config.web.activity_log.retain(|event| {
+                !(event.source == RemoteAccessSource::Browser && event.client_id == client_id)
+            });
+            config.web.paired_clients.len() != before
+        }) {
+            Ok(removed) => removed,
+            Err(_) => return false,
+        };
 
         if let Ok(mut clients) = self.inner.clients.lock() {
             let connection_ids: Vec<u64> = clients
@@ -1427,6 +1444,58 @@ impl RemoteHostService {
         }
 
         removed
+    }
+
+    pub fn reset_browser_access(&self) -> bool {
+        let removed_client_ids = match mutate_host_config(&self.inner, |config| {
+            let removed_ids = config
+                .web
+                .paired_clients
+                .iter()
+                .map(|client| client.client_id.clone())
+                .collect::<Vec<_>>();
+            config.web.paired_clients.clear();
+            config
+                .web
+                .activity_log
+                .retain(|event| event.source != RemoteAccessSource::Browser);
+            config.web.cookie_secret_hex = web::generate_cookie_secret_hex();
+            removed_ids
+        }) {
+            Ok(removed_client_ids) => removed_client_ids,
+            Err(_) => return false,
+        };
+        let removed_client_ids: HashSet<String> = removed_client_ids.into_iter().collect();
+
+        if let Ok(mut clients) = self.inner.clients.lock() {
+            let connection_ids: Vec<u64> = clients
+                .iter()
+                .filter_map(|(connection_id, client)| {
+                    (client.client_id.starts_with("web-")
+                        || removed_client_ids.contains(client.client_id.as_str()))
+                    .then_some(*connection_id)
+                })
+                .collect();
+            for connection_id in connection_ids {
+                if let Some(client) = clients.remove(&connection_id) {
+                    let _ = client.sender.send(ServerMessage::Disconnected {
+                        message: "Browser access was reset. Pair again to reconnect.".to_string(),
+                    });
+                }
+            }
+        }
+
+        if let Ok(mut controller) = self.inner.controller_client_id.write() {
+            if controller
+                .as_deref()
+                .map(|client_id| client_id.starts_with("web-"))
+                .unwrap_or(false)
+            {
+                *controller = None;
+            }
+        }
+
+        true
     }
 
     pub fn local_has_control(&self) -> bool {
@@ -2445,7 +2514,9 @@ pub(crate) fn deliver_pending_bootstraps(
     let due_session_ids_set: HashSet<String> = due_session_ids.iter().cloned().collect();
     let bootstraps: HashMap<String, RemoteSessionBootstrap> = due_session_ids
         .iter()
-        .filter_map(|session_id| provider(session_id).map(|bootstrap| (session_id.clone(), bootstrap)))
+        .filter_map(|session_id| {
+            provider(session_id).map(|bootstrap| (session_id.clone(), bootstrap))
+        })
         .collect();
     if bootstraps.is_empty() {
         return;
@@ -2456,8 +2527,11 @@ pub(crate) fn deliver_pending_bootstraps(
     };
     let mut dead_connections = Vec::new();
     for (connection_id, client) in clients.iter_mut() {
-        let pending_for_client: Vec<String> =
-            client.bootstrap_pending_session_ids.iter().cloned().collect();
+        let pending_for_client: Vec<String> = client
+            .bootstrap_pending_session_ids
+            .iter()
+            .cloned()
+            .collect();
         for session_id in pending_for_client {
             if !due_session_ids_set.contains(&session_id) {
                 continue;
@@ -2494,10 +2568,11 @@ pub(crate) fn deliver_pending_bootstraps(
 }
 
 fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, stream: TcpStream) {
-    let peer_label = stream
-        .peer_addr()
+    let peer_addr = stream.peer_addr().ok();
+    let peer_label = peer_addr
         .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| "unknown client".to_string());
+        .unwrap_or_else(|| "unknown client".to_string());
+    let peer_ip = peer_addr.map(|addr| addr.ip().to_string());
     let config = inner
         .config
         .read()
@@ -2550,7 +2625,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
 
     let (tx, rx) = mpsc::channel::<ServerMessage>();
 
-    let (client_id, client_token) = match authenticate_client(&inner, hello) {
+    let (client_id, client_token, client_label) = match authenticate_client(&inner, hello) {
         Ok(auth) => auth,
         Err(message) => {
             set_last_connection_note(
@@ -2621,6 +2696,39 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
             clients.remove(&connection_id);
         }
         return;
+    }
+    if let Err(error) = mutate_host_config(&inner, |config| {
+        let had_previous_connect = config.web.activity_log.iter().any(|event| {
+            event.source == RemoteAccessSource::NativeApp
+                && event.client_id == client_id
+                && matches!(
+                    event.event_kind,
+                    RemoteAccessActivityKind::Connected | RemoteAccessActivityKind::Reconnected
+                )
+        });
+        append_remote_access_activity_event(
+            config,
+            RemoteAccessActivityEvent {
+                client_id: client_id.clone(),
+                source: RemoteAccessSource::NativeApp,
+                event_kind: if had_previous_connect {
+                    RemoteAccessActivityKind::Reconnected
+                } else {
+                    RemoteAccessActivityKind::Connected
+                },
+                label: client_label.clone(),
+                ip_address: peer_ip.clone(),
+                event_at_epoch_ms: Some(now_epoch_ms()),
+                browser_family: None,
+                browser_version: None,
+                os_family: None,
+                device_class: Some("desktop".to_string()),
+            },
+        );
+    }) {
+        eprintln!(
+            "[remote] failed to persist native access log for {client_id} from {peer_label}: {error}"
+        );
     }
     set_last_connection_note(
         &inner,
@@ -2836,7 +2944,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
 fn authenticate_client(
     inner: &Arc<RemoteHostInner>,
     hello: ClientMessage,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, String), String> {
     let ClientMessage::Hello {
         protocol_version,
         client_label,
@@ -2852,6 +2960,12 @@ fn authenticate_client(
             PROTOCOL_VERSION
         ));
     }
+    let client_label = client_label.trim().to_string();
+    let client_label = if client_label.is_empty() {
+        "Desktop app".to_string()
+    } else {
+        client_label
+    };
 
     let _update_guard = inner
         .config_update_lock
@@ -2870,12 +2984,12 @@ fn authenticate_client(
             let client_token = generate_secret("auth");
             config.paired_clients.push(PairedRemoteClient {
                 client_id: client_id.clone(),
-                label: client_label,
+                label: client_label.clone(),
                 auth_token: client_token.clone(),
                 last_seen_epoch_ms: Some(now_epoch_ms()),
             });
             bump_host_config_revision(inner);
-            Ok((client_id, client_token))
+            Ok((client_id, client_token, client_label))
         }
         ClientAuth::ClientToken {
             client_id,
@@ -2888,9 +3002,14 @@ fn authenticate_client(
             else {
                 return Err("Saved remote credentials are no longer valid.".to_string());
             };
+            client.label = client_label.clone();
             client.last_seen_epoch_ms = Some(now_epoch_ms());
             bump_host_config_revision(inner);
-            Ok((client.client_id.clone(), client.auth_token.clone()))
+            Ok((
+                client.client_id.clone(),
+                client.auth_token.clone(),
+                client.label.clone(),
+            ))
         }
     }
 }
@@ -3432,18 +3551,54 @@ pub(crate) mod test_support {
 
     static TEST_PROFILE_LOCK: Mutex<()> = Mutex::new(());
 
-    pub(crate) struct TestProfileGuard {
+    pub(crate) struct TestProfileEnvGuard {
         previous_profile: Option<String>,
-        remote_state_dir: PathBuf,
         _lock: MutexGuard<'static, ()>,
+    }
+
+    impl TestProfileEnvGuard {
+        fn with_profile(profile: Option<String>) -> Self {
+            let lock = TEST_PROFILE_LOCK.lock().expect("profile lock");
+            let previous_profile = std::env::var("DEVMANAGER_PROFILE").ok();
+            if let Some(profile) = profile.as_ref() {
+                std::env::set_var("DEVMANAGER_PROFILE", profile);
+            } else {
+                std::env::remove_var("DEVMANAGER_PROFILE");
+            }
+            Self {
+                previous_profile,
+                _lock: lock,
+            }
+        }
+
+        pub(crate) fn new(label: &str) -> Self {
+            let profile = format!("{label}-{}-{}", std::process::id(), now_epoch_ms());
+            Self::with_profile(Some(profile))
+        }
+
+        pub(crate) fn without_profile() -> Self {
+            Self::with_profile(None)
+        }
+    }
+
+    impl Drop for TestProfileEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous_profile) = self.previous_profile.as_ref() {
+                std::env::set_var("DEVMANAGER_PROFILE", previous_profile);
+            } else {
+                std::env::remove_var("DEVMANAGER_PROFILE");
+            }
+        }
+    }
+
+    pub(crate) struct TestProfileGuard {
+        remote_state_dir: PathBuf,
+        _env: TestProfileEnvGuard,
     }
 
     impl TestProfileGuard {
         pub(crate) fn new(label: &str) -> Self {
-            let lock = TEST_PROFILE_LOCK.lock().expect("profile lock");
-            let previous_profile = std::env::var("DEVMANAGER_PROFILE").ok();
-            let profile = format!("{label}-{}-{}", std::process::id(), now_epoch_ms());
-            std::env::set_var("DEVMANAGER_PROFILE", &profile);
+            let env = TestProfileEnvGuard::new(label);
             let remote_state_dir = remote_state_path()
                 .expect("remote state path")
                 .parent()
@@ -3451,9 +3606,8 @@ pub(crate) mod test_support {
                 .to_path_buf();
             let _ = std::fs::remove_dir_all(&remote_state_dir);
             Self {
-                previous_profile,
                 remote_state_dir,
-                _lock: lock,
+                _env: env,
             }
         }
     }
@@ -3461,11 +3615,6 @@ pub(crate) mod test_support {
     impl Drop for TestProfileGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.remote_state_dir);
-            if let Some(previous_profile) = self.previous_profile.as_ref() {
-                std::env::set_var("DEVMANAGER_PROFILE", previous_profile);
-            } else {
-                std::env::remove_var("DEVMANAGER_PROFILE");
-            }
         }
     }
 }
@@ -3475,14 +3624,14 @@ mod tests {
     use super::test_support::TestProfileGuard;
     use super::{
         apply_workspace_delta, current_controller_allows, current_snapshot,
-        deliver_pending_bootstraps,
-        format_handshake_stage_error, generate_pairing_token, load_remote_machine_state,
-        now_epoch_ms, save_remote_machine_state, set_last_connection_note, upsert_known_host,
-        ClientAuth, ConnectedRemoteClient, KnownRemoteHost, LocalPortForwardManager,
-        PairedRemoteClient, PairedWebClient, RemoteClientHandle, RemoteClientInner,
-        RemoteHostConfig, RemoteHostService, RemoteLatencyStats, RemoteMachineState,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteWorkspaceDelta,
-        RemoteWorkspaceSnapshot, ServerMessage,
+        deliver_pending_bootstraps, format_handshake_stage_error, generate_pairing_token,
+        load_remote_machine_state, now_epoch_ms, save_remote_machine_state,
+        set_last_connection_note, upsert_known_host, ClientAuth, ConnectedRemoteClient,
+        KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
+        RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource,
+        RemoteClientHandle, RemoteClientInner, RemoteHostConfig, RemoteHostService,
+        RemoteLatencyStats, RemoteMachineState, RemoteSessionBootstrap, RemoteSessionStreamEvent,
+        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
     };
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
@@ -3537,9 +3686,17 @@ mod tests {
         state.host.web.cookie_secret_hex = "feedface".repeat(8);
         state.host.web.paired_clients.push(PairedWebClient {
             client_id: "web-client-1".to_string(),
+            browser_install_id: "browser-install-1".to_string(),
+            nickname: None,
             label: "Phone".to_string(),
             issued_at_epoch_ms: Some(10),
             last_seen_epoch_ms: Some(20),
+            last_seen_ip: Some("127.0.0.1".to_string()),
+            user_agent: Some("Safari".to_string()),
+            browser_family: Some("Safari".to_string()),
+            browser_version: Some("17.4".to_string()),
+            os_family: Some("iOS".to_string()),
+            device_class: Some("phone".to_string()),
         });
 
         save_remote_machine_state(&state).expect("save remote machine state");
@@ -3578,12 +3735,21 @@ mod tests {
 
     #[test]
     fn revoke_paired_web_client_disconnects_live_browser_and_clears_control() {
+        let _profile = TestProfileGuard::new("revoke-web-client");
         let mut config = RemoteHostConfig::default();
         config.web.paired_clients.push(PairedWebClient {
             client_id: "web-client-1".to_string(),
+            browser_install_id: "browser-install-1".to_string(),
+            nickname: None,
             label: "Browser".to_string(),
             issued_at_epoch_ms: Some(1),
             last_seen_epoch_ms: Some(1),
+            last_seen_ip: Some("127.0.0.1".to_string()),
+            user_agent: Some("Browser".to_string()),
+            browser_family: Some("Chrome".to_string()),
+            browser_version: Some("135".to_string()),
+            os_family: Some("Windows".to_string()),
+            device_class: Some("desktop".to_string()),
         });
         let service = RemoteHostService::new(config);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3619,6 +3785,112 @@ mod tests {
             }
             other => panic!("expected disconnected message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reset_browser_access_rotates_cookie_and_disconnects_live_browsers() {
+        let _profile = TestProfileGuard::new("reset-web-access");
+        let mut config = RemoteHostConfig::default();
+        let original_cookie_secret = config.web.cookie_secret_hex.clone();
+        config.web.paired_clients.push(PairedWebClient {
+            client_id: "web-client-1".to_string(),
+            browser_install_id: "browser-install-1".to_string(),
+            nickname: None,
+            label: "Browser".to_string(),
+            issued_at_epoch_ms: Some(1),
+            last_seen_epoch_ms: Some(1),
+            last_seen_ip: Some("127.0.0.1".to_string()),
+            user_agent: Some("Browser".to_string()),
+            browser_family: Some("Chrome".to_string()),
+            browser_version: Some("135".to_string()),
+            os_family: Some("Windows".to_string()),
+            device_class: Some("desktop".to_string()),
+        });
+        config.web.activity_log.push(RemoteAccessActivityEvent {
+            client_id: "web-client-1".to_string(),
+            source: RemoteAccessSource::Browser,
+            event_kind: RemoteAccessActivityKind::Connected,
+            label: "Browser".to_string(),
+            ip_address: Some("127.0.0.1".to_string()),
+            event_at_epoch_ms: Some(1),
+            browser_family: Some("Chrome".to_string()),
+            browser_version: Some("135".to_string()),
+            os_family: Some("Windows".to_string()),
+            device_class: Some("desktop".to_string()),
+        });
+        config.web.activity_log.push(RemoteAccessActivityEvent {
+            client_id: "client-native-1".to_string(),
+            source: RemoteAccessSource::NativeApp,
+            event_kind: RemoteAccessActivityKind::Connected,
+            label: "Studio MacBook".to_string(),
+            ip_address: Some("127.0.0.2".to_string()),
+            event_at_epoch_ms: Some(2),
+            browser_family: None,
+            browser_version: None,
+            os_family: Some("macOS".to_string()),
+            device_class: Some("desktop".to_string()),
+        });
+        let service = RemoteHostService::new(config);
+        let (web_tx, web_rx) = std::sync::mpsc::channel();
+        let (native_tx, _native_rx) = std::sync::mpsc::channel();
+
+        if let Ok(mut clients) = service.inner.clients.lock() {
+            clients.insert(
+                1,
+                ConnectedRemoteClient {
+                    client_id: "web-client-1".to_string(),
+                    sender: web_tx,
+                    subscribed_session_ids: HashSet::new(),
+                    bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
+                    focused_session_id: None,
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                },
+            );
+            clients.insert(
+                2,
+                ConnectedRemoteClient {
+                    client_id: "client-native-1".to_string(),
+                    sender: native_tx,
+                    subscribed_session_ids: HashSet::new(),
+                    bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
+                    focused_session_id: None,
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                },
+            );
+        }
+        if let Ok(mut controller) = service.inner.controller_client_id.write() {
+            *controller = Some("web-client-1".to_string());
+        }
+
+        assert!(service.reset_browser_access());
+        let saved = service.config();
+        assert!(saved.web.paired_clients.is_empty());
+        assert_eq!(saved.web.activity_log.len(), 1);
+        assert_eq!(
+            saved.web.activity_log[0].source,
+            RemoteAccessSource::NativeApp
+        );
+        assert_ne!(saved.web.cookie_secret_hex, original_cookie_secret);
+        assert!(service.status().controller_client_id.is_none());
+
+        match web_rx.recv().expect("disconnect message") {
+            ServerMessage::Disconnected { message } => {
+                assert!(message.contains("reset"));
+            }
+            other => panic!("expected disconnected message, got {other:?}"),
+        }
+        assert_eq!(service.status().connected_web_clients, 0);
+        assert_eq!(service.status().connected_native_clients, 1);
     }
 
     #[test]
@@ -4183,6 +4455,58 @@ mod tests {
             || service.status().connected_clients == 1,
             Duration::from_secs(3),
             "host never registered connected client",
+        );
+
+        result.client.disconnect();
+
+        wait_for(
+            || service.status().connected_clients == 0,
+            Duration::from_secs(3),
+            "host never observed client disconnect",
+        );
+
+        config.enabled = false;
+        service.apply_config(config);
+    }
+
+    #[test]
+    fn native_client_connections_are_recorded_in_activity_log() {
+        let _profile = TestProfileGuard::new("native-activity-log");
+        let port = reserve_free_tcp_port();
+        let mut config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let service = RemoteHostService::new(config.clone());
+
+        wait_for(
+            || service.status().listening,
+            Duration::from_secs(3),
+            "remote host never started listening",
+        );
+
+        let result = RemoteClientHandle::connect(
+            "127.0.0.1",
+            port,
+            "Studio MacBook",
+            ClientAuth::PairToken { token: pair_token },
+            None,
+        )
+        .expect("loopback remote connect should succeed");
+
+        wait_for(
+            || {
+                service.config().web.activity_log.iter().any(|event| {
+                    event.source == RemoteAccessSource::NativeApp
+                        && event.event_kind == RemoteAccessActivityKind::Connected
+                        && event.label == "Studio MacBook"
+                })
+            },
+            Duration::from_secs(3),
+            "native client connection never appeared in activity log",
         );
 
         result.client.disconnect();

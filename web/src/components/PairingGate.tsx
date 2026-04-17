@@ -1,6 +1,8 @@
 import { Terminal } from "lucide-react";
 import { useState, type FormEvent } from "react";
 
+import { buildPairingUrl } from "../lib/browserIdentity";
+
 export function PairingGate() {
   const [token, setToken] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -16,15 +18,11 @@ export function PairingGate() {
     setSubmitting(true);
     setError(null);
     try {
-      // Hit /pair — the server validates the token, mints the remembered
-      // auth cookie for this DevManager instance, and 303s to "/". fetch()
-      // with follow will land us back on the SPA with the cookie set. We
-      // then force a full navigation so the app reinitialises against the
-      // authenticated WS.
-      const response = await fetch(
-        `/pair?t=${encodeURIComponent(trimmed)}`,
-        { credentials: "include" },
-      );
+      // Pair with the stable browser install id so the host can dedupe this
+      // browser across reconnects instead of inflating the activity history.
+      const response = await fetch(buildPairingUrl(trimmed), {
+        credentials: "include",
+      });
       if (!response.ok && response.status !== 0) {
         const retryAfter = Number(response.headers.get("Retry-After") ?? "0");
         setSubmitting(false);

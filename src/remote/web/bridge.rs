@@ -15,17 +15,19 @@
 //! `RwLock`/`Mutex` from `RemoteHostInner`.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc as std_mpsc, Arc};
 use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::super::{
@@ -35,14 +37,22 @@ use super::super::{
     REQUEST_TIMEOUT,
 };
 use super::wire::{WsInbound, WsOutbound};
-use super::{authenticate_request, WebState};
+use super::{authenticate_request, record_browser_connection, WebState};
 use crate::state::SessionDimensions;
 
 /// Frame type byte prefixed to binary WS frames carrying terminal output.
 const BINARY_FRAME_SESSION_OUTPUT: u8 = 0x01;
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct WsConnectQuery {
+    browser_install_id: Option<String>,
+}
+
 pub(crate) async fn ws_handler(
     State(state): State<Arc<WebState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WsConnectQuery>,
     ws: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
@@ -54,6 +64,19 @@ pub(crate) async fn ws_handler(
             .into_response();
     };
     let inner = state.inner.clone();
+    if let Err(error) = record_browser_connection(
+        &inner,
+        &client_id,
+        addr.ip(),
+        query.browser_install_id,
+        &headers,
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to record browser connection: {error}"),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| run_session(socket, inner, client_id))
 }
 
@@ -372,9 +395,7 @@ fn handle_inbound(
                             // not merely "it subscribed". Otherwise a
                             // late-attaching browser can miss the snapshot
                             // forever if the first lookup returns `None`.
-                            client
-                                .bootstrapped_session_ids
-                                .insert(session_id.clone());
+                            client.bootstrapped_session_ids.insert(session_id.clone());
                             // Only clear the pending bit after a bootstrap has
                             // really been delivered. Clearing it on an eager
                             // subscribe miss regressed late-attaching AI tabs:
@@ -680,9 +701,17 @@ mod tests {
         }
         config.web.paired_clients.push(PairedWebClient {
             client_id: client_id.to_string(),
+            browser_install_id: format!("browser-install-{client_id}"),
+            nickname: None,
             label: "Test Browser".to_string(),
             issued_at_epoch_ms: Some(1),
             last_seen_epoch_ms: Some(1),
+            last_seen_ip: Some("127.0.0.1".to_string()),
+            user_agent: Some("Test Browser".to_string()),
+            browser_family: Some("Chrome".to_string()),
+            browser_version: Some("135".to_string()),
+            os_family: Some("Windows".to_string()),
+            device_class: Some("desktop".to_string()),
         });
     }
 

@@ -62,6 +62,16 @@ const WINDOW_TITLE_SEPARATOR: &str = " • ";
 
 static EDITOR_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+// Remote-specific background hosting was a legacy Windows taskbar workaround.
+// Until we add real tray support, only the global minimize-to-tray setting may
+// intercept the window close button.
+fn should_minimize_window_on_close(
+    minimize_to_tray: bool,
+    _legacy_remote_keep_hosting_in_background: bool,
+) -> bool {
+    minimize_to_tray
+}
+
 pub fn run() {
     Application::new()
         .with_assets(AppAssets::new())
@@ -1385,8 +1395,6 @@ impl NativeShell {
             draft.remote_known_hosts = self.remote_machine_state.known_hosts.clone();
             draft.remote_paired_clients = self.remote_machine_state.host.paired_clients.clone();
             draft.remote_host_enabled = self.remote_machine_state.host.enabled;
-            draft.remote_keep_hosting_in_background =
-                self.remote_machine_state.host.keep_hosting_in_background;
             draft.remote_web_enabled = self.remote_machine_state.host.web.enabled;
             draft.remote_web_pairing_token =
                 self.remote_machine_state.host.web.pairing_token.clone();
@@ -1396,6 +1404,8 @@ impl NativeShell {
                 self.remote_machine_state.host.web.paired_clients.len();
             draft.remote_web_paired_clients_detail =
                 self.remote_machine_state.host.web.paired_clients.clone();
+            draft.remote_access_activity_log =
+                self.remote_machine_state.host.web.activity_log.clone();
 
             if !draft.remote_connected && draft.remote_connect_address.trim().is_empty() {
                 if let Some(host) = draft.remote_known_hosts.first() {
@@ -3448,26 +3458,10 @@ impl NativeShell {
         self.sync_terminal_focus(None);
         self.capture_window_bounds(window);
 
-        let keep_hosting_in_background = self.remote_mode.is_none()
-            && self.remote_machine_state.host.enabled
-            && self.remote_machine_state.host.keep_hosting_in_background;
-        if keep_hosting_in_background {
-            self.save_session_state();
-            window.minimize_window();
-            self.terminal_notice = Some(
-                "DevManager is keeping remote hosting alive in the background. Reopen it from the taskbar to return to the window."
-                    .to_string(),
-            );
-            self.set_remote_status_notice(
-                "Hosting remains alive in the background for remote clients.",
-                false,
-            );
-            self.sync_settings_remote_draft();
-            cx.notify();
-            return false;
-        }
-
-        if self.state.settings().minimize_to_tray {
+        if should_minimize_window_on_close(
+            self.state.settings().minimize_to_tray,
+            self.remote_machine_state.host.keep_hosting_in_background,
+        ) {
             self.save_session_state();
             window.minimize_window();
             self.terminal_notice = Some(
@@ -4008,10 +4002,7 @@ impl NativeShell {
                 remote_host_enabled: self.remote_machine_state.host.enabled,
                 remote_bind_address: self.remote_machine_state.host.bind_address.clone(),
                 remote_port: self.remote_machine_state.host.port.to_string(),
-                remote_keep_hosting_in_background: self
-                    .remote_machine_state
-                    .host
-                    .keep_hosting_in_background,
+                remote_web_port: self.remote_machine_state.host.web.port.to_string(),
                 remote_pairing_token: remote_status.pairing_token,
                 remote_connect_address: preferred_known_host
                     .as_ref()
@@ -4068,6 +4059,7 @@ impl NativeShell {
                     .web
                     .paired_clients
                     .clone(),
+                remote_access_activity_log: self.remote_machine_state.host.web.activity_log.clone(),
                 open_picker: None,
             }),
             cx,
@@ -5926,22 +5918,6 @@ impl NativeShell {
                     cx.notify();
                 }
             }
-            EditorAction::ToggleRemoteKeepHostingInBackground => {
-                if !self.ensure_mutation_control(cx) {
-                    return;
-                }
-                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-                    draft.remote_keep_hosting_in_background =
-                        !draft.remote_keep_hosting_in_background;
-                    self.remote_machine_state.host.keep_hosting_in_background =
-                        draft.remote_keep_hosting_in_background;
-                    self.remote_host_service
-                        .apply_config(self.remote_machine_state.host.clone());
-                    self.persist_remote_machine_state();
-                    self.sync_settings_remote_draft();
-                    cx.notify();
-                }
-            }
             EditorAction::RegenerateRemotePairingToken => {
                 if !self.ensure_mutation_control(cx) {
                     return;
@@ -5967,6 +5943,11 @@ impl NativeShell {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.remote_web_enabled = !draft.remote_web_enabled;
                     self.remote_machine_state.host.web.enabled = draft.remote_web_enabled;
+                    self.remote_machine_state.host.web.port =
+                        parse_optional_u16(&draft.remote_web_port)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(43872);
                     self.remote_machine_state.host.web.ensure_secrets();
                     self.remote_host_service
                         .apply_config(self.remote_machine_state.host.clone());
@@ -5989,6 +5970,21 @@ impl NativeShell {
                     self.sync_settings_remote_draft();
                     cx.notify();
                 }
+            }
+            EditorAction::ResetRemoteWebAccess => {
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                if self.remote_host_service.reset_browser_access() {
+                    self.remote_machine_state.host = self.remote_host_service.config();
+                    self.persist_remote_machine_state();
+                    self.sync_settings_remote_draft();
+                    self.editor_notice =
+                        Some("Reset browser access. All browsers must pair again.".to_string());
+                } else {
+                    self.editor_notice = Some("Could not reset browser access.".to_string());
+                }
+                cx.notify();
             }
             EditorAction::CopyRemoteWebPairingToken => {
                 let token = self.remote_machine_state.host.web.pairing_token.clone();
@@ -6144,16 +6140,17 @@ impl NativeShell {
                 cx.notify();
             }
             EditorAction::RevokeRemoteWebClient(client_id) => {
-                self.remote_machine_state
-                    .host
-                    .web
-                    .paired_clients
-                    .retain(|client| client.client_id != client_id);
-                self.remote_host_service
-                    .revoke_paired_web_client(&client_id);
-                self.persist_remote_machine_state();
-                self.sync_settings_remote_draft();
-                self.editor_notice = Some("Revoked paired browser.".to_string());
+                if self
+                    .remote_host_service
+                    .revoke_paired_web_client(&client_id)
+                {
+                    self.remote_machine_state.host = self.remote_host_service.config();
+                    self.persist_remote_machine_state();
+                    self.sync_settings_remote_draft();
+                    self.editor_notice = Some("Revoked paired browser.".to_string());
+                } else {
+                    self.editor_notice = Some("Could not revoke paired browser.".to_string());
+                }
                 cx.notify();
             }
             EditorAction::ToggleProjectPinned => {
@@ -6668,10 +6665,9 @@ impl NativeShell {
                         // first local paint. Taking another eager
                         // `session_view()` here reintroduced the "open the AI
                         // tab locally while web is attached" hang regression.
-                        let mut current_view = self.process_manager.session_view_from_runtime(
-                            runtime_snapshot,
-                            &active_spec.session_id,
-                        );
+                        let mut current_view = self
+                            .process_manager
+                            .session_view_from_runtime(runtime_snapshot, &active_spec.session_id);
                         if current_view.is_some() {
                             self.process_manager
                                 .set_active_session(active_spec.session_id.clone());
@@ -11821,10 +11817,13 @@ fn remote_ai_tab_payload_for_remote_response(
     let runtime = process_manager.runtime_state();
     let session_runtime = runtime.sessions.get(session_id).cloned();
     let session_attached = process_manager.session_attached(session_id);
-    let session_view =
-        remote_ai_response_should_include_session_view(session_runtime.as_ref(), session_attached, now)
-            .then(|| process_manager.session_view(session_id))
-            .flatten();
+    let session_view = remote_ai_response_should_include_session_view(
+        session_runtime.as_ref(),
+        session_attached,
+        now,
+    )
+    .then(|| process_manager.session_view(session_id))
+    .flatten();
     remote_ai_tab_payload(state, session_id, session_view)
 }
 
@@ -13399,6 +13398,14 @@ mod tests {
         assert!(!fatal_remote_reconnect_error(
             "Connect failed: Connection refused."
         ));
+    }
+
+    #[test]
+    fn close_button_background_behavior_uses_only_global_minimize_setting() {
+        assert!(!should_minimize_window_on_close(false, false));
+        assert!(!should_minimize_window_on_close(false, true));
+        assert!(should_minimize_window_on_close(true, false));
+        assert!(should_minimize_window_on_close(true, true));
     }
 
     #[test]

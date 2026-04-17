@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::super::now_epoch_ms;
@@ -13,6 +14,7 @@ pub const WEB_COOKIE_NAME: &str = "dm_web";
 const WEB_COOKIE_NAME_PREFIX: &str = "dm_web_";
 const PAIRING_BACKOFF_STEPS_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const PAIRING_LOCKOUT_SECS: u64 = 60;
+static COOKIE_SECRET_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub fn cookie_name_for_server_id(server_id: &str) -> String {
     if server_id.trim().is_empty() {
@@ -27,18 +29,34 @@ pub fn cookie_name_for_server_id(server_id: &str) -> String {
 #[serde(default, rename_all = "camelCase")]
 pub struct PairedWebClient {
     pub client_id: String,
+    pub browser_install_id: String,
+    pub nickname: Option<String>,
     pub label: String,
     pub issued_at_epoch_ms: Option<u64>,
     pub last_seen_epoch_ms: Option<u64>,
+    pub last_seen_ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub browser_family: Option<String>,
+    pub browser_version: Option<String>,
+    pub os_family: Option<String>,
+    pub device_class: Option<String>,
 }
 
 impl Default for PairedWebClient {
     fn default() -> Self {
         Self {
             client_id: String::new(),
+            browser_install_id: String::new(),
+            nickname: None,
             label: String::new(),
             issued_at_epoch_ms: None,
             last_seen_epoch_ms: None,
+            last_seen_ip: None,
+            user_agent: None,
+            browser_family: None,
+            browser_version: None,
+            os_family: None,
+            device_class: None,
         }
     }
 }
@@ -67,11 +85,13 @@ pub fn generate_cookie_secret_hex() -> String {
     // monotonic counter. Not as strong as /dev/urandom but good enough for an
     // MVP cookie signing secret that the user can rotate any time.
     let mut bytes = [0u8; 32];
+    let counter = COOKIE_SECRET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let seed = format!(
-        "cookie-{}-{}-{:?}",
+        "cookie-{}-{}-{:?}-{}",
         now_epoch_ms(),
         std::process::id(),
-        std::thread::current().id()
+        std::thread::current().id(),
+        counter
     );
     use sha2::Digest;
     let mut hasher = Sha256::new();

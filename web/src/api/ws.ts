@@ -5,6 +5,7 @@ import type {
   WsInbound,
   WsOutbound,
 } from "./types";
+import { buildWebSocketUrl } from "../lib/browserIdentity";
 
 export type WsStatus =
   | { kind: "idle" }
@@ -112,8 +113,7 @@ export class WsClient {
       return;
     }
 
-    const scheme = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${scheme}://${location.host}/api/ws`;
+    const url = buildWebSocketUrl(location);
     let socket: WebSocket;
     try {
       socket = new WebSocket(url);

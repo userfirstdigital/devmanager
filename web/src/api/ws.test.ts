@@ -41,6 +41,13 @@ describe("WsClient request handling", () => {
     FakeWebSocket.instances = [];
     vi.stubGlobal("window", globalThis);
     vi.stubGlobal("location", { protocol: "http:", host: "example.test" });
+    vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("crypto", {
+      randomUUID: vi.fn(() => "browser-install-uuid"),
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({ ok: true, status: 200 }),
@@ -63,6 +70,9 @@ describe("WsClient request handling", () => {
     await client.start();
     const socket = FakeWebSocket.instances[0];
     expect(socket).toBeDefined();
+    expect(socket.url).toBe(
+      "ws://example.test/api/ws?browserInstallId=browser-install-uuid",
+    );
     socket.emitOpen();
 
     const action: RemoteAction = { type: "closeTab", tab_id: "tab-1" };
