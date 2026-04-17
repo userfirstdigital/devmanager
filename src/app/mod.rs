@@ -2765,10 +2765,11 @@ impl NativeShell {
                         Ok(session_id) => {
                             did_change = true;
                             self.save_session_state();
-                            let payload = remote_ai_tab_payload(
+                            let payload = remote_ai_tab_payload_for_remote_response(
                                 &self.state,
+                                &self.process_manager,
                                 &session_id,
-                                self.process_manager.session_view(&session_id),
+                                Instant::now(),
                             );
                             RemoteActionResult::ok(Some(format!("Opened {session_id}")), payload)
                         }
@@ -2784,10 +2785,11 @@ impl NativeShell {
                         self.save_session_state();
                         RemoteActionResult::ok(
                             None,
-                            remote_ai_tab_payload(
+                            remote_ai_tab_payload_for_remote_response(
                                 &self.state,
+                                &self.process_manager,
                                 &session_id,
-                                self.process_manager.session_view(&session_id),
+                                Instant::now(),
                             ),
                         )
                     }
@@ -2802,10 +2804,11 @@ impl NativeShell {
                         self.save_session_state();
                         RemoteActionResult::ok(
                             None,
-                            remote_ai_tab_payload(
+                            remote_ai_tab_payload_for_remote_response(
                                 &self.state,
+                                &self.process_manager,
                                 &session_id,
-                                self.process_manager.session_view(&session_id),
+                                Instant::now(),
                             ),
                         )
                     }
@@ -6630,14 +6633,18 @@ impl NativeShell {
                 let session_attached = self
                     .process_manager
                     .session_attached(&active_spec.session_id);
-                let passive_view = local_has_resize_control
-                    .then(|| self.local_viewer_session_view(&active_spec.session_id, dimensions))
-                    .flatten();
+                // Selecting a busy Claude/Codex tab while the web client is
+                // also attached can make `session_view()` expensive enough to
+                // freeze the native window if we call it just to answer the
+                // startup-guard question. Use the cheap runtime metadata here
+                // and take a real snapshot only in the branch that will render
+                // it.
+                let passive_view_available = session_attached && session_runtime.is_some();
                 let render_mode = if local_has_resize_control {
                     native_ai_render_mode(
                         session_runtime.as_ref(),
                         session_attached,
-                        passive_view.is_some(),
+                        passive_view_available,
                         Instant::now(),
                     )
                 } else {
@@ -6653,13 +6660,18 @@ impl NativeShell {
                     }
                     NativeAiRenderMode::PassiveView => {
                         self.terminal_notice = None;
-                        active_session = passive_view.or_else(|| {
-                            self.local_viewer_session_view(&active_spec.session_id, dimensions)
-                        });
+                        active_session =
+                            self.local_viewer_session_view(&active_spec.session_id, dimensions);
                     }
                     NativeAiRenderMode::ActiveControl => {
-                        let mut current_view =
-                            self.process_manager.session_view(&active_spec.session_id);
+                        // Reuse the runtime snapshot we already have for the
+                        // first local paint. Taking another eager
+                        // `session_view()` here reintroduced the "open the AI
+                        // tab locally while web is attached" hang regression.
+                        let mut current_view = self.process_manager.session_view_from_runtime(
+                            runtime_snapshot,
+                            &active_spec.session_id,
+                        );
                         if current_view.is_some() {
                             self.process_manager
                                 .set_active_session(active_spec.session_id.clone());
@@ -11789,6 +11801,33 @@ fn remote_ai_tab_payload(
     })
 }
 
+fn remote_ai_response_should_include_session_view(
+    session: Option<&crate::state::SessionRuntimeState>,
+    session_attached: bool,
+    now: Instant,
+) -> bool {
+    matches!(
+        native_ai_render_mode(session, session_attached, true, now),
+        NativeAiRenderMode::ActiveControl
+    )
+}
+
+fn remote_ai_tab_payload_for_remote_response(
+    state: &AppState,
+    process_manager: &ProcessManager,
+    session_id: &str,
+    now: Instant,
+) -> Option<RemoteActionPayload> {
+    let runtime = process_manager.runtime_state();
+    let session_runtime = runtime.sessions.get(session_id).cloned();
+    let session_attached = process_manager.session_attached(session_id);
+    let session_view =
+        remote_ai_response_should_include_session_view(session_runtime.as_ref(), session_attached, now)
+            .then(|| process_manager.session_view(session_id))
+            .flatten();
+    remote_ai_tab_payload(state, session_id, session_view)
+}
+
 fn window_title_project_name(tab: &SessionTab, state: &AppState) -> Option<String> {
     if matches!(tab.tab_type, TabType::Ssh) {
         Some("SSH".to_string())
@@ -13188,6 +13227,34 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn remote_ai_launch_response_skips_session_view_for_fresh_attached_startup_sessions() {
+        let now = Instant::now();
+        let mut session = SessionRuntimeState::new(
+            "claude-session",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.session_kind = crate::state::SessionKind::Claude;
+        session.status = crate::state::SessionStatus::Starting;
+        session.started_at = Some(now);
+
+        assert!(!remote_ai_response_should_include_session_view(
+            Some(&session),
+            true,
+            now,
+        ));
+
+        session.status = crate::state::SessionStatus::Running;
+        session.at_prompt = true;
+        assert!(remote_ai_response_should_include_session_view(
+            Some(&session),
+            true,
+            now + AI_LOCAL_RENDER_GUARD_WINDOW,
+        ));
     }
 
     #[test]

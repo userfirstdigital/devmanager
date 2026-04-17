@@ -253,6 +253,7 @@ fn register_client(
             sender,
             subscribed_session_ids: HashSet::new(),
             bootstrapped_session_ids: HashSet::new(),
+            bootstrap_pending_session_ids: HashSet::new(),
             focused_session_id: None,
             last_app_hash: stable_hash(&app_state),
             last_runtime_hash: stable_hash(&runtime_state),
@@ -330,13 +331,11 @@ fn handle_inbound(
                 if let Some(client) = clients.get_mut(&connection_id) {
                     for session_id in &session_ids {
                         client.subscribed_session_ids.insert(session_id.clone());
-                        // Mark web clients "bootstrap satisfied" immediately so
-                        // live PTY output can flow even if the eager bootstrap
-                        // snapshot is slow or blocked on a hot AI session. The
-                        // subscribe handler may still deliver a bootstrap frame
-                        // later for scrollback, but `push_session_output()`
-                        // must not stall behind that lookup.
-                        client.bootstrapped_session_ids.insert(session_id.clone());
+                        if !client.bootstrapped_session_ids.contains(session_id) {
+                            client
+                                .bootstrap_pending_session_ids
+                                .insert(session_id.clone());
+                        }
                     }
                 }
             }
@@ -359,11 +358,30 @@ fn handle_inbound(
                 if let Some(client) = clients.get_mut(&connection_id) {
                     for (session_id, bootstrap) in bootstraps {
                         if !client.subscribed_session_ids.contains(&session_id) {
+                            client.bootstrap_pending_session_ids.remove(&session_id);
                             continue;
                         }
-                        let _ = tokio_tx.send(ServerMessage::SessionStream {
-                            event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
-                        });
+                        if tokio_tx
+                            .send(ServerMessage::SessionStream {
+                                event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
+                            })
+                            .is_ok()
+                        {
+                            // `bootstrapped_session_ids` must mean "this
+                            // connection has actually been sent a bootstrap",
+                            // not merely "it subscribed". Otherwise a
+                            // late-attaching browser can miss the snapshot
+                            // forever if the first lookup returns `None`.
+                            client
+                                .bootstrapped_session_ids
+                                .insert(session_id.clone());
+                            // Only clear the pending bit after a bootstrap has
+                            // really been delivered. Clearing it on an eager
+                            // subscribe miss regressed late-attaching AI tabs:
+                            // the browser stayed subscribed, but no later host
+                            // retry was allowed to send the first snapshot.
+                            client.bootstrap_pending_session_ids.remove(&session_id);
+                        }
                     }
                 }
             }
@@ -374,6 +392,7 @@ fn handle_inbound(
                     for session_id in &session_ids {
                         client.subscribed_session_ids.remove(session_id);
                         client.bootstrapped_session_ids.remove(session_id);
+                        client.bootstrap_pending_session_ids.remove(session_id);
                     }
                 }
             }
@@ -640,12 +659,32 @@ mod tests {
     use super::*;
     use crate::models::TabType;
     use crate::remote::{
-        RemoteAction, RemoteHostConfig, RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
+        deliver_pending_bootstraps, PairedWebClient, RemoteAction, RemoteHostConfig,
+        RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
     };
     use crate::state::{SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot};
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::mpsc as std_mpsc;
+
+    fn pair_web_client(service: &RemoteHostService, client_id: &str) {
+        let mut config = service.inner.config.write().expect("config lock");
+        if config
+            .web
+            .paired_clients
+            .iter()
+            .any(|client| client.client_id == client_id)
+        {
+            return;
+        }
+        config.web.paired_clients.push(PairedWebClient {
+            client_id: client_id.to_string(),
+            label: "Test Browser".to_string(),
+            issued_at_epoch_ms: Some(1),
+            last_seen_epoch_ms: Some(1),
+        });
+    }
 
     #[test]
     fn binary_frame_layout_is_stable() {
@@ -800,6 +839,7 @@ mod tests {
 
         let connection_id = 7;
         let client_id = "web-client";
+        pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
 
@@ -835,6 +875,7 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let connection_id = 9;
         let client_id = "web-client";
+        pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
         *service
@@ -882,6 +923,7 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let connection_id = 10;
         let client_id = "web-viewer";
+        pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
 
@@ -926,6 +968,7 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let connection_id = 12;
         let client_id = "web-viewer";
+        pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
 
@@ -966,6 +1009,7 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let connection_id = 13;
         let client_id = "web-viewer";
+        pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
 
@@ -999,6 +1043,7 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let connection_id = 14;
         let client_id = "web-client";
+        pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
         *service
@@ -1062,6 +1107,7 @@ mod tests {
 
         let connection_id = 11;
         let client_id = "web-client";
+        pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
 
@@ -1115,6 +1161,7 @@ mod tests {
 
         let connection_id = 12;
         let client_id = "web-client";
+        pair_web_client(&service, client_id);
         let (std_tx, std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, connection_id, client_id, std_tx);
 
@@ -1154,5 +1201,79 @@ mod tests {
         *lock.lock().expect("gate lock") = true;
         cvar.notify_all();
         worker.join().expect("worker join");
+    }
+
+    #[test]
+    fn subscribe_without_initial_bootstrap_still_bootstraps_once_session_becomes_ready() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 15;
+        let client_id = "web-client";
+        pair_web_client(&service, client_id);
+        let (std_tx, std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, connection_id, client_id, std_tx);
+
+        let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::SubscribeSessions {
+                session_ids: vec!["alpha".to_string()],
+            },
+            &tokio_tx,
+        );
+
+        service.push_session_output("alpha", b"before-ready".to_vec());
+        match std_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ServerMessage::SessionStream {
+                event:
+                    RemoteSessionStreamEvent::Output {
+                        session_id, bytes, ..
+                    },
+            }) => {
+                assert_eq!(session_id, "alpha");
+                assert_eq!(bytes, b"before-ready".to_vec());
+            }
+            other => panic!("expected output before bootstrap is ready, got {other:?}"),
+        }
+
+        service.set_session_bootstrap_provider(Some(Arc::new(|session_id| {
+            Some(RemoteSessionBootstrap {
+                session_id: session_id.to_string(),
+                runtime: SessionRuntimeState::new(
+                    session_id.to_string(),
+                    PathBuf::from("C:\\Code"),
+                    SessionDimensions::default(),
+                    TerminalBackend::default(),
+                ),
+                screen: TerminalScreenSnapshot::default(),
+                replay_bytes: format!("{session_id}\r\n").into_bytes(),
+            })
+        })));
+
+        let mut last_bootstrap_retry_at = HashMap::new();
+        deliver_pending_bootstraps(&service.inner, &mut last_bootstrap_retry_at);
+
+        match std_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ServerMessage::SessionStream {
+                event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
+            }) => assert_eq!(bootstrap.session_id, "alpha"),
+            other => panic!("expected late bootstrap event, got {other:?}"),
+        }
+
+        service.push_session_output("alpha", b"after-ready".to_vec());
+
+        match std_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ServerMessage::SessionStream {
+                event:
+                    RemoteSessionStreamEvent::Output {
+                        session_id, bytes, ..
+                    },
+            }) => {
+                assert_eq!(session_id, "alpha");
+                assert_eq!(bytes, b"after-ready".to_vec());
+            }
+            other => panic!("expected output after late bootstrap, got {other:?}"),
+        }
     }
 }

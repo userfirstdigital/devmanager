@@ -73,6 +73,7 @@ interface StoreState {
     listener: (bootstrap: SessionBootstrapFrame) => void,
   ): () => void;
   drainBootstrap(sessionId: string): SessionBootstrapFrame | null;
+  drainTerminalFrames(sessionId: string): SessionOutputFrame[];
   takeControl(): void;
   releaseControl(): void;
   sendInput(sessionId: string, text: string): void;
@@ -494,17 +495,7 @@ export const useStore = create<StoreState>((set, get) => {
     const bucket = existing ? new Set(existing) : new Set();
     bucket.add(listener);
     next.set(sessionId, bucket as Set<(frame: SessionOutputFrame) => void>);
-    const pendingFrames = get().pendingTerminalFrames.get(sessionId) ?? [];
-    if (pendingFrames.length > 0) {
-      for (const frame of pendingFrames) {
-        listener(frame);
-      }
-      const pendingNext = new Map(get().pendingTerminalFrames);
-      pendingNext.delete(sessionId);
-      set({ terminalSubscribers: next, pendingTerminalFrames: pendingNext });
-    } else {
-      set({ terminalSubscribers: next });
-    }
+    set({ terminalSubscribers: next });
     return () => {
       const current = get().terminalSubscribers;
       const after = new Map(current);
@@ -550,6 +541,16 @@ export const useStore = create<StoreState>((set, get) => {
     next.delete(sessionId);
     set({ pendingBootstraps: next });
     return bootstrap;
+  },
+
+  drainTerminalFrames(sessionId) {
+    const pending = get().pendingTerminalFrames;
+    const frames = pending.get(sessionId) ?? [];
+    if (frames.length === 0) return [];
+    const next = new Map(pending);
+    next.delete(sessionId);
+    set({ pendingTerminalFrames: next });
+    return frames;
   },
 
   takeControl() {

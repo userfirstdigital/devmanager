@@ -139,21 +139,64 @@ function refreshTerminal(terminal: XTerm): void {
   });
 }
 
-function applyBootstrapToTerminal(
-  terminal: XTerm,
-  bootstrap: SessionBootstrapFrame,
-): void {
-  const bootstrapPayload =
+type TerminalWritePayload = string | Uint8Array;
+
+function terminalPayloadFromBootstrap(
+  bootstrap: SessionBootstrapFrame | null,
+): TerminalWritePayload | null {
+  if (!bootstrap) {
+    return null;
+  }
+  const payload =
     bootstrap.screen.rows > 0 && bootstrap.screen.cols > 0
       ? screenSnapshotToAnsi(bootstrap.screen)
       : bootstrap.bytes;
   if (
-    (bootstrapPayload instanceof Uint8Array && bootstrapPayload.byteLength === 0) ||
-    (typeof bootstrapPayload === "string" && bootstrapPayload.length === 0)
+    (payload instanceof Uint8Array && payload.byteLength === 0) ||
+    (typeof payload === "string" && payload.length === 0)
   ) {
-    return;
+    return null;
   }
-  terminal.write(bootstrapPayload, () => refreshTerminal(terminal));
+  return payload;
+}
+
+function applyAttachPayloads(
+  terminal: XTerm,
+  payloads: TerminalWritePayload[],
+  needsFirstAttachPaint: boolean,
+): boolean {
+  if (payloads.length === 0) {
+    return needsFirstAttachPaint;
+  }
+  for (let index = 0; index < payloads.length; index++) {
+    const payload = payloads[index];
+    const isLast = index === payloads.length - 1;
+    if (isLast && needsFirstAttachPaint) {
+      terminal.write(payload, () => refreshTerminal(terminal));
+    } else {
+      terminal.write(payload);
+    }
+  }
+  return false;
+}
+
+function applyBufferedAttachState(
+  terminal: XTerm,
+  bootstrap: SessionBootstrapFrame | null,
+  frames: SessionOutputFrame[],
+  needsFirstAttachPaint: boolean,
+): boolean {
+  const payloads: TerminalWritePayload[] = [];
+  const bootstrapPayload = terminalPayloadFromBootstrap(bootstrap);
+  if (bootstrapPayload) {
+    payloads.push(bootstrapPayload);
+  }
+  for (const frame of frames) {
+    if (frame.bytes.byteLength > 0) {
+      payloads.push(frame.bytes);
+    }
+  }
+  return applyAttachPayloads(terminal, payloads, needsFirstAttachPaint);
 }
 
 type ResponsiveXTerm = XTerm & {
@@ -191,6 +234,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
   const subscribeTerminal = useStore((s) => s.subscribeTerminal);
   const subscribeBootstrap = useStore((s) => s.subscribeBootstrap);
   const drainBootstrap = useStore((s) => s.drainBootstrap);
+  const drainTerminalFrames = useStore((s) => s.drainTerminalFrames);
   const sendInput = useStore((s) => s.sendInput);
   const pasteImage = useStore((s) => s.pasteImage);
   const youHaveControl = useStore(
@@ -446,23 +490,53 @@ export function TerminalView({ sessionId }: TerminalProps) {
       // render, desyncing Claude Code's absolute-position TUI drawing.
 
       // Subscribe to live output frames.
+      let attachReady = false;
+      let needsFirstAttachPaint = true;
+      let queuedBootstrap: SessionBootstrapFrame | null = null;
+      const queuedFrames: SessionOutputFrame[] = [];
       const unsubscribe = subscribeTerminal(
         sessionId,
         (frame: SessionOutputFrame) => {
-          terminal.write(frame.bytes);
+          if (!attachReady) {
+            queuedFrames.push(frame);
+            return;
+          }
+          needsFirstAttachPaint = applyBufferedAttachState(
+            terminal,
+            null,
+            [frame],
+            needsFirstAttachPaint,
+          );
         },
       );
       const unsubscribeBootstrap = subscribeBootstrap(sessionId, (bootstrap) => {
-        applyBootstrapToTerminal(terminal, bootstrap);
+        if (!attachReady) {
+          queuedBootstrap = bootstrap;
+          return;
+        }
+        needsFirstAttachPaint = applyBufferedAttachState(
+          terminal,
+          bootstrap,
+          [],
+          needsFirstAttachPaint,
+        );
       });
 
-      // Drain any bootstrap scrollback that arrived before mount, then
-      // schedule a refresh in the next frame so xterm's render service has
-      // a chance to mark every row dirty and re-paint.
-      const bootstrap = drainBootstrap(sessionId);
-      if (bootstrap) {
-        applyBootstrapToTerminal(terminal, bootstrap);
-      }
+      // Register live listeners first, then perform a single explicit drain of
+      // any attach payloads that arrived before mount. This keeps late-attach
+      // ordering deterministic: bootstrap first, then buffered output, then
+      // anything that raced in while the terminal was mounting.
+      const bootstrap = queuedBootstrap ?? drainBootstrap(sessionId);
+      const bufferedFrames = drainTerminalFrames(sessionId);
+      needsFirstAttachPaint = applyBufferedAttachState(
+        terminal,
+        bootstrap,
+        [...bufferedFrames, ...queuedFrames],
+        needsFirstAttachPaint,
+      );
+      queuedBootstrap = null;
+      queuedFrames.length = 0;
+      attachReady = true;
 
       // Focus after first paint.
       const focusTimer = window.setTimeout(() => {
@@ -507,6 +581,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
     subscribeTerminal,
     subscribeBootstrap,
     drainBootstrap,
+    drainTerminalFrames,
     sendInput,
   ]);
 

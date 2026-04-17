@@ -35,6 +35,7 @@ pub const PROTOCOL_VERSION: u32 = 5;
 const REMOTE_FILE_NAME: &str = "remote.json";
 const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
+const PENDING_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -918,6 +919,7 @@ struct ConnectedRemoteClient {
     sender: mpsc::Sender<ServerMessage>,
     subscribed_session_ids: HashSet<String>,
     bootstrapped_session_ids: HashSet<String>,
+    bootstrap_pending_session_ids: HashSet<String>,
     focused_session_id: Option<String>,
     last_app_hash: u64,
     last_runtime_hash: u64,
@@ -1124,62 +1126,23 @@ impl RemoteHostService {
             .unwrap_or_default()
     }
 
-    fn try_bootstrap_session(&self, session_id: &str) -> Option<RemoteSessionBootstrap> {
-        self.inner
-            .session_bootstrap_provider
-            .read()
-            .ok()
-            .and_then(|provider| provider.as_ref().cloned())
-            .and_then(|provider| provider(session_id))
-    }
-
-    fn auto_bootstrap_subscribed_clients(&self, session_id: &str) {
-        let needs_bootstrap = {
-            let Ok(clients) = self.inner.clients.lock() else {
-                return;
-            };
-            clients.values().any(|client| {
-                client.subscribed_session_ids.contains(session_id)
-                    && !client.bootstrapped_session_ids.contains(session_id)
-            })
-        };
-        if !needs_bootstrap {
-            return;
-        }
-
-        let Some(bootstrap) = self.try_bootstrap_session(session_id) else {
-            return;
-        };
-
+    fn mark_subscribed_clients_bootstrap_pending(&self, session_id: &str) {
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
         };
-        let mut dead_connections = Vec::new();
-        for (connection_id, client) in clients.iter_mut() {
-            if !client.subscribed_session_ids.contains(session_id)
-                || client.bootstrapped_session_ids.contains(session_id)
+        for client in clients.values_mut() {
+            if client.subscribed_session_ids.contains(session_id)
+                && !client.bootstrapped_session_ids.contains(session_id)
             {
-                continue;
-            }
-
-            if client
-                .sender
-                .send(ServerMessage::SessionStream {
-                    event: RemoteSessionStreamEvent::Bootstrap {
-                        bootstrap: bootstrap.clone(),
-                    },
-                })
-                .is_ok()
-            {
+                // Only mark the session pending here. Doing the actual
+                // bootstrap lookup inline from `push_session_output()` used to
+                // block live AI output behind a heavy PTY snapshot, which left
+                // the web terminal black and amplified native hangs when the
+                // same session was selected locally.
                 client
-                    .bootstrapped_session_ids
+                    .bootstrap_pending_session_ids
                     .insert(session_id.to_string());
-            } else {
-                dead_connections.push(*connection_id);
             }
-        }
-        for connection_id in dead_connections {
-            clients.remove(&connection_id);
         }
     }
 
@@ -1187,7 +1150,7 @@ impl RemoteHostService {
         if bytes.is_empty() {
             return;
         }
-        self.auto_bootstrap_subscribed_clients(session_id);
+        self.mark_subscribed_clients_bootstrap_pending(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
         };
@@ -1217,7 +1180,7 @@ impl RemoteHostService {
     }
 
     pub fn push_session_runtime(&self, session_id: &str, runtime: SessionRuntimeState) {
-        self.auto_bootstrap_subscribed_clients(session_id);
+        self.mark_subscribed_clients_bootstrap_pending(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
         };
@@ -1228,6 +1191,7 @@ impl RemoteHostService {
             }
             if !runtime.status.is_live() {
                 client.bootstrapped_session_ids.remove(session_id);
+                client.bootstrap_pending_session_ids.remove(session_id);
             }
             let event = if runtime.status.is_live() {
                 RemoteSessionStreamEvent::RuntimePatch {
@@ -1263,6 +1227,7 @@ impl RemoteHostService {
                 continue;
             }
             client.bootstrapped_session_ids.remove(session_id);
+            client.bootstrap_pending_session_ids.remove(session_id);
             if client
                 .sender
                 .send(ServerMessage::SessionStream {
@@ -2319,6 +2284,7 @@ fn run_listener(inner: Arc<RemoteHostInner>) {
 fn run_broadcaster(inner: Arc<RemoteHostInner>) {
     let mut last_snapshot_revision = 0_u64;
     let mut last_controller_client_id: Option<String> = None;
+    let mut last_bootstrap_retry_at: HashMap<String, Instant> = HashMap::new();
 
     while !inner.stop_flag.load(Ordering::Relaxed) {
         let connected_clients = inner
@@ -2330,6 +2296,8 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             thread::sleep(IDLE_BROADCAST_INTERVAL);
             continue;
         }
+
+        deliver_pending_bootstraps(&inner, &mut last_bootstrap_retry_at);
 
         let snapshot_revision = inner.snapshot_revision.load(Ordering::Relaxed);
         let controller_client_id = inner
@@ -2410,6 +2378,118 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
         last_controller_client_id = controller_client_id;
 
         thread::sleep(SNAPSHOT_BROADCAST_INTERVAL);
+    }
+}
+
+pub(crate) fn deliver_pending_bootstraps(
+    inner: &Arc<RemoteHostInner>,
+    last_bootstrap_retry_at: &mut HashMap<String, Instant>,
+) {
+    // Retry pending bootstraps from the broadcaster thread instead of the PTY
+    // output path. That keeps terminal output flowing immediately and rate-
+    // limits repeated snapshot attempts for hot AI sessions until one
+    // bootstrap finally succeeds.
+    let pending_session_ids: HashSet<String> = {
+        let Ok(clients) = inner.clients.lock() else {
+            return;
+        };
+        clients
+            .values()
+            .flat_map(|client| {
+                client
+                    .bootstrap_pending_session_ids
+                    .iter()
+                    .filter(|session_id| {
+                        client.subscribed_session_ids.contains(*session_id)
+                            && !client.bootstrapped_session_ids.contains(*session_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    if pending_session_ids.is_empty() {
+        last_bootstrap_retry_at.clear();
+        return;
+    }
+
+    last_bootstrap_retry_at.retain(|session_id, _| pending_session_ids.contains(session_id));
+    let now = Instant::now();
+    let due_session_ids: Vec<String> = pending_session_ids
+        .into_iter()
+        .filter(|session_id| {
+            last_bootstrap_retry_at
+                .get(session_id)
+                .map(|last_retry| {
+                    now.duration_since(*last_retry) >= PENDING_BOOTSTRAP_RETRY_INTERVAL
+                })
+                .unwrap_or(true)
+        })
+        .collect();
+    if due_session_ids.is_empty() {
+        return;
+    }
+
+    let provider = inner
+        .session_bootstrap_provider
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    let Some(provider) = provider else {
+        return;
+    };
+
+    for session_id in &due_session_ids {
+        last_bootstrap_retry_at.insert(session_id.clone(), now);
+    }
+    let due_session_ids_set: HashSet<String> = due_session_ids.iter().cloned().collect();
+    let bootstraps: HashMap<String, RemoteSessionBootstrap> = due_session_ids
+        .iter()
+        .filter_map(|session_id| provider(session_id).map(|bootstrap| (session_id.clone(), bootstrap)))
+        .collect();
+    if bootstraps.is_empty() {
+        return;
+    }
+
+    let Ok(mut clients) = inner.clients.lock() else {
+        return;
+    };
+    let mut dead_connections = Vec::new();
+    for (connection_id, client) in clients.iter_mut() {
+        let pending_for_client: Vec<String> =
+            client.bootstrap_pending_session_ids.iter().cloned().collect();
+        for session_id in pending_for_client {
+            if !due_session_ids_set.contains(&session_id) {
+                continue;
+            }
+            if !client.subscribed_session_ids.contains(&session_id)
+                || client.bootstrapped_session_ids.contains(&session_id)
+            {
+                client.bootstrap_pending_session_ids.remove(&session_id);
+                continue;
+            }
+            let Some(bootstrap) = bootstraps.get(&session_id) else {
+                continue;
+            };
+            if client
+                .sender
+                .send(ServerMessage::SessionStream {
+                    event: RemoteSessionStreamEvent::Bootstrap {
+                        bootstrap: bootstrap.clone(),
+                    },
+                })
+                .is_ok()
+            {
+                client.bootstrap_pending_session_ids.remove(&session_id);
+                client.bootstrapped_session_ids.insert(session_id);
+            } else {
+                dead_connections.push(*connection_id);
+                break;
+            }
+        }
+    }
+    for connection_id in dead_connections {
+        clients.remove(&connection_id);
     }
 }
 
@@ -2505,6 +2585,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 sender: tx.clone(),
                 subscribed_session_ids: initial_subscriptions,
                 bootstrapped_session_ids: snapshot.session_views.keys().cloned().collect(),
+                bootstrap_pending_session_ids: HashSet::new(),
                 focused_session_id: snapshot.runtime_state.active_session_id.clone(),
                 last_app_hash: app_hash,
                 last_runtime_hash: runtime_hash,
@@ -2580,6 +2661,18 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 }
             }
             Ok(Some(ClientMessage::SubscribeSessions { session_ids })) => {
+                if let Ok(mut clients) = inner.clients.lock() {
+                    if let Some(client) = clients.get_mut(&connection_id) {
+                        for session_id in &session_ids {
+                            client.subscribed_session_ids.insert(session_id.clone());
+                            if !client.bootstrapped_session_ids.contains(session_id) {
+                                client
+                                    .bootstrap_pending_session_ids
+                                    .insert(session_id.clone());
+                            }
+                        }
+                    }
+                }
                 let bootstraps = inner
                     .session_bootstrap_provider
                     .read()
@@ -2595,13 +2688,6 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                if let Ok(mut clients) = inner.clients.lock() {
-                    if let Some(client) = clients.get_mut(&connection_id) {
-                        for session_id in &session_ids {
-                            client.subscribed_session_ids.insert(session_id.clone());
-                        }
-                    }
-                }
                 let mut bootstrapped_session_ids = Vec::new();
                 for (session_id, bootstrap) in bootstraps {
                     if tx
@@ -2616,6 +2702,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 if let Ok(mut clients) = inner.clients.lock() {
                     if let Some(client) = clients.get_mut(&connection_id) {
                         for session_id in bootstrapped_session_ids {
+                            client.bootstrap_pending_session_ids.remove(&session_id);
                             client.bootstrapped_session_ids.insert(session_id);
                         }
                     }
@@ -2627,6 +2714,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                         for session_id in &session_ids {
                             client.subscribed_session_ids.remove(session_id);
                             client.bootstrapped_session_ids.remove(session_id);
+                            client.bootstrap_pending_session_ids.remove(session_id);
                         }
                     }
                 }
@@ -3387,6 +3475,7 @@ mod tests {
     use super::test_support::TestProfileGuard;
     use super::{
         apply_workspace_delta, current_controller_allows, current_snapshot,
+        deliver_pending_bootstraps,
         format_handshake_stage_error, generate_pairing_token, load_remote_machine_state,
         now_epoch_ms, save_remote_machine_state, set_last_connection_note, upsert_known_host,
         ClientAuth, ConnectedRemoteClient, KnownRemoteHost, LocalPortForwardManager,
@@ -3507,6 +3596,7 @@ mod tests {
                     sender: tx,
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
                     focused_session_id: None,
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -3545,6 +3635,7 @@ mod tests {
                     sender: native_tx,
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
                     focused_session_id: None,
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -3560,6 +3651,7 @@ mod tests {
                     sender: web_tx,
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
                     focused_session_id: None,
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -3656,6 +3748,7 @@ mod tests {
                     sender: subscribed_tx,
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
                     focused_session_id: Some("alpha".to_string()),
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -3671,6 +3764,7 @@ mod tests {
                     sender: idle_tx,
                     subscribed_session_ids: HashSet::from(["beta".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
                     focused_session_id: Some("beta".to_string()),
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -3714,6 +3808,7 @@ mod tests {
                     sender: tx,
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
                     focused_session_id: Some("alpha".to_string()),
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -3757,6 +3852,7 @@ mod tests {
                     sender: tx,
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
                     focused_session_id: Some("alpha".to_string()),
                     last_app_hash: 0,
                     last_runtime_hash: 0,
@@ -3790,14 +3886,17 @@ mod tests {
             })
         })));
 
-        service.push_session_output("alpha", b"after-ready".to_vec());
+        let mut last_bootstrap_retry_at = HashMap::new();
+        deliver_pending_bootstraps(&service.inner, &mut last_bootstrap_retry_at);
 
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(ServerMessage::SessionStream {
                 event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
             }) => assert_eq!(bootstrap.session_id, "alpha"),
-            other => panic!("expected bootstrap event, got {other:?}"),
+            other => panic!("expected late bootstrap event, got {other:?}"),
         }
+
+        service.push_session_output("alpha", b"after-ready".to_vec());
 
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(ServerMessage::SessionStream {
@@ -3820,6 +3919,69 @@ mod tests {
                 .expect("client map should be available");
             let client = clients.get(&1).expect("client should remain connected");
             assert!(client.bootstrapped_session_ids.contains("alpha"));
+        }
+    }
+
+    #[test]
+    fn push_session_output_does_not_wait_for_blocked_bootstrap_lookup() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut clients) = service.inner.clients.lock() {
+            clients.insert(
+                1,
+                ConnectedRemoteClient {
+                    client_id: "client-1".to_string(),
+                    sender: tx,
+                    subscribed_session_ids: HashSet::from(["alpha".to_string()]),
+                    bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
+                    focused_session_id: Some("alpha".to_string()),
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                },
+            );
+        }
+
+        let release = Arc::new(AtomicBool::new(false));
+        let provider_release = release.clone();
+        service.set_session_bootstrap_provider(Some(Arc::new(move |_session_id| {
+            let started_at = Instant::now();
+            while !provider_release.load(Ordering::Relaxed)
+                && started_at.elapsed() < Duration::from_secs(1)
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Some(RemoteSessionBootstrap {
+                session_id: "alpha".to_string(),
+                runtime: session_view("alpha").runtime,
+                screen: session_view("alpha").screen,
+                replay_bytes: b"alpha\r\n".to_vec(),
+            })
+        })));
+
+        let background = service.clone();
+        let join = thread::spawn(move || {
+            background.push_session_output("alpha", b"hello".to_vec());
+        });
+
+        let output = rx.recv_timeout(Duration::from_millis(250));
+        release.store(true, Ordering::Relaxed);
+        join.join().expect("push_session_output should return");
+
+        match output {
+            Ok(ServerMessage::SessionStream {
+                event:
+                    RemoteSessionStreamEvent::Output {
+                        session_id, bytes, ..
+                    },
+            }) => {
+                assert_eq!(session_id, "alpha");
+                assert_eq!(bytes, b"hello".to_vec());
+            }
+            other => panic!("expected output before bootstrap lookup completes, got {other:?}"),
         }
     }
 

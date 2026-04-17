@@ -238,6 +238,36 @@ describe("web AI tab actions", () => {
     expect(state.pendingBootstraps.get("claude-session-2")?.screen.rows).toBe(24);
   });
 
+  it("launchAiTab still activates the new session when the payload omits session_view", async () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+    client?.request.mockResolvedValue({
+      ok: true,
+      message: "Opened claude-session-2",
+      payload: {
+        type: "aiTab",
+        tab_id: "claude-tab-2",
+        project_id: "project-1",
+        tab_type: "claude",
+        session_id: "claude-session-2",
+        label: "Claude 1",
+        session_view: null,
+      },
+    });
+
+    await useStore.getState().launchAiTab("project-1", "claude");
+
+    const state = useStore.getState();
+    expect(state.activeSessionId).toBe("claude-session-2");
+    expect(state.snapshot?.appState.open_tabs).toContainEqual(
+      expect.objectContaining({
+        id: "claude-tab-2",
+        ptySessionId: "claude-session-2",
+      }),
+    );
+    expect(state.pendingBootstraps.has("claude-session-2")).toBe(false);
+  });
+
   it("openAiTab follows the host-returned session id for existing tabs", async () => {
     useStore.setState({
       snapshot: makeExistingAiTabSnapshot(),
@@ -285,7 +315,7 @@ describe("web AI tab actions", () => {
     ).toBe("claude-session-new");
   });
 
-  it("buffers session output that arrives before the terminal subscribes", () => {
+  it("buffers session output until the terminal explicitly drains it", () => {
     const client = wsClientState.instance;
     expect(client).toBeTruthy();
 
@@ -300,8 +330,40 @@ describe("web AI tab actions", () => {
       .getState()
       .subscribeTerminal("claude-session-3", (frame) => seen.push(frame.bytes));
 
-    expect(seen).toHaveLength(1);
-    expect(Array.from(seen[0] ?? new Uint8Array())).toEqual([65, 66, 67]);
+    expect(seen).toHaveLength(0);
+
+    const drained = useStore.getState().drainTerminalFrames("claude-session-3");
+    expect(drained).toHaveLength(1);
+    expect(Array.from(drained[0]?.bytes ?? new Uint8Array())).toEqual([65, 66, 67]);
+
+    unsubscribe();
+  });
+
+  it("keeps buffered output queued until late-attach state is explicitly drained", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+
+    client?.callbacks.onSessionOutput({
+      sessionId: "claude-session-3",
+      chunkSeq: 1,
+      bytes: new Uint8Array([65, 66, 67]),
+    });
+    client?.callbacks.onMessage({
+      type: "sessionBootstrap",
+      sessionId: "claude-session-3",
+      replayBase64: "",
+      screen: makeScreen(),
+    });
+
+    const seen: Uint8Array[] = [];
+    const unsubscribe = useStore
+      .getState()
+      .subscribeTerminal("claude-session-3", (frame) => seen.push(frame.bytes));
+
+    const state = useStore.getState();
+    expect(seen).toHaveLength(0);
+    expect(state.pendingBootstraps.get("claude-session-3")?.screen.rows).toBe(24);
+    expect(state.pendingTerminalFrames.get("claude-session-3")).toHaveLength(1);
 
     unsubscribe();
   });
@@ -351,6 +413,49 @@ describe("web AI tab actions", () => {
       fileName: "clip.png",
       dataBase64: "AQID",
     });
+  });
+
+  it("takeControl keeps the attached session active when control flips", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+
+    const snapshot = makeSnapshot();
+    snapshot.controllerClientId = "native-client";
+    snapshot.youHaveControl = false;
+    snapshot.runtimeState.sessions["claude-session-3"] =
+      makeSessionView("claude-session-3").runtime;
+
+    useStore.setState({
+      snapshot,
+      activeSessionId: "claude-session-3",
+      pendingBootstraps: new Map([
+        [
+          "claude-session-3",
+          {
+            sessionId: "claude-session-3",
+            bytes: new Uint8Array(0),
+            screen: makeScreen(),
+          },
+        ],
+      ]),
+    });
+
+    useStore.getState().takeControl();
+    expect(client?.send).toHaveBeenCalledWith({ type: "takeControl" });
+
+    client?.callbacks.onMessage({
+      type: "delta",
+      delta: {
+        controllerClientId: "web-client",
+        youHaveControl: true,
+      },
+    });
+
+    const state = useStore.getState();
+    expect(state.activeSessionId).toBe("claude-session-3");
+    expect(state.snapshot?.youHaveControl).toBe(true);
+    expect(state.snapshot?.controllerClientId).toBe("web-client");
+    expect(state.pendingBootstraps.get("claude-session-3")?.screen.rows).toBe(24);
   });
 
   it("revoked browser disconnect falls back to pairing", () => {
