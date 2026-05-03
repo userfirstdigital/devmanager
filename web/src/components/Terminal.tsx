@@ -237,6 +237,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
   const drainTerminalFrames = useStore((s) => s.drainTerminalFrames);
   const sendInput = useStore((s) => s.sendInput);
   const pasteImage = useStore((s) => s.pasteImage);
+  const refreshActiveConnection = useStore((s) => s.refreshActiveConnection);
   const youHaveControl = useStore(
     (s) => s.snapshot?.youHaveControl ?? false,
   );
@@ -419,6 +420,8 @@ export function TerminalView({ sessionId }: TerminalProps) {
       // if the earlier sidebar-level subscribe happened before the PTY was
       // fully ready.
       client?.send({ type: "subscribeSessions", sessionIds: [sessionId] });
+      client?.send({ type: "focusSession", sessionId });
+      refreshActiveConnection();
 
       // Copy-on-Ctrl+C when there's a selection, paste handled by browser
       // default on Ctrl+V. Matches the archive's custom handler at
@@ -540,7 +543,10 @@ export function TerminalView({ sessionId }: TerminalProps) {
 
       // Focus after first paint.
       const focusTimer = window.setTimeout(() => {
-        if (!cancelled) terminal.focus();
+        if (!cancelled) {
+          refreshActiveConnection();
+          terminal.focus();
+        }
       }, 50);
 
       const previousCleanup = cleanup;
@@ -582,6 +588,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
     subscribeBootstrap,
     drainBootstrap,
     drainTerminalFrames,
+    refreshActiveConnection,
     sendInput,
   ]);
 
@@ -604,6 +611,8 @@ export function TerminalView({ sessionId }: TerminalProps) {
       ref={shellRef}
       className="dm-terminal-shell flex flex-1 min-h-0 min-w-0 bg-[#09090b]"
       data-terminal-pan={responsiveLayout.allowHorizontalPan ? "true" : "false"}
+      onFocusCapture={refreshActiveConnection}
+      onPointerDown={refreshActiveConnection}
     >
       <div
         ref={containerRef}

@@ -567,6 +567,13 @@ fn handle_inbound(
                 *controller = Some(client_id.to_string());
             }
         }
+        WsInbound::ClaimControlIfAvailable => {
+            if let Ok(mut controller) = inner.controller_client_id.write() {
+                if controller.as_deref().is_none() || controller.as_deref() == Some(client_id) {
+                    *controller = Some(client_id.to_string());
+                }
+            }
+        }
         WsInbound::ReleaseControl => {
             if let Ok(mut controller) = inner.controller_client_id.write() {
                 if controller.as_deref() == Some(client_id) {
@@ -897,6 +904,69 @@ mod tests {
         let client = clients.get(&connection_id).expect("registered client");
         assert!(client.subscribed_session_ids.contains("alpha"));
         assert!(client.bootstrapped_session_ids.contains("alpha"));
+    }
+
+    #[test]
+    fn claim_control_if_available_claims_unowned_controller() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 16;
+        let client_id = "web-client";
+        pair_web_client(&service, client_id);
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, connection_id, client_id, std_tx);
+
+        let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::ClaimControlIfAvailable,
+            &tokio_tx,
+        );
+
+        assert_eq!(
+            service
+                .inner
+                .controller_client_id
+                .read()
+                .expect("controller lock")
+                .as_deref(),
+            Some(client_id)
+        );
+    }
+
+    #[test]
+    fn claim_control_if_available_does_not_steal_controller() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 17;
+        let client_id = "web-client";
+        pair_web_client(&service, client_id);
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, connection_id, client_id, std_tx);
+        *service
+            .inner
+            .controller_client_id
+            .write()
+            .expect("controller lock") = Some("desktop-client".to_string());
+
+        let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::ClaimControlIfAvailable,
+            &tokio_tx,
+        );
+
+        assert_eq!(
+            service
+                .inner
+                .controller_client_id
+                .read()
+                .expect("controller lock")
+                .as_deref(),
+            Some("desktop-client")
+        );
     }
 
     #[test]

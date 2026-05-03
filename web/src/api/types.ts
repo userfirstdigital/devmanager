@@ -350,6 +350,7 @@ export type WsInbound =
   | { type: "action"; action: RemoteAction }
   | { type: "request"; id: number; action: RemoteAction }
   | { type: "takeControl" }
+  | { type: "claimControlIfAvailable" }
   | { type: "releaseControl" }
   | { type: "ping" };
 

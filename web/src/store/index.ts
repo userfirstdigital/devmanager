@@ -17,6 +17,7 @@ import type {
 import { WsClient } from "../api/ws";
 
 const ACTIVE_PROJECT_KEY = "devmanager-active-project-id";
+const ACTIVE_TERMINAL_KEY = "devmanager-active-terminal";
 const COLLAPSED_PROJECTS_KEY = "devmanager-collapsed-projects";
 const MAX_PENDING_TERMINAL_FRAMES = 256;
 
@@ -32,6 +33,12 @@ interface PendingLaunch {
   tabType: "claude" | "codex";
   knownTabIds: Set<string>;
   issuedAt: number;
+}
+
+interface PersistedActiveTerminal {
+  sessionId: string;
+  tabId?: string | null;
+  savedAt: number;
 }
 
 interface StoreState {
@@ -74,6 +81,7 @@ interface StoreState {
   ): () => void;
   drainBootstrap(sessionId: string): SessionBootstrapFrame | null;
   drainTerminalFrames(sessionId: string): SessionOutputFrame[];
+  refreshActiveConnection(): void;
   takeControl(): void;
   releaseControl(): void;
   sendInput(sessionId: string, text: string): void;
@@ -110,6 +118,83 @@ function persistCollapsedProjects(set: Set<string>): void {
   } catch {
     // quota / privacy mode — ignore.
   }
+}
+
+function sessionIdForTab(tab: SessionTab): string {
+  return tab.ptySessionId ?? tab.commandId ?? tab.id;
+}
+
+function findTabForSession(
+  snapshot: RemoteWorkspaceSnapshot | null,
+  sessionId: string,
+): SessionTab | null {
+  const tabs = snapshot?.appState?.open_tabs ?? [];
+  return (
+    tabs.find((tab) => sessionIdForTab(tab) === sessionId) ??
+    tabs.find((tab) => tab.ptySessionId === sessionId) ??
+    null
+  );
+}
+
+function loadPersistedActiveTerminal(): PersistedActiveTerminal | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_TERMINAL_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PersistedActiveTerminal>;
+    if (typeof parsed.sessionId !== "string" || parsed.sessionId.trim() === "") {
+      return null;
+    }
+    return {
+      sessionId: parsed.sessionId,
+      tabId: typeof parsed.tabId === "string" ? parsed.tabId : null,
+      savedAt: typeof parsed.savedAt === "number" ? parsed.savedAt : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistActiveTerminal(
+  snapshot: RemoteWorkspaceSnapshot | null,
+  sessionId: string | null,
+): void {
+  try {
+    if (!sessionId) {
+      localStorage.removeItem(ACTIVE_TERMINAL_KEY);
+      return;
+    }
+    const tab = findTabForSession(snapshot, sessionId);
+    const payload: PersistedActiveTerminal = {
+      sessionId,
+      tabId: tab?.id ?? null,
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(ACTIVE_TERMINAL_KEY, JSON.stringify(payload));
+  } catch {
+    // quota / privacy mode — ignore.
+  }
+}
+
+function restorePersistedActiveSession(
+  snapshot: RemoteWorkspaceSnapshot,
+): string | null {
+  const persisted = loadPersistedActiveTerminal();
+  if (!persisted) return null;
+  if (snapshot.runtimeState?.sessions?.[persisted.sessionId]) {
+    return persisted.sessionId;
+  }
+  const tabs = snapshot.appState?.open_tabs ?? [];
+  const tabById = persisted.tabId
+    ? tabs.find((tab) => tab.id === persisted.tabId)
+    : null;
+  if (tabById) return sessionIdForTab(tabById);
+  const tabBySession = tabs.find(
+    (tab) =>
+      tab.ptySessionId === persisted.sessionId ||
+      tab.commandId === persisted.sessionId ||
+      tab.id === persisted.sessionId,
+  );
+  return tabBySession ? sessionIdForTab(tabBySession) : null;
 }
 
 /**
@@ -314,7 +399,12 @@ export const useStore = create<StoreState>((set, get) => {
     if (get().client) return;
 
     const client = new WsClient({
-      onStatus: (status) => set({ status }),
+      onStatus: (status) => {
+        set({ status });
+        if (status.kind === "open") {
+          globalThis.setTimeout(() => get().refreshActiveConnection(), 0);
+        }
+      },
       onMessage: (message: WsOutbound) => {
         switch (message.type) {
           case "snapshot": {
@@ -331,16 +421,26 @@ export const useStore = create<StoreState>((set, get) => {
             // Check for newly-created AI tabs that we're waiting on.
             const { nextPending, autoActivateSessionId } =
               resolvePendingLaunches(snapshot, get().pendingLaunches);
+            const restoredActiveSessionId =
+              !autoActivateSessionId && !get().activeSessionId
+                ? restorePersistedActiveSession(snapshot)
+                : null;
+            const nextActiveSessionId =
+              autoActivateSessionId ?? restoredActiveSessionId;
             const patch: Partial<StoreState> = {
               snapshot,
               activeProjectId,
               lastError: null,
               pendingLaunches: nextPending,
             };
-            if (autoActivateSessionId) {
-              patch.activeSessionId = autoActivateSessionId;
+            if (nextActiveSessionId) {
+              patch.activeSessionId = nextActiveSessionId;
             }
             set(patch);
+            if (nextActiveSessionId) {
+              persistActiveTerminal(snapshot, nextActiveSessionId);
+              get().refreshActiveConnection();
+            }
             break;
           }
           case "delta": {
@@ -354,26 +454,33 @@ export const useStore = create<StoreState>((set, get) => {
               pendingLaunches: nextPending,
             };
             if (autoActivateSessionId) {
-              patch.activeSessionId = autoActivateSessionId;
-              // Also send the subscribe message we'd normally send via
-              // setActiveSession. The browser tracks its own focused session;
-              // it should not steer the native host's active terminal.
-              const client = get().client;
               const prev = get().activeSessionId;
-              if (client) {
-                if (prev && prev !== autoActivateSessionId) {
-                  client.send({
-                    type: "unsubscribeSessions",
-                    sessionIds: [prev],
-                  });
-                }
-                client.send({
-                  type: "subscribeSessions",
-                  sessionIds: [autoActivateSessionId],
+              if (prev && prev !== autoActivateSessionId) {
+                get().client?.send({
+                  type: "unsubscribeSessions",
+                  sessionIds: [prev],
                 });
               }
+              patch.activeSessionId = autoActivateSessionId;
             }
             set(patch);
+            if (autoActivateSessionId) {
+              persistActiveTerminal(merged, autoActivateSessionId);
+              get().refreshActiveConnection();
+            }
+            break;
+          }
+          case "controlState": {
+            const current = get().snapshot;
+            if (current) {
+              set({
+                snapshot: {
+                  ...current,
+                  controllerClientId: message.controllerClientId,
+                  youHaveControl: message.youHaveControl,
+                },
+              });
+            }
             break;
           }
           case "sessionBootstrap": {
@@ -414,6 +521,7 @@ export const useStore = create<StoreState>((set, get) => {
               message.message.includes("revoked");
             if (requiresPairing) {
               get().client?.stop();
+              persistActiveTerminal(null, null);
             }
             set({
               lastError: message.message,
@@ -466,17 +574,23 @@ export const useStore = create<StoreState>((set, get) => {
 
   setActiveSession(sessionId: string | null) {
     const prev = get().activeSessionId;
-    if (prev === sessionId) return;
     const client = get().client;
     if (client) {
-      if (prev) {
+      if (prev && prev !== sessionId) {
         client.send({ type: "unsubscribeSessions", sessionIds: [prev] });
       }
       if (sessionId) {
         client.send({ type: "subscribeSessions", sessionIds: [sessionId] });
+        client.send({ type: "focusSession", sessionId });
       }
     }
+    persistActiveTerminal(get().snapshot, sessionId);
+    if (prev === sessionId) {
+      get().refreshActiveConnection();
+      return;
+    }
     set({ activeSessionId: sessionId });
+    get().refreshActiveConnection();
   },
 
   toggleProjectCollapsed(projectId: string) {
@@ -551,6 +665,22 @@ export const useStore = create<StoreState>((set, get) => {
     next.delete(sessionId);
     set({ pendingTerminalFrames: next });
     return frames;
+  },
+
+  refreshActiveConnection() {
+    const state = get();
+    const client = state.client;
+    const sessionId = state.activeSessionId;
+    if (!client || !sessionId) return;
+
+    client.wake();
+    client.send({ type: "subscribeSessions", sessionIds: [sessionId] });
+    client.send({ type: "focusSession", sessionId });
+
+    const controller = state.snapshot?.controllerClientId ?? null;
+    if (controller === null || state.snapshot?.youHaveControl) {
+      client.send({ type: "claimControlIfAvailable" });
+    }
   },
 
   takeControl() {

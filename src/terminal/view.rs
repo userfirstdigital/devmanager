@@ -70,6 +70,8 @@ pub struct TerminalPaneActions {
     pub on_export_screen: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_export_scrollback: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_export_selection: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_take_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_release_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_toggle_mouse_override: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_toggle_read_only: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub scrollbar: Option<TerminalScrollbarActions>,
@@ -105,8 +107,17 @@ pub struct TerminalRuntimeControlsModel {
     pub can_export_screen: bool,
     pub can_export_scrollback: bool,
     pub can_export_selection: bool,
+    pub remote_control: Option<TerminalRemoteControlModel>,
     pub mouse_override_enabled: bool,
     pub read_only_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalRemoteControlModel {
+    pub label: String,
+    pub color: u32,
+    pub can_take: bool,
+    pub can_release: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1045,6 +1056,8 @@ fn render_runtime_actions(
         on_export_screen: _,
         on_export_scrollback,
         on_export_selection,
+        on_take_remote_control,
+        on_release_remote_control,
         on_toggle_mouse_override: _,
         on_toggle_read_only: _,
         scrollbar: _,
@@ -1099,6 +1112,9 @@ fn render_runtime_actions(
                     runtime_action_button(label.as_str(), controls.prompt_action_color, on_click)
                 }),
         )
+        .children(controls.remote_control.map(|control| {
+            remote_control_button(control, on_take_remote_control, on_release_remote_control)
+        }))
         .children(
             controls
                 .can_search
@@ -1176,6 +1192,45 @@ fn render_runtime_actions(
                 .flatten()
                 .map(|on_click| runtime_action_button("selection", theme::TEXT_MUTED, on_click)),
         )
+}
+
+fn remote_control_button(
+    control: TerminalRemoteControlModel,
+    on_take_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    on_release_remote_control: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+) -> impl IntoElement {
+    let action = if control.can_release {
+        on_release_remote_control.map(|on_click| ("release", on_click))
+    } else if control.can_take {
+        on_take_remote_control.map(|on_click| ("take control", on_click))
+    } else {
+        None
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .px(px(5.0))
+        .py(px(1.0))
+        .border_1()
+        .border_color(rgb(theme::BORDER_PRIMARY))
+        .bg(rgb(theme::PANEL_HEADER_BG))
+        .rounded_sm()
+        .text_xs()
+        .text_color(rgb(control.color))
+        .child(SharedString::from(control.label))
+        .children(action.map(|(label, on_click)| {
+            div()
+                .px(px(4.0))
+                .bg(rgb(theme::BUTTON_HOVER_BG))
+                .rounded_sm()
+                .text_color(rgb(theme::TEXT_PRIMARY))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .child(SharedString::from(label.to_string()))
+                .on_mouse_down(MouseButton::Left, on_click)
+        }))
 }
 
 fn runtime_action_button(

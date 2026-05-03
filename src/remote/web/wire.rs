@@ -52,6 +52,7 @@ pub enum WsInbound {
         action: RemoteAction,
     },
     TakeControl,
+    ClaimControlIfAvailable,
     ReleaseControl,
     Ping,
 }
@@ -186,6 +187,13 @@ mod tests {
         let raw = json!({ "type": "takeControl" });
         let parsed: WsInbound = serde_json::from_value(raw).expect("parse");
         assert!(matches!(parsed, WsInbound::TakeControl));
+    }
+
+    #[test]
+    fn inbound_claim_control_if_available_has_no_payload() {
+        let raw = json!({ "type": "claimControlIfAvailable" });
+        let parsed: WsInbound = serde_json::from_value(raw).expect("parse");
+        assert!(matches!(parsed, WsInbound::ClaimControlIfAvailable));
     }
 
     #[test]

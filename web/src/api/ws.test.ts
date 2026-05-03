@@ -4,12 +4,14 @@ import type { RemoteAction } from "./types";
 import { WsClient } from "./ws";
 
 class FakeWebSocket {
+  static readonly CONNECTING = 0;
   static readonly OPEN = 1;
+  static readonly CLOSED = 3;
   static instances: FakeWebSocket[] = [];
 
   readonly sent: string[] = [];
   readonly url: string;
-  readyState = FakeWebSocket.OPEN;
+  readyState = FakeWebSocket.CONNECTING;
   binaryType = "";
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
@@ -25,9 +27,13 @@ class FakeWebSocket {
     this.sent.push(data);
   }
 
-  close(): void {}
+  close(): void {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.({ code: 1006, reason: "" } as CloseEvent);
+  }
 
   emitOpen(): void {
+    this.readyState = FakeWebSocket.OPEN;
     this.onopen?.({} as Event);
   }
 
@@ -100,5 +106,98 @@ describe("WsClient request handling", () => {
       message: "opened",
       payload: null,
     });
+  });
+});
+
+describe("WsClient reconnect wake handling", () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = [];
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.stubGlobal("window", globalThis);
+    vi.stubGlobal("location", { protocol: "http:", host: "example.test" });
+    vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("crypto", {
+      randomUUID: vi.fn(() => "browser-install-uuid"),
+    });
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("wake retries immediately instead of waiting for reconnect backoff", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn()
+        .mockRejectedValueOnce(new Error("offline"))
+        .mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient({
+      onStatus: vi.fn(),
+      onMessage: vi.fn(),
+      onSessionOutput: vi.fn(),
+    });
+
+    await client.start();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+
+    client.wake();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("does not create duplicate sockets while a start is already in flight", async () => {
+    let resolveFetch: (value: { ok: boolean; status: number }) => void = () => {};
+    const fetchMock = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new WsClient({
+      onStatus: vi.fn(),
+      onMessage: vi.fn(),
+      onSessionOutput: vi.fn(),
+    });
+
+    const firstStart = client.start();
+    await client.start();
+    resolveFetch({ ok: true, status: 200 });
+    await firstStart;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("replaces an open socket that has gone stale after backgrounding", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient({
+      onStatus: vi.fn(),
+      onMessage: vi.fn(),
+      onSessionOutput: vi.fn(),
+    });
+
+    await client.start();
+    FakeWebSocket.instances[0]?.emitOpen();
+    vi.setSystemTime(31_000);
+
+    client.wake();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(FakeWebSocket.instances).toHaveLength(2);
   });
 });

@@ -1255,6 +1255,33 @@ impl NativeShell {
         None
     }
 
+    fn remote_terminal_control_model(&self) -> Option<view::TerminalRemoteControlModel> {
+        let remote_mode = self.remote_mode.as_ref()?;
+        if remote_mode.reconnect.is_some() {
+            return Some(view::TerminalRemoteControlModel {
+                label: "Reconnecting".to_string(),
+                color: theme::WARNING_TEXT,
+                can_take: false,
+                can_release: false,
+            });
+        }
+        if remote_mode.snapshot.you_have_control {
+            Some(view::TerminalRemoteControlModel {
+                label: "You control".to_string(),
+                color: theme::SUCCESS_TEXT,
+                can_take: false,
+                can_release: true,
+            })
+        } else {
+            Some(view::TerminalRemoteControlModel {
+                label: "Watching only".to_string(),
+                color: theme::WARNING_TEXT,
+                can_take: true,
+                can_release: false,
+            })
+        }
+    }
+
     fn remote_request(&mut self, action: RemoteAction) -> Result<RemoteActionResult, String> {
         let Some(remote_mode) = self.remote_mode.as_ref() else {
             return Err("Remote host is not connected.".to_string());
@@ -7369,6 +7396,7 @@ impl NativeShell {
     ) -> Option<view::TerminalRuntimeControlsModel> {
         let remote = self.remote_mode.is_some();
         let allow_mutation = !remote || self.remote_has_control();
+        let remote_control = self.remote_terminal_control_model();
 
         if active_tab_type == Some(TabType::Ssh) {
             self.active_port_state = None;
@@ -7429,6 +7457,7 @@ impl NativeShell {
                 can_export_screen: active_session.is_some(),
                 can_export_scrollback: active_session.is_some(),
                 can_export_selection: self.selection_range(session.screen.cols).is_some(),
+                remote_control: remote_control.clone(),
                 mouse_override_enabled: self.state.settings().terminal_mouse_override,
                 read_only_enabled: self.state.settings().terminal_read_only,
             });
@@ -7466,6 +7495,7 @@ impl NativeShell {
                 can_export_screen: true,
                 can_export_scrollback: true,
                 can_export_selection: self.selection_range(session.screen.cols).is_some(),
+                remote_control: remote_control.clone(),
                 mouse_override_enabled: self.state.settings().terminal_mouse_override,
                 read_only_enabled: self.state.settings().terminal_read_only,
             });
@@ -7607,6 +7637,7 @@ impl NativeShell {
             can_export_selection: active_session
                 .and_then(|session| self.selection_range(session.screen.cols))
                 .is_some(),
+            remote_control,
             mouse_override_enabled: self.state.settings().terminal_mouse_override,
             read_only_enabled: self.state.settings().terminal_read_only,
         })
@@ -10240,6 +10271,30 @@ impl Render for NativeShell {
                     this.toggle_terminal_read_only_action(cx);
                 }))
             };
+        let make_take_remote_control_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if let Some(remote_mode) = this.remote_mode.as_ref() {
+                        remote_mode.client.take_control();
+                    }
+                    this.editor_notice =
+                        Some("This client now controls the remote host.".to_string());
+                    this.sync_settings_remote_draft();
+                    cx.notify();
+                }))
+            };
+        let make_release_remote_control_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if let Some(remote_mode) = this.remote_mode.as_ref() {
+                        remote_mode.client.release_control();
+                    }
+                    this.editor_notice =
+                        Some("This client released control and is now a viewer.".to_string());
+                    this.sync_settings_remote_draft();
+                    cx.notify();
+                }))
+            };
         let make_start_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -10587,6 +10642,14 @@ impl Render for NativeShell {
                 on_export_selection: controls
                     .filter(|controls| controls.can_export_selection)
                     .map(|_| make_export_selection_handler()),
+                on_take_remote_control: controls
+                    .and_then(|controls| controls.remote_control.as_ref())
+                    .filter(|control| control.can_take)
+                    .map(|_| make_take_remote_control_handler()),
+                on_release_remote_control: controls
+                    .and_then(|controls| controls.remote_control.as_ref())
+                    .filter(|control| control.can_release)
+                    .map(|_| make_release_remote_control_handler()),
                 on_toggle_mouse_override: Some(make_toggle_mouse_override_handler()),
                 on_toggle_read_only: Some(make_toggle_read_only_handler()),
                 scrollbar: Some(view::TerminalScrollbarActions {

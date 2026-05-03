@@ -39,6 +39,7 @@ interface PendingRequest {
 }
 
 const BINARY_FRAME_SESSION_OUTPUT = 0x01;
+const STALE_SOCKET_MS = 30_000;
 
 /**
  * Decode the binary session-output frame emitted by the Rust bridge.
@@ -81,9 +82,11 @@ export function decodeSessionOutputFrame(
 export class WsClient {
   private ws: WebSocket | null = null;
   private stopped = false;
+  private starting = false;
   private reconnectDelayMs = 1000;
   private reconnectTimer: number | null = null;
   private pingTimer: number | null = null;
+  private lastFrameAt = 0;
   private nextRequestId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
 
@@ -91,6 +94,10 @@ export class WsClient {
 
   async start(): Promise<void> {
     if (this.stopped) return;
+    if (this.starting) return;
+    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.ws?.readyState === WebSocket.CONNECTING) return;
+    this.starting = true;
     this.cb.onStatus({ kind: "connecting" });
 
     // Authentication probe — cheap, one HTTP round trip, tells us whether
@@ -100,6 +107,7 @@ export class WsClient {
     // network blip.
     try {
       const meResp = await fetch("/api/me", { credentials: "include" });
+      if (this.stopped) return;
       if (meResp.status === 401) {
         this.cb.onStatus({ kind: "unauthorized" });
         return;
@@ -111,6 +119,8 @@ export class WsClient {
     } catch (error) {
       this.scheduleReconnect(`me probe error: ${error}`);
       return;
+    } finally {
+      this.starting = false;
     }
 
     const url = buildWebSocketUrl(location);
@@ -125,12 +135,21 @@ export class WsClient {
     this.ws = socket;
 
     socket.onopen = () => {
+      if (this.ws !== socket) {
+        try {
+          socket.close();
+        } catch {}
+        return;
+      }
+      this.lastFrameAt = Date.now();
       this.reconnectDelayMs = 1000;
       this.cb.onStatus({ kind: "open" });
       this.startHeartbeat();
     };
 
     socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
+      this.lastFrameAt = Date.now();
       if (typeof event.data === "string") {
         let parsed: WsOutbound;
         try {
@@ -150,6 +169,7 @@ export class WsClient {
     };
 
     socket.onclose = (event) => {
+      if (this.ws !== socket) return;
       this.stopHeartbeat();
       const reason = event.reason || `code ${event.code}`;
       this.rejectPendingRequests(`websocket closed: ${reason}`);
@@ -192,6 +212,7 @@ export class WsClient {
 
   stop(): void {
     this.stopped = true;
+    this.starting = false;
     this.stopHeartbeat();
     this.rejectPendingRequests("websocket stopped");
     if (this.reconnectTimer !== null) {
@@ -204,6 +225,35 @@ export class WsClient {
       } catch {}
       this.ws = null;
     }
+  }
+
+  /**
+   * Foreground/focus recovery hook for mobile browsers. It bypasses reconnect
+   * backoff and replaces sockets that still report OPEN after a long browser
+   * suspension but have stopped producing frames.
+   */
+  wake(): void {
+    if (this.stopped) return;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectDelayMs = 1000;
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      if (Date.now() - this.lastFrameAt <= STALE_SOCKET_MS) return;
+      const stale = this.ws;
+      this.ws = null;
+      this.stopHeartbeat();
+      try {
+        stale.close();
+      } catch {}
+      void this.start();
+      return;
+    }
+
+    if (this.ws?.readyState === WebSocket.CONNECTING || this.starting) return;
+    void this.start();
   }
 
   private scheduleReconnect(_reason: string): void {

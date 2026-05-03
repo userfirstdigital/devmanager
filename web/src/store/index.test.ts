@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_DIMENSIONS } from "../api/types";
 import type {
@@ -16,6 +16,7 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
     readonly request = vi.fn<(action: unknown) => Promise<RemoteActionResult>>();
     readonly start = vi.fn(async () => {});
     readonly stop = vi.fn();
+    readonly wake = vi.fn();
   readonly callbacks: {
     onStatus(status: unknown): void;
     onMessage(message: unknown): void;
@@ -171,6 +172,19 @@ function makeSessionView(sessionId: string): TerminalSessionView {
   };
 }
 
+function makeStorage(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial));
+  return {
+    getItem: vi.fn((key: string) => values.get(key) ?? null),
+    setItem: vi.fn((key: string, value: string) => {
+      values.set(key, value);
+    }),
+    removeItem: vi.fn((key: string) => {
+      values.delete(key);
+    }),
+  };
+}
+
 describe("web AI tab actions", () => {
   beforeEach(() => {
     wsClientState.instance = null;
@@ -189,6 +203,10 @@ describe("web AI tab actions", () => {
       pendingLaunches: [],
     });
     useStore.getState().init();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("launchAiTab uses the returned aiTab payload immediately", async () => {
@@ -456,6 +474,80 @@ describe("web AI tab actions", () => {
     expect(state.snapshot?.youHaveControl).toBe(true);
     expect(state.snapshot?.controllerClientId).toBe("web-client");
     expect(state.pendingBootstraps.get("claude-session-3")?.screen.rows).toBe(24);
+  });
+
+  it("restores the last active terminal from persisted state on snapshot", () => {
+    const storage = makeStorage({
+      "devmanager-active-terminal": JSON.stringify({
+        sessionId: "claude-session-old",
+        tabId: "claude-tab-1",
+        savedAt: 1,
+      }),
+    });
+    vi.stubGlobal("localStorage", storage);
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+
+    client?.callbacks.onMessage({
+      type: "snapshot",
+      workspace: makeExistingAiTabSnapshot(),
+    });
+
+    expect(useStore.getState().activeSessionId).toBe("claude-session-old");
+    expect(client?.wake).toHaveBeenCalled();
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "subscribeSessions",
+      sessionIds: ["claude-session-old"],
+    });
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "focusSession",
+      sessionId: "claude-session-old",
+    });
+  });
+
+  it("refreshActiveConnection wakes and reasserts the active terminal subscription", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+    const snapshot = makeExistingAiTabSnapshot();
+    snapshot.controllerClientId = null;
+    snapshot.youHaveControl = false;
+    useStore.setState({
+      snapshot,
+      activeSessionId: "claude-session-old",
+    });
+
+    useStore.getState().refreshActiveConnection();
+
+    expect(client?.wake).toHaveBeenCalled();
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "subscribeSessions",
+      sessionIds: ["claude-session-old"],
+    });
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "focusSession",
+      sessionId: "claude-session-old",
+    });
+    expect(client?.send).toHaveBeenCalledWith({
+      type: "claimControlIfAvailable",
+    });
+  });
+
+  it("refreshActiveConnection does not steal control from another client", () => {
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+    const snapshot = makeExistingAiTabSnapshot();
+    snapshot.controllerClientId = "desktop-client";
+    snapshot.youHaveControl = false;
+    useStore.setState({
+      snapshot,
+      activeSessionId: "claude-session-old",
+    });
+
+    useStore.getState().refreshActiveConnection();
+
+    expect(client?.send).not.toHaveBeenCalledWith({
+      type: "claimControlIfAvailable",
+    });
   });
 
   it("revoked browser disconnect falls back to pairing", () => {

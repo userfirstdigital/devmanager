@@ -15,11 +15,29 @@ export function App() {
   const snapshot = useStore((s) => s.snapshot);
   const activeSessionId = useStore((s) => s.activeSessionId);
   const closeActiveTab = useStore((s) => s.closeActiveTab);
+  const refreshActiveConnection = useStore((s) => s.refreshActiveConnection);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   useEffect(() => {
     init();
   }, [init]);
+
+  useEffect(() => {
+    const wake = () => refreshActiveConnection();
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") wake();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", wake);
+    window.addEventListener("pageshow", wake);
+    window.addEventListener("online", wake);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", wake);
+      window.removeEventListener("pageshow", wake);
+      window.removeEventListener("online", wake);
+    };
+  }, [refreshActiveConnection]);
 
   if (status.kind === "unauthorized") {
     return <PairingGate />;
