@@ -31,10 +31,10 @@ use serde::Deserialize;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::super::{
-    current_controller_allows, now_epoch_ms, requires_control, stable_hash, ConnectedRemoteClient,
-    PendingRemoteRequest, RemoteActionResult, RemoteHostInner, RemoteImageAttachment,
-    RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot, ServerMessage,
-    REQUEST_TIMEOUT,
+    current_controller_allows, now_epoch_ms, request_timeout_for_action, requires_control,
+    stable_hash, ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
+    RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot,
+    ServerMessage,
 };
 use super::wire::{WsInbound, WsOutbound};
 use super::{authenticate_request, record_browser_connection, WebState};
@@ -543,6 +543,7 @@ fn handle_inbound(
             }
 
             let (response_tx, response_rx) = std_mpsc::channel();
+            let timeout = request_timeout_for_action(&action);
             if let Ok(mut requests) = inner.pending_requests.lock() {
                 requests.push(PendingRemoteRequest {
                     client_id: client_id.to_string(),
@@ -554,7 +555,7 @@ fn handle_inbound(
             let response_tx = tokio_tx.clone();
             std::thread::spawn(move || {
                 let result = response_rx
-                    .recv_timeout(REQUEST_TIMEOUT)
+                    .recv_timeout(timeout)
                     .unwrap_or_else(|_| RemoteActionResult::error("Remote host timed out."));
                 let _ = response_tx.send(ServerMessage::Response {
                     request_id: id,

@@ -39,6 +39,7 @@ const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const REMOTE_ACCESS_LOG_LIMIT: usize = 100;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_OUTBOUND_MESSAGES_PER_TICK: usize = 128;
@@ -1780,6 +1781,7 @@ impl RemoteClientHandle {
     }
 
     pub fn request(&self, action: RemoteAction) -> Result<RemoteActionResult, String> {
+        let timeout = request_timeout_for_action(&action);
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         if let Ok(mut pending) = self.inner.pending.lock() {
@@ -1789,7 +1791,7 @@ impl RemoteClientHandle {
             .outgoing
             .send(ClientMessage::Request { request_id, action })
             .map_err(|error| format!("Remote request failed: {error}"))?;
-        rx.recv_timeout(REQUEST_TIMEOUT)
+        rx.recv_timeout(timeout)
             .map_err(|_| "Timed out waiting for remote host.".to_string())
     }
 
@@ -2872,6 +2874,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                     continue;
                 }
 
+                let timeout = request_timeout_for_action(&action);
                 let (response_tx, response_rx) = mpsc::channel();
                 if let Ok(mut requests) = inner.pending_requests.lock() {
                     requests.push(PendingRemoteRequest {
@@ -2881,7 +2884,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                     });
                 }
                 let result = response_rx
-                    .recv_timeout(REQUEST_TIMEOUT)
+                    .recv_timeout(timeout)
                     .unwrap_or_else(|_| RemoteActionResult::error("Remote host timed out."));
                 let _ = tx.send(ServerMessage::Response { request_id, result });
             }
@@ -3157,6 +3160,18 @@ pub(crate) fn requires_control(action: &RemoteAction) -> bool {
             | RemoteAction::GitBranches { .. }
             | RemoteAction::GitGetGithubAuthStatus
     )
+}
+
+pub(crate) fn request_timeout_for_action(action: &RemoteAction) -> Duration {
+    match action {
+        RemoteAction::GitCommit { .. }
+        | RemoteAction::GitPush { .. }
+        | RemoteAction::GitPushSetUpstream { .. }
+        | RemoteAction::GitPull { .. }
+        | RemoteAction::GitFetch { .. }
+        | RemoteAction::GitSync { .. } => GIT_REQUEST_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    }
 }
 
 fn apply_remote_session_output(
@@ -3668,9 +3683,10 @@ mod tests {
         apply_remote_session_output, apply_workspace_delta, current_controller_allows,
         current_snapshot, deliver_pending_bootstraps, format_handshake_stage_error,
         generate_pairing_token, light_snapshot, load_remote_machine_state, now_epoch_ms,
-        save_remote_machine_state, set_last_connection_note, upsert_known_host, ClientAuth,
-        ConnectedRemoteClient, KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient,
-        PairedWebClient, RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource,
+        request_timeout_for_action, requires_control, save_remote_machine_state,
+        set_last_connection_note, upsert_known_host, ClientAuth, ConnectedRemoteClient,
+        KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
+        RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource, RemoteAction,
         RemoteClientHandle, RemoteClientInner, RemoteHostConfig, RemoteHostService,
         RemoteLatencyStats, RemoteMachineState, RemoteSessionBootstrap, RemoteSessionStreamEvent,
         RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
@@ -3709,6 +3725,107 @@ mod tests {
         assert!(!config.certificate_pem.is_empty());
         assert!(!config.private_key_pem.is_empty());
         assert!(!config.certificate_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn lightweight_remote_actions_use_default_request_timeout() {
+        assert_eq!(
+            request_timeout_for_action(&RemoteAction::GitListRepos),
+            super::REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for_action(&RemoteAction::StopAllServers),
+            super::REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn network_backed_git_actions_use_extended_request_timeout() {
+        let repo_path = "repo".to_string();
+        let extended_actions = [
+            RemoteAction::GitCommit {
+                repo_path: repo_path.clone(),
+                summary: "summary".to_string(),
+                body: None,
+            },
+            RemoteAction::GitPush {
+                repo_path: repo_path.clone(),
+            },
+            RemoteAction::GitPushSetUpstream {
+                repo_path: repo_path.clone(),
+                branch: "main".to_string(),
+            },
+            RemoteAction::GitSync {
+                repo_path: repo_path.clone(),
+            },
+        ];
+
+        for action in extended_actions {
+            assert!(
+                request_timeout_for_action(&action) > super::REQUEST_TIMEOUT,
+                "{action:?} should use an extended timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn git_read_actions_do_not_require_remote_control() {
+        let repo_path = "repo".to_string();
+        let read_actions = [
+            RemoteAction::GitListRepos,
+            RemoteAction::GitStatus {
+                repo_path: repo_path.clone(),
+            },
+            RemoteAction::GitLog {
+                repo_path: repo_path.clone(),
+                limit: 50,
+                skip: 0,
+            },
+            RemoteAction::GitDiffFile {
+                repo_path: repo_path.clone(),
+                file_path: "src/main.rs".to_string(),
+                staged: false,
+            },
+            RemoteAction::GitDiffCommit {
+                repo_path: repo_path.clone(),
+                hash: "HEAD".to_string(),
+            },
+            RemoteAction::GitBranches { repo_path },
+        ];
+
+        for action in read_actions {
+            assert!(
+                !requires_control(&action),
+                "{action:?} should be readable without remote control"
+            );
+        }
+    }
+
+    #[test]
+    fn git_mutation_actions_require_remote_control() {
+        let repo_path = "repo".to_string();
+        let mutation_actions = [
+            RemoteAction::GitCommit {
+                repo_path: repo_path.clone(),
+                summary: "summary".to_string(),
+                body: None,
+            },
+            RemoteAction::GitPush {
+                repo_path: repo_path.clone(),
+            },
+            RemoteAction::GitPushSetUpstream {
+                repo_path: repo_path.clone(),
+                branch: "main".to_string(),
+            },
+            RemoteAction::GitSync { repo_path },
+        ];
+
+        for action in mutation_actions {
+            assert!(
+                requires_control(&action),
+                "{action:?} should require remote control"
+            );
+        }
     }
 
     #[test]
