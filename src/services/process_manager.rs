@@ -660,11 +660,12 @@ impl ProcessManager {
         // Update visible UI state synchronously so the tab disappears
         // immediately from the sidebar — but push the actual PTY teardown
         // to a background thread. Claude Code spawns a tree of npx/node/
-        // tar/git child processes, and signalling that whole tree with
-        // taskkill /F on Windows can take multiple seconds to return. The
-        // main thread processes remote-host actions and GPUI rendering,
-        // so blocking it on a slow process-tree kill is exactly what made
-        // the window go "(Not Responding)" when a web client closed a tab.
+        // tar/git child processes, and tearing that whole tree down can
+        // take multiple seconds (enumerating descendants + waiting for
+        // each TerminateProcess to settle). The main thread processes
+        // remote-host actions and GPUI rendering, so blocking it on a
+        // slow process-tree kill is exactly what made the window go
+        // "(Not Responding)" when a web client closed a tab.
         app_state.remove_tab(tab_id);
         if let Some(session_id) = session_id {
             let manager = self.clone();

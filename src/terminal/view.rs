@@ -40,6 +40,7 @@ pub struct TerminalPaneModel {
     pub session: Option<TerminalSessionView>,
     pub startup_notice: Option<String>,
     pub blocking_notice: Option<String>,
+    pub actionable_notice: Option<TerminalActionableNotice>,
     pub debug_enabled: bool,
     pub font_size: f32,
     pub cell_width: f32,
@@ -52,12 +53,20 @@ pub struct TerminalPaneModel {
     pub splash_image: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TerminalActionableNotice {
+    pub message: String,
+    pub action_label: &'static str,
+    pub action_color: u32,
+}
+
 pub struct TerminalPaneActions {
     pub on_start_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_stop_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_restart_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_clear_output: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_kill_port: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_actionable_notice_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_open_local_url: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_prompt_action: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_toggle_search: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
@@ -144,18 +153,32 @@ pub fn render_terminal_surface(
     model: &TerminalPaneModel,
     actions: Option<TerminalPaneActions>,
 ) -> impl IntoElement {
+    let mut actions = actions;
+    let actionable_notice_action = actions
+        .as_mut()
+        .and_then(|actions| actions.on_actionable_notice_action.take());
     let scrollbar_actions = actions
         .as_ref()
         .and_then(|actions| actions.scrollbar.clone());
-    let notice = model.startup_notice.as_ref().map(|message| {
-        div()
-            .px_2()
-            .py_1()
-            .bg(rgb(theme::PANEL_HEADER_BG))
-            .text_xs()
-            .text_color(rgb(theme::TEXT_MUTED))
-            .child(SharedString::from(message.clone()))
-    });
+    // Hide the plain muted startup_notice when an actionable banner is taking over,
+    // so we don't show the same text twice.
+    let notice = if model.actionable_notice.is_some() {
+        None
+    } else {
+        model.startup_notice.as_ref().map(|message| {
+            div()
+                .px_2()
+                .py_1()
+                .bg(rgb(theme::PANEL_HEADER_BG))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(SharedString::from(message.clone()))
+        })
+    };
+    let actionable_banner = model
+        .actionable_notice
+        .as_ref()
+        .map(|banner| render_actionable_notice(banner, actionable_notice_action));
     let blocking_notice = model.blocking_notice.as_ref().map(|message| {
         div()
             .mx_2()
@@ -333,6 +356,7 @@ pub fn render_terminal_surface(
                     .gap(px(2.0))
                     .bg(rgb(theme::TERMINAL_BG))
                     .children(notice)
+                    .children(actionable_banner)
                     .children(blocking_notice)
                     .children(model.search.as_ref().map(render_search_bar))
                     .children(exit_banner)
@@ -1044,6 +1068,7 @@ fn render_runtime_actions(
         on_restart_server,
         on_clear_output: _,
         on_kill_port,
+        on_actionable_notice_action: _,
         on_open_local_url,
         on_prompt_action,
         on_toggle_search,
@@ -1231,6 +1256,36 @@ fn remote_control_button(
                 .child(SharedString::from(label.to_string()))
                 .on_mouse_down(MouseButton::Left, on_click)
         }))
+}
+
+fn render_actionable_notice(
+    banner: &TerminalActionableNotice,
+    on_click: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+) -> impl IntoElement {
+    div()
+        .mx(px(8.0))
+        .my(px(4.0))
+        .px(px(10.0))
+        .py(px(6.0))
+        .border_1()
+        .border_color(rgb(theme::DANGER_TEXT))
+        .bg(rgb(theme::DANGER_BG_SUBTLE))
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .text_color(rgb(theme::DANGER_TEXT))
+                .child(SharedString::from(banner.message.clone())),
+        )
+        .children(
+            on_click.map(|handler| {
+                runtime_action_button(banner.action_label, banner.action_color, handler)
+            }),
+        )
 }
 
 fn runtime_action_button(

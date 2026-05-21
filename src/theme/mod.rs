@@ -38,6 +38,7 @@ pub const SUCCESS_BG: u32 = 0x142117;
 pub const SUCCESS_TEXT: u32 = 0x4ade80;
 pub const WARNING_TEXT: u32 = 0xfacc15;
 pub const DANGER_TEXT: u32 = 0xfb7185;
+pub const DANGER_BG_SUBTLE: u32 = 0x2a1517; // dark red tint for actionable banners
 
 // Primary action color
 pub const PRIMARY: u32 = 0x4f46e5; // indigo-600 — primary action

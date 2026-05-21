@@ -237,6 +237,20 @@ extern "system" {
 }
 
 #[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+    fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+#[cfg(windows)]
+const PROCESS_TERMINATE: u32 = 0x0001;
+#[cfg(windows)]
+const SYNCHRONIZE: u32 = 0x00100000;
+
+#[cfg(windows)]
 fn windows_port(raw_port: u32) -> u16 {
     u16::from_be((raw_port & 0xffff) as u16)
 }
@@ -244,7 +258,14 @@ fn windows_port(raw_port: u32) -> u16 {
 pub fn kill_process_tree(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        run_taskkill(pid, true)
+        // Terminate descendants leaf-first so a parent can't repopulate the tree
+        // mid-kill. We ignore per-child errors and rely on the final check of the
+        // root PID to determine success.
+        let descendants = collect_descendant_process_identities(pid);
+        for child in descendants.iter().rev() {
+            let _ = windows_terminate_pid(child.pid);
+        }
+        windows_terminate_pid(pid)
     }
 
     #[cfg(not(windows))]
@@ -256,7 +277,7 @@ pub fn kill_process_tree(pid: u32) -> Result<(), String> {
 pub fn kill_process(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        run_taskkill(pid, false)
+        windows_terminate_pid(pid)
     }
 
     #[cfg(not(windows))]
@@ -540,21 +561,34 @@ fn applescript_quote(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn run_taskkill(pid: u32, include_tree: bool) -> Result<(), String> {
-    let mut command = Command::new("taskkill");
-    command.args(["/PID", &pid.to_string(), "/F"]);
-    command.creation_flags(CREATE_NO_WINDOW);
-    if include_tree {
-        command.arg("/T");
+fn windows_terminate_pid(pid: u32) -> Result<(), String> {
+    if !is_pid_running(pid) {
+        return Ok(());
     }
-
-    let output = command
-        .output()
-        .map_err(|error| format!("Failed to run taskkill: {error}"))?;
-    if output.status.success() || !is_pid_running(pid) {
-        Ok(())
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            if !is_pid_running(pid) {
+                return Ok(());
+            }
+            return Err(format!(
+                "OpenProcess({pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let ok = TerminateProcess(handle, 1);
+        if ok == 0 && is_pid_running(pid) {
+            let err = std::io::Error::last_os_error();
+            CloseHandle(handle);
+            return Err(format!("TerminateProcess({pid}) failed: {err}"));
+        }
+        let _ = WaitForSingleObject(handle, 2000);
+        CloseHandle(handle);
+    }
+    if is_pid_running(pid) {
+        Err(format!("Process {pid} did not exit after TerminateProcess"))
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Ok(())
     }
 }
 

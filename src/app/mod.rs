@@ -129,6 +129,14 @@ pub fn run() {
         });
 }
 
+#[derive(Debug, Clone)]
+enum ActionableNotice {
+    PortInUse {
+        command_id: String,
+        message: String,
+    },
+}
+
 struct NativeShell {
     state: AppState,
     session_manager: SessionManager,
@@ -136,6 +144,7 @@ struct NativeShell {
     updater: UpdaterService,
     startup_notice: Option<String>,
     terminal_notice: Option<String>,
+    terminal_actionable_notice: Option<ActionableNotice>,
     editor_notice: Option<String>,
     remote_machine_state: RemoteMachineState,
     remote_host_service: RemoteHostService,
@@ -709,6 +718,7 @@ impl NativeShell {
             updater,
             startup_notice,
             terminal_notice,
+            terminal_actionable_notice: None,
             editor_notice: None,
             remote_machine_state,
             remote_host_service,
@@ -6530,6 +6540,7 @@ impl NativeShell {
                     .clone()
                     .or_else(|| self.terminal_notice.clone()),
                 blocking_notice,
+                actionable_notice: None,
                 debug_enabled: self.process_manager.debug_enabled(),
                 font_size: self.terminal_font_size(),
                 cell_width: terminal_metrics.cell_width,
@@ -6819,6 +6830,25 @@ impl NativeShell {
         let search_highlight = self.current_search_highlight(active_session.as_ref());
         let scrollbar = self.terminal_scrollbar_model(active_session.as_ref());
         let has_active_tab = active_tab_type.is_some();
+        let actionable_notice = self.terminal_actionable_notice.as_ref().and_then(|notice| {
+            match notice {
+                ActionableNotice::PortInUse {
+                    command_id,
+                    message,
+                    ..
+                } => {
+                    if command_id.as_str() == active_spec.session_id.as_str() {
+                        Some(view::TerminalActionableNotice {
+                            message: message.clone(),
+                            action_label: "Kill process & start server",
+                            action_color: theme::DANGER_TEXT,
+                        })
+                    } else {
+                        None
+                    }
+                }
+            }
+        });
         view::TerminalPaneModel {
             active_project: if has_active_tab {
                 self.state
@@ -6840,6 +6870,7 @@ impl NativeShell {
                 .clone()
                 .or_else(|| self.terminal_notice.clone()),
             blocking_notice,
+            actionable_notice,
             debug_enabled: self.process_manager.debug_enabled(),
             font_size: self.terminal_font_size(),
             cell_width: terminal_metrics.cell_width,
@@ -7915,6 +7946,7 @@ impl NativeShell {
                         self.select_server_tab_action(command_id, cx);
                     }
                     self.terminal_notice = None;
+                    self.terminal_actionable_notice = None;
                 }
                 Ok(result) => {
                     self.terminal_notice = Some(
@@ -7953,6 +7985,7 @@ impl NativeShell {
                         self.synced_session_id = Some(command_id.to_string());
                     }
                     self.terminal_notice = None;
+                    self.terminal_actionable_notice = None;
                     self.save_session_state();
                 }
                 Err(error) => {
@@ -8004,8 +8037,14 @@ impl NativeShell {
                                 .pid
                                 .map(|pid| format!("{owner} ({pid})"))
                                 .unwrap_or(owner);
-                            this.terminal_notice =
-                                Some(format!("Port {port} is already in use by {owner_label}."));
+                            let message =
+                                format!("Port {port} is already in use by {owner_label}.");
+                            this.terminal_notice = Some(message.clone());
+                            this.terminal_actionable_notice =
+                                Some(ActionableNotice::PortInUse {
+                                    command_id: command_id.clone(),
+                                    message,
+                                });
                             cx.notify();
                             return;
                         }
@@ -8030,6 +8069,7 @@ impl NativeShell {
                                     this.synced_session_id = Some(command_id.clone());
                                 }
                                 this.terminal_notice = None;
+                                this.terminal_actionable_notice = None;
                                 this.save_session_state();
                             }
                             Err(error) => {
@@ -8300,6 +8340,7 @@ impl NativeShell {
             Ok(()) => {
                 self.synced_session_id = Some(command_id.to_string());
                 self.terminal_notice = None;
+                self.terminal_actionable_notice = None;
                 self.save_session_state();
             }
             Err(error) => {
@@ -10606,6 +10647,13 @@ impl Render for NativeShell {
                 on_kill_port: controls
                     .filter(|controls| controls.can_kill_port)
                     .map(|_| make_kill_port_handler(command_id.clone())),
+                on_actionable_notice_action: self.terminal_actionable_notice.as_ref().map(
+                    |notice| match notice {
+                        ActionableNotice::PortInUse {
+                            command_id: cmd_id, ..
+                        } => make_kill_port_handler(cmd_id.clone()),
+                    },
+                ),
                 on_open_local_url: controls
                     .filter(|controls| controls.can_open_url)
                     .map(|_| make_open_server_url_handler(command_id.clone())),
