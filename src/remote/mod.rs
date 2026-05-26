@@ -386,6 +386,9 @@ pub enum RemoteAction {
     DisconnectSsh {
         connection_id: String,
     },
+    CloseSession {
+        session_id: String,
+    },
     CloseTab {
         tab_id: String,
     },

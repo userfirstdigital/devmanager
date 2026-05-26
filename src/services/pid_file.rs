@@ -4,17 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use std::sync::MutexGuard;
-
 static PID_FILE_ACCESS_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(test)]
 static TEST_PID_FILE_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(test)]
 static TEST_PID_FILE_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 const LEDGER_VERSION: u32 = 1;
@@ -93,12 +89,11 @@ enum TrackedProcessState {
     ReusedPid,
 }
 
-#[cfg(test)]
-pub(crate) struct TestPidFileGuard {
+#[doc(hidden)]
+pub struct TestPidFileGuard {
     _lock: MutexGuard<'static, ()>,
 }
 
-#[cfg(test)]
 impl Drop for TestPidFileGuard {
     fn drop(&mut self) {
         if let Ok(mut override_path) = TEST_PID_FILE_OVERRIDE.lock() {
@@ -107,8 +102,8 @@ impl Drop for TestPidFileGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn use_test_pid_file(path: PathBuf) -> TestPidFileGuard {
+#[doc(hidden)]
+pub fn use_test_pid_file(path: PathBuf) -> TestPidFileGuard {
     let lock = TEST_PID_FILE_OVERRIDE_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -119,7 +114,6 @@ pub(crate) fn use_test_pid_file(path: PathBuf) -> TestPidFileGuard {
 }
 
 fn pid_file_path() -> Result<PathBuf, String> {
-    #[cfg(test)]
     if let Ok(override_path) = TEST_PID_FILE_OVERRIDE.lock() {
         if let Some(path) = override_path.clone() {
             return Ok(path);
@@ -520,6 +514,21 @@ pub fn active_tracked_processes() -> Vec<ManagedProcessRecord> {
         Err(_) => return Vec::new(),
     };
     active_processes_with(&path, platform_service::capture_process_identity)
+}
+
+pub fn active_tracked_processes_for_session(session_id: &str) -> Vec<ManagedProcessRecord> {
+    let path = match pid_file_path() {
+        Ok(path) => path,
+        Err(_) => return Vec::new(),
+    };
+    read_ledger_from_path(&path)
+        .sessions
+        .into_values()
+        .filter(|entry| entry.session_id == session_id)
+        .filter_map(|entry| {
+            active_processes_in_record_with(&entry, &mut platform_service::capture_process_identity)
+        })
+        .collect()
 }
 
 pub fn active_tracked_pids() -> Vec<u32> {

@@ -124,6 +124,8 @@ const DEFAULT_CLAUDE_COMMAND: &str =
 const DEFAULT_CODEX_COMMAND: &str =
     "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox";
 const AI_COMMAND_INJECTION_DELAY_MS: u64 = 500;
+#[cfg(not(test))]
+const SESSION_REAPER_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Default for ProcessManager {
     fn default() -> Self {
@@ -272,6 +274,12 @@ impl ProcessManager {
         if self.session_exists(&session_id) {
             return Ok(());
         }
+
+        let _ = force_reap_session_processes_until_clear(
+            &self.inner,
+            &session_id,
+            Duration::from_secs(2),
+        );
 
         match TerminalSession::spawn(
             session_id.clone(),
@@ -440,6 +448,29 @@ impl ProcessManager {
 
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
         self.request_session_close(session_id, true)
+    }
+
+    pub fn close_tab(&self, app_state: &mut AppState, tab_id: &str) -> Result<(), String> {
+        let Some(tab) = app_state.find_tab(tab_id).cloned() else {
+            return Ok(());
+        };
+
+        match tab.tab_type {
+            TabType::Server => {
+                let command_id = tab.command_id.unwrap_or_else(|| tab.id.clone());
+                let _ = self.stop_server(&command_id);
+                app_state.remove_tab(tab_id);
+            }
+            TabType::Claude | TabType::Codex => {
+                self.close_ai_session(app_state, tab_id)?;
+            }
+            TabType::Ssh => {
+                self.close_ssh_session(app_state, tab_id)?;
+                app_state.remove_tab(tab_id);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn active_session(&self) -> Option<TerminalSessionView> {
@@ -1366,6 +1397,10 @@ impl ProcessManager {
 
         let mut forced_kill_pids = 0;
         if self.live_session_count() > 0 || !active_tracked_processes.is_empty() {
+            for session_id in self.live_session_ids() {
+                forced_kill_pids += force_reap_session_processes(&self.inner, &session_id);
+            }
+
             let mut pids_to_kill = self.live_session_pids();
             pids_to_kill.extend(pid_file::active_tracked_pids());
             pids_to_kill.sort_unstable();
@@ -1533,8 +1568,34 @@ impl ProcessManager {
     }
 
     fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
-        let session = self.get_session(session_id)?;
-        session.close(closed_by_user)
+        let result = match self.get_session(session_id) {
+            Ok(session) => session.close(closed_by_user),
+            Err(error) => {
+                self.note_missing_session_close_request(session_id, closed_by_user);
+                Err(error)
+            }
+        };
+        self.spawn_session_reaper(session_id.to_string());
+        result
+    }
+
+    fn note_missing_session_close_request(&self, session_id: &str, closed_by_user: bool) {
+        self.update_session_state(session_id, |session| {
+            if session.status.is_live() {
+                session.status = SessionStatus::Stopping;
+                session.exit = Some(SessionExitState {
+                    code: None,
+                    signal: None,
+                    closed_by_user,
+                    summary: if closed_by_user {
+                        "Session close requested by user".to_string()
+                    } else {
+                        "Session close requested".to_string()
+                    },
+                });
+                session.mark_dirty();
+            }
+        });
     }
 
     fn live_session_ids(&self) -> Vec<String> {
@@ -1553,25 +1614,6 @@ impl ProcessManager {
             .filter(|session| session.status.is_live())
             .filter_map(|session| session.pid)
             .collect()
-    }
-
-    fn tracked_session_pids(&self, session_id: &str) -> Vec<u32> {
-        let runtime = self.runtime_state();
-        let mut pids = runtime
-            .sessions
-            .get(session_id)
-            .map(|session| {
-                let mut pids = session.resources.process_ids.clone();
-                if let Some(pid) = session.pid {
-                    pids.push(pid);
-                }
-                pids
-            })
-            .unwrap_or_default();
-        pids.extend(pid_file::active_tracked_pids_for_session(session_id));
-        pids.sort_unstable();
-        pids.dedup();
-        pids
     }
 
     fn wait_for_session_shutdown(&self, session_id: &str, timeout: Duration) -> bool {
@@ -1595,19 +1637,34 @@ impl ProcessManager {
     }
 
     fn force_kill_session_processes(&self, session_id: &str) -> usize {
-        let mut forced_kill_pids = 0;
-        for pid in self.tracked_session_pids(session_id) {
-            if !platform_service::is_pid_running(pid) {
-                continue;
-            }
-            if platform_service::kill_process_tree(pid).is_ok()
-                || !platform_service::is_pid_running(pid)
-            {
-                forced_kill_pids += 1;
-            }
+        force_reap_session_processes(&self.inner, session_id)
+    }
+
+    fn spawn_session_reaper(&self, session_id: String) {
+        #[cfg(test)]
+        {
+            let _ =
+                self.reap_session_processes_until_clear(&session_id, Duration::from_millis(100));
         }
-        let _ = pid_file::prune_inactive_entries();
-        forced_kill_pids
+
+        #[cfg(not(test))]
+        {
+            let manager = self.clone();
+            thread::spawn(move || {
+                let _ =
+                    manager.reap_session_processes_until_clear(&session_id, SESSION_REAPER_TIMEOUT);
+            });
+        }
+    }
+
+    fn reap_session_processes_until_clear(&self, session_id: &str, timeout: Duration) -> usize {
+        let reaped = force_reap_session_processes_until_clear(&self.inner, session_id, timeout);
+        if pid_file::active_tracked_pids_for_session(session_id).is_empty()
+            && !live_runtime_root_running(&self.inner, session_id)
+        {
+            mark_session_reaped(&self.inner, session_id);
+        }
+        reaped
     }
 
     fn update_session_state(&self, session_id: &str, f: impl FnOnce(&mut SessionRuntimeState)) {
@@ -1727,6 +1784,11 @@ impl ProcessManager {
         let launch_clone = launch.clone();
         let session_id_owned = session_id.to_string();
         thread::spawn(move || {
+            let _ = force_reap_session_processes_until_clear(
+                &manager.inner,
+                &session_id_owned,
+                Duration::from_secs(2),
+            );
             let result = TerminalSession::spawn_command(
                 session_id_owned.clone(),
                 launch_clone.cwd.clone(),
@@ -1790,6 +1852,12 @@ impl ProcessManager {
         if self.session_exists(session_id) {
             return Ok(());
         }
+
+        let _ = force_reap_session_processes_until_clear(
+            &self.inner,
+            session_id,
+            Duration::from_secs(2),
+        );
 
         let session = TerminalSession::spawn_command(
             session_id.to_string(),
@@ -2035,6 +2103,107 @@ fn collect_process_tree_ids(system: &sysinfo::System, root_pid: sysinfo::Pid) ->
     process_ids
 }
 
+fn force_reap_session_processes_until_clear(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    timeout: Duration,
+) -> usize {
+    let started_at = Instant::now();
+    let mut reaped = 0;
+    loop {
+        reaped += force_reap_session_processes(inner, session_id);
+        if pid_file::active_tracked_pids_for_session(session_id).is_empty()
+            && !live_runtime_root_running(inner, session_id)
+        {
+            break;
+        }
+        if started_at.elapsed() >= timeout {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    reaped
+}
+
+fn force_reap_session_processes(inner: &Arc<ProcessManagerInner>, session_id: &str) -> usize {
+    let mut forced_kill_pids = 0;
+    for pid in collect_session_reap_pids(inner, session_id) {
+        if !platform_service::is_pid_running(pid) {
+            continue;
+        }
+        if platform_service::kill_process_tree(pid).is_ok()
+            || !platform_service::is_pid_running(pid)
+        {
+            forced_kill_pids += 1;
+        }
+    }
+    let _ = pid_file::prune_inactive_entries();
+    forced_kill_pids
+}
+
+fn collect_session_reap_pids(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Vec<u32> {
+    let mut pids = BTreeSet::new();
+
+    for entry in pid_file::active_tracked_processes_for_session(session_id) {
+        let root_verified = platform_service::process_matches_identity(
+            entry.pid,
+            entry.started_at_unix_secs,
+            entry.process_name.as_deref(),
+        );
+        if root_verified {
+            pids.insert(entry.pid);
+            for descendant in platform_service::collect_descendant_process_identities(entry.pid) {
+                pids.insert(descendant.pid);
+            }
+        }
+        for descendant in entry.descendant_processes {
+            pids.insert(descendant.pid);
+        }
+    }
+
+    if let Some(root_pid) = live_runtime_root_pid(inner, session_id) {
+        pids.insert(root_pid);
+        for descendant in platform_service::collect_descendant_process_identities(root_pid) {
+            pids.insert(descendant.pid);
+        }
+    }
+
+    pids.into_iter().collect()
+}
+
+fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Option<u32> {
+    inner.runtime_state.read().ok().and_then(|runtime| {
+        runtime
+            .sessions
+            .get(session_id)
+            .and_then(|session| (session.status.is_live()).then_some(session.pid).flatten())
+    })
+}
+
+fn live_runtime_root_running(inner: &Arc<ProcessManagerInner>, session_id: &str) -> bool {
+    live_runtime_root_pid(inner, session_id).is_some_and(platform_service::is_pid_running)
+}
+
+fn mark_session_reaped(inner: &Arc<ProcessManagerInner>, session_id: &str) {
+    let mut changed = false;
+    if let Ok(mut runtime) = inner.runtime_state.write() {
+        if let Some(session) = runtime.sessions.get_mut(session_id) {
+            if session.status == SessionStatus::Stopping {
+                let dirty_before = session.dirty_generation;
+                session.status = SessionStatus::Stopped;
+                session.pid = None;
+                session.resources = ResourceSnapshot::default();
+                session.mark_dirty();
+                changed = session.dirty_generation != dirty_before;
+            }
+        }
+    }
+    if changed {
+        bump_runtime_revision(inner);
+        emit_tracked_remote_runtime_snapshot(inner, session_id);
+    }
+}
+
 fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
     #[derive(Debug)]
     enum ExitReconciliation {
@@ -2100,6 +2269,7 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 cwd,
                 dimensions,
             } => {
+                let _ = force_reap_session_processes(inner, &session_id);
                 if restore_interrupted_server_prompt(inner, &session_id, cwd, dimensions).is_err() {
                     let mut changed = false;
                     if let Ok(mut runtime) = inner.runtime_state.write() {
@@ -2118,6 +2288,7 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 }
             }
             ExitReconciliation::MarkStopped { session_id } => {
+                let _ = force_reap_session_processes(inner, &session_id);
                 let mut changed = false;
                 if let Ok(mut runtime) = inner.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&session_id) {
@@ -2134,6 +2305,7 @@ fn reconcile_exit_states(inner: &Arc<ProcessManagerInner>) {
                 }
             }
             ExitReconciliation::MarkCrashed { session_id } => {
+                let _ = force_reap_session_processes(inner, &session_id);
                 let mut changed = false;
                 if let Ok(mut runtime) = inner.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&session_id) {
@@ -2556,6 +2728,8 @@ fn spawn_server_session_with_inner(
         return Ok(());
     }
 
+    let _ = force_reap_session_processes_until_clear(inner, &session_id, Duration::from_secs(2));
+
     if let Ok(existing_session) = inner
         .sessions
         .lock()
@@ -2833,15 +3007,18 @@ fn next_ssh_session_id(connection_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AppConfig, Project, ProjectFolder, RunCommand, Settings};
+    use crate::models::{
+        AppConfig, Project, ProjectFolder, RunCommand, SessionTab, Settings, TabType,
+    };
     use crate::services::pid_file;
     use std::fs;
     use std::thread;
 
     #[test]
     fn clear_virtual_output_resets_terminal_snapshot() {
-        let manager = ProcessManager::new();
         let cwd = temp_test_dir("clear-virtual-output");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
         let session_id = "test-shell";
 
         manager
@@ -2864,12 +3041,13 @@ mod tests {
     #[test]
     fn restart_server_preserves_or_clears_logs_based_on_setting() {
         for clear_logs_on_restart in [false, true] {
-            let manager = ProcessManager::new();
             let cwd = temp_test_dir(if clear_logs_on_restart {
                 "restart-clear-logs"
             } else {
                 "restart-preserve-logs"
             });
+            let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+            let manager = ProcessManager::new();
             let mut app_state = app_state_with_server(&cwd, clear_logs_on_restart);
             let command_id = "server-cmd";
             let dimensions = SessionDimensions::default();
@@ -3037,6 +3215,95 @@ mod tests {
             process_name: Some("node.exe".to_string()),
         }];
         assert!(!is_blocking_external_editor(&non_editor_descendants));
+    }
+
+    #[test]
+    fn reaper_targets_tracked_descendant_when_root_is_gone() {
+        let cwd = temp_test_dir("reaper-dead-root-descendant");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let current = platform_service::capture_process_identity(std::process::id())
+            .expect("current process identity");
+        pid_file::track_session_process(pid_file::ManagedProcessRecord {
+            session_id: "server-cmd".to_string(),
+            pid: u32::MAX,
+            started_at_unix_secs: 1,
+            process_name: Some("missing-root.exe".to_string()),
+            session_kind: "server".to_string(),
+            program: "cmd".to_string(),
+            project_id: Some("project-1".to_string()),
+            command_id: Some("server-cmd".to_string()),
+            tab_id: None,
+            descendant_processes: vec![pid_file::TrackedProcessIdentity {
+                pid: current.pid,
+                started_at_unix_secs: current.started_at_unix_secs,
+                process_name: current.process_name,
+            }],
+        })
+        .unwrap();
+
+        let pids = collect_session_reap_pids(&manager.inner, "server-cmd");
+
+        assert_eq!(pids, vec![std::process::id()]);
+    }
+
+    #[test]
+    fn reaper_marks_stopping_session_stopped_after_processes_clear() {
+        let cwd = temp_test_dir("reaper-stopped-session");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        manager.register_runtime_session(SessionRuntimeState::new(
+            "alpha",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        ));
+        manager.update_session_state("alpha", |session| {
+            session.status = SessionStatus::Stopping;
+            session.pid = None;
+            session.mark_dirty();
+        });
+
+        manager.reap_session_processes_until_clear("alpha", Duration::from_millis(1));
+
+        let runtime = manager.runtime_state();
+        assert_eq!(
+            runtime.sessions.get("alpha").map(|session| session.status),
+            Some(SessionStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn close_tab_removes_ssh_tab_and_stops_session() {
+        let manager = ProcessManager::new();
+        let mut app_state = AppState::default();
+        app_state.open_tabs.push(SessionTab {
+            id: "ssh-tab".to_string(),
+            tab_type: TabType::Ssh,
+            project_id: "project-1".to_string(),
+            command_id: None,
+            pty_session_id: Some("ssh-session".to_string()),
+            label: Some("SSH".to_string()),
+            ssh_connection_id: Some("ssh-1".to_string()),
+        });
+        manager.register_runtime_session(SessionRuntimeState::new(
+            "ssh-session",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        ));
+
+        manager.close_tab(&mut app_state, "ssh-tab").unwrap();
+
+        let runtime = manager.runtime_state();
+        assert!(app_state.find_tab("ssh-tab").is_none());
+        assert_eq!(
+            runtime
+                .sessions
+                .get("ssh-session")
+                .map(|session| session.status),
+            Some(SessionStatus::Stopped)
+        );
     }
 
     fn temp_test_dir(label: &str) -> PathBuf {

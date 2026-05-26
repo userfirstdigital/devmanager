@@ -608,6 +608,8 @@ impl NativeShell {
                 )),
             ),
         };
+        pid_file::cleanup_orphaned_processes();
+
         let process_manager = ProcessManager::new();
         process_manager.set_settings(state.config.settings.clone());
         process_manager.set_notification_sound(state.config.settings.notification_sound.clone());
@@ -688,8 +690,6 @@ impl NativeShell {
             .settings
             .restore_session_on_start
             .unwrap_or(true);
-
-        pid_file::cleanup_orphaned_processes();
 
         if !restore_enabled {
             state.open_tabs.clear();
@@ -2861,17 +2861,16 @@ impl NativeShell {
                     }
                     Err(error) => RemoteActionResult::error(error),
                 },
-                RemoteAction::CloseAiTab { tab_id } => match self
-                    .process_manager
-                    .close_ai_session(&mut self.state, &tab_id)
-                {
-                    Ok(()) => {
-                        did_change = true;
-                        self.save_session_state();
-                        RemoteActionResult::ok(None, None)
+                RemoteAction::CloseAiTab { tab_id } => {
+                    match self.process_manager.close_tab(&mut self.state, &tab_id) {
+                        Ok(()) => {
+                            did_change = true;
+                            self.save_session_state();
+                            RemoteActionResult::ok(None, None)
+                        }
+                        Err(error) => RemoteActionResult::error(error),
                     }
-                    Err(error) => RemoteActionResult::error(error),
-                },
+                }
                 RemoteAction::OpenSshTab { connection_id } => {
                     if let Some(connection) =
                         self.state.find_ssh_connection(&connection_id).cloned()
@@ -2986,34 +2985,26 @@ impl NativeShell {
                         RemoteActionResult::ok(None, None)
                     }
                 }
-                RemoteAction::CloseTab { tab_id } => {
-                    if let Some(tab) = self.state.find_tab(&tab_id).cloned() {
-                        let result = match tab.tab_type {
-                            TabType::Server => {
-                                let command_id = tab.command_id.unwrap_or(tab.id.clone());
-                                let _ = self.process_manager.stop_server(&command_id);
-                                self.state.remove_tab(&tab_id);
-                                Ok(())
-                            }
-                            TabType::Claude | TabType::Codex => self
-                                .process_manager
-                                .close_ai_session(&mut self.state, &tab_id),
-                            TabType::Ssh => self
-                                .process_manager
-                                .close_ssh_session(&mut self.state, &tab_id),
-                        };
-                        match result {
-                            Ok(()) => {
-                                did_change = true;
-                                self.synced_session_id = None;
-                                self.last_dimensions = None;
-                                self.save_session_state();
-                                RemoteActionResult::ok(None, None)
-                            }
-                            Err(error) => RemoteActionResult::error(error),
+                RemoteAction::CloseSession { session_id } => {
+                    match self.process_manager.close_session(&session_id) {
+                        Ok(()) => {
+                            did_change = true;
+                            self.save_session_state();
+                            RemoteActionResult::ok(None, None)
                         }
-                    } else {
-                        RemoteActionResult::ok(None, None)
+                        Err(error) => RemoteActionResult::error(error),
+                    }
+                }
+                RemoteAction::CloseTab { tab_id } => {
+                    match self.process_manager.close_tab(&mut self.state, &tab_id) {
+                        Ok(()) => {
+                            did_change = true;
+                            self.synced_session_id = None;
+                            self.last_dimensions = None;
+                            self.save_session_state();
+                            RemoteActionResult::ok(None, None)
+                        }
+                        Err(error) => RemoteActionResult::error(error),
                     }
                 }
                 RemoteAction::StopAllServers => {
@@ -3581,28 +3572,23 @@ impl NativeShell {
             return;
         }
         if self.remote_mode.is_some() {
-            let command_ids: Vec<String> = self
-                .current_runtime_snapshot()
-                .sessions
-                .iter()
-                .filter(|(_, session)| {
-                    matches!(session.session_kind, crate::state::SessionKind::Server)
-                        && session.status.is_live()
-                })
-                .map(|(command_id, _)| command_id.clone())
-                .collect();
-
-            for command_id in &command_ids {
-                self.remote_send_action(RemoteAction::StopServer {
-                    command_id: command_id.clone(),
-                });
+            match self.remote_request(RemoteAction::StopAllServers) {
+                Ok(result) if result.ok => {
+                    self.terminal_notice = result
+                        .message
+                        .or_else(|| Some("Stopping remote server tab(s).".to_string()));
+                }
+                Ok(result) => {
+                    self.terminal_notice = Some(
+                        result
+                            .message
+                            .unwrap_or_else(|| "Failed to stop remote servers.".to_string()),
+                    );
+                }
+                Err(error) => {
+                    self.terminal_notice = Some(format!("Failed to stop remote servers: {error}"));
+                }
             }
-
-            self.terminal_notice = Some(if command_ids.is_empty() {
-                "No running remote servers to stop.".to_string()
-            } else {
-                format!("Stopping {} remote server tab(s).", command_ids.len())
-            });
             cx.notify();
             return;
         }
@@ -3654,29 +3640,17 @@ impl NativeShell {
             return;
         }
 
-        match tab.tab_type {
-            TabType::Server => {
-                let _ = self.process_manager.stop_server(tab_id);
-                self.state.remove_tab(tab_id);
+        match self.process_manager.close_tab(&mut self.state, tab_id) {
+            Ok(()) => {
                 self.synced_session_id = None;
                 self.last_dimensions = None;
                 self.save_session_state();
-                cx.notify();
             }
-            TabType::Claude | TabType::Codex => {
-                self.close_ai_tab_action(tab_id, cx);
-            }
-            TabType::Ssh => {
-                let _ = self
-                    .process_manager
-                    .close_ssh_session(&mut self.state, tab_id);
-                self.state.remove_tab(tab_id);
-                self.synced_session_id = None;
-                self.last_dimensions = None;
-                self.save_session_state();
-                cx.notify();
+            Err(error) => {
+                self.terminal_notice = Some(format!("Failed to close tab: {error}"));
             }
         }
+        cx.notify();
     }
 
     fn confirm_live_tab_close(&self, tab: &crate::models::SessionTab) -> bool {
@@ -8679,10 +8653,7 @@ impl NativeShell {
             return;
         }
 
-        if let Err(error) = self
-            .process_manager
-            .close_ai_session(&mut self.state, tab_id)
-        {
+        if let Err(error) = self.process_manager.close_tab(&mut self.state, tab_id) {
             self.terminal_notice = Some(format!("Failed to close AI tab: {error}"));
         } else {
             self.synced_session_id = None;
@@ -9418,7 +9389,13 @@ impl NativeShell {
                     let Some(session_id) = session_id.as_ref() else {
                         return;
                     };
-                    let _ = self.process_manager.close_session(session_id);
+                    if self.remote_mode.is_some() {
+                        self.remote_send_action(RemoteAction::CloseSession {
+                            session_id: session_id.clone(),
+                        });
+                    } else {
+                        let _ = self.process_manager.close_session(session_id);
+                    }
                 }
                 window.prevent_default();
             }

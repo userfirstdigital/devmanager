@@ -243,12 +243,88 @@ extern "system" {
     fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+    fn SetInformationJobObject(
+        job: *mut c_void,
+        job_object_info_class: u32,
+        job_object_info: *mut c_void,
+        job_object_info_length: u32,
+    ) -> i32;
+    fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
 }
 
 #[cfg(windows)]
 const PROCESS_TERMINATE: u32 = 0x0001;
 #[cfg(windows)]
+const PROCESS_SET_QUOTA: u32 = 0x0100;
+#[cfg(windows)]
 const SYNCHRONIZE: u32 = 0x00100000;
+#[cfg(windows)]
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct JobObjectBasicLimitInformation {
+    per_process_user_time_limit: i64,
+    per_job_user_time_limit: i64,
+    limit_flags: u32,
+    minimum_working_set_size: usize,
+    maximum_working_set_size: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct IoCounters {
+    read_operation_count: u64,
+    write_operation_count: u64,
+    other_operation_count: u64,
+    read_transfer_count: u64,
+    write_transfer_count: u64,
+    other_transfer_count: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct JobObjectExtendedLimitInformation {
+    basic_limit_information: JobObjectBasicLimitInformation,
+    io_info: IoCounters,
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
+}
+
+#[derive(Debug)]
+pub struct ManagedProcessJob {
+    #[cfg(windows)]
+    handle: *mut c_void,
+}
+
+#[cfg(windows)]
+unsafe impl Send for ManagedProcessJob {}
+#[cfg(windows)]
+unsafe impl Sync for ManagedProcessJob {}
+
+impl Drop for ManagedProcessJob {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            if !self.handle.is_null() {
+                let _ = CloseHandle(self.handle);
+                self.handle = std::ptr::null_mut();
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 fn windows_port(raw_port: u32) -> u16 {
@@ -283,6 +359,67 @@ pub fn kill_process(pid: u32) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         kill_unix_target(pid, false)
+    }
+}
+
+pub fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
+    #[cfg(windows)]
+    {
+        attach_process_to_windows_job(pid).map(Some)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        Ok(None)
+    }
+}
+
+#[cfg(windows)]
+fn attach_process_to_windows_job(pid: u32) -> Result<ManagedProcessJob, String> {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            return Err(format!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let mut limits = JobObjectExtendedLimitInformation::default();
+        limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set_ok = SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            &mut limits as *mut _ as *mut c_void,
+            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+        );
+        if set_ok == 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = CloseHandle(job);
+            return Err(format!("SetInformationJobObject failed: {error}"));
+        }
+
+        let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SET_QUOTA, 0, pid);
+        if process.is_null() {
+            let error = std::io::Error::last_os_error();
+            let _ = CloseHandle(job);
+            return Err(format!(
+                "OpenProcess({pid}) for job assignment failed: {error}"
+            ));
+        }
+
+        let assign_ok = AssignProcessToJobObject(job, process);
+        let assign_error = std::io::Error::last_os_error();
+        let _ = CloseHandle(process);
+        if assign_ok == 0 {
+            let _ = CloseHandle(job);
+            return Err(format!(
+                "AssignProcessToJobObject({pid}) failed: {assign_error}"
+            ));
+        }
+
+        Ok(ManagedProcessJob { handle: job })
     }
 }
 

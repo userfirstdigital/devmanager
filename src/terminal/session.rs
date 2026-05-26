@@ -307,6 +307,7 @@ pub struct TerminalSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    process_job: Arc<Mutex<Option<platform_service::ManagedProcessJob>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     dimensions: Arc<Mutex<SessionDimensions>>,
     event_proxy: SessionEventProxy,
@@ -612,13 +613,18 @@ impl TerminalSession {
             }
         }
 
-        let mut killer = self
+        self.sync_tracked_descendants();
+        let kill_result = self
             .killer
             .lock()
-            .map_err(|_| "Session killer poisoned".to_string())?;
-        killer
-            .kill()
-            .map_err(|error| format!("Failed to terminate shell session: {error}"))
+            .map_err(|_| "Session killer poisoned".to_string())
+            .and_then(|mut killer| {
+                killer
+                    .kill()
+                    .map_err(|error| format!("Failed to terminate shell session: {error}"))
+            });
+        self.drop_managed_process_job();
+        kill_result
     }
 
     pub fn restart_command(
@@ -631,6 +637,9 @@ impl TerminalSession {
         log_file_path: Option<PathBuf>,
         track_pid: bool,
     ) -> Result<(), String> {
+        self.sync_tracked_descendants();
+        self.drop_managed_process_job();
+
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(pty_size(dimensions))
@@ -651,6 +660,7 @@ impl TerminalSession {
 
         let pid = child.process_id();
         let mut cleanup_killer = child.clone_killer();
+        let mut process_job = attach_managed_process_job(pid);
 
         let writer = match pair.master.take_writer() {
             Ok(writer) => writer,
@@ -693,6 +703,7 @@ impl TerminalSession {
                 Ok(killer_slot) => killer_slot,
                 Err(_) => {
                     cleanup_failed_spawn(&mut cleanup_killer);
+                    drop(process_job.take());
                     return Err("Session killer poisoned".to_string());
                 }
             };
@@ -744,6 +755,17 @@ impl TerminalSession {
         if let Ok(mut replay) = self.replay_buffer.lock() {
             replay.clear();
         }
+        {
+            let mut job_slot = match self.process_job.lock() {
+                Ok(job_slot) => job_slot,
+                Err(_) => {
+                    cleanup_failed_spawn(&mut cleanup_killer);
+                    drop(process_job.take());
+                    return Err("Process job poisoned".to_string());
+                }
+            };
+            *job_slot = process_job.take();
+        }
 
         spawn_reader_thread(
             self.session_id.clone(),
@@ -760,6 +782,7 @@ impl TerminalSession {
             self.session_id.clone(),
             child,
             pid,
+            self.process_job.clone(),
             self.runtime_state.clone(),
             self.event_proxy.debug_enabled,
             self.event_proxy.state_notifier.clone(),
@@ -767,6 +790,27 @@ impl TerminalSession {
 
         self.event_proxy.debug_log(format!("respawned {}", program));
         Ok(())
+    }
+
+    fn drop_managed_process_job(&self) {
+        drop_managed_process_job(&self.process_job);
+    }
+
+    fn sync_tracked_descendants(&self) {
+        let root_pid = self.runtime_state.read().ok().and_then(|runtime| {
+            runtime
+                .sessions
+                .get(&self.session_id)
+                .and_then(|session| session.pid)
+        });
+        if let Some(root_pid) = root_pid {
+            let descendants = platform_service::collect_descendant_process_identities(root_pid);
+            let _ = pid_file::sync_session_descendant_processes(
+                &self.session_id,
+                root_pid,
+                descendants,
+            );
+        }
     }
 
     pub fn write_virtual_text(&self, text: &str) {
@@ -1540,6 +1584,7 @@ fn spawn_wait_thread(
     session_id: String,
     mut child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
+    process_job: Arc<Mutex<Option<platform_service::ManagedProcessJob>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     debug_enabled: bool,
     state_notifier: Option<SessionStateNotifier>,
@@ -1549,6 +1594,8 @@ fn spawn_wait_thread(
             if debug_enabled {
                 eprintln!("[terminal:{session_id}] child exit -> {status}");
             }
+            drop_managed_process_job(&process_job);
+            thread::sleep(Duration::from_millis(50));
             let surviving_descendants = pid
                 .map(platform_service::collect_descendant_process_identities)
                 .unwrap_or_default();
@@ -1585,6 +1632,8 @@ fn spawn_wait_thread(
             if debug_enabled {
                 eprintln!("[terminal:{session_id}] wait error: {error}");
             }
+            drop_managed_process_job(&process_job);
+            thread::sleep(Duration::from_millis(50));
             let surviving_descendants = pid
                 .map(platform_service::collect_descendant_process_identities)
                 .unwrap_or_default();
@@ -1649,6 +1698,7 @@ fn spawn_with_command(
 
     let pid = child.process_id();
     let mut cleanup_killer = child.clone_killer();
+    let process_job = attach_managed_process_job(pid);
     let writer = match pair.master.take_writer() {
         Ok(writer) => writer,
         Err(error) => {
@@ -1668,6 +1718,7 @@ fn spawn_with_command(
     let writer = Arc::new(Mutex::new(writer));
     let master = Arc::new(Mutex::new(pair.master));
     let killer = Arc::new(Mutex::new(child.clone_killer()));
+    let process_job = Arc::new(Mutex::new(process_job));
     let dimensions_state = Arc::new(Mutex::new(dimensions));
     let replay_buffer = Arc::new(Mutex::new(Vec::new()));
     let event_proxy = SessionEventProxy {
@@ -1719,6 +1770,7 @@ fn spawn_with_command(
         session_id.to_string(),
         child,
         pid,
+        process_job.clone(),
         runtime_state.clone(),
         debug_enabled,
         state_notifier,
@@ -1732,6 +1784,7 @@ fn spawn_with_command(
         writer,
         master,
         killer,
+        process_job,
         runtime_state,
         dimensions: dimensions_state,
         event_proxy,
@@ -1739,6 +1792,20 @@ fn spawn_with_command(
         scrolling_history,
         replay_buffer,
         output_notifier,
+    })
+}
+
+fn drop_managed_process_job(process_job: &Arc<Mutex<Option<platform_service::ManagedProcessJob>>>) {
+    if let Ok(mut process_job) = process_job.lock() {
+        process_job.take();
+    }
+}
+
+fn attach_managed_process_job(pid: Option<u32>) -> Option<platform_service::ManagedProcessJob> {
+    pid.and_then(|pid| {
+        platform_service::attach_process_to_managed_job(pid)
+            .ok()
+            .flatten()
     })
 }
 

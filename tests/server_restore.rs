@@ -1,5 +1,5 @@
 use devmanager::persistence::{load_config_from_str, load_session_from_str, WorkspaceSnapshot};
-use devmanager::services::ProcessManager;
+use devmanager::services::{pid_file, ProcessManager};
 use devmanager::state::{AppState, SessionDimensions, SessionRuntimeState, SessionStatus};
 use devmanager::terminal::session::TerminalBackend;
 use std::path::PathBuf;
@@ -13,6 +13,15 @@ fn load_fixture_state() -> AppState {
     let config = load_config_from_str(&config_text).expect("parse config");
     let session = load_session_from_str(&session_text).expect("parse session");
     AppState::from_workspace(WorkspaceSnapshot { config, session })
+}
+
+fn use_isolated_pid_file(label: &str) -> pid_file::TestPidFileGuard {
+    let path = std::env::temp_dir().join(format!(
+        "devmanager-server-restore-{label}-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    pid_file::use_test_pid_file(path)
 }
 
 #[test]
@@ -48,6 +57,7 @@ fn merge_recovered_server_tabs_adds_missing() {
 
 #[test]
 fn reconcile_saved_server_tabs_recovers_live_sessions() {
+    let _pid_file_guard = use_isolated_pid_file("reconcile-saved-server-tabs");
     let mut state = load_fixture_state();
     state
         .open_tabs
@@ -73,6 +83,7 @@ fn reconcile_saved_server_tabs_recovers_live_sessions() {
 
 #[test]
 fn stop_server_and_wait_transitions_to_stopped() {
+    let _pid_file_guard = use_isolated_pid_file("stop-server-and-wait");
     let manager = ProcessManager::new();
     let mut session = SessionRuntimeState::new(
         "cmd-dev".to_string(),
@@ -85,7 +96,7 @@ fn stop_server_and_wait_transitions_to_stopped() {
     manager.register_runtime_session(session);
 
     let stopped = manager.stop_server_and_wait("cmd-dev", Duration::from_millis(0));
-    assert!(!stopped);
+    assert!(stopped);
     let runtime = manager.runtime_state();
     let session = runtime.sessions.get("cmd-dev").expect("session present");
     assert_eq!(session.status, SessionStatus::Stopped);
