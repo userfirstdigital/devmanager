@@ -128,7 +128,17 @@ still succeed) rather than hard-failing the session.
 - The private key is now stored **in the config JSON in plaintext**, same exposure model as
   the existing plaintext password but a higher-value secret. The materialized key files live
   under the app config dir with locked-down permissions.
-- Encrypting secrets at rest (password + key) is a worthwhile **follow-up**, out of scope here.
+- The key also travels **to paired remote/web clients**: workspace snapshots mirror the full
+  `AppState` (including `ssh_connections[].privateKey`) over the existing TLS + pairing-token
+  channel — the same channel that already carries saved SSH passwords. Decision (user,
+  2026-07-10): **accepted and documented**; only paired clients receive snapshots, and a key
+  is higher-value than a per-host password but rides an already-trusted transport. Naive
+  redaction would break remote editing (`RemoteAction::SaveSsh` sends the whole connection, so
+  a redacted mirror would wipe the host's stored key on any remote edit) — proper redaction
+  needs a keep-sentinel protocol change.
+- Encrypting secrets at rest (password + key) and **redacting secrets from client snapshots
+  (with a keep-sentinel for SaveSsh)** are a worthwhile combined **follow-up**, out of scope
+  here.
 
 ## Out of scope (YAGNI)
 
