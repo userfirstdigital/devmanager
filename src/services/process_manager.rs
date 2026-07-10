@@ -875,7 +875,11 @@ impl ProcessManager {
         }
 
         let session_id = next_ssh_session_id(&connection_id);
-        let launch = build_ssh_launch_spec(app_state, &tab, &connection);
+        let (key_file, key_error) = match self.materialize_ssh_key(&connection) {
+            Ok(path) => (path, None),
+            Err(error) => (None, Some(error)),
+        };
+        let launch = build_ssh_launch_spec(app_state, &tab, &connection, key_file.as_deref());
 
         let _ = app_state.update_ssh_tab_session(&tab.id, Some(session_id.clone()));
         if activate_tab {
@@ -893,6 +897,14 @@ impl ProcessManager {
         });
 
         self.spawn_ssh_session(&launch, &session_id, dimensions)?;
+        if let Some(error) = key_error {
+            let _ = self.write_virtual_text(
+                &session_id,
+                &format!(
+                    "[devmanager] Couldn't prepare the saved SSH key ({error}); trying password/agent auth instead.\r\n"
+                ),
+            );
+        }
         if activate_tab {
             self.set_active_session(session_id.clone());
         }
@@ -1901,6 +1913,24 @@ impl ProcessManager {
 
         Ok(())
     }
+
+    fn materialize_ssh_key(&self, connection: &SSHConnection) -> Result<Option<PathBuf>, String> {
+        let dir = crate::persistence::app_config_dir()
+            .map_err(|error| format!("resolve config dir: {error}"))?
+            .join("ssh-keys");
+        materialize_ssh_key_in(&dir, connection)
+    }
+
+    /// Best-effort cleanup when a connection is deleted or its key cleared.
+    /// Materialized files are permission-locked, so a missed delete is low risk.
+    pub fn remove_materialized_ssh_key(connection_id: &str) {
+        let Ok(dir) = crate::persistence::app_config_dir() else {
+            return;
+        };
+        let _ = std::fs::remove_file(
+            dir.join("ssh-keys").join(safe_key_file_name(connection_id)),
+        );
+    }
 }
 
 impl Drop for ProcessManagerInner {
@@ -2536,10 +2566,125 @@ fn build_server_launch_command(settings: &Settings, command: &RunCommand) -> (St
     (shell, args)
 }
 
+/// OpenSSH rejects key files with CRLF line endings or a missing final
+/// newline — both are common artifacts of pasting a key into a text field.
+fn sanitize_private_key(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    format!("{}\n", normalized.trim())
+}
+
+fn safe_key_file_name(connection_id: &str) -> String {
+    connection_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn materialize_ssh_key_in(
+    dir: &Path,
+    connection: &SSHConnection,
+) -> Result<Option<PathBuf>, String> {
+    let Some(key) = connection
+        .private_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let file_name = safe_key_file_name(&connection.id);
+    if file_name.is_empty() {
+        return Err("connection id is empty".to_string());
+    }
+
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("create {}: {error}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("set permissions on {}: {error}", dir.display()))?;
+    }
+    let path = dir.join(file_name);
+    write_key_file(&path, &sanitize_private_key(key))?;
+    if let Err(error) = lock_key_file_permissions(&path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(Some(path))
+}
+
+#[cfg(unix)]
+fn write_key_file(path: &Path, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &Path, contents: &str) -> Result<(), String> {
+    std::fs::write(path, contents).map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+#[cfg(unix)]
+fn lock_key_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("set permissions on {}: {error}", path.display()))
+}
+
+#[cfg(windows)]
+fn lock_key_file_permissions(path: &Path) -> Result<(), String> {
+    // Win32-OpenSSH refuses private keys readable by other accounts. Strip
+    // inherited ACEs and grant only the current user.
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let username =
+        std::env::var("USERNAME").map_err(|_| "resolve current user name".to_string())?;
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{username}:F"))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("run icacls on {}: {error}", path.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "icacls failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_key_file_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn build_ssh_launch_spec(
     app_state: &AppState,
     tab: &SessionTab,
     connection: &SSHConnection,
+    key_file: Option<&Path>,
 ) -> SshLaunchSpec {
     let cwd = app_state
         .find_project(&tab.project_id)
@@ -2547,17 +2692,25 @@ fn build_ssh_launch_spec(
         .filter(|path| path.is_dir())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
 
+    let mut args = vec![
+        format!("{}@{}", connection.username.trim(), connection.host.trim()),
+        "-p".to_string(),
+        connection.port.to_string(),
+    ];
+    if let Some(key_file) = key_file {
+        // No `-o IdentitiesOnly=yes` on purpose: the user prefers the saved
+        // key but still wants agent/default keys as fallback.
+        args.push("-i".to_string());
+        args.push(key_file.display().to_string());
+    }
+
     SshLaunchSpec {
         tab_id: tab.id.clone(),
         ssh_connection_id: connection.id.clone(),
         project_id: tab.project_id.clone(),
         cwd,
         program: "ssh".to_string(),
-        args: vec![
-            format!("{}@{}", connection.username.trim(), connection.host.trim()),
-            "-p".to_string(),
-            connection.port.to_string(),
-        ],
+        args,
     }
 }
 
@@ -3304,6 +3457,174 @@ mod tests {
                 .map(|session| session.status),
             Some(SessionStatus::Stopped)
         );
+    }
+
+    #[test]
+    fn sanitize_private_key_normalizes_line_endings_and_trailing_newline() {
+        let pasted = "-----BEGIN OPENSSH PRIVATE KEY-----\r\nabc\r\n-----END OPENSSH PRIVATE KEY-----";
+        assert_eq!(
+            sanitize_private_key(pasted),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"
+        );
+    }
+
+    #[test]
+    fn sanitize_private_key_leaves_clean_key_unchanged() {
+        let clean = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n";
+        assert_eq!(sanitize_private_key(clean), clean);
+    }
+
+    #[test]
+    fn sanitize_private_key_trims_surrounding_blank_lines() {
+        let pasted = "\n\n  -----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n\n\n";
+        assert_eq!(
+            sanitize_private_key(pasted),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"
+        );
+    }
+
+    fn ssh_test_connection() -> SSHConnection {
+        SSHConnection {
+            id: "ssh-1".to_string(),
+            label: "Prod".to_string(),
+            host: "example.com".to_string(),
+            port: 2222,
+            username: "deploy".to_string(),
+            password: None,
+            private_key: None,
+        }
+    }
+
+    fn ssh_test_tab() -> SessionTab {
+        SessionTab {
+            id: "ssh-tab-1".to_string(),
+            tab_type: TabType::Ssh,
+            project_id: "project-1".to_string(),
+            ssh_connection_id: Some("ssh-1".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_ssh_launch_spec_without_key_omits_identity_flag() {
+        let state = AppState::default();
+
+        let launch = build_ssh_launch_spec(&state, &ssh_test_tab(), &ssh_test_connection(), None);
+
+        assert_eq!(launch.program, "ssh");
+        assert_eq!(
+            launch.args,
+            vec![
+                "deploy@example.com".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_launch_spec_with_key_appends_identity_flag() {
+        let state = AppState::default();
+        let key_file = PathBuf::from("/keys/ssh-1");
+
+        let launch = build_ssh_launch_spec(
+            &state,
+            &ssh_test_tab(),
+            &ssh_test_connection(),
+            Some(key_file.as_path()),
+        );
+
+        assert_eq!(
+            launch.args,
+            vec![
+                "deploy@example.com".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "-i".to_string(),
+                key_file.display().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn safe_key_file_name_replaces_path_hostile_characters() {
+        assert_eq!(safe_key_file_name("ssh-1a2b-3"), "ssh-1a2b-3");
+        assert_eq!(safe_key_file_name("ssh/../evil"), "ssh____evil");
+    }
+
+    #[test]
+    fn materialize_ssh_key_writes_sanitized_key_file() {
+        let dir = temp_test_dir("materialize-ssh-key");
+        let connection = SSHConnection {
+            id: "ssh-test".to_string(),
+            label: "Test".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            password: None,
+            private_key: Some("-----BEGIN KEY-----\r\nabc\r\n-----END KEY-----".to_string()),
+        };
+
+        let path = materialize_ssh_key_in(&dir, &connection)
+            .expect("materialize")
+            .expect("path");
+
+        assert_eq!(path, dir.join("ssh-test"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read key"),
+            "-----BEGIN KEY-----\nabc\n-----END KEY-----\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let dir_mode = fs::metadata(&dir).expect("dir metadata").permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn materialize_ssh_key_rejects_empty_connection_id() {
+        let dir = temp_test_dir("materialize-ssh-key-empty-id");
+        let connection = SSHConnection {
+            id: String::new(),
+            label: "Test".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            password: None,
+            private_key: Some("-----BEGIN KEY-----\nabc\n-----END KEY-----".to_string()),
+        };
+
+        let error = materialize_ssh_key_in(&dir, &connection).expect_err("should reject");
+        assert!(error.contains("connection id"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn sanitize_private_key_normalizes_lone_carriage_returns() {
+        let input = "-----BEGIN KEY-----\rabc\r-----END KEY-----";
+        assert_eq!(
+            sanitize_private_key(input),
+            "-----BEGIN KEY-----\nabc\n-----END KEY-----\n"
+        );
+    }
+
+    #[test]
+    fn materialize_ssh_key_returns_none_without_key_material() {
+        let dir = temp_test_dir("materialize-ssh-key-empty");
+        let connection = SSHConnection {
+            id: "ssh-empty".to_string(),
+            label: "Test".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            password: Some("pw".to_string()),
+            private_key: Some("   \n".to_string()),
+        };
+
+        assert_eq!(materialize_ssh_key_in(&dir, &connection), Ok(None));
+        assert!(!dir.join("ssh-empty").exists());
     }
 
     fn temp_test_dir(label: &str) -> PathBuf {

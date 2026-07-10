@@ -97,6 +97,7 @@ fn native_config_edits_round_trip_through_disk() {
         port: 2222,
         username: "builder".to_string(),
         password: Some("secret".to_string()),
+        private_key: None,
     });
 
     let config_path = unique_temp_path("config.json");
@@ -180,6 +181,7 @@ fn saved_config_keeps_legacy_compatible_camel_case_shape() {
         port: 22,
         username: "shape".to_string(),
         password: None,
+        private_key: None,
     });
 
     let config_path = unique_temp_path("shape-config.json");
