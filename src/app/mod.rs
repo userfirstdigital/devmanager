@@ -4902,6 +4902,7 @@ impl NativeShell {
                 port_text: "22".to_string(),
                 username: String::new(),
                 password: String::new(),
+                key_text: String::new(),
             }),
             cx,
         );
@@ -4917,6 +4918,7 @@ impl NativeShell {
                     port_text: connection.port.to_string(),
                     username: connection.username,
                     password: connection.password.unwrap_or_default(),
+                    key_text: connection.private_key.unwrap_or_default(),
                 }),
                 cx,
             );
@@ -5238,8 +5240,11 @@ impl NativeShell {
                     port,
                     username: draft.username.trim().to_string(),
                     password: normalize_optional_string(&draft.password),
-                    private_key: None,
+                    private_key: normalize_optional_string(&draft.key_text),
                 };
+                if connection.private_key.is_none() {
+                    ProcessManager::remove_materialized_ssh_key(&connection.id);
+                }
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
@@ -5667,6 +5672,7 @@ impl NativeShell {
                 .close_ssh_session(&mut self.state, &tab_id);
         }
         self.state.remove_ssh_connection(connection_id);
+        ProcessManager::remove_materialized_ssh_key(connection_id);
         self.synced_session_id = None;
         self.last_dimensions = None;
         self.save_config_state();

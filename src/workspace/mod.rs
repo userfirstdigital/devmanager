@@ -942,6 +942,14 @@ impl EditorPanel {
                         "Saved".to_string()
                     },
                 ),
+                (
+                    "Key".to_string(),
+                    if draft.key_text.trim().is_empty() {
+                        "Not saved".to_string()
+                    } else {
+                        "Saved".to_string()
+                    },
+                ),
             ],
         }
     }
@@ -1062,6 +1070,7 @@ impl EditorPanel {
             (Self::Ssh(draft), EditorField::Ssh(SshField::Port)) => Some(&draft.port_text),
             (Self::Ssh(draft), EditorField::Ssh(SshField::Username)) => Some(&draft.username),
             (Self::Ssh(draft), EditorField::Ssh(SshField::Password)) => Some(&draft.password),
+            (Self::Ssh(draft), EditorField::Ssh(SshField::KeyText)) => Some(&draft.key_text),
             _ => None,
         }
     }
@@ -1150,6 +1159,7 @@ impl EditorPanel {
             (Self::Ssh(draft), EditorField::Ssh(SshField::Port)) => Some(&mut draft.port_text),
             (Self::Ssh(draft), EditorField::Ssh(SshField::Username)) => Some(&mut draft.username),
             (Self::Ssh(draft), EditorField::Ssh(SshField::Password)) => Some(&mut draft.password),
+            (Self::Ssh(draft), EditorField::Ssh(SshField::KeyText)) => Some(&mut draft.key_text),
             _ => None,
         }
     }
@@ -1301,6 +1311,7 @@ pub struct SshDraft {
     pub port_text: String,
     pub username: String,
     pub password: String,
+    pub key_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1320,7 +1331,9 @@ impl EditorField {
     pub fn allows_newlines(self) -> bool {
         matches!(
             self,
-            Self::Project(ProjectField::Notes) | Self::Folder(FolderField::EnvContents)
+            Self::Project(ProjectField::Notes)
+                | Self::Folder(FolderField::EnvContents)
+                | Self::Ssh(SshField::KeyText)
         )
     }
 
@@ -1396,6 +1409,7 @@ pub enum SshField {
     Port,
     Username,
     Password,
+    KeyText,
 }
 
 #[derive(Debug, Clone)]
@@ -3730,6 +3744,7 @@ fn sample_ssh_draft() -> SshDraft {
         port_text: "22".to_string(),
         username: "deploy".to_string(),
         password: String::new(),
+        key_text: String::new(),
     }
 }
 
@@ -4702,12 +4717,20 @@ fn render_ssh_panel(
                     EditorField::Ssh(SshField::Port),
                 ),
             ]),
-            FormSection::new("Authentication").field(FormField::text(
-                "Password",
-                "Leave blank if you use keys or an agent.",
-                draft.password.clone(),
-                EditorField::Ssh(SshField::Password),
-            )),
+            FormSection::new("Authentication").fields(vec![
+                FormField::text(
+                    "Password",
+                    "Leave blank if you use keys or an agent.",
+                    draft.password.clone(),
+                    EditorField::Ssh(SshField::Password),
+                ),
+                FormField::multiline(
+                    "Private key",
+                    "Paste your private key (OpenSSH or PEM). Used before the password when set.",
+                    draft.key_text.clone(),
+                    EditorField::Ssh(SshField::KeyText),
+                ),
+            ]),
         ],
         model,
         actions,
