@@ -2619,12 +2619,13 @@ fn lock_key_file_permissions(path: &Path) -> Result<(), String> {
         .arg(format!("{username}:F"))
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|error| format!("run icacls: {error}"))?;
+        .map_err(|error| format!("run icacls on {}: {error}", path.display()))?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "icacls failed: {}",
+            "icacls failed on {}: {}",
+            path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
