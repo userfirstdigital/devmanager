@@ -5242,9 +5242,6 @@ impl NativeShell {
                     password: normalize_optional_string(&draft.password),
                     private_key: normalize_optional_string(&draft.key_text),
                 };
-                if connection.private_key.is_none() {
-                    ProcessManager::remove_materialized_ssh_key(&connection.id);
-                }
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
@@ -5265,6 +5262,9 @@ impl NativeShell {
                         }
                     }
                     return;
+                }
+                if connection.private_key.is_none() {
+                    ProcessManager::remove_materialized_ssh_key(&connection.id);
                 }
                 self.state.upsert_ssh_connection(connection);
                 self.save_config_state();
