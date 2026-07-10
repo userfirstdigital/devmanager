@@ -1,7 +1,12 @@
-# SSH key-or-password authentication — design
+# SSH key-or-password authentication + always-visible terminal scrollbar — design
 
-Date: 2026-07-06
+Date: 2026-07-06 (scrollbar section added 2026-07-09)
 Status: Approved for planning
+
+This spec covers two independent work items shipped on the same branch:
+Part 1 — SSH key-or-password auth. Part 2 — always-visible terminal scrollbar (native app).
+
+# Part 1: SSH key-or-password authentication
 
 ## Goal
 
@@ -132,3 +137,46 @@ still succeed) rather than hard-failing the session.
 - Pointing at an existing key **file** by path (rejected in favor of paste-the-text).
 - `-o IdentitiesOnly=yes` strict mode (rejected in favor of agent fallback).
 - Encryption at rest for stored secrets.
+
+# Part 2: Always-visible terminal scrollbar (native app)
+
+## Diagnosis (confirmed with user, 2026-07-09)
+
+The terminal scrollbar is not a regression: it hides whenever the grid has no scrollback
+(`total_lines <= rows`). Claude Code v2 runs its UI in the **alternate screen** (binary
+contains `[?1049h`/`[?1049l`), which by definition has no scrollback — so Claude/Codex tabs
+show no scrollbar while shell/server tabs still do. User confirmed: scrollbar appears in
+shell/server tabs; the "missing" case is Claude tabs in the **native desktop app**.
+
+## Behavior change
+
+When `showTerminalScrollbar` is enabled, always render the scrollbar gutter. With no
+scrollback (alt-screen apps, fresh sessions) show a **full-height inert thumb** — matching
+Windows Terminal — instead of hiding the bar. With scrollback, behavior is unchanged.
+
+## Changes (both in `src/app/mod.rs`)
+
+1. `terminal_has_scrollbar` (`:6921`): drop the `total_lines > rows.max(1)` condition; gate
+   on `settings.show_terminal_scrollbar` alone. Layout is unaffected — `available_width`
+   (`:3549`) already reserves the gutter whenever the setting is on, so PTY cols don't change.
+2. `terminal_scrollbar_model` (`:6891`): remove the `total_lines <= visible_lines → None`
+   early return. Existing math then yields `thumb_height_ratio = 1.0` and a pinned thumb.
+
+Safety, verified: `scrollbar_thumb_top_ratio` (`:12868`) handles `max_offset == 0`;
+geometry clamps `max_offset` to ≥ 1; dragging an inert thumb resolves to display offset 0
+(no-op). The web UI (xterm.js) surface is untouched.
+
+## Testing
+
+- Unit test: a session view with `total_lines == rows` (no history) yields
+  `Some(TerminalScrollbarModel)` with `thumb_height_ratio == 1.0`, not `None` (harness
+  patterns exist near `src/app/mod.rs:13580`).
+- Unit test: a session with history keeps current proportional thumb behavior.
+- Existing `scrollbar_thumb_top_ratio` behavior unchanged.
+
+## Out of scope
+
+- The browser web UI surface (user is on the native app; xterm.js hides its own scrollbar
+  in alt screen — possible follow-up).
+- Scrollback for alt-screen apps (nothing to scroll; Claude Code manages its own history).
+- Disabled/dimmed styling for the inert thumb (keep existing colors).
