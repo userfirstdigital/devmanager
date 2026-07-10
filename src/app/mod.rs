@@ -5238,6 +5238,7 @@ impl NativeShell {
                     port,
                     username: draft.username.trim().to_string(),
                     password: normalize_optional_string(&draft.password),
+                    private_key: None,
                 };
                 if !self.ensure_mutation_control(cx) {
                     return;
@@ -13077,6 +13078,7 @@ mod tests {
             port: 22,
             username: "dev".to_string(),
             password: None,
+            private_key: None,
         }
     }
 

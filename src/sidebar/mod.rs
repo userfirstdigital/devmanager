@@ -1675,6 +1675,7 @@ mod tests {
             username: "deploy".to_string(),
             port: 22,
             password: None,
+            private_key: None,
         };
         let custom_port = crate::models::SSHConnection {
             port: 2222,

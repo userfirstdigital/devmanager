@@ -82,6 +82,7 @@ pub struct SSHConnection {
     pub port: u16,
     pub username: String,
     pub password: Option<String>,
+    pub private_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
