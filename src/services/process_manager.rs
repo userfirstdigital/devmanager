@@ -875,7 +875,11 @@ impl ProcessManager {
         }
 
         let session_id = next_ssh_session_id(&connection_id);
-        let launch = build_ssh_launch_spec(app_state, &tab, &connection);
+        let (key_file, key_error) = match self.materialize_ssh_key(&connection) {
+            Ok(path) => (path, None),
+            Err(error) => (None, Some(error)),
+        };
+        let launch = build_ssh_launch_spec(app_state, &tab, &connection, key_file.as_deref());
 
         let _ = app_state.update_ssh_tab_session(&tab.id, Some(session_id.clone()));
         if activate_tab {
@@ -893,6 +897,14 @@ impl ProcessManager {
         });
 
         self.spawn_ssh_session(&launch, &session_id, dimensions)?;
+        if let Some(error) = key_error {
+            let _ = self.write_virtual_text(
+                &session_id,
+                &format!(
+                    "[devmanager] Couldn't prepare the saved SSH key ({error}); trying password/agent auth instead.\r\n"
+                ),
+            );
+        }
         if activate_tab {
             self.set_active_session(session_id.clone());
         }
@@ -2640,6 +2652,7 @@ fn build_ssh_launch_spec(
     app_state: &AppState,
     tab: &SessionTab,
     connection: &SSHConnection,
+    key_file: Option<&Path>,
 ) -> SshLaunchSpec {
     let cwd = app_state
         .find_project(&tab.project_id)
@@ -2647,17 +2660,25 @@ fn build_ssh_launch_spec(
         .filter(|path| path.is_dir())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
 
+    let mut args = vec![
+        format!("{}@{}", connection.username.trim(), connection.host.trim()),
+        "-p".to_string(),
+        connection.port.to_string(),
+    ];
+    if let Some(key_file) = key_file {
+        // No `-o IdentitiesOnly=yes` on purpose: the user prefers the saved
+        // key but still wants agent/default keys as fallback.
+        args.push("-i".to_string());
+        args.push(key_file.display().to_string());
+    }
+
     SshLaunchSpec {
         tab_id: tab.id.clone(),
         ssh_connection_id: connection.id.clone(),
         project_id: tab.project_id.clone(),
         cwd,
         program: "ssh".to_string(),
-        args: vec![
-            format!("{}@{}", connection.username.trim(), connection.host.trim()),
-            "-p".to_string(),
-            connection.port.to_string(),
-        ],
+        args,
     }
 }
 
@@ -3427,6 +3448,69 @@ mod tests {
         assert_eq!(
             sanitize_private_key(pasted),
             "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"
+        );
+    }
+
+    fn ssh_test_connection() -> SSHConnection {
+        SSHConnection {
+            id: "ssh-1".to_string(),
+            label: "Prod".to_string(),
+            host: "example.com".to_string(),
+            port: 2222,
+            username: "deploy".to_string(),
+            password: None,
+            private_key: None,
+        }
+    }
+
+    fn ssh_test_tab() -> SessionTab {
+        SessionTab {
+            id: "ssh-tab-1".to_string(),
+            tab_type: TabType::Ssh,
+            project_id: "project-1".to_string(),
+            ssh_connection_id: Some("ssh-1".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_ssh_launch_spec_without_key_omits_identity_flag() {
+        let state = AppState::default();
+
+        let launch = build_ssh_launch_spec(&state, &ssh_test_tab(), &ssh_test_connection(), None);
+
+        assert_eq!(launch.program, "ssh");
+        assert_eq!(
+            launch.args,
+            vec![
+                "deploy@example.com".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_launch_spec_with_key_appends_identity_flag() {
+        let state = AppState::default();
+        let key_file = PathBuf::from("/keys/ssh-1");
+
+        let launch = build_ssh_launch_spec(
+            &state,
+            &ssh_test_tab(),
+            &ssh_test_connection(),
+            Some(key_file.as_path()),
+        );
+
+        assert_eq!(
+            launch.args,
+            vec![
+                "deploy@example.com".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "-i".to_string(),
+                key_file.display().to_string(),
+            ]
         );
     }
 
