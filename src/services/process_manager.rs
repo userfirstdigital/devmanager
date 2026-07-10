@@ -2599,13 +2599,45 @@ fn materialize_ssh_key_in(
         return Ok(None);
     };
 
+    let file_name = safe_key_file_name(&connection.id);
+    if file_name.is_empty() {
+        return Err("connection id is empty".to_string());
+    }
+
     std::fs::create_dir_all(dir)
         .map_err(|error| format!("create {}: {error}", dir.display()))?;
-    let path = dir.join(safe_key_file_name(&connection.id));
-    std::fs::write(&path, sanitize_private_key(key))
-        .map_err(|error| format!("write {}: {error}", path.display()))?;
-    lock_key_file_permissions(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("set permissions on {}: {error}", dir.display()))?;
+    }
+    let path = dir.join(file_name);
+    write_key_file(&path, &sanitize_private_key(key))?;
+    if let Err(error) = lock_key_file_permissions(&path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
     Ok(Some(path))
+}
+
+#[cfg(unix)]
+fn write_key_file(path: &Path, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &Path, contents: &str) -> Result<(), String> {
+    std::fs::write(path, contents).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 #[cfg(unix)]
@@ -3547,7 +3579,35 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).expect("metadata").permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+            let dir_mode = fs::metadata(&dir).expect("dir metadata").permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
         }
+    }
+
+    #[test]
+    fn materialize_ssh_key_rejects_empty_connection_id() {
+        let dir = temp_test_dir("materialize-ssh-key-empty-id");
+        let connection = SSHConnection {
+            id: String::new(),
+            label: "Test".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            password: None,
+            private_key: Some("-----BEGIN KEY-----\nabc\n-----END KEY-----".to_string()),
+        };
+
+        let error = materialize_ssh_key_in(&dir, &connection).expect_err("should reject");
+        assert!(error.contains("connection id"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn sanitize_private_key_normalizes_lone_carriage_returns() {
+        let input = "-----BEGIN KEY-----\rabc\r-----END KEY-----";
+        assert_eq!(
+            sanitize_private_key(input),
+            "-----BEGIN KEY-----\nabc\n-----END KEY-----\n"
+        );
     }
 
     #[test]

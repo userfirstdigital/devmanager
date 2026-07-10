@@ -3096,6 +3096,9 @@ impl NativeShell {
                     RemoteActionResult::ok(None, None)
                 }
                 RemoteAction::SaveSsh { connection } => {
+                    if connection.private_key.is_none() {
+                        ProcessManager::remove_materialized_ssh_key(&connection.id);
+                    }
                     self.state.upsert_ssh_connection(connection);
                     did_change = true;
                     self.save_config_state();
