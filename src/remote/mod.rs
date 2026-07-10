@@ -757,7 +757,20 @@ pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceErro
     serde_json::from_str(&contents).map_err(|source| PersistenceError::Parse { path, source })
 }
 
+// remote.json has several independent writers in one process (the host
+// service persisting config, the app shell persisting client-side known
+// hosts) plus potentially other app instances. Serialize in-process savers
+// and give every save its own temp file so concurrent write+rename pairs
+// can't consume each other's temp file (the rename loser used to fail with
+// NotFound and, via mutate_host_config's rollback, silently drop the
+// mutation that triggered the save).
+static REMOTE_STATE_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static REMOTE_STATE_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub fn save_remote_machine_state(state: &RemoteMachineState) -> Result<(), PersistenceError> {
+    let _guard = REMOTE_STATE_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = remote_state_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| PersistenceError::Io {
@@ -769,12 +782,19 @@ pub fn save_remote_machine_state(state: &RemoteMachineState) -> Result<(), Persi
         path: path.clone(),
         source,
     })?;
-    let temp_path = path.with_extension("json.tmp");
+    let temp_path = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        REMOTE_STATE_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&temp_path, json).map_err(|source| PersistenceError::Io {
         path: temp_path.clone(),
         source,
     })?;
-    fs::rename(&temp_path, &path).map_err(|source| PersistenceError::Io { path, source })?;
+    if let Err(source) = fs::rename(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(PersistenceError::Io { path, source });
+    }
     Ok(())
 }
 
@@ -3874,6 +3894,29 @@ mod tests {
         );
         assert_eq!(reloaded.known_hosts.len(), 1);
         assert_eq!(reloaded.known_hosts[0].server_id, "host-existing");
+    }
+
+    #[test]
+    fn concurrent_remote_state_saves_do_not_race_on_temp_file() {
+        let _profile = TestProfileGuard::new("concurrent-remote-save");
+
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                thread::spawn(|| {
+                    for _ in 0..50 {
+                        save_remote_machine_state(&RemoteMachineState::default())?;
+                    }
+                    Ok::<(), crate::persistence::PersistenceError>(())
+                })
+            })
+            .collect();
+
+        for handle in threads {
+            handle
+                .join()
+                .expect("save thread panicked")
+                .expect("concurrent saves should all succeed");
+        }
     }
 
     #[test]
