@@ -123,12 +123,23 @@ pub struct SessionExitState {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessResourceNode {
+    pub pid: u32,
+    pub parent_pid: Option<u32>,
+    pub name: String,
+    pub cpu_percent: f32,
+    pub memory_bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     pub cpu_percent: f32,
     pub memory_bytes: u64,
     pub process_count: u32,
     pub process_ids: Vec<u32>,
+    #[serde(default)]
+    pub processes: Vec<ProcessResourceNode>,
     #[serde(skip, default)]
     pub last_sample_at: Option<Instant>,
 }
@@ -231,6 +242,9 @@ pub struct SessionRuntimeState {
     pub metrics: SessionMetrics,
     pub resources: ResourceSnapshot,
     pub awaiting_external_editor: bool,
+    /// Set when session close reaping timed out with tracked children still alive.
+    #[serde(default)]
+    pub reap_incomplete: bool,
     pub shell_integration: ShellIntegrationKind,
     pub prompt_marks: Vec<PromptMark>,
     pub reported_cwd: Option<PathBuf>,
@@ -296,6 +310,7 @@ impl SessionRuntimeState {
             metrics: SessionMetrics::default(),
             resources: ResourceSnapshot::default(),
             awaiting_external_editor: false,
+            reap_incomplete: false,
             shell_integration: ShellIntegrationKind::None,
             prompt_marks: Vec::new(),
             reported_cwd: None,
@@ -425,6 +440,7 @@ impl SessionRuntimeState {
         self.pid = None;
         self.resources = ResourceSnapshot::default();
         self.awaiting_external_editor = false;
+        self.reap_incomplete = false;
         self.at_prompt = false;
         if self.session_kind.is_ai() {
             self.ai_activity = Some(AiActivity::Idle);
@@ -447,6 +463,7 @@ impl SessionRuntimeState {
         self.exit_code = None;
         self.resources = ResourceSnapshot::default();
         self.awaiting_external_editor = false;
+        self.reap_incomplete = false;
         self.prompt_marks.clear();
         self.reported_cwd = None;
         self.at_prompt = false;
@@ -851,6 +868,7 @@ mod tests {
             memory_bytes: 12_345,
             process_count: 3,
             process_ids: vec![11, 22, 33],
+            processes: Vec::new(),
             last_sample_at: Some(Instant::now()),
         };
 
@@ -865,6 +883,7 @@ mod tests {
             memory_bytes: 9_999,
             process_count: 2,
             process_ids: vec![44, 55],
+            processes: Vec::new(),
             last_sample_at: Some(Instant::now()),
         };
         session.note_exit(

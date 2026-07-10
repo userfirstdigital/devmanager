@@ -132,7 +132,11 @@ const DEFAULT_CODEX_COMMAND: &str =
     "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox";
 const AI_COMMAND_INJECTION_DELAY_MS: u64 = 500;
 #[cfg(not(test))]
-const SESSION_REAPER_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_REAPER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Second force-kill retry window after the primary reaper timeout.
+/// Same kill strategy as the first pass; gives stubborn descendants more time to die.
+#[cfg(not(test))]
+const SESSION_REAPER_ESCALATED_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Default for ProcessManager {
     fn default() -> Self {
@@ -314,6 +318,40 @@ impl ProcessManager {
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
         self.schedule_stop_server_and_wait(command_id, wait, response)
+    }
+
+    pub fn enqueue_kill_process(
+        &self,
+        session_id: &str,
+        pid: u32,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::KillProcess {
+                op_id,
+                session_id: session_id.to_string(),
+                pid,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    pub fn enqueue_kill_process_tree(
+        &self,
+        session_id: &str,
+        pid: u32,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::KillProcessTree {
+                op_id,
+                session_id: session_id.to_string(),
+                pid,
+                response,
+            })
+            .map(|_| ())
     }
 
     pub fn schedule_kill_port_and_restart(
@@ -1786,6 +1824,7 @@ impl ProcessManager {
                     last_sample_at: Some(Instant::now()),
                     ..ResourceSnapshot::default()
                 };
+                state.reap_incomplete = true;
                 state.exit = Some(SessionExitState {
                     code: None,
                     signal: None,
@@ -2133,6 +2172,13 @@ impl ProcessManager {
         {
             let _ =
                 self.reap_session_processes_until_clear(&session_id, Duration::from_millis(100));
+            if !pid_file::active_tracked_pids_for_session(&session_id).is_empty()
+                || live_runtime_root_running(&self.inner, &session_id)
+            {
+                self.note_reap_incomplete(&session_id);
+            } else {
+                mark_session_reaped(&self.inner, &session_id);
+            }
         }
 
         #[cfg(not(test))]
@@ -2141,8 +2187,149 @@ impl ProcessManager {
             thread::spawn(move || {
                 let _ =
                     manager.reap_session_processes_until_clear(&session_id, SESSION_REAPER_TIMEOUT);
+                if pid_file::active_tracked_pids_for_session(&session_id).is_empty()
+                    && !live_runtime_root_running(&manager.inner, &session_id)
+                {
+                    return;
+                }
+                let _ = manager.reap_session_processes_until_clear(
+                    &session_id,
+                    SESSION_REAPER_ESCALATED_TIMEOUT,
+                );
+                if !pid_file::active_tracked_pids_for_session(&session_id).is_empty()
+                    || live_runtime_root_running(&manager.inner, &session_id)
+                {
+                    manager.note_reap_incomplete(&session_id);
+                }
             });
         }
+    }
+
+    fn note_reap_incomplete(&self, session_id: &str) {
+        let remaining_tracked = pid_file::active_tracked_processes_for_session(session_id);
+        let mut remaining_pids = BTreeSet::new();
+        let mut processes = Vec::new();
+
+        for entry in &remaining_tracked {
+            let root_verified = platform_service::process_matches_identity(
+                entry.pid,
+                entry.started_at_unix_secs,
+                entry.process_name.as_deref(),
+            );
+            if root_verified {
+                remaining_pids.insert(entry.pid);
+                let root_name = entry
+                    .process_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pid-{}", entry.pid));
+                processes.push(crate::state::ProcessResourceNode {
+                    pid: entry.pid,
+                    parent_pid: None,
+                    name: root_name,
+                    cpu_percent: 0.0,
+                    memory_bytes: 0,
+                });
+                for descendant in platform_service::collect_descendant_process_identities(entry.pid)
+                {
+                    if remaining_pids.insert(descendant.pid) {
+                        processes.push(crate::state::ProcessResourceNode {
+                            pid: descendant.pid,
+                            parent_pid: Some(entry.pid),
+                            name: descendant
+                                .process_name
+                                .clone()
+                                .unwrap_or_else(|| format!("pid-{}", descendant.pid)),
+                            cpu_percent: 0.0,
+                            memory_bytes: 0,
+                        });
+                    }
+                }
+            } else {
+                for descendant in &entry.descendant_processes {
+                    if platform_service::process_matches_identity(
+                        descendant.pid,
+                        descendant.started_at_unix_secs,
+                        descendant.process_name.as_deref(),
+                    ) && remaining_pids.insert(descendant.pid)
+                    {
+                        processes.push(crate::state::ProcessResourceNode {
+                            pid: descendant.pid,
+                            parent_pid: Some(entry.pid),
+                            name: descendant
+                                .process_name
+                                .clone()
+                                .unwrap_or_else(|| format!("pid-{}", descendant.pid)),
+                            cpu_percent: 0.0,
+                            memory_bytes: 0,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(root_pid) = live_runtime_root_pid(&self.inner, session_id) {
+            if platform_service::is_pid_running(root_pid) && remaining_pids.insert(root_pid) {
+                let name = platform_service::capture_process_identity(root_pid)
+                    .and_then(|identity| identity.process_name)
+                    .unwrap_or_else(|| format!("pid-{root_pid}"));
+                processes.push(crate::state::ProcessResourceNode {
+                    pid: root_pid,
+                    parent_pid: None,
+                    name,
+                    cpu_percent: 0.0,
+                    memory_bytes: 0,
+                });
+            }
+            for descendant in platform_service::collect_descendant_process_identities(root_pid) {
+                if remaining_pids.insert(descendant.pid) {
+                    processes.push(crate::state::ProcessResourceNode {
+                        pid: descendant.pid,
+                        parent_pid: Some(root_pid),
+                        name: descendant
+                            .process_name
+                            .clone()
+                            .unwrap_or_else(|| format!("pid-{}", descendant.pid)),
+                        cpu_percent: 0.0,
+                        memory_bytes: 0,
+                    });
+                }
+            }
+        }
+
+        if remaining_pids.is_empty() {
+            // Nothing verified remains — finish the stop instead of leaving Stopping forever.
+            mark_session_reaped(&self.inner, session_id);
+            return;
+        }
+
+        let remaining_pids: Vec<u32> = remaining_pids.into_iter().collect();
+        self.update_session_state(session_id, |state| {
+            state.reap_incomplete = true;
+            state.status = SessionStatus::Failed;
+            state.pid = None;
+            state.resources = ResourceSnapshot {
+                process_count: remaining_pids.len() as u32,
+                process_ids: remaining_pids.clone(),
+                processes: processes.clone(),
+                last_sample_at: Some(Instant::now()),
+                ..ResourceSnapshot::default()
+            };
+            let summary = format!(
+                "Session close left {} tracked process(es) running.",
+                remaining_pids.len()
+            );
+            state.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user: state
+                    .exit
+                    .as_ref()
+                    .map(|exit| exit.closed_by_user)
+                    .unwrap_or(true),
+                summary,
+            });
+            state.mark_dirty();
+        });
     }
 
     fn reap_session_processes_until_clear(&self, session_id: &str, timeout: Duration) -> usize {
@@ -2288,13 +2475,20 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                 .sessions
                 .iter()
                 .filter_map(|(id, session)| {
-                    (session.status.is_live())
-                        .then_some(
-                            session
-                                .pid
-                                .map(|pid| (id.clone(), pid, session.session_kind.is_ai())),
-                        )
-                        .flatten()
+                    if session.status.is_live() {
+                        return session
+                            .pid
+                            .map(|pid| (id.clone(), pid, session.session_kind.is_ai()));
+                    }
+                    if session.reap_incomplete {
+                        let ledger_pid = pid_file::active_tracked_processes_for_session(id)
+                            .into_iter()
+                            .next()
+                            .map(|entry| entry.pid);
+                        let pid = ledger_pid.or_else(|| session.resources.process_ids.first().copied());
+                        return pid.map(|pid| (id.clone(), pid, false));
+                    }
+                    None
                 })
                 .collect()
         })
@@ -2317,40 +2511,68 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     for (session_id, pid, is_ai_session) in sessions {
         let (snapshot, awaiting_external_editor) = tracked_processes
             .get(&session_id)
-            .filter(|entry| entry.pid == pid)
             .filter(|entry| {
-                platform_service::process_matches_identity_with_system(
+                entry.pid == pid
+                    || entry
+                        .descendant_processes
+                        .iter()
+                        .any(|descendant| descendant.pid == pid)
+            })
+            .and_then(|entry| {
+                let sample_root = if platform_service::process_matches_identity_with_system(
                     system,
                     entry.pid,
                     entry.started_at_unix_secs,
                     entry.process_name.as_deref(),
-                )
-            })
-            .and_then(|entry| {
-                let root_pid = sysinfo::Pid::from_u32(entry.pid);
+                ) {
+                    entry.pid
+                } else if entry.pid == pid {
+                    return None;
+                } else {
+                    pid
+                };
+                let root_pid = sysinfo::Pid::from_u32(sample_root);
                 let _root_process = system.process(root_pid)?;
                 let process_tree_ids = collect_process_tree_ids(system, root_pid);
                 let descendant_processes = process_tree_ids
                     .iter()
                     .skip(1)
-                    .filter_map(|pid| {
-                        platform_service::process_identity_with_system(system, pid.as_u32())
+                    .filter_map(|tree_pid| {
+                        platform_service::process_identity_with_system(system, tree_pid.as_u32())
                     })
                     .collect::<Vec<_>>();
                 let awaiting_external_editor =
                     is_ai_session && is_blocking_external_editor(&descendant_processes);
-                let _ = pid_file::sync_session_descendant_processes(
-                    session_id.as_str(),
-                    entry.pid,
-                    descendant_processes,
-                );
+                if sample_root == entry.pid {
+                    let _ = pid_file::sync_session_descendant_processes(
+                        session_id.as_str(),
+                        entry.pid,
+                        descendant_processes,
+                    );
+                }
                 let mut cpu_percent = 0.0;
                 let mut memory_bytes = 0;
+                let mut processes = Vec::with_capacity(process_tree_ids.len());
 
                 for tree_pid in &process_tree_ids {
                     if let Some(process) = system.process(*tree_pid) {
-                        cpu_percent += process.cpu_usage();
-                        memory_bytes += process.memory();
+                        let process_cpu = process.cpu_usage();
+                        let process_memory = process.memory();
+                        cpu_percent += process_cpu;
+                        memory_bytes += process_memory;
+                        let name = platform_service::process_identity_with_system(
+                            system,
+                            tree_pid.as_u32(),
+                        )
+                        .and_then(|identity| identity.process_name)
+                        .unwrap_or_else(|| format!("pid-{}", tree_pid.as_u32()));
+                        processes.push(crate::state::ProcessResourceNode {
+                            pid: tree_pid.as_u32(),
+                            parent_pid: process.parent().map(|parent| parent.as_u32()),
+                            name,
+                            cpu_percent: process_cpu,
+                            memory_bytes: process_memory,
+                        });
                     }
                 }
 
@@ -2358,14 +2580,54 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                     ResourceSnapshot {
                         cpu_percent,
                         memory_bytes,
-                        process_count: process_tree_ids.len() as u32,
-                        process_ids: process_tree_ids
-                            .into_iter()
-                            .map(|pid| pid.as_u32())
-                            .collect(),
+                        process_count: processes.len() as u32,
+                        process_ids: processes.iter().map(|process| process.pid).collect(),
+                        processes,
                         last_sample_at: Some(sampled_at),
                     },
                     awaiting_external_editor,
+                ))
+            })
+            .or_else(|| {
+                // Live runtime root without a matching ledger entry yet.
+                let root_pid = sysinfo::Pid::from_u32(pid);
+                let process = system.process(root_pid)?;
+                let process_tree_ids = collect_process_tree_ids(system, root_pid);
+                let mut cpu_percent = 0.0;
+                let mut memory_bytes = 0;
+                let mut processes = Vec::with_capacity(process_tree_ids.len());
+                for tree_pid in &process_tree_ids {
+                    if let Some(tree_process) = system.process(*tree_pid) {
+                        let process_cpu = tree_process.cpu_usage();
+                        let process_memory = tree_process.memory();
+                        cpu_percent += process_cpu;
+                        memory_bytes += process_memory;
+                        let name = platform_service::process_identity_with_system(
+                            system,
+                            tree_pid.as_u32(),
+                        )
+                        .and_then(|identity| identity.process_name)
+                        .unwrap_or_else(|| format!("pid-{}", tree_pid.as_u32()));
+                        processes.push(crate::state::ProcessResourceNode {
+                            pid: tree_pid.as_u32(),
+                            parent_pid: tree_process.parent().map(|parent| parent.as_u32()),
+                            name,
+                            cpu_percent: process_cpu,
+                            memory_bytes: process_memory,
+                        });
+                    }
+                }
+                let _ = process;
+                Some((
+                    ResourceSnapshot {
+                        cpu_percent,
+                        memory_bytes,
+                        process_count: processes.len() as u32,
+                        process_ids: processes.iter().map(|node| node.pid).collect(),
+                        processes,
+                        last_sample_at: Some(sampled_at),
+                    },
+                    false,
                 ))
             })
             .unwrap_or_default();
@@ -2373,12 +2635,22 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     }
 
     let mut touched_sessions = Vec::new();
+    let mut cleared_reap_sessions = Vec::new();
     if let Ok(mut runtime) = inner.runtime_state.write() {
         for (session_id, snapshot, awaiting_external_editor) in snapshots {
             if let Some(session) = runtime.sessions.get_mut(&session_id) {
                 let dirty_before = session.dirty_generation;
+                let cleared_unreaped = session.reap_incomplete && snapshot.process_ids.is_empty();
                 session.note_resource_sample(snapshot);
                 session.note_external_editor_wait(awaiting_external_editor);
+                if cleared_unreaped {
+                    session.reap_incomplete = false;
+                    session.status = SessionStatus::Stopped;
+                    session.pid = None;
+                    session.resources = ResourceSnapshot::default();
+                    session.mark_dirty();
+                    cleared_reap_sessions.push(session_id.clone());
+                }
                 if session.dirty_generation != dirty_before {
                     touched_sessions.push(session_id);
                 }
@@ -2389,6 +2661,10 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         bump_runtime_revision(inner);
     }
     for session_id in touched_sessions {
+        emit_tracked_remote_runtime_snapshot(inner, &session_id);
+    }
+    for session_id in cleared_reap_sessions {
+        let _ = pid_file::prune_inactive_entries();
         emit_tracked_remote_runtime_snapshot(inner, &session_id);
     }
 }
@@ -2493,14 +2769,22 @@ fn collect_session_reap_pids(inner: &Arc<ProcessManagerInner>, session_id: &str)
             }
         }
         for descendant in entry.descendant_processes {
-            pids.insert(descendant.pid);
+            if platform_service::process_matches_identity(
+                descendant.pid,
+                descendant.started_at_unix_secs,
+                descendant.process_name.as_deref(),
+            ) {
+                pids.insert(descendant.pid);
+            }
         }
     }
 
     if let Some(root_pid) = live_runtime_root_pid(inner, session_id) {
-        pids.insert(root_pid);
-        for descendant in platform_service::collect_descendant_process_identities(root_pid) {
-            pids.insert(descendant.pid);
+        if platform_service::is_pid_running(root_pid) {
+            pids.insert(root_pid);
+            for descendant in platform_service::collect_descendant_process_identities(root_pid) {
+                pids.insert(descendant.pid);
+            }
         }
     }
 
@@ -2524,11 +2808,20 @@ fn mark_session_reaped(inner: &Arc<ProcessManagerInner>, session_id: &str) {
     let mut changed = false;
     if let Ok(mut runtime) = inner.runtime_state.write() {
         if let Some(session) = runtime.sessions.get_mut(session_id) {
-            if session.status == SessionStatus::Stopping {
+            if session.status.is_live() || session.reap_incomplete {
                 let dirty_before = session.dirty_generation;
                 session.status = SessionStatus::Stopped;
                 session.pid = None;
                 session.resources = ResourceSnapshot::default();
+                session.reap_incomplete = false;
+                if session.exit.is_none() {
+                    session.exit = Some(SessionExitState {
+                        code: None,
+                        signal: None,
+                        closed_by_user: true,
+                        summary: "Session processes cleared.".to_string(),
+                    });
+                }
                 session.mark_dirty();
                 changed = session.dirty_generation != dirty_before;
             }
@@ -3847,6 +4140,63 @@ pub(crate) fn execute_process_op_inner(
                 None,
             )
         }
+        ProcessOp::KillProcess {
+            session_id,
+            pid,
+            response,
+            ..
+        } => {
+            let outcome = kill_session_process_inner(inner, &session_id, pid, false);
+            let (result, message) = match outcome {
+                Ok(KillProcessOutcome::Killed) => {
+                    (Ok(()), Some(format!("Killed process {pid}.")))
+                }
+                Ok(KillProcessOutcome::AlreadyGone) => (
+                    Ok(()),
+                    Some(format!("Process {pid} was already gone.")),
+                ),
+                Err(error) => (Err(error), None),
+            };
+            (
+                ProcessOpKind::KillProcess,
+                result,
+                ProcessOpContext {
+                    session_id: Some(session_id),
+                    message,
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::KillProcessTree {
+            session_id,
+            pid,
+            response,
+            ..
+        } => {
+            let outcome = kill_session_process_inner(inner, &session_id, pid, true);
+            let (result, message) = match outcome {
+                Ok(KillProcessOutcome::Killed) => (
+                    Ok(()),
+                    Some(format!("Killed process tree rooted at {pid}.")),
+                ),
+                Ok(KillProcessOutcome::AlreadyGone) => (
+                    Ok(()),
+                    Some(format!("Process tree rooted at {pid} was already gone.")),
+                ),
+                Err(error) => (Err(error), None),
+            };
+            (
+                ProcessOpKind::KillProcessTree,
+                result,
+                ProcessOpContext {
+                    session_id: Some(session_id),
+                    message,
+                    ..Default::default()
+                },
+                response,
+            )
+        }
     };
 
     ProcessOpCompletion {
@@ -3857,6 +4207,114 @@ pub(crate) fn execute_process_op_inner(
         context,
         remote_response,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillProcessOutcome {
+    Killed,
+    AlreadyGone,
+}
+
+fn verified_session_process_identity(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    pid: u32,
+) -> Option<platform_service::ProcessIdentity> {
+    for entry in pid_file::active_tracked_processes_for_session(session_id) {
+        if entry.pid == pid
+            && platform_service::process_matches_identity(
+                entry.pid,
+                entry.started_at_unix_secs,
+                entry.process_name.as_deref(),
+            )
+        {
+            return Some(platform_service::ProcessIdentity {
+                pid: entry.pid,
+                started_at_unix_secs: entry.started_at_unix_secs,
+                process_name: entry.process_name.clone(),
+            });
+        }
+        for descendant in &entry.descendant_processes {
+            if descendant.pid == pid
+                && platform_service::process_matches_identity(
+                    descendant.pid,
+                    descendant.started_at_unix_secs,
+                    descendant.process_name.as_deref(),
+                )
+            {
+                return Some(platform_service::ProcessIdentity {
+                    pid: descendant.pid,
+                    started_at_unix_secs: descendant.started_at_unix_secs,
+                    process_name: descendant.process_name.clone(),
+                });
+            }
+        }
+        if platform_service::process_matches_identity(
+            entry.pid,
+            entry.started_at_unix_secs,
+            entry.process_name.as_deref(),
+        ) {
+            for descendant in platform_service::collect_descendant_process_identities(entry.pid) {
+                if descendant.pid == pid {
+                    return Some(descendant);
+                }
+            }
+        }
+    }
+
+    if live_runtime_root_pid(inner, session_id) == Some(pid) {
+        return platform_service::capture_process_identity(pid);
+    }
+    if let Some(root_pid) = live_runtime_root_pid(inner, session_id) {
+        for descendant in platform_service::collect_descendant_process_identities(root_pid) {
+            if descendant.pid == pid {
+                return Some(descendant);
+            }
+        }
+    }
+    None
+}
+
+fn kill_session_process_inner(
+    inner: &Arc<ProcessManagerInner>,
+    session_id: &str,
+    pid: u32,
+    kill_tree: bool,
+) -> Result<KillProcessOutcome, String> {
+    let Some(expected) = verified_session_process_identity(inner, session_id, pid) else {
+        return Err(format!(
+            "Process {pid} is not part of session `{session_id}`."
+        ));
+    };
+    if !platform_service::process_matches_identity(
+        pid,
+        expected.started_at_unix_secs,
+        expected.process_name.as_deref(),
+    ) {
+        return Err(format!(
+            "Process {pid} no longer matches the tracked identity for session `{session_id}`."
+        ));
+    }
+    if !platform_service::is_pid_running(pid) {
+        let _ = pid_file::prune_inactive_entries();
+        bump_runtime_revision(inner);
+        return Ok(KillProcessOutcome::AlreadyGone);
+    }
+    let result = if kill_tree {
+        platform_service::kill_process_tree(pid)
+    } else {
+        platform_service::kill_process(pid)
+    };
+    let _ = pid_file::prune_inactive_entries();
+    result?;
+    let remaining = pid_file::active_tracked_pids_for_session(session_id);
+    if remaining.is_empty() && !live_runtime_root_running(inner, session_id) {
+        mark_session_reaped(inner, session_id);
+    } else {
+        bump_runtime_revision(inner);
+        emit_tracked_remote_runtime_snapshot(inner, session_id);
+    }
+    Ok(KillProcessOutcome::Killed)
 }
 
 fn spawn_ssh_session_with_inner(
@@ -4312,6 +4770,8 @@ mod tests {
 
     #[test]
     fn close_tab_removes_ssh_tab_and_stops_session() {
+        let cwd = temp_test_dir("close-ssh-tab");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
         let manager = ProcessManager::new();
         let mut app_state = AppState::default();
         app_state.open_tabs.push(SessionTab {
@@ -4338,7 +4798,10 @@ mod tests {
                 .sessions
                 .get("ssh-session")
                 .map(|session| session.status);
-            if matches!(status, Some(SessionStatus::Stopped) | None) {
+            if matches!(
+                status,
+                Some(SessionStatus::Stopped) | Some(SessionStatus::Failed) | None
+            ) {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
@@ -4351,7 +4814,10 @@ mod tests {
             .get("ssh-session")
             .map(|session| session.status);
         assert!(
-            matches!(status, Some(SessionStatus::Stopped) | None),
+            matches!(
+                status,
+                Some(SessionStatus::Stopped) | Some(SessionStatus::Failed) | None
+            ),
             "expected ssh session to stop or be removed, got {status:?}"
         );
     }
@@ -4702,6 +5168,245 @@ mod tests {
             completed_while_locked.is_ok(),
             "record_frame blocked on runtime lock"
         );
+    }
+
+    #[test]
+    fn kill_process_rejects_pid_outside_session_tree() {
+        let cwd = temp_test_dir("kill-reject-foreign");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "shell-kill-reject";
+
+        manager
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None, None)
+            .unwrap();
+        wait_for_live_session(&manager, session_id);
+
+        let foreign_pid = 4_294_967_294;
+        let completion = execute_process_op_inner(
+            &manager.inner,
+            ProcessOp::KillProcess {
+                op_id: next_op_id(),
+                session_id: session_id.to_string(),
+                pid: foreign_pid,
+                response: None,
+            },
+        );
+        assert!(completion.result.is_err());
+        assert!(completion
+            .result
+            .unwrap_err()
+            .contains("not part of session"));
+
+        let _ = manager.close_session(session_id);
+    }
+
+    #[test]
+    fn kill_process_rejects_stale_resource_pid_without_verified_identity() {
+        let cwd = temp_test_dir("kill-reject-stale");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "stale-kill-session";
+        let running_pid = std::process::id();
+
+        {
+            let mut runtime = manager.inner.runtime_state.write().expect("runtime write");
+            let mut session = SessionRuntimeState::new(
+                session_id,
+                cwd.clone(),
+                SessionDimensions::default(),
+                TerminalBackend::PortablePtyFeedingAlacritty,
+            );
+            session.status = SessionStatus::Failed;
+            session.reap_incomplete = true;
+            session.pid = None;
+            session.resources = ResourceSnapshot {
+                process_count: 1,
+                process_ids: vec![running_pid],
+                processes: vec![crate::state::ProcessResourceNode {
+                    pid: running_pid,
+                    parent_pid: None,
+                    name: "stale".to_string(),
+                    cpu_percent: 0.0,
+                    memory_bytes: 0,
+                }],
+                ..Default::default()
+            };
+            runtime.sessions.insert(session_id.to_string(), session);
+        }
+
+        let completion = execute_process_op_inner(
+            &manager.inner,
+            ProcessOp::KillProcess {
+                op_id: next_op_id(),
+                session_id: session_id.to_string(),
+                pid: running_pid,
+                response: None,
+            },
+        );
+        assert!(completion.result.is_err());
+        assert!(completion
+            .result
+            .unwrap_err()
+            .contains("not part of session"));
+    }
+
+    #[test]
+    fn kill_process_accepts_verified_live_session_root() {
+        let cwd = temp_test_dir("kill-accept-root");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "shell-kill-accept";
+
+        manager
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None, None)
+            .unwrap();
+        wait_for_live_session(&manager, session_id);
+        let pid = manager
+            .runtime_state()
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.pid)
+            .expect("live pid");
+
+        let completion = execute_process_op_inner(
+            &manager.inner,
+            ProcessOp::KillProcess {
+                op_id: next_op_id(),
+                session_id: session_id.to_string(),
+                pid,
+                response: None,
+            },
+        );
+        assert!(completion.result.is_ok(), "{:?}", completion.result);
+        assert!(
+            completion
+                .context
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains(&format!("Killed process {pid}"))),
+            "unexpected message: {:?}",
+            completion.context.message
+        );
+    }
+
+    #[test]
+    fn note_reap_incomplete_marks_failed_session_with_tracked_pids() {
+        let cwd = temp_test_dir("reap-incomplete");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "reap-incomplete-session";
+
+        let identity =
+            platform_service::capture_process_identity(std::process::id()).expect("self identity");
+        pid_file::track_session_process(pid_file::ManagedProcessRecord {
+            session_id: session_id.to_string(),
+            pid: identity.pid,
+            started_at_unix_secs: identity.started_at_unix_secs,
+            process_name: identity.process_name.clone(),
+            session_kind: "shell".to_string(),
+            program: "test-shell".to_string(),
+            project_id: None,
+            command_id: None,
+            tab_id: None,
+            descendant_processes: Vec::new(),
+        })
+        .unwrap();
+
+        {
+            let mut runtime = manager.inner.runtime_state.write().expect("runtime write");
+            let mut session = SessionRuntimeState::new(
+                session_id,
+                cwd.clone(),
+                SessionDimensions::default(),
+                TerminalBackend::PortablePtyFeedingAlacritty,
+            );
+            session.status = SessionStatus::Stopping;
+            session.pid = Some(identity.pid);
+            runtime.sessions.insert(session_id.to_string(), session);
+        }
+
+        manager.note_reap_incomplete(session_id);
+        let runtime = manager.runtime_state();
+        let session = runtime.sessions.get(session_id).expect("session");
+        assert!(session.reap_incomplete);
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert!(session.pid.is_none());
+        assert!(session.resources.process_ids.contains(&identity.pid));
+        assert!(session
+            .exit
+            .as_ref()
+            .is_some_and(|exit| exit.summary.contains("tracked process")));
+    }
+
+    #[test]
+    fn refresh_resource_snapshots_populates_named_process_nodes() {
+        let cwd = temp_test_dir("resource-sample-nodes");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "shell-sample-nodes";
+
+        manager
+            .spawn_shell_session(session_id, &cwd, SessionDimensions::default(), None, None)
+            .unwrap();
+        wait_for_live_session(&manager, session_id);
+        wait_for_tracked_process(session_id);
+
+        let mut system = sysinfo::System::new();
+        refresh_resource_snapshots(&manager.inner, &mut system);
+
+        let session = manager
+            .runtime_state()
+            .sessions
+            .get(session_id)
+            .cloned()
+            .expect("session");
+        assert!(
+            !session.resources.processes.is_empty(),
+            "expected named process nodes from sampler"
+        );
+        assert_eq!(
+            session.resources.process_count as usize,
+            session.resources.processes.len()
+        );
+        assert!(!session.resources.processes[0].name.is_empty());
+
+        let _ = manager.close_session(session_id);
+    }
+
+    #[test]
+    fn resource_snapshot_processes_round_trip_in_session_state() {
+        let mut session = SessionRuntimeState::new(
+            "resource-nodes",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.note_resource_sample(ResourceSnapshot {
+            cpu_percent: 12.5,
+            memory_bytes: 2048,
+            process_count: 2,
+            process_ids: vec![1, 2],
+            processes: vec![
+                crate::state::ProcessResourceNode {
+                    pid: 1,
+                    parent_pid: None,
+                    name: "shell".to_string(),
+                    cpu_percent: 1.0,
+                    memory_bytes: 1024,
+                },
+                crate::state::ProcessResourceNode {
+                    pid: 2,
+                    parent_pid: Some(1),
+                    name: "node".to_string(),
+                    cpu_percent: 11.5,
+                    memory_bytes: 1024,
+                },
+            ],
+            last_sample_at: Some(Instant::now()),
+        });
+        assert_eq!(session.resources.processes.len(), 2);
+        assert_eq!(session.resources.processes[1].name, "node");
     }
 
     fn wait_for_live_session(manager: &ProcessManager, session_id: &str) {

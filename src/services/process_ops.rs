@@ -26,6 +26,8 @@ pub enum ProcessOpKind {
     CloseAi,
     StopAll,
     Shutdown,
+    KillProcess,
+    KillProcessTree,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +145,18 @@ pub enum ProcessOp {
         op_id: u64,
         timeout: Duration,
     },
+    KillProcess {
+        op_id: u64,
+        session_id: String,
+        pid: u32,
+        response: Option<Sender<RemoteActionResult>>,
+    },
+    KillProcessTree {
+        op_id: u64,
+        session_id: String,
+        pid: u32,
+        response: Option<Sender<RemoteActionResult>>,
+    },
 }
 
 fn op_preempts_in_flight(op: &ProcessOp) -> bool {
@@ -173,7 +187,9 @@ impl ProcessOp {
             | ProcessOp::RestartAi { op_id, .. }
             | ProcessOp::CloseAi { op_id, .. }
             | ProcessOp::StopAll { op_id, .. }
-            | ProcessOp::Shutdown { op_id, .. } => *op_id,
+            | ProcessOp::Shutdown { op_id, .. }
+            | ProcessOp::KillProcess { op_id, .. }
+            | ProcessOp::KillProcessTree { op_id, .. } => *op_id,
         }
     }
 
@@ -194,6 +210,12 @@ impl ProcessOp {
                 .unwrap_or_else(|| "ssh".to_string()),
             ProcessOp::StopAll { .. } => "stop-all".to_string(),
             ProcessOp::Shutdown { .. } => "shutdown".to_string(),
+            ProcessOp::KillProcess {
+                session_id, pid, ..
+            }
+            | ProcessOp::KillProcessTree {
+                session_id, pid, ..
+            } => format!("kill:{session_id}:{pid}"),
         }
     }
 }

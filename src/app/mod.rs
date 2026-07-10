@@ -1,4 +1,5 @@
 mod chrome;
+mod process_monitor;
 
 use crate::assets::AppAssets;
 use crate::git::git_service;
@@ -19,7 +20,9 @@ use crate::services::{
     RemoteSessionEvent, SessionManager,
 };
 use crate::sidebar;
-use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState, SessionStatus};
+use crate::state::{
+    AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
+};
 use crate::terminal::{self, view};
 use crate::updater::UpdaterService;
 use crate::workspace::{
@@ -184,6 +187,8 @@ struct NativeShell {
     is_selecting_editor: bool,
     sidebar_context_menu: Option<sidebar::SidebarContextMenu>,
     add_project_wizard: Option<workspace::AddProjectWizard>,
+    process_monitor: Option<process_monitor::ProcessMonitorState>,
+    process_monitor_revision: u64,
     last_window_title: Option<String>,
     splash_image: Option<Arc<RenderImage>>,
     splash_fetch_in_flight: bool,
@@ -761,6 +766,8 @@ impl NativeShell {
             is_selecting_editor: false,
             sidebar_context_menu: None,
             add_project_wizard: None,
+            process_monitor: None,
+            process_monitor_revision: 0,
             last_window_title: None,
             splash_image: None,
             splash_fetch_in_flight: false,
@@ -968,6 +975,14 @@ impl NativeShell {
                                     host_changed
                                 };
                                 changed = shell.handle_process_op_completions(cx) || changed;
+                                if shell.process_monitor.is_some() {
+                                    let revision = shell.process_manager.runtime_revision();
+                                    if revision != shell.process_monitor_revision {
+                                        shell.process_monitor_revision = revision;
+                                        changed = true;
+                                    }
+                                    next = Duration::from_millis(500);
+                                }
                                 if changed {
                                     cx.notify();
                                 }
@@ -2802,6 +2817,11 @@ impl NativeShell {
                             }
                         }
                     }
+                    ProcessOpKind::KillProcess | ProcessOpKind::KillProcessTree => {
+                        if let Some(message) = completion.context.message.clone() {
+                            self.terminal_notice = Some(message);
+                        }
+                    }
                     _ => {}
                 }
                 self.save_session_state();
@@ -4344,6 +4364,139 @@ impl NativeShell {
 
     fn open_add_project_action(&mut self, cx: &mut Context<Self>) {
         self.add_project_wizard = Some(workspace::AddProjectWizard::default());
+        cx.notify();
+    }
+
+    fn open_process_monitor_action(&mut self, cx: &mut Context<Self>) {
+        self.process_monitor = Some(process_monitor::ProcessMonitorState::default());
+        self.process_monitor_revision = self.process_manager.runtime_revision();
+        cx.notify();
+    }
+
+    fn close_process_monitor_action(&mut self, cx: &mut Context<Self>) {
+        self.process_monitor = None;
+        cx.notify();
+    }
+
+    fn handle_process_monitor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.process_monitor.is_none() {
+            return false;
+        }
+        if event.keystroke.key.to_ascii_lowercase() == "escape" {
+            self.close_process_monitor_action(cx);
+            window.prevent_default();
+            return true;
+        }
+        true
+    }
+
+    fn handle_process_monitor_action(
+        &mut self,
+        action: process_monitor::ProcessMonitorAction,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            process_monitor::ProcessMonitorAction::Close => {
+                self.close_process_monitor_action(cx);
+            }
+            process_monitor::ProcessMonitorAction::ToggleSession(session_id) => {
+                if let Some(monitor) = self.process_monitor.as_mut() {
+                    if !monitor.expanded_sessions.insert(session_id.clone()) {
+                        monitor.expanded_sessions.remove(&session_id);
+                    }
+                    cx.notify();
+                }
+            }
+            process_monitor::ProcessMonitorAction::KillProcess { session_id, pid } => {
+                match self
+                    .process_manager
+                    .enqueue_kill_process(&session_id, pid, None)
+                {
+                    Ok(()) => {
+                        self.terminal_notice =
+                            Some(format!("Killing process {pid} in `{session_id}`..."));
+                    }
+                    Err(error) => {
+                        self.terminal_notice = Some(format!("Failed to kill process: {error}"));
+                    }
+                }
+                cx.notify();
+            }
+            process_monitor::ProcessMonitorAction::KillProcessTree { session_id, pid } => {
+                match self
+                    .process_manager
+                    .enqueue_kill_process_tree(&session_id, pid, None)
+                {
+                    Ok(()) => {
+                        self.terminal_notice =
+                            Some(format!("Killing process tree {pid} in `{session_id}`..."));
+                    }
+                    Err(error) => {
+                        self.terminal_notice =
+                            Some(format!("Failed to kill process tree: {error}"));
+                    }
+                }
+                cx.notify();
+            }
+            process_monitor::ProcessMonitorAction::StopSession(session_id) => {
+                self.stop_monitor_session(&session_id, cx);
+            }
+        }
+    }
+
+    fn stop_monitor_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let runtime = self.process_manager.runtime_state();
+        let Some(session) = runtime.sessions.get(session_id).cloned() else {
+            self.terminal_notice = Some(format!("Unknown session `{session_id}`."));
+            cx.notify();
+            return;
+        };
+
+        let result = match session.session_kind {
+            SessionKind::Server => {
+                let command_id = session
+                    .command_id
+                    .clone()
+                    .unwrap_or_else(|| session_id.to_string());
+                self.process_manager.enqueue_stop_server_and_wait(
+                    &command_id,
+                    Duration::from_secs(5),
+                    None,
+                )
+            }
+            SessionKind::Claude | SessionKind::Codex => {
+                if let Some(tab_id) = session.tab_id.as_deref() {
+                    self.process_manager
+                        .close_ai_session(&mut self.state, tab_id)
+                } else {
+                    self.process_manager.close_session(session_id)
+                }
+            }
+            SessionKind::Ssh => {
+                if let Some(tab_id) = session.tab_id.as_deref() {
+                    self.process_manager
+                        .close_ssh_session(&mut self.state, tab_id)
+                } else {
+                    self.process_manager.close_session(session_id)
+                }
+            }
+            SessionKind::Shell => self.process_manager.close_session(session_id),
+        };
+
+        match result {
+            Ok(()) => {
+                self.terminal_notice = Some(format!("Stopping session `{session_id}`..."));
+                self.save_session_state();
+            }
+            Err(error) => {
+                self.terminal_notice = Some(format!("Failed to stop session: {error}"));
+            }
+        }
         cx.notify();
     }
 
@@ -6573,7 +6726,7 @@ impl NativeShell {
         window: &mut Window,
         _: &mut Context<Self>,
     ) {
-        if self.add_project_wizard.is_some() {
+        if self.add_project_wizard.is_some() || self.process_monitor.is_some() {
             return;
         }
         self.focus_editor(window);
@@ -6589,6 +6742,9 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.handle_process_monitor_key(event, window, cx) {
+            return true;
+        }
         let Some(wizard) = self.add_project_wizard.as_mut() else {
             return false;
         };
@@ -9066,7 +9222,7 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.add_project_wizard.is_some() {
+        if self.add_project_wizard.is_some() || self.process_monitor.is_some() {
             return;
         }
         self.focus_terminal(window);
@@ -10678,6 +10834,20 @@ impl Render for NativeShell {
                     this.install_update_action(cx);
                 }))
             };
+        let make_open_process_monitor_handler =
+            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.open_process_monitor_action(cx);
+                }))
+            };
+        let make_process_monitor_action_handler =
+            |action: process_monitor::ProcessMonitorAction| -> Box<
+                dyn Fn(&MouseDownEvent, &mut Window, &mut App),
+            > {
+                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    this.handle_process_monitor_action(action.clone(), cx);
+                }))
+            };
         let editor_entity = cx.weak_entity();
         let make_editor_action_handler = {
             let editor_entity = editor_entity.clone();
@@ -10982,6 +11152,7 @@ impl Render for NativeShell {
                         &updater_snapshot,
                         Some(&remote_status_bar.model),
                         chrome::StatusBarActions {
+                            on_open_process_monitor: &make_open_process_monitor_handler,
                             on_install_update: &make_install_update_handler,
                             on_open_remote: &make_open_remote_handler,
                             on_remote_native_toggle: &make_remote_native_toggle_handler,
@@ -11007,6 +11178,15 @@ impl Render for NativeShell {
                         },
                     )),
             )
+            .children(self.process_monitor.as_ref().map(|monitor| {
+                process_monitor::render_process_monitor(
+                    monitor,
+                    &runtime_snapshot,
+                    process_monitor::ProcessMonitorActions {
+                        on_action: &make_process_monitor_action_handler,
+                    },
+                )
+            }))
             .children(self.add_project_wizard.as_ref().map(|wizard| {
                 workspace::render_add_project_wizard(
                     wizard,

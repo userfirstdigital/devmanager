@@ -41,6 +41,8 @@ pub struct RemoteStatusBarModel {
 }
 
 pub struct StatusBarActions<'a> {
+    pub on_open_process_monitor:
+        &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_install_update: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_open_remote: &'a dyn Fn() -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
     pub on_remote_native_toggle:
@@ -79,6 +81,9 @@ pub fn render_status_bar(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.85))
+                .on_mouse_down(MouseButton::Left, (actions.on_open_process_monitor)())
                 .child(
                     div()
                         .flex()
