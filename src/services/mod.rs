@@ -3,6 +3,7 @@ pub mod pid_file;
 pub mod platform_service;
 pub mod ports_service;
 mod process_manager;
+mod process_ops;
 pub mod scanner_service;
 mod session_manager;
 
@@ -12,5 +13,7 @@ pub use platform_service::*;
 pub use ports_service::*;
 pub(crate) use process_manager::ai_session_needs_restore;
 pub use process_manager::{ManagedShutdownReport, ProcessManager, RemoteSessionEvent};
+pub use process_ops::{ProcessOpCompletion, ProcessOpKind};
+pub(crate) use process_ops::{next_op_id, ProcessOp, ProcessOpContext, ProcessOpQueue};
 pub use scanner_service::*;
 pub use session_manager::{ConfigImportMode, SessionManager};

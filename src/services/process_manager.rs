@@ -2,6 +2,10 @@ use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
 use crate::notifications;
+use crate::remote::RemoteActionResult;
+use crate::services::process_ops::{
+    next_op_id, ProcessOp, ProcessOpCompletion, ProcessOpContext, ProcessOpKind, ProcessOpQueue,
+};
 use crate::services::{env_service, pid_file, platform_service};
 use crate::state::AppState;
 use crate::state::{
@@ -17,6 +21,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::Sender,
     Arc, Mutex, RwLock,
 };
 use std::thread;
@@ -52,6 +57,7 @@ pub(crate) fn ai_session_needs_restore(
 #[derive(Clone)]
 pub struct ProcessManager {
     inner: Arc<ProcessManagerInner>,
+    op_queue: Arc<ProcessOpQueue>,
 }
 
 #[derive(Clone)]
@@ -71,7 +77,7 @@ pub enum RemoteSessionEvent {
 
 type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
 
-struct ProcessManagerInner {
+pub(crate) struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
     runtime_state: Arc<RwLock<RuntimeState>>,
     runtime_revision: AtomicU64,
@@ -86,6 +92,7 @@ struct ProcessManagerInner {
     remote_session_handler: RwLock<Option<RemoteSessionEventHandler>>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    op_queue: Mutex<Option<Arc<ProcessOpQueue>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,14 +158,491 @@ impl ProcessManager {
             remote_session_handler: RwLock::new(None),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
+            op_queue: Mutex::new(None),
         });
+
+        let op_queue = Arc::new(ProcessOpQueue::new(inner.clone()));
+        if let Ok(mut slot) = inner.op_queue.lock() {
+            *slot = Some(op_queue.clone());
+        }
 
         let thread_handle = spawn_background_tasks(inner.clone());
         if let Ok(mut handle_slot) = inner.background_thread.lock() {
             *handle_slot = Some(thread_handle);
         }
 
-        Self { inner }
+        let op_queue = Arc::new(ProcessOpQueue::new(inner.clone()));
+
+        Self { inner, op_queue }
+    }
+
+    pub fn drain_process_op_completions(&self) -> Vec<ProcessOpCompletion> {
+        self.op_queue.drain_completions()
+    }
+
+    pub fn submit_process_op(&self, op: ProcessOp) -> Result<u64, String> {
+        self.op_queue.submit(op)
+    }
+
+    fn schedule_start_server(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+        activate_tab: bool,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let Some(launch) =
+            self.prepare_start_server(app_state, command_id, dimensions, activate_tab)?
+        else {
+            return Ok(());
+        };
+        let op_id = next_op_id();
+        self.op_queue.submit(ProcessOp::StartServer {
+            op_id,
+            launch,
+            dimensions,
+            activate: activate_tab,
+            response,
+        })?;
+        Ok(())
+    }
+
+    fn schedule_restart_server(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+        banner: &str,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let (launch, clear_logs) =
+            self.prepare_restart_server(app_state, command_id, dimensions, banner)?;
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::RestartServer {
+                op_id,
+                launch,
+                dimensions,
+                banner: banner.to_string(),
+                clear_logs,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn schedule_stop_server_and_wait(
+        &self,
+        command_id: &str,
+        wait: Duration,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::StopServer {
+                op_id,
+                command_id: command_id.to_string(),
+                wait,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn enqueue_kill_port_op(
+        &self,
+        command_id: &str,
+        port: u16,
+        launch: ServerLaunchSpec,
+        dimensions: SessionDimensions,
+        banner: &str,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::KillPortAndRestart {
+                op_id,
+                command_id: command_id.to_string(),
+                port,
+                launch,
+                dimensions,
+                banner: banner.to_string(),
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn schedule_stop_all_servers(
+        &self,
+        wait: Duration,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let command_ids: Vec<String> = self
+            .runtime_state()
+            .sessions
+            .values()
+            .filter(|session| session.command_id.is_some() && session.status.is_live())
+            .filter_map(|session| session.command_id.clone())
+            .collect();
+        for command_id in &command_ids {
+            self.update_session_state(command_id, |state| {
+                state.note_user_stop_request();
+                state.status = SessionStatus::Stopping;
+                state.mark_dirty();
+            });
+        }
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::StopAll {
+                op_id,
+                command_ids,
+                wait,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    pub fn schedule_shutdown(&self, timeout: Duration) -> Result<u64, String> {
+        let op_id = next_op_id();
+        self.op_queue.submit(ProcessOp::Shutdown { op_id, timeout })?;
+        Ok(op_id)
+    }
+
+    pub fn enqueue_stop_server_and_wait(
+        &self,
+        command_id: &str,
+        wait: Duration,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        self.schedule_stop_server_and_wait(command_id, wait, response)
+    }
+
+    pub fn schedule_kill_port_and_restart(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        port: u16,
+        dimensions: SessionDimensions,
+        banner: &str,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let lookup = app_state
+            .find_command(command_id)
+            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
+        let project_id = lookup.project.id.clone();
+        let command_id_owned = lookup.command.id.clone();
+        let command_label = lookup.command.label.clone();
+        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
+        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
+        let cwd = if cwd.is_dir() {
+            cwd
+        } else {
+            PathBuf::from(lookup.project.root_path.clone())
+        };
+        let env = build_command_env(lookup.folder, lookup.command);
+        let (program, args) =
+            build_server_launch_command(&app_state.config.settings, lookup.command);
+        let launch_spec = ServerLaunchSpec {
+            command_id: command_id_owned.clone(),
+            project_id: project_id.clone(),
+            cwd,
+            program,
+            args,
+            env,
+            auto_restart: command_auto_restart,
+            log_file_path: build_server_log_file_path(
+                lookup.project,
+                lookup.folder,
+                lookup.command,
+            ),
+        };
+        app_state.open_server_tab(&project_id, &command_id_owned, Some(command_label));
+        self.update_session_state(&command_id_owned, |state| {
+            state.status = SessionStatus::Starting;
+            state.mark_dirty();
+        });
+        self.enqueue_kill_port_op(
+            &command_id_owned,
+            port,
+            launch_spec,
+            dimensions,
+            banner,
+            response,
+        )
+    }
+
+    fn prepare_start_server(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+        activate_tab: bool,
+    ) -> Result<Option<ServerLaunchSpec>, String> {
+        let lookup = app_state
+            .find_command(command_id)
+            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
+
+        let project_id = lookup.project.id.clone();
+        let command_id = lookup.command.id.clone();
+        let command_label = lookup.command.label.clone();
+        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
+        let session_id = command_id.clone();
+        let runtime = self.runtime_state();
+        if let Some(session) = runtime.sessions.get(&session_id) {
+            if session.has_live_process() && self.get_session(&session_id).is_ok() {
+                if activate_tab {
+                    app_state.open_server_tab(
+                        &project_id,
+                        &command_id,
+                        Some(command_label.clone()),
+                    );
+                    self.set_active_session(session_id);
+                } else {
+                    app_state.ensure_server_tab(
+                        &project_id,
+                        &command_id,
+                        Some(command_label.clone()),
+                    );
+                }
+                return Ok(None);
+            }
+        }
+
+        let previous_active_session_id = (!activate_tab)
+            .then(|| runtime.active_session_id.clone())
+            .flatten();
+
+        if activate_tab {
+            self.set_active_session(session_id.clone());
+        }
+
+        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
+        let cwd = if cwd.is_dir() {
+            cwd
+        } else {
+            PathBuf::from(lookup.project.root_path.clone())
+        };
+
+        self.ensure_runtime_entry(&session_id, cwd.clone(), dimensions);
+
+        let env = build_command_env(lookup.folder, lookup.command);
+        let (program, args) =
+            build_server_launch_command(&app_state.config.settings, lookup.command);
+        let launch_spec = ServerLaunchSpec {
+            command_id: command_id.clone(),
+            project_id: project_id.clone(),
+            cwd: cwd.clone(),
+            program: program.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            auto_restart: command_auto_restart,
+            log_file_path: build_server_log_file_path(
+                lookup.project,
+                lookup.folder,
+                lookup.command,
+            ),
+        };
+
+        if activate_tab {
+            app_state.open_server_tab(&project_id, &command_id, Some(command_label.clone()));
+        } else {
+            app_state.ensure_server_tab(&project_id, &command_id, Some(command_label.clone()));
+        }
+
+        self.update_session_state(&session_id, |state| {
+            state.status = SessionStatus::Starting;
+            state.cwd = cwd.clone();
+            state.dimensions = dimensions;
+            state.shell_program = program.clone();
+            state.configure_server(launch_spec.clone());
+            state.exit = None;
+            state.mark_dirty();
+        });
+
+        if !activate_tab {
+            self.restore_active_session(previous_active_session_id);
+        }
+
+        Ok(Some(launch_spec))
+    }
+
+    fn prepare_restart_server(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+        banner: &str,
+    ) -> Result<(ServerLaunchSpec, bool), String> {
+        let lookup = app_state
+            .find_command(command_id)
+            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
+
+        let project_id = lookup.project.id.clone();
+        let command_id = lookup.command.id.clone();
+        let command_label = lookup.command.label.clone();
+        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
+        let clear_logs_on_restart = lookup.command.clear_logs_on_restart.unwrap_or(true);
+        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
+        let cwd = if cwd.is_dir() {
+            cwd
+        } else {
+            PathBuf::from(lookup.project.root_path.clone())
+        };
+        let env = build_command_env(lookup.folder, lookup.command);
+        let (program, args) =
+            build_server_launch_command(&app_state.config.settings, lookup.command);
+        let launch_spec = ServerLaunchSpec {
+            command_id: command_id.clone(),
+            project_id: project_id.clone(),
+            cwd: cwd.clone(),
+            program: program.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            auto_restart: command_auto_restart,
+            log_file_path: build_server_log_file_path(
+                lookup.project,
+                lookup.folder,
+                lookup.command,
+            ),
+        };
+
+        self.update_session_state(&command_id, |state| {
+            state.status = SessionStatus::Stopping;
+            state.mark_dirty();
+        });
+        self.set_active_session(command_id.clone());
+        app_state.open_server_tab(&project_id, &command_id, Some(command_label));
+        self.update_session_state(&command_id, |state| {
+            state.status = SessionStatus::Starting;
+            state.cwd = cwd.clone();
+            state.dimensions = dimensions;
+            state.shell_program = program.clone();
+            state.configure_server(launch_spec.clone());
+            state.exit = None;
+            state.mark_dirty();
+        });
+
+        let _ = banner;
+        Ok((launch_spec, clear_logs_on_restart))
+    }
+
+    fn schedule_spawn_ai(
+        &self,
+        launch: &AiLaunchSpec,
+        session_id: &str,
+        dimensions: SessionDimensions,
+        activate: bool,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let _ = activate;
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::SpawnAi {
+                op_id,
+                launch: launch.clone(),
+                session_id: session_id.to_string(),
+                dimensions,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn schedule_restart_ai(
+        &self,
+        close_session_id: Option<String>,
+        launch: AiLaunchSpec,
+        session_id: String,
+        dimensions: SessionDimensions,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::RestartAi {
+                op_id,
+                close_session_id,
+                launch,
+                session_id: session_id.clone(),
+                dimensions,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn schedule_close_ai(
+        &self,
+        session_id: &str,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::CloseAi {
+                op_id,
+                session_id: session_id.to_string(),
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn schedule_start_ssh(
+        &self,
+        launch: SshLaunchSpec,
+        session_id: String,
+        dimensions: SessionDimensions,
+        key_warning: Option<String>,
+        activate: bool,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let _ = activate;
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::StartSsh {
+                op_id,
+                launch,
+                session_id: session_id.clone(),
+                dimensions,
+                key_warning,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn schedule_restart_ssh(
+        &self,
+        close_session_id: Option<String>,
+        launch: SshLaunchSpec,
+        session_id: String,
+        dimensions: SessionDimensions,
+        key_warning: Option<String>,
+        activate: bool,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let _ = activate;
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::RestartSsh {
+                op_id,
+                close_session_id,
+                launch,
+                session_id: session_id.clone(),
+                dimensions,
+                key_warning,
+                response,
+            })
+            .map(|_| ())
+    }
+
+    fn schedule_close_ssh(
+        &self,
+        session_id: Option<String>,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        let op_id = next_op_id();
+        self.op_queue
+            .submit(ProcessOp::CloseSsh {
+                op_id,
+                session_id,
+                response,
+            })
+            .map(|_| ())
     }
 
     pub fn runtime_state(&self) -> RuntimeState {
@@ -458,7 +942,7 @@ impl ProcessManager {
         match tab.tab_type {
             TabType::Server => {
                 let command_id = tab.command_id.unwrap_or_else(|| tab.id.clone());
-                let _ = self.stop_server(&command_id);
+                let _ = self.enqueue_stop_server_and_wait(&command_id, Duration::ZERO, None);
                 app_state.remove_tab(tab_id);
             }
             TabType::Claude | TabType::Codex => {
@@ -565,6 +1049,25 @@ impl ProcessManager {
         dimensions: SessionDimensions,
         activate: bool,
     ) -> Result<String, String> {
+        self.start_ai_session_activate_with_response(
+            app_state,
+            project_id,
+            tab_type,
+            dimensions,
+            activate,
+            None,
+        )
+    }
+
+    pub fn start_ai_session_activate_with_response(
+        &self,
+        app_state: &mut AppState,
+        project_id: &str,
+        tab_type: TabType,
+        dimensions: SessionDimensions,
+        activate: bool,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<String, String> {
         if app_state.find_project(project_id).is_none() {
             return Err(format!("Unknown project `{project_id}`"));
         }
@@ -581,7 +1084,14 @@ impl ProcessManager {
             activate,
         );
 
-        self.ensure_ai_session_for_tab(app_state, &tab_id, dimensions, activate, false)
+        self.ensure_ai_session_for_tab_with_response(
+            app_state,
+            &tab_id,
+            dimensions,
+            activate,
+            false,
+            response,
+        )
     }
 
     pub fn ensure_ai_session_for_tab(
@@ -591,6 +1101,25 @@ impl ProcessManager {
         dimensions: SessionDimensions,
         activate_tab: bool,
         force_new_session: bool,
+    ) -> Result<String, String> {
+        self.ensure_ai_session_for_tab_with_response(
+            app_state,
+            tab_id,
+            dimensions,
+            activate_tab,
+            force_new_session,
+            None,
+        )
+    }
+
+    pub fn ensure_ai_session_for_tab_with_response(
+        &self,
+        app_state: &mut AppState,
+        tab_id: &str,
+        dimensions: SessionDimensions,
+        activate_tab: bool,
+        force_new_session: bool,
+        response: Option<Sender<RemoteActionResult>>,
     ) -> Result<String, String> {
         let tab = app_state
             .find_ai_tab(tab_id)
@@ -645,7 +1174,7 @@ impl ProcessManager {
             state.exit = None;
         });
 
-        self.spawn_ai_shell_session(&launch, &session_id, dimensions)?;
+        self.schedule_spawn_ai(&launch, &session_id, dimensions, activate_tab, response)?;
         if activate_tab {
             self.set_active_session(session_id.clone());
         }
@@ -672,38 +1201,84 @@ impl ProcessManager {
         dimensions: SessionDimensions,
         activate_tab: bool,
     ) -> Result<String, String> {
+        self.restart_ai_session_activate_with_response(
+            app_state,
+            tab_id,
+            dimensions,
+            activate_tab,
+            None,
+        )
+    }
+
+    pub fn restart_ai_session_activate_with_response(
+        &self,
+        app_state: &mut AppState,
+        tab_id: &str,
+        dimensions: SessionDimensions,
+        activate_tab: bool,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<String, String> {
         let existing_session_id = app_state
             .find_ai_tab(tab_id)
             .and_then(|tab| tab.pty_session_id.clone());
-        if let Some(session_id) = existing_session_id {
-            let _ = self.close_session(&session_id);
-            self.forget_session(&session_id);
+
+        let tab = app_state
+            .find_ai_tab(tab_id)
+            .cloned()
+            .ok_or_else(|| format!("Unknown AI tab `{tab_id}`"))?;
+        let project = app_state
+            .find_project(&tab.project_id)
+            .cloned()
+            .ok_or_else(|| format!("Unknown project `{}`", tab.project_id))?;
+
+        let session_id = next_ai_session_id(&tab.tab_type);
+        let launch = build_ai_launch_spec(&app_state.config.settings, &project, &tab, &session_id)?;
+
+        let _ = app_state.update_ai_tab_session(&tab.id, session_id.clone());
+        if activate_tab {
+            let _ = app_state.select_tab(&tab.id);
         }
 
-        self.ensure_ai_session_for_tab(app_state, tab_id, dimensions, activate_tab, true)
+        self.ensure_runtime_entry(&session_id, launch.cwd.clone(), dimensions);
+        self.update_session_state(&session_id, |state| {
+            state.status = SessionStatus::Starting;
+            state.cwd = launch.cwd.clone();
+            state.dimensions = dimensions;
+            state.shell_program = launch.shell_program.clone();
+            state.configure_ai(launch.clone());
+            state.exit = None;
+        });
+
+        self.schedule_restart_ai(
+            existing_session_id,
+            launch,
+            session_id.clone(),
+            dimensions,
+            response,
+        )?;
+        if activate_tab {
+            self.set_active_session(session_id.clone());
+        }
+        Ok(session_id)
     }
 
     pub fn close_ai_session(&self, app_state: &mut AppState, tab_id: &str) -> Result<(), String> {
+        self.close_ai_session_with_response(app_state, tab_id, None)
+    }
+
+    pub fn close_ai_session_with_response(
+        &self,
+        app_state: &mut AppState,
+        tab_id: &str,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
         let session_id = app_state
             .find_ai_tab(tab_id)
             .and_then(|tab| tab.pty_session_id.clone());
 
-        // Update visible UI state synchronously so the tab disappears
-        // immediately from the sidebar — but push the actual PTY teardown
-        // to a background thread. Claude Code spawns a tree of npx/node/
-        // tar/git child processes, and tearing that whole tree down can
-        // take multiple seconds (enumerating descendants + waiting for
-        // each TerminateProcess to settle). The main thread processes
-        // remote-host actions and GPUI rendering, so blocking it on a
-        // slow process-tree kill is exactly what made the window go
-        // "(Not Responding)" when a web client closed a tab.
         app_state.remove_tab(tab_id);
         if let Some(session_id) = session_id {
-            let manager = self.clone();
-            std::thread::spawn(move || {
-                let _ = manager.close_session(&session_id);
-                manager.forget_session(&session_id);
-            });
+            self.schedule_close_ai(&session_id, response)?;
         }
         Ok(())
     }
@@ -813,6 +1388,16 @@ impl ProcessManager {
         connection_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<String, String> {
+        self.start_ssh_session_with_response(app_state, connection_id, dimensions, None)
+    }
+
+    pub fn start_ssh_session_with_response(
+        &self,
+        app_state: &mut AppState,
+        connection_id: &str,
+        dimensions: SessionDimensions,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<String, String> {
         let connection = app_state
             .find_ssh_connection(connection_id)
             .cloned()
@@ -830,7 +1415,14 @@ impl ProcessManager {
             .unwrap_or_default();
         let tab_id = app_state.open_ssh_tab(&project_id, connection_id, Some(connection.label));
 
-        self.ensure_ssh_session_for_tab(app_state, &tab_id, dimensions, true, false)
+        self.ensure_ssh_session_for_tab_with_response(
+            app_state,
+            &tab_id,
+            dimensions,
+            true,
+            false,
+            response,
+        )
     }
 
     pub fn ensure_ssh_session_for_tab(
@@ -840,6 +1432,25 @@ impl ProcessManager {
         dimensions: SessionDimensions,
         activate_tab: bool,
         force_new_session: bool,
+    ) -> Result<String, String> {
+        self.ensure_ssh_session_for_tab_with_response(
+            app_state,
+            tab_id,
+            dimensions,
+            activate_tab,
+            force_new_session,
+            None,
+        )
+    }
+
+    pub fn ensure_ssh_session_for_tab_with_response(
+        &self,
+        app_state: &mut AppState,
+        tab_id: &str,
+        dimensions: SessionDimensions,
+        activate_tab: bool,
+        force_new_session: bool,
+        response: Option<Sender<RemoteActionResult>>,
     ) -> Result<String, String> {
         let tab = app_state
             .find_ssh_tab(tab_id)
@@ -896,18 +1507,14 @@ impl ProcessManager {
             state.exit = None;
         });
 
-        self.spawn_ssh_session(&launch, &session_id, dimensions)?;
-        if let Some(error) = key_error {
-            let _ = self.write_virtual_text(
-                &session_id,
-                &format!(
-                    "[devmanager] Couldn't prepare the saved SSH key ({error}); trying password/agent auth instead.\r\n"
-                ),
-            );
-        }
-        if activate_tab {
-            self.set_active_session(session_id.clone());
-        }
+        self.schedule_start_ssh(
+            launch,
+            session_id.clone(),
+            dimensions,
+            key_error,
+            activate_tab,
+            response,
+        )?;
         Ok(session_id)
     }
 
@@ -917,29 +1524,81 @@ impl ProcessManager {
         tab_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<String, String> {
+        self.restart_ssh_session_with_response(app_state, tab_id, dimensions, None)
+    }
+
+    pub fn restart_ssh_session_with_response(
+        &self,
+        app_state: &mut AppState,
+        tab_id: &str,
+        dimensions: SessionDimensions,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<String, String> {
         let existing_session_id = app_state
             .find_ssh_tab(tab_id)
             .and_then(|tab| tab.pty_session_id.clone());
-        if let Some(session_id) = existing_session_id {
-            let _ = self.close_session(&session_id);
-            self.forget_session(&session_id);
-            let _ = app_state.update_ssh_tab_session(tab_id, None);
-        }
 
-        self.ensure_ssh_session_for_tab(app_state, tab_id, dimensions, true, true)
+        let tab = app_state
+            .find_ssh_tab(tab_id)
+            .cloned()
+            .ok_or_else(|| format!("Unknown SSH tab `{tab_id}`"))?;
+        let connection_id = tab
+            .ssh_connection_id
+            .clone()
+            .ok_or_else(|| format!("SSH tab `{tab_id}` is missing a connection id"))?;
+        let connection = app_state
+            .find_ssh_connection(&connection_id)
+            .cloned()
+            .ok_or_else(|| format!("Unknown SSH connection `{connection_id}`"))?;
+
+        let session_id = next_ssh_session_id(&connection_id);
+        let (key_file, key_error) = match self.materialize_ssh_key(&connection) {
+            Ok(path) => (path, None),
+            Err(error) => (None, Some(error)),
+        };
+        let launch = build_ssh_launch_spec(app_state, &tab, &connection, key_file.as_deref());
+
+        let _ = app_state.update_ssh_tab_session(&tab.id, Some(session_id.clone()));
+        let _ = app_state.select_tab(&tab.id);
+
+        self.ensure_runtime_entry(&session_id, launch.cwd.clone(), dimensions);
+        self.update_session_state(&session_id, |state| {
+            state.status = SessionStatus::Starting;
+            state.cwd = launch.cwd.clone();
+            state.dimensions = dimensions;
+            state.shell_program = launch.program.clone();
+            state.configure_ssh(launch.clone());
+            state.exit = None;
+        });
+
+        self.schedule_restart_ssh(
+            existing_session_id,
+            launch,
+            session_id.clone(),
+            dimensions,
+            key_error,
+            true,
+            response,
+        )?;
+        Ok(session_id)
     }
 
     pub fn close_ssh_session(&self, app_state: &mut AppState, tab_id: &str) -> Result<(), String> {
+        self.close_ssh_session_with_response(app_state, tab_id, None)
+    }
+
+    pub fn close_ssh_session_with_response(
+        &self,
+        app_state: &mut AppState,
+        tab_id: &str,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
         let session_id = app_state
             .find_ssh_tab(tab_id)
             .and_then(|tab| tab.pty_session_id.clone());
 
-        if let Some(session_id) = session_id {
-            let _ = self.close_session(&session_id);
-            self.forget_session(&session_id);
-        }
         let _ = app_state.update_ssh_tab_session(tab_id, None);
-        Ok(())
+        self.schedule_close_ssh(session_id, response)
     }
 
     pub fn reconcile_saved_ssh_tabs(&self, app_state: &mut AppState) -> usize {
@@ -1042,7 +1701,7 @@ impl ProcessManager {
         command_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<(), String> {
-        self.start_server_with_activation(app_state, command_id, dimensions, true)
+        self.schedule_start_server(app_state, command_id, dimensions, true, None)
     }
 
     pub fn start_server_in_background(
@@ -1051,108 +1710,24 @@ impl ProcessManager {
         command_id: &str,
         dimensions: SessionDimensions,
     ) -> Result<(), String> {
-        self.start_server_with_activation(app_state, command_id, dimensions, false)
+        self.schedule_start_server(app_state, command_id, dimensions, false, None)
     }
 
-    fn start_server_with_activation(
+    pub fn start_server_with_remote_response(
         &self,
         app_state: &mut AppState,
         command_id: &str,
         dimensions: SessionDimensions,
         activate_tab: bool,
+        response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
-        let lookup = app_state
-            .find_command(command_id)
-            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
-
-        let project_id = lookup.project.id.clone();
-        let command_id = lookup.command.id.clone();
-        let command_label = lookup.command.label.clone();
-        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
-        let session_id = command_id.clone();
-        let runtime = self.runtime_state();
-        if let Some(session) = runtime.sessions.get(&session_id) {
-            if session.has_live_process() && self.get_session(&session_id).is_ok() {
-                if activate_tab {
-                    app_state.open_server_tab(
-                        &project_id,
-                        &command_id,
-                        Some(command_label.clone()),
-                    );
-                    self.set_active_session(session_id);
-                } else {
-                    app_state.ensure_server_tab(
-                        &project_id,
-                        &command_id,
-                        Some(command_label.clone()),
-                    );
-                }
-                return Ok(());
-            }
-        }
-
-        let previous_active_session_id = (!activate_tab)
-            .then(|| runtime.active_session_id.clone())
-            .flatten();
-
-        if activate_tab {
-            self.set_active_session(session_id.clone());
-        }
-
-        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
-        let cwd = if cwd.is_dir() {
-            cwd
-        } else {
-            PathBuf::from(lookup.project.root_path.clone())
-        };
-
-        self.ensure_runtime_entry(&session_id, cwd.clone(), dimensions);
-
-        let env = build_command_env(lookup.folder, lookup.command);
-        let (program, args) =
-            build_server_launch_command(&app_state.config.settings, lookup.command);
-        let launch_spec = ServerLaunchSpec {
-            command_id: command_id.clone(),
-            project_id: project_id.clone(),
-            cwd: cwd.clone(),
-            program: program.clone(),
-            args: args.clone(),
-            env: env.clone(),
-            auto_restart: command_auto_restart,
-            log_file_path: build_server_log_file_path(
-                lookup.project,
-                lookup.folder,
-                lookup.command,
-            ),
-        };
-
-        if activate_tab {
-            app_state.open_server_tab(&project_id, &command_id, Some(command_label.clone()));
-        } else {
-            app_state.ensure_server_tab(&project_id, &command_id, Some(command_label.clone()));
-        }
-
-        self.update_session_state(&session_id, |state| {
-            state.status = SessionStatus::Starting;
-            state.cwd = cwd.clone();
-            state.dimensions = dimensions;
-            state.shell_program = program.clone();
-            state.configure_server(launch_spec.clone());
-            state.exit = None;
-            state.mark_dirty();
-        });
-
-        self.spawn_server_session(&launch_spec, dimensions, activate_tab)?;
-
-        self.update_session_state(&session_id, |state| {
-            state.configure_server(launch_spec.clone());
-        });
-
-        if !activate_tab {
-            self.restore_active_session(previous_active_session_id);
-        }
-
-        Ok(())
+        self.schedule_start_server(
+            app_state,
+            command_id,
+            dimensions,
+            activate_tab,
+            response,
+        )
     }
 
     pub fn stop_server(&self, command_id: &str) -> Result<(), String> {
@@ -1242,88 +1817,18 @@ impl ProcessManager {
         dimensions: SessionDimensions,
         banner: &str,
     ) -> Result<(), String> {
-        let lookup = app_state
-            .find_command(command_id)
-            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
+        self.schedule_restart_server(app_state, command_id, dimensions, banner, None)
+    }
 
-        let project_id = lookup.project.id.clone();
-        let command_id = lookup.command.id.clone();
-        let command_label = lookup.command.label.clone();
-        let command_auto_restart = lookup.command.auto_restart.unwrap_or(false);
-        let clear_logs_on_restart = lookup.command.clear_logs_on_restart.unwrap_or(true);
-        let cwd = PathBuf::from(lookup.folder.folder_path.clone());
-        let cwd = if cwd.is_dir() {
-            cwd
-        } else {
-            PathBuf::from(lookup.project.root_path.clone())
-        };
-        let env = build_command_env(lookup.folder, lookup.command);
-        let (program, args) =
-            build_server_launch_command(&app_state.config.settings, lookup.command);
-        let launch_spec = ServerLaunchSpec {
-            command_id: command_id.clone(),
-            project_id: project_id.clone(),
-            cwd: cwd.clone(),
-            program: program.clone(),
-            args: args.clone(),
-            env: env.clone(),
-            auto_restart: command_auto_restart,
-            log_file_path: build_server_log_file_path(
-                lookup.project,
-                lookup.folder,
-                lookup.command,
-            ),
-        };
-
-        if !self.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
-            return Err(format!(
-                "Managed process `{command_id}` did not stop cleanly."
-            ));
-        }
-        self.set_active_session(command_id.clone());
-        app_state.open_server_tab(&project_id, &command_id, Some(command_label));
-        self.update_session_state(&command_id, |state| {
-            state.status = SessionStatus::Starting;
-            state.cwd = cwd.clone();
-            state.dimensions = dimensions;
-            state.shell_program = program.clone();
-            state.configure_server(launch_spec.clone());
-            state.exit = None;
-            state.mark_dirty();
-        });
-
-        if let Ok(session) = self.get_session(&command_id) {
-            if clear_logs_on_restart {
-                session.clear_virtual_output();
-            }
-            session.write_virtual_text(&format!(
-                "{}\x1b[33m{banner}\x1b[0m\r\n",
-                if clear_logs_on_restart { "" } else { "\r\n" }
-            ));
-            session.restart_command(
-                cwd.clone(),
-                dimensions,
-                program.clone(),
-                args.clone(),
-                env.clone(),
-                launch_spec.log_file_path.clone(),
-                true,
-            )?;
-            self.update_session_state(&command_id, |state| {
-                state.configure_server(launch_spec.clone());
-            });
-            return Ok(());
-        }
-
-        self.start_server(app_state, &command_id, dimensions)?;
-        let _ = self.write_virtual_text(
-            &command_id,
-            &format!(
-                "{}\x1b[33m{banner}\x1b[0m\r\n",
-                if clear_logs_on_restart { "" } else { "\r\n" }
-            ),
-        );
-        Ok(())
+    pub fn restart_server_with_remote_response(
+        &self,
+        app_state: &mut AppState,
+        command_id: &str,
+        dimensions: SessionDimensions,
+        banner: &str,
+        response: Option<Sender<RemoteActionResult>>,
+    ) -> Result<(), String> {
+        self.schedule_restart_server(app_state, command_id, dimensions, banner, response)
     }
 
     pub fn start_all_for_project(
@@ -1340,33 +1845,39 @@ impl ProcessManager {
     }
 
     pub fn stop_all_for_project(&self, project_id: &str) {
-        let runtime = self.runtime_state();
-        for session in runtime.sessions.values() {
-            if session.project_id.as_deref() == Some(project_id)
-                && matches!(
-                    session.status,
-                    SessionStatus::Running | SessionStatus::Starting
-                )
-            {
-                let _ = self.stop_server(&session.session_id);
-            }
-        }
-    }
-
-    pub fn stop_all_servers(&self) -> usize {
         let command_ids: Vec<String> = self
             .runtime_state()
             .sessions
             .values()
-            .filter(|session| session.command_id.is_some() && session.status.is_live())
+            .filter(|session| {
+                session.project_id.as_deref() == Some(project_id)
+                    && session.command_id.is_some()
+                    && matches!(
+                        session.status,
+                        SessionStatus::Running | SessionStatus::Starting
+                    )
+            })
             .filter_map(|session| session.command_id.clone())
             .collect();
-
         for command_id in &command_ids {
-            let _ = self.stop_server(command_id);
+            self.update_session_state(command_id, |state| {
+                state.note_user_stop_request();
+                state.status = SessionStatus::Stopping;
+                state.mark_dirty();
+            });
+            let _ = self.enqueue_stop_server_and_wait(command_id, Duration::ZERO, None);
         }
+    }
 
-        command_ids.len()
+    pub fn stop_all_servers(&self) -> usize {
+        let count = self
+            .runtime_state()
+            .sessions
+            .values()
+            .filter(|session| session.command_id.is_some() && session.status.is_live())
+            .count();
+        let _ = self.schedule_stop_all_servers(Duration::from_secs(5), None);
+        count
     }
 
     pub fn live_session_count(&self) -> usize {
@@ -1388,71 +1899,36 @@ impl ProcessManager {
     }
 
     pub fn shutdown_managed_processes(&self, timeout: Duration) -> ManagedShutdownReport {
-        let session_ids = self.live_session_ids();
-        for session_id in &session_ids {
-            let _ = self.request_session_close(session_id, false);
-        }
-
-        let started_at = Instant::now();
-        let mut active_tracked_processes = loop {
-            let _ = pid_file::prune_inactive_entries();
-            let remaining_live_sessions = self.live_session_count();
-            let active_tracked_processes = pid_file::active_tracked_processes();
-            if remaining_live_sessions == 0 && active_tracked_processes.is_empty() {
-                break active_tracked_processes;
+        let op_id = match self.schedule_shutdown(timeout) {
+            Ok(op_id) => op_id,
+            Err(_) => {
+                return ManagedShutdownReport {
+                    requested_sessions: self.live_session_count(),
+                    ..ManagedShutdownReport::default()
+                };
             }
-            if started_at.elapsed() >= timeout {
-                break active_tracked_processes;
-            }
-            thread::sleep(Duration::from_millis(100));
         };
-
-        let mut forced_kill_pids = 0;
-        if self.live_session_count() > 0 || !active_tracked_processes.is_empty() {
-            for session_id in self.live_session_ids() {
-                forced_kill_pids += force_reap_session_processes(&self.inner, &session_id);
-            }
-
-            let mut pids_to_kill = self.live_session_pids();
-            pids_to_kill.extend(pid_file::active_tracked_pids());
-            pids_to_kill.sort_unstable();
-            pids_to_kill.dedup();
-
-            for pid in pids_to_kill {
-                if !platform_service::is_pid_running(pid) {
-                    continue;
-                }
-                if platform_service::kill_process_tree(pid).is_ok()
-                    || !platform_service::is_pid_running(pid)
-                {
-                    forced_kill_pids += 1;
+        let started = Instant::now();
+        loop {
+            for completion in self.drain_process_op_completions() {
+                if completion.op_id == op_id {
+                    if let Some(report) = completion.context.shutdown_report {
+                        return report;
+                    }
+                    return ManagedShutdownReport::default();
                 }
             }
-
-            let _ = pid_file::prune_inactive_entries();
-            let force_started = Instant::now();
-            while force_started.elapsed() < Duration::from_secs(1) {
-                let _ = pid_file::prune_inactive_entries();
-                let remaining_live_sessions = self.live_session_count();
-                active_tracked_processes = pid_file::active_tracked_processes();
-                if remaining_live_sessions == 0 && active_tracked_processes.is_empty() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
+            if started.elapsed() >= timeout + Duration::from_secs(2) {
+                break;
             }
+            thread::sleep(Duration::from_millis(50));
         }
-
-        let _ = pid_file::prune_inactive_entries();
-        let report = ManagedShutdownReport {
-            requested_sessions: session_ids.len(),
-            forced_kill_pids,
+        ManagedShutdownReport {
+            requested_sessions: self.live_session_count(),
             remaining_live_sessions: self.live_session_count(),
             remaining_tracked_pids: pid_file::active_tracked_pids().len(),
-        };
-        if report.remaining_live_sessions == 0 && report.remaining_tracked_pids == 0 {
-            pid_file::clear_all();
+            ..ManagedShutdownReport::default()
         }
-        report
     }
 
     pub fn reconcile_saved_server_tabs(&self, app_state: &mut AppState) -> usize {
@@ -1726,35 +2202,6 @@ impl ProcessManager {
         }
     }
 
-    fn spawn_server_session(
-        &self,
-        launch: &ServerLaunchSpec,
-        dimensions: SessionDimensions,
-        activate_session: bool,
-    ) -> Result<(), String> {
-        let session_id = launch.command_id.clone();
-        if activate_session {
-            self.set_active_session(session_id.clone());
-        }
-
-        match spawn_server_session_with_inner(&self.inner, launch, dimensions) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.update_session_state(&session_id, |state| {
-                    state.status = SessionStatus::Failed;
-                    state.exit = Some(SessionExitState {
-                        code: None,
-                        signal: None,
-                        closed_by_user: false,
-                        summary: error.clone(),
-                    });
-                    state.mark_dirty();
-                });
-                Err(error)
-            }
-        }
-    }
-
     fn restore_active_session(&self, active_session_id: Option<String>) {
         let mut changed = false;
         if let Ok(mut runtime) = self.inner.runtime_state.write() {
@@ -1766,152 +2213,6 @@ impl ProcessManager {
         if changed {
             bump_runtime_revision(&self.inner);
         }
-    }
-
-    fn spawn_ai_shell_session(
-        &self,
-        launch: &AiLaunchSpec,
-        session_id: &str,
-        dimensions: SessionDimensions,
-    ) -> Result<(), String> {
-        if self.session_exists(session_id) {
-            return Ok(());
-        }
-
-        // Offload the PTY spawn to a background thread. On Windows,
-        // `TerminalSession::spawn_command` has to create a ConPTY handle,
-        // fork the shell (cmd.exe / bash.exe), and wait for it to initialise
-        // before it returns. That can take several seconds and would
-        // otherwise block the GPUI main thread, making the window appear
-        // "(Not Responding)" to the OS.
-        //
-        // The session is already marked `Starting` in `runtime_state` by
-        // `ensure_ai_session_for_tab` before we get here, so the sidebar
-        // shows the new tab immediately. Activation is owned by the caller:
-        // remote-triggered launches must be able to spawn the PTY without
-        // redirecting the native UI onto it. When the spawn completes in the
-        // background, the session registers in the `sessions` map and its
-        // status transitions via the normal output-notifier path.
-        let manager = self.clone();
-        let launch_clone = launch.clone();
-        let session_id_owned = session_id.to_string();
-        thread::spawn(move || {
-            let _ = force_reap_session_processes_until_clear(
-                &manager.inner,
-                &session_id_owned,
-                Duration::from_secs(2),
-            );
-            let result = TerminalSession::spawn_command(
-                session_id_owned.clone(),
-                launch_clone.cwd.clone(),
-                dimensions,
-                launch_clone.shell_program.clone(),
-                launch_clone.shell_args.clone(),
-                HashMap::new(),
-                manager.log_buffer_size(),
-                None,
-                manager.inner.runtime_state.clone(),
-                manager.inner.debug_enabled,
-                Some(session_change_notifier(
-                    manager.inner.clone(),
-                    session_id_owned.clone(),
-                )),
-                Some(session_output_notifier(
-                    manager.inner.clone(),
-                    session_id_owned.clone(),
-                )),
-            );
-            let session = match result {
-                Ok(session) => session,
-                Err(error) => {
-                    manager.update_session_state(&session_id_owned, |state| {
-                        state.status = SessionStatus::Failed;
-                        state.exit = Some(SessionExitState {
-                            code: None,
-                            signal: None,
-                            closed_by_user: false,
-                            summary: error.clone(),
-                        });
-                        state.mark_dirty();
-                    });
-                    return;
-                }
-            };
-
-            let session = Arc::new(session);
-            if let Ok(mut sessions) = manager.inner.sessions.lock() {
-                sessions.insert(session_id_owned.clone(), session.clone());
-            }
-
-            // Fire the startup command after the usual injection delay so
-            // the shell has time to show its prompt first.
-            let startup_command = launch_clone.startup_command.clone();
-            thread::sleep(Duration::from_millis(AI_COMMAND_INJECTION_DELAY_MS));
-            let _ = session.write_text(&(startup_command + "\r\n"));
-        });
-
-        Ok(())
-    }
-
-    fn spawn_ssh_session(
-        &self,
-        launch: &SshLaunchSpec,
-        session_id: &str,
-        dimensions: SessionDimensions,
-    ) -> Result<(), String> {
-        self.set_active_session(session_id.to_string());
-
-        if self.session_exists(session_id) {
-            return Ok(());
-        }
-
-        let _ = force_reap_session_processes_until_clear(
-            &self.inner,
-            session_id,
-            Duration::from_secs(2),
-        );
-
-        let session = TerminalSession::spawn_command(
-            session_id.to_string(),
-            launch.cwd.clone(),
-            dimensions,
-            launch.program.clone(),
-            launch.args.clone(),
-            HashMap::new(),
-            self.log_buffer_size(),
-            None,
-            self.inner.runtime_state.clone(),
-            self.inner.debug_enabled,
-            Some(session_change_notifier(
-                self.inner.clone(),
-                session_id.to_string(),
-            )),
-            Some(session_output_notifier(
-                self.inner.clone(),
-                session_id.to_string(),
-            )),
-        )
-        .map_err(|error| {
-            self.update_session_state(session_id, |state| {
-                state.status = SessionStatus::Failed;
-                state.exit = Some(SessionExitState {
-                    code: None,
-                    signal: None,
-                    closed_by_user: false,
-                    summary: error.clone(),
-                });
-                state.mark_dirty();
-            });
-            error
-        })?;
-
-        self.inner
-            .sessions
-            .lock()
-            .map_err(|_| "Session store poisoned".to_string())?
-            .insert(session_id.to_string(), Arc::new(session));
-
-        Ok(())
     }
 
     fn materialize_ssh_key(&self, connection: &SSHConnection) -> Result<Option<PathBuf>, String> {
@@ -1939,6 +2240,11 @@ impl Drop for ProcessManagerInner {
         if let Ok(mut handle) = self.background_thread.lock() {
             if let Some(handle) = handle.take() {
                 let _ = handle.join();
+            }
+        }
+        if let Ok(mut slot) = self.op_queue.lock() {
+            if let Some(queue) = slot.take() {
+                queue.shutdown();
             }
         }
         if let Ok(sessions) = self.sessions.lock() {
@@ -2465,6 +2771,19 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
             thread::sleep(delay);
             if inner_clone.background_stop.load(Ordering::SeqCst) {
                 return;
+            }
+            if let Ok(queue) = inner_clone.op_queue.lock() {
+                if let Some(queue) = queue.as_ref() {
+                    let op_id = next_op_id();
+                    let _ = queue.submit(ProcessOp::StartServer {
+                        op_id,
+                        launch: launch_clone,
+                        dimensions: SessionDimensions::default(),
+                        activate: false,
+                        response: None,
+                    });
+                    return;
+                }
             }
             if let Err(error) = spawn_server_session_with_inner(
                 &inner_clone,
@@ -3157,6 +3476,560 @@ fn next_ssh_session_id(connection_id: &str) -> String {
     format!("{connection_id}-{scope}-{millis:x}-{counter:x}")
 }
 
+fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> ProcessManager {
+    let op_queue = inner
+        .op_queue
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .expect("process op queue missing");
+    ProcessManager { inner, op_queue }
+}
+
+pub(crate) fn execute_process_op_inner(
+    inner: &Arc<ProcessManagerInner>,
+    op: ProcessOp,
+) -> ProcessOpCompletion {
+    let op_id = op.op_id();
+    let target_id = op.target_id();
+    let manager = process_manager_from_inner(inner.clone());
+    let (kind, result, context, remote_response) = match op {
+        ProcessOp::StartServer {
+            launch,
+            dimensions,
+            activate,
+            response,
+            ..
+        } => {
+            if activate {
+                manager.set_active_session(launch.command_id.clone());
+            }
+            let result = spawn_server_session_with_inner(inner, &launch, dimensions).map_err(|error| {
+                manager.update_session_state(&launch.command_id, |state| {
+                    state.status = SessionStatus::Failed;
+                    state.exit = Some(SessionExitState {
+                        code: None,
+                        signal: None,
+                        closed_by_user: false,
+                        summary: error.clone(),
+                    });
+                    state.mark_dirty();
+                });
+                error
+            });
+            if result.is_ok() {
+                manager.update_session_state(&launch.command_id, |state| {
+                    state.configure_server(launch.clone());
+                });
+            }
+            (
+                ProcessOpKind::StartServer,
+                result.map(|_| ()),
+                ProcessOpContext {
+                    session_id: Some(launch.command_id.clone()),
+                    focus: activate,
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::StopServer {
+            command_id,
+            wait,
+            response,
+            ..
+        } => {
+            let result = if wait.is_zero() {
+                manager.stop_server(&command_id).map(|_| ())
+            } else {
+                if manager.stop_server_and_wait(&command_id, wait) {
+                    Ok(())
+                } else {
+                    Err(format!("Failed to stop `{command_id}` cleanly."))
+                }
+            };
+            (
+                ProcessOpKind::StopServer,
+                result,
+                ProcessOpContext {
+                    session_id: Some(command_id.clone()),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::RestartServer {
+            launch,
+            dimensions,
+            banner,
+            clear_logs,
+            response,
+            ..
+        } => {
+            let command_id = launch.command_id.clone();
+            let result = (|| {
+                if !manager.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
+                    return Err(format!(
+                        "Managed process `{command_id}` did not stop cleanly."
+                    ));
+                }
+                manager.set_active_session(command_id.clone());
+                if let Ok(session) = manager.get_session(&command_id) {
+                    if clear_logs {
+                        session.clear_virtual_output();
+                    }
+                    session.write_virtual_text(&format!(
+                        "{}\x1b[33m{banner}\x1b[0m\r\n",
+                        if clear_logs { "" } else { "\r\n" }
+                    ));
+                    session.restart_command(
+                        launch.cwd.clone(),
+                        dimensions,
+                        launch.program.clone(),
+                        launch.args.clone(),
+                        launch.env.clone(),
+                        launch.log_file_path.clone(),
+                        true,
+                    )?;
+                    manager.update_session_state(&command_id, |state| {
+                        state.configure_server(launch.clone());
+                    });
+                    return Ok(());
+                }
+                spawn_server_session_with_inner(inner, &launch, dimensions)?;
+                let _ = manager.write_virtual_text(
+                    &command_id,
+                    &format!(
+                        "{}\x1b[33m{banner}\x1b[0m\r\n",
+                        if clear_logs { "" } else { "\r\n" }
+                    ),
+                );
+                manager.update_session_state(&command_id, |state| {
+                    state.configure_server(launch.clone());
+                });
+                Ok(())
+            })();
+            (
+                ProcessOpKind::RestartServer,
+                result,
+                ProcessOpContext {
+                    session_id: Some(command_id),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::KillPortAndRestart {
+            command_id,
+            port,
+            launch,
+            dimensions,
+            banner,
+            response,
+            ..
+        } => {
+            let result = (|| {
+                let is_active = inner
+                    .runtime_state
+                    .read()
+                    .ok()
+                    .and_then(|runtime| {
+                        runtime.sessions.get(&command_id).map(|session| session.status.is_live())
+                    })
+                    .unwrap_or(false);
+                if is_active && !manager.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
+                    return Err(format!(
+                        "Managed process `{command_id}` did not stop cleanly."
+                    ));
+                }
+                crate::services::ports_service::kill_port(port)?;
+                spawn_server_session_with_inner(inner, &launch, dimensions)?;
+                let _ = manager.write_virtual_text(
+                    &command_id,
+                    &format!("\x1b[33m{banner}\x1b[0m\r\n"),
+                );
+                manager.update_session_state(&command_id, |state| {
+                    state.configure_server(launch.clone());
+                });
+                Ok(())
+            })();
+            (
+                ProcessOpKind::KillPortAndRestart,
+                result,
+                ProcessOpContext {
+                    session_id: Some(command_id.clone()),
+                    port: Some(port),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::StartSsh {
+            launch,
+            session_id,
+            dimensions,
+            key_warning,
+            response,
+            ..
+        } => {
+            let result = spawn_ssh_session_with_inner(inner, &launch, &session_id, dimensions);
+            if let Some(error) = key_warning {
+                let _ = manager.write_virtual_text(
+                    &session_id,
+                    &format!(
+                        "[devmanager] Couldn't prepare the saved SSH key ({error}); trying password/agent auth instead.\r\n"
+                    ),
+                );
+            }
+            (
+                ProcessOpKind::StartSsh,
+                result,
+                ProcessOpContext {
+                    session_id: Some(session_id),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::RestartSsh {
+            close_session_id,
+            launch,
+            session_id,
+            dimensions,
+            key_warning,
+            response,
+            ..
+        } => {
+            if let Some(close_id) = close_session_id {
+                let _ = manager.close_session(&close_id);
+                manager.forget_session(&close_id);
+            }
+            let result = spawn_ssh_session_with_inner(inner, &launch, &session_id, dimensions);
+            if let Some(error) = key_warning {
+                let _ = manager.write_virtual_text(
+                    &session_id,
+                    &format!(
+                        "[devmanager] Couldn't prepare the saved SSH key ({error}); trying password/agent auth instead.\r\n"
+                    ),
+                );
+            }
+            (
+                ProcessOpKind::RestartSsh,
+                result,
+                ProcessOpContext {
+                    session_id: Some(session_id),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::CloseSsh {
+            session_id,
+            response,
+            ..
+        } => {
+            let result = if let Some(session_id) = session_id {
+                let _ = manager.close_session(&session_id);
+                manager.forget_session(&session_id);
+                Ok(())
+            } else {
+                Ok(())
+            };
+            (
+                ProcessOpKind::CloseSsh,
+                result,
+                ProcessOpContext::default(),
+                response,
+            )
+        }
+        ProcessOp::SpawnAi {
+            launch,
+            session_id,
+            dimensions,
+            response,
+            ..
+        } => {
+            let result = spawn_ai_session_with_inner(inner, &launch, &session_id, dimensions);
+            (
+                ProcessOpKind::SpawnAi,
+                result,
+                ProcessOpContext {
+                    session_id: Some(session_id),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::RestartAi {
+            close_session_id,
+            launch,
+            session_id,
+            dimensions,
+            response,
+            ..
+        } => {
+            if let Some(close_id) = close_session_id {
+                let _ = manager.close_session(&close_id);
+                manager.forget_session(&close_id);
+            }
+            let result = spawn_ai_session_with_inner(inner, &launch, &session_id, dimensions);
+            (
+                ProcessOpKind::RestartAi,
+                result,
+                ProcessOpContext {
+                    session_id: Some(session_id),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::CloseAi {
+            session_id,
+            response,
+            ..
+        } => {
+            let _ = manager.close_session(&session_id);
+            manager.forget_session(&session_id);
+            (
+                ProcessOpKind::CloseAi,
+                Ok(()),
+                ProcessOpContext {
+                    session_id: Some(session_id),
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+        ProcessOp::StopAll {
+            command_ids,
+            wait,
+            response,
+            ..
+        } => {
+            let mut failures = Vec::new();
+            for command_id in &command_ids {
+                if wait.is_zero() {
+                    if let Err(error) = manager.stop_server(command_id) {
+                        failures.push(error);
+                    }
+                } else if !manager.stop_server_and_wait(command_id, wait) {
+                    failures.push(format!("Failed to stop `{command_id}` cleanly."));
+                }
+            }
+            let result = if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join(" "))
+            };
+            (
+                ProcessOpKind::StopAll,
+                result,
+                ProcessOpContext::default(),
+                response,
+            )
+        }
+        ProcessOp::Shutdown { timeout, .. } => {
+            let report = shutdown_managed_processes_inner(inner, timeout);
+            (
+                ProcessOpKind::Shutdown,
+                if report.remaining_live_sessions == 0 && report.remaining_tracked_pids == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Shutdown left {} live session(s) and {} tracked pid(s).",
+                        report.remaining_live_sessions, report.remaining_tracked_pids
+                    ))
+                },
+                ProcessOpContext {
+                    shutdown_report: Some(report),
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+    };
+
+    ProcessOpCompletion {
+        op_id,
+        kind,
+        target_id,
+        result,
+        context,
+        remote_response,
+    }
+}
+
+fn spawn_ssh_session_with_inner(
+    inner: &Arc<ProcessManagerInner>,
+    launch: &SshLaunchSpec,
+    session_id: &str,
+    dimensions: SessionDimensions,
+) -> Result<(), String> {
+    let manager = process_manager_from_inner(inner.clone());
+    if manager.session_exists(session_id) {
+        return Ok(());
+    }
+    let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
+    let session = TerminalSession::spawn_command(
+        session_id.to_string(),
+        launch.cwd.clone(),
+        dimensions,
+        launch.program.clone(),
+        launch.args.clone(),
+        HashMap::new(),
+        inner
+            .scrollback_lines
+            .read()
+            .map(|lines| *lines)
+            .unwrap_or(10_000),
+        None,
+        inner.runtime_state.clone(),
+        inner.debug_enabled,
+        Some(session_change_notifier(inner.clone(), session_id.to_string())),
+        Some(session_output_notifier(inner.clone(), session_id.to_string())),
+    )
+    .map_err(|error| {
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Failed;
+            state.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user: false,
+                summary: error.clone(),
+            });
+            state.mark_dirty();
+        });
+        error
+    })?;
+    if let Ok(mut sessions) = inner.sessions.lock() {
+        sessions.insert(session_id.to_string(), Arc::new(session));
+    }
+    Ok(())
+}
+
+fn spawn_ai_session_with_inner(
+    inner: &Arc<ProcessManagerInner>,
+    launch: &AiLaunchSpec,
+    session_id: &str,
+    dimensions: SessionDimensions,
+) -> Result<(), String> {
+    let manager = process_manager_from_inner(inner.clone());
+    if manager.session_exists(session_id) {
+        return Ok(());
+    }
+    let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
+    let session = TerminalSession::spawn_command(
+        session_id.to_string(),
+        launch.cwd.clone(),
+        dimensions,
+        launch.shell_program.clone(),
+        launch.shell_args.clone(),
+        HashMap::new(),
+        inner
+            .scrollback_lines
+            .read()
+            .map(|lines| *lines)
+            .unwrap_or(10_000),
+        None,
+        inner.runtime_state.clone(),
+        inner.debug_enabled,
+        Some(session_change_notifier(inner.clone(), session_id.to_string())),
+        Some(session_output_notifier(inner.clone(), session_id.to_string())),
+    )
+    .map_err(|error| {
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Failed;
+            state.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user: false,
+                summary: error.clone(),
+            });
+            state.mark_dirty();
+        });
+        error
+    })?;
+    let session = Arc::new(session);
+    if let Ok(mut sessions) = inner.sessions.lock() {
+        sessions.insert(session_id.to_string(), session.clone());
+    }
+    thread::sleep(Duration::from_millis(AI_COMMAND_INJECTION_DELAY_MS));
+    let _ = session.write_text(&(launch.startup_command.clone() + "\r\n"));
+    Ok(())
+}
+
+fn shutdown_managed_processes_inner(
+    inner: &Arc<ProcessManagerInner>,
+    timeout: Duration,
+) -> ManagedShutdownReport {
+    let manager = process_manager_from_inner(inner.clone());
+    let session_ids = manager.live_session_ids();
+    for session_id in &session_ids {
+        let _ = manager.request_session_close(session_id, false);
+    }
+
+    let started_at = Instant::now();
+    let mut active_tracked_processes = loop {
+        let _ = pid_file::prune_inactive_entries();
+        let remaining_live_sessions = manager.live_session_count();
+        let active_tracked_processes = pid_file::active_tracked_processes();
+        if remaining_live_sessions == 0 && active_tracked_processes.is_empty() {
+            break active_tracked_processes;
+        }
+        if started_at.elapsed() >= timeout {
+            break active_tracked_processes;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    let mut forced_kill_pids = 0;
+    if manager.live_session_count() > 0 || !active_tracked_processes.is_empty() {
+        for session_id in manager.live_session_ids() {
+            forced_kill_pids += force_reap_session_processes(inner, &session_id);
+        }
+
+        let mut pids_to_kill = manager.live_session_pids();
+        pids_to_kill.extend(pid_file::active_tracked_pids());
+        pids_to_kill.sort_unstable();
+        pids_to_kill.dedup();
+
+        for pid in pids_to_kill {
+            if !platform_service::is_pid_running(pid) {
+                continue;
+            }
+            if platform_service::kill_process_tree(pid).is_ok()
+                || !platform_service::is_pid_running(pid)
+            {
+                forced_kill_pids += 1;
+            }
+        }
+
+        let _ = pid_file::prune_inactive_entries();
+        let force_started = Instant::now();
+        while force_started.elapsed() < Duration::from_secs(1) {
+            let _ = pid_file::prune_inactive_entries();
+            let remaining_live_sessions = manager.live_session_count();
+            active_tracked_processes = pid_file::active_tracked_processes();
+            if remaining_live_sessions == 0 && active_tracked_processes.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let _ = pid_file::prune_inactive_entries();
+    let report = ManagedShutdownReport {
+        requested_sessions: session_ids.len(),
+        forced_kill_pids,
+        remaining_live_sessions: manager.live_session_count(),
+        remaining_tracked_pids: pid_file::active_tracked_pids().len(),
+    };
+    if report.remaining_live_sessions == 0 && report.remaining_tracked_pids == 0 {
+        pid_file::clear_all();
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3216,6 +4089,17 @@ mod tests {
             manager
                 .restart_server(&mut app_state, command_id, dimensions)
                 .unwrap();
+            for _ in 0..50 {
+                let _ = manager.drain_process_op_completions();
+                if manager
+                    .session_view(command_id)
+                    .map(|view| screen_text(&view).contains("Restarting"))
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
             wait_for_live_session(&manager, command_id);
 
             let view = manager
@@ -3447,15 +4331,49 @@ mod tests {
         ));
 
         manager.close_tab(&mut app_state, "ssh-tab").unwrap();
+        for _ in 0..50 {
+            let _ = manager.drain_process_op_completions();
+            let status = manager
+                .runtime_state()
+                .sessions
+                .get("ssh-session")
+                .map(|session| session.status);
+            if matches!(status, Some(SessionStatus::Stopped) | None) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
 
         let runtime = manager.runtime_state();
         assert!(app_state.find_tab("ssh-tab").is_none());
-        assert_eq!(
-            runtime
-                .sessions
-                .get("ssh-session")
-                .map(|session| session.status),
-            Some(SessionStatus::Stopped)
+        let status = runtime
+            .sessions
+            .get("ssh-session")
+            .map(|session| session.status);
+        assert!(
+            matches!(status, Some(SessionStatus::Stopped) | None),
+            "expected ssh session to stop or be removed, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn schedule_start_server_returns_immediately() {
+        let cwd = temp_test_dir("schedule-start-immediate");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let mut app_state = app_state_with_server(&cwd, true);
+        let started = Instant::now();
+        manager
+            .start_server_in_background(
+                &mut app_state,
+                "server-cmd",
+                SessionDimensions::default(),
+            )
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "start_server_in_background blocked for {:?}",
+            started.elapsed()
         );
     }
 
@@ -3787,13 +4705,15 @@ mod tests {
     }
 
     fn wait_for_live_session(manager: &ProcessManager, session_id: &str) {
-        for _ in 0..30 {
+        for _ in 0..50 {
+            let _ = manager.drain_process_op_completions();
             if manager
                 .runtime_state()
                 .sessions
                 .get(session_id)
                 .map(|session| session.status.is_live())
                 .unwrap_or(false)
+                && manager.get_session(session_id).is_ok()
             {
                 return;
             }
