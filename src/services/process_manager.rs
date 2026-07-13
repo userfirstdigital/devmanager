@@ -2,6 +2,9 @@ use crate::ai::claude_hooks::{
     prepare_claude_launch_overlay, ClaudeHookRegistration, ClaudeHookRegistry,
     ClaudeHookRelayListener, ClaudeRegistryEvent, ClaudeShellKind,
 };
+use crate::ai::codex_bridge::{
+    prepare_codex_adapter, CodexBridgeHandle, PreparedCodexAdapter,
+};
 use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
@@ -100,6 +103,8 @@ pub enum RemoteSessionEvent {
 }
 
 type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
+type CodexAdapterPreparer =
+    Arc<dyn Fn(&str) -> Result<PreparedCodexAdapter, String> + Send + Sync>;
 
 pub(crate) struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
@@ -119,6 +124,9 @@ pub(crate) struct ProcessManagerInner {
     claude_hook_sessions: Mutex<HashMap<String, ClaudeHookSession>>,
     claude_hook_temp_root: PathBuf,
     claude_overlay_owner: Mutex<Weak<ClaudeOverlayOwner>>,
+    codex_adapter_preparer: RwLock<CodexAdapterPreparer>,
+    codex_adapter_generation: AtomicU64,
+    codex_adapter_registry: Mutex<CodexAdapterRegistry>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
     op_queue: Mutex<Option<Arc<ProcessOpQueue>>>,
@@ -165,6 +173,70 @@ fn claude_semantic_identity_for_registration(
             .find(|(_, session)| session.registration == *registration)
             .map(|(session_id, session)| claude_semantic_identity(session_id, session))
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexAdapterIdentity {
+    stable_session_key: StableSessionKey,
+    generation: u64,
+}
+
+#[derive(Debug)]
+enum CodexAdapterSession {
+    Pending(CodexAdapterIdentity),
+    Degraded(CodexAdapterIdentity),
+    Running {
+        identity: CodexAdapterIdentity,
+        handle: CodexBridgeHandle,
+    },
+}
+
+impl CodexAdapterSession {
+    fn identity(&self) -> &CodexAdapterIdentity {
+        match self {
+            Self::Pending(identity) | Self::Degraded(identity) => identity,
+            Self::Running { identity, .. } => identity,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexAdapterRegistry {
+    sessions: HashMap<String, CodexAdapterSession>,
+    latest_generations: HashMap<StableSessionKey, u64>,
+}
+
+impl CodexAdapterRegistry {
+    fn is_current(&self, identity: &CodexAdapterIdentity) -> bool {
+        self.latest_generations
+            .get(&identity.stable_session_key)
+            .is_some_and(|generation| *generation == identity.generation)
+            && self
+                .sessions
+                .values()
+                .any(|session| session.identity() == identity)
+    }
+
+    fn note_generation(&mut self, identity: &CodexAdapterIdentity) {
+        let generation = self
+            .latest_generations
+            .entry(identity.stable_session_key.clone())
+            .or_insert(identity.generation);
+        *generation = (*generation).max(identity.generation);
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> Option<CodexAdapterSession> {
+        let removed = self.sessions.remove(session_id);
+        if let Some(session) = removed.as_ref() {
+            let stable_session_key = &session.identity().stable_session_key;
+            if !self.sessions.values().any(|candidate| {
+                &candidate.identity().stable_session_key == stable_session_key
+            }) {
+                self.latest_generations.remove(stable_session_key);
+            }
+        }
+        removed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +312,9 @@ impl ProcessManager {
             claude_hook_sessions: Mutex::new(HashMap::new()),
             claude_hook_temp_root: claude_hook_temp_root.clone(),
             claude_overlay_owner: Mutex::new(Weak::new()),
+            codex_adapter_preparer: RwLock::new(Arc::new(prepare_codex_adapter)),
+            codex_adapter_generation: AtomicU64::new(1),
+            codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
             op_queue: Mutex::new(None),
@@ -1043,6 +1118,147 @@ impl ProcessManager {
         remove_owned_claude_overlay_root(&self.inner.claude_hook_temp_root);
     }
 
+    #[cfg(test)]
+    fn set_codex_adapter_preparer_for_test(&self, preparer: CodexAdapterPreparer) {
+        *self
+            .inner
+            .codex_adapter_preparer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = preparer;
+    }
+
+    fn prepare_codex_launch_for_session(&self, launch: &mut AiLaunchSpec, session_id: &str) {
+        if launch.tool != SessionKind::Codex {
+            return;
+        }
+        let identity = CodexAdapterIdentity {
+            stable_session_key: StableSessionKey::from_tab(&launch.tab_id),
+            generation: self
+                .inner
+                .codex_adapter_generation
+                .fetch_add(1, Ordering::Relaxed),
+        };
+        let replaced = {
+            let mut registry = self
+                .inner
+                .codex_adapter_registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.note_generation(&identity);
+            registry.sessions.insert(
+                session_id.to_string(),
+                CodexAdapterSession::Pending(identity.clone()),
+            )
+        };
+        drop(replaced);
+
+        let preparer = self
+            .inner
+            .codex_adapter_preparer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let prepared = match preparer(&launch.startup_command) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+                return;
+            }
+        };
+
+        let semantic_inner = Arc::downgrade(&self.inner);
+        let semantic_identity = identity.clone();
+        let exit_inner = Arc::downgrade(&self.inner);
+        let exit_identity = identity.clone();
+        let mut handle = match CodexBridgeHandle::start(
+            prepared.clone(),
+            launch.cwd.clone(),
+            identity.stable_session_key.clone(),
+            move |draft| {
+                if let Some(inner) = semantic_inner.upgrade() {
+                    emit_codex_semantic_if_current(&inner, &semantic_identity, draft);
+                }
+            },
+            move |_| {
+                if let Some(inner) = exit_inner.upgrade() {
+                    emit_codex_health_if_current(
+                        &inner,
+                        &exit_identity,
+                        SemanticAdapterHealth::Degraded,
+                    );
+                }
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(_) => {
+                mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+                return;
+            }
+        };
+        if !handle.is_running() {
+            handle.shutdown();
+            mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+            return;
+        }
+
+        let endpoint = handle.endpoint().to_string();
+        let installed = {
+            let mut registry = self
+                .inner
+                .codex_adapter_registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Recheck liveness while holding the same registry lock used by the
+            // exit callback. If the sidecar died after `start` returned, either
+            // this rejects the install or the queued degraded event is emitted
+            // after the healthy event; a dead bridge can never win the race.
+            let is_current = handle.is_running()
+                && registry.is_current(&identity)
+                && registry
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|session| session.identity() == &identity);
+            if is_current {
+                registry.sessions.insert(
+                    session_id.to_string(),
+                    CodexAdapterSession::Running {
+                        identity: identity.clone(),
+                        handle,
+                    },
+                );
+                emit_remote_session_event(
+                    &self.inner,
+                    RemoteSessionEvent::AdapterHealth {
+                        stable_session_key: identity.stable_session_key.clone(),
+                        health: SemanticAdapterHealth::Healthy,
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if !installed {
+            return;
+        }
+        launch.startup_command = prepared.tui_command(&endpoint, &launch.shell_program);
+    }
+
+    fn cleanup_codex_adapter_session(&self, session_id: &str) {
+        let removed = self
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove_session(session_id);
+        drop(removed);
+    }
+
+    fn cleanup_ai_adapters_for_session(&self, session_id: &str) {
+        self.cleanup_claude_hook_session(session_id);
+        self.cleanup_codex_adapter_session(session_id);
+    }
+
     pub fn set_notification_sound(&self, sound_id: Option<String>) {
         if let Ok(mut notification_sound) = self.inner.notification_sound.write() {
             *notification_sound = sound_id;
@@ -1537,7 +1753,7 @@ impl ProcessManager {
         if let Err(error) =
             self.schedule_spawn_ai(&launch, &session_id, dimensions, activate_tab, response)
         {
-            self.cleanup_claude_hook_session(&session_id);
+            self.cleanup_ai_adapters_for_session(&session_id);
             return Err(error);
         }
         if activate_tab {
@@ -1627,7 +1843,7 @@ impl ProcessManager {
             dimensions,
             response,
         ) {
-            self.cleanup_claude_hook_session(&session_id);
+            self.cleanup_ai_adapters_for_session(&session_id);
             return Err(error);
         }
         if activate_tab {
@@ -2434,7 +2650,7 @@ impl ProcessManager {
         let result = match self.get_session(session_id) {
             Ok(session) => session.close(closed_by_user),
             Err(error) => {
-                self.cleanup_claude_hook_session(session_id);
+                self.cleanup_ai_adapters_for_session(session_id);
                 self.note_missing_session_close_request(session_id, closed_by_user);
                 Err(error)
             }
@@ -2696,7 +2912,7 @@ impl ProcessManager {
     }
 
     fn forget_session(&self, session_id: &str) {
-        self.cleanup_claude_hook_session(session_id);
+        self.cleanup_ai_adapters_for_session(session_id);
         if let Ok(mut sessions) = self.inner.sessions.lock() {
             sessions.remove(session_id);
         }
@@ -4200,6 +4416,95 @@ fn cleanup_claude_hook_session_if_matches(
     true
 }
 
+fn emit_codex_semantic_if_current(
+    inner: &ProcessManagerInner,
+    identity: &CodexAdapterIdentity,
+    draft: SemanticEventDraft,
+) {
+    let registry = inner
+        .codex_adapter_registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registry.is_current(identity) {
+        emit_remote_session_event(inner, RemoteSessionEvent::Semantic { draft });
+    }
+}
+
+fn emit_codex_health_if_current(
+    inner: &ProcessManagerInner,
+    identity: &CodexAdapterIdentity,
+    health: SemanticAdapterHealth,
+) {
+    let registry = inner
+        .codex_adapter_registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registry.is_current(identity) {
+        emit_remote_session_event(
+            inner,
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key: identity.stable_session_key.clone(),
+                health,
+            },
+        );
+    }
+}
+
+fn mark_codex_adapter_degraded(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    identity: &CodexAdapterIdentity,
+) {
+    let mut registry = inner
+        .codex_adapter_registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !registry.is_current(identity)
+        || !registry
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.identity() == identity)
+    {
+        return;
+    }
+    let previous = registry.sessions.insert(
+        session_id.to_string(),
+        CodexAdapterSession::Degraded(identity.clone()),
+    );
+    emit_remote_session_event(
+        inner,
+        RemoteSessionEvent::AdapterHealth {
+            stable_session_key: identity.stable_session_key.clone(),
+            health: SemanticAdapterHealth::Degraded,
+        },
+    );
+    drop(registry);
+    drop(previous);
+}
+
+fn cleanup_codex_adapter_session_if_matches(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    expected: &CodexAdapterIdentity,
+) -> bool {
+    let removed = {
+        let mut registry = inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = registry
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.identity() == expected);
+        matches
+            .then(|| registry.remove_session(session_id))
+            .flatten()
+    };
+    let was_removed = removed.is_some();
+    drop(removed);
+    was_removed
+}
+
 fn session_change_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
@@ -4210,6 +4515,13 @@ fn session_change_notifier(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&session_id)
         .map(|session| session.registration.clone());
+    let codex_identity = inner
+        .codex_adapter_registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sessions
+        .get(&session_id)
+        .map(|session| session.identity().clone());
     Arc::new(move || {
         if note_runtime_generation_change(&inner, &session_id) {
             mark_remote_session_dirty(&inner, &session_id);
@@ -4229,6 +4541,9 @@ fn session_change_notifier(
         if terminal_exited {
             if let Some(registration) = claude_registration.as_ref() {
                 cleanup_claude_hook_session_if_matches(&inner, &session_id, registration);
+            }
+            if let Some(identity) = codex_identity.as_ref() {
+                cleanup_codex_adapter_session_if_matches(&inner, &session_id, identity);
             }
         }
     })
@@ -4933,12 +5248,18 @@ fn spawn_ai_session_with_inner(
         return Ok(());
     }
     let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
+    let mut effective_launch = launch.clone();
+    manager.prepare_codex_launch_for_session(&mut effective_launch, session_id);
+    manager.update_session_state(session_id, |state| {
+        state.shell_program = effective_launch.shell_program.clone();
+        state.configure_ai(effective_launch.clone());
+    });
     let session = TerminalSession::spawn_command(
         session_id.to_string(),
-        launch.cwd.clone(),
+        effective_launch.cwd.clone(),
         dimensions,
-        launch.shell_program.clone(),
-        launch.shell_args.clone(),
+        effective_launch.shell_program.clone(),
+        effective_launch.shell_args.clone(),
         HashMap::new(),
         inner
             .scrollback_lines
@@ -4952,7 +5273,7 @@ fn spawn_ai_session_with_inner(
         Some(session_output_notifier(inner.clone(), session_id.to_string())),
     )
     .map_err(|error| {
-        manager.cleanup_claude_hook_session(session_id);
+        manager.cleanup_ai_adapters_for_session(session_id);
         manager.update_session_state(session_id, |state| {
             state.status = SessionStatus::Failed;
             state.exit = Some(SessionExitState {
@@ -4970,7 +5291,7 @@ fn spawn_ai_session_with_inner(
         sessions.insert(session_id.to_string(), session.clone());
     }
     thread::sleep(Duration::from_millis(AI_COMMAND_INJECTION_DELAY_MS));
-    let _ = session.write_text(&(launch.startup_command.clone() + "\r\n"));
+    let _ = session.write_text(&(effective_launch.startup_command + "\r\n"));
     Ok(())
 }
 
@@ -5097,6 +5418,252 @@ mod tests {
         });
 
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn codex_preparation_failure_is_fail_open_and_marks_adapter_degraded() {
+        let manager = ProcessManager::new();
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Err("capability unavailable".to_string())
+        }));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
+        let mut launch = AiLaunchSpec {
+            tab_id: "codex-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Codex,
+            cwd: std::env::current_dir().unwrap(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "my-codex-wrapper --custom".to_string(),
+        };
+
+        manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
+
+        assert_eq!(launch.startup_command, "my-codex-wrapper --custom");
+        assert!(matches!(
+            manager
+                .inner
+                .codex_adapter_registry
+                .lock()
+                .unwrap()
+                .sessions
+                .get("codex-session"),
+            Some(CodexAdapterSession::Degraded(_))
+        ));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key,
+                health: SemanticAdapterHealth::Degraded,
+            } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
+        )));
+        manager.cleanup_codex_adapter_session("codex-session");
+        assert!(
+            manager
+                .inner
+                .codex_adapter_registry
+                .lock()
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn codex_preparation_installs_remote_tui_and_owns_live_bridge() {
+        let manager = ProcessManager::new();
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Ok(PreparedCodexAdapter::echo_sidecar_for_test(vec![
+                "--full-auto".to_string(),
+            ]))
+        }));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
+        let mut launch = AiLaunchSpec {
+            tab_id: "codex-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Codex,
+            cwd: std::env::current_dir().unwrap(),
+            shell_program: if cfg!(windows) {
+                "powershell.exe".to_string()
+            } else {
+                "/bin/bash".to_string()
+            },
+            shell_args: Vec::new(),
+            startup_command: "codex --full-auto".to_string(),
+        };
+
+        manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
+
+        assert!(launch.startup_command.contains("--full-auto"));
+        assert!(launch.startup_command.contains("--remote"));
+        assert!(launch.startup_command.contains("ws://127.0.0.1:"));
+        {
+            let registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            assert!(matches!(
+                registry.sessions.get("codex-session"),
+                Some(CodexAdapterSession::Running { handle, .. }) if handle.is_running()
+            ));
+        }
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key,
+                health: SemanticAdapterHealth::Healthy,
+            } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
+        )));
+
+        manager.cleanup_codex_adapter_session("codex-session");
+        assert!(
+            manager
+                .inner
+                .codex_adapter_registry
+                .lock()
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn codex_publication_revalidates_latest_session_generation() {
+        use crate::remote::presentation::{
+            SemanticEventKind, SemanticRetention, SemanticSource,
+        };
+
+        let manager = ProcessManager::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
+        let stable_session_key = StableSessionKey::from_tab("codex-tab");
+        let old = CodexAdapterIdentity {
+            stable_session_key: stable_session_key.clone(),
+            generation: 1,
+        };
+        let current = CodexAdapterIdentity {
+            stable_session_key: stable_session_key.clone(),
+            generation: 2,
+        };
+        {
+            let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            registry.note_generation(&old);
+            registry.note_generation(&current);
+            registry.sessions.insert(
+                "old".to_string(),
+                CodexAdapterSession::Pending(old.clone()),
+            );
+            registry.sessions.insert(
+                "current".to_string(),
+                CodexAdapterSession::Pending(current.clone()),
+            );
+        }
+        let draft = |detail: &str| SemanticEventDraft {
+            stable_session_key: stable_session_key.clone(),
+            occurred_at_epoch_ms: 1,
+            source: SemanticSource::Codex,
+            kind: SemanticEventKind::Status {
+                state: "idle".to_string(),
+                detail: Some(detail.to_string()),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        };
+
+        emit_codex_semantic_if_current(&manager.inner, &old, draft("old"));
+        emit_codex_semantic_if_current(&manager.inner, &current, draft("current"));
+        emit_codex_health_if_current(
+            &manager.inner,
+            &old,
+            SemanticAdapterHealth::Degraded,
+        );
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RemoteSessionEvent::Semantic { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::Semantic { draft } if matches!(
+                &draft.kind,
+                SemanticEventKind::Status { detail: Some(detail), .. } if detail == "current"
+            )
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::AdapterHealth { .. }
+        )));
+    }
+
+    #[test]
+    fn codex_old_generation_cannot_resume_after_newer_session_cleanup() {
+        use crate::remote::presentation::{
+            SemanticEventKind, SemanticRetention, SemanticSource,
+        };
+
+        let manager = ProcessManager::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
+        let stable_session_key = StableSessionKey::from_tab("codex-tab");
+        let old = CodexAdapterIdentity {
+            stable_session_key: stable_session_key.clone(),
+            generation: 1,
+        };
+        let current = CodexAdapterIdentity {
+            stable_session_key: stable_session_key.clone(),
+            generation: 2,
+        };
+        {
+            let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            registry.note_generation(&old);
+            registry.note_generation(&current);
+            registry.sessions.insert(
+                "old".to_string(),
+                CodexAdapterSession::Pending(old.clone()),
+            );
+            registry.sessions.insert(
+                "current".to_string(),
+                CodexAdapterSession::Pending(current.clone()),
+            );
+        }
+
+        assert!(cleanup_codex_adapter_session_if_matches(
+            &manager.inner,
+            "current",
+            &current,
+        ));
+        emit_codex_semantic_if_current(
+            &manager.inner,
+            &old,
+            SemanticEventDraft {
+                stable_session_key,
+                occurred_at_epoch_ms: 1,
+                source: SemanticSource::Codex,
+                kind: SemanticEventKind::Status {
+                    state: "idle".to_string(),
+                    detail: Some("stale".to_string()),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            },
+        );
+
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[test]

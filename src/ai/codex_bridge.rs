@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -1080,6 +1080,8 @@ pub struct PreparedCodexAdapter {
 #[derive(Debug)]
 pub struct CodexBridgeHandle {
     endpoint: String,
+    alive: std::sync::Arc<AtomicBool>,
+    stopping: std::sync::Arc<AtomicBool>,
     shutdown: Option<oneshot::Sender<()>>,
     bridge_thread: Option<std::thread::JoinHandle<()>>,
     observer_thread: Option<std::thread::JoinHandle<()>>,
@@ -1125,6 +1127,10 @@ impl CodexBridgeHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let on_exit = std::sync::Arc::new(on_exit);
+        let alive = std::sync::Arc::new(AtomicBool::new(false));
+        let bridge_alive = alive.clone();
+        let stopping = std::sync::Arc::new(AtomicBool::new(false));
+        let bridge_stopping = stopping.clone();
         let bridge_thread = match std::thread::Builder::new()
             .name("codex-app-server-bridge".to_string())
             .spawn(move || {
@@ -1139,6 +1145,8 @@ impl CodexBridgeHandle {
                         return;
                     }
                 };
+                let runtime_alive = bridge_alive.clone();
+                let runtime_stopping = bridge_stopping.clone();
                 runtime.block_on(async move {
                     let listener = match TcpListener::from_std(listener) {
                         Ok(listener) => listener,
@@ -1203,6 +1211,7 @@ impl CodexBridgeHandle {
                         reader: stdout,
                         writer: stdin,
                     };
+                    runtime_alive.store(true, Ordering::Release);
                     let _ = ready_tx.send(Ok(()));
 
                     let bridge = serve_one_loopback_client(listener, stdio, observer, shutdown_rx);
@@ -1214,15 +1223,19 @@ impl CodexBridgeHandle {
                             Err(error) => Err(format!("Codex app-server wait failed: {error}")),
                         },
                     };
+                    runtime_alive.store(false, Ordering::Release);
                     terminate_sidecar(&mut child).await;
                     if let Some(task) = stderr_task {
                         task.abort();
                         let _ = task.await;
                     }
-                    if let Err(error) = outcome {
-                        on_exit(error);
+                    if !runtime_stopping.load(Ordering::Acquire) {
+                        on_exit(outcome.err().unwrap_or_else(|| {
+                            "Codex bridge closed before the managed session ended".to_string()
+                        }));
                     }
                 });
+                bridge_alive.store(false, Ordering::Release);
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -1235,6 +1248,8 @@ impl CodexBridgeHandle {
         match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(Self {
                 endpoint,
+                alive,
+                stopping,
                 shutdown: Some(shutdown_tx),
                 bridge_thread: Some(bridge_thread),
                 observer_thread: Some(observer_thread),
@@ -1258,7 +1273,12 @@ impl CodexBridgeHandle {
         &self.endpoint
     }
 
+    pub fn is_running(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     pub fn shutdown(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -1328,6 +1348,32 @@ async fn terminate_sidecar(child: &mut tokio::process::Child) {
 }
 
 impl PreparedCodexAdapter {
+    #[cfg(test)]
+    pub(crate) fn echo_sidecar_for_test(tui_args: Vec<String>) -> Self {
+        #[cfg(windows)]
+        let (executable, sidecar_prefix_args) = (
+            resolve_executable("powershell.exe").expect("PowerShell must exist for bridge tests"),
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "while (($line = [Console]::In.ReadLine()) -ne $null) { [Console]::Out.WriteLine($line); [Console]::Out.Flush() }".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (executable, sidecar_prefix_args) = (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), "cat".to_string()],
+        );
+
+        Self {
+            executable,
+            sidecar_prefix_args,
+            tui_args,
+            version: "test".to_string(),
+        }
+    }
+
     pub fn executable(&self) -> &Path {
         &self.executable
     }
@@ -2285,6 +2331,34 @@ mod tests {
         })
         .await
         .unwrap();
+        bridge.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unexpected_tui_disconnect_reports_adapter_exit() {
+        let prepared = PreparedCodexAdapter::echo_sidecar_for_test(Vec::new());
+        let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
+        let mut bridge = CodexBridgeHandle::start(
+            prepared,
+            std::env::current_dir().unwrap(),
+            StableSessionKey::from_tab("codex-tab"),
+            |_| {},
+            move |error| {
+                let _ = exit_tx.send(error);
+            },
+        )
+        .unwrap();
+        let (mut tui, _) = connect_async(bridge.endpoint()).await.unwrap();
+
+        tui.close(None).await.unwrap();
+
+        let error = tokio::task::spawn_blocking(move || {
+            exit_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("unexpected disconnect must degrade the adapter");
+        assert!(error.contains("closed"), "unexpected exit reason: {error}");
         bridge.shutdown();
     }
 
