@@ -157,8 +157,10 @@ impl CodexSemanticReducer {
                 )),
             )],
             "thread/status/changed" => self.thread_status(params, occurred_at_epoch_ms),
+            "thread/tokenUsage/updated" => self.token_usage(params, occurred_at_epoch_ms),
             "turn/started" => self.turn_status(params, occurred_at_epoch_ms, "working"),
-            "turn/completed" => self.turn_status(params, occurred_at_epoch_ms, "idle"),
+            "turn/completed" => self.turn_completed(params, occurred_at_epoch_ms),
+            "item/mcpToolCall/progress" => self.mcp_progress(params, occurred_at_epoch_ms),
             "error" => self.error_event(params, occurred_at_epoch_ms),
             "item/commandExecution/requestApproval" => {
                 self.approval_question(&message, params, occurred_at_epoch_ms, "Command approval")
@@ -508,6 +510,85 @@ impl CodexSemanticReducer {
             },
             SemanticRetention::Canonical,
             Some(format!("codex:turn-status:{turn_id}")),
+        )]
+    }
+
+    fn turn_completed(&self, params: &Value, now: u64) -> Vec<SemanticEventDraft> {
+        let turn = params.get("turn").unwrap_or(&Value::Null);
+        let status = string_field(turn, "status").unwrap_or("completed");
+        let state = match status {
+            "failed" => "failed",
+            "interrupted" => "interrupted",
+            "inProgress" => "working",
+            _ => "idle",
+        };
+        let detail = turn.get("error").and_then(|error| {
+            let message = string_field(error, "message")?;
+            let additional = string_field(error, "additionalDetails");
+            Some(match additional.filter(|value| !value.is_empty()) {
+                Some(additional) => format!("{message}: {additional}"),
+                None => message.to_string(),
+            })
+        });
+        let turn_id = string_field(turn, "id")
+            .or_else(|| string_field(params, "turnId"))
+            .unwrap_or("unknown");
+        vec![self.event(
+            now,
+            SemanticEventKind::Status {
+                state: state.to_string(),
+                detail: detail.map(|detail| self.visible_text(&detail)),
+            },
+            SemanticRetention::Canonical,
+            Some(format!("codex:turn-status:{turn_id}")),
+        )]
+    }
+
+    fn token_usage(&self, params: &Value, now: u64) -> Vec<SemanticEventDraft> {
+        let Some(token_usage) = params.get("tokenUsage") else {
+            return Vec::new();
+        };
+        let Some(total_tokens) = token_usage
+            .get("total")
+            .and_then(|total| total.get("totalTokens"))
+            .and_then(Value::as_u64)
+        else {
+            return Vec::new();
+        };
+        let Some(context_window) = token_usage
+            .get("modelContextWindow")
+            .and_then(Value::as_u64)
+        else {
+            return Vec::new();
+        };
+        let thread_id = string_field(params, "threadId").unwrap_or("unknown");
+        vec![self.event(
+            now,
+            SemanticEventKind::Status {
+                state: "usage".to_string(),
+                detail: Some(format!(
+                    "{total_tokens} total tokens, {context_window} context window"
+                )),
+            },
+            SemanticRetention::Verbose,
+            Some(format!("codex:token-usage:{thread_id}")),
+        )]
+    }
+
+    fn mcp_progress(&self, params: &Value, now: u64) -> Vec<SemanticEventDraft> {
+        let Some(item_id) = string_field(params, "itemId") else {
+            return Vec::new();
+        };
+        let Some(message) = string_field(params, "message") else {
+            return Vec::new();
+        };
+        vec![self.tool_event(
+            now,
+            item_id,
+            "MCP tool",
+            SemanticToolState::Running,
+            self.visible_text(message),
+            format!("codex:tool:{item_id}"),
         )]
     }
 
@@ -1595,9 +1676,13 @@ fn split_command_line(command: &str) -> Result<Vec<String>, String> {
 
 fn parse_codex_version(output: &str) -> Result<String, String> {
     let version = output
-        .split_whitespace()
-        .rev()
-        .find(|token| token.chars().any(|character| character.is_ascii_digit()))
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            matches!(fields.next(), Some("codex" | "codex-cli"))
+                .then(|| fields.next())
+                .flatten()
+        })
         .ok_or_else(|| "Codex version probe returned no version".to_string())?;
     validate_version_token(version)?;
     Ok(version.to_string())
@@ -1998,6 +2083,48 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_turn_outcomes_and_mcp_progress_become_native_events() {
+        let mut reducer = reducer();
+
+        let usage = reducer.observe(
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t","turnId":"u","tokenUsage":{"last":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":5,"reasoningOutputTokens":2,"totalTokens":17},"total":{"inputTokens":120,"cachedInputTokens":30,"outputTokens":50,"reasoningOutputTokens":20,"totalTokens":170},"modelContextWindow":200000}}}"#,
+            1,
+        );
+        let progress = reducer.observe(
+            r#"{"method":"item/mcpToolCall/progress","params":{"threadId":"t","turnId":"u","itemId":"mcp-1","message":"Reading the project"}}"#,
+            2,
+        );
+        let failed = reducer.observe(
+            r#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"failed-turn","items":[],"status":"failed","error":{"message":"tool execution failed","additionalDetails":"exit 1"}}}}"#,
+            3,
+        );
+        let interrupted = reducer.observe(
+            r#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"stopped-turn","items":[],"status":"interrupted","error":null}}}"#,
+            4,
+        );
+
+        assert!(matches!(
+            &usage[0].kind,
+            SemanticEventKind::Status { state, detail: Some(detail) }
+                if state == "usage" && detail.contains("170") && detail.contains("200000")
+        ));
+        assert!(matches!(
+            &progress[0].kind,
+            SemanticEventKind::Tool { tool_id, state: SemanticToolState::Running, summary, .. }
+                if tool_id == "mcp-1" && summary == "Reading the project"
+        ));
+        assert!(matches!(
+            &failed[0].kind,
+            SemanticEventKind::Status { state, detail: Some(detail) }
+                if state == "failed" && detail.contains("tool execution failed") && detail.contains("exit 1")
+        ));
+        assert!(matches!(
+            &interrupted[0].kind,
+            SemanticEventKind::Status { state, detail: None } if state == "interrupted"
+        ));
+    }
+
+    #[test]
     fn approval_and_user_input_requests_become_questions() {
         let mut reducer = reducer();
 
@@ -2226,6 +2353,22 @@ mod tests {
         assert!(command.contains("'@openai/codex@0.144.3'"));
         assert!(command.contains("'--remote' 'ws://127.0.0.1:49152'"));
         assert!(!command.contains("@latest"));
+    }
+
+    #[test]
+    fn version_parser_uses_only_anchored_codex_version_lines() {
+        assert_eq!(
+            parse_codex_version(
+                "npm warn deprecated package 9\ncodex-cli 0.144.3\nnpm notice update 10"
+            )
+            .unwrap(),
+            "0.144.3"
+        );
+        assert_eq!(
+            parse_codex_version("codex 1.2.3-beta.1\n").unwrap(),
+            "1.2.3-beta.1"
+        );
+        assert!(parse_codex_version("npm warn retry 9\nnpm notice update 10").is_err());
     }
 
     #[test]

@@ -239,6 +239,14 @@ impl CodexAdapterRegistry {
     }
 }
 
+fn next_codex_adapter_generation(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+            generation.checked_add(1)
+        })
+        .ok()
+}
+
 #[derive(Debug, Clone)]
 struct RestartBackoff {
     delay: Duration,
@@ -1131,12 +1139,21 @@ impl ProcessManager {
         if launch.tool != SessionKind::Codex {
             return;
         }
+        let stable_session_key = StableSessionKey::from_tab(&launch.tab_id);
+        let Some(generation) = next_codex_adapter_generation(&self.inner.codex_adapter_generation)
+        else {
+            emit_remote_session_event(
+                &self.inner,
+                RemoteSessionEvent::AdapterHealth {
+                    stable_session_key,
+                    health: SemanticAdapterHealth::Degraded,
+                },
+            );
+            return;
+        };
         let identity = CodexAdapterIdentity {
-            stable_session_key: StableSessionKey::from_tab(&launch.tab_id),
-            generation: self
-                .inner
-                .codex_adapter_generation
-                .fetch_add(1, Ordering::Relaxed),
+            stable_session_key,
+            generation,
         };
         let replaced = {
             let mut registry = self
@@ -5471,6 +5488,61 @@ mod tests {
                 .sessions
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn codex_generation_exhaustion_fails_closed_without_wrapping_or_adapting() {
+        let manager = ProcessManager::new();
+        manager
+            .inner
+            .codex_adapter_generation
+            .store(u64::MAX, Ordering::Relaxed);
+        let prepare_calls = Arc::new(AtomicU64::new(0));
+        let observed_calls = prepare_calls.clone();
+        manager.set_codex_adapter_preparer_for_test(Arc::new(move |_| {
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+            Err("must not prepare after generation exhaustion".to_string())
+        }));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
+        let mut launch = AiLaunchSpec {
+            tab_id: "codex-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Codex,
+            cwd: std::env::current_dir().unwrap(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "codex --full-auto".to_string(),
+        };
+
+        manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
+
+        assert_eq!(launch.startup_command, "codex --full-auto");
+        assert_eq!(prepare_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            manager
+                .inner
+                .codex_adapter_generation
+                .load(Ordering::Relaxed),
+            u64::MAX
+        );
+        assert!(manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .is_empty());
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key,
+                health: SemanticAdapterHealth::Degraded,
+            } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
+        )));
     }
 
     #[test]
