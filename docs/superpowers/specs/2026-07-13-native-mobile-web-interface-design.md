@@ -121,7 +121,9 @@ The composer is a real `<textarea>` with `font-size: 16px` or larger to avoid iO
 - an interrupt/stop affordance while an AI is actively running;
 - growing height capped so the timeline remains visible.
 
-Drafts are stored locally under `(runtimeInstanceId, stableSessionKey)`. They survive page suspension and app switching, but are discarded when the host runtime instance changes or the target session no longer exists.
+Drafts are stored locally under `(runtimeInstanceId, stableSessionKey)`. They survive page suspension and app switching, expire after seven days, and are discarded when the host runtime instance changes or the target session no longer exists. Draft text is the only session content intentionally stored by the browser.
+
+Image attachments reuse the existing authenticated WebSocket image-paste path. The browser accepts PNG/JPEG up to 5 MiB, sends the bytes only after the target AI session and writer lease are validated, and waits for host acknowledgement. The host stages the file beneath the target workspace's `.devmanager/pasted-images` directory (or its existing temp fallback), inserts only that session's `@path` reference, and removes staged files older than 24 hours. Attachment bytes and paths never enter the semantic journal or browser cache.
 
 ### 4.6 AI density
 
@@ -148,7 +150,8 @@ Stable session keys are:
 
 - `server:<commandId>` for configured servers;
 - `tab:<tabId>` for Claude, Codex, and SSH tabs;
-- `shell:<tabId>` for a future explicit shell tab if one is exposed in AppState.
+
+An interactive shell currently belongs to its configured server tab and therefore retains `server:<commandId>` identity while the renderer changes from server controls to command-composer mode. A future standalone-shell model would require its own persisted tab ID, but is not needed to provide the coordinated shell experience in this release.
 
 Canonical routes use the SPA fallback already provided by the embedded web server:
 
@@ -212,7 +215,7 @@ If the host runtime ID differs from the browser's remembered ID:
 
 ### 6.5 Offline presentation
 
-The service worker caches only the application shell and static assets. Authenticated API data, snapshots, journals, and terminal output are never stored in Cache Storage or IndexedDB.
+The service worker caches only the application shell and static assets. Authenticated API data, snapshots, journals, and terminal output are never stored in Cache Storage or IndexedDB. LocalStorage intentionally holds only runtime-scoped drafts, the installed-app last route/runtime pair, and presentation preferences; runtime-change and expiry rules clear stale entries before they can render.
 
 While disconnected, an already mounted timeline may remain visually present but is covered by a concise `Reconnecting…` state and its composer is disabled. On a cold offline launch the shell shows that DevManager is unreachable; it does not display an old transcript.
 
@@ -224,9 +227,9 @@ Rules:
 
 1. A visible web client requests the lease on connection, foreground return, composer focus, or an attempted mutating action.
 2. The current web lease is renewed by heartbeat and input activity.
-3. A hidden or disconnected web client releases naturally after a short expiry, targeted at 8 seconds.
-4. A foreground web client may reclaim an expired or background web lease automatically.
-5. Native desktop control takes priority while it is actively sending input; the phone shows a passive `Active on desktop` state until that short lease becomes idle, then reclaims automatically on interaction.
+3. A hidden or disconnected web client becomes immediately preemptible; expiry remains only a crash/network-loss guarantee.
+4. A foreground interaction transfers the lease atomically from a hidden, disconnected, or idle client. A very short active-input guard prevents two simultaneously typing clients from interleaving bytes, but phone-to-desktop and desktop-to-phone handoff does not wait for the normal expiry.
+5. A currently active writer is shown passively as `Active on another device`; focusing the composer completes the automatic handoff as soon as the active-input guard is clear.
 6. Mutating messages include a lease generation. Stale writers are rejected without replaying input.
 7. Read-only subscriptions never require the lease.
 
@@ -299,7 +302,7 @@ The common event kinds are:
 
 Provider-specific data may be retained in an optional diagnostics payload, but the React renderer consumes the normalized fields above.
 
-Journal retention is bounded by count and UTF-8 bytes, with conservative defaults of 2,000 events and 4 MiB per session. When the limit rolls over, the host emits the oldest available sequence so the browser can replace, rather than incorrectly append to, an incomplete view.
+Journal retention is tiered. User/assistant prose, commands, questions, final tool summaries, errors, and state transitions are retained for the full host runtime under a generous per-session safety ceiling (target 50,000 events or 64 MiB). Verbose server logs, streaming deltas, and tool output use separate rolling budgets and collapse into explicit truncation markers before canonical conversation events are considered for eviction. When any safety ceiling rolls over, the host emits the oldest available sequence so the browser can replace, rather than incorrectly append to, an incomplete view. Ordinary all-day phone use must not lose the conversation timeline.
 
 ### 8.4 WebSocket additions
 
@@ -335,7 +338,7 @@ For recognized Claude Code launch commands:
 5. Normalize user/assistant display content, parallel tool lifecycles keyed by `tool_use_id`, errors, questions, and lifecycle entries into the ephemeral semantic journal.
 6. Treat the PTY child-exit path as authoritative if SessionEnd is missing.
 
-If the command is customized such that safe settings injection or relay installation is unavailable, mark adapter health as `degraded` and use the terminal projector. Do not prevent the Claude session from launching.
+If the command is customized such that safe settings injection or relay installation is unavailable, mark adapter health as `degraded` and use the native DOM terminal projector. Do not prevent the Claude session from launching.
 
 Claude's transcript path may be retained only as session-scoped diagnostic metadata. Its undocumented JSONL entry format is not a semantic contract and is not tailed as the primary event source. Hook backpressure drops optional MessageDisplay diagnostics before lifecycle events and must never block Claude.
 
@@ -351,7 +354,7 @@ For recognized Codex launch commands, prefer Codex's structured app-server proto
 6. Normalize observed events into the shared semantic journal without answering approvals on the TUI's behalf.
 7. Stop the sidecar and bridge with the tab's process tree.
 
-Compatibility is capability-detected at launch; no assumption is made from version text alone. If app-server startup, bridge binding, or protocol negotiation fails, terminate only the sidecar and launch the user's normal Codex command unchanged. Mark the adapter `degraded` and use the terminal projector. Rollout JSONL is an optional recovery diagnostic, not a public or primary contract; if exact correlation cannot be proven, DevManager never attaches to it.
+Compatibility is capability-detected at launch; no assumption is made from version text alone. If app-server startup, bridge binding, or protocol negotiation fails, terminate only the sidecar and launch the user's normal Codex command unchanged. Mark the adapter `degraded` and use the native DOM terminal projector. Rollout JSONL is an optional recovery diagnostic, not a public or primary contract; if exact correlation cannot be proven, DevManager never attaches to it.
 
 ### 9.4 Shell and SSH projector
 
@@ -381,7 +384,9 @@ Server sessions emit:
 
 The mobile server view does not show a prompt composer unless the underlying command is explicitly interactive.
 
-### 9.6 Raw terminal fallback
+### 9.6 Native terminal projection and raw fallback
+
+The guaranteed degradation path is still native DOM. DevManager projects the host terminal's plain-text screen/scrollback into selectable, wrapping rows with a native composer even when Claude/Codex structured integration is unavailable. This path preserves a mobile-readable experience across provider version drift and custom commands, although its cards are less richly classified.
 
 The existing xterm view remains lazy-loaded and uses the existing PTY bootstrap/replay path.
 
@@ -389,12 +394,12 @@ Raw mode activates automatically when:
 
 - a non-AI shell/SSH screen enters alternate-screen mode;
 - mouse reporting is enabled;
-- the semantic provider adapter reports it cannot safely represent the current interaction; or
+- the projector reports that the current interaction cannot be operated without cursor-grid or mouse semantics; or
 - the user chooses `Open Terminal` from the session overflow menu.
 
 When alternate-screen and mouse-reporting modes end, the UI returns to semantic mode automatically unless the user manually pinned Terminal for that session.
 
-For Claude/Codex, a healthy structured adapter takes precedence over the TUI's own alternate-screen mode. Adapter degradation causes a clear but non-blocking `Terminal view` transition.
+For Claude/Codex, both a healthy structured adapter and the native terminal projector take precedence over the TUI's own alternate-screen mode. Adapter degradation changes card richness, not the overall mobile-native layout. Only an interaction that genuinely needs cursor-grid semantics causes a clear but non-blocking raw Terminal transition.
 
 ## 10. PWA and iPhone integration
 
@@ -482,7 +487,7 @@ Existing xterm and image-paste utilities are retained behind the new session vie
 - **Host unreachable on cold launch:** show a native empty/error state with automatic retry and current host label; no stale session content.
 - **Session ended while away:** show its final status and journal if still present in the current runtime, with context-appropriate restart/reopen action.
 - **Session removed while away:** return to Sessions with a brief non-blocking notice.
-- **Adapter parser error:** record diagnostics, show a one-time compact fallback card, and continue in raw terminal mode.
+- **Adapter parser error:** record diagnostics, show a one-time compact fallback card, and continue through the native DOM terminal projector; use raw terminal only if the interaction needs cursor-grid semantics.
 - **Journal rollover:** replace with the available bounded bootstrap and show `Earlier activity is no longer in host memory` once.
 - **Writer conflict:** queue no input; wait for automatic lease resolution and preserve the local draft.
 - **PWA update:** do not reload while composer text is non-empty or a mutation is in flight.
@@ -503,10 +508,10 @@ Existing xterm and image-paste utilities are retained behind the new session vie
 
 The embedded bundle is part of the Rust binary and must never be silently stale or incomplete.
 
-- `build.rs` watches the web source, public assets, HTML, Vite configuration, package manifest, and lockfile.
-- A source fingerprint/build stamp determines whether the bundle is current; the presence of `index.html` alone is insufficient.
-- Clean dependency restoration uses `npm ci`.
-- A Rust build fails if the web build fails or the resulting index references a missing hashed asset, manifest, service worker, or required icon.
+- The complete production bundle, including hashed assets, manifest, service worker, icons, and a source fingerprint, is tracked so an ordinary clean Rust checkout remains offline-buildable.
+- `build.rs` validates that the tracked bundle is internally complete; the presence of `index.html` alone is insufficient. It does not install Node dependencies or access the network.
+- CI/release and explicit frontend workflows perform `npm ci` and `npm run build` before Rust packaging, then fail if the generated fingerprint or references are inconsistent.
+- A Rust build fails if the tracked index references a missing hashed asset, manifest, service worker, or required icon, and explains the exact frontend build command when regeneration is needed.
 - One generated web build ID is embedded in both the bundle and the web welcome frame.
 - CI verifies a clean checkout by removing generated bundle files, performing the supported build, and probing the root, every referenced static asset, the manifest, the service worker, and a deep-link SPA fallback.
 - Versioned hashed assets use immutable caching; HTML, manifest, and service worker use revalidation/no-cache headers.
