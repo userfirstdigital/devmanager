@@ -50,6 +50,7 @@ export interface WsClientCallbacks {
 
 interface PendingRequest {
   action: RemoteAction;
+  accountedBytes: number;
   sent: boolean;
   resolve(result: RemoteActionResult): void;
   reject(error: Error): void;
@@ -58,11 +59,17 @@ interface PendingRequest {
 interface PendingComposer {
   fingerprint: string;
   submission: ComposerSubmission;
+  accountedBytes: number;
   promise: Promise<ComposerAccepted>;
   resolve(result: ComposerAccepted): void;
   reject(error: Error): void;
   inFlight: boolean;
   lastSentAt: number;
+}
+
+interface PendingWriterFrame {
+  message: WriterLeaseFrame;
+  accountedBytes: number;
 }
 
 export class ComposerRejectedError extends Error {
@@ -86,9 +93,13 @@ const COMPOSER_RETRY_MIN_MS = 250;
 const COMPOSER_RETRY_MAX_MS = 1_000;
 const COMPOSER_ACK_TIMEOUT_MS = 5_000;
 const FOREGROUND_WAKE_COALESCE_MS = 1_000;
-const MAX_PENDING_WRITER_FRAMES = 256;
+const MAX_PENDING_OUTBOUND_ITEMS = 256;
+const MAX_PENDING_OUTBOUND_BYTES = 8 * 1_024 * 1_024;
+const OUTBOUND_CAPACITY_MESSAGE =
+  "Too much outbound work is waiting to be sent.";
 const CLIENT_INSTANCE_ID_KEY = "devmanager.clientInstanceId";
 let fallbackClientInstanceId: string | null = null;
+const outboundEncoder = new TextEncoder();
 
 const TRANSIENT_COMPOSER_REJECTIONS: ReadonlySet<ComposerRejected["code"]> =
   new Set([
@@ -162,6 +173,14 @@ function composerFingerprint(submission: ComposerSubmission): string {
   ]);
 }
 
+function outboundWorkBytes(value: unknown): number {
+  try {
+    return outboundEncoder.encode(JSON.stringify(value)).byteLength;
+  } catch {
+    return MAX_PENDING_OUTBOUND_BYTES + 1;
+  }
+}
+
 /**
  * Decode the binary session-output frame emitted by the Rust bridge.
  * Layout (see `src/remote/web/bridge.rs::encode_session_output_frame`):
@@ -215,7 +234,9 @@ export class WsClient {
   private readonly clientInstanceId = getClientInstanceId();
   private readonly pendingRequests = new Map<number, PendingRequest>();
   private readonly pendingComposers = new Map<string, PendingComposer>();
-  private readonly pendingWriterFrames: WriterLeaseFrame[] = [];
+  private readonly pendingWriterFrames: PendingWriterFrame[] = [];
+  private pendingOutboundItems = 0;
+  private pendingOutboundBytes = 0;
 
   constructor(private readonly cb: WsClientCallbacks) {}
 
@@ -287,7 +308,6 @@ export class WsClient {
         } catch {
           return;
         }
-        this.observeWriterLease(parsed);
         if (parsed.type === "response") {
           this.resolvePendingRequest(parsed.id, parsed.result);
           return;
@@ -298,6 +318,10 @@ export class WsClient {
           this.handleComposerRejected(parsed);
         }
         this.cb.onMessage(parsed);
+        if (!this.isCurrentSocket(socket, epoch)) return;
+        // Store reconciliation may clear old-runtime work. Apply the lease
+        // from this authoritative frame only after that cleanup completes.
+        this.observeWriterLease(parsed);
         this.continueComposerRetriesAfter(parsed);
       } else if (event.data instanceof ArrayBuffer) {
         const frame = decodeSessionOutputFrame(event.data);
@@ -345,10 +369,16 @@ export class WsClient {
   }
 
   request(action: RemoteAction): Promise<RemoteActionResult> {
+    if (this.stopped) return Promise.reject(new Error("websocket stopped"));
+    const accountedBytes = outboundWorkBytes(action);
+    if (!this.reservePendingWork(accountedBytes)) {
+      return Promise.reject(new Error(OUTBOUND_CAPACITY_MESSAGE));
+    }
     const id = this.nextRequestId++;
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = {
         action,
+        accountedBytes,
         sent: false,
         resolve,
         reject,
@@ -367,9 +397,7 @@ export class WsClient {
    * reconnect because they have never reached the socket.
    */
   sendWithWriterLease(message: WriterLeaseFrame): boolean {
-    if (this.stopped || this.pendingWriterFrames.length >= MAX_PENDING_WRITER_FRAMES) {
-      return false;
-    }
+    if (this.stopped) return false;
     if (
       this.ws?.readyState === WebSocket.OPEN &&
       this.writerLease.youAreOwner &&
@@ -380,7 +408,32 @@ export class WsClient {
     ) {
       return true;
     }
-    this.pendingWriterFrames.push(message);
+    const accountedBytes = outboundWorkBytes(message);
+    if (message.type === "resize") {
+      const existing = this.pendingWriterFrames.find(
+        (pending) =>
+          pending.message.type === "resize" &&
+          pending.message.sessionId === message.sessionId,
+      );
+      if (existing) {
+        const nextBytes =
+          this.pendingOutboundBytes - existing.accountedBytes + accountedBytes;
+        if (
+          accountedBytes > MAX_PENDING_OUTBOUND_BYTES ||
+          nextBytes > MAX_PENDING_OUTBOUND_BYTES
+        ) {
+          return false;
+        }
+        this.pendingOutboundBytes = nextBytes;
+        existing.message = message;
+        existing.accountedBytes = accountedBytes;
+        this.ensureWriterLease();
+        this.scheduleComposerRetry();
+        return true;
+      }
+    }
+    if (!this.reservePendingWork(accountedBytes)) return false;
+    this.pendingWriterFrames.push({ message, accountedBytes });
     this.ensureWriterLease();
     this.scheduleComposerRetry();
     return true;
@@ -395,6 +448,11 @@ export class WsClient {
         new Error("This mutation ID is already pending with different content."),
       );
     }
+    if (this.stopped) return Promise.reject(new Error("websocket stopped"));
+    const accountedBytes = outboundWorkBytes(submission);
+    if (!this.reservePendingWork(accountedBytes)) {
+      return Promise.reject(new Error(OUTBOUND_CAPACITY_MESSAGE));
+    }
 
     let resolvePending: (result: ComposerAccepted) => void = () => {};
     let rejectPending: (error: Error) => void = () => {};
@@ -405,6 +463,7 @@ export class WsClient {
     this.pendingComposers.set(submission.mutationId, {
       fingerprint,
       submission,
+      accountedBytes,
       promise,
       resolve: resolvePending,
       reject: rejectPending,
@@ -437,6 +496,7 @@ export class WsClient {
     const pending = this.pendingComposers.get(mutationId);
     if (!pending) return;
     this.pendingComposers.delete(mutationId);
+    this.releasePendingWork(pending.accountedBytes);
     pending.reject(new Error(reason));
     if (!this.hasPendingRetryWork()) this.cancelComposerRetry();
   }
@@ -449,7 +509,7 @@ export class WsClient {
     this.cancelComposerRetry();
     this.rejectPendingRequests("websocket stopped");
     this.rejectPendingComposers("websocket stopped");
-    this.pendingWriterFrames.length = 0;
+    this.clearPendingWriterFrames();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -530,8 +590,18 @@ export class WsClient {
     this.cancelComposerRetry();
     this.rejectPendingRequests(reason);
     this.rejectPendingComposers(reason);
-    this.pendingWriterFrames.length = 0;
+    this.clearPendingWriterFrames();
     this.writerLease = { ...EMPTY_WRITER_LEASE };
+  }
+
+  discardWriterFramesForSession(sessionId: string): void {
+    for (let index = this.pendingWriterFrames.length - 1; index >= 0; index -= 1) {
+      const pending = this.pendingWriterFrames[index];
+      if (pending.message.sessionId !== sessionId) continue;
+      this.pendingWriterFrames.splice(index, 1);
+      this.releasePendingWork(pending.accountedBytes);
+    }
+    if (!this.hasPendingRetryWork()) this.cancelComposerRetry();
   }
 
   leaseState(): WebWriterLeaseState {
@@ -641,6 +711,34 @@ export class WsClient {
     return false;
   }
 
+  private reservePendingWork(accountedBytes: number): boolean {
+    if (
+      accountedBytes > MAX_PENDING_OUTBOUND_BYTES ||
+      this.pendingOutboundItems >= MAX_PENDING_OUTBOUND_ITEMS ||
+      this.pendingOutboundBytes + accountedBytes > MAX_PENDING_OUTBOUND_BYTES
+    ) {
+      return false;
+    }
+    this.pendingOutboundItems += 1;
+    this.pendingOutboundBytes += accountedBytes;
+    return true;
+  }
+
+  private releasePendingWork(accountedBytes: number): void {
+    this.pendingOutboundItems = Math.max(0, this.pendingOutboundItems - 1);
+    this.pendingOutboundBytes = Math.max(
+      0,
+      this.pendingOutboundBytes - accountedBytes,
+    );
+  }
+
+  private clearPendingWriterFrames(): void {
+    for (const pending of this.pendingWriterFrames) {
+      this.releasePendingWork(pending.accountedBytes);
+    }
+    this.pendingWriterFrames.length = 0;
+  }
+
   private hasPendingRetryWork(): boolean {
     return (
       this.pendingComposers.size > 0 ||
@@ -655,16 +753,17 @@ export class WsClient {
       this.ws?.readyState === WebSocket.OPEN &&
       this.writerLease.youAreOwner
     ) {
-      const message = this.pendingWriterFrames[0];
+      const pending = this.pendingWriterFrames[0];
       if (
         !this.send({
-          ...message,
+          ...pending.message,
           expectedLeaseGeneration: this.writerLease.generation,
         } as WsInbound)
       ) {
         return;
       }
       this.pendingWriterFrames.shift();
+      this.releasePendingWork(pending.accountedBytes);
     }
   }
 
@@ -764,6 +863,7 @@ export class WsClient {
     const pending = this.pendingRequests.get(id);
     if (!pending) return;
     this.pendingRequests.delete(id);
+    this.releasePendingWork(pending.accountedBytes);
     pending.resolve(result);
     if (!this.hasPendingRetryWork()) this.cancelComposerRetry();
   }
@@ -773,6 +873,7 @@ export class WsClient {
     for (const [id, pending] of this.pendingRequests) {
       if (!pending.sent) continue;
       this.pendingRequests.delete(id);
+      this.releasePendingWork(pending.accountedBytes);
       pending.reject(error);
     }
   }
@@ -782,6 +883,7 @@ export class WsClient {
     const error = new Error(reason);
     for (const [id, pending] of this.pendingRequests) {
       this.pendingRequests.delete(id);
+      this.releasePendingWork(pending.accountedBytes);
       pending.reject(error);
     }
     if (!this.hasPendingRetryWork()) this.cancelComposerRetry();
@@ -791,6 +893,7 @@ export class WsClient {
     const pending = this.pendingComposers.get(accepted.mutationId);
     if (!pending) return;
     this.pendingComposers.delete(accepted.mutationId);
+    this.releasePendingWork(pending.accountedBytes);
     pending.resolve(accepted);
     if (!this.hasPendingRetryWork()) this.cancelComposerRetry();
   }
@@ -805,6 +908,7 @@ export class WsClient {
       return;
     }
     this.pendingComposers.delete(rejected.mutationId);
+    this.releasePendingWork(pending.accountedBytes);
     pending.reject(new ComposerRejectedError(rejected));
     if (!this.hasPendingRetryWork()) this.cancelComposerRetry();
   }
@@ -833,6 +937,7 @@ export class WsClient {
     const error = new Error(reason);
     for (const [mutationId, pending] of this.pendingComposers) {
       this.pendingComposers.delete(mutationId);
+      this.releasePendingWork(pending.accountedBytes);
       pending.reject(error);
     }
     if (!this.hasPendingRetryWork()) this.cancelComposerRetry();

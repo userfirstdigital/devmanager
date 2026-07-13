@@ -140,6 +140,7 @@ export type SemanticToolState = "pending" | "running" | "completed" | "failed";
 interface SemanticEventBase {
   stableSessionKey: StableSessionKey;
   sequence: number;
+  replacesSequence?: number;
   occurredAtEpochMs: number;
   source: SemanticSource;
 }

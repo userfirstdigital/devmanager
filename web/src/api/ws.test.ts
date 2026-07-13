@@ -437,6 +437,209 @@ describe("WsClient request handling", () => {
     expect(composerRejected).toBe(true);
   });
 
+  it("applies the authoritative hard-reset lease after runtime cleanup", async () => {
+    let client: WsClient;
+    const onMessage = vi.fn((message: unknown) => {
+      const inbound = message as { type?: string; hardReset?: boolean };
+      if (inbound.type === "resumeState" && inbound.hardReset) {
+        client.resetRuntime("host runtime changed");
+      }
+    });
+    client = new WsClient(clientCallbacks({ onMessage }));
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "resumeState",
+        runtimeInstanceId: "runtime-new",
+        revision: 1,
+        hardReset: true,
+        route: "/sessions",
+        desiredSessionKey: null,
+        workspace: null,
+        semanticReplay: null,
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 44,
+          expiresAtEpochMs: 20_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    socket.sent.length = 0;
+
+    expect(
+      client.sendWithWriterLease({
+        type: "input",
+        sessionId: "pty-a",
+        text: "uses authoritative lease",
+      }),
+    ).toBe(true);
+
+    expect(jsonFrames(socket)).toEqual([
+      {
+        type: "input",
+        sessionId: "pty-a",
+        text: "uses authoritative lease",
+        expectedLeaseGeneration: 44,
+      },
+    ]);
+  });
+
+  it("shares a bounded pending-work count across raw frames and actions", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    FakeWebSocket.instances[0]?.emitOpen();
+    for (let index = 0; index < 256; index += 1) {
+      expect(
+        client.sendWithWriterLease({
+          type: "input",
+          sessionId: "pty-a",
+          text: "x",
+        }),
+      ).toBe(true);
+    }
+
+    let rejection: unknown;
+    void client.request({ type: "stopAllServers" }).catch((error: unknown) => {
+      rejection = error;
+    });
+    await Promise.resolve();
+
+    expect(rejection).toMatchObject({
+      message: expect.stringContaining("Too much outbound work"),
+    });
+  });
+
+  it("bounds staged raw work by encoded bytes and resets the accounting", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    FakeWebSocket.instances[0]?.emitOpen();
+    const largeBase64 = "a".repeat(7 * 1_024 * 1_024);
+    const image = {
+      type: "pasteImage" as const,
+      sessionId: "pty-a",
+      mimeType: "image/png" as const,
+      fileName: "large.png",
+      dataBase64: largeBase64,
+    };
+
+    expect(client.sendWithWriterLease(image)).toBe(true);
+    expect(client.sendWithWriterLease(image)).toBe(false);
+
+    client.resetRuntime("host runtime changed");
+    expect(client.sendWithWriterLease(image)).toBe(true);
+  });
+
+  it("rejects a composer payload that exceeds the shared byte budget", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    FakeWebSocket.instances[0]?.emitOpen();
+    let rejection: unknown;
+    void client
+      .submitComposer({
+        mutationId: "mutation-too-large",
+        stableSessionKey: "tab:tab-1",
+        text: "image",
+        attachments: [
+          {
+            mimeType: "image/png",
+            fileName: "too-large.png",
+            dataBase64: "a".repeat(9 * 1_024 * 1_024),
+          },
+        ],
+      })
+      .catch((error: unknown) => {
+        rejection = error;
+      });
+    await Promise.resolve();
+
+    expect(rejection).toMatchObject({
+      message: expect.stringContaining("Too much outbound work"),
+    });
+  });
+
+  it("coalesces staged resizes to the latest dimensions per session", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    client.sendWithWriterLease({
+      type: "resize",
+      sessionId: "pty-a",
+      rows: 24,
+      cols: 80,
+    });
+    client.sendWithWriterLease({
+      type: "resize",
+      sessionId: "pty-a",
+      rows: 30,
+      cols: 100,
+    });
+
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 45,
+          expiresAtEpochMs: 20_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(jsonFrames(socket).filter((frame) => frame.type === "resize")).toEqual([
+      {
+        type: "resize",
+        sessionId: "pty-a",
+        rows: 30,
+        cols: 100,
+        expectedLeaseGeneration: 45,
+      },
+    ]);
+  });
+
+  it("discards staged raw work for a closed session only", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    client.sendWithWriterLease({
+      type: "input",
+      sessionId: "pty-a",
+      text: "discard",
+    });
+    client.sendWithWriterLease({
+      type: "input",
+      sessionId: "pty-b",
+      text: "keep",
+    });
+
+    client.discardWriterFramesForSession("pty-a");
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 46,
+          expiresAtEpochMs: 20_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([
+      {
+        type: "input",
+        sessionId: "pty-b",
+        text: "keep",
+        expectedLeaseGeneration: 46,
+      },
+    ]);
+  });
+
   it("requests a visible writer lease for actions without replaying the action", async () => {
     const client = new WsClient(clientCallbacks());
     await client.start();

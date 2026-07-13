@@ -30,6 +30,7 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
     readonly foreground = vi.fn();
     readonly setVisibility = vi.fn();
     readonly resetRuntime = vi.fn();
+    readonly discardWriterFramesForSession = vi.fn();
     readonly ensureWriterLease = vi.fn();
     readonly cancelComposer = vi.fn();
     readonly leaseState = vi.fn(() => ({
@@ -293,6 +294,57 @@ describe("host runtime reconciliation", () => {
     expect(wsClientState.instance?.resetRuntime).toHaveBeenCalledTimes(1);
   });
 
+  it("fails closed and exposes a compatibility diagnostic for an unsupported protocol", () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({
+      activeSessionKey: "tab:a",
+      journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
+      drafts: { "tab:a": "do not render" },
+      unread: { "tab:a": 2 },
+      pendingRoute: "/session/tab/a",
+      pendingMutations: {
+        "tab:a": {
+          mutationId: "mutation-old-protocol",
+          stableSessionKey: "tab:a",
+          text: "do not send",
+          attachments: [],
+        },
+      },
+    });
+
+    useStore.getState().applySnapshot(
+      makeSnapshot({
+        webProtocolVersion: 99,
+        runtimeInstanceId: "runtime-new",
+      }),
+    );
+
+    const state = useStore.getState();
+    expect(state.compatibilityDiagnostic).toEqual({
+      expectedProtocolVersion: 2,
+      receivedProtocolVersion: 99,
+    });
+    expect(state.status).toMatchObject({ kind: "closed" });
+    expect(state.workspace).toBeNull();
+    expect(state.snapshot).toBeNull();
+    expect(state.runtimeInstanceId).toBeNull();
+    expect(state.sessions).toEqual({});
+    expect(state.writerLease.youAreOwner).toBe(false);
+    expect(state.activeSessionKey).toBeNull();
+    expect(state.journals).toEqual({});
+    expect(state.drafts).toEqual({});
+    expect(state.unread).toEqual({});
+    expect(state.pendingRoute).toBeNull();
+    expect(state.pendingMutations).toEqual({});
+    expect(state.rawTerminal.pendingTerminalFrames.size).toBe(0);
+    expect(state.client).toBeNull();
+    expect(wsClientState.instance?.resetRuntime).toHaveBeenCalledWith(
+      expect.stringContaining("protocol 99"),
+    );
+    expect(wsClientState.instance?.stop).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves stable-key journals and drafts across same-runtime snapshots", () => {
     useStore.getState().applySnapshot(makeSnapshot());
     useStore.setState({
@@ -386,6 +438,172 @@ describe("host runtime reconciliation", () => {
       "gone-mutation",
       "session removed by host",
     );
+    expect(
+      wsClientState.instance?.discardWriterFramesForSession,
+    ).toHaveBeenCalledWith("pty-gone");
+  });
+
+  it.each([true, false])(
+    "purges an %sactive removed session immediately and rejects its late raw frames",
+    (removedSessionWasActive) => {
+      useStore.getState().init();
+      const base = makeSnapshot();
+      const removedSession = {
+        ...base.sessions[0],
+        sessionId: "pty-b",
+        stableSessionKey: "tab:b",
+        tabId: "b",
+      };
+      useStore.getState().applySnapshot(
+        makeSnapshot({
+          tabs: [
+            ...base.tabs,
+            {
+              ...base.tabs[0],
+              id: "b",
+              sessionId: "pty-b",
+              label: "Claude B",
+            },
+          ],
+          sessions: [...base.sessions, removedSession],
+        }),
+      );
+      const removedEvent = {
+        ...outputEvent(3),
+        stableSessionKey: "tab:b",
+      };
+      useStore.setState((state) => ({
+        activeSessionKey: removedSessionWasActive ? "tab:b" : "tab:a",
+        journals: {
+          "tab:a": journal([outputEvent(1), outputEvent(2)]),
+          "tab:b": {
+            ...journal([removedEvent]),
+            stableSessionKey: "tab:b",
+          },
+        },
+        drafts: { "tab:a": "keep", "tab:b": "remove" },
+        unread: { "tab:a": 1, "tab:b": 2 },
+        semanticGapKeys: new Set(["tab:a", "tab:b"]),
+        semanticGapSequences: { "tab:a": 4, "tab:b": 5 },
+        semanticReplay: {
+          ...replayDescriptor({ stableSessionKey: "tab:b" }),
+          nextSequence: 2,
+        },
+        pendingMutations: {
+          "tab:b": {
+            mutationId: "mutation-b",
+            stableSessionKey: "tab:b",
+            text: "remove",
+            attachments: [],
+          },
+        },
+        rawTerminal: {
+          ...state.rawTerminal,
+          activeStreamSessionId: removedSessionWasActive ? "pty-b" : "pty-a",
+          terminalSubscribers: new Map([
+            ["pty-a", new Set()],
+            ["pty-b", new Set()],
+          ]),
+          pendingTerminalFrames: new Map([
+            ["pty-a", []],
+            ["pty-b", []],
+          ]),
+          bootstrapSubscribers: new Map([
+            ["pty-a", new Set()],
+            ["pty-b", new Set()],
+          ]),
+          pendingBootstraps: new Map([
+            ["pty-a", {} as never],
+            ["pty-b", {} as never],
+          ]),
+        },
+      }));
+
+      wsClientState.instance?.callbacks.onMessage({
+        type: "sessionRemoved",
+        sessionId: "pty-b",
+      });
+      wsClientState.instance?.callbacks.onSessionOutput({
+        sessionId: "pty-b",
+        chunkSeq: 99,
+        bytes: new Uint8Array([1, 2, 3]),
+      });
+
+      const state = useStore.getState();
+      expect(state.activeSessionKey).toBe(
+        removedSessionWasActive ? null : "tab:a",
+      );
+      expect(state.sessions["tab:b"]).toBeUndefined();
+      expect(state.workspace?.sessions.some((session) => session.sessionId === "pty-b"))
+        .toBe(false);
+      expect(state.journals["tab:b"]).toBeUndefined();
+      expect(state.drafts["tab:b"]).toBeUndefined();
+      expect(state.unread["tab:b"]).toBeUndefined();
+      expect(state.semanticGapKeys.has("tab:b")).toBe(false);
+      expect(state.semanticGapSequences["tab:b"]).toBeUndefined();
+      expect(state.semanticReplay).toBeNull();
+      expect(state.pendingMutations["tab:b"]).toBeUndefined();
+      expect(state.rawTerminal.streamSessionIdByStableKey["tab:b"]).toBeUndefined();
+      expect(state.rawTerminal.terminalSubscribers.has("pty-b")).toBe(false);
+      expect(state.rawTerminal.pendingTerminalFrames.has("pty-b")).toBe(false);
+      expect(state.rawTerminal.bootstrapSubscribers.has("pty-b")).toBe(false);
+      expect(state.rawTerminal.pendingBootstraps.has("pty-b")).toBe(false);
+      expect(wsClientState.instance?.cancelComposer).toHaveBeenCalledWith(
+        "mutation-b",
+        "session removed by host",
+      );
+      expect(
+        wsClientState.instance?.discardWriterFramesForSession,
+      ).toHaveBeenCalledWith("pty-b");
+    },
+  );
+
+  it("closes only raw PTY state while retaining the stable semantic session", () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState((state) => ({
+      activeSessionKey: "tab:a",
+      journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
+      drafts: { "tab:a": "keep final draft" },
+      pendingMutations: {
+        "tab:a": {
+          mutationId: "mutation-a",
+          stableSessionKey: "tab:a",
+          text: "keep final draft",
+          attachments: [],
+        },
+      },
+      rawTerminal: {
+        ...state.rawTerminal,
+        activeStreamSessionId: "pty-a",
+        terminalSubscribers: new Map([["pty-a", new Set()]]),
+        pendingTerminalFrames: new Map([["pty-a", []]]),
+        bootstrapSubscribers: new Map([["pty-a", new Set()]]),
+        pendingBootstraps: new Map([["pty-a", {} as never]]),
+      },
+    }));
+
+    wsClientState.instance?.callbacks.onMessage({
+      type: "sessionClosed",
+      sessionId: "pty-a",
+    });
+
+    const state = useStore.getState();
+    expect(state.activeSessionKey).toBe("tab:a");
+    expect(state.sessions["tab:a"]).toBeDefined();
+    expect(state.journals["tab:a"]?.events).toHaveLength(2);
+    expect(state.drafts["tab:a"]).toBe("keep final draft");
+    expect(state.pendingMutations["tab:a"]?.mutationId).toBe("mutation-a");
+    expect(state.rawTerminal.activeStreamSessionId).toBeNull();
+    expect(state.rawTerminal.streamSessionIdByStableKey["tab:a"]).toBeUndefined();
+    expect(state.rawTerminal.terminalSubscribers.has("pty-a")).toBe(false);
+    expect(state.rawTerminal.pendingTerminalFrames.has("pty-a")).toBe(false);
+    expect(state.rawTerminal.bootstrapSubscribers.has("pty-a")).toBe(false);
+    expect(state.rawTerminal.pendingBootstraps.has("pty-a")).toBe(false);
+    expect(wsClientState.instance?.cancelComposer).not.toHaveBeenCalled();
+    expect(
+      wsClientState.instance?.discardWriterFramesForSession,
+    ).toHaveBeenCalledWith("pty-a");
   });
 
   it("trims journals to host retention and the browser memory cap", () => {
@@ -803,6 +1021,97 @@ describe("semantic journal reconciliation", () => {
     expect(useStore.getState().semanticReplay).toBeNull();
   });
 
+  it("buffers ordered live events during replay and flushes them exactly once", () => {
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({
+      activeSessionKey: "tab:a",
+      journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
+    });
+    useStore.getState().beginSemanticReplay(
+      replayDescriptor({ fromSequence: 2, throughSequence: 4 }),
+    );
+    useStore.getState().applySemanticReplayPage(
+      replayPage({
+        fromSequence: 2,
+        throughSequence: 4,
+        nextSequence: 3,
+        complete: false,
+        events: [outputEvent(3)],
+      }),
+    );
+
+    useStore.getState().appendSemanticEvent(outputEvent(5, "live-five"));
+    useStore.getState().appendSemanticEvent(outputEvent(5, "duplicate-five"));
+    useStore.getState().appendSemanticEvent(outputEvent(6, "live-six"));
+    expect(
+      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+    ).toEqual([1, 2, 3]);
+
+    useStore.getState().applySemanticReplayPage(
+      replayPage({
+        fromSequence: 3,
+        throughSequence: 4,
+        nextSequence: 4,
+        complete: true,
+        events: [outputEvent(4)],
+      }),
+    );
+
+    const events = useStore.getState().journals["tab:a"]?.events ?? [];
+    expect(events.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(events.find((event) => event.sequence === 5)).toMatchObject({
+      text: "live-five",
+    });
+    expect(useStore.getState().semanticReplay).toBeNull();
+  });
+
+  it("removes the retained event replaced by a newer live semantic event", () => {
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({
+      activeSessionKey: "tab:a",
+      journals: {
+        "tab:a": journal([outputEvent(1), outputEvent(2), outputEvent(3)]),
+      },
+    });
+
+    useStore.getState().appendSemanticEvent({
+      ...outputEvent(4, "replacement"),
+      replacesSequence: 2,
+    });
+
+    expect(
+      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+    ).toEqual([1, 3, 4]);
+  });
+
+  it("applies replacement metadata carried by a replay page", () => {
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({
+      activeSessionKey: "tab:a",
+      journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
+    });
+    useStore.getState().beginSemanticReplay(
+      replayDescriptor({ fromSequence: 2, throughSequence: 4 }),
+    );
+
+    useStore.getState().applySemanticReplayPage(
+      replayPage({
+        fromSequence: 2,
+        throughSequence: 4,
+        nextSequence: 4,
+        complete: true,
+        events: [
+          outputEvent(3),
+          { ...outputEvent(4, "replacement"), replacesSequence: 2 },
+        ],
+      }),
+    );
+
+    expect(
+      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+    ).toEqual([1, 3, 4]);
+  });
+
   it("requests one atomic replay for a live gap without advancing the cursor", () => {
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
@@ -941,6 +1250,19 @@ describe("resume ownership and stable session identity", () => {
     expect(state.sessions["tab:a"]?.stableSessionKey).toBe("tab:a");
     expect(state.rawTerminal.streamSessionIdByStableKey["tab:a"]).toBe("pty-a");
     expect("activeSessionId" in state).toBe(false);
+  });
+
+  it("does not emit a second Resume when opening the already-selected AI tab", async () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.getState().setActiveSession("pty-a");
+    const client = wsClientState.instance;
+    client?.wake.mockClear();
+
+    await useStore.getState().openAiTab("a");
+
+    expect(client?.wake).not.toHaveBeenCalled();
+    expect(useStore.getState().activeSessionKey).toBe("tab:a");
   });
 });
 
