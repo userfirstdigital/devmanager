@@ -690,6 +690,15 @@ impl SemanticJournalStore {
             .map(|binding| binding.key.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_next_sequence_for_test(
+        &mut self,
+        key: &StableSessionKey,
+        next_sequence: u64,
+    ) {
+        self.ensure_session(key, false).journal.next_sequence = next_sequence;
+    }
+
     pub fn set_attention(
         &mut self,
         key: &StableSessionKey,

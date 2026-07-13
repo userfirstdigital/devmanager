@@ -628,11 +628,15 @@ fn capture_web_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> WebWor
                 .snapshot_state_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let semantic_metadata = inner
-                .semantic_journals
-                .lock()
-                .map(|journals| journals.metadata_snapshot())
-                .unwrap_or_default();
+            let semantic_journals = match inner.semantic_journals.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    let guard = poisoned.into_inner();
+                    inner.semantic_journals.clear_poison();
+                    guard
+                }
+            };
+            let semantic_metadata = semantic_journals.metadata_snapshot();
             (
                 light_snapshot(inner, client_id),
                 inner.snapshot_revision.load(Ordering::Relaxed),
@@ -890,6 +894,113 @@ mod tests {
     #[test]
     fn browser_capture_waits_for_runtime_semantic_revision_publication() {
         assert_browser_capture_waits_for_semantic_publication(SemanticPublicationCase::Runtime);
+    }
+
+    #[test]
+    fn browser_capture_recovers_after_semantic_publication_panic() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app = crate::state::AppState::default();
+        let mut runtime_state = crate::state::RuntimeState::default();
+
+        for (tab_id, session_id) in [
+            ("exhausted-tab", "exhausted-runtime"),
+            ("healthy-tab", "healthy-runtime"),
+        ] {
+            app.open_tabs.push(crate::models::SessionTab {
+                id: tab_id.to_string(),
+                tab_type: crate::models::TabType::Claude,
+                pty_session_id: Some(session_id.to_string()),
+                ..crate::models::SessionTab::default()
+            });
+            let mut runtime = SessionRuntimeState::new(
+                session_id,
+                PathBuf::new(),
+                SessionDimensions::default(),
+                TerminalBackend::default(),
+            );
+            runtime.session_kind = SessionKind::Claude;
+            runtime.tab_id = Some(tab_id.to_string());
+            runtime_state
+                .sessions
+                .insert(runtime.session_id.clone(), runtime);
+        }
+
+        service.update_snapshot(app, runtime_state, HashMap::new());
+        let initial = capture_web_snapshot(&service.inner, "web-client");
+        let initial_exhausted = initial
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "exhausted-runtime")
+            .expect("exhausted semantic session");
+        let initial_exhausted_latest = initial_exhausted.latest_sequence;
+        assert!(
+            initial_exhausted_latest > 0,
+            "the exhausted session should begin with published metadata"
+        );
+        let initial_healthy_latest = initial
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "healthy-runtime")
+            .expect("healthy semantic session")
+            .latest_sequence;
+
+        service
+            .inner
+            .semantic_journals
+            .lock()
+            .expect("semantic journals lock")
+            .set_next_sequence_for_test(&StableSessionKey::from_tab("exhausted-tab"), u64::MAX);
+
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service.push_session_output("exhausted-runtime", b"exhaust sequence".to_vec());
+        }));
+        assert!(
+            publication.is_err(),
+            "sequence exhaustion should still panic"
+        );
+        assert!(
+            !service.inner.semantic_journals.is_poisoned(),
+            "panic recovery should not poison the semantic journal store"
+        );
+        assert_eq!(
+            service
+                .inner
+                .semantic_publication_generation
+                .load(Ordering::Acquire)
+                % 2,
+            0,
+            "publication generation should recover to an even value"
+        );
+
+        let recovered = capture_web_snapshot(&service.inner, "web-client");
+        assert!(
+            recovered.revision > initial.revision,
+            "panic recovery must conservatively publish a new revision"
+        );
+        assert_eq!(
+            recovered
+                .sessions
+                .iter()
+                .find(|session| session.session_id == "exhausted-runtime")
+                .expect("exhausted semantic session should remain projected")
+                .latest_sequence,
+            initial_exhausted_latest,
+            "panic recovery must preserve previously published metadata"
+        );
+
+        service.push_session_output("healthy-runtime", b"publication still works".to_vec());
+        let subsequent = capture_web_snapshot(&service.inner, "web-client");
+        assert!(subsequent.revision > recovered.revision);
+        assert!(
+            subsequent
+                .sessions
+                .iter()
+                .find(|session| session.session_id == "healthy-runtime")
+                .expect("healthy semantic session should remain projected")
+                .latest_sequence
+                > initial_healthy_latest,
+            "a healthy journal should publish successfully after the panic"
+        );
     }
 
     fn pair_web_client(service: &RemoteHostService, client_id: &str) {

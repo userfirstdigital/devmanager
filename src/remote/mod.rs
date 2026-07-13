@@ -1393,26 +1393,57 @@ impl RemoteHostService {
         &self,
         mutation: impl FnOnce(&mut SemanticJournalStore) -> bool,
     ) -> bool {
-        let _publication_guard = self
-            .inner
-            .semantic_publication_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let publication_guard = match self.inner.semantic_publication_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.inner.semantic_publication_lock.clear_poison();
+                guard
+            }
+        };
         let previous_generation = self
             .inner
             .semantic_publication_generation
             .fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(previous_generation % 2, 0);
-        let _epoch = SemanticPublicationEpoch {
+        let epoch = SemanticPublicationEpoch {
             generation: &self.inner.semantic_publication_generation,
         };
 
-        let changed = self
-            .inner
-            .semantic_journals
-            .lock()
-            .map(|mut journals| mutation(&mut journals))
-            .unwrap_or(false);
+        let mut journals = match self.inner.semantic_journals.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.inner.semantic_journals.clear_poison();
+                guard
+            }
+        };
+        let mutation_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mutation(&mut journals)));
+        // The panic was caught while the journal guard was still alive, so a
+        // normal drop here keeps the store usable by later publications.
+        drop(journals);
+
+        let changed = match mutation_result {
+            Ok(changed) => changed,
+            Err(payload) => {
+                {
+                    let _snapshot_guard = self
+                        .inner
+                        .snapshot_state_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    self.inner
+                        .snapshot_revision
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // Keep the generation odd until the conservative revision is
+                // visible, and release both guards normally before unwinding.
+                drop(epoch);
+                drop(publication_guard);
+                std::panic::resume_unwind(payload);
+            }
+        };
         if changed {
             #[cfg(test)]
             self.run_semantic_publication_test_hook();
@@ -1423,6 +1454,8 @@ impl RemoteHostService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
         }
+        drop(epoch);
+        drop(publication_guard);
         changed
     }
 
