@@ -10,6 +10,7 @@ import {
 } from "react";
 
 import type { ComposerAttachment } from "../api/types";
+import type { ReturnBehavior } from "../settings/inputPreference";
 import {
   buildImagePastePayload,
   inspectClipboardImageItems,
@@ -17,7 +18,11 @@ import {
 } from "../components/imagePaste";
 
 const MAX_ATTACHMENTS = 4;
-const MAX_ATTACHMENT_TOTAL_BYTES = 10 * 1024 * 1024;
+// The socket keeps one shared 8 MiB encoded outbound budget. Base64 expands
+// image bytes by roughly one third, so a 5 MiB raw batch leaves room for the
+// message, filenames, JSON envelope, and other acknowledged work.
+const MAX_ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
+const SUPPORTED_ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg"]);
 
 interface PendingAttachment extends ComposerAttachment {
   id: string;
@@ -25,10 +30,13 @@ interface PendingAttachment extends ComposerAttachment {
 }
 
 export interface ComposerProps {
+  /** Runtime + stable-session identity. Local attachment state never crosses it. */
+  scopeKey: string;
   value: string;
   disabled: boolean;
   pending: boolean;
   supportsAttachments: boolean;
+  returnBehavior?: ReturnBehavior;
   placeholder?: string;
   note?: string | null;
   onChange(value: string): void;
@@ -41,10 +49,12 @@ function attachmentId(): string {
 }
 
 export function Composer({
+  scopeKey,
   value,
   disabled,
   pending,
   supportsAttachments,
+  returnBehavior = "newline",
   placeholder = "Message",
   note = null,
   onChange,
@@ -56,8 +66,24 @@ export function Composer({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const scopeRef = useRef(scopeKey);
+  const scopeGenerationRef = useRef(0);
+  const attachmentsRef = useRef<PendingAttachment[]>([]);
+  const attachmentReadPendingRef = useRef(false);
   const busy = pending || submitting;
   const canSend = !disabled && !busy && (localValue.trim().length > 0 || attachments.length > 0);
+
+  useLayoutEffect(() => {
+    if (scopeRef.current === scopeKey) return;
+    scopeRef.current = scopeKey;
+    scopeGenerationRef.current += 1;
+    attachmentReadPendingRef.current = false;
+    attachmentsRef.current = [];
+    setLocalValue(value);
+    setAttachments([]);
+    setSubmitting(false);
+    setError(null);
+  }, [scopeKey, value]);
 
   useEffect(() => setLocalValue(value), [value]);
 
@@ -76,13 +102,50 @@ export function Composer({
   const addFiles = async (files: File[]) => {
     if (!supportsAttachments || files.length === 0) return;
     setError(null);
+    if (attachmentReadPendingRef.current) {
+      setError("Wait for the current images to finish attaching.");
+      return;
+    }
+    const current = attachmentsRef.current;
+    if (current.length + files.length > MAX_ATTACHMENTS) {
+      setError("Attach no more than four images.");
+      return;
+    }
+    const unsupported = files.find(
+      (file) => !SUPPORTED_ATTACHMENT_TYPES.has(file.type),
+    );
+    if (unsupported) {
+      setError("Only PNG and JPEG images are supported.");
+      return;
+    }
+    const oversized = files.find((file) => file.size > WEB_PASTE_IMAGE_MAX_BYTES);
+    if (oversized) {
+      setError(`${oversized.name || "Image"} is larger than 5 MiB.`);
+      return;
+    }
+    const selectedBytes = files.reduce((total, file) => total + file.size, 0);
+    const currentBytes = current.reduce(
+      (total, attachment) => total + attachment.byteLength,
+      0,
+    );
+    if (currentBytes + selectedBytes > MAX_ATTACHMENT_TOTAL_BYTES) {
+      setError("Attachments must be 5 MiB or less in total.");
+      return;
+    }
+
+    const operationScope = scopeRef.current;
+    const operationGeneration = scopeGenerationRef.current;
+    attachmentReadPendingRef.current = true;
     try {
       const additions: PendingAttachment[] = [];
       for (const file of files) {
-        if (file.size > WEB_PASTE_IMAGE_MAX_BYTES) {
-          throw new Error(`${file.name || "Image"} is larger than 5 MiB.`);
-        }
         const payload = await buildImagePastePayload(file);
+        if (
+          scopeRef.current !== operationScope ||
+          scopeGenerationRef.current !== operationGeneration
+        ) {
+          return;
+        }
         additions.push({
           id: attachmentId(),
           mimeType: payload.mimeType,
@@ -91,25 +154,30 @@ export function Composer({
           byteLength: file.size,
         });
       }
-      setAttachments((current) => {
-        const next = [...current, ...additions];
-        if (next.length > MAX_ATTACHMENTS) {
-          setError("Attach no more than four images.");
-          return current;
-        }
-        if (next.reduce((total, attachment) => total + attachment.byteLength, 0) > MAX_ATTACHMENT_TOTAL_BYTES) {
-          setError("Attachments must be 10 MiB or less in total.");
-          return current;
-        }
-        return next;
-      });
+      const next = [...current, ...additions];
+      attachmentsRef.current = next;
+      setAttachments(next);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "That image could not be attached.");
+      if (
+        scopeRef.current === operationScope &&
+        scopeGenerationRef.current === operationGeneration
+      ) {
+        setError(caught instanceof Error ? caught.message : "That image could not be attached.");
+      }
+    } finally {
+      if (
+        scopeRef.current === operationScope &&
+        scopeGenerationRef.current === operationGeneration
+      ) {
+        attachmentReadPendingRef.current = false;
+      }
     }
   };
 
   const submit = async () => {
     if (!canSend) return;
+    const operationScope = scopeRef.current;
+    const operationGeneration = scopeGenerationRef.current;
     setSubmitting(true);
     setError(null);
     try {
@@ -117,12 +185,29 @@ export function Composer({
         localValue,
         attachments.map(({ mimeType, fileName, dataBase64 }) => ({ mimeType, fileName, dataBase64 })),
       );
+      if (
+        scopeRef.current !== operationScope ||
+        scopeGenerationRef.current !== operationGeneration
+      ) {
+        return;
+      }
+      attachmentsRef.current = [];
       setAttachments([]);
       updateValue("");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Your message could not be sent yet.");
+      if (
+        scopeRef.current === operationScope &&
+        scopeGenerationRef.current === operationGeneration
+      ) {
+        setError(caught instanceof Error ? caught.message : "Your message could not be sent yet.");
+      }
     } finally {
-      setSubmitting(false);
+      if (
+        scopeRef.current === operationScope &&
+        scopeGenerationRef.current === operationGeneration
+      ) {
+        setSubmitting(false);
+      }
     }
   };
 
@@ -132,7 +217,12 @@ export function Composer({
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) {
+    const shouldSend =
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing &&
+      (returnBehavior === "send" || event.metaKey || event.ctrlKey);
+    if (shouldSend) {
       event.preventDefault();
       void submit();
     }
@@ -161,7 +251,17 @@ export function Composer({
           {attachments.map((attachment) => (
             <span className="dm-attachment-chip" key={attachment.id}>
               {attachment.fileName ?? "Image"}
-              <button type="button" aria-label={`Remove ${attachment.fileName ?? "image"}`} onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}>
+              <button
+                type="button"
+                aria-label={`Remove ${attachment.fileName ?? "image"}`}
+                onClick={() => {
+                  const next = attachmentsRef.current.filter(
+                    (item) => item.id !== attachment.id,
+                  );
+                  attachmentsRef.current = next;
+                  setAttachments(next);
+                }}
+              >
                 <X size={14} aria-hidden="true" />
               </button>
             </span>
@@ -207,7 +307,11 @@ export function Composer({
         </button>
       </div>
       {error && <p className="dm-composer-error" role="alert">{error}</p>}
-      <p className="dm-composer-hint">⌘↵ to send · Shift↵ for a new line</p>
+      <p className="dm-composer-hint">
+        {returnBehavior === "send"
+          ? "Return to send · Shift↵ for a new line"
+          : "⌘↵ to send · Return for a new line"}
+      </p>
     </form>
   );
 }

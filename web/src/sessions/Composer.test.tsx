@@ -15,6 +15,7 @@ describe("native session composer", () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     render(
       <Composer
+        scopeKey="runtime-a:tab:claude-a"
         value=""
         disabled={false}
         pending={false}
@@ -39,6 +40,7 @@ describe("native session composer", () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     render(
       <Composer
+        scopeKey="runtime-a:tab:claude-a"
         value="line one"
         disabled={false}
         pending={false}
@@ -61,6 +63,7 @@ describe("native session composer", () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     render(
       <Composer
+        scopeKey="runtime-a:tab:claude-a"
         value="look at this"
         disabled={false}
         pending={false}
@@ -85,6 +88,7 @@ describe("native session composer", () => {
   it("disables mutations while reconnecting without hiding the draft", () => {
     render(
       <Composer
+        scopeKey="runtime-a:tab:claude-a"
         value="preserved draft"
         disabled
         pending={false}
@@ -97,5 +101,122 @@ describe("native session composer", () => {
     expect((screen.getByDisplayValue("preserved draft") as HTMLTextAreaElement).disabled).toBe(true);
     expect(screen.getByText(/reconnecting/i).isConnected).toBe(true);
     expect((screen.getByRole("button", { name: /send/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("sends on plain Return only after the user chooses that preference", () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value="send this"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        returnBehavior="send"
+        onChange={() => {}}
+        onSubmit={onSubmit}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("textbox", { name: /message/i }), {
+      key: "Enter",
+    });
+    expect(onSubmit).toHaveBeenCalledWith("send this", []);
+  });
+
+  it("clears attachment and in-flight UI state when the session scope changes", async () => {
+    const user = userEvent.setup();
+    let resolveFirstSubmit: () => void = () => {};
+    const firstSubmit = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveFirstSubmit = resolve;
+        }),
+    );
+    const secondSubmit = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value="message for A"
+        disabled={false}
+        pending={false}
+        supportsAttachments
+        onChange={() => {}}
+        onSubmit={firstSubmit}
+      />,
+    );
+
+    await user.upload(
+      screen.getByLabelText(/attach image/i),
+      new File([new Uint8Array([1, 2, 3])], "a-only.png", {
+        type: "image/png",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    expect(firstSubmit).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <Composer
+        scopeKey="runtime-a:tab:claude-b"
+        value="message for B"
+        disabled={false}
+        pending={false}
+        supportsAttachments
+        onChange={() => {}}
+        onSubmit={secondSubmit}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText("a-only.png")).toBeNull();
+      expect(
+        (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement)
+          .value,
+      ).toBe("message for B");
+      expect(
+        (screen.getByRole("button", { name: /send message/i }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
+
+    resolveFirstSubmit();
+    await waitFor(() => {
+      expect(
+        (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement)
+          .value,
+      ).toBe("message for B");
+    });
+  });
+
+  it("rejects an oversized selection before reading any image bytes", async () => {
+    const user = userEvent.setup();
+    const first = new File([new Uint8Array(4 * 1024 * 1024)], "first.png", {
+      type: "image/png",
+    });
+    const second = new File([new Uint8Array(2 * 1024 * 1024)], "second.png", {
+      type: "image/png",
+    });
+    const firstRead = vi.fn().mockResolvedValue(new ArrayBuffer(0));
+    const secondRead = vi.fn().mockResolvedValue(new ArrayBuffer(0));
+    Object.defineProperty(first, "arrayBuffer", { value: firstRead });
+    Object.defineProperty(second, "arrayBuffer", { value: secondRead });
+
+    render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value=""
+        disabled={false}
+        pending={false}
+        supportsAttachments
+        onChange={() => {}}
+        onSubmit={async () => {}}
+      />,
+    );
+    await user.upload(screen.getByLabelText(/attach image/i), [first, second]);
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(
+      /5 MiB or less in total/i,
+    );
+    expect(firstRead).not.toHaveBeenCalled();
+    expect(secondRead).not.toHaveBeenCalled();
   });
 });

@@ -16,12 +16,14 @@ import { useStore } from "../store";
 interface ProjectScreenProps {
   workspace: WebWorkspaceSnapshot;
   projectId: string;
+  connected: boolean;
   onNavigate(route: AppRoute): void;
 }
 
 export function ProjectScreen({
   workspace,
   projectId,
+  connected,
   onNavigate,
 }: ProjectScreenProps) {
   const sendAction = useStore((state) => state.sendAction);
@@ -56,6 +58,7 @@ export function ProjectScreen({
   );
 
   const launch = (kind: "claude" | "codex") => {
+    if (!connected) return;
     void launchAiTab(project.id, kind).then(() => {
       const key = useStore.getState().activeSessionKey;
       if (key) onNavigate(routeForSessionKey(key));
@@ -76,11 +79,11 @@ export function ProjectScreen({
       </header>
       <div className="dm-screen-scroll">
         <section className="dm-launch-grid" aria-label="Start an AI session">
-          <button type="button" onClick={() => launch("claude")}>
+          <button type="button" disabled={!connected} onClick={() => launch("claude")}>
             <span className="dm-launch-icon dm-claude" aria-hidden="true"><Bot size={22} /></span>
             <span><strong>New Claude</strong><small>Start coding</small></span>
           </button>
-          <button type="button" onClick={() => launch("codex")}>
+          <button type="button" disabled={!connected} onClick={() => launch("codex")}>
             <span className="dm-launch-icon dm-codex" aria-hidden="true"><TerminalSquare size={22} /></span>
             <span><strong>New Codex</strong><small>Start coding</small></span>
           </button>
@@ -99,7 +102,7 @@ export function ProjectScreen({
                     type="button"
                     className="dm-simple-row"
                     onClick={() => {
-                      void openAiTab(tab.id);
+                      if (connected) void openAiTab(tab.id);
                       onNavigate(routeForSessionKey(key));
                     }}
                   >
@@ -144,11 +147,13 @@ export function ProjectScreen({
                           <button
                             type="button"
                             aria-label={`Restart ${command.label}`}
+                            disabled={!connected}
                             onClick={() => sendAction({ type: "restartServer", command_id: command.id })}
                           ><RefreshCw size={18} /></button>
                           <button
                             type="button"
                             aria-label={`Stop ${command.label}`}
+                            disabled={!connected}
                             onClick={() => sendAction({ type: "stopServer", command_id: command.id })}
                           ><CircleStop size={19} /></button>
                         </>
@@ -156,6 +161,7 @@ export function ProjectScreen({
                         <button
                           type="button"
                           aria-label={`Start ${command.label}`}
+                          disabled={!connected}
                           onClick={() => sendAction({ type: "startServer", command_id: command.id })}
                         ><Play size={19} fill="currentColor" /></button>
                       )}
@@ -175,6 +181,7 @@ export function ProjectScreen({
                 <button
                   key={connection.id}
                   type="button"
+                  disabled={!connected}
                   className="dm-simple-row"
                   onClick={() => connectSsh(connection.id)}
                 >

@@ -157,46 +157,23 @@ Alternatively, you can right-click the app in Finder, choose **Open**, and click
 
 This workaround is needed until proper Apple code signing and notarization are added to the release workflow.
 
-## Browser Web UI
+## Mobile Web App
 
-DevManager can host a second client over plain HTTP so any browser on the same LAN — phones, tablets, another laptop — can see terminals and drive servers without installing the native app.
+DevManager includes an iPhone-first web app for working with the same live sessions managed by the native desktop process. Claude, Codex, servers, shell, and SSH are rendered as wrapping, selectable native web views; the terminal grid is loaded only for interactions that genuinely require terminal cursor semantics.
 
-### Enable
+The native DevManager process remains the source of truth. App switching, phone locking, browser suspension, and ordinary network loss reconnect automatically and return to the current host state without a Resume, Reload, or Take Control button. Closing the web app does not close sessions. Restarting the native host intentionally starts a new blank web runtime.
 
-1. In the desktop app, open **Settings → Browser Web UI**.
-2. Flip **Enable web UI**. The panel shows the listener URL (defaults to `http://<your-lan-ip>:43872`) and the web pair token.
-3. On another device, visit `http://<your-lan-ip>:43872/pair?t=<web-pair-token>`. The host sets a long-lived `HttpOnly` cookie for that DevManager instance and redirects to `/`.
-4. Subsequent visits to that same DevManager from the paired browser load directly — no token required. If you run multiple DevManager web listeners on the same host, each instance now keeps its own remembered browser auth.
+### Connect and install
 
-### Usage
+1. In the desktop app, open **Settings → Browser Web UI** and enable it.
+2. Open the displayed pairing link once on the phone. Pairing sets a long-lived, host-specific `HttpOnly` browser cookie.
+3. For LAN diagnostics, the displayed `http://<lan-ip>:43872` URL can run the control UI directly.
+4. For Home Screen installation, attachments that need secure browser APIs, and notifications, expose DevManager through a trusted HTTPS tunnel or reverse proxy. Never publish the raw listener directly to the internet.
+5. In iPhone Safari, open the HTTPS address, choose **Share → Add to Home Screen**, then launch DevManager from its Home Screen icon.
 
-- The sidebar mirrors the desktop app's project tree. Tap a command row to open its terminal. Tap **Start** (hover to reveal) to launch a server.
-- The top-right **View / Control** toggle claims keyboard control. While the browser has control, the desktop app runs in viewer mode; toggle back to hand control over.
-- Below the terminal on mobile, a helper row surfaces Esc, Tab, Ctrl (sticky), arrow keys, and common shell chars that a phone keyboard lacks.
-- The **Running ports** section on the empty screen lists every dev server that has `inUse = true` and links to each with the browser's current hostname substituted — so `http://<lan-ip>:5173` just works when the dev server is bound to `0.0.0.0`.
+The installed app opens on Sessions, highlights work needing attention, and labels every item with its project. It restores the last valid session only after the host confirms that the same runtime and session still exist. Normal prompts use a real multiline text area, so iOS dictation, paste, selection, autocorrection, and the software keyboard work normally.
 
-### Remote access beyond the LAN
-
-The web listener ships as plain HTTP only. For access from outside the LAN, front it with a tunnel that terminates TLS upstream — Tailscale Funnel and Cloudflare Tunnel are both known good. Do **not** port-forward the raw `:43872` listener to the public internet.
-
-### Architecture notes
-
-- The listener is an Axum + Tokio server embedded inside `RemoteHostService` (`src/remote/web/`). It runs alongside — or instead of — the TCP remote-host listener on `:43871`.
-- WebSocket frames at `/api/ws` carry a simplified JSON protocol that reuses `RemoteAction` / `RemoteWorkspaceSnapshot` / `RemoteWorkspaceDelta` verbatim. Session output rides binary frames for zero-overhead streaming.
-- The React + Vite + Tailwind SPA lives under `web/`. It is embedded into the packaged binary via `rust-embed`, so a single `devmanager.exe` ships the entire web client.
-- `build.rs` auto-runs `npm install && npm run build` in `web/` on a fresh clone when the committed bundle stub is detected. CI explicitly runs `npm ci && npm run build` as a workflow step before `cargo packager`.
-
-### Developing the web UI
-
-Iterating on the SPA outside the packaged flow:
-
-```powershell
-cd web
-npm install
-npm run dev
-```
-
-Vite's dev server (port 5199) renders the SPA in isolation. Point it at a running devmanager instance by manually opening `http://localhost:5199/?` and the embedded WS client connects back to the devmanager on port 43872. Rebuild the embedded bundle with `npm run build` when you want the packaged binary to pick up your changes — or let `build.rs` rebuild on the next clean `cargo build` if you've only got the stub.
+See [Mobile Web App operations](docs/REMOTE_MOBILE_WEB.md) for lifecycle guarantees, HTTPS setup, notification behavior, adapter fallback, security boundaries, and development commands.
 
 ## Notes
 

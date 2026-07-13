@@ -99,6 +99,8 @@ export interface WebSessionSummary {
   attention: SemanticAttention;
   attentionCount: number;
   adapterHealth: SemanticAdapterHealth;
+  /** Additive host hint; absent older hosts are ordinary log-only servers. */
+  interactiveShell?: boolean;
   rawRequired: boolean;
   oldestSequence: number;
   latestSequence: number;

@@ -115,6 +115,7 @@ export interface StoreState {
     attachments?: ComposerAttachment[],
   ): Promise<ComposerAccepted>;
   sendAction(action: RemoteAction): void;
+  clearLastError(): void;
   setActiveProject(projectId: string | null): void;
   setActiveSession(sessionIdentifier: string | null): void;
   setConnectionVisibility(visible: boolean): void;
@@ -1485,6 +1486,10 @@ export const useStore = create<StoreState>((set, get) => {
               error instanceof Error ? error.message : "Remote action failed.",
           });
         });
+    },
+
+    clearLastError() {
+      set({ lastError: null });
     },
 
     setActiveProject(projectId) {

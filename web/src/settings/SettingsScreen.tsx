@@ -1,15 +1,21 @@
 import {
   Bell,
+  Keyboard,
   LockKeyhole,
   MonitorSmartphone,
   MoonStar,
   Radio,
   Smartphone,
+  SquareTerminal,
 } from "lucide-react";
 
 import type { WsStatus } from "../api/ws";
 import { isStandaloneDisplayMode } from "../app/restore";
 import { useDensityPreference } from "./densityPreference";
+import {
+  useReturnBehavior,
+  useTerminalPreference,
+} from "./inputPreference";
 
 interface SettingsScreenProps {
   status: WsStatus;
@@ -26,6 +32,8 @@ export function SettingsScreen({ status }: SettingsScreenProps) {
   const secure = globalThis.isSecureContext === true;
   const installed = isStandaloneDisplayMode();
   const [density, setDensity] = useDensityPreference();
+  const [returnBehavior, setReturnBehavior] = useReturnBehavior();
+  const [terminalPreference, setTerminalPreference] = useTerminalPreference();
 
   return (
     <section className="dm-screen" aria-labelledby="settings-title">
@@ -54,6 +62,30 @@ export function SettingsScreen({ status }: SettingsScreenProps) {
                 <option value="calm">Calm</option>
                 <option value="minimal">Minimal</option>
                 <option value="full">Full detail</option>
+              </select>
+            </label>
+            <label className="dm-setting-row">
+              <span className="dm-setting-icon dm-icon-green" aria-hidden="true"><Keyboard size={18} /></span>
+              <span className="dm-row-copy"><strong>Return key</strong><small>The send button always works</small></span>
+              <select
+                aria-label="Return key behavior"
+                value={returnBehavior}
+                onChange={(event) => setReturnBehavior(event.currentTarget.value as typeof returnBehavior)}
+              >
+                <option value="newline">New line</option>
+                <option value="send">Send message</option>
+              </select>
+            </label>
+            <label className="dm-setting-row">
+              <span className="dm-setting-icon dm-icon-gray" aria-hidden="true"><SquareTerminal size={18} /></span>
+              <span className="dm-row-copy"><strong>Terminal view</strong><small>Advanced session display</small></span>
+              <select
+                aria-label="Terminal view preference"
+                value={terminalPreference}
+                onChange={(event) => setTerminalPreference(event.currentTarget.value as typeof terminalPreference)}
+              >
+                <option value="automatic">Automatic</option>
+                <option value="raw">Open raw terminal</option>
               </select>
             </label>
           </div>

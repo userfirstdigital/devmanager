@@ -107,9 +107,82 @@ button:disabled {
 }
 
 .dm-app-stage {
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+
+.dm-app-notices {
+  position: absolute;
+  z-index: 40;
+  top: calc(var(--safe-top) + 8px);
+  right: 12px;
+  left: 12px;
+  display: flex;
+  max-width: 620px;
+  margin: 0 auto;
+  flex-direction: column;
+  gap: 7px;
+  pointer-events: none;
+}
+
+.dm-connection-banner,
+.dm-app-error {
+  display: flex;
+  min-height: 48px;
+  padding: 7px 11px;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid color-mix(in srgb, var(--dm-separator) 86%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--dm-surface) 92%, transparent);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.16);
+  -webkit-backdrop-filter: blur(22px) saturate(170%);
+  backdrop-filter: blur(22px) saturate(170%);
+  pointer-events: auto;
+}
+
+.dm-connection-banner > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.dm-connection-banner strong,
+.dm-app-error span {
+  color: var(--dm-label);
+  font-size: 0.79rem;
+  line-height: 1.25;
+}
+
+.dm-connection-banner small {
+  color: var(--dm-secondary);
+  font-size: 0.7rem;
+}
+
+.dm-connection-banner svg {
+  color: var(--dm-orange);
+}
+
+.dm-app-error {
+  color: var(--dm-red);
+}
+
+.dm-app-error span {
+  flex: 1 1 auto;
+}
+
+.dm-app-error button {
+  display: grid;
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  margin: -5px -7px -5px 0;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--dm-secondary);
 }
 
 .dm-sidebar {
@@ -776,7 +849,7 @@ button:disabled {
 .dm-primary-inline-button,
 .dm-interrupt-button {
   display: inline-flex;
-  min-height: 34px;
+  min-height: 44px;
   padding: 0 12px;
   align-items: center;
   gap: 6px;
@@ -786,6 +859,74 @@ button:disabled {
   color: var(--dm-accent);
   font-size: 0.78rem;
   font-weight: 620;
+}
+
+.dm-primary-inline-button:disabled,
+.dm-interrupt-button:disabled,
+.dm-server-controls button:disabled,
+.dm-session-actions-menu button:disabled {
+  opacity: 0.45;
+}
+
+.dm-session-action-strip-end {
+  position: relative;
+}
+
+.dm-session-actions-menu {
+  position: relative;
+}
+
+.dm-session-actions-menu > summary {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  list-style: none;
+  border-radius: 50%;
+  color: var(--dm-accent);
+  background: var(--dm-surface);
+  box-shadow: var(--dm-shadow);
+  cursor: pointer;
+}
+
+.dm-session-actions-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.dm-session-actions-menu > summary[aria-disabled="true"] {
+  opacity: 0.45;
+}
+
+.dm-session-actions-menu > div {
+  position: absolute;
+  z-index: 12;
+  top: 50px;
+  right: 0;
+  display: flex;
+  min-width: 174px;
+  padding: 5px;
+  flex-direction: column;
+  border: 1px solid var(--dm-separator);
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--dm-surface) 96%, transparent);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.22);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+}
+
+.dm-session-actions-menu button {
+  display: flex;
+  min-height: 44px;
+  padding: 0 11px;
+  align-items: center;
+  gap: 9px;
+  border-radius: 9px;
+  color: var(--dm-label);
+  text-align: left;
+}
+
+.dm-session-actions-menu button.is-destructive {
+  color: var(--dm-red);
 }
 
 .dm-interrupt-button {
@@ -895,7 +1036,7 @@ button:disabled {
 .dm-event-card-toggle {
   display: flex;
   width: 100%;
-  min-height: 40px;
+  min-height: 44px;
   padding: 8px 11px;
   align-items: center;
   gap: 8px;
@@ -1053,8 +1194,8 @@ button:disabled {
   display: grid;
   position: relative;
   flex: 0 0 auto;
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border-radius: 50%;
 }
@@ -1122,7 +1263,7 @@ button:disabled {
 .dm-attachment-chip {
   display: inline-flex;
   max-width: 220px;
-  min-height: 30px;
+  min-height: 44px;
   padding: 4px 4px 4px 10px;
   align-items: center;
   gap: 4px;
@@ -1136,8 +1277,9 @@ button:disabled {
 
 .dm-attachment-chip button {
   display: grid;
-  width: 24px;
-  height: 24px;
+  width: 44px;
+  height: 44px;
+  margin: -4px -4px -4px 0;
   place-items: center;
   border-radius: 50%;
   background: transparent;
@@ -1201,7 +1343,7 @@ button:disabled {
 
 .dm-server-controls button {
   display: inline-flex;
-  min-height: 36px;
+  min-height: 44px;
   padding: 0 13px;
   align-items: center;
   gap: 6px;

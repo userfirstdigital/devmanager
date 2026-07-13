@@ -33,6 +33,7 @@ function CompactCard({
   defaultExpanded,
   forceExpanded,
   mono = false,
+  sequence,
 }: {
   title: string;
   detail: ReactNode;
@@ -40,13 +41,18 @@ function CompactCard({
   defaultExpanded: boolean;
   forceExpanded: boolean;
   mono?: boolean;
+  sequence: number;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded || forceExpanded);
   const shown = expanded;
   const StatusIcon =
     state === "failure" ? CircleAlert : state === "success" ? CircleCheck : CircleEllipsis;
   return (
-    <article className={`dm-event-card${shown ? " is-expanded" : ""}`} data-state={state}>
+    <article
+      className={`dm-event-card${shown ? " is-expanded" : ""}`}
+      data-state={state}
+      data-event-sequence={sequence}
+    >
       <button
         type="button"
         className="dm-event-card-toggle"
@@ -66,11 +72,12 @@ function cardForEvent(event: SemanticEvent, density: InterfaceDensity): ReactNod
   const full = density === "full";
   switch (event.kind) {
     case "reasoning":
-      return <CompactCard title="Thinking" detail={event.summary} defaultExpanded={false} forceExpanded={full} />;
+      return <CompactCard sequence={event.sequence} title="Thinking" detail={event.summary} defaultExpanded={false} forceExpanded={full} />;
     case "tool": {
       const failed = event.state === "failed";
       return (
         <CompactCard
+          sequence={event.sequence}
           title={`${event.name} · ${event.state}`}
           detail={event.summary || "No additional detail"}
           state={failed ? "failure" : event.state === "completed" ? "success" : "active"}
@@ -80,10 +87,11 @@ function cardForEvent(event: SemanticEvent, density: InterfaceDensity): ReactNod
       );
     }
     case "diff":
-      return <CompactCard title="Code changes" detail={<pre>{event.unified_diff}</pre>} defaultExpanded={false} forceExpanded={full} mono />;
+      return <CompactCard sequence={event.sequence} title="Code changes" detail={<pre>{event.unified_diff}</pre>} defaultExpanded={false} forceExpanded={full} mono />;
     case "command":
       return (
         <CompactCard
+          sequence={event.sequence}
           title={event.exit_code === null ? "Command running" : `Command exited ${event.exit_code}`}
           detail={<code>$ {event.text}</code>}
           state={event.exit_code === null ? "active" : event.exit_code === 0 ? "success" : "failure"}
@@ -93,11 +101,11 @@ function cardForEvent(event: SemanticEvent, density: InterfaceDensity): ReactNod
         />
       );
     case "output":
-      return <CompactCard title={event.stream === "stderr" ? "Error output" : "Output"} detail={<pre>{event.text}</pre>} state={event.stream === "stderr" ? "failure" : undefined} defaultExpanded={event.stream === "stderr"} forceExpanded={full} mono />;
+      return <CompactCard sequence={event.sequence} title={event.stream === "stderr" ? "Error output" : "Output"} detail={<pre>{event.text}</pre>} state={event.stream === "stderr" ? "failure" : undefined} defaultExpanded={event.stream === "stderr"} forceExpanded={full} mono />;
     case "status":
-      return <CompactCard title={event.state} detail={event.detail ?? "Session status updated"} defaultExpanded={false} forceExpanded={full} />;
+      return <CompactCard sequence={event.sequence} title={event.state} detail={event.detail ?? "Session status updated"} defaultExpanded={false} forceExpanded={full} />;
     case "terminalMode":
-      return <CompactCard title={event.raw_required ? "Terminal view needed" : "Native view restored"} detail={event.raw_required ? "This interaction needs a terminal grid." : "This session can be read as native text again."} defaultExpanded={false} forceExpanded={full} />;
+      return <CompactCard sequence={event.sequence} title={event.raw_required ? "Terminal view needed" : "Native view restored"} detail={event.raw_required ? "This interaction needs a terminal grid." : "This session can be read as native text again."} defaultExpanded={false} forceExpanded={full} />;
     default:
       return null;
   }
@@ -111,11 +119,11 @@ export function EventRenderer({
   density: InterfaceDensity;
 }) {
   if (event.kind === "userMessage") {
-    return <article className="dm-message dm-message-user"><p>{event.text}</p></article>;
+    return <article className="dm-message dm-message-user" data-event-sequence={event.sequence}><p>{event.text}</p></article>;
   }
   if (event.kind === "assistantMessage") {
     return (
-      <article className="dm-message dm-message-assistant" aria-busy={event.streaming || undefined}>
+      <article className="dm-message dm-message-assistant" data-event-sequence={event.sequence} aria-busy={event.streaming || undefined}>
         <p>{event.text}</p>
         {event.streaming && <span className="dm-streaming-dot" aria-label="Responding" />}
       </article>
@@ -123,7 +131,7 @@ export function EventRenderer({
   }
   if (event.kind === "question") {
     return (
-      <article className="dm-question-card">
+      <article className="dm-question-card" data-event-sequence={event.sequence}>
         <CircleAlert size={19} aria-hidden="true" />
         <div>
           <strong>Input needed</strong>
@@ -137,7 +145,7 @@ export function EventRenderer({
   }
   if (event.kind === "error") {
     return (
-      <article className="dm-error-card" role="alert">
+      <article className="dm-error-card" data-event-sequence={event.sequence} role="alert">
         <CircleAlert size={19} aria-hidden="true" />
         <div><strong>Something needs attention</strong><p>{event.message}</p></div>
       </article>
@@ -146,7 +154,7 @@ export function EventRenderer({
 
   const card = cardForEvent(event, density);
   return card ? <>{card}</> : (
-    <article className="dm-event-card is-expanded">
+    <article className="dm-event-card is-expanded" data-event-sequence={event.sequence}>
       <div className="dm-event-card-toggle"><Terminal size={17} aria-hidden="true" /><span>Session activity</span></div>
     </article>
   );

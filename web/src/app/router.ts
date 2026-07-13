@@ -103,6 +103,13 @@ export function routesEqual(left: AppRoute, right: AppRoute): boolean {
   return hrefForRoute(left) === hrefForRoute(right);
 }
 
+export function isCanonicalRouteLocation(
+  route: AppRoute,
+  pathnameAndSearch: string,
+): boolean {
+  return pathnameAndSearch === hrefForRoute(route);
+}
+
 export function currentBrowserRoute(): AppRoute {
   if (typeof window === "undefined") return SESSIONS_ROUTE;
   return parseRoute(`${window.location.pathname}${window.location.search}`);

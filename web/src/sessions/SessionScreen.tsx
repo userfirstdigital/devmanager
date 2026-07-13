@@ -12,10 +12,14 @@ import {
 import type { WsStatus } from "../api/ws";
 import { clearOtherRuntimes, loadDraft, removeDraft, saveDraft } from "../drafts/draftStore";
 import { useDensityPreference } from "../settings/densityPreference";
+import {
+  useReturnBehavior,
+  useTerminalPreference,
+} from "../settings/inputPreference";
 import { useStore } from "../store";
 import { Composer } from "./Composer";
 import { describeSession } from "./sessionModel";
-import { resolveViewMode } from "./viewMode";
+import { resolveNativeSessionView, resolveViewMode } from "./viewMode";
 import { AiSessionView } from "./views/AiSessionView";
 import { CommandSessionView } from "./views/CommandSessionView";
 import { RawTerminalView } from "./views/RawTerminalView";
@@ -87,8 +91,15 @@ export function SessionScreen({
   const sendAction = useStore((state) => state.sendAction);
   const restartAiTab = useStore((state) => state.restartAiTab);
   const connectSsh = useStore((state) => state.connectSsh);
+  const restartSsh = useStore((state) => state.restartSsh);
+  const disconnectSsh = useStore((state) => state.disconnectSsh);
+  const foregroundConnection = useStore((state) => state.foregroundConnection);
   const [density] = useDensityPreference();
-  const [terminalPinned, setTerminalPinned] = useState(false);
+  const [returnBehavior] = useReturnBehavior();
+  const [terminalPreference] = useTerminalPreference();
+  const [terminalPinned, setTerminalPinned] = useState(
+    terminalPreference === "raw",
+  );
   const latestDraft = useRef("");
   const loadedDraftKey = useRef<string | null>(null);
 
@@ -120,7 +131,10 @@ export function SessionScreen({
     return () => globalThis.removeEventListener?.("pagehide", onPageHide);
   }, [stableSessionKey, workspace.runtimeInstanceId]);
 
-  useEffect(() => setTerminalPinned(false), [stableSessionKey, workspace.runtimeInstanceId]);
+  useEffect(
+    () => setTerminalPinned(terminalPreference === "raw"),
+    [stableSessionKey, terminalPreference, workspace.runtimeInstanceId],
+  );
 
   if (!stableSessionKey || !summary || !item) {
     return <SessionUnavailable onNavigate={onNavigate} />;
@@ -129,6 +143,10 @@ export function SessionScreen({
   const connected = status.kind === "open";
   const live = isLiveStatus(summary.status);
   const ai = summary.kind === "claude" || summary.kind === "codex";
+  const nativeView = resolveNativeSessionView(
+    summary.kind,
+    summary.interactiveShell === true,
+  );
   const viewMode = resolveViewMode({
     adapterHealth: summary.adapterHealth,
     ai,
@@ -150,10 +168,13 @@ export function SessionScreen({
       : null;
   const composer = (
     <Composer
+      key={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
+      scopeKey={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
       value={draft}
       disabled={!connected || !live}
       pending={mutationPending}
       supportsAttachments={ai}
+      returnBehavior={returnBehavior}
       placeholder={ai ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}` : "Enter a command"}
       note={controlNote}
       onFocus={prepareComposer}
@@ -171,13 +192,14 @@ export function SessionScreen({
   let content;
   if (viewMode === "terminal") {
     content = <RawTerminalView sessionId={summary.sessionId} />;
-  } else if (ai) {
+  } else if (nativeView === "ai") {
     content = (
       <AiSessionView
         events={events}
         density={density}
         adapterHealth={summary.adapterHealth}
         running={live}
+        actionsDisabled={!connected}
         composer={composer}
         onInterrupt={() => interruptSession(stableSessionKey)}
         onRestart={() => {
@@ -185,7 +207,7 @@ export function SessionScreen({
         }}
       />
     );
-  } else if (summary.kind === "server") {
+  } else if (nativeView === "server") {
     content = (
       <ServerSessionView
         session={summary}
@@ -193,6 +215,7 @@ export function SessionScreen({
         port={port}
         events={events}
         density={density}
+        actionsDisabled={!connected}
         onStart={() => commandId && sendAction({ type: "startServer", command_id: commandId })}
         onStop={() => commandId && sendAction({ type: "stopServer", command_id: commandId })}
         onRestart={() => commandId && sendAction({ type: "restartServer", command_id: commandId })}
@@ -204,6 +227,7 @@ export function SessionScreen({
         events={events}
         density={density}
         connected={live}
+        actionsDisabled={!connected}
         composer={composer}
         onReconnect={
           summary.kind === "ssh" && tab?.connectionId
@@ -212,6 +236,21 @@ export function SessionScreen({
               ? () => sendAction({ type: "startServer", command_id: commandId })
               : undefined
         }
+        onRestart={
+          summary.kind === "ssh" && tab?.connectionId
+            ? () => restartSsh(tab.connectionId as string)
+            : summary.kind === "server" && commandId
+              ? () => sendAction({ type: "restartServer", command_id: commandId })
+              : undefined
+        }
+        onDisconnect={
+          summary.kind === "ssh" && tab?.connectionId
+            ? () => disconnectSsh(tab.connectionId as string)
+            : summary.kind === "server" && commandId
+              ? () => sendAction({ type: "stopServer", command_id: commandId })
+              : undefined
+        }
+        disconnectLabel={summary.kind === "server" ? "Stop" : "Disconnect"}
       />
     );
   }
@@ -231,7 +270,16 @@ export function SessionScreen({
           className="dm-session-mode-button"
           aria-label={summary.rawRequired ? "Terminal grid required" : viewMode === "terminal" ? "Use native text view" : "Use raw terminal"}
           disabled={summary.rawRequired}
-          onClick={() => setTerminalPinned((current) => !current)}
+          onClick={() => {
+            if (viewMode === "terminal") {
+              setTerminalPinned(false);
+              // Resume from the latest semantic cursor so output produced
+              // while xterm was visible is reconciled before native render.
+              foregroundConnection();
+            } else {
+              setTerminalPinned(true);
+            }
+          }}
         >
           {summary.rawRequired ? <WifiOff size={19} /> : viewMode === "terminal" ? <Text size={19} /> : <Columns3 size={19} />}
         </button>

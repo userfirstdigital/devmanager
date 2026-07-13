@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveViewMode } from "./viewMode";
+import { resolveNativeSessionView, resolveViewMode } from "./viewMode";
 
 describe("raw terminal fallback", () => {
   it("stays native when an AI adapter degrades", () => {
@@ -11,5 +11,12 @@ describe("raw terminal fallback", () => {
   it("uses xterm only for terminal-grid interactions or an explicit pin", () => {
     expect(resolveViewMode({ adapterHealth: "degraded", ai: true, gridInteractionRequired: true, pinned: false })).toBe("terminal");
     expect(resolveViewMode({ adapterHealth: "healthy", ai: false, gridInteractionRequired: false, pinned: true })).toBe("terminal");
+  });
+
+  it("routes interactive servers through the command timeline", () => {
+    expect(resolveNativeSessionView("server", false)).toBe("server");
+    expect(resolveNativeSessionView("server", true)).toBe("command");
+    expect(resolveNativeSessionView("ssh", false)).toBe("command");
+    expect(resolveNativeSessionView("claude", false)).toBe("ai");
   });
 });

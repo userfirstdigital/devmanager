@@ -16,6 +16,7 @@ export function ServerSessionView({
   port,
   events,
   density,
+  actionsDisabled,
   onStart,
   onStop,
   onRestart,
@@ -25,6 +26,7 @@ export function ServerSessionView({
   port: WebPortStatus | null;
   events: SemanticEvent[];
   density: InterfaceDensity;
+  actionsDisabled: boolean;
   onStart(): void;
   onStop(): void;
   onRestart(): void;
@@ -40,11 +42,11 @@ export function ServerSessionView({
       <div className="dm-server-controls">
         {live ? (
           <>
-            <button type="button" onClick={onRestart}><RefreshCw size={17} aria-hidden="true" />Restart</button>
-            <button type="button" className="is-destructive" onClick={onStop}><CircleStop size={18} aria-hidden="true" />Stop</button>
+            <button type="button" disabled={actionsDisabled} onClick={onRestart}><RefreshCw size={17} aria-hidden="true" />Restart</button>
+            <button type="button" disabled={actionsDisabled} className="is-destructive" onClick={onStop}><CircleStop size={18} aria-hidden="true" />Stop</button>
           </>
         ) : (
-          <button type="button" className="is-primary" onClick={onStart}><Play size={16} fill="currentColor" aria-hidden="true" />Start</button>
+          <button type="button" disabled={actionsDisabled} className="is-primary" onClick={onStart}><Play size={16} fill="currentColor" aria-hidden="true" />Start</button>
         )}
       </div>
       <Timeline

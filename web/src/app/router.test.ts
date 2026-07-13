@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   hrefForRoute,
+  isCanonicalRouteLocation,
   parseRoute,
   routeForSessionKey,
   routesEqual,
@@ -43,5 +44,12 @@ describe("app router", () => {
     expect(href).toBe("/session/server/dev%2Fweb%20%231");
     expect(parseRoute(href)).toEqual(route);
     expect(routesEqual(parseRoute(href), route)).toBe(true);
+  });
+
+  it("canonicalizes fallback and manifest entry URLs after routing", () => {
+    const sessions = { name: "sessions" } as const;
+    expect(isCanonicalRouteLocation(sessions, "/")).toBe(false);
+    expect(isCanonicalRouteLocation(sessions, "/sessions?source=pwa")).toBe(false);
+    expect(isCanonicalRouteLocation(sessions, "/sessions")).toBe(true);
   });
 });

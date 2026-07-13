@@ -10,6 +10,7 @@ export function AiSessionView({
   density,
   adapterHealth,
   running,
+  actionsDisabled,
   composer,
   onInterrupt,
   onRestart,
@@ -18,6 +19,7 @@ export function AiSessionView({
   density: InterfaceDensity;
   adapterHealth: SemanticAdapterHealth;
   running: boolean;
+  actionsDisabled: boolean;
   composer: ReactNode;
   onInterrupt(): void;
   onRestart(): void;
@@ -32,11 +34,11 @@ export function AiSessionView({
       )}
       <div className="dm-session-action-strip">
         {running ? (
-          <button type="button" className="dm-interrupt-button" onClick={onInterrupt}>
+          <button type="button" className="dm-interrupt-button" disabled={actionsDisabled} onClick={onInterrupt}>
             <CircleStop size={17} aria-hidden="true" /> Interrupt
           </button>
         ) : (
-          <button type="button" className="dm-primary-inline-button" onClick={onRestart}>
+          <button type="button" className="dm-primary-inline-button" disabled={actionsDisabled} onClick={onRestart}>
             <Play size={16} fill="currentColor" aria-hidden="true" /> Reopen session
           </button>
         )}

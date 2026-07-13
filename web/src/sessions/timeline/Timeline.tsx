@@ -9,6 +9,38 @@ import {
 
 const FOLLOW_DISTANCE_PX = 96;
 
+interface TimelineAnchorCalculation {
+  scrollTop: number;
+  previousAnchorOffset: number;
+  nextAnchorOffset: number;
+}
+
+export function preserveTimelineAnchor({
+  scrollTop,
+  previousAnchorOffset,
+  nextAnchorOffset,
+}: TimelineAnchorCalculation): number {
+  return Math.max(0, scrollTop + nextAnchorOffset - previousAnchorOffset);
+}
+
+interface VisibleAnchor {
+  sequence: string;
+  offset: number;
+}
+
+function captureVisibleAnchor(element: HTMLDivElement): VisibleAnchor | null {
+  const viewportTop = element.getBoundingClientRect().top;
+  const candidates = element.querySelectorAll<HTMLElement>("[data-event-sequence]");
+  for (const candidate of candidates) {
+    const rect = candidate.getBoundingClientRect();
+    if (rect.bottom >= viewportTop) {
+      const sequence = candidate.dataset.eventSequence;
+      if (sequence) return { sequence, offset: rect.top - viewportTop };
+    }
+  }
+  return null;
+}
+
 function coalesceOutput(events: SemanticEvent[]): SemanticEvent[] {
   const result: SemanticEvent[] = [];
   for (const event of events) {
@@ -43,6 +75,7 @@ export function Timeline({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+  const visibleAnchorRef = useRef<VisibleAnchor | null>(null);
   const visibleEvents = useMemo(
     () => coalesceOutput(visibleEventsForDensity(events, density)),
     [density, events],
@@ -50,7 +83,30 @@ export function Timeline({
 
   useLayoutEffect(() => {
     const element = scrollRef.current;
-    if (element && followRef.current) element.scrollTop = element.scrollHeight;
+    if (!element) return;
+    const previousAnchor = visibleAnchorRef.current;
+    visibleAnchorRef.current = null;
+    if (followRef.current) {
+      element.scrollTop = element.scrollHeight;
+    } else if (previousAnchor) {
+      const anchored = element.querySelector<HTMLElement>(
+        `[data-event-sequence="${previousAnchor.sequence}"]`,
+      );
+      if (anchored) {
+        const nextOffset =
+          anchored.getBoundingClientRect().top - element.getBoundingClientRect().top;
+        element.scrollTop = preserveTimelineAnchor({
+          scrollTop: element.scrollTop,
+          previousAnchorOffset: previousAnchor.offset,
+          nextAnchorOffset: nextOffset,
+        });
+      }
+    }
+    return () => {
+      if (!followRef.current) {
+        visibleAnchorRef.current = captureVisibleAnchor(element);
+      }
+    };
   }, [visibleEvents]);
 
   return (

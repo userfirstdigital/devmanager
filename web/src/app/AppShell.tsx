@@ -3,6 +3,8 @@ import {
   MonitorSmartphone,
   Settings2,
   Sparkles,
+  WifiOff,
+  X,
 } from "lucide-react";
 import type { ReactNode } from "react";
 
@@ -45,6 +47,8 @@ export interface AppShellProps {
   route: AppRoute;
   status: WsStatus;
   attentionCount: number;
+  lastError: string | null;
+  onDismissError(): void;
   onNavigate(route: AppRoute): void;
   children: ReactNode;
 }
@@ -68,6 +72,8 @@ export function AppShell({
   route,
   status,
   attentionCount,
+  lastError,
+  onDismissError,
   onNavigate,
   children,
 }: AppShellProps) {
@@ -115,7 +121,30 @@ export function AppShell({
         </div>
       </aside>
 
-      <main className="dm-app-stage">{children}</main>
+      <main className="dm-app-stage">
+        {status.kind !== "open" || lastError ? (
+          <div className="dm-app-notices">
+            {status.kind !== "open" && status.kind !== "unauthorized" ? (
+              <div className="dm-connection-banner" role="status" aria-live="polite">
+                <WifiOff size={17} aria-hidden="true" />
+                <span>
+                  <strong>Reconnecting automatically</strong>
+                  <small>Your host sessions keep running.</small>
+                </span>
+              </div>
+            ) : null}
+            {lastError ? (
+              <div className="dm-app-error" role="alert">
+                <span>{lastError}</span>
+                <button type="button" aria-label="Dismiss error" onClick={onDismissError}>
+                  <X size={18} aria-hidden="true" />
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {children}
+      </main>
 
       {!isSession ? (
         <nav className="dm-tab-bar" aria-label="App navigation">

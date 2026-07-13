@@ -440,7 +440,7 @@ describe("host runtime reconciliation", () => {
     );
     expect(
       wsClientState.instance?.discardWriterFramesForSession,
-    ).toHaveBeenCalledWith("pty-gone");
+    ).toHaveBeenCalledWith("pty-gone", "tab:gone");
   });
 
   it.each([true, false])(
@@ -554,7 +554,7 @@ describe("host runtime reconciliation", () => {
       );
       expect(
         wsClientState.instance?.discardWriterFramesForSession,
-      ).toHaveBeenCalledWith("pty-b");
+      ).toHaveBeenCalledWith("pty-b", "tab:b");
     },
   );
 
@@ -603,7 +603,7 @@ describe("host runtime reconciliation", () => {
     expect(wsClientState.instance?.cancelComposer).not.toHaveBeenCalled();
     expect(
       wsClientState.instance?.discardWriterFramesForSession,
-    ).toHaveBeenCalledWith("pty-a");
+    ).toHaveBeenCalledWith("pty-a", "tab:a");
   });
 
   it("trims journals to host retention and the browser memory cap", () => {

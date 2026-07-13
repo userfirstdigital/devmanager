@@ -5,6 +5,7 @@ import { AppShell } from "./app/AppShell";
 import {
   currentBrowserRoute,
   hrefForRoute,
+  isCanonicalRouteLocation,
   navigateBrowser,
   parseRoute,
   routesEqual,
@@ -67,6 +68,8 @@ export function App() {
   const setActiveSession = useStore((state) => state.setActiveSession);
   const activeSessionKey = useStore((state) => state.activeSessionKey);
   const pendingRoute = useStore((state) => state.pendingRoute);
+  const lastError = useStore((state) => state.lastError);
+  const clearLastError = useStore((state) => state.clearLastError);
   const [route, setRoute] = useState<AppRoute>(() => currentBrowserRoute());
   const initialRoute = useRef(route);
   const savedRoute = useRef(readSavedRoute());
@@ -131,7 +134,13 @@ export function App() {
       });
       const validated = routeExists(resolved, workspace) ? resolved : { name: "sessions" } as AppRoute;
       resolvedRuntime.current = workspace.runtimeInstanceId;
-      if (!routesEqual(route, validated)) moveTo(validated, { replace: true });
+      const browserLocation = `${window.location.pathname}${window.location.search}`;
+      if (
+        !routesEqual(route, validated) ||
+        !isCanonicalRouteLocation(validated, browserLocation)
+      ) {
+        moveTo(validated, { replace: true });
+      }
       else setActiveSession(stableSessionKeyForRoute(validated));
       if (standalone.current) {
         writeSavedRoute({ runtimeInstanceId: workspace.runtimeInstanceId, route: validated });
@@ -196,7 +205,14 @@ export function App() {
       screen = <ProjectsScreen workspace={workspace} onNavigate={moveTo} />;
       break;
     case "project":
-      screen = <ProjectScreen workspace={workspace} projectId={route.projectId} onNavigate={moveTo} />;
+      screen = (
+        <ProjectScreen
+          workspace={workspace}
+          projectId={route.projectId}
+          connected={status.kind === "open"}
+          onNavigate={moveTo}
+        />
+      );
       break;
     case "settings":
       screen = <SettingsScreen status={status} />;
@@ -219,7 +235,14 @@ export function App() {
   }
 
   return (
-    <AppShell route={route} status={status} attentionCount={attentionCount} onNavigate={moveTo}>
+    <AppShell
+      route={route}
+      status={status}
+      attentionCount={attentionCount}
+      lastError={lastError}
+      onDismissError={clearLastError}
+      onNavigate={moveTo}
+    >
       {screen}
     </AppShell>
   );
