@@ -25,6 +25,7 @@ const CODEX_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const BRIDGE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const BRIDGE_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy)]
 pub struct CodexReducerLimits {
@@ -1012,14 +1013,41 @@ pub async fn serve_one_loopback_client<S>(
     listener: TcpListener,
     stdio: S,
     observer: SemanticObserverSender,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    serve_one_loopback_client_with_activation(
+        listener,
+        stdio,
+        observer,
+        shutdown,
+        None,
+        BRIDGE_ACTIVATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn serve_one_loopback_client_with_activation<S>(
+    listener: TcpListener,
+    stdio: S,
+    observer: SemanticObserverSender,
+    mut shutdown: oneshot::Receiver<()>,
+    mut on_activated: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    activation_timeout: std::time::Duration,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let activation_deadline = tokio::time::sleep(activation_timeout);
+    tokio::pin!(activation_deadline);
     let (socket, peer) = tokio::select! {
         accepted = listener.accept() => accepted.map_err(|error| format!("Codex bridge accept failed: {error}"))?,
         _ = &mut shutdown => return Ok(()),
+        _ = &mut activation_deadline, if on_activated.is_some() => {
+            return Err("Codex bridge activation timed out before initialize negotiation".to_string());
+        }
     };
     if !peer_is_allowed(peer) {
         return Err(format!("Codex bridge rejected non-loopback peer {peer}"));
@@ -1038,11 +1066,16 @@ where
                 .map_err(|error| format!("Codex bridge WebSocket handshake failed: {error}"))?
         },
         _ = &mut shutdown => return Ok(()),
+        _ = &mut activation_deadline, if on_activated.is_some() => {
+            return Err("Codex bridge activation timed out during WebSocket negotiation".to_string());
+        }
     };
     let (mut websocket_write, mut websocket_read) = websocket.split();
     let (stdio_read, mut stdio_write) = tokio::io::split(stdio);
     let mut stdio_read = BufReader::new(stdio_read);
     let mut server_frame = Vec::new();
+    let mut initialize_id = None;
+    let mut activated = on_activated.is_none();
 
     loop {
         server_frame.clear();
@@ -1055,6 +1088,18 @@ where
                 }
                 let observed_at = epoch_millis();
                 let frame = forward_server_frame(&server_frame, observed_at, &observer);
+                if let Some(expected_id) = initialize_id.as_deref() {
+                    match initialize_response(frame, expected_id) {
+                        Some(Ok(())) => {
+                            activated = true;
+                            if let Some(callback) = on_activated.take() {
+                                callback();
+                            }
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => {}
+                    }
+                }
                 let message = match std::str::from_utf8(frame) {
                     Ok(text) => Message::Text(text.to_string().into()),
                     Err(_) => Message::Binary(frame.to_vec()),
@@ -1069,6 +1114,9 @@ where
                     .map_err(|error| format!("Codex bridge WebSocket read failed: {error}"))?;
                 match incoming {
                     Message::Text(text) => {
+                        if let Some(id) = initialize_request_id(text.as_bytes()) {
+                            initialize_id = Some(id);
+                        }
                         bridge_io("app-server write", async {
                             stdio_write.write_all(text.as_bytes()).await?;
                             stdio_write.write_all(b"\n").await?;
@@ -1076,6 +1124,9 @@ where
                         }).await?;
                     }
                     Message::Binary(bytes) => {
+                        if let Some(id) = initialize_request_id(&bytes) {
+                            initialize_id = Some(id);
+                        }
                         bridge_io("app-server write", async {
                             stdio_write.write_all(&bytes).await?;
                             stdio_write.write_all(b"\n").await?;
@@ -1093,8 +1144,35 @@ where
                 let _ = websocket_write.send(Message::Close(None)).await;
                 return Ok(());
             }
+            _ = &mut activation_deadline, if !activated => {
+                return Err("Codex bridge activation timed out waiting for initialize response".to_string());
+            }
         }
     }
+}
+
+fn initialize_request_id(frame: &[u8]) -> Option<String> {
+    let message = serde_json::from_slice::<Value>(frame).ok()?;
+    (message.get("method").and_then(Value::as_str) == Some("initialize"))
+        .then(|| rpc_id(&message))
+        .flatten()
+}
+
+fn initialize_response(frame: &[u8], expected_id: &str) -> Option<Result<(), String>> {
+    let message = serde_json::from_slice::<Value>(frame).ok()?;
+    if rpc_id(&message).as_deref() != Some(expected_id) {
+        return None;
+    }
+    if message.get("result").is_some() && message.get("error").is_none() {
+        return Some(Ok(()));
+    }
+    let detail = message
+        .get("error")
+        .and_then(|error| string_field(error, "message"))
+        .unwrap_or("app-server rejected initialize");
+    Some(Err(format!(
+        "Codex initialize negotiation failed: {detail}"
+    )))
 }
 
 async fn bridge_io<T, E, F>(label: &str, future: F) -> Result<T, String>
@@ -1162,6 +1240,7 @@ pub struct PreparedCodexAdapter {
 pub struct CodexBridgeHandle {
     endpoint: String,
     alive: std::sync::Arc<AtomicBool>,
+    activated: std::sync::Arc<AtomicBool>,
     stopping: std::sync::Arc<AtomicBool>,
     shutdown: Option<oneshot::Sender<()>>,
     bridge_thread: Option<std::thread::JoinHandle<()>>,
@@ -1178,6 +1257,31 @@ impl CodexBridgeHandle {
     ) -> Result<Self, String>
     where
         OnEvent: Fn(SemanticEventDraft) + Send + Sync + 'static,
+        OnExit: Fn(String) + Send + Sync + 'static,
+    {
+        Self::start_with_activation_timeout(
+            prepared,
+            cwd,
+            stable_session_key,
+            on_event,
+            || {},
+            on_exit,
+            BRIDGE_ACTIVATION_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn start_with_activation_timeout<OnEvent, OnActivated, OnExit>(
+        prepared: PreparedCodexAdapter,
+        cwd: PathBuf,
+        stable_session_key: StableSessionKey,
+        on_event: OnEvent,
+        on_activated: OnActivated,
+        on_exit: OnExit,
+        activation_timeout: std::time::Duration,
+    ) -> Result<Self, String>
+    where
+        OnEvent: Fn(SemanticEventDraft) + Send + Sync + 'static,
+        OnActivated: Fn() + Send + Sync + 'static,
         OnExit: Fn(String) + Send + Sync + 'static,
     {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1208,8 +1312,11 @@ impl CodexBridgeHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let on_exit = std::sync::Arc::new(on_exit);
+        let on_activated = std::sync::Arc::new(on_activated);
         let alive = std::sync::Arc::new(AtomicBool::new(false));
         let bridge_alive = alive.clone();
+        let activated = std::sync::Arc::new(AtomicBool::new(false));
+        let bridge_activated = activated.clone();
         let stopping = std::sync::Arc::new(AtomicBool::new(false));
         let bridge_stopping = stopping.clone();
         let bridge_thread = match std::thread::Builder::new()
@@ -1295,7 +1402,20 @@ impl CodexBridgeHandle {
                     runtime_alive.store(true, Ordering::Release);
                     let _ = ready_tx.send(Ok(()));
 
-                    let bridge = serve_one_loopback_client(listener, stdio, observer, shutdown_rx);
+                    let activation_callback: std::sync::Arc<dyn Fn() + Send + Sync> =
+                        std::sync::Arc::new(move || {
+                            if !bridge_activated.swap(true, Ordering::AcqRel) {
+                                on_activated();
+                            }
+                        });
+                    let bridge = serve_one_loopback_client_with_activation(
+                        listener,
+                        stdio,
+                        observer,
+                        shutdown_rx,
+                        Some(activation_callback),
+                        activation_timeout,
+                    );
                     tokio::pin!(bridge);
                     let outcome = tokio::select! {
                         result = &mut bridge => result,
@@ -1330,6 +1450,7 @@ impl CodexBridgeHandle {
             Ok(Ok(())) => Ok(Self {
                 endpoint,
                 alive,
+                activated,
                 stopping,
                 shutdown: Some(shutdown_tx),
                 bridge_thread: Some(bridge_thread),
@@ -1356,6 +1477,10 @@ impl CodexBridgeHandle {
 
     pub fn is_running(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.activated.load(Ordering::Acquire)
     }
 
     pub fn shutdown(&mut self) {
@@ -1438,13 +1563,16 @@ impl PreparedCodexAdapter {
                 "-NoProfile".to_string(),
                 "-NonInteractive".to_string(),
                 "-Command".to_string(),
-                "while (($line = [Console]::In.ReadLine()) -ne $null) { [Console]::Out.WriteLine($line); [Console]::Out.Flush() }".to_string(),
+                "while (($line = [Console]::In.ReadLine()) -ne $null) { try { $message = $line | ConvertFrom-Json; if ($message.method -eq 'initialize') { $response = [ordered]@{ id = $message.id; result = @{} } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($response); [Console]::Out.Flush(); continue } } catch {} [Console]::Out.WriteLine($line); [Console]::Out.Flush() }".to_string(),
             ],
         );
         #[cfg(not(windows))]
         let (executable, sidecar_prefix_args) = (
             PathBuf::from("/bin/sh"),
-            vec!["-c".to_string(), "cat".to_string()],
+            vec![
+                "-c".to_string(),
+                "while IFS= read -r line; do case \"$line\" in *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":1,\"result\":{}}' ;; *) printf '%s\\n' \"$line\" ;; esac; done".to_string(),
+            ],
         );
 
         Self {
@@ -2301,6 +2429,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activation_requires_matching_successful_initialize_response() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
+        let (observer, _receiver) = semantic_observer_channel(4);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let activation_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_activation = activation_count.clone();
+        let activation_callback: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || {
+                observed_activation.fetch_add(1, Ordering::SeqCst);
+            });
+        let proxy = tokio::spawn(serve_one_loopback_client_with_activation(
+            listener,
+            bridge_stdio,
+            observer,
+            shutdown_rx,
+            Some(activation_callback),
+            std::time::Duration::from_secs(1),
+        ));
+        let (mut tui, _) = connect_async(&endpoint).await.unwrap();
+        let (fake_read, mut fake_write) = tokio::io::split(fake_server_stdio);
+        let mut fake_read = BufReader::new(fake_read);
+        tui.send(Message::Text(
+            r#"{"id":41,"method":"initialize","params":{}}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let mut forwarded = Vec::new();
+        fake_read.read_until(b'\n', &mut forwarded).await.unwrap();
+
+        fake_write
+            .write_all(b"{\"id\":40,\"result\":{}}\n")
+            .await
+            .unwrap();
+        fake_write.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(activation_count.load(Ordering::SeqCst), 0);
+
+        fake_write
+            .write_all(b"{\"id\":41,\"result\":{}}\n")
+            .await
+            .unwrap();
+        fake_write.flush().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while activation_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(activation_count.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(());
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn proxy_rejects_non_loopback_peer_before_websocket_upgrade() {
         assert!(!peer_is_allowed("192.0.2.10:1234".parse().unwrap()));
         assert!(peer_is_allowed("127.0.0.1:1234".parse().unwrap()));
@@ -2503,6 +2693,32 @@ mod tests {
         .expect("unexpected disconnect must degrade the adapter");
         assert!(error.contains("closed"), "unexpected exit reason: {error}");
         bridge.shutdown();
+    }
+
+    #[test]
+    fn bridge_activation_deadline_reports_exit_when_no_tui_negotiates() {
+        let prepared = PreparedCodexAdapter::echo_sidecar_for_test(Vec::new());
+        let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
+        let _bridge = CodexBridgeHandle::start_with_activation_timeout(
+            prepared,
+            std::env::current_dir().unwrap(),
+            StableSessionKey::from_tab("codex-tab"),
+            |_| {},
+            || {},
+            move |error| {
+                let _ = exit_tx.send(error);
+            },
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap();
+
+        let error = exit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("an unnegotiated bridge must fail within its activation deadline");
+        assert!(
+            error.contains("activation") || error.contains("initialize"),
+            "unexpected deadline reason: {error}"
+        );
     }
 
     #[test]
