@@ -9,8 +9,8 @@ pub use client_pool::RemoteClientPool;
 pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
 
 use presentation::{
-    SemanticAttention, SemanticEvent, SemanticEventDraft, SemanticEventKind,
-    SemanticJournalStore, SemanticReplay, SemanticSessionMetadata, StableSessionKey,
+    SemanticAttention, SemanticEvent, SemanticEventDraft, SemanticEventKind, SemanticJournalStore,
+    SemanticReplay, SemanticSessionMetadata, SemanticSource, StableSessionKey,
 };
 use web::bridge::{BrowserOutboundSender, WebConnectionTombstone};
 use web::input_executor::WebInputExecutor;
@@ -1506,13 +1506,21 @@ impl RemoteHostService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let stable_session_key = draft.stable_session_key.clone();
-        let is_question = matches!(&draft.kind, SemanticEventKind::Question { .. });
-        let is_completion = matches!(
-            &draft.kind,
-            SemanticEventKind::Status { state, .. }
-                if matches!(state.trim().to_ascii_lowercase().as_str(),
-                    "completed" | "complete" | "done" | "idle" | "ready" | "success")
-        );
+        let provider = draft.source;
+        let is_ai_provider = matches!(provider, SemanticSource::Claude | SemanticSource::Codex);
+        let is_question =
+            is_ai_provider && matches!(&draft.kind, SemanticEventKind::Question { .. });
+        let is_completion = match &draft.kind {
+            SemanticEventKind::Status { state, .. } if is_ai_provider => {
+                let state = state.trim().to_ascii_lowercase();
+                matches!(
+                    state.as_str(),
+                    "completed" | "complete" | "done" | "success"
+                ) || (provider == SemanticSource::Claude && state == "ready")
+                    || (provider == SemanticSource::Codex && state == "idle")
+            }
+            _ => false,
+        };
         let visibly_focused = self.stable_key_is_visibly_focused(&stable_session_key);
         let mut push_action = None;
         let changed = self.publish_semantic_change(|journals| {
@@ -1570,8 +1578,7 @@ impl RemoteHostService {
             .lock()
             .map(|journals| {
                 focused_session_ids.iter().any(|session_id| {
-                    journals.stable_key_for_session(session_id).as_ref()
-                        == Some(stable_session_key)
+                    journals.stable_key_for_session(session_id).as_ref() == Some(stable_session_key)
                 })
             })
             .unwrap_or(false)
@@ -1688,7 +1695,10 @@ impl RemoteHostService {
             let action = match runtime.session_kind {
                 SessionKind::Server
                     if previous_status.is_some_and(SessionStatus::is_live)
-                        && matches!(runtime.status, SessionStatus::Crashed | SessionStatus::Failed) =>
+                        && matches!(
+                            runtime.status,
+                            SessionStatus::Crashed | SessionStatus::Failed
+                        ) =>
                 {
                     Some(web::push::PushAttentionKind::ServerCrashed)
                 }
@@ -5715,7 +5725,10 @@ mod tests {
         assert!(!delivery.payload.body.contains("log"));
 
         service.push_session_runtime("server-a", crashed);
-        assert!(receiver.try_recv().is_err(), "same transition must not notify twice");
+        assert!(
+            receiver.try_recv().is_err(),
+            "same transition must not notify twice"
+        );
 
         let mut ai = attention_runtime("claude-a", SessionKind::Claude, SessionStatus::Running);
         service.push_session_runtime("claude-a", ai.clone());
@@ -5741,6 +5754,21 @@ mod tests {
             .recv_timeout(Duration::from_millis(250))
             .expect("unexpected SSH disconnect push");
         assert_eq!(delivery.payload.action, PushAttentionKind::SshDisconnected);
+
+        let user_closed = attention_runtime("ssh-user", SessionKind::Ssh, SessionStatus::Running);
+        service.push_session_runtime("ssh-user", user_closed.clone());
+        let mut user_closed = user_closed;
+        user_closed.status = SessionStatus::Exited;
+        user_closed.exit = Some(crate::state::SessionExitState {
+            closed_by_user: true,
+            summary: "closed".to_string(),
+            ..Default::default()
+        });
+        service.push_session_runtime("ssh-user", user_closed);
+        assert!(
+            receiver.try_recv().is_err(),
+            "an intentional SSH close is not actionable"
+        );
     }
 
     #[test]
@@ -5784,7 +5812,11 @@ mod tests {
     #[test]
     fn semantic_completion_and_question_transitions_notify_without_duplicates() {
         let (service, receiver) = service_with_push_subscription("phone-semantic");
-        let runtime = attention_runtime("claude-semantic", SessionKind::Claude, SessionStatus::Running);
+        let runtime = attention_runtime(
+            "claude-semantic",
+            SessionKind::Claude,
+            SessionStatus::Running,
+        );
         service.push_session_runtime("claude-semantic", runtime);
         let key = StableSessionKey::from_tab("claude-semantic");
 
@@ -5834,6 +5866,43 @@ mod tests {
         assert!(!delivery.payload.body.contains("PROMPT_SENTINEL"));
         service.push_semantic_draft(question);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn semantic_pushes_require_provider_specific_actionable_states() {
+        let (service, receiver) = service_with_push_subscription("phone-provider-status");
+        let codex_key = StableSessionKey::from_tab("codex-status");
+        let status = |source, key: StableSessionKey, state: &str| SemanticEventDraft {
+            stable_session_key: key,
+            occurred_at_epoch_ms: 20,
+            source,
+            kind: SemanticEventKind::Status {
+                state: state.to_string(),
+                detail: None,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        };
+
+        // Codex emits `ready` when a thread starts. That is not a completed
+        // turn, and non-AI status strings must never create AI notifications.
+        service.push_semantic_draft(status(SemanticSource::Codex, codex_key.clone(), "ready"));
+        service.push_semantic_draft(status(
+            SemanticSource::Server,
+            StableSessionKey::from_server("server-status"),
+            "completed",
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        service.push_semantic_draft(status(SemanticSource::Codex, codex_key, "idle"));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_millis(250))
+                .expect("Codex turn completion push")
+                .payload
+                .action,
+            PushAttentionKind::Completed
+        );
     }
 
     #[test]

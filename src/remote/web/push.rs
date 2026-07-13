@@ -139,6 +139,13 @@ impl WebPushConfig {
         self.subscriptions.len() != before
     }
 
+    fn remove_subscription_if_matches(&mut self, expected: &WebPushSubscription) -> bool {
+        let before = self.subscriptions.len();
+        self.subscriptions
+            .retain(|subscription| subscription != expected);
+        self.subscriptions.len() != before
+    }
+
     pub fn remove_client(&mut self, client_id: &str) -> bool {
         let before = self.subscriptions.len();
         self.subscriptions
@@ -306,11 +313,33 @@ fn push_worker_loop(
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let Ok(validated) = delivery.subscription.validated() else {
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
+        let Some((current_config, current_subscription)) =
+            inner.config.read().ok().and_then(|config| {
+                let current = &config.web.push;
+                if current.vapid_private_key_base64 != delivery.config.vapid_private_key_base64
+                    || current.vapid_public_key_base64 != delivery.config.vapid_public_key_base64
+                {
+                    return None;
+                }
+                current
+                    .subscriptions
+                    .iter()
+                    .find(|subscription| **subscription == delivery.subscription)
+                    .cloned()
+                    .map(|subscription| (current.clone(), subscription))
+            })
+        else {
+            // Pairing revocation, host reset, key rotation, and a replacement
+            // subscription all invalidate already-queued delivery work.
             continue;
         };
-        let Ok(request) = build_push_request(&delivery.config, &validated, &delivery.payload)
-        else {
+        let Ok(validated) = current_subscription.validated() else {
+            continue;
+        };
+        let Ok(request) = build_push_request(&current_config, &validated, &delivery.payload) else {
             continue;
         };
         let Ok(status) = transport(request) else {
@@ -319,13 +348,14 @@ fn push_worker_loop(
         if classify_push_status(status) != PushDeliveryOutcome::Expired {
             continue;
         }
-        let Some(inner) = inner.upgrade() else {
-            continue;
-        };
-        let client_id = delivery.subscription.client_id;
-        let endpoint = delivery.subscription.endpoint;
         let _ = crate::remote::mutate_host_config(&inner, |config| {
-            config.web.push.remove_subscription(&client_id, &endpoint)
+            // A browser can replace a subscription while an old request is in
+            // flight. A terminal response for the old request must not delete
+            // that newer registration merely because the endpoint was reused.
+            config
+                .web
+                .push
+                .remove_subscription_if_matches(&current_subscription)
         });
     }
 }
@@ -593,6 +623,7 @@ mod tests {
     use crate::remote::test_support::TestProfileGuard;
     use crate::remote::{RemoteHostConfig, RemoteHostService};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::Instant;
 
@@ -819,14 +850,115 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_queue_is_bounded_and_admission_never_blocks() {
-        let service = RemoteHostService::new(RemoteHostConfig::default());
+    fn dispatcher_reauthorizes_queued_work_after_subscription_revocation() {
+        let mut config = RemoteHostConfig::default();
+        let validated = validate_registration(valid_registration()).unwrap();
+        config.web.push.upsert_subscription("phone", validated, 1);
+        let service = RemoteHostService::new(config);
         let push = service.config().web.push;
-        let subscription = WebPushSubscription::from_validated(
-            "phone",
-            validate_registration(valid_registration()).unwrap(),
-            1,
+        let subscription = push.subscriptions[0].clone();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let (called_tx, called_rx) = mpsc::channel();
+        let transport: PushTransport = Arc::new(move |_| {
+            let call = worker_calls.fetch_add(1, Ordering::AcqRel);
+            let _ = called_tx.send(());
+            if call == 0 {
+                worker_entered.wait();
+                worker_release.wait();
+            }
+            Ok(201)
+        });
+        let dispatcher =
+            PushDispatcher::start_with_transport(Arc::downgrade(&service.inner), 2, 1, transport)
+                .unwrap();
+
+        dispatcher
+            .sender()
+            .send(delivery(&push, &subscription, "in-flight"))
+            .unwrap();
+        called_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first delivery reached transport");
+        entered.wait();
+        dispatcher
+            .sender()
+            .send(delivery(&push, &subscription, "queued"))
+            .unwrap();
+        service
+            .inner
+            .config
+            .write()
+            .unwrap()
+            .web
+            .push
+            .remove_subscription("phone", &subscription.endpoint);
+        release.wait();
+
+        assert!(
+            called_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "revoked queued work must never reach the network"
         );
+        drop(dispatcher);
+    }
+
+    #[test]
+    fn stale_terminal_response_cannot_remove_a_replacement_subscription() {
+        let mut config = RemoteHostConfig::default();
+        let validated = validate_registration(valid_registration()).unwrap();
+        config
+            .web
+            .push
+            .upsert_subscription("phone", validated.clone(), 1);
+        let service = RemoteHostService::new(config);
+        let push = service.config().web.push;
+        let old_subscription = push.subscriptions[0].clone();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let transport: PushTransport = Arc::new(move |_| {
+            worker_entered.wait();
+            worker_release.wait();
+            Ok(410)
+        });
+        let dispatcher =
+            PushDispatcher::start_with_transport(Arc::downgrade(&service.inner), 2, 1, transport)
+                .unwrap();
+
+        dispatcher
+            .sender()
+            .send(delivery(&push, &old_subscription, "old-event"))
+            .unwrap();
+        entered.wait();
+        service
+            .inner
+            .config
+            .write()
+            .unwrap()
+            .web
+            .push
+            .upsert_subscription("phone", validated, 2);
+        release.wait();
+        drop(dispatcher);
+
+        let subscriptions = &service.config().web.push.subscriptions;
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].created_at_epoch_ms, 2);
+    }
+
+    #[test]
+    fn dispatcher_queue_is_bounded_and_admission_never_blocks() {
+        let mut config = RemoteHostConfig::default();
+        let validated = validate_registration(valid_registration()).unwrap();
+        config.web.push.upsert_subscription("phone", validated, 1);
+        let service = RemoteHostService::new(config);
+        let push = service.config().web.push;
+        let subscription = push.subscriptions[0].clone();
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let worker_entered = entered.clone();
