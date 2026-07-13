@@ -89,6 +89,7 @@ import {
   MAX_SEMANTIC_EVENTS_PER_SESSION,
   selectAppBadgeSyncState,
   selectAggregateBadgeCount,
+  shouldApplyAppBadge,
   useStore,
 } from "./index";
 
@@ -262,7 +263,7 @@ beforeEach(() => {
 });
 
 describe("aggregate app badge", () => {
-  it("counts sessions requiring action without counting ordinary unread output", () => {
+  it("sums every non-none attention count with a minimum of one", () => {
     const ordinary = makeSnapshot().sessions[0]!;
     const needsInput = {
       ...ordinary,
@@ -274,6 +275,11 @@ describe("aggregate app badge", () => {
       stableSessionKey: "server:failed",
       attention: "failed" as const,
     };
+    const completedWithoutCount = {
+      ...ordinary,
+      stableSessionKey: "tab:completed",
+      attentionCount: 0,
+    };
 
     expect(
       selectAggregateBadgeCount({
@@ -284,9 +290,26 @@ describe("aggregate app badge", () => {
           "tab:a": ordinary,
           "tab:input": needsInput,
           "server:failed": failed,
+          "tab:completed": completedWithoutCount,
         },
       }),
-    ).toBe(2);
+    ).toBe(7);
+  });
+
+  it("caps the aggregate attention count at 99", () => {
+    expect(
+      selectAggregateBadgeCount({
+        runtimeInstanceId: "runtime-1",
+        status: { kind: "open" },
+        compatibilityDiagnostic: null,
+        sessions: {
+          "tab:a": {
+            ...makeSnapshot().sessions[0]!,
+            attentionCount: 150,
+          },
+        },
+      }),
+    ).toBe(99);
   });
 
   it("does not clear a service-worker badge before host state is authoritative", () => {
@@ -351,6 +374,40 @@ describe("aggregate app badge", () => {
 
     expect(connected).toEqual({ count: 0, authorityKey: "runtime:runtime-old" });
     expect(revoked).toEqual({ count: 0, authorityKey: "unauthorized" });
+  });
+
+  it("clears a completed-session badge after same-runtime visible acknowledgement", () => {
+    const unread = selectAppBadgeSyncState({
+      runtimeInstanceId: "runtime-1",
+      status: { kind: "open" },
+      compatibilityDiagnostic: null,
+      sessions: {
+        "tab:a": {
+          ...makeSnapshot().sessions[0]!,
+          attention: "unread",
+          attentionCount: 1,
+        },
+      },
+    });
+    const acknowledged = selectAppBadgeSyncState({
+      runtimeInstanceId: "runtime-1",
+      status: { kind: "open" },
+      compatibilityDiagnostic: null,
+      sessions: {
+        "tab:a": {
+          ...makeSnapshot().sessions[0]!,
+          attention: "none",
+          attentionCount: 0,
+        },
+      },
+    });
+
+    expect(unread).toEqual({ count: 1, authorityKey: "runtime:runtime-1" });
+    expect(acknowledged).toEqual({
+      count: 0,
+      authorityKey: "runtime:runtime-1",
+    });
+    expect(shouldApplyAppBadge(unread, acknowledged)).toBe(true);
   });
 });
 

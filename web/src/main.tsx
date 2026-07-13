@@ -4,7 +4,11 @@ import "./index.css";
 import { notifyPwaSafetyStateChanged, registerPwa } from "./pwa/register";
 import { applyAppBadge } from "./pwa/notifications";
 import { readStoreUpdateSafetyState } from "./pwa/storeSafety";
-import { selectAppBadgeSyncState, useStore } from "./store";
+import {
+  selectAppBadgeSyncState,
+  shouldApplyAppBadge,
+  useStore,
+} from "./store";
 
 // Deliberately NOT using <StrictMode>. Double-invoking effects at dev time
 // is useful for surfacing cleanup bugs, but xterm.js's terminal lifecycle
@@ -32,11 +36,7 @@ useStore.subscribe((state) => {
     notifyPwaSafetyStateChanged();
   }
   const nextBadgeState = selectAppBadgeSyncState(state);
-  if (
-    nextBadgeState.count !== null &&
-    (nextBadgeState.count !== previousBadgeState.count ||
-      nextBadgeState.authorityKey !== previousBadgeState.authorityKey)
-  ) {
+  if (shouldApplyAppBadge(previousBadgeState, nextBadgeState)) {
     void applyAppBadge(nextBadgeState.count);
   }
   previousBadgeState = nextBadgeState;

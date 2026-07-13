@@ -172,15 +172,26 @@ export function selectAggregateBadgeCount(
   if (state.status.kind === "unauthorized") return 0;
   if (state.compatibilityDiagnostic !== null) return 0;
   if (state.runtimeInstanceId === null) return null;
-  return Object.values(state.sessions).filter(
-    (session) =>
-      session.attention === "needsInput" || session.attention === "failed",
-  ).length;
+  return Object.values(state.sessions).reduce((total, session) => {
+    if (session.attention === "none") return total;
+    return Math.min(99, total + Math.max(1, session.attentionCount));
+  }, 0);
 }
 
 export interface AppBadgeSyncState {
   count: number | null;
   authorityKey: string | null;
+}
+
+export function shouldApplyAppBadge(
+  previous: AppBadgeSyncState,
+  next: AppBadgeSyncState,
+): next is AppBadgeSyncState & { count: number } {
+  return (
+    next.count !== null &&
+    (next.count !== previous.count ||
+      next.authorityKey !== previous.authorityKey)
+  );
 }
 
 export function selectAppBadgeSyncState(
