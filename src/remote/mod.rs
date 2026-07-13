@@ -12,7 +12,8 @@ use presentation::{
     SemanticEvent, SemanticEventDraft, SemanticJournalStore, SemanticReplay,
     SemanticSessionMetadata, StableSessionKey,
 };
-use web::lease::WriterLeaseManager;
+use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
+use web::wire::{SemanticBootstrap, WsOutbound};
 
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
@@ -40,6 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc as tokio_mpsc;
 
 pub const PROTOCOL_VERSION: u32 = 5;
 const REMOTE_FILE_NAME: &str = "remote.json";
@@ -950,14 +952,23 @@ pub(crate) struct RemoteHostInner {
     semantic_publication_generation: AtomicU64,
     #[cfg(test)]
     semantic_publication_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Serializes browser subscription commits and broadcaster delivery. It is
+    /// intentionally separate from semantic publication, so replay cloning or
+    /// a slow browser can never block the PTY output path.
+    semantic_delivery_lock: Mutex<()>,
+    #[cfg(test)]
+    semantic_delivery_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     session_bootstrap_provider: RwLock<Option<SessionBootstrapProvider>>,
     terminal_input_handler: RwLock<Option<TerminalInputHandler>>,
     terminal_resize_handler: RwLock<Option<TerminalResizeHandler>>,
     focused_session_handler: RwLock<Option<FocusedSessionHandler>>,
-    /// Browser mutation coordination. Lock order is writer lease -> native
-    /// controller; neither this nor the mutation registry may be held while a
-    /// terminal/bootstrap callback runs.
-    web_writer_leases: Mutex<WriterLeaseManager>,
+    /// Serializes browser control transitions and the Resume capture/enqueue
+    /// sequence. It is never held while a terminal/bootstrap callback runs.
+    web_control_operation_lock: Mutex<()>,
+    /// Browser writer leases, exact legacy claimant, deferred takeover, and
+    /// busy composer state share one reducer so no path can invalidate only
+    /// part of the authority state.
+    web_control: Mutex<WebControlState>,
     web_composer_mutations: Mutex<HashMap<String, WebComposerMutationRecord>>,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
@@ -984,6 +995,7 @@ pub(crate) struct RemoteHostInner {
 pub(crate) struct WebComposerMutationRecord {
     pub(crate) fingerprint: u64,
     pub(crate) status: WebComposerMutationStatus,
+    pub(crate) updated_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1013,6 +1025,10 @@ impl Drop for SemanticPublicationEpoch<'_> {
 struct ConnectedRemoteClient {
     client_id: String,
     sender: mpsc::Sender<ServerMessage>,
+    /// Present only for browser clients. Browser-only semantic/control frames
+    /// must never enter the native MessagePack `ServerMessage` protocol.
+    web_sender: Option<tokio_mpsc::Sender<WsOutbound>>,
+    semantic_cursors: HashMap<StableSessionKey, u64>,
     subscribed_session_ids: HashSet<String>,
     bootstrapped_session_ids: HashSet<String>,
     bootstrap_pending_session_ids: HashSet<String>,
@@ -1022,6 +1038,7 @@ struct ConnectedRemoteClient {
     last_port_hash: u64,
     last_controller_client_id: Option<String>,
     last_you_have_control: bool,
+    last_snapshot_revision: u64,
 }
 
 #[derive(Clone)]
@@ -1096,11 +1113,15 @@ impl RemoteHostService {
                 semantic_publication_generation: AtomicU64::new(0),
                 #[cfg(test)]
                 semantic_publication_test_hook: RwLock::new(None),
+                semantic_delivery_lock: Mutex::new(()),
+                #[cfg(test)]
+                semantic_delivery_test_hook: RwLock::new(None),
                 session_bootstrap_provider: RwLock::new(None),
                 terminal_input_handler: RwLock::new(None),
                 terminal_resize_handler: RwLock::new(None),
                 focused_session_handler: RwLock::new(None),
-                web_writer_leases: Mutex::new(WriterLeaseManager::new(Duration::from_secs(8))),
+                web_control_operation_lock: Mutex::new(()),
+                web_control: Mutex::new(WebControlState::new(Duration::from_secs(8))),
                 web_composer_mutations: Mutex::new(HashMap::new()),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
@@ -1461,9 +1482,7 @@ impl RemoteHostService {
                         .snapshot_state_lock
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    self.inner
-                        .snapshot_revision
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
                 }
                 // Keep the generation odd until the conservative revision is
                 // visible, and release both guards normally before unwinding.
@@ -1816,13 +1835,18 @@ impl RemoteHostService {
                 let _ = thread.join();
             }
         }
-        // Tear down the web listener independently of the TCP listener so
-        // rebinding one does not require tearing down the other.
+        // Stop accepting browser connections first. Tokio shutdown may cancel
+        // WebSocket tasks before their async unregister tail runs, so drain
+        // any records left behind immediately afterwards. This ordering also
+        // closes the narrow race where a new browser could register between a
+        // pre-shutdown drain and runtime teardown.
         if let Ok(mut slot) = self.inner.web_listener.lock() {
             if let Some(handle) = slot.take() {
                 handle.shutdown();
             }
         }
+        drain_web_clients_for_restart(&self.inner);
+        // Web-listener errors are scoped independently from native TCP state.
         if let Ok(mut error) = self.inner.web_listener_error.write() {
             *error = None;
         }
@@ -2637,6 +2661,7 @@ fn run_listener(inner: Arc<RemoteHostInner>) {
 
 fn run_broadcaster(inner: Arc<RemoteHostInner>) {
     let mut last_snapshot_revision = 0_u64;
+    let mut last_semantic_delivery_revision = 0_u64;
     let mut last_controller_client_id: Option<String> = None;
     let mut last_bootstrap_retry_at: HashMap<String, Instant> = HashMap::new();
 
@@ -2654,6 +2679,11 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
         deliver_pending_bootstraps(&inner, &mut last_bootstrap_retry_at);
 
         let snapshot_revision = inner.snapshot_revision.load(Ordering::Relaxed);
+        if snapshot_revision != last_semantic_delivery_revision
+            && deliver_live_semantic_events(&inner)
+        {
+            last_semantic_delivery_revision = snapshot_revision;
+        }
         let controller_client_id = inner
             .controller_client_id
             .read()
@@ -2699,8 +2729,15 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             let port_changed = client.last_port_hash != port_hash;
             let controller_changed = client.last_controller_client_id != controller_client_id
                 || client.last_you_have_control != you_have_control;
+            let web_revision_changed =
+                client.web_sender.is_some() && client.last_snapshot_revision != snapshot_revision;
 
-            if !app_changed && !runtime_changed && !port_changed && !controller_changed {
+            if !app_changed
+                && !runtime_changed
+                && !port_changed
+                && !controller_changed
+                && !web_revision_changed
+            {
                 continue;
             }
 
@@ -2722,6 +2759,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             client.last_port_hash = port_hash;
             client.last_controller_client_id = controller_client_id.clone();
             client.last_you_have_control = you_have_control;
+            client.last_snapshot_revision = snapshot_revision;
         }
 
         let removed = remove_client_records(&mut clients, dead_connections);
@@ -2941,6 +2979,8 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
             ConnectedRemoteClient {
                 client_id: client_id.clone(),
                 sender: tx.clone(),
+                web_sender: None,
+                semantic_cursors: HashMap::new(),
                 subscribed_session_ids: HashSet::new(),
                 bootstrapped_session_ids: HashSet::new(),
                 bootstrap_pending_session_ids: HashSet::new(),
@@ -2950,6 +2990,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 last_port_hash: port_hash,
                 last_controller_client_id: controller_client_id.clone(),
                 last_you_have_control: you_have_control,
+                last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
             },
         );
     }
@@ -3405,19 +3446,208 @@ pub(crate) fn publish_semantic_event(
     published.expect("semantic event publication completed without an event")
 }
 
+/// Fan semantic journal changes out through the bounded browser-only channel.
+/// A delivery-only lock orders this against subscribe/unsubscribe without ever
+/// excluding PTY publication. No client lock is nested with the journal lock,
+/// and `try_send` never waits. Saturated clients are disconnected and recover
+/// by replaying from their last acknowledged cursor after reconnect.
+fn deliver_live_semantic_events(inner: &Arc<RemoteHostInner>) -> bool {
+    let _delivery = inner
+        .semantic_delivery_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    {
+        let hook = inner
+            .semantic_delivery_test_hook
+            .read()
+            .ok()
+            .and_then(|hook| hook.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    let generation_before = inner
+        .semantic_publication_generation
+        .load(Ordering::Acquire);
+    if generation_before % 2 != 0 {
+        return false;
+    }
+    let subscriptions = inner
+        .clients
+        .lock()
+        .map(|clients| {
+            clients
+                .iter()
+                .filter_map(|(connection_id, client)| {
+                    client.web_sender.as_ref()?;
+                    Some(
+                        client
+                            .semantic_cursors
+                            .iter()
+                            .map(|(key, cursor)| (*connection_id, key.clone(), *cursor))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut dead_connections = Vec::new();
+    for (connection_id, key, cursor) in subscriptions {
+        let replay = inner
+            .semantic_journals
+            .lock()
+            .ok()
+            .and_then(|journals| journals.replay_after(&key, cursor));
+        let Some(replay) = replay else {
+            continue;
+        };
+        if inner
+            .semantic_publication_generation
+            .load(Ordering::Acquire)
+            != generation_before
+        {
+            return false;
+        }
+
+        let latest_sequence = replay.latest_sequence;
+        if let Ok(mut clients) = inner.clients.lock() {
+            if let Some(client) = clients.get_mut(&connection_id) {
+                if client.semantic_cursors.get(&key) != Some(&cursor) {
+                    continue;
+                }
+                let Some(sender) = client.web_sender.as_ref() else {
+                    continue;
+                };
+                let send_result = if replay.cursor_rolled_over {
+                    sender.try_send(WsOutbound::SemanticBootstrap {
+                        bootstrap: SemanticBootstrap {
+                            stable_session_key: key.clone(),
+                            oldest_sequence: replay.oldest_sequence,
+                            latest_sequence,
+                            cursor_rolled_over: true,
+                            events: replay.events,
+                        },
+                    })
+                } else {
+                    let mut result = Ok(());
+                    for event in replay.events {
+                        if let Err(error) = sender.try_send(WsOutbound::SemanticEvent { event }) {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                    result
+                };
+                if send_result.is_err() {
+                    dead_connections.push(connection_id);
+                } else {
+                    client.semantic_cursors.insert(key, latest_sequence);
+                }
+            }
+        }
+    }
+    dead_connections.sort_unstable();
+    dead_connections.dedup();
+    if !dead_connections.is_empty() {
+        let removed = inner
+            .clients
+            .lock()
+            .map(|mut clients| remove_client_records(&mut clients, dead_connections))
+            .unwrap_or_default();
+        release_removed_web_connections(inner, removed);
+    }
+    inner
+        .semantic_publication_generation
+        .load(Ordering::Acquire)
+        == generation_before
+}
+
+fn drain_web_clients_for_restart(inner: &Arc<RemoteHostInner>) {
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let removed = inner
+        .clients
+        .lock()
+        .map(|mut clients| {
+            let web_connection_ids = clients
+                .iter()
+                .filter_map(|(connection_id, client)| {
+                    client.web_sender.as_ref().map(|_| *connection_id)
+                })
+                .collect::<Vec<_>>();
+            web_connection_ids
+                .into_iter()
+                .filter_map(|connection_id| clients.remove(&connection_id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for client in &removed {
+        if let Some(sender) = client.web_sender.as_ref() {
+            let _ = sender.try_send(WsOutbound::Disconnected {
+                message: "The browser listener is restarting.".to_string(),
+            });
+        }
+    }
+
+    let controller_id = inner
+        .controller_client_id
+        .read()
+        .map(|controller| controller.clone())
+        .unwrap_or_default();
+    let (request, clear_web_controller) = inner
+        .web_control
+        .lock()
+        .map(|mut control| {
+            let web_controller_id = control
+                .writer_leases()
+                .peek()
+                .map(|lease| lease.owner_client_id)
+                .or_else(|| control.legacy_claimant_client_id().map(str::to_string));
+            let clear_web_controller =
+                controller_id.is_some() && controller_id.as_deref() == web_controller_id.as_deref();
+            (
+                control.reset_web(clear_web_controller),
+                clear_web_controller,
+            )
+        })
+        .unwrap_or((ControllerRequest::Deferred, false));
+    if matches!(request, ControllerRequest::Applied { .. }) && clear_web_controller {
+        if let Ok(mut controller) = inner.controller_client_id.write() {
+            if *controller == controller_id {
+                *controller = None;
+            }
+        }
+    }
+}
+
 pub(crate) fn set_native_controller(
     inner: &Arc<RemoteHostInner>,
     controller_client_id: Option<String>,
 ) {
-    // Global lock order: browser writer lease before the native controller.
-    // This invalidates every outstanding browser generation before native or
-    // local desktop input can become authoritative.
-    if let Ok(mut leases) = inner.web_writer_leases.lock() {
-        leases.invalidate();
+    let target = controller_client_id
+        .clone()
+        .map(ControllerTarget::Native)
+        .unwrap_or(ControllerTarget::Local);
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let request = inner
+        .web_control
+        .lock()
+        .map(|mut control| control.request_controller(target))
+        .unwrap_or(ControllerRequest::Deferred);
+    if matches!(request, ControllerRequest::Applied { .. }) {
         if let Ok(mut controller) = inner.controller_client_id.write() {
             *controller = controller_client_id;
         }
     }
+    web::bridge::broadcast_writer_lease_state_locked(inner, now_epoch_ms());
 }
 
 pub(crate) fn release_web_writer_connection(
@@ -3425,18 +3655,25 @@ pub(crate) fn release_web_writer_connection(
     connection_id: u64,
     client_id: &str,
 ) -> bool {
-    let Ok(mut leases) = inner.web_writer_leases.lock() else {
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Ok(mut control) = inner.web_control.lock() else {
         return false;
     };
-    let released = leases.disconnect(connection_id, client_id);
-    if released {
+    let release = control.release_connection(connection_id, client_id);
+    let released_now = release.released_lease.is_some() || release.legacy_released;
+    drop(control);
+    if released_now {
         if let Ok(mut controller) = inner.controller_client_id.write() {
             if controller.as_deref() == Some(client_id) {
                 *controller = None;
             }
         }
     }
-    released
+    web::bridge::broadcast_writer_lease_state_locked(inner, now_epoch_ms());
+    released_now || release.lease_release_deferred
 }
 
 fn remove_client_records(
@@ -4023,9 +4260,10 @@ mod tests {
     use super::test_support::TestProfileGuard;
     use super::{
         apply_remote_session_output, apply_workspace_delta, current_controller_allows,
-        current_snapshot, deliver_pending_bootstraps, format_handshake_stage_error,
-        generate_pairing_token, light_snapshot, load_remote_machine_state, now_epoch_ms,
-        request_timeout_for_action, requires_control, save_remote_machine_state,
+        current_snapshot, deliver_live_semantic_events, deliver_pending_bootstraps,
+        drain_web_clients_for_restart, format_handshake_stage_error, generate_pairing_token,
+        light_snapshot, load_remote_machine_state, now_epoch_ms, publish_semantic_event,
+        request_timeout_for_action, requires_control, run_broadcaster, save_remote_machine_state,
         set_last_connection_note, upsert_known_host, ClientAuth, ConnectedRemoteClient,
         KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
         RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource, RemoteAction,
@@ -4035,8 +4273,11 @@ mod tests {
     };
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::remote::presentation::{
-        SemanticAdapterHealth, SemanticAttention, SemanticEventKind, StableSessionKey,
+        JournalLimits, SemanticAdapterHealth, SemanticAttention, SemanticEventDraft,
+        SemanticEventKind, SemanticJournalStore, SemanticRetention, SemanticSource,
+        StableSessionKey,
     };
+    use crate::remote::web::wire::WsOutbound;
     use crate::state::{
         AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
     };
@@ -4291,6 +4532,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "web-client-1".to_string(),
                     sender: tx,
+                    web_sender: Some(tokio::sync::mpsc::channel(1).0),
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4300,6 +4543,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
         }
@@ -4371,6 +4615,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "web-client-1".to_string(),
                     sender: web_tx,
+                    web_sender: Some(tokio::sync::mpsc::channel(1).0),
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4380,6 +4626,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
             clients.insert(
@@ -4387,6 +4634,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "client-native-1".to_string(),
                     sender: native_tx,
+                    web_sender: None,
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4396,6 +4645,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
         }
@@ -4436,6 +4686,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
                     sender: native_tx,
+                    web_sender: None,
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4445,6 +4697,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
             clients.insert(
@@ -4452,6 +4705,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "web-client-1".to_string(),
                     sender: web_tx,
+                    web_sender: Some(tokio::sync::mpsc::channel(1).0),
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4461,6 +4716,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
         }
@@ -4549,6 +4805,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
                     sender: subscribed_tx,
+                    web_sender: None,
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4558,6 +4816,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
             clients.insert(
@@ -4565,6 +4824,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "client-2".to_string(),
                     sender: idle_tx,
+                    web_sender: None,
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["beta".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4574,6 +4835,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
         }
@@ -4683,25 +4945,21 @@ mod tests {
             ..TerminalModeSnapshot::default()
         };
 
-        service.push_session_output_with_mode(
-            "ai-runtime",
-            b"ai".to_vec(),
-            alternate_screen,
-        );
-        service.push_session_output_with_mode(
-            "shell-runtime",
-            b"shell".to_vec(),
-            alternate_screen,
-        );
+        service.push_session_output_with_mode("ai-runtime", b"ai".to_vec(), alternate_screen);
+        service.push_session_output_with_mode("shell-runtime", b"shell".to_vec(), alternate_screen);
 
-        assert!(!service
-            .semantic_session_metadata(&StableSessionKey::from_tab("ai-tab"))
-            .expect("AI metadata")
-            .raw_required);
-        assert!(service
-            .semantic_session_metadata(&StableSessionKey::from_server("shell-command"))
-            .expect("shell metadata")
-            .raw_required);
+        assert!(
+            !service
+                .semantic_session_metadata(&StableSessionKey::from_tab("ai-tab"))
+                .expect("AI metadata")
+                .raw_required
+        );
+        assert!(
+            service
+                .semantic_session_metadata(&StableSessionKey::from_server("shell-command"))
+                .expect("shell metadata")
+                .raw_required
+        );
         assert!(service.inner.clients.lock().unwrap().is_empty());
     }
 
@@ -4740,10 +4998,12 @@ mod tests {
                 service
                     .semantic_replay(&StableSessionKey::from_tab("tab-stable"), 0)
                     .is_some_and(|replay| {
-                        replay.events.iter().any(|event| matches!(
-                            &event.kind,
-                            SemanticEventKind::Output { text, .. } if text == "projected"
-                        ))
+                        replay.events.iter().any(|event| {
+                            matches!(
+                                &event.kind,
+                                SemanticEventKind::Output { text, .. } if text == "projected"
+                            )
+                        })
                     })
             },
             Duration::from_millis(250),
@@ -4805,6 +5065,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
                     sender: tx,
+                    web_sender: None,
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4814,6 +5076,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
         }
@@ -4849,6 +5112,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
                     sender: tx,
+                    web_sender: None,
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -4858,6 +5123,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
         }
@@ -4952,6 +5218,8 @@ mod tests {
             ConnectedRemoteClient {
                 client_id: "client-1".to_string(),
                 sender: tx,
+                web_sender: None,
+                semantic_cursors: HashMap::new(),
                 subscribed_session_ids: HashSet::from(["pty-runtime".to_string()]),
                 bootstrapped_session_ids: HashSet::new(),
                 bootstrap_pending_session_ids: HashSet::from(["pty-runtime".to_string()]),
@@ -4961,6 +5229,7 @@ mod tests {
                 last_port_hash: 0,
                 last_controller_client_id: None,
                 last_you_have_control: false,
+                last_snapshot_revision: 0,
             },
         );
         service.set_session_bootstrap_provider(Some(Arc::new(move |_| {
@@ -5001,6 +5270,8 @@ mod tests {
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
                     sender: tx,
+                    web_sender: None,
+                    semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
                     bootstrap_pending_session_ids: HashSet::new(),
@@ -5010,6 +5281,7 @@ mod tests {
                     last_port_hash: 0,
                     last_controller_client_id: None,
                     last_you_have_control: false,
+                    last_snapshot_revision: 0,
                 },
             );
         }
@@ -5630,6 +5902,374 @@ mod tests {
         assert_eq!(updated.screen.cols, 90);
         assert_eq!(updated.screen.history_size, 180);
         assert_eq!(updated.screen.display_offset, 99);
+    }
+
+    #[test]
+    fn browser_semantic_delivery_is_exact_once_and_never_uses_native_messages() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let key = StableSessionKey::from_tab("semantic-tab");
+        let (native_tx, native_rx) = mpsc::channel();
+        let (web_tx, mut web_rx) = tokio::sync::mpsc::channel(8);
+        let mut client = test_connected_client("browser", native_tx, Some(web_tx));
+        client.semantic_cursors.insert(key.clone(), 0);
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(1, client);
+
+        let published = publish_semantic_event(
+            &service.inner,
+            semantic_status_draft(key.clone(), "ready", 1),
+        );
+        assert!(deliver_live_semantic_events(&service.inner));
+        match web_rx.try_recv().expect("live browser event") {
+            WsOutbound::SemanticEvent { event } => assert_eq!(event, published),
+            other => panic!("unexpected browser frame: {other:?}"),
+        }
+        assert!(
+            native_rx.try_recv().is_err(),
+            "browser-only frames must not enter ServerMessage"
+        );
+
+        assert!(deliver_live_semantic_events(&service.inner));
+        assert!(
+            web_rx.try_recv().is_err(),
+            "a committed semantic cursor must not be delivered twice"
+        );
+    }
+
+    #[test]
+    fn semantic_cursor_rollover_is_one_bootstrap_frame() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        *service
+            .inner
+            .semantic_journals
+            .lock()
+            .expect("journal lock") = SemanticJournalStore::with_limits(JournalLimits {
+            canonical_events: 1,
+            canonical_bytes: 1024 * 1024,
+            verbose_events: 1,
+            verbose_bytes: 1024 * 1024,
+        });
+        let key = StableSessionKey::from_tab("rollover-tab");
+        let (native_tx, _native_rx) = mpsc::channel();
+        let (web_tx, mut web_rx) = tokio::sync::mpsc::channel(8);
+        let mut client = test_connected_client("browser", native_tx, Some(web_tx));
+        client.semantic_cursors.insert(key.clone(), 0);
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(1, client);
+
+        let first = publish_semantic_event(
+            &service.inner,
+            semantic_status_draft(key.clone(), "first", 1),
+        );
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .get_mut(&1)
+            .expect("browser client")
+            .semantic_cursors
+            .insert(key.clone(), first.sequence);
+        let second = publish_semantic_event(
+            &service.inner,
+            semantic_status_draft(key.clone(), "second", 2),
+        );
+
+        assert!(deliver_live_semantic_events(&service.inner));
+        match web_rx.try_recv().expect("rollover bootstrap") {
+            WsOutbound::SemanticBootstrap { bootstrap } => {
+                assert!(bootstrap.cursor_rolled_over);
+                assert_eq!(bootstrap.latest_sequence, second.sequence);
+                assert_eq!(bootstrap.events, vec![second]);
+            }
+            other => panic!("unexpected rollover frame: {other:?}"),
+        }
+        assert!(deliver_live_semantic_events(&service.inner));
+        assert!(
+            web_rx.try_recv().is_err(),
+            "rollover bootstrap must be exact once"
+        );
+    }
+
+    #[test]
+    fn saturated_semantic_browser_is_dropped_without_blocking_fanout() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let key = StableSessionKey::from_tab("slow-tab");
+        let (native_tx, _native_rx) = mpsc::channel();
+        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(1);
+        web_tx
+            .try_send(WsOutbound::Pong)
+            .expect("prefill bounded channel");
+        let mut client = test_connected_client("slow-browser", native_tx, Some(web_tx));
+        client.semantic_cursors.insert(key.clone(), 0);
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(1, client);
+        publish_semantic_event(&service.inner, semantic_status_draft(key, "ready", 1));
+
+        let started = Instant::now();
+        assert!(deliver_live_semantic_events(&service.inner));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(
+            !service
+                .inner
+                .clients
+                .lock()
+                .expect("clients lock")
+                .contains_key(&1),
+            "a saturated browser must not retain an unbounded backlog"
+        );
+    }
+
+    #[test]
+    fn pty_output_does_not_wait_for_blocked_semantic_fanout() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app = AppState::default();
+        app.open_tabs.push(SessionTab {
+            id: "semantic-tab".to_string(),
+            tab_type: TabType::Claude,
+            pty_session_id: Some("semantic-runtime".to_string()),
+            ..SessionTab::default()
+        });
+        let mut runtime = RuntimeState::default();
+        let mut session = SessionRuntimeState::new(
+            "semantic-runtime",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        session.tab_id = Some("semantic-tab".to_string());
+        runtime.sessions.insert(session.session_id.clone(), session);
+        service.update_snapshot(app, runtime, HashMap::new());
+        service.push_session_output("semantic-runtime", b"first\n".to_vec());
+
+        let key = StableSessionKey::from_tab("semantic-tab");
+        let (native_tx, _native_rx) = mpsc::channel();
+        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let mut client = test_connected_client("browser", native_tx, Some(web_tx));
+        client.semantic_cursors.insert(key, 0);
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(1, client);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = release.clone();
+        *service
+            .inner
+            .semantic_delivery_test_hook
+            .write()
+            .expect("delivery hook lock") = Some(Arc::new(move || {
+            entered_tx.send(()).expect("delivery observer");
+            let (lock, cvar) = &*hook_release;
+            let mut released = lock.lock().expect("delivery gate lock");
+            while !*released {
+                released = cvar.wait(released).expect("delivery gate wait");
+            }
+        }));
+
+        let delivery_inner = service.inner.clone();
+        let delivery = thread::spawn(move || deliver_live_semantic_events(&delivery_inner));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fanout reached blocking hook");
+
+        let started = Instant::now();
+        service.push_session_output("semantic-runtime", b"second\n".to_vec());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "PTY publication waited for browser fanout"
+        );
+
+        let (lock, cvar) = &*release;
+        *lock.lock().expect("delivery gate lock") = true;
+        cvar.notify_all();
+        assert!(delivery.join().expect("delivery thread"));
+    }
+
+    #[test]
+    fn semantic_only_revision_still_wakes_the_browser_snapshot_path() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (native_tx, native_rx) = mpsc::channel();
+        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let client = test_connected_client("browser", native_tx, Some(web_tx));
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(1, client);
+        publish_semantic_event(
+            &service.inner,
+            semantic_status_draft(StableSessionKey::from_tab("revision-tab"), "ready", 1),
+        );
+
+        service.inner.stop_flag.store(false, Ordering::SeqCst);
+        let broadcaster_inner = service.inner.clone();
+        let broadcaster = thread::spawn(move || run_broadcaster(broadcaster_inner));
+        let message = native_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("semantic-only browser delta");
+        service.inner.stop_flag.store(true, Ordering::SeqCst);
+        broadcaster.join().expect("broadcaster thread");
+        assert!(matches!(message, ServerMessage::Delta { .. }));
+    }
+
+    #[test]
+    fn native_server_message_pong_messagepack_shape_is_unchanged() {
+        let encoded = rmp_serde::encode::to_vec_named(&ServerMessage::Pong)
+            .expect("native pong serialization");
+        assert_eq!(
+            encoded,
+            vec![0x81, 0xa4, b't', b'y', b'p', b'e', 0xa4, b'p', b'o', b'n', b'g']
+        );
+    }
+
+    #[test]
+    fn restart_drain_removes_web_state_but_preserves_native_client() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (web_native_tx, _web_native_rx) = mpsc::channel();
+        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let (native_tx, _native_rx) = mpsc::channel();
+        let web_client = test_connected_client("browser", web_native_tx, Some(web_tx));
+        let native_client = test_connected_client("native", native_tx, None);
+        {
+            let mut clients = service.inner.clients.lock().expect("clients lock");
+            clients.insert(1, web_client);
+            clients.insert(2, native_client);
+        }
+        service
+            .inner
+            .web_control
+            .lock()
+            .expect("web control lock")
+            .writer_leases_mut()
+            .acquire(1, "browser", "tab", 1_000)
+            .expect("browser lease");
+        *service
+            .inner
+            .controller_client_id
+            .write()
+            .expect("controller lock") = Some("browser".to_string());
+
+        drain_web_clients_for_restart(&service.inner);
+
+        let clients = service.inner.clients.lock().expect("clients lock");
+        assert!(!clients.contains_key(&1));
+        assert!(
+            clients.contains_key(&2),
+            "native connection must survive web restart"
+        );
+        drop(clients);
+        assert!(service
+            .inner
+            .web_control
+            .lock()
+            .expect("web control lock")
+            .writer_leases()
+            .peek()
+            .is_none());
+        assert!(service
+            .inner
+            .controller_client_id
+            .read()
+            .expect("controller lock")
+            .is_none());
+    }
+
+    #[test]
+    fn restart_drain_never_clears_the_real_native_controller() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (web_native_tx, _web_native_rx) = mpsc::channel();
+        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let (native_tx, _native_rx) = mpsc::channel();
+        {
+            let mut clients = service.inner.clients.lock().expect("clients lock");
+            clients.insert(
+                1,
+                test_connected_client("browser", web_native_tx, Some(web_tx)),
+            );
+            clients.insert(2, test_connected_client("native", native_tx, None));
+        }
+        *service
+            .inner
+            .controller_client_id
+            .write()
+            .expect("controller lock") = Some("native".to_string());
+
+        drain_web_clients_for_restart(&service.inner);
+
+        assert_eq!(
+            service
+                .inner
+                .controller_client_id
+                .read()
+                .expect("controller lock")
+                .as_deref(),
+            Some("native")
+        );
+        assert!(service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .contains_key(&2));
+    }
+
+    fn semantic_status_draft(
+        stable_session_key: StableSessionKey,
+        state: &str,
+        occurred_at_epoch_ms: u64,
+    ) -> SemanticEventDraft {
+        SemanticEventDraft {
+            stable_session_key,
+            occurred_at_epoch_ms,
+            source: SemanticSource::System,
+            kind: SemanticEventKind::Status {
+                state: state.to_string(),
+                detail: None,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        }
+    }
+
+    fn test_connected_client(
+        client_id: &str,
+        sender: mpsc::Sender<ServerMessage>,
+        web_sender: Option<tokio::sync::mpsc::Sender<WsOutbound>>,
+    ) -> ConnectedRemoteClient {
+        ConnectedRemoteClient {
+            client_id: client_id.to_string(),
+            sender,
+            web_sender,
+            semantic_cursors: HashMap::new(),
+            subscribed_session_ids: HashSet::new(),
+            bootstrapped_session_ids: HashSet::new(),
+            bootstrap_pending_session_ids: HashSet::new(),
+            focused_session_id: None,
+            last_app_hash: 0,
+            last_runtime_hash: 0,
+            last_port_hash: 0,
+            last_controller_client_id: None,
+            last_you_have_control: false,
+            last_snapshot_revision: 0,
+        }
     }
 
     fn session_view(session_id: &str) -> TerminalSessionView {

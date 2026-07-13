@@ -118,6 +118,17 @@ pub enum WsInbound {
         attachments: Vec<ComposerAttachment>,
         expected_lease_generation: u64,
     },
+    SubscribeSemantic {
+        stable_session_key: StableSessionKey,
+        after_sequence: u64,
+    },
+    UnsubscribeSemantic {
+        stable_session_key: StableSessionKey,
+    },
+    InterruptSession {
+        stable_session_key: StableSessionKey,
+        expected_lease_generation: u64,
+    },
     SubscribeSessions {
         session_ids: Vec<String>,
     },
@@ -130,24 +141,34 @@ pub enum WsInbound {
     Input {
         session_id: String,
         text: String,
+        #[serde(default)]
+        expected_lease_generation: Option<u64>,
     },
     PasteImage {
         session_id: String,
         mime_type: String,
         file_name: Option<String>,
         data_base64: String,
+        #[serde(default)]
+        expected_lease_generation: Option<u64>,
     },
     Resize {
         session_id: String,
         rows: u16,
         cols: u16,
+        #[serde(default)]
+        expected_lease_generation: Option<u64>,
     },
     Action {
         action: WebAction,
+        #[serde(default)]
+        expected_lease_generation: Option<u64>,
     },
     Request {
         id: u64,
         action: WebAction,
+        #[serde(default)]
+        expected_lease_generation: Option<u64>,
     },
     TakeControl,
     ClaimControlIfAvailable,
@@ -187,6 +208,9 @@ pub enum WsOutbound {
     SemanticBootstrap {
         #[serde(flatten)]
         bootstrap: SemanticBootstrap,
+    },
+    SemanticEvent {
+        event: SemanticEvent,
     },
     ComposerAccepted {
         #[serde(flatten)]
@@ -259,9 +283,14 @@ mod tests {
         });
         let parsed: WsInbound = serde_json::from_value(raw).expect("parse");
         match parsed {
-            WsInbound::Input { session_id, text } => {
+            WsInbound::Input {
+                session_id,
+                text,
+                expected_lease_generation,
+            } => {
                 assert_eq!(session_id, "srv-1");
                 assert_eq!(text, "echo hi\n");
+                assert_eq!(expected_lease_generation, None);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -283,11 +312,13 @@ mod tests {
                 mime_type,
                 file_name,
                 data_base64,
+                expected_lease_generation,
             } => {
                 assert_eq!(session_id, "claude-1");
                 assert_eq!(mime_type, "image/png");
                 assert_eq!(file_name.as_deref(), Some("clip.png"));
                 assert_eq!(data_base64, "AQID");
+                assert_eq!(expected_lease_generation, None);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -410,5 +441,79 @@ mod tests {
         assert_eq!(text, "run tests");
         assert!(attachments.is_empty());
         assert_eq!(expected_lease_generation, 7);
+    }
+
+    #[test]
+    fn generation_bearing_raw_input_remains_backward_compatible() {
+        let raw = json!({
+            "type": "input",
+            "sessionId": "srv-1",
+            "text": "pwd\n",
+            "expectedLeaseGeneration": 9
+        });
+        let parsed: WsInbound = serde_json::from_value(raw).expect("parse generation input");
+        let WsInbound::Input {
+            expected_lease_generation,
+            ..
+        } = parsed
+        else {
+            panic!("expected input");
+        };
+        assert_eq!(expected_lease_generation, Some(9));
+    }
+
+    #[test]
+    fn semantic_subscription_and_interrupt_frames_deserialize() {
+        let subscribe: WsInbound = serde_json::from_value(json!({
+            "type": "subscribeSemantic",
+            "stableSessionKey": "tab:tab-a",
+            "afterSequence": 12
+        }))
+        .expect("parse semantic subscribe");
+        assert!(matches!(
+            subscribe,
+            WsInbound::SubscribeSemantic {
+                after_sequence: 12,
+                ..
+            }
+        ));
+
+        let interrupt: WsInbound = serde_json::from_value(json!({
+            "type": "interruptSession",
+            "stableSessionKey": "tab:tab-a",
+            "expectedLeaseGeneration": 9
+        }))
+        .expect("parse interrupt");
+        assert!(matches!(
+            interrupt,
+            WsInbound::InterruptSession {
+                expected_lease_generation: 9,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn semantic_event_is_a_standalone_web_only_frame() {
+        use crate::remote::presentation::{SemanticEventKind, SemanticSource};
+
+        let event = SemanticEvent {
+            stable_session_key: StableSessionKey::from_tab("tab-a"),
+            sequence: 13,
+            occurred_at_epoch_ms: 1_234,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::AssistantMessage {
+                message_id: "message-1".to_string(),
+                text: "done".to_string(),
+                streaming: false,
+            },
+        };
+        let value = serde_json::to_value(WsOutbound::SemanticEvent {
+            event: event.clone(),
+        })
+        .expect("serialize semantic event");
+        assert_eq!(value["type"], "semanticEvent");
+        assert_eq!(value["event"]["sequence"], 13);
+        assert_eq!(value["event"]["stableSessionKey"], "tab:tab-a");
     }
 }
