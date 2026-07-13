@@ -1,17 +1,93 @@
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearOtherRuntimes,
+  hasExactDraftHandoff,
   loadDraft,
   pruneDrafts,
   removeDraft,
   saveDraft,
+  stageDraftHandoff,
 } from "./draftStore";
 
 describe("runtime-scoped draft storage", () => {
-  beforeEach(() => localStorage.clear());
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("stages and consumes an exact runtime-scoped compatibility handoff", () => {
+    const exactDraft = "  exact draft\n";
+    saveDraft("runtime-a", "tab:x", exactDraft);
+
+    expect(
+      stageDraftHandoff("runtime-a", { "tab:x": exactDraft }),
+    ).toBe(true);
+    expect(
+      hasExactDraftHandoff("runtime-a", { "tab:x": exactDraft }),
+    ).toBe(true);
+    expect(loadDraft("runtime-a", "tab:x")).toBe(exactDraft);
+    expect(
+      hasExactDraftHandoff("runtime-a", { "tab:x": exactDraft }),
+    ).toBe(false);
+    expect(loadDraft("runtime-a", "tab:x")).toBe(exactDraft);
+  });
+
+  it("rejects a handoff that cannot preserve every exact byte", () => {
+    const oversized = "x".repeat(32 * 1024 + 1);
+
+    expect(stageDraftHandoff("runtime-a", { "tab:x": oversized })).toBe(
+      false,
+    );
+    expect(
+      hasExactDraftHandoff("runtime-a", { "tab:x": oversized }),
+    ).toBe(false);
+  });
+
+  it("clears a stale handoff when the exact draft set becomes empty", () => {
+    expect(
+      stageDraftHandoff("runtime-a", { "tab:x": "stale draft" }),
+    ).toBe(true);
+
+    expect(stageDraftHandoff("runtime-a", {})).toBe(true);
+    expect(loadDraft("runtime-a", "tab:x")).toBeNull();
+  });
+
+  it("fails closed when session handoff storage rejects the write", () => {
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(() => {
+        throw new DOMException("quota exceeded");
+      });
+
+    expect(stageDraftHandoff("runtime-a", { "tab:x": "keep me" })).toBe(
+      false,
+    );
+    setItem.mockRestore();
+  });
+
+  it("prunes and removes handoff-only drafts with the session lifecycle", () => {
+    expect(
+      stageDraftHandoff("runtime-a", {
+        "tab:keep": "keep",
+        "tab:gone": "gone",
+      }),
+    ).toBe(true);
+
+    pruneDrafts("runtime-a", new Set(["tab:keep"]));
+    expect(
+      hasExactDraftHandoff("runtime-a", { "tab:keep": "keep" }),
+    ).toBe(true);
+
+    removeDraft("runtime-a", "tab:keep");
+    expect(
+      hasExactDraftHandoff("runtime-a", { "tab:keep": "keep" }),
+    ).toBe(false);
+  });
 
   it("keeps a draft only for the current host runtime", () => {
     saveDraft("runtime-a", "tab:x", "hello");

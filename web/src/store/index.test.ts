@@ -60,6 +60,10 @@ const { requestCompatibleBuild } = vi.hoisted(() => ({
   requestCompatibleBuild: vi.fn(),
 }));
 
+const { stageDraftHandoff } = vi.hoisted(() => ({
+  stageDraftHandoff: vi.fn(() => true),
+}));
+
 vi.mock("../api/ws", () => ({
   WsClient: MockWsClient,
   isTransientComposerRejection: (code: string) =>
@@ -73,6 +77,10 @@ vi.mock("../api/ws", () => ({
 
 vi.mock("../pwa/register", () => ({
   requestCompatibleBuild,
+}));
+
+vi.mock("../drafts/draftStore", () => ({
+  stageDraftHandoff,
 }));
 
 import {
@@ -243,6 +251,9 @@ function resetStore(): void {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  requestCompatibleBuild.mockReset();
+  stageDraftHandoff.mockReset();
+  stageDraftHandoff.mockReturnValue(true);
   vi.stubGlobal("localStorage", storageMock());
   vi.stubGlobal("crypto", { randomUUID: vi.fn(() => "mutation-uuid") });
   resetStore();
@@ -1470,6 +1481,7 @@ describe("safe compatibility and raw terminal IO", () => {
     useStore.setState({
       activeSessionKey: "tab:a",
     });
+    useStore.getState().setDraft("tab:a", "  preserve exactly\n");
 
     client?.callbacks.onHelloFailure?.({
       kind: "buildMismatch",
@@ -1482,10 +1494,38 @@ describe("safe compatibility and raw terminal IO", () => {
     });
 
     const state = useStore.getState();
+    expect(stageDraftHandoff).toHaveBeenCalledWith("runtime-1", {
+      "tab:a": "  preserve exactly\n",
+    });
+    expect(stageDraftHandoff.mock.invocationCallOrder[0]).toBeLessThan(
+      requestCompatibleBuild.mock.invocationCallOrder[0],
+    );
     expect(requestCompatibleBuild).toHaveBeenCalledWith("different-host-build");
+    expect(state.compatibleDraftHandoffReady).toBe(true);
     expect(state.status.kind).toBe("closed");
     expect(state.snapshot).toBe(existingSnapshot);
     expect(state.activeSessionKey).toBe("tab:a");
     expect(state.lastError).toMatch(/automatically/i);
+  });
+
+  it("does not recover when an exact draft handoff cannot be staged", () => {
+    stageDraftHandoff.mockReturnValue(false);
+    useStore.getState().init();
+    const client = wsClientState.instance;
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.getState().setDraft("tab:a", "cannot lose this");
+
+    client?.callbacks.onHelloFailure?.({
+      kind: "buildMismatch",
+      expectedBuildId: "client-build",
+      receivedBuildId: "different-host-build",
+    });
+
+    expect(stageDraftHandoff).toHaveBeenCalledWith("runtime-1", {
+      "tab:a": "cannot lose this",
+    });
+    expect(requestCompatibleBuild).not.toHaveBeenCalled();
+    expect(useStore.getState().compatibleDraftHandoffReady).toBe(false);
+    expect(useStore.getState().lastError).toMatch(/preserve.*draft/i);
   });
 });

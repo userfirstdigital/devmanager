@@ -1,9 +1,14 @@
+// @vitest-environment jsdom
+
 import { beforeEach, describe, expect, it } from "vitest";
+import { stageDraftHandoff } from "../drafts/draftStore";
 import { useStore } from "../store";
 import { readStoreUpdateSafetyState } from "./storeSafety";
 
 describe("readStoreUpdateSafetyState", () => {
   beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
     useStore.setState(useStore.getInitialState(), true);
   });
 
@@ -34,6 +39,45 @@ describe("readStoreUpdateSafetyState", () => {
       pendingMutations: 0,
       selectedAttachments: 0,
       attachmentLoads: 0,
+    });
+  });
+
+  it("allows only a verified compatibility handoff to cover draft safety", () => {
+    const handedOffState = {
+      runtimeInstanceId: "runtime-a",
+      drafts: { first: "  preserve exactly\n" },
+      pendingMutations: {},
+      composerSafety: {},
+      compatibleDraftHandoffReady: true,
+    };
+
+    expect(readStoreUpdateSafetyState(handedOffState).hasDraft).toBe(true);
+    expect(
+      stageDraftHandoff("runtime-a", handedOffState.drafts),
+    ).toBe(true);
+    expect(
+      readStoreUpdateSafetyState(handedOffState),
+    ).toEqual({
+      hasDraft: false,
+      pendingMutations: 0,
+      selectedAttachments: 0,
+      attachmentLoads: 0,
+    });
+
+    expect(
+      readStoreUpdateSafetyState({
+        ...handedOffState,
+        pendingMutations: { first: {} },
+        composerSafety: {
+          first: { selectedAttachments: 1, attachmentLoads: 1 },
+        },
+        compatibleDraftHandoffReady: true,
+      }),
+    ).toEqual({
+      hasDraft: false,
+      pendingMutations: 1,
+      selectedAttachments: 1,
+      attachmentLoads: 1,
     });
   });
 

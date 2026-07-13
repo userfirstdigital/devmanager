@@ -340,19 +340,19 @@ export class WsClient {
             this.failHello(socket, epoch, { kind: "missingHello" });
             return;
           }
-          if (parsed.protocolVersion !== WEB_PROTOCOL_VERSION) {
-            this.failHello(socket, epoch, {
-              kind: "protocolMismatch",
-              expectedProtocolVersion: WEB_PROTOCOL_VERSION,
-              receivedProtocolVersion: parsed.protocolVersion,
-            });
-            return;
-          }
           if (parsed.webBuildId !== CLIENT_WEB_BUILD_ID) {
             this.failHello(socket, epoch, {
               kind: "buildMismatch",
               expectedBuildId: CLIENT_WEB_BUILD_ID,
               receivedBuildId: parsed.webBuildId,
+            });
+            return;
+          }
+          if (parsed.protocolVersion !== WEB_PROTOCOL_VERSION) {
+            this.failHello(socket, epoch, {
+              kind: "protocolMismatch",
+              expectedProtocolVersion: WEB_PROTOCOL_VERSION,
+              receivedProtocolVersion: parsed.protocolVersion,
             });
             return;
           }

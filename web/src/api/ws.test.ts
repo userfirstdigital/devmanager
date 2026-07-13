@@ -192,6 +192,34 @@ describe("WsClient request handling", () => {
     expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
   });
 
+  it("uses compatible-build recovery when protocol and build both differ", async () => {
+    const onHelloFailure = vi.fn();
+    const callbacks = clientCallbacks({ onHelloFailure });
+    const client = new WsClient(callbacks);
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+
+    socket.emitOpen(false);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION + 1,
+        webBuildId: "different-host-build",
+      }),
+    );
+
+    expect(onHelloFailure).toHaveBeenCalledWith({
+      kind: "buildMismatch",
+      expectedBuildId: CLIENT_WEB_BUILD_ID,
+      receivedBuildId: "different-host-build",
+    });
+    expect(callbacks.onStatus).not.toHaveBeenCalledWith({ kind: "open" });
+    expect(jsonFrames(socket)).toEqual([]);
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+  });
+
   it("opens and resumes only after a compatible hello", async () => {
     const callbacks = clientCallbacks();
     const client = new WsClient(callbacks);

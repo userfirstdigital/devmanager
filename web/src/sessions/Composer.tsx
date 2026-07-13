@@ -76,17 +76,32 @@ export function Composer({
   const scopeGenerationRef = useRef(0);
   const attachmentsRef = useRef<PendingAttachment[]>([]);
   const attachmentReadPendingRef = useRef(false);
+  const onSafetyStateChangeRef = useRef(onSafetyStateChange);
+  onSafetyStateChangeRef.current = onSafetyStateChange;
   const busy = pending || submitting || readingAttachments;
   const canSend = !disabled && !busy && (localValue.trim().length > 0 || attachments.length > 0);
   const publishSafety = (
     nextAttachments = attachmentsRef.current,
     loading = attachmentReadPendingRef.current,
   ) => {
-    onSafetyStateChange?.({
+    onSafetyStateChangeRef.current?.({
       selectedAttachments: nextAttachments.length,
       attachmentLoads: loading ? 1 : 0,
     });
   };
+
+  useEffect(
+    () => () => {
+      scopeGenerationRef.current += 1;
+      attachmentReadPendingRef.current = false;
+      attachmentsRef.current = [];
+      onSafetyStateChangeRef.current?.({
+        selectedAttachments: 0,
+        attachmentLoads: 0,
+      });
+    },
+    [],
+  );
 
   useLayoutEffect(() => {
     if (scopeRef.current === scopeKey) return;

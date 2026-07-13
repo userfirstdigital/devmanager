@@ -1,7 +1,10 @@
+import { hasExactDraftHandoff } from "../drafts/draftStore";
 import type { UpdateSafetyState } from "./register";
 
 interface ComposerSafetyStore {
+  runtimeInstanceId?: string | null;
   drafts?: Record<string, string>;
+  compatibleDraftHandoffReady?: boolean;
   pendingMutations?: Record<string, unknown>;
   composerSafety?: Record<
     string,
@@ -34,9 +37,20 @@ export function readStoreUpdateSafetyState(
     };
   }
   const safetyValues = Object.values(composerState.composerSafety);
+  const hasDraft = Object.values(composerState.drafts).some(
+    (text) => text !== "",
+  );
+  const exactHandoffReady =
+    hasDraft &&
+    composerState.compatibleDraftHandoffReady === true &&
+    typeof composerState.runtimeInstanceId === "string" &&
+    hasExactDraftHandoff(
+      composerState.runtimeInstanceId,
+      composerState.drafts,
+    );
   return {
     // Preserve the exact text. Whitespace can be intentional terminal input.
-    hasDraft: Object.values(composerState.drafts).some((text) => text !== ""),
+    hasDraft: hasDraft && !exactHandoffReady,
     pendingMutations: Object.keys(composerState.pendingMutations).length,
     selectedAttachments: safetyValues.reduce(
       (total, safety) => total + Math.max(0, safety.selectedAttachments ?? 0),

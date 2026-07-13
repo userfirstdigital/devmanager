@@ -1,6 +1,9 @@
 const STORAGE_KEY = "devmanager-native-drafts:v1";
+const HANDOFF_STORAGE_KEY = "devmanager-compatible-draft-handoff:v1";
 const VERSION = 1;
+const HANDOFF_VERSION = 1;
 const MAX_DRAFT_BYTES = 32 * 1024;
+const MAX_HANDOFF_BYTES = 512 * 1024;
 const DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface StoredDraft {
@@ -14,9 +17,23 @@ interface StoredDrafts {
   drafts: Record<string, StoredDraft>;
 }
 
+interface StoredDraftHandoff {
+  version: typeof HANDOFF_VERSION;
+  runtimeInstanceId: string;
+  drafts: Record<string, string>;
+}
+
 function storage(): Storage | null {
   try {
     return globalThis.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function handoffStorage(): Storage | null {
+  try {
+    return globalThis.sessionStorage ?? null;
   } catch {
     return null;
   }
@@ -53,6 +70,126 @@ function writeStoredDrafts(value: StoredDrafts | null): void {
   } catch {
     // Draft persistence is best effort in private/quota-limited contexts.
   }
+}
+
+function readDraftHandoff(): StoredDraftHandoff | null {
+  try {
+    const raw = handoffStorage()?.getItem(HANDOFF_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredDraftHandoff>;
+    if (
+      parsed.version !== HANDOFF_VERSION ||
+      typeof parsed.runtimeInstanceId !== "string" ||
+      !parsed.drafts ||
+      typeof parsed.drafts !== "object" ||
+      !Object.values(parsed.drafts).every((text) => typeof text === "string")
+    ) {
+      return null;
+    }
+    return parsed as StoredDraftHandoff;
+  } catch {
+    return null;
+  }
+}
+
+function writeDraftHandoff(value: StoredDraftHandoff | null): boolean {
+  try {
+    const target = handoffStorage();
+    if (!target) return false;
+    if (!value || Object.keys(value.drafts).length === 0) {
+      target.removeItem(HANDOFF_STORAGE_KEY);
+      return true;
+    }
+    const serialized = JSON.stringify(value);
+    if (new TextEncoder().encode(serialized).byteLength > MAX_HANDOFF_BYTES) {
+      return false;
+    }
+    target.setItem(HANDOFF_STORAGE_KEY, serialized);
+    return target.getItem(HANDOFF_STORAGE_KEY) === serialized;
+  } catch {
+    return false;
+  }
+}
+
+function exactDraftRecordsMatch(
+  left: Record<string, string>,
+  right: Record<string, string>,
+): boolean {
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key, index) =>
+        key === rightKeys[index] && left[key] === right[rightKeys[index]],
+    )
+  );
+}
+
+function nonEmptyDrafts(
+  drafts: Record<string, string>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(drafts).filter(([, text]) => text !== ""),
+  );
+}
+
+export function hasExactDraftHandoff(
+  runtimeInstanceId: string,
+  drafts: Record<string, string>,
+): boolean {
+  const exactDrafts = nonEmptyDrafts(drafts);
+  if (!runtimeInstanceId || Object.keys(exactDrafts).length === 0) return false;
+  const handoff = readDraftHandoff();
+  return Boolean(
+    handoff &&
+      handoff.runtimeInstanceId === runtimeInstanceId &&
+      exactDraftRecordsMatch(handoff.drafts, exactDrafts),
+  );
+}
+
+export function stageDraftHandoff(
+  runtimeInstanceId: string,
+  drafts: Record<string, string>,
+): boolean {
+  const exactDrafts = nonEmptyDrafts(drafts);
+  if (Object.keys(exactDrafts).length === 0) {
+    return writeDraftHandoff(null);
+  }
+  if (!runtimeInstanceId) return false;
+  if (
+    Object.values(exactDrafts).some(
+      (text) => new TextEncoder().encode(text).byteLength > MAX_DRAFT_BYTES,
+    )
+  ) {
+    return false;
+  }
+  if (
+    !writeDraftHandoff({
+      version: HANDOFF_VERSION,
+      runtimeInstanceId,
+      drafts: exactDrafts,
+    })
+  ) {
+    return false;
+  }
+  return hasExactDraftHandoff(runtimeInstanceId, exactDrafts);
+}
+
+function takeDraftHandoff(
+  runtimeInstanceId: string,
+  stableSessionKey: string,
+): string | null {
+  const handoff = readDraftHandoff();
+  if (!handoff || handoff.runtimeInstanceId !== runtimeInstanceId) return null;
+  const text = handoff.drafts[stableSessionKey];
+  if (typeof text !== "string") return null;
+  const drafts = { ...handoff.drafts };
+  delete drafts[stableSessionKey];
+  writeDraftHandoff(
+    Object.keys(drafts).length === 0 ? null : { ...handoff, drafts },
+  );
+  return text;
 }
 
 function truncateUtf8(text: string, maxBytes = MAX_DRAFT_BYTES): string {
@@ -104,6 +241,8 @@ export function loadDraft(
   stableSessionKey: string,
   now = Date.now(),
 ): string | null {
+  const handedOff = takeDraftHandoff(runtimeInstanceId, stableSessionKey);
+  if (handedOff !== null) return handedOff;
   const value = readStoredDrafts();
   if (!value || value.runtimeInstanceId !== runtimeInstanceId) return null;
   const cleaned = removeExpired(value, now);
@@ -115,15 +254,30 @@ export function loadDraft(
 
 export function removeDraft(runtimeInstanceId: string, stableSessionKey: string): void {
   const value = readStoredDrafts();
-  if (!value || value.runtimeInstanceId !== runtimeInstanceId) return;
-  const drafts = { ...value.drafts };
-  delete drafts[stableSessionKey];
-  writeStoredDrafts({ ...value, drafts });
+  if (value?.runtimeInstanceId === runtimeInstanceId) {
+    const drafts = { ...value.drafts };
+    delete drafts[stableSessionKey];
+    writeStoredDrafts({ ...value, drafts });
+  }
+  const handoff = readDraftHandoff();
+  if (handoff?.runtimeInstanceId === runtimeInstanceId) {
+    const handedOffDrafts = { ...handoff.drafts };
+    delete handedOffDrafts[stableSessionKey];
+    writeDraftHandoff(
+      Object.keys(handedOffDrafts).length === 0
+        ? null
+        : { ...handoff, drafts: handedOffDrafts },
+    );
+  }
 }
 
 export function clearOtherRuntimes(runtimeInstanceId: string): void {
   const value = readStoredDrafts();
   if (value && value.runtimeInstanceId !== runtimeInstanceId) writeStoredDrafts(null);
+  const handoff = readDraftHandoff();
+  if (handoff && handoff.runtimeInstanceId !== runtimeInstanceId) {
+    writeDraftHandoff(null);
+  }
 }
 
 export function pruneDrafts(
@@ -132,10 +286,26 @@ export function pruneDrafts(
   now = Date.now(),
 ): void {
   const value = readStoredDrafts();
-  if (!value || value.runtimeInstanceId !== runtimeInstanceId) return;
-  const cleaned = removeExpired(value, now);
-  const drafts = Object.fromEntries(
-    Object.entries(cleaned.drafts).filter(([key]) => liveSessionKeys.has(key)),
-  );
-  writeStoredDrafts({ ...cleaned, drafts });
+  if (value?.runtimeInstanceId === runtimeInstanceId) {
+    const cleaned = removeExpired(value, now);
+    const drafts = Object.fromEntries(
+      Object.entries(cleaned.drafts).filter(([key]) =>
+        liveSessionKeys.has(key),
+      ),
+    );
+    writeStoredDrafts({ ...cleaned, drafts });
+  }
+  const handoff = readDraftHandoff();
+  if (handoff?.runtimeInstanceId === runtimeInstanceId) {
+    const handedOffDrafts = Object.fromEntries(
+      Object.entries(handoff.drafts).filter(([key]) =>
+        liveSessionKeys.has(key),
+      ),
+    );
+    writeDraftHandoff(
+      Object.keys(handedOffDrafts).length === 0
+        ? null
+        : { ...handoff, drafts: handedOffDrafts },
+    );
+  }
 }

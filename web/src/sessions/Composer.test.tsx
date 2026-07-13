@@ -1,12 +1,27 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Composer } from "./Composer";
 
 afterEach(cleanup);
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 describe("native session composer", () => {
   it("uses a native multiline textarea and sends without a resume step", async () => {
@@ -184,6 +199,124 @@ describe("native session composer", () => {
         (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement)
           .value,
       ).toBe("message for B");
+    });
+  });
+
+  it("does not republish an attachment read after its session scope changes", async () => {
+    const read = deferred<ArrayBuffer>();
+    const file = new File([new Uint8Array([1, 2, 3])], "a-only.png", {
+      type: "image/png",
+    });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: vi.fn(() => read.promise),
+    });
+    const safetyStates: Array<{
+      selectedAttachments: number;
+      attachmentLoads: number;
+    }> = [];
+    const onSafetyStateChange = vi.fn(
+      (state: { selectedAttachments: number; attachmentLoads: number }) => {
+        safetyStates.push({ ...state });
+      },
+    );
+    const { rerender } = render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value=""
+        disabled={false}
+        pending={false}
+        supportsAttachments
+        onChange={() => {}}
+        onSubmit={async () => {}}
+        onSafetyStateChange={onSafetyStateChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText(/attach image/i), {
+      target: { files: [file] },
+    });
+    await waitFor(() =>
+      expect(safetyStates[safetyStates.length - 1]).toEqual({
+        selectedAttachments: 0,
+        attachmentLoads: 1,
+      }),
+    );
+
+    rerender(
+      <Composer
+        scopeKey="runtime-a:tab:claude-b"
+        value=""
+        disabled={false}
+        pending={false}
+        supportsAttachments
+        onChange={() => {}}
+        onSubmit={async () => {}}
+        onSafetyStateChange={onSafetyStateChange}
+      />,
+    );
+    expect(safetyStates[safetyStates.length - 1]).toEqual({
+      selectedAttachments: 0,
+      attachmentLoads: 0,
+    });
+
+    await act(async () => {
+      read.resolve(new ArrayBuffer(3));
+      await read.promise;
+    });
+    expect(safetyStates[safetyStates.length - 1]).toEqual({
+      selectedAttachments: 0,
+      attachmentLoads: 0,
+    });
+  });
+
+  it("clears safety and ignores an attachment read that finishes after unmount", async () => {
+    const read = deferred<ArrayBuffer>();
+    const file = new File([new Uint8Array([1, 2, 3])], "a-only.png", {
+      type: "image/png",
+    });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: vi.fn(() => read.promise),
+    });
+    const safetyStates: Array<{
+      selectedAttachments: number;
+      attachmentLoads: number;
+    }> = [];
+    const { unmount } = render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value=""
+        disabled={false}
+        pending={false}
+        supportsAttachments
+        onChange={() => {}}
+        onSubmit={async () => {}}
+        onSafetyStateChange={(state) => safetyStates.push({ ...state })}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText(/attach image/i), {
+      target: { files: [file] },
+    });
+    await waitFor(() =>
+      expect(safetyStates[safetyStates.length - 1]).toEqual({
+        selectedAttachments: 0,
+        attachmentLoads: 1,
+      }),
+    );
+
+    unmount();
+    expect(safetyStates[safetyStates.length - 1]).toEqual({
+      selectedAttachments: 0,
+      attachmentLoads: 0,
+    });
+
+    await act(async () => {
+      read.resolve(new ArrayBuffer(3));
+      await read.promise;
+    });
+    expect(safetyStates[safetyStates.length - 1]).toEqual({
+      selectedAttachments: 0,
+      attachmentLoads: 0,
     });
   });
 
