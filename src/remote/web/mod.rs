@@ -1,6 +1,8 @@
+pub mod action;
 pub mod assets;
 pub mod auth;
 pub mod bridge;
+pub mod dto;
 pub mod image_paste;
 pub mod wire;
 

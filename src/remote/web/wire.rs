@@ -1,19 +1,17 @@
 //! JSON-over-WebSocket wire protocol between the browser SPA and the in-process
-//! `WebClientSession` bridge. Kept deliberately small and passthrough-friendly:
-//! we reuse `RemoteAction`, `RemoteWorkspaceSnapshot`, `RemoteWorkspaceDelta`,
-//! and `RemoteActionResult` directly because they already derive `Serialize` /
-//! `Deserialize` and there is no benefit to inventing duplicate web-only
-//! shapes.
+//! `WebClientSession` bridge. Browser-visible workspace state and mutating
+//! action inputs use explicit web-only allowlists instead of native workspace
+//! snapshots, deltas, or `RemoteAction` values.
 
 use serde::{Deserialize, Serialize};
 
-use super::super::{
-    RemoteAction, RemoteActionResult, RemoteWorkspaceDelta, RemoteWorkspaceSnapshot,
-};
+use super::super::RemoteActionResult;
+use super::action::WebAction;
+use super::dto::{WebWorkspaceDelta, WebWorkspaceSnapshot};
 use crate::terminal::session::TerminalScreenSnapshot;
 
 /// Messages the browser sends to the host over the `/api/ws` text channel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -45,11 +43,11 @@ pub enum WsInbound {
         cols: u16,
     },
     Action {
-        action: RemoteAction,
+        action: WebAction,
     },
     Request {
         id: u64,
-        action: RemoteAction,
+        action: WebAction,
     },
     TakeControl,
     ClaimControlIfAvailable,
@@ -74,10 +72,10 @@ pub enum WsOutbound {
         protocol_version: u32,
     },
     Snapshot {
-        workspace: RemoteWorkspaceSnapshot,
+        workspace: WebWorkspaceSnapshot,
     },
     Delta {
-        delta: RemoteWorkspaceDelta,
+        delta: WebWorkspaceDelta,
     },
     ControlState {
         controller_client_id: Option<String>,

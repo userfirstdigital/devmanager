@@ -36,6 +36,7 @@ use super::super::{
     RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot,
     ServerMessage,
 };
+use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState};
 use super::wire::{WsInbound, WsOutbound};
 use super::{authenticate_request, record_browser_connection, WebState};
 use crate::state::SessionDimensions;
@@ -134,9 +135,11 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     let (mut ws_sink, mut ws_stream) = socket.split();
 
     // Writer task: serialize `ServerMessage`s and push out on the WS.
+    let writer_inner = inner.clone();
+    let writer_client_id = client_id.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(message) = tokio_rx.recv().await {
-            match encode_outbound(&message) {
+            match translate_outbound(&message, &writer_inner, &writer_client_id) {
                 Some(EncodedFrame::Text(text)) => {
                     if ws_sink.send(WsMessage::Text(text)).await.is_err() {
                         break;
@@ -517,6 +520,7 @@ fn handle_inbound(
             }
         }
         WsInbound::Action { action } => {
+            let action = action.into_remote();
             if requires_control(&action) && !current_controller_allows(inner, client_id) {
                 let _ = tokio_tx.send(ServerMessage::Disconnected {
                     message: "viewer mode: take control before acting".to_string(),
@@ -532,6 +536,7 @@ fn handle_inbound(
             }
         }
         WsInbound::Request { id, action } => {
+            let action = action.into_remote();
             if requires_control(&action) && !current_controller_allows(inner, client_id) {
                 let _ = tokio_tx.send(ServerMessage::Response {
                     request_id: id,
@@ -590,17 +595,59 @@ enum EncodedFrame {
     Binary(Vec<u8>),
 }
 
+/// Convert native broadcaster messages into browser-only wire frames. Native
+/// snapshots are treated strictly as host-side source data and are projected
+/// through the allowlist before JSON serialization. Native deltas intentionally
+/// trigger a fresh full projection for now.
+fn translate_outbound(
+    message: &ServerMessage,
+    inner: &Arc<RemoteHostInner>,
+    client_id: &str,
+) -> Option<EncodedFrame> {
+    match message {
+        ServerMessage::Snapshot { snapshot } => {
+            serialize_web_snapshot(project_web_snapshot(inner, snapshot))
+        }
+        ServerMessage::Delta { .. } => {
+            let snapshot = light_snapshot(inner, client_id);
+            serialize_web_snapshot(project_web_snapshot(inner, &snapshot))
+        }
+        _ => encode_outbound(message),
+    }
+}
+
+fn project_web_snapshot(
+    inner: &Arc<RemoteHostInner>,
+    snapshot: &RemoteWorkspaceSnapshot,
+) -> WebWorkspaceSnapshot {
+    let lease = WebWriterLeaseState {
+        owner_client_instance_id: snapshot.controller_client_id.clone(),
+        generation: 0,
+        expires_at_epoch_ms: None,
+        you_are_owner: snapshot.you_have_control,
+    };
+    let mut projected = WebWorkspaceSnapshot::from_host(
+        inner.runtime_instance_id.clone(),
+        inner.snapshot_revision.load(Ordering::Relaxed),
+        &snapshot.app_state,
+        &snapshot.runtime_state,
+        &snapshot.port_statuses,
+        &lease,
+    );
+    projected.server_id = snapshot.server_id.clone();
+    projected
+}
+
+fn serialize_web_snapshot(workspace: WebWorkspaceSnapshot) -> Option<EncodedFrame> {
+    serialize_text(&WsOutbound::Snapshot { workspace })
+}
+
 /// Translate a `ServerMessage` (the type the broadcaster produces) into a
 /// WS frame. Returns `None` for variants that only make sense on the TCP
 /// path (e.g., `HelloOk`, `PortForwardOk`).
 fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
     match message {
-        ServerMessage::Snapshot { snapshot } => serialize_text(&WsOutbound::Snapshot {
-            workspace: snapshot.clone(),
-        }),
-        ServerMessage::Delta { delta } => serialize_text(&WsOutbound::Delta {
-            delta: delta.clone(),
-        }),
+        ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => None,
         ServerMessage::Pong => serialize_text(&WsOutbound::Pong),
         ServerMessage::Error { message } => serialize_text(&WsOutbound::Error {
             message: message.clone(),
@@ -685,11 +732,11 @@ fn serialize_text(value: &WsOutbound) -> Option<EncodedFrame> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::action::{WebAction, WebAiKind};
     use super::*;
-    use crate::models::TabType;
     use crate::remote::{
-        deliver_pending_bootstraps, PairedWebClient, RemoteAction, RemoteHostConfig,
-        RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
+        deliver_pending_bootstraps, PairedWebClient, RemoteHostConfig, RemoteHostService,
+        RemoteSessionBootstrap, PROTOCOL_VERSION,
     };
     use crate::state::{SessionDimensions, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot};
@@ -738,19 +785,58 @@ mod tests {
     }
 
     #[test]
-    fn encode_outbound_handles_snapshot_as_text() {
+    fn translate_outbound_projects_snapshot_as_safe_text() {
         use super::super::super::RemoteWorkspaceSnapshot;
-        let snapshot = RemoteWorkspaceSnapshot::default();
-        let frame = encode_outbound(&ServerMessage::Snapshot {
-            snapshot: snapshot.clone(),
-        })
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let snapshot = RemoteWorkspaceSnapshot {
+            server_id: "host-1".to_string(),
+            ..RemoteWorkspaceSnapshot::default()
+        };
+        let frame = translate_outbound(
+            &ServerMessage::Snapshot { snapshot },
+            &service.inner,
+            "web-client",
+        )
         .expect("snapshot encodes");
         match frame {
             EncodedFrame::Text(text) => {
-                assert!(text.contains("\"type\":\"snapshot\""));
+                let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+                assert_eq!(value["type"], "snapshot");
+                assert_eq!(value["workspace"]["webProtocolVersion"], 2);
+                assert_eq!(value["workspace"]["serverId"], "host-1");
+                assert!(value["workspace"]["runtimeInstanceId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("runtime-")));
+                assert!(value["workspace"].get("appState").is_none());
+                assert!(value["workspace"].get("runtimeState").is_none());
             }
             EncodedFrame::Binary(_) => panic!("snapshot should be text"),
         }
+    }
+
+    #[test]
+    fn translate_outbound_emits_a_full_safe_snapshot_for_native_deltas() {
+        use super::super::super::RemoteWorkspaceDelta;
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app = crate::state::AppState::default();
+        app.config.settings.github_token = Some("TOKEN_SENTINEL".to_string());
+        service.update_snapshot(app, crate::state::RuntimeState::default(), HashMap::new());
+
+        let frame = translate_outbound(
+            &ServerMessage::Delta {
+                delta: RemoteWorkspaceDelta::default(),
+            },
+            &service.inner,
+            "web-client",
+        )
+        .expect("delta projects");
+        let EncodedFrame::Text(text) = frame else {
+            panic!("workspace update should be text");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["type"], "snapshot");
+        assert_eq!(value["workspace"]["revision"], 2);
+        assert!(!text.contains("TOKEN_SENTINEL"));
     }
 
     #[test]
@@ -770,11 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_action_start_server_uses_snake_case_fields() {
+    fn native_remote_action_start_server_wire_shape_stays_unchanged() {
         // `RemoteAction` has `rename_all = "camelCase"` on the enum (which
-        // only affects the `type` tag) but no `rename_all_fields`. Confirm
-        // the variant fields keep their Rust snake_case names so we know
-        // exactly what the browser SPA must send.
+        // only affects the `type` tag) but no `rename_all_fields`. Keep this
+        // regression assertion for the separate native MessagePack protocol;
+        // browser action input now goes through `WebAction`.
         use crate::remote::RemoteAction;
         use crate::state::SessionDimensions;
         let action = RemoteAction::StartServer {
@@ -991,10 +1077,9 @@ mod tests {
             client_id,
             WsInbound::Request {
                 id: 17,
-                action: RemoteAction::LaunchAi {
+                action: WebAction::LaunchAi {
                     project_id: "project-1".to_string(),
-                    tab_type: TabType::Claude,
-                    dimensions: SessionDimensions::default(),
+                    tab_type: WebAiKind::Claude,
                 },
             },
             &tokio_tx,
@@ -1034,10 +1119,9 @@ mod tests {
             client_id,
             WsInbound::Request {
                 id: 23,
-                action: RemoteAction::LaunchAi {
+                action: WebAction::LaunchAi {
                     project_id: "project-1".to_string(),
-                    tab_type: TabType::Claude,
-                    dimensions: SessionDimensions::default(),
+                    tab_type: WebAiKind::Claude,
                 },
             },
             &tokio_tx,
@@ -1079,7 +1163,7 @@ mod tests {
             client_id,
             WsInbound::Request {
                 id: 29,
-                action: RemoteAction::StopAllServers,
+                action: WebAction::StopAllServers,
             },
             &tokio_tx,
         );
