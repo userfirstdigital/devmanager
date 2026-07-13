@@ -353,6 +353,7 @@ export type WsOutbound =
       clientId: string;
       serverId: string;
       protocolVersion: number;
+      webBuildId: string;
     }
   | { type: "snapshot"; workspace: WebWorkspaceSnapshot }
   | { type: "delta"; delta: WebWorkspaceDelta }
@@ -484,6 +485,9 @@ export type RemoteAiTabPayload = WebActionPayload;
 export type RemoteWorkspaceSnapshot = LegacyWorkspaceProjection;
 export type RemoteWorkspaceDelta = never;
 
+// Default dimensions to send with start/restart actions from the web UI.
+// These are terminal character cells, not pixels — the host just wants
+// something sensible so the PTY opens at a reasonable size.
 export const DEFAULT_DIMENSIONS: SessionDimensions = {
   cols: 100,
   rows: 30,

@@ -206,6 +206,7 @@ pub enum WsOutbound {
         client_id: String,
         server_id: String,
         protocol_version: u32,
+        web_build_id: String,
     },
     Snapshot {
         workspace: WebWorkspaceSnapshot,

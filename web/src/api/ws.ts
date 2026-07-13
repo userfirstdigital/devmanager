@@ -220,9 +220,9 @@ export class WsClient {
   private stopped = false;
   private starting = false;
   private reconnectDelayMs = 1000;
-  private reconnectTimer: number | null = null;
-  private heartbeatTimer: number | null = null;
-  private composerRetryTimer: number | null = null;
+  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof globalThis.setInterval> | null = null;
+  private composerRetryTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   private composerRetryDelayMs = COMPOSER_RETRY_MIN_MS;
   private lastWriterLeaseRequestAt = Number.NEGATIVE_INFINITY;
   private lastForegroundWakeAt = Number.NEGATIVE_INFINITY;

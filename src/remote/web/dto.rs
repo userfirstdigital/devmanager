@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 pub const WEB_PROTOCOL_VERSION: u32 = 2;
+pub const WEB_BUILD_ID: &str = env!("DEVMANAGER_WEB_BUILD_ID");
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

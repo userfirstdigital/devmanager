@@ -1,4 +1,5 @@
 node_modules/
-bundle/*
-!bundle/index.html
 *.log
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js

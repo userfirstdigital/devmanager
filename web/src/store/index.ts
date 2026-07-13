@@ -27,6 +27,8 @@ import type {
   WsStatus,
 } from "../api/ws";
 import { isTransientComposerRejection, WsClient } from "../api/ws";
+import { evaluateBuildCompatibility } from "../pwa/buildCompatibility";
+import { requestCompatibleBuild } from "../pwa/register";
 
 const ACTIVE_PROJECT_KEY = "devmanager-active-project-id";
 const COLLAPSED_PROJECTS_KEY = "devmanager-collapsed-projects";
@@ -1146,8 +1148,10 @@ export const useStore = create<StoreState>((set, get) => {
 
     init() {
       if (get().client) return;
+      let compatibleBuildPending = false;
       const client = new WsClient({
         onStatus: (status) => {
+          if (compatibleBuildPending) return;
           if (
             status.kind === "connecting" ||
             status.kind === "closed" ||
@@ -1158,7 +1162,27 @@ export const useStore = create<StoreState>((set, get) => {
           }
           set({ status });
         },
-        onMessage: handleMessage,
+        onMessage: (message) => {
+          if (compatibleBuildPending) return;
+          if (message.type === "hello") {
+            const compatibility = evaluateBuildCompatibility(message.webBuildId);
+            if (compatibility.kind === "reloadRequired") {
+              compatibleBuildPending = true;
+              client.stop();
+              requestCompatibleBuild(compatibility.hostBuildId);
+              set({
+                status: {
+                  kind: "closed",
+                  reason: "host web bundle changed",
+                },
+                lastError:
+                  "DevManager is reconciling this web app with the updated host automatically.",
+              });
+              return;
+            }
+          }
+          handleMessage(message);
+        },
         onSessionOutput: handleSessionOutput,
         getResumeContext: (): ResumeContext => {
           const state = get();

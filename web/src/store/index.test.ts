@@ -55,6 +55,10 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
   return { wsClientState: state, MockWsClient };
 });
 
+const { requestCompatibleBuild } = vi.hoisted(() => ({
+  requestCompatibleBuild: vi.fn(),
+}));
+
 vi.mock("../api/ws", () => ({
   WsClient: MockWsClient,
   isTransientComposerRejection: (code: string) =>
@@ -64,6 +68,10 @@ vi.mock("../api/ws", () => ({
       "nativeControllerActive",
       "mutationInFlight",
     ].includes(code),
+}));
+
+vi.mock("../pwa/register", () => ({
+  requestCompatibleBuild,
 }));
 
 import {
@@ -1450,5 +1458,36 @@ describe("safe compatibility and raw terminal IO", () => {
       type: "startServer",
       command_id: "command-1",
     });
+  });
+
+  it("stops incompatible frames and requests automatic recovery without replacing the UI", () => {
+    useStore.getState().init();
+    const client = wsClientState.instance;
+    expect(client).toBeTruthy();
+    useStore.getState().applySnapshot(makeSnapshot());
+    const existingSnapshot = useStore.getState().snapshot;
+    useStore.setState({
+      activeSessionKey: "tab:a",
+    });
+
+    client?.callbacks.onMessage({
+      type: "hello",
+      clientId: "web-client",
+      serverId: "server-1",
+      protocolVersion: 2,
+      webBuildId: "different-host-build",
+    });
+    client?.callbacks.onMessage({
+      type: "snapshot",
+      workspace: makeSnapshot(),
+    });
+
+    const state = useStore.getState();
+    expect(client?.stop).toHaveBeenCalledTimes(1);
+    expect(requestCompatibleBuild).toHaveBeenCalledWith("different-host-build");
+    expect(state.status.kind).toBe("closed");
+    expect(state.snapshot).toBe(existingSnapshot);
+    expect(state.activeSessionKey).toBe("tab:a");
+    expect(state.lastError).toMatch(/automatically/i);
   });
 });

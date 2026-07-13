@@ -205,12 +205,20 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
-      - name: Build browser web UI bundle
+      - name: Rebuild and verify browser web UI bundle
         shell: bash
-        working-directory: web
         run: |
-          npm ci --no-audit --no-fund
-          npm run build
+          set -euo pipefail
+          rm -rf web/bundle
+          npm --prefix web ci --no-audit --no-fund
+          npm --prefix web run build
+          if [ -n "$(git status --porcelain -- web/bundle)" ]; then
+            git status --short -- web/bundle
+            git diff -- web/bundle
+            echo "Generated web/bundle differs from the tracked bundle." >&2
+            exit 1
+          fi
+          cargo test remote::web::assets --lib
 
       - name: Install cargo-packager
         shell: bash

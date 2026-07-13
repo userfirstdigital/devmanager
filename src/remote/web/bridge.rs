@@ -43,7 +43,7 @@ use super::super::{
     WebComposerMutationRecord, WebComposerMutationStatus,
 };
 use super::action::WebActionResult;
-use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState};
+use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState, WEB_BUILD_ID, WEB_PROTOCOL_VERSION};
 #[cfg(test)]
 use super::lease::MutationBegin;
 use super::lease::{LeaseError, WriterLease};
@@ -117,6 +117,15 @@ pub(crate) async fn ws_handler(
     ws.on_upgrade(move |socket| run_session(socket, inner, client_id))
 }
 
+fn initial_web_hello(client_id: &str, snapshot: &RemoteWorkspaceSnapshot) -> WsOutbound {
+    WsOutbound::Hello {
+        client_id: client_id.to_string(),
+        server_id: snapshot.server_id.clone(),
+        protocol_version: WEB_PROTOCOL_VERSION,
+        web_build_id: WEB_BUILD_ID.to_string(),
+    }
+}
+
 async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: String) {
     let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
     let (outbound, outbound_rx) =
@@ -142,6 +151,8 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // snapshot and can't stall the handshake.
     {
         let snapshot = light_snapshot(&inner, &client_id);
+        let initial_hello = initial_web_hello(&client_id, &snapshot);
+        let _ = outbound.try_send(initial_hello);
         let _ = outbound.try_send_server_message(
             &ServerMessage::Snapshot { snapshot },
             &inner,
@@ -7113,6 +7124,36 @@ mod tests {
         ]);
         assert_eq!(seq, 42);
         assert_eq!(&frame[18..], b"hello");
+    }
+
+    #[test]
+    fn initial_web_hello_carries_the_validated_bundle_build_id() {
+        let service = RemoteHostService::new(RemoteHostConfig {
+            server_id: "host-1".to_string(),
+            ..RemoteHostConfig::default()
+        });
+        let snapshot = light_snapshot(&service.inner, "web-client");
+        let hello = initial_web_hello("web-client", &snapshot);
+        let serialized = serde_json::to_value(&hello).expect("hello serializes");
+        assert_eq!(serialized["type"], "hello");
+        assert_eq!(serialized["webBuildId"], WEB_BUILD_ID);
+
+        let WsOutbound::Hello {
+            client_id,
+            server_id,
+            protocol_version,
+            web_build_id,
+        } = hello
+        else {
+            panic!("initial frame must be web hello");
+        };
+        assert_eq!(client_id, "web-client");
+        assert_eq!(server_id, "host-1");
+        assert_eq!(protocol_version, super::super::dto::WEB_PROTOCOL_VERSION);
+        assert_eq!(
+            web_build_id,
+            include_str!("../../../web/bundle/source-fingerprint.txt").trim()
+        );
     }
 
     #[test]
