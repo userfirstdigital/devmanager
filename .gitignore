@@ -43,4 +43,5 @@ serviceAccountKey.json
 /target-test-*
 /tests/targets/
 /.worktrees/
+/.superpowers/
 /target-live-dev
