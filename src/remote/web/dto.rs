@@ -140,6 +140,7 @@ pub struct WebSessionSummary {
     pub command_id: Option<String>,
     pub tab_id: Option<String>,
     pub dimensions: SessionDimensions,
+    pub interactive_shell: bool,
     pub last_activity_epoch_ms: Option<u64>,
     pub attention: SemanticAttention,
     pub attention_count: u64,
@@ -169,6 +170,7 @@ impl WebSessionSummary {
             command_id: session.command_id.clone(),
             tab_id: session.tab_id.clone(),
             dimensions: session.dimensions,
+            interactive_shell: session.interactive_shell,
             last_activity_epoch_ms: metadata.last_activity_epoch_ms,
             attention: metadata.attention,
             attention_count: metadata.attention_count,
@@ -479,5 +481,28 @@ mod tests {
         assert_eq!(snapshot.sessions[0].oldest_sequence, 1);
         assert_eq!(snapshot.sessions[0].latest_sequence, 1);
         assert_eq!(snapshot.port_statuses[0].port, 43872);
+    }
+
+    #[test]
+    fn browser_session_summary_projects_interactive_shell_state() {
+        let mut fixture = host_fixture_with_sentinels();
+        fixture
+            .runtime
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .interactive_shell = true;
+        let value = serde_json::to_value(WebWorkspaceSnapshot::from_host(
+            "runtime-1",
+            7,
+            &fixture.app,
+            &fixture.runtime,
+            &fixture.ports,
+            &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
+        ))
+        .unwrap();
+
+        assert_eq!(value["sessions"][0]["interactiveShell"], true);
     }
 }

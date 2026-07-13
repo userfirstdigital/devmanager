@@ -15,6 +15,7 @@ use presentation::{
 use web::bridge::{BrowserOutboundSender, WebConnectionTombstone};
 use web::input_executor::WebInputExecutor;
 use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
+use web::request_executor::WebRequestExecutor;
 
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
@@ -53,6 +54,7 @@ pub(crate) const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const REMOTE_ACCESS_LOG_LIMIT: usize = 100;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_OUTBOUND_MESSAGES_PER_TICK: usize = 128;
+pub(crate) const MAX_PENDING_REMOTE_REQUESTS: usize = 256;
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler =
@@ -320,6 +322,15 @@ pub struct RemoteImageAttachment {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemoteWebMutationAuthority {
+    pub runtime_instance_id: String,
+    pub connection_id: u64,
+    pub client_id: String,
+    pub lease_generation: u64,
+}
+
 impl Default for RemoteImageAttachment {
     fn default() -> Self {
         Self {
@@ -353,6 +364,8 @@ pub enum RemoteTerminalInput {
         session_id: String,
         text: String,
         attachments: Vec<RemoteImageAttachment>,
+        #[serde(default)]
+        authority: RemoteWebMutationAuthority,
     },
 }
 
@@ -717,6 +730,20 @@ pub struct PendingRemoteRequest {
     pub response: Option<mpsc::Sender<RemoteActionResult>>,
 }
 
+pub(crate) fn try_enqueue_pending_request(
+    inner: &RemoteHostInner,
+    request: PendingRemoteRequest,
+) -> Result<(), PendingRemoteRequest> {
+    let Ok(mut requests) = inner.pending_requests.lock() else {
+        return Err(request);
+    };
+    if requests.len() >= MAX_PENDING_REMOTE_REQUESTS {
+        return Err(request);
+    }
+    requests.push(request);
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteHostStatus {
     pub enabled: bool,
@@ -976,6 +1003,7 @@ pub(crate) struct RemoteHostInner {
     web_control: Mutex<WebControlState>,
     web_composer_mutations: Mutex<HashMap<String, WebComposerMutationRecord>>,
     web_input_executor: WebInputExecutor,
+    web_request_executor: WebRequestExecutor,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
@@ -1190,6 +1218,7 @@ impl RemoteHostService {
                 web_control: Mutex::new(WebControlState::new(Duration::from_secs(8))),
                 web_composer_mutations: Mutex::new(HashMap::new()),
                 web_input_executor: WebInputExecutor::default(),
+                web_request_executor: WebRequestExecutor::default(),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
                 controller_client_id: RwLock::new(None),
@@ -1209,6 +1238,13 @@ impl RemoteHostService {
         };
         service.apply_config(config);
         service
+    }
+
+    pub(crate) fn web_mutation_authority_is_current(
+        &self,
+        authority: &RemoteWebMutationAuthority,
+    ) -> bool {
+        web::bridge::web_mutation_authority_is_current(&self.inner, authority)
     }
 
     pub fn apply_config(&self, config: RemoteHostConfig) {
@@ -3240,13 +3276,14 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 if requires_control(&action) && !current_controller_allows(&inner, &client_id) {
                     continue;
                 }
-                if let Ok(mut requests) = inner.pending_requests.lock() {
-                    requests.push(PendingRemoteRequest {
+                let _ = try_enqueue_pending_request(
+                    &inner,
+                    PendingRemoteRequest {
                         client_id: client_id.clone(),
                         action,
                         response: None,
-                    });
-                }
+                    },
+                );
             }
             Ok(Some(ClientMessage::TakeControl)) => {
                 set_native_controller(&inner, Some(client_id.clone()));
@@ -3300,12 +3337,21 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
 
                 let timeout = request_timeout_for_action(&action);
                 let (response_tx, response_rx) = mpsc::channel();
-                if let Ok(mut requests) = inner.pending_requests.lock() {
-                    requests.push(PendingRemoteRequest {
+                if try_enqueue_pending_request(
+                    &inner,
+                    PendingRemoteRequest {
                         client_id: client_id.clone(),
                         action,
                         response: Some(response_tx),
+                    },
+                )
+                .is_err()
+                {
+                    let _ = tx.send(ServerMessage::Response {
+                        request_id,
+                        result: RemoteActionResult::error("Remote host is busy. Retry shortly."),
                     });
+                    continue;
                 }
                 let result = response_rx
                     .recv_timeout(timeout)
@@ -4332,12 +4378,13 @@ mod tests {
         drain_web_clients_for_restart, format_handshake_stage_error, generate_pairing_token,
         light_snapshot, load_remote_machine_state, now_epoch_ms, publish_semantic_event,
         request_timeout_for_action, requires_control, run_broadcaster, save_remote_machine_state,
-        set_last_connection_note, upsert_known_host, ClientAuth, ConnectedRemoteClient,
-        KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
-        RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource, RemoteAction,
-        RemoteClientHandle, RemoteClientInner, RemoteHostConfig, RemoteHostService,
-        RemoteLatencyStats, RemoteMachineState, RemoteSessionBootstrap, RemoteSessionStreamEvent,
-        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
+        set_last_connection_note, try_enqueue_pending_request, upsert_known_host, ClientAuth,
+        ConnectedRemoteClient, KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient,
+        PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
+        RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
+        RemoteHostService, RemoteLatencyStats, RemoteMachineState, RemoteSessionBootstrap,
+        RemoteSessionStreamEvent, RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
+        MAX_PENDING_REMOTE_REQUESTS,
     };
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::remote::presentation::{
@@ -4395,6 +4442,36 @@ mod tests {
         assert_eq!(
             request_timeout_for_action(&RemoteAction::StopAllServers),
             super::REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn pending_remote_request_queue_is_bounded() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        for index in 0..MAX_PENDING_REMOTE_REQUESTS {
+            assert!(try_enqueue_pending_request(
+                &service.inner,
+                PendingRemoteRequest {
+                    client_id: format!("client-{index}"),
+                    action: RemoteAction::GitListRepos,
+                    response: None,
+                },
+            )
+            .is_ok());
+        }
+
+        assert!(try_enqueue_pending_request(
+            &service.inner,
+            PendingRemoteRequest {
+                client_id: "overflow".to_string(),
+                action: RemoteAction::GitListRepos,
+                response: None,
+            },
+        )
+        .is_err());
+        assert_eq!(
+            service.inner.pending_requests.lock().unwrap().len(),
+            MAX_PENDING_REMOTE_REQUESTS
         );
     }
 

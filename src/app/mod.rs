@@ -16,8 +16,8 @@ use crate::remote::{
 };
 use crate::services::{
     ai_session_needs_restore, env_service, pid_file, platform_service, ports_service,
-    scanner_service, ConfigImportMode, ProcessManager, ProcessOpKind,
-    RemoteSessionEvent, SessionManager,
+    scanner_service, ConfigImportMode, ProcessManager, ProcessOpKind, RemoteSessionEvent,
+    SessionManager,
 };
 use crate::sidebar;
 use crate::state::{
@@ -134,13 +134,8 @@ pub fn run() {
 
 #[derive(Debug, Clone)]
 enum ActionableNotice {
-    PortInUse {
-        command_id: String,
-        message: String,
-    },
-    ForceQuit {
-        message: String,
-    },
+    PortInUse { command_id: String, message: String },
+    ForceQuit { message: String },
 }
 
 struct NativeShell {
@@ -666,11 +661,13 @@ impl NativeShell {
                         session_id,
                         text,
                         attachments,
+                        authority,
                     } => crate::remote::web::image_paste::handle_web_composer_batch(
                         &input_manager,
                         &session_id,
                         &attachments,
                         &text,
+                        || input_host_service.web_mutation_authority_is_current(&authority),
                     ),
                 };
                 if result.is_ok() {
@@ -1354,18 +1351,14 @@ impl NativeShell {
         action: RemoteAction,
         cx: &mut Context<Self>,
         on_complete: impl FnOnce(&mut Self, Result<RemoteActionResult, String>, &mut Context<Self>)
-        + Send
-        + 'static,
+            + Send
+            + 'static,
     ) -> bool {
         let Some(remote_mode) = self.remote_mode.as_ref() else {
             return false;
         };
         if remote_mode.reconnect.is_some() {
-            on_complete(
-                self,
-                Err("Reconnecting to remote host...".to_string()),
-                cx,
-            );
+            on_complete(self, Err("Reconnecting to remote host...".to_string()), cx);
             return true;
         }
         let client = remote_mode.client.clone();
@@ -2758,13 +2751,12 @@ impl NativeShell {
                     if let Some(session_id) = completion.context.session_id.as_deref() {
                         match completion.kind {
                             ProcessOpKind::SpawnAi | ProcessOpKind::RestartAi => {
-                                remote_result.payload =
-                                    remote_ai_tab_payload_for_remote_response(
-                                        &self.state,
-                                        &self.process_manager,
-                                        session_id,
-                                        Instant::now(),
-                                    );
+                                remote_result.payload = remote_ai_tab_payload_for_remote_response(
+                                    &self.state,
+                                    &self.process_manager,
+                                    session_id,
+                                    Instant::now(),
+                                );
                             }
                             _ => {}
                         }
@@ -2845,7 +2837,8 @@ impl NativeShell {
                     ProcessOpKind::StartServer
                     | ProcessOpKind::RestartServer
                     | ProcessOpKind::KillPortAndRestart => {
-                        self.terminal_notice = Some(format!("Failed to run server action: {error}"));
+                        self.terminal_notice =
+                            Some(format!("Failed to run server action: {error}"));
                         if completion.kind == ProcessOpKind::KillPortAndRestart {
                             if let (Some(command_id), Some(port)) = (
                                 completion.context.session_id.as_deref(),
@@ -2869,7 +2862,8 @@ impl NativeShell {
                             Some(format!("Failed to run SSH session action: {error}"));
                     }
                     ProcessOpKind::SpawnAi | ProcessOpKind::RestartAi => {
-                        self.terminal_notice = Some(format!("Failed to run AI session action: {error}"));
+                        self.terminal_notice =
+                            Some(format!("Failed to run AI session action: {error}"));
                     }
                     ProcessOpKind::Shutdown => {
                         let message = format!("Shutdown did not complete cleanly: {error}");
@@ -3056,10 +3050,11 @@ impl NativeShell {
                     Err(error) => RemoteActionResult::error(error),
                 },
                 RemoteAction::CloseAiTab { tab_id } => {
-                    match self
-                        .process_manager
-                        .close_ai_session_with_response(&mut self.state, &tab_id, response.clone())
-                    {
+                    match self.process_manager.close_ai_session_with_response(
+                        &mut self.state,
+                        &tab_id,
+                        response.clone(),
+                    ) {
                         Ok(()) => {
                             did_change = true;
                             self.save_session_state();
@@ -4536,27 +4531,34 @@ impl NativeShell {
         }
 
         let project_name_for_remote = project_name.clone();
-        if self.spawn_remote_request(RemoteAction::SaveProject { project: project.clone() }, cx, move |this, result, cx| {
-            match result {
-                Ok(result) if result.ok => {
-                    if this.editor_notice.is_none() {
-                        this.editor_notice = Some(format!("Created project `{project_name_for_remote}`"));
+        if self.spawn_remote_request(
+            RemoteAction::SaveProject {
+                project: project.clone(),
+            },
+            cx,
+            move |this, result, cx| {
+                match result {
+                    Ok(result) if result.ok => {
+                        if this.editor_notice.is_none() {
+                            this.editor_notice =
+                                Some(format!("Created project `{project_name_for_remote}`"));
+                        }
+                    }
+                    Ok(result) => {
+                        this.editor_notice = Some(
+                            result
+                                .message
+                                .unwrap_or_else(|| "Could not create remote project.".to_string()),
+                        );
+                    }
+                    Err(error) => {
+                        this.editor_notice =
+                            Some(format!("Could not create remote project: {error}"));
                     }
                 }
-                Ok(result) => {
-                    this.editor_notice = Some(
-                        result
-                            .message
-                            .unwrap_or_else(|| "Could not create remote project.".to_string()),
-                    );
-                }
-                Err(error) => {
-                    this.editor_notice =
-                        Some(format!("Could not create remote project: {error}"));
-                }
-            }
-            cx.notify();
-        }) {
+                cx.notify();
+            },
+        ) {
             return;
         }
 
@@ -5113,56 +5115,62 @@ impl NativeShell {
             .join(&env_file_path)
             .to_string_lossy()
             .to_string();
-        if self.spawn_remote_request(RemoteAction::ReadTextFile { path: full_path }, cx, move |this, result, cx| {
-            let env_contents = match result {
-                Ok(result) if result.ok => match result.payload {
-                    Some(RemoteActionPayload::TextFile { contents, .. }) => Some(contents),
-                    _ => None,
-                },
-                Ok(result) => {
-                    this.editor_notice = Some(
-                        result
-                            .message
-                            .unwrap_or_else(|| "Remote env load failed.".to_string()),
-                    );
-                    cx.notify();
-                    return;
-                }
-                Err(error) => {
-                    this.editor_notice = Some(format!("Remote env load failed: {error}"));
-                    cx.notify();
-                    return;
-                }
-            };
-            match env_contents {
-                Some(contents) => {
-                    if let Some(EditorPanel::Folder(draft)) = this.editor_panel.as_mut() {
-                        draft.env_file_contents = contents;
-                        draft.env_file_loaded = true;
-                        draft.scan_message = Some("Loaded env file contents.".to_string());
-                    }
-                }
-                None => {
-                    if let Some(EditorPanel::Folder(draft)) = this.editor_panel.as_mut() {
-                        draft.env_file_contents.clear();
-                        draft.env_file_loaded = true;
-                        draft.scan_message = Some(
-                            "Env file does not exist yet. Saving the folder will create it."
-                                .to_string(),
+        if self.spawn_remote_request(
+            RemoteAction::ReadTextFile { path: full_path },
+            cx,
+            move |this, result, cx| {
+                let env_contents = match result {
+                    Ok(result) if result.ok => match result.payload {
+                        Some(RemoteActionPayload::TextFile { contents, .. }) => Some(contents),
+                        _ => None,
+                    },
+                    Ok(result) => {
+                        this.editor_notice = Some(
+                            result
+                                .message
+                                .unwrap_or_else(|| "Remote env load failed.".to_string()),
                         );
+                        cx.notify();
+                        return;
+                    }
+                    Err(error) => {
+                        this.editor_notice = Some(format!("Remote env load failed: {error}"));
+                        cx.notify();
+                        return;
+                    }
+                };
+                match env_contents {
+                    Some(contents) => {
+                        if let Some(EditorPanel::Folder(draft)) = this.editor_panel.as_mut() {
+                            draft.env_file_contents = contents;
+                            draft.env_file_loaded = true;
+                            draft.scan_message = Some("Loaded env file contents.".to_string());
+                        }
+                    }
+                    None => {
+                        if let Some(EditorPanel::Folder(draft)) = this.editor_panel.as_mut() {
+                            draft.env_file_contents.clear();
+                            draft.env_file_loaded = true;
+                            draft.scan_message = Some(
+                                "Env file does not exist yet. Saving the folder will create it."
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
-            }
-            this.editor_active_field = Some(EditorField::Folder(FolderField::EnvContents));
-            this.editor_cursor = this
-                .editor_panel
-                .as_ref()
-                .and_then(|panel| panel.text_value(EditorField::Folder(FolderField::EnvContents)))
-                .map(|value| value.chars().count())
-                .unwrap_or(0);
-            this.editor_needs_focus = true;
-            cx.notify();
-        }) {
+                this.editor_active_field = Some(EditorField::Folder(FolderField::EnvContents));
+                this.editor_cursor = this
+                    .editor_panel
+                    .as_ref()
+                    .and_then(|panel| {
+                        panel.text_value(EditorField::Folder(FolderField::EnvContents))
+                    })
+                    .map(|value| value.chars().count())
+                    .unwrap_or(0);
+                this.editor_needs_focus = true;
+                cx.notify();
+            },
+        ) {
             return;
         }
 
@@ -5461,8 +5469,12 @@ impl NativeShell {
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
-                if self.spawn_remote_request(RemoteAction::SaveProject { project: project.clone() }, cx, |this, result, cx| {
-                    match result {
+                if self.spawn_remote_request(
+                    RemoteAction::SaveProject {
+                        project: project.clone(),
+                    },
+                    cx,
+                    |this, result, cx| match result {
                         Ok(result) if result.ok => this.close_editor(cx),
                         Ok(result) => {
                             this.editor_notice = Some(
@@ -5476,8 +5488,8 @@ impl NativeShell {
                             this.editor_notice = Some(format!("Could not save project: {error}"));
                             cx.notify();
                         }
-                    }
-                }) {
+                    },
+                ) {
                     return;
                 }
                 self.state.upsert_project(project);
@@ -5521,9 +5533,8 @@ impl NativeShell {
                 let env_file_contents = (draft.env_file_loaded
                     && !draft.env_file_path.trim().is_empty())
                 .then_some(draft.env_file_contents.clone());
-                let save_remote_folder = move |this: &mut Self,
-                                             cx: &mut Context<Self>,
-                                             folder: ProjectFolder| {
+                let save_remote_folder =
+                    move |this: &mut Self, cx: &mut Context<Self>, folder: ProjectFolder| {
                         let project_id = project_id.clone();
                         let env_file_contents = env_file_contents.clone();
                         let _ = this.spawn_remote_request(
@@ -5536,11 +5547,10 @@ impl NativeShell {
                             |this, result, cx| match result {
                                 Ok(result) if result.ok => this.close_editor(cx),
                                 Ok(result) => {
-                                    this.editor_notice = Some(
-                                        result.message.unwrap_or_else(|| {
+                                    this.editor_notice =
+                                        Some(result.message.unwrap_or_else(|| {
                                             "Could not save folder".to_string()
-                                        }),
-                                    );
+                                        }));
                                     cx.notify();
                                 }
                                 Err(error) => {
@@ -5572,11 +5582,10 @@ impl NativeShell {
                                     save_remote_folder(this, cx, folder_for_save);
                                 }
                                 Ok(result) => {
-                                    this.editor_notice = Some(
-                                        result.message.unwrap_or_else(|| {
+                                    this.editor_notice =
+                                        Some(result.message.unwrap_or_else(|| {
                                             "Could not save env file.".to_string()
-                                        }),
-                                    );
+                                        }));
                                     cx.notify();
                                 }
                                 Err(error) => {
@@ -5725,15 +5734,18 @@ impl NativeShell {
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
-                if self.spawn_remote_request(RemoteAction::SaveSsh { connection: connection.clone() }, cx, |this, result, cx| {
-                    match result {
+                if self.spawn_remote_request(
+                    RemoteAction::SaveSsh {
+                        connection: connection.clone(),
+                    },
+                    cx,
+                    |this, result, cx| match result {
                         Ok(result) if result.ok => this.close_editor(cx),
                         Ok(result) => {
-                            this.editor_notice = Some(
-                                result.message.unwrap_or_else(|| {
+                            this.editor_notice =
+                                Some(result.message.unwrap_or_else(|| {
                                     "Could not save SSH connection".to_string()
-                                }),
-                            );
+                                }));
                             cx.notify();
                         }
                         Err(error) => {
@@ -5741,8 +5753,8 @@ impl NativeShell {
                                 Some(format!("Could not save SSH connection: {error}"));
                             cx.notify();
                         }
-                    }
-                }) {
+                    },
+                ) {
                     return;
                 }
                 if connection.private_key.is_none() {
@@ -5781,9 +5793,9 @@ impl NativeShell {
                             Ok(result) if result.ok => this.close_editor(cx),
                             Ok(result) => {
                                 this.editor_notice = Some(
-                                    result.message.unwrap_or_else(|| {
-                                        "Could not delete project".to_string()
-                                    }),
+                                    result
+                                        .message
+                                        .unwrap_or_else(|| "Could not delete project".to_string()),
                                 );
                                 cx.notify();
                             }
@@ -5844,9 +5856,9 @@ impl NativeShell {
                             Ok(result) if result.ok => this.close_editor(cx),
                             Ok(result) => {
                                 this.editor_notice = Some(
-                                    result.message.unwrap_or_else(|| {
-                                        "Could not delete folder".to_string()
-                                    }),
+                                    result
+                                        .message
+                                        .unwrap_or_else(|| "Could not delete folder".to_string()),
                                 );
                                 cx.notify();
                             }
@@ -5900,9 +5912,9 @@ impl NativeShell {
                             Ok(result) if result.ok => this.close_editor(cx),
                             Ok(result) => {
                                 this.editor_notice = Some(
-                                    result.message.unwrap_or_else(|| {
-                                        "Could not delete command".to_string()
-                                    }),
+                                    result
+                                        .message
+                                        .unwrap_or_else(|| "Could not delete command".to_string()),
                                 );
                                 cx.notify();
                             }
@@ -5940,17 +5952,14 @@ impl NativeShell {
                         |this, result, cx| match result {
                             Ok(result) if result.ok => this.close_editor(cx),
                             Ok(result) => {
-                                this.editor_notice = Some(
-                                    result.message.unwrap_or_else(|| {
-                                        "Could not delete SSH connection".to_string()
-                                    }),
-                                );
+                                this.editor_notice = Some(result.message.unwrap_or_else(|| {
+                                    "Could not delete SSH connection".to_string()
+                                }));
                                 cx.notify();
                             }
                             Err(error) => {
-                                this.editor_notice = Some(format!(
-                                    "Could not delete SSH connection: {error}"
-                                ));
+                                this.editor_notice =
+                                    Some(format!("Could not delete SSH connection: {error}"));
                                 cx.notify();
                             }
                         },
@@ -5995,9 +6004,9 @@ impl NativeShell {
                         }
                         Ok(result) => {
                             this.terminal_notice = Some(
-                                result.message.unwrap_or_else(|| {
-                                    "Could not delete project.".to_string()
-                                }),
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not delete project.".to_string()),
                             );
                         }
                         Err(error) => {
@@ -6060,9 +6069,9 @@ impl NativeShell {
                         }
                         Ok(result) => {
                             this.terminal_notice = Some(
-                                result.message.unwrap_or_else(|| {
-                                    "Could not delete folder.".to_string()
-                                }),
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not delete folder.".to_string()),
                             );
                         }
                         Err(error) => {
@@ -6131,9 +6140,9 @@ impl NativeShell {
                         }
                         Ok(result) => {
                             this.terminal_notice = Some(
-                                result.message.unwrap_or_else(|| {
-                                    "Could not delete command.".to_string()
-                                }),
+                                result
+                                    .message
+                                    .unwrap_or_else(|| "Could not delete command.".to_string()),
                             );
                         }
                         Err(error) => {
@@ -6173,11 +6182,10 @@ impl NativeShell {
                             this.terminal_notice = None;
                         }
                         Ok(result) => {
-                            this.terminal_notice = Some(
-                                result.message.unwrap_or_else(|| {
+                            this.terminal_notice =
+                                Some(result.message.unwrap_or_else(|| {
                                     "Could not delete SSH connection.".to_string()
-                                }),
-                            );
+                                }));
                         }
                         Err(error) => {
                             this.terminal_notice =
@@ -7344,30 +7352,33 @@ impl NativeShell {
         let search_highlight = self.current_search_highlight(active_session.as_ref());
         let scrollbar = self.terminal_scrollbar_model(active_session.as_ref());
         let has_active_tab = active_tab_type.is_some();
-        let actionable_notice = self.terminal_actionable_notice.as_ref().and_then(|notice| {
-            match notice {
-                ActionableNotice::PortInUse {
-                    command_id,
-                    message,
-                    ..
-                } => {
-                    if command_id.as_str() == active_spec.session_id.as_str() {
+        let actionable_notice =
+            self.terminal_actionable_notice
+                .as_ref()
+                .and_then(|notice| match notice {
+                    ActionableNotice::PortInUse {
+                        command_id,
+                        message,
+                        ..
+                    } => {
+                        if command_id.as_str() == active_spec.session_id.as_str() {
+                            Some(view::TerminalActionableNotice {
+                                message: message.clone(),
+                                action_label: "Kill process & start server",
+                                action_color: theme::DANGER_TEXT,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    ActionableNotice::ForceQuit { message } => {
                         Some(view::TerminalActionableNotice {
                             message: message.clone(),
-                            action_label: "Kill process & start server",
+                            action_label: "Quit anyway",
                             action_color: theme::DANGER_TEXT,
                         })
-                    } else {
-                        None
                     }
-                }
-                ActionableNotice::ForceQuit { message } => Some(view::TerminalActionableNotice {
-                    message: message.clone(),
-                    action_label: "Quit anyway",
-                    action_color: theme::DANGER_TEXT,
-                }),
-            }
-        });
+                });
         view::TerminalPaneModel {
             active_project: if has_active_tab {
                 self.state
@@ -7440,7 +7451,8 @@ impl NativeShell {
         let session = session?;
         scrollbar_model_for_screen(
             &session.screen,
-            self.terminal_scrollbar_drag.map(|drag| drag.thumb_top_ratio),
+            self.terminal_scrollbar_drag
+                .map(|drag| drag.thumb_top_ratio),
             self.state.settings().show_terminal_scrollbar,
         )
     }
@@ -8562,11 +8574,10 @@ impl NativeShell {
                             let message =
                                 format!("Port {port} is already in use by {owner_label}.");
                             this.terminal_notice = Some(message.clone());
-                            this.terminal_actionable_notice =
-                                Some(ActionableNotice::PortInUse {
-                                    command_id: command_id.clone(),
-                                    message,
-                                });
+                            this.terminal_actionable_notice = Some(ActionableNotice::PortInUse {
+                                command_id: command_id.clone(),
+                                message,
+                            });
                             cx.notify();
                             return;
                         }
@@ -9200,8 +9211,7 @@ impl NativeShell {
             });
             self.synced_session_id = None;
             self.last_dimensions = None;
-            self.terminal_notice =
-                Some("Disconnecting remote SSH session...".to_string());
+            self.terminal_notice = Some("Disconnecting remote SSH session...".to_string());
             cx.notify();
             return;
         }
@@ -10672,12 +10682,11 @@ impl Render for NativeShell {
                     this.kill_server_port_action(&command_id, window, cx);
                 }))
             };
-        let make_force_quit_handler =
-            || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
-                Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                    this.force_quit_action(cx);
-                }))
-            };
+        let make_force_quit_handler = || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
+            Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.force_quit_action(cx);
+            }))
+        };
         let make_select_server_handler =
             |command_id: String| -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
                 Box::new(cx.listener(move |this, _: &MouseDownEvent, _window, cx| {

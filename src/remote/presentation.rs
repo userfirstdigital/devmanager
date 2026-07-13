@@ -296,7 +296,9 @@ impl SemanticJournal {
             .copied();
         let sequence = self.allocate_sequence();
         if let Some(replaced_sequence) = replaced_sequence {
-            self.remove_sequence(replaced_sequence);
+            if !self.preserve_replacement_link(replaced_sequence) {
+                self.remove_sequence(replaced_sequence);
+            }
         }
         self.insert_draft(draft, sequence, replaced_sequence)
     }
@@ -428,6 +430,41 @@ impl SemanticJournal {
                 self.remove_deduplication_for(&stored);
             }
         }
+    }
+
+    fn preserve_replacement_link(&mut self, sequence: u64) -> bool {
+        let mut deduplication_key = None;
+        let retained = if let Some(stored) = self
+            .canonical
+            .iter_mut()
+            .find(|stored| stored.event.sequence == sequence)
+        {
+            if stored.event.replaces_sequence.is_some() {
+                deduplication_key = stored.deduplication_key.take();
+                true
+            } else {
+                false
+            }
+        } else if let Some(stored) = self
+            .verbose
+            .iter_mut()
+            .find(|stored| stored.event.sequence == sequence)
+        {
+            if stored.event.replaces_sequence.is_some() {
+                deduplication_key = stored.deduplication_key.take();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if let Some(key) = deduplication_key {
+            if self.deduplication_sequences.get(&key).copied() == Some(sequence) {
+                self.deduplication_sequences.remove(&key);
+            }
+        }
+        retained
     }
 
     fn retained_bytes(&self) -> usize {
@@ -1579,6 +1616,49 @@ mod tests {
         );
         let json = serde_json::to_value(incremental.events[0].as_ref()).unwrap();
         assert_eq!(json["replacesSequence"], partial.sequence);
+    }
+
+    #[test]
+    fn chained_deduplication_replay_deletes_every_observable_predecessor() {
+        let key = StableSessionKey::from_tab("tab-chain");
+        let mut journal = SemanticJournal::default();
+        let first = journal.push(output_draft(
+            key.clone(),
+            "first partial",
+            SemanticRetention::Canonical,
+            Some("assistant-message-chain"),
+        ));
+        let second = journal.push(output_draft(
+            key.clone(),
+            "second partial",
+            SemanticRetention::Canonical,
+            Some("assistant-message-chain"),
+        ));
+        let final_event = journal.push(output_draft(
+            key,
+            "final response",
+            SemanticRetention::Canonical,
+            Some("assistant-message-chain"),
+        ));
+
+        let replay = journal.replay_after(first.sequence);
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![second.sequence, final_event.sequence]
+        );
+
+        let mut browser_sequences = std::collections::BTreeSet::from([first.sequence]);
+        for event in replay.events {
+            if let Some(replaced) = event.replaces_sequence {
+                browser_sequences.remove(&replaced);
+            }
+            browser_sequences.insert(event.sequence);
+        }
+        assert_eq!(browser_sequences, [final_event.sequence].into());
     }
 
     #[test]

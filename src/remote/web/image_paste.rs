@@ -8,6 +8,8 @@ use crate::services::ProcessManager;
 use crate::state::SessionRuntimeState;
 
 pub(crate) const WEB_PASTE_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const WEB_COMPOSER_AUTHORITY_CHANGED: &str =
+    "The writer lease changed before the prompt reached the terminal.";
 const STAGING_DIR: [&str; 2] = [".devmanager", "pasted-images"];
 const STAGED_IMAGE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 static NEXT_STAGED_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
@@ -38,6 +40,7 @@ pub(crate) fn handle_web_composer_batch(
     session_id: &str,
     attachments: &[RemoteImageAttachment],
     text: &str,
+    authorize: impl FnOnce() -> bool,
 ) -> Result<(), String> {
     let runtime = process_manager.runtime_state();
     let session = runtime
@@ -45,7 +48,7 @@ pub(crate) fn handle_web_composer_batch(
         .get(session_id)
         .cloned()
         .ok_or_else(|| format!("Unknown terminal session: {session_id}"))?;
-    execute_web_composer_batch(&session, attachments, text, |prompt| {
+    execute_web_composer_batch(&session, attachments, text, authorize, |prompt| {
         process_manager.write_to_session(session_id, prompt)
     })
 }
@@ -54,6 +57,7 @@ fn execute_web_composer_batch(
     session: &SessionRuntimeState,
     attachments: &[RemoteImageAttachment],
     text: &str,
+    authorize: impl FnOnce() -> bool,
     write: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut staged = Vec::with_capacity(attachments.len());
@@ -76,6 +80,10 @@ fn execute_web_composer_batch(
     } else {
         format!("{references} {text}")
     };
+    if !authorize() {
+        rollback_staged_images(&staged);
+        return Err(WEB_COMPOSER_AUTHORITY_CHANGED.to_string());
+    }
     match write(&prompt) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -283,10 +291,16 @@ mod tests {
         ];
         let writes = std::sync::atomic::AtomicUsize::new(0);
 
-        let result = execute_web_composer_batch(&session, &attachments, "hello\r", |_| {
-            writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        });
+        let result = execute_web_composer_batch(
+            &session,
+            &attachments,
+            "hello\r",
+            || true,
+            |_| {
+                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
 
         assert!(result.is_err());
         assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -322,11 +336,17 @@ mod tests {
         let writes = std::sync::atomic::AtomicUsize::new(0);
         let observed_prompt = std::sync::Mutex::new(None);
 
-        execute_web_composer_batch(&session, &attachments, "hello\r", |prompt| {
-            writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *observed_prompt.lock().unwrap() = Some(prompt.to_string());
-            Ok(())
-        })
+        execute_web_composer_batch(
+            &session,
+            &attachments,
+            "hello\r",
+            || true,
+            |prompt| {
+                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *observed_prompt.lock().unwrap() = Some(prompt.to_string());
+                Ok(())
+            },
+        )
         .expect("batch succeeds");
 
         assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -344,6 +364,43 @@ mod tests {
         assert_eq!(
             fs::read(cwd.join(references[1].trim_start_matches('@'))).unwrap(),
             vec![4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn composer_batch_revalidates_authority_after_staging_and_rolls_back() {
+        let cwd = temp_test_dir("web-composer-authority-rollback");
+        let mut session = SessionRuntimeState::new(
+            "claude-authority",
+            cwd.clone(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        let attachments = vec![RemoteImageAttachment {
+            mime_type: "image/png".to_string(),
+            file_name: Some("authority.png".to_string()),
+            bytes: vec![1, 2, 3],
+        }];
+        let writes = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = execute_web_composer_batch(
+            &session,
+            &attachments,
+            "hello\r",
+            || false,
+            |_| {
+                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), WEB_COMPOSER_AUTHORITY_CHANGED);
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let staging = cwd.join(".devmanager").join("pasted-images");
+        assert!(
+            !staging.exists() || fs::read_dir(staging).unwrap().next().is_none(),
+            "authority loss left staged files behind"
         );
     }
 

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
@@ -37,9 +37,10 @@ use super::super::presentation::{
 };
 use super::super::{
     now_epoch_ms, publish_semantic_event, request_timeout_for_action, requires_control,
-    stable_hash, ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
-    RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot,
-    ServerMessage, WebComposerMutationRecord, WebComposerMutationStatus,
+    stable_hash, try_enqueue_pending_request, ConnectedRemoteClient, PendingRemoteRequest,
+    RemoteActionResult, RemoteHostInner, RemoteImageAttachment, RemoteSessionStreamEvent,
+    RemoteTerminalInput, RemoteWebMutationAuthority, RemoteWorkspaceSnapshot, ServerMessage,
+    WebComposerMutationRecord, WebComposerMutationStatus,
 };
 use super::action::WebActionResult;
 use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState};
@@ -73,6 +74,7 @@ const MAX_COMPOSER_ATTACHMENTS: usize = 4;
 const MAX_COMPOSER_ATTACHMENT_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_COMPOSER_FILE_NAME_BYTES: usize = 255;
 const MAX_RESUME_ROUTE_BYTES: usize = 2048;
+const MAX_RESUME_CAPTURE_ATTEMPTS: usize = 4;
 const MAX_CLIENT_INSTANCE_ID_BYTES: usize = 128;
 const MAX_STABLE_SESSION_KEY_BYTES: usize = 512;
 const MAX_SESSION_ID_BYTES: usize = 512;
@@ -1003,6 +1005,7 @@ fn handle_inbound_core(
                 Some(expected_lease_generation),
                 now_epoch_ms(),
                 stable_session_key,
+                1,
                 tokio_tx.clone(),
                 |session_id| RemoteTerminalInput::Bytes {
                     session_id,
@@ -1175,6 +1178,7 @@ fn handle_inbound_core(
                 });
                 return;
             };
+            let retained_bytes = text.len();
             let result = enqueue_terminal_input(
                 inner,
                 connection_id,
@@ -1183,6 +1187,7 @@ fn handle_inbound_core(
                 expected_lease_generation,
                 now_epoch_ms(),
                 stable_session_key,
+                retained_bytes,
                 tokio_tx.clone(),
                 move |current_session_id| RemoteTerminalInput::Text {
                     session_id: current_session_id,
@@ -1246,6 +1251,8 @@ fn handle_inbound_core(
                 });
                 return;
             };
+            let retained_bytes =
+                bytes.len() + mime_type.len() + file_name.as_ref().map_or(0, String::len);
             let result = enqueue_terminal_input(
                 inner,
                 connection_id,
@@ -1254,6 +1261,7 @@ fn handle_inbound_core(
                 expected_lease_generation,
                 now_epoch_ms(),
                 stable_session_key,
+                retained_bytes,
                 tokio_tx.clone(),
                 move |current_session_id| RemoteTerminalInput::Image {
                     session_id: current_session_id,
@@ -1327,14 +1335,15 @@ fn handle_inbound_core(
             let action = action.into_remote();
             let requires_writer = requires_control(&action);
             let enqueue = || {
-                inner.pending_requests.lock().is_ok_and(|mut requests| {
-                    requests.push(PendingRemoteRequest {
+                try_enqueue_pending_request(
+                    inner,
+                    PendingRemoteRequest {
                         client_id: client_id.to_string(),
                         action,
                         response: None,
-                    });
-                    true
-                })
+                    },
+                )
+                .is_ok()
             };
             let accepted = if requires_writer {
                 with_web_mutation_authority(
@@ -1355,11 +1364,19 @@ fn handle_inbound_core(
                     enqueue,
                 )
             };
-            if accepted.is_none() && requires_writer {
-                let _ = tokio_tx.send(ServerMessage::Disconnected {
-                    message: "viewer mode: take control before acting".to_string(),
-                });
-                return;
+            match accepted {
+                Some(true) => {}
+                Some(false) => {
+                    let _ = tokio_tx.send(ServerMessage::Error {
+                        message: "Remote host is busy. Retry shortly.".to_string(),
+                    });
+                }
+                None if requires_writer => {
+                    let _ = tokio_tx.send(ServerMessage::Disconnected {
+                        message: "viewer mode: take control before acting".to_string(),
+                    });
+                }
+                None => {}
             }
         }
         WsInbound::Request {
@@ -1371,15 +1388,41 @@ fn handle_inbound_core(
             let requires_writer = requires_control(&action);
             let (response_tx, response_rx) = std_mpsc::channel();
             let timeout = request_timeout_for_action(&action);
+            let deadline = Instant::now() + timeout;
+            let (start_tx, start_rx) = std_mpsc::sync_channel(1);
+            let response_lane = tokio_tx.clone();
+            if inner
+                .web_request_executor
+                .dispatch(move || {
+                    if !matches!(start_rx.recv(), Ok(true)) {
+                        return;
+                    }
+                    let result = response_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or_else(|_| RemoteActionResult::error("Remote host timed out."));
+                    let _ = response_lane.send(ServerMessage::Response {
+                        request_id: id,
+                        result,
+                    });
+                })
+                .is_err()
+            {
+                let _ = tokio_tx.send(ServerMessage::Response {
+                    request_id: id,
+                    result: RemoteActionResult::error("Remote host is busy. Retry shortly."),
+                });
+                return;
+            }
             let enqueue = || {
-                inner.pending_requests.lock().is_ok_and(|mut requests| {
-                    requests.push(PendingRemoteRequest {
+                try_enqueue_pending_request(
+                    inner,
+                    PendingRemoteRequest {
                         client_id: client_id.to_string(),
                         action,
                         response: Some(response_tx),
-                    });
-                    true
-                })
+                    },
+                )
+                .is_ok()
             };
             let accepted = if requires_writer {
                 with_web_mutation_authority(
@@ -1400,29 +1443,30 @@ fn handle_inbound_core(
                     enqueue,
                 )
             };
-            if accepted.is_none() {
-                if !requires_writer {
-                    return;
+            match accepted {
+                Some(true) => {
+                    let _ = start_tx.send(true);
                 }
-                let _ = tokio_tx.send(ServerMessage::Response {
-                    request_id: id,
-                    result: RemoteActionResult::error(
-                        "This client is in viewer mode. Take control first.",
-                    ),
-                });
-                return;
+                Some(false) => {
+                    let _ = start_tx.send(false);
+                    let _ = tokio_tx.send(ServerMessage::Response {
+                        request_id: id,
+                        result: RemoteActionResult::error("Remote host is busy. Retry shortly."),
+                    });
+                }
+                None => {
+                    let _ = start_tx.send(false);
+                    if !requires_writer {
+                        return;
+                    }
+                    let _ = tokio_tx.send(ServerMessage::Response {
+                        request_id: id,
+                        result: RemoteActionResult::error(
+                            "This client is in viewer mode. Take control first.",
+                        ),
+                    });
+                }
             }
-
-            let response_tx = tokio_tx.clone();
-            std::thread::spawn(move || {
-                let result = response_rx
-                    .recv_timeout(timeout)
-                    .unwrap_or_else(|_| RemoteActionResult::error("Remote host timed out."));
-                let _ = response_tx.send(ServerMessage::Response {
-                    request_id: id,
-                    result,
-                });
-            });
         }
         WsInbound::TakeControl => {
             claim_legacy_control_for_connection(
@@ -1583,7 +1627,7 @@ fn with_web_mutation_authority<R>(
         return None;
     }
     let permit = registered_web_tombstone(inner, connection_id, client_id, expected_tombstone)?;
-    let (authorized, lease_changed) = {
+    let (authorized, before, after) = {
         let Ok(mut control) = inner.web_control.lock() else {
             return None;
         };
@@ -1596,8 +1640,10 @@ fn with_web_mutation_authority<R>(
             None => control.legacy_authorizes(connection_id, client_id),
         };
         let after = control.writer_leases().peek();
-        (authorized, before != after)
+        (authorized, before, after)
     };
+    clear_controller_after_lease_removal(inner, before.as_ref(), after.as_ref());
+    let lease_changed = before != after;
     let controller_matches = inner
         .controller_client_id
         .read()
@@ -1699,6 +1745,29 @@ impl WebInputFence {
     }
 }
 
+pub(crate) fn web_mutation_authority_is_current(
+    inner: &Arc<RemoteHostInner>,
+    authority: &RemoteWebMutationAuthority,
+) -> bool {
+    if authority.runtime_instance_id != inner.runtime_instance_id {
+        return false;
+    }
+    let Some(tombstone) =
+        registered_web_tombstone(inner, authority.connection_id, &authority.client_id, None)
+    else {
+        return false;
+    };
+    WebInputFence {
+        inner: inner.clone(),
+        connection_id: authority.connection_id,
+        client_id: authority.client_id.clone(),
+        tombstone: Some(tombstone),
+        lease_generation: Some(authority.lease_generation),
+        runtime_instance_id: authority.runtime_instance_id.clone(),
+    }
+    .is_current()
+}
+
 fn reserve_web_input_fence(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
@@ -1797,6 +1866,7 @@ fn enqueue_terminal_input(
     expected_lease_generation: Option<u64>,
     enqueued_at_epoch_ms: u64,
     stable_session_key: StableSessionKey,
+    retained_bytes: usize,
     response: ServerResponseLane,
     build_input: impl FnOnce(String) -> RemoteTerminalInput + Send + 'static,
 ) -> Result<(), WebInputEnqueueError> {
@@ -1813,7 +1883,7 @@ fn enqueue_terminal_input(
     let job_key = stable_session_key.clone();
     inner
         .web_input_executor
-        .dispatch(job_key, move || {
+        .dispatch(job_key, retained_bytes, move || {
             if !fence.is_current() {
                 let _ = response.send(ServerMessage::Error {
                     message: "The writer lease changed before terminal input executed.".to_string(),
@@ -1872,40 +1942,45 @@ fn enqueue_terminal_resize(
     let job_key = stable_session_key.clone();
     inner
         .web_input_executor
-        .dispatch(job_key, move || {
-            if !fence.is_current() {
-                let _ = response.send(ServerMessage::Error {
-                    message: "The writer lease changed before terminal resize executed."
-                        .to_string(),
-                });
-                return;
-            }
-            let (session_id, _) = match resolve_unique_session(&fence.inner, &stable_session_key) {
-                Ok(session) => session,
-                Err(_) => {
+        .dispatch(
+            job_key,
+            std::mem::size_of::<SessionDimensions>(),
+            move || {
+                if !fence.is_current() {
                     let _ = response.send(ServerMessage::Error {
-                        message: "The requested session no longer exists.".to_string(),
+                        message: "The writer lease changed before terminal resize executed."
+                            .to_string(),
                     });
                     return;
                 }
-            };
-            let handler = fence
-                .inner
-                .terminal_resize_handler
-                .read()
-                .ok()
-                .and_then(|slot| slot.as_ref().cloned());
-            if let Some(handler) = handler {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler(session_id, dimensions);
-                }));
-                if result.is_err() {
-                    let _ = response.send(ServerMessage::Error {
-                        message: "The terminal resize handler panicked.".to_string(),
-                    });
+                let (session_id, _) =
+                    match resolve_unique_session(&fence.inner, &stable_session_key) {
+                        Ok(session) => session,
+                        Err(_) => {
+                            let _ = response.send(ServerMessage::Error {
+                                message: "The requested session no longer exists.".to_string(),
+                            });
+                            return;
+                        }
+                    };
+                let handler = fence
+                    .inner
+                    .terminal_resize_handler
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().cloned());
+                if let Some(handler) = handler {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handler(session_id, dimensions);
+                    }));
+                    if result.is_err() {
+                        let _ = response.send(ServerMessage::Error {
+                            message: "The terminal resize handler panicked.".to_string(),
+                        });
+                    }
                 }
-            }
-        })
+            },
+        )
         .map_err(|_| WebInputEnqueueError::QueueUnavailable)
 }
 
@@ -2255,51 +2330,95 @@ fn capture_resume_projection(
     desired_session_key: Option<&StableSessionKey>,
     semantic_after_sequence: u64,
 ) -> (WebWorkspaceSnapshot, Option<SemanticReplay>, u64) {
-    loop {
-        let generation_before = inner
-            .semantic_publication_generation
-            .load(Ordering::Acquire);
-        if generation_before % 2 != 0 {
+    let generation = &inner.semantic_publication_generation;
+    let capture = || {
+        capture_resume_projection_raw(
+            inner,
+            client_id,
+            desired_session_key,
+            semantic_after_sequence,
+        )
+    };
+    let (snapshot, revision, semantic_metadata, replay_capture) =
+        capture_with_bounded_generation(generation, capture, || {
+            let _publication = inner
+                .semantic_publication_lock
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    inner.semantic_publication_lock.clear_poison();
+                    poisoned.into_inner()
+                });
+            capture_resume_projection_raw(
+                inner,
+                client_id,
+                desired_session_key,
+                semantic_after_sequence,
+            )
+        });
+
+    // Replay materialization/capping and web projection can be comparatively
+    // expensive. Do them once, after a coherent capture has been selected.
+    let replay =
+        replay_capture.map(|capture| cap_semantic_replay_for_mobile(capture.into_replay()));
+    (
+        project_web_snapshot(inner, &snapshot, revision, &semantic_metadata, writer_lease),
+        replay,
+        generation.load(Ordering::Acquire),
+    )
+}
+
+fn capture_with_bounded_generation<T>(
+    generation: &AtomicU64,
+    mut capture: impl FnMut() -> T,
+    fallback: impl FnOnce() -> T,
+) -> T {
+    for _ in 0..MAX_RESUME_CAPTURE_ATTEMPTS {
+        let before = generation.load(Ordering::Acquire);
+        if before % 2 != 0 {
             std::thread::yield_now();
             continue;
         }
-        let (snapshot, revision, semantic_metadata, replay_capture) = {
-            let _snapshot_guard = inner
-                .snapshot_state_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let semantic_journals = match inner.semantic_journals.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    let guard = poisoned.into_inner();
-                    inner.semantic_journals.clear_poison();
-                    guard
-                }
-            };
-            let replay = desired_session_key.and_then(|key| {
-                semantic_journals.capture_replay_after(key, semantic_after_sequence)
-            });
-            (
-                light_snapshot(inner, client_id),
-                inner.snapshot_revision.load(Ordering::Relaxed),
-                semantic_journals.metadata_snapshot(),
-                replay,
-            )
-        };
-        let replay =
-            replay_capture.map(|capture| cap_semantic_replay_for_mobile(capture.into_replay()));
-        let generation_after = inner
-            .semantic_publication_generation
-            .load(Ordering::Acquire);
-        if generation_before == generation_after {
-            return (
-                project_web_snapshot(inner, &snapshot, revision, &semantic_metadata, writer_lease),
-                replay,
-                generation_after,
-            );
+        let value = capture();
+        let after = generation.load(Ordering::Acquire);
+        if before == after {
+            return value;
         }
         std::thread::yield_now();
     }
+    fallback()
+}
+
+fn capture_resume_projection_raw(
+    inner: &Arc<RemoteHostInner>,
+    client_id: &str,
+    desired_session_key: Option<&StableSessionKey>,
+    semantic_after_sequence: u64,
+) -> (
+    RemoteWorkspaceSnapshot,
+    u64,
+    HashMap<StableSessionKey, SemanticSessionMetadata>,
+    Option<super::super::presentation::SemanticReplayCapture>,
+) {
+    let _snapshot_guard = inner
+        .snapshot_state_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let semantic_journals = match inner.semantic_journals.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            inner.semantic_journals.clear_poison();
+            guard
+        }
+    };
+    let replay = desired_session_key
+        .and_then(|key| semantic_journals.capture_replay_after(key, semantic_after_sequence));
+    (
+        light_snapshot(inner, client_id),
+        inner.snapshot_revision.load(Ordering::Relaxed),
+        semantic_journals.metadata_snapshot(),
+        replay,
+    )
 }
 
 fn validate_resume_route(
@@ -2848,6 +2967,17 @@ fn dispatch_composer_submit_for_connection(
             ));
         }
     };
+    let retained_bytes = text.len()
+        + mutation_id.len()
+        + stable_session_key.as_str().len()
+        + decoded_attachments
+            .iter()
+            .map(|attachment| {
+                attachment.bytes.len()
+                    + attachment.mime_type.len()
+                    + attachment.file_name.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>();
     if let Err(code) = resolve_unique_session(inner, &stable_session_key) {
         let message = if code == ComposerRejectCode::AmbiguousSession {
             "The stable session key resolves to more than one PTY."
@@ -3040,130 +3170,151 @@ fn dispatch_composer_submit_for_connection(
     let fence_check_epoch_ms = completion
         .uses_deterministic_test_clock()
         .then_some(now_epoch_ms);
-    let dispatch = inner.web_input_executor.dispatch(job_key, move || {
-        let execution_epoch_ms = fence_check_epoch_ms.unwrap_or_else(super::super::now_epoch_ms);
-        if !fence.is_current_at(execution_epoch_ms) {
-            clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
-            completion.send(Err(composer_rejected(
-                &fence.inner,
-                connection_id,
-                mutation_id,
-                ComposerRejectCode::StaleGeneration,
-                "The writer lease changed before the prompt executed.",
-                execution_epoch_ms,
-            )));
-            return;
-        }
-        let (session_id, session_kind) =
-            match resolve_unique_session(&fence.inner, &stable_session_key) {
-                Ok(session) => session,
-                Err(code) => {
+    let dispatch = inner
+        .web_input_executor
+        .dispatch(job_key, retained_bytes, move || {
+            let execution_epoch_ms =
+                fence_check_epoch_ms.unwrap_or_else(super::super::now_epoch_ms);
+            if !fence.is_current_at(execution_epoch_ms) {
+                clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
+                completion.send(Err(composer_rejected(
+                    &fence.inner,
+                    connection_id,
+                    mutation_id,
+                    ComposerRejectCode::StaleGeneration,
+                    "The writer lease changed before the prompt executed.",
+                    execution_epoch_ms,
+                )));
+                return;
+            }
+            let (session_id, session_kind) =
+                match resolve_unique_session(&fence.inner, &stable_session_key) {
+                    Ok(session) => session,
+                    Err(code) => {
+                        clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
+                        completion.send(Err(composer_rejected(
+                            &fence.inner,
+                            connection_id,
+                            mutation_id,
+                            code,
+                            "The requested session no longer exists.",
+                            execution_epoch_ms,
+                        )));
+                        return;
+                    }
+                };
+            let handler = fence
+                .inner
+                .terminal_input_handler
+                .read()
+                .ok()
+                .and_then(|slot| slot.as_ref().cloned());
+            let callback_result = handler.map_or_else(
+                || Err("The target PTY is not ready for input.".to_string()),
+                |handler| {
+                    invoke_terminal_input(
+                        &handler,
+                        RemoteTerminalInput::ComposerBatch {
+                            session_id,
+                            text: format!("{text}\r"),
+                            attachments: decoded_attachments,
+                            authority: RemoteWebMutationAuthority {
+                                runtime_instance_id: fence.inner.runtime_instance_id.clone(),
+                                connection_id,
+                                client_id: fence.client_id.clone(),
+                                lease_generation,
+                            },
+                        },
+                        execution_epoch_ms,
+                    )
+                },
+            );
+            if let Err(message) = callback_result {
+                if message == super::image_paste::WEB_COMPOSER_AUTHORITY_CHANGED {
                     clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
                     completion.send(Err(composer_rejected(
                         &fence.inner,
                         connection_id,
                         mutation_id,
-                        code,
-                        "The requested session no longer exists.",
+                        ComposerRejectCode::StaleGeneration,
+                        message,
                         execution_epoch_ms,
                     )));
                     return;
                 }
-            };
-        let handler = fence
-            .inner
-            .terminal_input_handler
-            .read()
-            .ok()
-            .and_then(|slot| slot.as_ref().cloned());
-        let callback_result = handler.map_or_else(
-            || Err("The target PTY is not ready for input.".to_string()),
-            |handler| {
-                invoke_terminal_input(
-                    &handler,
-                    RemoteTerminalInput::ComposerBatch {
-                        session_id,
-                        text: format!("{text}\r"),
-                        attachments: decoded_attachments,
-                    },
+                let message = bounded_composer_error(&message);
+                store_pty_rejection(&fence.inner, &mutation_id, fingerprint, &message);
+                completion.send(Err(composer_rejected(
+                    &fence.inner,
+                    connection_id,
+                    mutation_id,
+                    ComposerRejectCode::PtyRejected,
+                    message,
                     execution_epoch_ms,
-                )
-            },
-        );
-        if let Err(message) = callback_result {
-            let message = bounded_composer_error(&message);
-            store_pty_rejection(&fence.inner, &mutation_id, fingerprint, &message);
-            completion.send(Err(composer_rejected(
-                &fence.inner,
-                connection_id,
-                mutation_id,
-                ComposerRejectCode::PtyRejected,
-                message,
-                execution_epoch_ms,
-            )));
-            return;
-        }
-
-        let source = match session_kind {
-            SessionKind::Claude => SemanticSource::Claude,
-            SessionKind::Codex => SemanticSource::Codex,
-            SessionKind::Shell => SemanticSource::Shell,
-            SessionKind::Server => SemanticSource::Server,
-            SessionKind::Ssh => SemanticSource::Ssh,
-        };
-        let kind = if session_kind.is_ai() {
-            SemanticEventKind::UserMessage { text: text.clone() }
-        } else {
-            SemanticEventKind::Command {
-                command_id: mutation_id.clone(),
-                text: text.clone(),
-                exit_code: None,
+                )));
+                return;
             }
-        };
-        let occurred_at_epoch_ms = execution_epoch_ms;
-        let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            publish_semantic_event(
+
+            let source = match session_kind {
+                SessionKind::Claude => SemanticSource::Claude,
+                SessionKind::Codex => SemanticSource::Codex,
+                SessionKind::Shell => SemanticSource::Shell,
+                SessionKind::Server => SemanticSource::Server,
+                SessionKind::Ssh => SemanticSource::Ssh,
+            };
+            let kind = if session_kind.is_ai() {
+                SemanticEventKind::UserMessage { text: text.clone() }
+            } else {
+                SemanticEventKind::Command {
+                    command_id: mutation_id.clone(),
+                    text: text.clone(),
+                    exit_code: None,
+                }
+            };
+            let occurred_at_epoch_ms = execution_epoch_ms;
+            let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publish_semantic_event(
+                    &fence.inner,
+                    SemanticEventDraft {
+                        stable_session_key: stable_session_key.clone(),
+                        occurred_at_epoch_ms,
+                        source,
+                        kind,
+                        retention: SemanticRetention::Canonical,
+                        deduplication_key: Some(format!("composer:{mutation_id}")),
+                    },
+                )
+            }));
+            let accepted_sequence = published.map(|event| event.sequence).unwrap_or_else(|_| {
+                fence
+                    .inner
+                    .semantic_journals
+                    .lock()
+                    .ok()
+                    .and_then(|journals| journals.metadata(&stable_session_key))
+                    .map(|metadata| metadata.latest_sequence)
+                    .unwrap_or(0)
+            });
+            let accepted = ComposerAccepted {
+                mutation_id: mutation_id.clone(),
+                stable_session_key: stable_session_key.clone(),
+                accepted_sequence,
+                lease_generation,
+            };
+            store_composer_mutation_outcome(
                 &fence.inner,
-                SemanticEventDraft {
-                    stable_session_key: stable_session_key.clone(),
-                    occurred_at_epoch_ms,
-                    source,
-                    kind,
-                    retention: SemanticRetention::Canonical,
-                    deduplication_key: Some(format!("composer:{mutation_id}")),
+                mutation_id,
+                WebComposerMutationRecord {
+                    fingerprint,
+                    status: WebComposerMutationStatus::Accepted {
+                        stable_session_key,
+                        accepted_sequence,
+                        lease_generation,
+                    },
                 },
-            )
-        }));
-        let accepted_sequence = published.map(|event| event.sequence).unwrap_or_else(|_| {
-            fence
-                .inner
-                .semantic_journals
-                .lock()
-                .ok()
-                .and_then(|journals| journals.metadata(&stable_session_key))
-                .map(|metadata| metadata.latest_sequence)
-                .unwrap_or(0)
+            );
+            completion.send(Ok(accepted));
         });
-        let accepted = ComposerAccepted {
-            mutation_id: mutation_id.clone(),
-            stable_session_key: stable_session_key.clone(),
-            accepted_sequence,
-            lease_generation,
-        };
-        store_composer_mutation_outcome(
-            &fence.inner,
-            mutation_id,
-            WebComposerMutationRecord {
-                fingerprint,
-                status: WebComposerMutationStatus::Accepted {
-                    stable_session_key,
-                    accepted_sequence,
-                    lease_generation,
-                },
-            },
-        );
-        completion.send(Ok(accepted));
-    });
     if dispatch.is_err() {
         clear_in_flight_composer(inner, &dispatch_failure_mutation_id, fingerprint);
         return Err(composer_rejected(
@@ -5416,6 +5567,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resume_projection_generation_retry_is_bounded() {
+        let generation = AtomicU64::new(0);
+        let captures = AtomicUsize::new(0);
+
+        let value = capture_with_bounded_generation(
+            &generation,
+            || {
+                captures.fetch_add(1, Ordering::SeqCst);
+                generation.fetch_add(2, Ordering::SeqCst);
+                1
+            },
+            || 99,
+        );
+
+        assert_eq!(captures.load(Ordering::SeqCst), MAX_RESUME_CAPTURE_ATTEMPTS);
+        assert_eq!(value, 99);
+    }
+
     fn pair_web_client(service: &RemoteHostService, client_id: &str) {
         let mut config = service.inner.config.write().expect("config lock");
         if config
@@ -5733,6 +5903,7 @@ mod tests {
                 session_id,
                 text,
                 attachments,
+                ..
             } => {
                 assert_eq!(session_id, "session-a");
                 assert_eq!(text, "hello\r");
@@ -5760,6 +5931,47 @@ mod tests {
             1
         );
         assert_eq!(first.accepted_sequence, replay.through_sequence);
+    }
+
+    #[test]
+    fn composer_authority_change_at_pty_boundary_is_retryable() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let resume = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "tab-a",
+            ),
+            1_000,
+        );
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err(super::super::image_paste::WEB_COMPOSER_AUTHORITY_CHANGED.to_string())
+        })));
+        let submit = || {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                "authority-race".to_string(),
+                StableSessionKey::from_tab("tab-a"),
+                "hello".to_string(),
+                Vec::new(),
+                resume.writer_lease.generation,
+                1_100,
+            )
+            .unwrap_err()
+        };
+
+        assert_eq!(submit().code, ComposerRejectCode::StaleGeneration);
+        assert_eq!(submit().code, ComposerRejectCode::StaleGeneration);
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -7438,6 +7650,139 @@ mod tests {
             .lock()
             .expect("pending requests lock");
         assert!(requests.is_empty(), "viewer mode must not queue host work");
+    }
+
+    #[test]
+    fn expired_request_authorization_clears_controller_and_allows_reacquire() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let first_connection = 120;
+        let first_client = "expired-request-owner";
+        pair_web_client(&service, first_client);
+        let (first_native, _first_native_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(
+            &service.inner,
+            first_connection,
+            first_client,
+            first_native,
+            test_web_sender(),
+        );
+        let acquired = acquire_writer_lease(
+            &service.inner,
+            first_connection,
+            first_client,
+            "phone-a",
+            now_epoch_ms().saturating_sub(10_000),
+        );
+        assert!(acquired.you_are_owner);
+
+        let (response_tx, mut response_rx) = tokio_mpsc::unbounded_channel();
+        handle_inbound(
+            &service.inner,
+            first_connection,
+            first_client,
+            WsInbound::Request {
+                id: 91,
+                action: WebAction::StopAllServers,
+                expected_lease_generation: Some(acquired.generation),
+            },
+            &response_tx,
+        );
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(ServerMessage::Response { request_id: 91, result }) if !result.ok
+        ));
+        assert_eq!(
+            service
+                .inner
+                .controller_client_id
+                .read()
+                .expect("controller lock")
+                .as_deref(),
+            None,
+            "expired request left the web controller stranded"
+        );
+
+        let second_connection = 121;
+        let second_client = "replacement-request-owner";
+        pair_web_client(&service, second_client);
+        let (second_native, _second_native_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(
+            &service.inner,
+            second_connection,
+            second_client,
+            second_native,
+            test_web_sender(),
+        );
+        let reacquired = acquire_writer_lease(
+            &service.inner,
+            second_connection,
+            second_client,
+            "phone-b",
+            now_epoch_ms(),
+        );
+        assert!(reacquired.you_are_owner);
+    }
+
+    #[test]
+    fn saturated_host_request_queue_rejects_web_request_immediately() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 122;
+        let client_id = "saturated-request-owner";
+        pair_web_client(&service, client_id);
+        let (native, _native_rx) = std_mpsc::channel();
+        register_client(
+            &service.inner,
+            connection_id,
+            client_id,
+            native,
+            test_web_sender(),
+        );
+        let lease = acquire_writer_lease(
+            &service.inner,
+            connection_id,
+            client_id,
+            "phone-saturated",
+            now_epoch_ms(),
+        );
+        {
+            let mut requests = service.inner.pending_requests.lock().unwrap();
+            for index in 0..crate::remote::MAX_PENDING_REMOTE_REQUESTS {
+                requests.push(PendingRemoteRequest {
+                    client_id: format!("queued-{index}"),
+                    action: super::super::super::RemoteAction::GitListRepos,
+                    response: None,
+                });
+            }
+        }
+
+        let (response_tx, mut response_rx) = tokio_mpsc::unbounded_channel();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::Request {
+                id: 92,
+                action: WebAction::StopAllServers,
+                expected_lease_generation: Some(lease.generation),
+            },
+            &response_tx,
+        );
+
+        match response_rx.try_recv().expect("capacity response") {
+            ServerMessage::Response { request_id, result } => {
+                assert_eq!(request_id, 92);
+                assert!(!result.ok);
+                assert_eq!(
+                    result.message.as_deref(),
+                    Some("Remote host is busy. Retry shortly.")
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+        assert_eq!(
+            service.inner.pending_requests.lock().unwrap().len(),
+            crate::remote::MAX_PENDING_REMOTE_REQUESTS
+        );
     }
 
     #[test]

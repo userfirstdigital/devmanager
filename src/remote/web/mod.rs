@@ -6,6 +6,7 @@ pub mod dto;
 pub mod image_paste;
 pub(crate) mod input_executor;
 pub mod lease;
+pub(crate) mod request_executor;
 pub mod wire;
 
 use self::auth::{PairingAttemptTracker, PairingThrottleStatus};
