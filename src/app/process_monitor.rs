@@ -39,22 +39,23 @@ pub fn render_process_monitor(
         format_memory(total_memory)
     );
 
-    let body = if sessions.is_empty() {
-        div()
-            .text_sm()
-            .text_color(rgb(theme::TEXT_SUBTLE))
-            .child("No managed terminals or tracked subprocesses right now.")
-            .into_any_element()
-    } else {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .children(sessions.into_iter().map(|session| {
-                render_session_card(state, session, &actions).into_any_element()
-            }))
-            .into_any_element()
-    };
+    let body =
+        if sessions.is_empty() {
+            div()
+                .text_sm()
+                .text_color(rgb(theme::TEXT_SUBTLE))
+                .child("No managed terminals or tracked subprocesses right now.")
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .children(sessions.into_iter().map(|session| {
+                    render_session_card(state, session, &actions).into_any_element()
+                }))
+                .into_any_element()
+        };
 
     deferred(
         anchored().snap_to_window().anchor(Corner::TopLeft).child(
@@ -65,7 +66,10 @@ pub fn render_process_monitor(
                 .flex()
                 .items_center()
                 .justify_center()
-                .on_mouse_down(MouseButton::Left, (actions.on_action)(ProcessMonitorAction::Close))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    (actions.on_action)(ProcessMonitorAction::Close),
+                )
                 .child(
                     div()
                         .id("process-monitor-frame")
@@ -331,16 +335,13 @@ fn render_process_row(
                         .text_color(rgb(theme::TEXT_DIM))
                         .child(SharedString::from(format!("pid {}", node.pid))),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_SUBTLE))
-                        .child(SharedString::from(format!(
-                            "{:.1}% · {}",
-                            node.cpu_percent,
-                            format_memory(node.memory_bytes)
-                        ))),
-                ),
+                .child(div().text_xs().text_color(rgb(theme::TEXT_SUBTLE)).child(
+                    SharedString::from(format!(
+                        "{:.1}% · {}",
+                        node.cpu_percent,
+                        format_memory(node.memory_bytes)
+                    )),
+                )),
         )
         .child(
             div()
@@ -533,14 +534,16 @@ mod tests {
         runtime
             .sessions
             .insert(unreaped.session_id.clone(), unreaped);
-        runtime
-            .sessions
-            .insert(ignored.session_id.clone(), ignored);
+        runtime.sessions.insert(ignored.session_id.clone(), ignored);
 
         let sessions = monitor_sessions(&runtime);
         assert_eq!(sessions.len(), 2);
-        assert!(sessions.iter().any(|session| session.session_id == "live-1"));
-        assert!(sessions.iter().any(|session| session.session_id == "dead-1"));
+        assert!(sessions
+            .iter()
+            .any(|session| session.session_id == "live-1"));
+        assert!(sessions
+            .iter()
+            .any(|session| session.session_id == "dead-1"));
     }
 
     #[test]

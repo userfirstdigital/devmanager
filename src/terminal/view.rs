@@ -1281,11 +1281,9 @@ fn render_actionable_notice(
                 .text_color(rgb(theme::DANGER_TEXT))
                 .child(SharedString::from(banner.message.clone())),
         )
-        .children(
-            on_click.map(|handler| {
-                runtime_action_button(banner.action_label, banner.action_color, handler)
-            }),
-        )
+        .children(on_click.map(|handler| {
+            runtime_action_button(banner.action_label, banner.action_color, handler)
+        }))
 }
 
 fn runtime_action_button(

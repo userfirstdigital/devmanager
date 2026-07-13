@@ -24,7 +24,8 @@ fn private_key_serializes_camel_case_and_round_trips() {
 
 #[test]
 fn legacy_connection_without_private_key_loads_as_none() {
-    let json = r#"{"id":"ssh-1","label":"Prod","host":"example.com","port":22,"username":"deploy"}"#;
+    let json =
+        r#"{"id":"ssh-1","label":"Prod","host":"example.com","port":22,"username":"deploy"}"#;
 
     let connection: SSHConnection = serde_json::from_str(json).expect("deserialize legacy");
 

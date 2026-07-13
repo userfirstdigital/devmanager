@@ -6,8 +6,8 @@ pub mod dto;
 pub mod image_paste;
 pub(crate) mod input_executor;
 pub mod lease;
-pub(crate) mod request_executor;
 pub mod push;
+pub(crate) mod request_executor;
 pub mod wire;
 
 use self::auth::{PairingAttemptTracker, PairingThrottleStatus};
@@ -991,11 +991,7 @@ async fn push_subscribe_handler(
     let enabled = match enabled {
         Ok(enabled) => enabled,
         Err(push::PushEnableError::ClientLimitReached) => {
-            return (
-                StatusCode::CONFLICT,
-                "notification client limit reached",
-            )
-                .into_response()
+            return (StatusCode::CONFLICT, "notification client limit reached").into_response()
         }
     };
     match serde_json::to_vec(&PushMutationResponse { enabled }) {
@@ -1034,14 +1030,9 @@ async fn push_unsubscribe_handler(
     }
     match super::mutate_host_config(&state.inner, |config| {
         let legacy_endpoint_matches = request.endpoint.as_deref().is_some_and(|endpoint| {
-            config
-                .web
-                .push
-                .subscriptions
-                .iter()
-                .any(|subscription| {
-                    subscription.client_id == client_id && subscription.endpoint == endpoint
-                })
+            config.web.push.subscriptions.iter().any(|subscription| {
+                subscription.client_id == client_id && subscription.endpoint == endpoint
+            })
         });
         if request.disable || legacy_endpoint_matches {
             config.web.push.disable_client(&client_id);
@@ -1417,8 +1408,9 @@ mod tests {
             .build()
             .expect("test runtime")
             .block_on(async {
-                let headers =
-                    push_mutation_headers(pair_cookie_headers(state.clone(), "phone-disable").await);
+                let headers = push_mutation_headers(
+                    pair_cookie_headers(state.clone(), "phone-disable").await,
+                );
                 let endpoint = "https://web.push.apple.com/QM-phone-disabled";
 
                 let response = route_request(

@@ -2250,12 +2250,9 @@ fn send_resume_state_with_lane(
         return;
     }
     broadcast_writer_lease_state_locked_excluding(inner, now_epoch_ms, Some(connection_id));
-    let visible_focus = request.visible.then(|| {
-        (
-            desired_session_id.clone(),
-            desired_session_key.clone(),
-        )
-    });
+    let visible_focus = request
+        .visible
+        .then(|| (desired_session_id.clone(), desired_session_key.clone()));
     drop(_delivery);
     drop(_operation);
     if let Some((Some(session_id), stable_session_key)) = visible_focus {
@@ -6056,14 +6053,7 @@ mod tests {
         );
         hidden.visible = false;
         hidden.wants_writer_lease = false;
-        send_resume_state(
-            &service.inner,
-            1,
-            "web-client",
-            hidden,
-            1_000,
-            &response_tx,
-        );
+        send_resume_state(&service.inner, 1, "web-client", hidden, 1_000, &response_tx);
         let _ = response_rx.try_recv().expect("hidden resume response");
         assert!(service
             .inner
@@ -6556,8 +6546,9 @@ mod tests {
             .expect("composer prompt accepted");
         }
 
-        let prompt_count = || {
-            service
+        let prompt_count =
+            || {
+                service
                 .semantic_replay(&stable_key, 0)
                 .expect("semantic replay")
                 .events
@@ -6567,7 +6558,7 @@ mod tests {
                     SemanticEventKind::UserMessage { text } if text == "same legitimate text"
                 ))
                 .count()
-        };
+            };
         assert_eq!(prompt_count(), 2, "each phone prompt appears exactly once");
 
         service.push_claude_semantic_draft(
@@ -6935,10 +6926,12 @@ mod tests {
                 .unwrap()
                 .events
                 .iter()
-                .filter(|event| matches!(
-                    &event.kind,
-                    SemanticEventKind::UserMessage { text } if text == "same prompt"
-                ))
+                .filter(|event| {
+                    matches!(
+                        &event.kind,
+                        SemanticEventKind::UserMessage { text } if text == "same prompt"
+                    )
+                })
                 .count()
         };
         assert_eq!(prompt_count(), 2, "FIFO prompts must each appear once");
@@ -6990,10 +6983,13 @@ mod tests {
             },
         );
         let replay = service.semantic_replay(&stable_key, 0).unwrap();
-        assert!(replay.events.iter().any(|event| matches!(
-            &event.kind,
-            SemanticEventKind::UserMessage { text } if text == "local TUI prompt"
-        )), "unreserved local-TUI prompts must remain visible");
+        assert!(
+            replay.events.iter().any(|event| matches!(
+                &event.kind,
+                SemanticEventKind::UserMessage { text } if text == "local TUI prompt"
+            )),
+            "unreserved local-TUI prompts must remain visible"
+        );
     }
 
     #[test]
@@ -7194,7 +7190,11 @@ mod tests {
         for occurred_at_epoch_ms in [4, 5] {
             service.push_codex_semantic_draft(
                 identity.clone(),
-                provider("accepted removal", "codex:user:accepted", occurred_at_epoch_ms),
+                provider(
+                    "accepted removal",
+                    "codex:user:accepted",
+                    occurred_at_epoch_ms,
+                ),
             );
         }
 

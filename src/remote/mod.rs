@@ -9,9 +9,9 @@ pub use client_pool::RemoteClientPool;
 pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
 
 use presentation::{
-    SemanticAdapterHealth, SemanticAttention, SemanticEvent, SemanticEventDraft,
-    SemanticEventKind, SemanticJournalStore, SemanticReplay, SemanticSessionMetadata,
-    SemanticSource, StableSessionKey,
+    SemanticAdapterHealth, SemanticAttention, SemanticEvent, SemanticEventDraft, SemanticEventKind,
+    SemanticJournalStore, SemanticReplay, SemanticSessionMetadata, SemanticSource,
+    StableSessionKey,
 };
 use web::bridge::{BrowserOutboundSender, WebConnectionTombstone};
 use web::input_executor::WebInputExecutor;
@@ -1739,8 +1739,7 @@ impl RemoteHostService {
                             pending.state,
                             PendingClaudeComposerPromptState::Reserved {
                                 deferred_hook: None
-                            }
-                                | PendingClaudeComposerPromptState::Accepted
+                            } | PendingClaudeComposerPromptState::Accepted
                         )
                 }) {
                     let accepted = matches!(
@@ -1761,10 +1760,9 @@ impl RemoteHostService {
                             );
                         }
                     } else {
-                        state.pending[index].state =
-                            PendingClaudeComposerPromptState::Reserved {
-                                deferred_hook: Some(draft.clone()),
-                            };
+                        state.pending[index].state = PendingClaudeComposerPromptState::Reserved {
+                            deferred_hook: Some(draft.clone()),
+                        };
                     }
                     decision = Decision::Reconciled;
                 } else if draft.deduplication_key.as_ref().is_some_and(|key| {
@@ -4614,7 +4612,11 @@ fn remove_pending_codex_prompts(
     let mut index = 0;
     while index < state.pending.len() {
         if predicate(&state.pending[index]) {
-            if let Some(draft) = state.pending.remove(index).and_then(deferred_codex_provider) {
+            if let Some(draft) = state
+                .pending
+                .remove(index)
+                .and_then(deferred_codex_provider)
+            {
                 deferred.push(draft);
             }
         } else {

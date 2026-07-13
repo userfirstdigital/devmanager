@@ -205,9 +205,9 @@ impl ProcessOp {
             | ProcessOp::SpawnAi { session_id, .. }
             | ProcessOp::RestartAi { session_id, .. }
             | ProcessOp::CloseAi { session_id, .. } => session_id.clone(),
-            ProcessOp::CloseSsh { session_id, .. } => session_id
-                .clone()
-                .unwrap_or_else(|| "ssh".to_string()),
+            ProcessOp::CloseSsh { session_id, .. } => {
+                session_id.clone().unwrap_or_else(|| "ssh".to_string())
+            }
             ProcessOp::StopAll { .. } => "stop-all".to_string(),
             ProcessOp::Shutdown { .. } => "shutdown".to_string(),
             ProcessOp::KillProcess {
@@ -244,7 +244,13 @@ impl ProcessOpQueue {
         let worker = thread::Builder::new()
             .name("process-op-worker".into())
             .spawn(move || {
-                run_worker_loop(inner, submit_rx, completion_tx, stop_worker, in_flight_worker);
+                run_worker_loop(
+                    inner,
+                    submit_rx,
+                    completion_tx,
+                    stop_worker,
+                    in_flight_worker,
+                );
             })
             .expect("spawn process-op worker");
 
@@ -265,9 +271,7 @@ impl ProcessOpQueue {
                 if op_preempts_in_flight(&op) {
                     in_flight.remove(&target_id);
                 } else if in_flight.contains_key(&target_id) {
-                    return Err(format!(
-                        "Operation already in progress for `{target_id}`."
-                    ));
+                    return Err(format!("Operation already in progress for `{target_id}`."));
                 }
                 in_flight.insert(target_id, op_id);
             }

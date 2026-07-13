@@ -596,7 +596,10 @@ mod tests {
 
         assert_eq!(
             signals,
-            [("-42".to_string(), "TERM".to_string()), ("-42".to_string(), "KILL".to_string())]
+            [
+                ("-42".to_string(), "TERM".to_string()),
+                ("-42".to_string(), "KILL".to_string())
+            ]
         );
     }
 }
@@ -808,10 +811,7 @@ fn kill_unix_target(pid: u32, as_process_group: bool) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn terminate_owned_process_group(
-    pid: u32,
-    term_grace: Duration,
-) -> Result<(), String> {
+pub(crate) fn terminate_owned_process_group(pid: u32, term_grace: Duration) -> Result<(), String> {
     let group_target = format!("-{pid}");
     terminate_owned_process_group_with(
         &group_target,

@@ -2,9 +2,7 @@ use crate::ai::claude_hooks::{
     prepare_claude_launch_overlay, ClaudeHookRegistration, ClaudeHookRegistry,
     ClaudeHookRelayListener, ClaudeRegistryEvent, ClaudeShellKind,
 };
-use crate::ai::codex_bridge::{
-    prepare_codex_adapter, CodexBridgeHandle, PreparedCodexAdapter,
-};
+use crate::ai::codex_bridge::{prepare_codex_adapter, CodexBridgeHandle, PreparedCodexAdapter};
 use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
@@ -22,8 +20,8 @@ use crate::state::{
     SshLaunchSpec,
 };
 use crate::terminal::session::{
-    bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalSession,
-    TerminalModeSnapshot, TerminalSessionView,
+    bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalModeSnapshot,
+    TerminalSession, TerminalSessionView,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -113,8 +111,7 @@ pub enum RemoteSessionEvent {
 }
 
 type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
-type CodexAdapterPreparer =
-    Arc<dyn Fn(&str) -> Result<PreparedCodexAdapter, String> + Send + Sync>;
+type CodexAdapterPreparer = Arc<dyn Fn(&str) -> Result<PreparedCodexAdapter, String> + Send + Sync>;
 #[cfg(test)]
 type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -280,10 +277,7 @@ impl CodexAdapterSession {
         }
     }
 
-    fn registered_semantic_identity(
-        &self,
-        pty_session_id: &str,
-    ) -> Option<CodexSemanticIdentity> {
+    fn registered_semantic_identity(&self, pty_session_id: &str) -> Option<CodexSemanticIdentity> {
         match self {
             Self::Running { identity, .. } => {
                 Some(codex_semantic_identity(pty_session_id, identity))
@@ -322,9 +316,11 @@ impl CodexAdapterRegistry {
         let removed = self.sessions.remove(session_id);
         if let Some(session) = removed.as_ref() {
             let stable_session_key = &session.identity().stable_session_key;
-            if !self.sessions.values().any(|candidate| {
-                &candidate.identity().stable_session_key == stable_session_key
-            }) {
+            if !self
+                .sessions
+                .values()
+                .any(|candidate| &candidate.identity().stable_session_key == stable_session_key)
+            {
                 self.latest_generations.remove(stable_session_key);
             }
         }
@@ -461,12 +457,8 @@ impl ProcessManager {
             claude_hook_temp_root: claude_hook_temp_root.clone(),
             claude_overlay_owner: Mutex::new(Weak::new()),
             codex_adapter_preparer: RwLock::new(Arc::new(prepare_codex_adapter)),
-            codex_adapter_activation_timeout: RwLock::new(
-                std::time::Duration::from_secs(8),
-            ),
-            codex_fallback_terminal_ops: RwLock::new(Arc::new(
-                NativeCodexFallbackTerminalOps,
-            )),
+            codex_adapter_activation_timeout: RwLock::new(std::time::Duration::from_secs(8)),
+            codex_fallback_terminal_ops: RwLock::new(Arc::new(NativeCodexFallbackTerminalOps)),
             codex_adapter_generation: AtomicU64::new(1),
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             background_stop: AtomicBool::new(false),
@@ -731,7 +723,8 @@ impl ProcessManager {
 
     pub fn schedule_shutdown(&self, timeout: Duration) -> Result<u64, String> {
         let op_id = next_op_id();
-        self.op_queue.submit(ProcessOp::Shutdown { op_id, timeout })?;
+        self.op_queue
+            .submit(ProcessOp::Shutdown { op_id, timeout })?;
         Ok(op_id)
     }
 
@@ -1281,10 +1274,7 @@ impl ProcessManager {
     }
 
     #[cfg(test)]
-    fn set_codex_fallback_terminal_ops_for_test(
-        &self,
-        ops: Arc<dyn CodexFallbackTerminalOps>,
-    ) {
+    fn set_codex_fallback_terminal_ops_for_test(&self, ops: Arc<dyn CodexFallbackTerminalOps>) {
         *self
             .inner
             .codex_fallback_terminal_ops
@@ -1393,11 +1383,7 @@ impl ProcessManager {
             },
             move |_| {
                 if let Some(inner) = exit_inner.upgrade() {
-                    handle_codex_bridge_exit(
-                        inner,
-                        &exit_session_id,
-                        &exit_identity,
-                    );
+                    handle_codex_bridge_exit(inner, &exit_session_id, &exit_identity);
                 }
             },
             activation_timeout,
@@ -1847,12 +1833,7 @@ impl ProcessManager {
         activate: bool,
     ) -> Result<String, String> {
         self.start_ai_session_activate_with_response(
-            app_state,
-            project_id,
-            tab_type,
-            dimensions,
-            activate,
-            None,
+            app_state, project_id, tab_type, dimensions, activate, None,
         )
     }
 
@@ -1882,12 +1863,7 @@ impl ProcessManager {
         );
 
         self.ensure_ai_session_for_tab_with_response(
-            app_state,
-            &tab_id,
-            dimensions,
-            activate,
-            false,
-            response,
+            app_state, &tab_id, dimensions, activate, false, response,
         )
     }
 
@@ -2233,12 +2209,7 @@ impl ProcessManager {
         let tab_id = app_state.open_ssh_tab(&project_id, connection_id, Some(connection.label));
 
         self.ensure_ssh_session_for_tab_with_response(
-            app_state,
-            &tab_id,
-            dimensions,
-            true,
-            false,
-            response,
+            app_state, &tab_id, dimensions, true, false, response,
         )
     }
 
@@ -2538,13 +2509,7 @@ impl ProcessManager {
         activate_tab: bool,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
-        self.schedule_start_server(
-            app_state,
-            command_id,
-            dimensions,
-            activate_tab,
-            response,
-        )
+        self.schedule_start_server(app_state, command_id, dimensions, activate_tab, response)
     }
 
     pub fn stop_server(&self, command_id: &str) -> Result<(), String> {
@@ -3196,9 +3161,7 @@ impl ProcessManager {
         let Ok(dir) = crate::persistence::app_config_dir() else {
             return;
         };
-        let _ = std::fs::remove_file(
-            dir.join("ssh-keys").join(safe_key_file_name(connection_id)),
-        );
+        let _ = std::fs::remove_file(dir.join("ssh-keys").join(safe_key_file_name(connection_id)));
     }
 }
 
@@ -3284,7 +3247,8 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
                             .into_iter()
                             .next()
                             .map(|entry| entry.pid);
-                        let pid = ledger_pid.or_else(|| session.resources.process_ids.first().copied());
+                        let pid =
+                            ledger_pid.or_else(|| session.resources.process_ids.first().copied());
                         return pid.map(|pid| (id.clone(), pid, false));
                     }
                     None
@@ -4015,8 +3979,7 @@ fn materialize_ssh_key_in(
         return Err("connection id is empty".to_string());
     }
 
-    std::fs::create_dir_all(dir)
-        .map_err(|error| format!("create {}: {error}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -4711,13 +4674,15 @@ fn handle_codex_bridge_exit(
                 lifecycle,
                 original_launch,
                 ..
-            }) if current == identity => lifecycle
-                .claim_preactivation_fallback()
-                .map(|original_startup_command| {
-                    let mut launch = original_launch.clone();
-                    launch.startup_command = original_startup_command;
-                    launch
-                }),
+            }) if current == identity => {
+                lifecycle
+                    .claim_preactivation_fallback()
+                    .map(|original_startup_command| {
+                        let mut launch = original_launch.clone();
+                        launch.startup_command = original_startup_command;
+                        launch
+                    })
+            }
             _ => None,
         }
     };
@@ -4870,7 +4835,12 @@ impl CodexFallbackTerminalOps for NativeCodexFallbackTerminalOps {
             .runtime_state
             .read()
             .ok()
-            .and_then(|runtime| runtime.sessions.get(session_id).map(|session| session.dimensions))
+            .and_then(|runtime| {
+                runtime
+                    .sessions
+                    .get(session_id)
+                    .map(|session| session.dimensions)
+            })
             .unwrap_or_default();
         let session = Arc::new(TerminalSession::spawn_command(
             session_id.to_string(),
@@ -4887,8 +4857,14 @@ impl CodexFallbackTerminalOps for NativeCodexFallbackTerminalOps {
             None,
             inner.runtime_state.clone(),
             inner.debug_enabled,
-            Some(session_change_notifier(inner.clone(), session_id.to_string())),
-            Some(session_output_notifier(inner.clone(), session_id.to_string())),
+            Some(session_change_notifier(
+                inner.clone(),
+                session_id.to_string(),
+            )),
+            Some(session_output_notifier(
+                inner.clone(),
+                session_id.to_string(),
+            )),
         )?);
         inner
             .sessions
@@ -4960,10 +4936,7 @@ fn cleanup_codex_adapter_session_if_matches(
         .and_then(|session| session.registered_semantic_identity(session_id));
     drop(removed);
     if let Some(identity) = removed_identity {
-        emit_remote_session_event(
-            inner,
-            RemoteSessionEvent::CodexAdapterRemoved { identity },
-        );
+        emit_remote_session_event(inner, RemoteSessionEvent::CodexAdapterRemoved { identity });
     }
     was_removed
 }
@@ -5132,19 +5105,20 @@ pub(crate) fn execute_process_op_inner(
             if activate {
                 manager.set_active_session(launch.command_id.clone());
             }
-            let result = spawn_server_session_with_inner(inner, &launch, dimensions).map_err(|error| {
-                manager.update_session_state(&launch.command_id, |state| {
-                    state.status = SessionStatus::Failed;
-                    state.exit = Some(SessionExitState {
-                        code: None,
-                        signal: None,
-                        closed_by_user: false,
-                        summary: error.clone(),
+            let result =
+                spawn_server_session_with_inner(inner, &launch, dimensions).map_err(|error| {
+                    manager.update_session_state(&launch.command_id, |state| {
+                        state.status = SessionStatus::Failed;
+                        state.exit = Some(SessionExitState {
+                            code: None,
+                            signal: None,
+                            closed_by_user: false,
+                            summary: error.clone(),
+                        });
+                        state.mark_dirty();
                     });
-                    state.mark_dirty();
+                    error
                 });
-                error
-            });
             if result.is_ok() {
                 manager.update_session_state(&launch.command_id, |state| {
                     state.configure_server(launch.clone());
@@ -5262,7 +5236,10 @@ pub(crate) fn execute_process_op_inner(
                     .read()
                     .ok()
                     .and_then(|runtime| {
-                        runtime.sessions.get(&command_id).map(|session| session.status.is_live())
+                        runtime
+                            .sessions
+                            .get(&command_id)
+                            .map(|session| session.status.is_live())
                     })
                     .unwrap_or(false);
                 if is_active && !manager.stop_server_and_wait(&command_id, Duration::from_secs(5)) {
@@ -5272,10 +5249,8 @@ pub(crate) fn execute_process_op_inner(
                 }
                 crate::services::ports_service::kill_port(port)?;
                 spawn_server_session_with_inner(inner, &launch, dimensions)?;
-                let _ = manager.write_virtual_text(
-                    &command_id,
-                    &format!("\x1b[33m{banner}\x1b[0m\r\n"),
-                );
+                let _ = manager
+                    .write_virtual_text(&command_id, &format!("\x1b[33m{banner}\x1b[0m\r\n"));
                 manager.update_session_state(&command_id, |state| {
                     state.configure_server(launch.clone());
                 });
@@ -5483,13 +5458,10 @@ pub(crate) fn execute_process_op_inner(
         } => {
             let outcome = kill_session_process_inner(inner, &session_id, pid, false);
             let (result, message) = match outcome {
-                Ok(KillProcessOutcome::Killed) => {
-                    (Ok(()), Some(format!("Killed process {pid}.")))
+                Ok(KillProcessOutcome::Killed) => (Ok(()), Some(format!("Killed process {pid}."))),
+                Ok(KillProcessOutcome::AlreadyGone) => {
+                    (Ok(()), Some(format!("Process {pid} was already gone.")))
                 }
-                Ok(KillProcessOutcome::AlreadyGone) => (
-                    Ok(()),
-                    Some(format!("Process {pid} was already gone.")),
-                ),
                 Err(error) => (Err(error), None),
             };
             (
@@ -5678,8 +5650,14 @@ fn spawn_ssh_session_with_inner(
         None,
         inner.runtime_state.clone(),
         inner.debug_enabled,
-        Some(session_change_notifier(inner.clone(), session_id.to_string())),
-        Some(session_output_notifier(inner.clone(), session_id.to_string())),
+        Some(session_change_notifier(
+            inner.clone(),
+            session_id.to_string(),
+        )),
+        Some(session_output_notifier(
+            inner.clone(),
+            session_id.to_string(),
+        )),
     )
     .map_err(|error| {
         manager.update_session_state(session_id, |state| {
@@ -5742,8 +5720,14 @@ fn spawn_ai_session_with_inner(
         None,
         inner.runtime_state.clone(),
         inner.debug_enabled,
-        Some(session_change_notifier(inner.clone(), session_id.to_string())),
-        Some(session_output_notifier(inner.clone(), session_id.to_string())),
+        Some(session_change_notifier(
+            inner.clone(),
+            session_id.to_string(),
+        )),
+        Some(session_output_notifier(
+            inner.clone(),
+            session_id.to_string(),
+        )),
     )
     .map_err(|error| {
         manager.cleanup_ai_adapters_for_session(session_id);
@@ -5893,7 +5877,9 @@ mod tests {
     }
 
     fn websocket_endpoint_from_command(command: &str) -> String {
-        let start = command.find("ws://").expect("remote command must contain endpoint");
+        let start = command
+            .find("ws://")
+            .expect("remote command must contain endpoint");
         command[start..]
             .split(|character: char| character.is_whitespace() || matches!(character, '\'' | '"'))
             .next()
@@ -5985,15 +5971,13 @@ mod tests {
             } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
         )));
         manager.cleanup_codex_adapter_session("codex-session");
-        assert!(
-            manager
-                .inner
-                .codex_adapter_registry
-                .lock()
-                .unwrap()
-                .sessions
-                .is_empty()
-        );
+        assert!(manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .is_empty());
     }
 
     #[test]
@@ -6056,7 +6040,10 @@ mod tests {
         let original = "codex --full-auto --model o3";
         let mut pending = CodexAdapterLifecycle::new(original.to_string());
 
-        assert_eq!(pending.claim_preactivation_fallback().as_deref(), Some(original));
+        assert_eq!(
+            pending.claim_preactivation_fallback().as_deref(),
+            Some(original)
+        );
         assert_eq!(pending.claim_preactivation_fallback(), None);
 
         let mut activated = CodexAdapterLifecycle::new(original.to_string());
@@ -6092,15 +6079,12 @@ mod tests {
             startup_command: "codex --full-auto".to_string(),
         };
 
-        let terminal_env =
-            manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
+        let terminal_env = manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
 
         assert!(launch.startup_command.contains("--full-auto"));
         assert!(launch.startup_command.contains("--remote"));
         assert!(launch.startup_command.contains("ws://127.0.0.1:"));
-        assert!(launch
-            .startup_command
-            .contains("--remote-auth-token-env"));
+        assert!(launch.startup_command.contains("--remote-auth-token-env"));
         let token = terminal_env
             .get("DEVMANAGER_CODEX_BRIDGE_TOKEN")
             .expect("bridge bearer token must be scoped to this terminal");
@@ -6157,13 +6141,15 @@ mod tests {
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if events.lock().unwrap().iter().any(|event| matches!(
-                    event,
-                    RemoteSessionEvent::AdapterHealth {
-                        stable_session_key,
-                        health: SemanticAdapterHealth::Healthy,
-                    } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
-                )) {
+                if events.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        RemoteSessionEvent::AdapterHealth {
+                            stable_session_key,
+                            health: SemanticAdapterHealth::Healthy,
+                        } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
+                    )
+                }) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -6178,15 +6164,13 @@ mod tests {
             RemoteSessionEvent::CodexAdapterRemoved { identity }
                 if identity == &registered_identity
         )));
-        assert!(
-            manager
-                .inner
-                .codex_adapter_registry
-                .lock()
-                .unwrap()
-                .sessions
-                .is_empty()
-        );
+        assert!(manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .is_empty());
     }
 
     #[tokio::test]
@@ -6274,8 +6258,7 @@ mod tests {
         let mut stale = launch_spec("stale");
         manager.prepare_codex_launch_for_session(&mut stale, "stale-session");
         let mut current = launch_spec("current");
-        let current_env =
-            manager.prepare_codex_launch_for_session(&mut current, "current-session");
+        let current_env = manager.prepare_codex_launch_for_session(&mut current, "current-session");
 
         let current_identity = manager
             .inner
@@ -6303,9 +6286,7 @@ mod tests {
         );
         let (mut tui, _) = connect_async(request).await.unwrap();
         tui.send(Message::Text(
-            r#"{"id":1,"method":"initialize","params":{}}"#
-                .to_string()
-                .into(),
+            r#"{"id":1,"method":"initialize","params":{}}"#.to_string().into(),
         ))
         .await
         .unwrap();
@@ -6318,10 +6299,12 @@ mod tests {
                     .unwrap()
                     .sessions
                     .get("current-session")
-                    .is_some_and(|session| matches!(
-                        session,
-                        CodexAdapterSession::Running { lifecycle, .. } if lifecycle.activated
-                    ));
+                    .is_some_and(|session| {
+                        matches!(
+                            session,
+                            CodexAdapterSession::Running { lifecycle, .. } if lifecycle.activated
+                        )
+                    });
                 if activated {
                     break;
                 }
@@ -6342,9 +6325,7 @@ mod tests {
 
     #[test]
     fn codex_publication_revalidates_latest_session_generation() {
-        use crate::remote::presentation::{
-            SemanticEventKind, SemanticRetention, SemanticSource,
-        };
+        use crate::remote::presentation::{SemanticEventKind, SemanticRetention, SemanticSource};
 
         let manager = ProcessManager::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -6365,10 +6346,9 @@ mod tests {
             let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
             registry.note_generation(&old);
             registry.note_generation(&current);
-            registry.sessions.insert(
-                "old".to_string(),
-                CodexAdapterSession::Pending(old.clone()),
-            );
+            registry
+                .sessions
+                .insert("old".to_string(), CodexAdapterSession::Pending(old.clone()));
             registry.sessions.insert(
                 "current".to_string(),
                 CodexAdapterSession::Pending(current.clone()),
@@ -6388,11 +6368,7 @@ mod tests {
 
         emit_codex_semantic_if_current(&manager.inner, "old", &old, draft("old"));
         emit_codex_semantic_if_current(&manager.inner, "current", &current, draft("current"));
-        emit_codex_health_if_current(
-            &manager.inner,
-            &old,
-            SemanticAdapterHealth::Degraded,
-        );
+        emit_codex_health_if_current(&manager.inner, &old, SemanticAdapterHealth::Degraded);
 
         let events = events.lock().unwrap();
         assert_eq!(
@@ -6410,17 +6386,14 @@ mod tests {
                 SemanticEventKind::Status { detail: Some(detail), .. } if detail == "current"
             )
         )));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            RemoteSessionEvent::AdapterHealth { .. }
-        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RemoteSessionEvent::AdapterHealth { .. })));
     }
 
     #[test]
     fn codex_old_generation_cannot_resume_after_newer_session_cleanup() {
-        use crate::remote::presentation::{
-            SemanticEventKind, SemanticRetention, SemanticSource,
-        };
+        use crate::remote::presentation::{SemanticEventKind, SemanticRetention, SemanticSource};
 
         let manager = ProcessManager::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -6441,10 +6414,9 @@ mod tests {
             let mut registry = manager.inner.codex_adapter_registry.lock().unwrap();
             registry.note_generation(&old);
             registry.note_generation(&current);
-            registry.sessions.insert(
-                "old".to_string(),
-                CodexAdapterSession::Pending(old.clone()),
-            );
+            registry
+                .sessions
+                .insert("old".to_string(), CodexAdapterSession::Pending(old.clone()));
             registry.sessions.insert(
                 "current".to_string(),
                 CodexAdapterSession::Pending(current.clone()),
@@ -7501,11 +7473,7 @@ mod tests {
         let mut app_state = app_state_with_server(&cwd, true);
         let started = Instant::now();
         manager
-            .start_server_in_background(
-                &mut app_state,
-                "server-cmd",
-                SessionDimensions::default(),
-            )
+            .start_server_in_background(&mut app_state, "server-cmd", SessionDimensions::default())
             .unwrap();
         assert!(
             started.elapsed() < Duration::from_millis(250),
@@ -7516,7 +7484,8 @@ mod tests {
 
     #[test]
     fn sanitize_private_key_normalizes_line_endings_and_trailing_newline() {
-        let pasted = "-----BEGIN OPENSSH PRIVATE KEY-----\r\nabc\r\n-----END OPENSSH PRIVATE KEY-----";
+        let pasted =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\r\nabc\r\n-----END OPENSSH PRIVATE KEY-----";
         assert_eq!(
             sanitize_private_key(pasted),
             "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"
@@ -7634,7 +7603,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).expect("metadata").permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
-            let dir_mode = fs::metadata(&dir).expect("dir metadata").permissions().mode();
+            let dir_mode = fs::metadata(&dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode();
             assert_eq!(dir_mode & 0o777, 0o700);
         }
     }

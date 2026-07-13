@@ -30,8 +30,7 @@ const CODEX_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const CODEX_PROBE_TREE_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const CODEX_PROBE_PIPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(not(windows))]
-const CODEX_PROCESS_GROUP_TERM_GRACE: std::time::Duration =
-    std::time::Duration::from_millis(250);
+const CODEX_PROCESS_GROUP_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_CODEX_HANDSHAKES: usize = 16;
@@ -835,10 +834,7 @@ impl CodexSemanticReducer {
     }
 
     fn visible_text(&self, text: &str) -> String {
-        canonical_codex_visible_text(
-            text,
-            self.limits.item_bytes.min(self.limits.total_bytes),
-        )
+        canonical_codex_visible_text(text, self.limits.item_bytes.min(self.limits.total_bytes))
     }
 
     fn capture_protocol_state(&mut self, message: &Value) {
@@ -1048,9 +1044,10 @@ fn authorize_bridge_handshake(
     response: Response,
     expected_authorization: &str,
 ) -> Result<Response, ErrorResponse> {
-    let authorized = request.headers().get("Authorization").is_some_and(|value| {
-        constant_time_eq(value.as_bytes(), expected_authorization.as_bytes())
-    });
+    let authorized = request
+        .headers()
+        .get("Authorization")
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), expected_authorization.as_bytes()));
     if authorized {
         return Ok(response);
     }
@@ -1472,7 +1469,7 @@ impl CodexBridgeHandle {
                     };
                     let Some(pid) = child.id() else {
                         let _ = ready_tx.send(Err(
-                            "Codex app-server did not expose its process ID".to_string()
+                            "Codex app-server did not expose its process ID".to_string(),
                         ));
                         let _ = child.kill().await;
                         return;
@@ -1698,10 +1695,7 @@ struct SidecarOwnership {
     managed_job: Option<crate::services::platform_service::ManagedProcessJob>,
 }
 
-async fn terminate_sidecar(
-    child: &mut tokio::process::Child,
-    ownership: SidecarOwnership,
-) {
+async fn terminate_sidecar(child: &mut tokio::process::Child, ownership: SidecarOwnership) {
     let SidecarOwnership { pid, managed_job } = ownership;
     let _ = tokio::task::spawn_blocking(move || {
         terminate_owned_sidecar_with(pid, managed_job, |pid| {
@@ -2140,10 +2134,9 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
     // wrapper that exits before its descendants. Unix probes are placed in a
     // dedicated process group above. Tree termination remains the portable
     // first attempt on every completion path.
-    let managed_job =
-        crate::services::platform_service::attach_process_to_managed_job(pid)
-            .ok()
-            .flatten();
+    let managed_job = crate::services::platform_service::attach_process_to_managed_job(pid)
+        .ok()
+        .flatten();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut stdout_reader = spawn_probe_pipe_reader(stdout);
@@ -2155,10 +2148,12 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
             Ok(None) if started.elapsed() < CODEX_PROBE_TIMEOUT => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            Ok(None) => break Err(format!(
+            Ok(None) => {
+                break Err(format!(
                     "Codex capability probe timed out after {} seconds",
                     CODEX_PROBE_TIMEOUT.as_secs()
-                )),
+                ))
+            }
             Err(error) => break Err(format!("Codex capability probe failed: {error}")),
         }
     };
@@ -2182,9 +2177,7 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
     Ok(output)
 }
 
-fn spawn_probe_pipe_reader<R: std::io::Read + Send + 'static>(
-    pipe: Option<R>,
-) -> ProbePipeReader {
+fn spawn_probe_pipe_reader<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> ProbePipeReader {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::spawn(move || {
         let _ = sender.send(capture_probe_pipe(pipe));
@@ -2200,10 +2193,7 @@ struct ProbePipeReader {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-fn receive_probe_pipe(
-    reader: &mut ProbePipeReader,
-    deadline: std::time::Instant,
-) -> Vec<u8> {
+fn receive_probe_pipe(reader: &mut ProbePipeReader, deadline: std::time::Instant) -> Vec<u8> {
     match reader
         .receiver
         .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
@@ -2394,13 +2384,10 @@ mod tests {
         SemanticEventKind, SemanticRetention, SemanticSource, StableSessionKey,
     };
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::{
-        client::IntoClientRequest,
-        http::HeaderValue,
-    };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     fn reducer() -> CodexSemanticReducer {
@@ -2489,7 +2476,8 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let result = match result_rx.recv_timeout(std::time::Duration::from_secs(4)) {
             Ok(result) => result,
             Err(error) => {
-                if let Some(pid) = read_probe_child_pid(&pid_path, std::time::Duration::from_secs(1))
+                if let Some(pid) =
+                    read_probe_child_pid(&pid_path, std::time::Duration::from_secs(1))
                 {
                     let _ = crate::services::platform_service::kill_process_tree(pid);
                 }
@@ -2512,13 +2500,15 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let still_running =
-            crate::services::platform_service::is_pid_running(grandchild_pid);
+        let still_running = crate::services::platform_service::is_pid_running(grandchild_pid);
         if still_running {
             let _ = crate::services::platform_service::kill_process_tree(grandchild_pid);
         }
         let _ = std::fs::remove_dir_all(&temp);
-        assert!(!still_running, "probe must not leave its grandchild running");
+        assert!(
+            !still_running,
+            "probe must not leave its grandchild running"
+        );
     }
 
     #[cfg(not(windows))]
@@ -2560,8 +2550,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let still_running =
-            crate::services::platform_service::is_pid_running(grandchild_pid);
+        let still_running = crate::services::platform_service::is_pid_running(grandchild_pid);
         if still_running {
             let _ = crate::services::platform_service::kill_process_tree(grandchild_pid);
         }
@@ -2938,12 +2927,10 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             "unauthorized handshakes must not consume the one legitimate bridge"
         );
 
-        let (mut tui, _) = connect_async(authorized_request(
-            &base_endpoint,
-            &expected_authorization,
-        ))
-        .await
-        .unwrap();
+        let (mut tui, _) =
+            connect_async(authorized_request(&base_endpoint, &expected_authorization))
+                .await
+                .unwrap();
         let (fake_read, _fake_write) = tokio::io::split(fake_server_stdio);
         let mut fake_read = BufReader::new(fake_read);
         let request = r#"{"id":93,"method":"future/authenticated","params":{}}"#;
@@ -3054,9 +3041,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let (fake_read, mut fake_write) = tokio::io::split(fake_server_stdio);
         let mut fake_read = BufReader::new(fake_read);
         tui.send(Message::Text(
-            r#"{"id":41,"method":"initialize","params":{}}"#
-                .to_string()
-                .into(),
+            r#"{"id":41,"method":"initialize","params":{}}"#.to_string().into(),
         ))
         .await
         .unwrap();
@@ -3144,9 +3129,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         assert!(command.starts_with("& 'C:/Program Files/nodejs/npx.cmd'"));
         assert!(command.contains("'@openai/codex@0.144.3'"));
         assert!(command.contains("'--remote' 'ws://127.0.0.1:49152'"));
-        assert!(command.contains(
-            "'--remote-auth-token-env' 'DEVMANAGER_CODEX_BRIDGE_TOKEN'"
-        ));
+        assert!(command.contains("'--remote-auth-token-env' 'DEVMANAGER_CODEX_BRIDGE_TOKEN'"));
         assert!(!command.contains("@latest"));
     }
 
@@ -3343,14 +3326,11 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let released = std::sync::Arc::new(AtomicBool::new(false));
         let observed_pid = std::sync::Arc::new(AtomicUsize::new(0));
         let captured_pid = observed_pid.clone();
-        let result = terminate_owned_sidecar_with(
-            42,
-            Some(DropMarker(released.clone())),
-            move |pid| {
+        let result =
+            terminate_owned_sidecar_with(42, Some(DropMarker(released.clone())), move |pid| {
                 captured_pid.store(pid as usize, Ordering::Release);
                 Err("wrapper root already exited".to_string())
-            },
-        );
+            });
 
         assert_eq!(observed_pid.load(Ordering::Acquire), 42);
         assert!(released.load(Ordering::Acquire));
@@ -3373,11 +3353,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let pid_path = temp.join("descendant.pid");
         let child_script = temp.join("descendant.ps1");
         let wrapper_script = temp.join("wrapper.ps1");
-        std::fs::write(
-            &child_script,
-            "while ($true) { Start-Sleep -Seconds 60 }\n",
-        )
-        .unwrap();
+        std::fs::write(&child_script, "while ($true) { Start-Sleep -Seconds 60 }\n").unwrap();
         std::fs::write(
             &wrapper_script,
             r#"param(
