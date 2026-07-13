@@ -36,6 +36,7 @@ use super::super::{
     RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot,
     ServerMessage,
 };
+use super::action::WebActionResult;
 use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState};
 use super::wire::{WsInbound, WsOutbound};
 use super::{authenticate_request, record_browser_connection, WebState};
@@ -605,20 +606,31 @@ fn translate_outbound(
     client_id: &str,
 ) -> Option<EncodedFrame> {
     match message {
-        ServerMessage::Snapshot { snapshot } => {
-            serialize_web_snapshot(project_web_snapshot(inner, snapshot))
-        }
-        ServerMessage::Delta { .. } => {
-            let snapshot = light_snapshot(inner, client_id);
-            serialize_web_snapshot(project_web_snapshot(inner, &snapshot))
+        ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => {
+            serialize_web_snapshot(capture_web_snapshot(inner, client_id))
         }
         _ => encode_outbound(message),
     }
 }
 
+fn capture_web_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> WebWorkspaceSnapshot {
+    let (snapshot, revision) = {
+        let _snapshot_guard = inner
+            .snapshot_state_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            light_snapshot(inner, client_id),
+            inner.snapshot_revision.load(Ordering::Relaxed),
+        )
+    };
+    project_web_snapshot(inner, &snapshot, revision)
+}
+
 fn project_web_snapshot(
     inner: &Arc<RemoteHostInner>,
     snapshot: &RemoteWorkspaceSnapshot,
+    revision: u64,
 ) -> WebWorkspaceSnapshot {
     let lease = WebWriterLeaseState {
         owner_client_instance_id: snapshot.controller_client_id.clone(),
@@ -628,7 +640,7 @@ fn project_web_snapshot(
     };
     let mut projected = WebWorkspaceSnapshot::from_host(
         inner.runtime_instance_id.clone(),
-        inner.snapshot_revision.load(Ordering::Relaxed),
+        revision,
         &snapshot.app_state,
         &snapshot.runtime_state,
         &snapshot.port_statuses,
@@ -657,7 +669,7 @@ fn encode_outbound(message: &ServerMessage) -> Option<EncodedFrame> {
         }),
         ServerMessage::Response { request_id, result } => serialize_text(&WsOutbound::Response {
             id: *request_id,
-            result: result.clone(),
+            result: WebActionResult::from_remote(result),
         }),
         ServerMessage::SessionStream { event } => encode_session_stream(event),
         ServerMessage::HelloOk { .. }
@@ -735,11 +747,11 @@ mod tests {
     use super::super::action::{WebAction, WebAiKind};
     use super::*;
     use crate::remote::{
-        deliver_pending_bootstraps, PairedWebClient, RemoteHostConfig, RemoteHostService,
-        RemoteSessionBootstrap, PROTOCOL_VERSION,
+        deliver_pending_bootstraps, PairedWebClient, RemoteActionPayload, RemoteHostConfig,
+        RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
     };
-    use crate::state::{SessionDimensions, SessionRuntimeState};
-    use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot};
+    use crate::state::{AiLaunchSpec, SessionDimensions, SessionKind, SessionRuntimeState};
+    use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::mpsc as std_mpsc;
@@ -787,11 +799,11 @@ mod tests {
     #[test]
     fn translate_outbound_projects_snapshot_as_safe_text() {
         use super::super::super::RemoteWorkspaceSnapshot;
-        let service = RemoteHostService::new(RemoteHostConfig::default());
-        let snapshot = RemoteWorkspaceSnapshot {
+        let service = RemoteHostService::new(RemoteHostConfig {
             server_id: "host-1".to_string(),
-            ..RemoteWorkspaceSnapshot::default()
-        };
+            ..RemoteHostConfig::default()
+        });
+        let snapshot = RemoteWorkspaceSnapshot::default();
         let frame = translate_outbound(
             &ServerMessage::Snapshot { snapshot },
             &service.inner,
@@ -812,6 +824,47 @@ mod tests {
             }
             EncodedFrame::Binary(_) => panic!("snapshot should be text"),
         }
+    }
+
+    #[test]
+    fn queued_snapshot_captures_current_state_and_revision_together() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut old_app = crate::state::AppState::default();
+        old_app.config.projects.push(crate::models::Project {
+            id: "old-project".to_string(),
+            name: "Old Project".to_string(),
+            ..Default::default()
+        });
+        service.update_snapshot(
+            old_app,
+            crate::state::RuntimeState::default(),
+            HashMap::new(),
+        );
+        let queued = ServerMessage::Snapshot {
+            snapshot: light_snapshot(&service.inner, "web-client"),
+        };
+
+        let mut current_app = crate::state::AppState::default();
+        current_app.config.projects.push(crate::models::Project {
+            id: "current-project".to_string(),
+            name: "Current Project".to_string(),
+            ..Default::default()
+        });
+        service.update_snapshot(
+            current_app,
+            crate::state::RuntimeState::default(),
+            HashMap::new(),
+        );
+        let expected_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
+
+        let frame = translate_outbound(&queued, &service.inner, "web-client")
+            .expect("queued snapshot encodes");
+        let EncodedFrame::Text(text) = frame else {
+            panic!("snapshot should be text");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(value["workspace"]["revision"], expected_revision);
+        assert_eq!(value["workspace"]["projects"][0]["id"], "current-project");
     }
 
     #[test]
@@ -837,6 +890,63 @@ mod tests {
         assert_eq!(value["type"], "snapshot");
         assert_eq!(value["workspace"]["revision"], 2);
         assert!(!text.contains("TOKEN_SENTINEL"));
+    }
+
+    #[test]
+    fn allowed_ai_response_never_serializes_native_session_runtime() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut runtime = SessionRuntimeState::new(
+            "session-1",
+            PathBuf::from("C:\\Code\\project"),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Claude;
+        runtime.ai_launch = Some(AiLaunchSpec {
+            tab_id: "tab-1".to_string(),
+            project_id: "project-1".to_string(),
+            tool: SessionKind::Claude,
+            cwd: PathBuf::from("C:\\Code\\project"),
+            shell_program: "pwsh".to_string(),
+            shell_args: vec!["RUNTIME_ARG_SENTINEL".to_string()],
+            startup_command: "STARTUP_SENTINEL".to_string(),
+        });
+        let message = ServerMessage::Response {
+            request_id: 41,
+            result: RemoteActionResult::ok(
+                None::<String>,
+                Some(RemoteActionPayload::AiTab {
+                    tab_id: "tab-1".to_string(),
+                    project_id: "project-1".to_string(),
+                    tab_type: crate::models::TabType::Claude,
+                    session_id: "session-1".to_string(),
+                    label: Some("Claude".to_string()),
+                    session_view: Some(TerminalSessionView {
+                        runtime,
+                        screen: TerminalScreenSnapshot::default(),
+                    }),
+                }),
+            ),
+        };
+
+        let frame = translate_outbound(&message, &service.inner, "web-client")
+            .expect("AI response encodes");
+        let EncodedFrame::Text(text) = frame else {
+            panic!("AI response should be text");
+        };
+        assert!(!text.contains("STARTUP_SENTINEL"), "leaked startup: {text}");
+        assert!(
+            !text.contains("RUNTIME_ARG_SENTINEL"),
+            "leaked runtime args: {text}"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(value["type"], "response");
+        assert_eq!(value["id"], 41);
+        assert_eq!(value["result"]["payload"]["type"], "aiTab");
+        assert_eq!(value["result"]["payload"]["tabId"], "tab-1");
+        assert_eq!(value["result"]["payload"]["sessionId"], "session-1");
+        assert!(value["result"]["payload"].get("sessionView").is_none());
     }
 
     #[test]

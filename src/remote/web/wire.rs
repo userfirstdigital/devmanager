@@ -5,8 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::super::RemoteActionResult;
-use super::action::WebAction;
+use super::action::{WebAction, WebActionResult};
 use super::dto::{WebWorkspaceDelta, WebWorkspaceSnapshot};
 use crate::terminal::session::TerminalScreenSnapshot;
 
@@ -97,7 +96,7 @@ pub enum WsOutbound {
     },
     Response {
         id: u64,
-        result: RemoteActionResult,
+        result: WebActionResult,
     },
     Error {
         message: String,

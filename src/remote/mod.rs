@@ -927,6 +927,9 @@ pub(crate) struct RemoteHostInner {
     config: RwLock<RemoteHostConfig>,
     config_update_lock: Mutex<()>,
     config_revision: AtomicU64,
+    /// Coordinates publication of workspace state with browser snapshot
+    /// capture so a revision always describes the state sent with it.
+    snapshot_state_lock: Mutex<()>,
     snapshot_revision: AtomicU64,
     runtime_instance_id: String,
     shared_state: RwLock<AppState>,
@@ -1033,6 +1036,7 @@ impl RemoteHostService {
                 config: RwLock::new(config.clone()),
                 config_update_lock: Mutex::new(()),
                 config_revision: AtomicU64::new(1),
+                snapshot_state_lock: Mutex::new(()),
                 snapshot_revision: AtomicU64::new(1),
                 runtime_instance_id: generate_secret("runtime"),
                 shared_state: RwLock::new(AppState::default()),
@@ -1091,6 +1095,11 @@ impl RemoteHostService {
         runtime_state: Option<RuntimeState>,
         port_statuses: Option<HashMap<u16, PortStatus>>,
     ) {
+        let _snapshot_guard = self
+            .inner
+            .snapshot_state_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut changed = false;
         if let Some(app_state) = app_state {
             if let Ok(mut slot) = self.inner.shared_state.write() {

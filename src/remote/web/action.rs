@@ -1,13 +1,82 @@
 use crate::models::TabType;
-use crate::remote::RemoteAction;
+use crate::remote::{RemoteAction, RemoteActionPayload, RemoteActionResult};
 use crate::state::SessionDimensions;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebAiKind {
     Claude,
     Codex,
+}
+
+/// Browser-visible action result. This deliberately does not expose the
+/// native action payload enum, whose variants can contain host runtime state.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebActionResult {
+    pub ok: bool,
+    pub message: Option<String>,
+    pub payload: Option<WebActionPayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WebActionPayload {
+    AiTab {
+        tab_id: String,
+        project_id: String,
+        tab_type: WebAiKind,
+        session_id: String,
+        label: Option<String>,
+    },
+}
+
+impl WebActionResult {
+    pub fn from_remote(result: &RemoteActionResult) -> Self {
+        Self {
+            ok: result.ok,
+            message: result.message.clone(),
+            payload: result
+                .payload
+                .as_ref()
+                .and_then(WebActionPayload::from_remote),
+        }
+    }
+}
+
+impl WebActionPayload {
+    fn from_remote(payload: &RemoteActionPayload) -> Option<Self> {
+        let RemoteActionPayload::AiTab {
+            tab_id,
+            project_id,
+            tab_type,
+            session_id,
+            label,
+            ..
+        } = payload
+        else {
+            return None;
+        };
+
+        let tab_type = match tab_type {
+            TabType::Claude => WebAiKind::Claude,
+            TabType::Codex => WebAiKind::Codex,
+            TabType::Server | TabType::Ssh => return None,
+        };
+
+        Some(Self::AiTab {
+            tab_id: tab_id.clone(),
+            project_id: project_id.clone(),
+            tab_type,
+            session_id: session_id.clone(),
+            label: label.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
