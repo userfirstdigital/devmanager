@@ -942,6 +942,12 @@ pub(crate) struct RemoteHostInner {
     runtime_state: RwLock<RuntimeState>,
     port_statuses: RwLock<HashMap<u16, PortStatus>>,
     semantic_journals: Mutex<SemanticJournalStore>,
+    /// Serializes semantic writers while the generation below gives browser
+    /// capture a lock-free indication that publication is in progress.
+    semantic_publication_lock: Mutex<()>,
+    semantic_publication_generation: AtomicU64,
+    #[cfg(test)]
+    semantic_publication_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     session_bootstrap_provider: RwLock<Option<SessionBootstrapProvider>>,
     terminal_input_handler: RwLock<Option<TerminalInputHandler>>,
     terminal_resize_handler: RwLock<Option<TerminalResizeHandler>>,
@@ -965,6 +971,16 @@ pub(crate) struct RemoteHostInner {
     web_listener: Mutex<Option<WebListenerHandle>>,
     #[allow(dead_code)]
     web_listener_error: RwLock<Option<String>>,
+}
+
+struct SemanticPublicationEpoch<'a> {
+    generation: &'a AtomicU64,
+}
+
+impl Drop for SemanticPublicationEpoch<'_> {
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
@@ -1050,6 +1066,10 @@ impl RemoteHostService {
                 runtime_state: RwLock::new(RuntimeState::default()),
                 port_statuses: RwLock::new(HashMap::new()),
                 semantic_journals: Mutex::new(SemanticJournalStore::default()),
+                semantic_publication_lock: Mutex::new(()),
+                semantic_publication_generation: AtomicU64::new(0),
+                #[cfg(test)]
+                semantic_publication_test_hook: RwLock::new(None),
                 session_bootstrap_provider: RwLock::new(None),
                 terminal_input_handler: RwLock::new(None),
                 terminal_resize_handler: RwLock::new(None),
@@ -1283,34 +1303,16 @@ impl RemoteHostService {
             .read()
             .ok()
             .and_then(|state| state.sessions.get(session_id).cloned());
-        let semantic_changed = self
-            .inner
-            .semantic_journals
-            .lock()
-            .map(|mut journals| {
-                let runtime_changed = runtime.as_ref().is_some_and(|runtime| {
-                    journals.observe_runtime(runtime, &tabs, emitted_at_epoch_ms)
-                });
-                let mode_changed = mode.is_some_and(|mode| {
-                    journals.observe_native_terminal_mode(
-                        session_id,
-                        mode,
-                        emitted_at_epoch_ms,
-                    )
-                });
-                let output_changed =
-                    journals.observe_output(session_id, &bytes, emitted_at_epoch_ms);
-                runtime_changed || mode_changed || output_changed
-            })
-            .unwrap_or(false);
-        if semantic_changed {
-            let _snapshot_guard = self
-                .inner
-                .snapshot_state_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
-        }
+        self.publish_semantic_change(|journals| {
+            let runtime_changed = runtime.as_ref().is_some_and(|runtime| {
+                journals.observe_runtime(runtime, &tabs, emitted_at_epoch_ms)
+            });
+            let mode_changed = mode.is_some_and(|mode| {
+                journals.observe_native_terminal_mode(session_id, mode, emitted_at_epoch_ms)
+            });
+            let output_changed = journals.observe_output(session_id, &bytes, emitted_at_epoch_ms);
+            runtime_changed || mode_changed || output_changed
+        });
         self.mark_subscribed_clients_bootstrap_pending(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
@@ -1347,20 +1349,9 @@ impl RemoteHostService {
             .read()
             .map(|state| state.open_tabs.clone())
             .unwrap_or_default();
-        let semantic_changed = self
-            .inner
-            .semantic_journals
-            .lock()
-            .map(|mut journals| journals.observe_runtime(&runtime, &tabs, now_epoch_ms()))
-            .unwrap_or(false);
-        if semantic_changed {
-            let _snapshot_guard = self
-                .inner
-                .snapshot_state_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
-        }
+        self.publish_semantic_change(|journals| {
+            journals.observe_runtime(&runtime, &tabs, now_epoch_ms())
+        });
         self.mark_subscribed_clients_bootstrap_pending(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
@@ -1395,6 +1386,56 @@ impl RemoteHostService {
         }
         for connection_id in dead_connections {
             clients.remove(&connection_id);
+        }
+    }
+
+    fn publish_semantic_change(
+        &self,
+        mutation: impl FnOnce(&mut SemanticJournalStore) -> bool,
+    ) -> bool {
+        let _publication_guard = self
+            .inner
+            .semantic_publication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_generation = self
+            .inner
+            .semantic_publication_generation
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous_generation % 2, 0);
+        let _epoch = SemanticPublicationEpoch {
+            generation: &self.inner.semantic_publication_generation,
+        };
+
+        let changed = self
+            .inner
+            .semantic_journals
+            .lock()
+            .map(|mut journals| mutation(&mut journals))
+            .unwrap_or(false);
+        if changed {
+            #[cfg(test)]
+            self.run_semantic_publication_test_hook();
+            let _snapshot_guard = self
+                .inner
+                .snapshot_state_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    fn run_semantic_publication_test_hook(&self) {
+        let hook = self
+            .inner
+            .semantic_publication_test_hook
+            .read()
+            .ok()
+            .and_then(|hook| hook.clone());
+        if let Some(hook) = hook {
+            hook();
         }
     }
 

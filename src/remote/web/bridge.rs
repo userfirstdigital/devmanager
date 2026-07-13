@@ -615,23 +615,38 @@ fn translate_outbound(
 }
 
 fn capture_web_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> WebWorkspaceSnapshot {
-    let (snapshot, revision, semantic_metadata) = {
-        let _snapshot_guard = inner
-            .snapshot_state_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let semantic_metadata = inner
-            .semantic_journals
-            .lock()
-            .map(|journals| journals.metadata_snapshot())
-            .unwrap_or_default();
-        (
-            light_snapshot(inner, client_id),
-            inner.snapshot_revision.load(Ordering::Relaxed),
-            semantic_metadata,
-        )
-    };
-    project_web_snapshot(inner, &snapshot, revision, &semantic_metadata)
+    loop {
+        let generation_before = inner
+            .semantic_publication_generation
+            .load(Ordering::Acquire);
+        if generation_before % 2 != 0 {
+            std::thread::yield_now();
+            continue;
+        }
+        let (snapshot, revision, semantic_metadata) = {
+            let _snapshot_guard = inner
+                .snapshot_state_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let semantic_metadata = inner
+                .semantic_journals
+                .lock()
+                .map(|journals| journals.metadata_snapshot())
+                .unwrap_or_default();
+            (
+                light_snapshot(inner, client_id),
+                inner.snapshot_revision.load(Ordering::Relaxed),
+                semantic_metadata,
+            )
+        };
+        let generation_after = inner
+            .semantic_publication_generation
+            .load(Ordering::Acquire);
+        if generation_before == generation_after {
+            return project_web_snapshot(inner, &snapshot, revision, &semantic_metadata);
+        }
+        std::thread::yield_now();
+    }
 }
 
 fn project_web_snapshot(
@@ -764,6 +779,118 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::mpsc as std_mpsc;
+
+    #[derive(Debug, Clone, Copy)]
+    enum SemanticPublicationCase {
+        Output,
+        Runtime,
+    }
+
+    fn assert_browser_capture_waits_for_semantic_publication(case: SemanticPublicationCase) {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app = crate::state::AppState::default();
+        app.open_tabs.push(crate::models::SessionTab {
+            id: "semantic-tab".to_string(),
+            tab_type: crate::models::TabType::Claude,
+            pty_session_id: Some("semantic-runtime".to_string()),
+            ..crate::models::SessionTab::default()
+        });
+        let mut runtime = SessionRuntimeState::new(
+            "semantic-runtime",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Claude;
+        runtime.tab_id = Some("semantic-tab".to_string());
+        let mut runtime_state = crate::state::RuntimeState::default();
+        runtime_state
+            .sessions
+            .insert(runtime.session_id.clone(), runtime.clone());
+        service.update_snapshot(app, runtime_state, HashMap::new());
+        let initial = capture_web_snapshot(&service.inner, "web-client");
+        let initial_latest_sequence = initial
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "semantic-runtime")
+            .expect("semantic session")
+            .latest_sequence;
+
+        let (mutation_reached_tx, mutation_reached_rx) = std_mpsc::channel();
+        let (resume_tx, resume_rx) = std_mpsc::channel();
+        let resume_rx = Arc::new(std::sync::Mutex::new(resume_rx));
+        let hook_resume_rx = resume_rx.clone();
+        *service
+            .inner
+            .semantic_publication_test_hook
+            .write()
+            .expect("publication hook lock") = Some(Arc::new(move || {
+            mutation_reached_tx
+                .send(())
+                .expect("publication observer should remain open");
+            let _ = hook_resume_rx.lock().expect("publication gate lock").recv();
+        }));
+
+        let publisher_service = service.clone();
+        let publisher = std::thread::spawn(move || match case {
+            SemanticPublicationCase::Output => {
+                publisher_service.push_session_output("semantic-runtime", b"new output".to_vec())
+            }
+            SemanticPublicationCase::Runtime => {
+                runtime.status = crate::state::SessionStatus::Running;
+                runtime.unseen_ready = true;
+                runtime.notification_count = 3;
+                publisher_service.push_session_runtime("semantic-runtime", runtime);
+            }
+        });
+        mutation_reached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("semantic mutation should reach the pre-revision gate");
+
+        let capture_inner = service.inner.clone();
+        let (capture_tx, capture_rx) = std_mpsc::channel();
+        let capture = std::thread::spawn(move || {
+            capture_tx
+                .send(capture_web_snapshot(&capture_inner, "web-client"))
+                .expect("capture receiver should remain open");
+        });
+        let premature = capture_rx.recv_timeout(Duration::from_millis(100)).ok();
+
+        resume_tx.send(()).expect("publisher should remain open");
+        publisher.join().expect("publisher should complete");
+        if let Some(snapshot) = premature {
+            capture.join().expect("capture should complete");
+            panic!(
+                "{case:?} capture exposed semantic revision {} before publication advanced from {}",
+                snapshot.revision, initial.revision
+            );
+        }
+
+        let snapshot = capture_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("capture should complete after publication");
+        capture.join().expect("capture should complete");
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "semantic-runtime")
+            .expect("semantic session");
+        assert!(snapshot.revision > initial.revision);
+        assert!(session.latest_sequence > initial_latest_sequence);
+        if matches!(case, SemanticPublicationCase::Runtime) {
+            assert_eq!(session.attention_count, 3);
+        }
+    }
+
+    #[test]
+    fn browser_capture_waits_for_output_semantic_revision_publication() {
+        assert_browser_capture_waits_for_semantic_publication(SemanticPublicationCase::Output);
+    }
+
+    #[test]
+    fn browser_capture_waits_for_runtime_semantic_revision_publication() {
+        assert_browser_capture_waits_for_semantic_publication(SemanticPublicationCase::Runtime);
+    }
 
     fn pair_web_client(service: &RemoteHostService, client_id: &str) {
         let mut config = service.inner.config.write().expect("config lock");
