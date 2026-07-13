@@ -594,10 +594,18 @@ export class WsClient {
     this.writerLease = { ...EMPTY_WRITER_LEASE };
   }
 
-  discardWriterFramesForSession(sessionId: string): void {
+  discardWriterFramesForSession(
+    sessionId: string,
+    stableSessionKey: string | null = null,
+  ): void {
     for (let index = this.pendingWriterFrames.length - 1; index >= 0; index -= 1) {
       const pending = this.pendingWriterFrames[index];
-      if (pending.message.sessionId !== sessionId) continue;
+      const matches =
+        pending.message.type === "interruptSession"
+          ? stableSessionKey !== null &&
+            pending.message.stableSessionKey === stableSessionKey
+          : pending.message.sessionId === sessionId;
+      if (!matches) continue;
       this.pendingWriterFrames.splice(index, 1);
       this.releasePendingWork(pending.accountedBytes);
     }

@@ -664,7 +664,10 @@ export const useStore = create<StoreState>((set, get) => {
       ]);
       for (const sessionId of previousStreamSessionIds) {
         if (!validStreamSessionIds.has(sessionId)) {
-          current.client?.discardWriterFramesForSession(sessionId);
+          current.client?.discardWriterFramesForSession(
+            sessionId,
+            stableKeyForStreamSession(current, sessionId),
+          );
         }
       }
       for (const [stableSessionKey, mutation] of Object.entries(
@@ -919,7 +922,10 @@ export const useStore = create<StoreState>((set, get) => {
       }
       case "sessionClosed": {
         const stableSessionKey = stableKeyForStreamSession(get(), message.sessionId);
-        get().client?.discardWriterFramesForSession(message.sessionId);
+        get().client?.discardWriterFramesForSession(
+          message.sessionId,
+          stableSessionKey,
+        );
         set((state) => {
           return {
             rawTerminal: rawTerminalWithoutSession(
@@ -937,7 +943,10 @@ export const useStore = create<StoreState>((set, get) => {
         const pendingMutation = stableSessionKey
           ? before.pendingMutations[stableSessionKey]
           : undefined;
-        before.client?.discardWriterFramesForSession(message.sessionId);
+        before.client?.discardWriterFramesForSession(
+          message.sessionId,
+          stableSessionKey,
+        );
         if (pendingMutation) {
           before.client?.cancelComposer(
             pendingMutation.mutationId,

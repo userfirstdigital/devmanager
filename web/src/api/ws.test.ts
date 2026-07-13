@@ -640,6 +640,44 @@ describe("WsClient request handling", () => {
     ]);
   });
 
+  it("discards a staged interrupt with the exact closed stable session", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    client.sendWithWriterLease({
+      type: "interruptSession",
+      stableSessionKey: "tab:a",
+    });
+    client.sendWithWriterLease({
+      type: "interruptSession",
+      stableSessionKey: "tab:b",
+    });
+
+    client.discardWriterFramesForSession("pty-a", "tab:a");
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 47,
+          expiresAtEpochMs: 20_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "interruptSession"),
+    ).toEqual([
+      {
+        type: "interruptSession",
+        stableSessionKey: "tab:b",
+        expectedLeaseGeneration: 47,
+      },
+    ]);
+  });
+
   it("requests a visible writer lease for actions without replaying the action", async () => {
     const client = new WsClient(clientCallbacks());
     await client.start();
