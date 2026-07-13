@@ -1833,7 +1833,38 @@ where
 }
 
 fn help_advertises_flag(help: &str, flag: &str) -> bool {
-    help.split_ascii_whitespace().any(|token| token == flag)
+    if flag.is_empty() {
+        return false;
+    }
+    let help = strip_ansi_csi(help);
+    help.match_indices(flag).any(|(offset, _)| {
+        let before = help[..offset].chars().next_back();
+        let after = help[offset + flag.len()..].chars().next();
+        before.is_none_or(|character| !is_flag_name_character(character))
+            && after.is_none_or(|character| !is_flag_name_character(character))
+    })
+}
+
+fn strip_ansi_csi(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' && characters.peek() == Some(&'[') {
+            characters.next();
+            for control in characters.by_ref() {
+                if ('@'..='~').contains(&control) {
+                    break;
+                }
+            }
+        } else {
+            stripped.push(character);
+        }
+    }
+    stripped
+}
+
+fn is_flag_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
 }
 
 fn parse_codex_command(startup_command: &str) -> Result<ParsedCodexCommand, String> {
@@ -3071,6 +3102,42 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             "1.2.3-beta.1"
         );
         assert!(parse_codex_version("npm warn retry 9\nnpm notice update 10").is_err());
+    }
+
+    #[test]
+    fn help_flag_detection_ignores_ansi_csi_styling() {
+        assert!(help_advertises_flag(
+            "  \u{1b}[1;36m--remote\u{1b}[0m <URL>\n  \u{1b}[32m--remote-auth-token-env\u{1b}[0m <ENV>",
+            "--remote"
+        ));
+        assert!(help_advertises_flag(
+            "  \u{1b}[1;36m--remote\u{1b}[0m <URL>\n  \u{1b}[32m--remote-auth-token-env\u{1b}[0m <ENV>",
+            "--remote-auth-token-env"
+        ));
+    }
+
+    #[test]
+    fn help_flag_detection_accepts_adjacent_punctuation_and_arguments() {
+        assert!(help_advertises_flag(
+            "Options: [--remote=<URL>], (--listen <URL>).",
+            "--remote"
+        ));
+        assert!(help_advertises_flag(
+            "Options: [--remote=<URL>], (--listen <URL>).",
+            "--listen"
+        ));
+    }
+
+    #[test]
+    fn help_flag_detection_rejects_near_matches() {
+        assert!(!help_advertises_flag(
+            "--remote-mode prefix--remote --remote_auth --remote-auth-token-environment",
+            "--remote"
+        ));
+        assert!(!help_advertises_flag(
+            "--remote-auth-token-environment",
+            "--remote-auth-token-env"
+        ));
     }
 
     #[test]
