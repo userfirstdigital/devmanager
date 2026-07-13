@@ -1,4 +1,4 @@
-import { Terminal } from "lucide-react";
+import { LockKeyhole, MonitorSmartphone } from "lucide-react";
 import { useState, type FormEvent } from "react";
 
 import { buildPairingUrl } from "../lib/browserIdentity";
@@ -18,8 +18,6 @@ export function PairingGate() {
     setSubmitting(true);
     setError(null);
     try {
-      // Pair with the stable browser install id so the host can dedupe this
-      // browser across reconnects instead of inflating the activity history.
       const response = await fetch(buildPairingUrl(trimmed), {
         credentials: "include",
       });
@@ -33,39 +31,33 @@ export function PairingGate() {
               ? `Token rejected. Wait ${retryAfter}s before trying again.`
               : response.status === 401
                 ? "Token rejected."
-            : `Pair failed (HTTP ${response.status})`,
+                : `Pair failed (HTTP ${response.status})`,
         );
         return;
       }
-      // Full-page load so App.tsx's effect re-runs with the new cookie.
-      window.location.href = "/";
-    } catch (err) {
+      window.location.href = "/sessions";
+    } catch (reason) {
       setSubmitting(false);
-      setError(`Pair failed: ${err instanceof Error ? err.message : String(err)}`);
+      setError(
+        `Pair failed: ${reason instanceof Error ? reason.message : String(reason)}`,
+      );
     }
   };
 
   return (
-    <div className="min-h-screen bg-zinc-900 text-zinc-100 flex items-center justify-center px-4">
-      <div className="max-w-md w-full bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <Terminal className="size-5 text-indigo-400" />
-          <h1 className="text-lg font-semibold">DevManager Web</h1>
-        </div>
-        <p className="text-sm text-zinc-300 mb-4">
-          This browser is not paired with DevManager. If someone sent you an
-          invite link, open that directly. Otherwise open the desktop app, go
-          to{" "}
-          <strong className="text-zinc-100">
-            Remote → Host → Browser Access
-          </strong>
-          , copy the browser pair token, and paste it below.
+    <main className="dm-pairing-state">
+      <div className="dm-pairing-card">
+        <span className="dm-pairing-icon" aria-hidden="true">
+          <MonitorSmartphone size={28} />
+        </span>
+        <h1>Connect to DevManager</h1>
+        <p className="dm-pairing-intro">
+          Pair this iPhone once, then DevManager will reconnect automatically
+          whenever you return.
         </p>
-        <form onSubmit={onSubmit} className="space-y-3">
-          <label className="block">
-            <span className="block text-xs font-medium text-zinc-400 mb-1">
-              Browser pair token
-            </span>
+        <form onSubmit={onSubmit} className="dm-pairing-form">
+          <label>
+            <span>Browser pair token</span>
             <input
               type="text"
               inputMode="text"
@@ -73,31 +65,28 @@ export function PairingGate() {
               autoCapitalize="characters"
               spellCheck={false}
               value={token}
-              onChange={(e) => setToken(e.target.value)}
-              className="w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded text-sm text-zinc-100 font-mono tracking-wider placeholder:text-zinc-600 focus:outline-none focus:border-indigo-500"
+              onChange={(event) => setToken(event.target.value)}
               disabled={submitting}
-              autoFocus
+              placeholder="Paste token"
             />
           </label>
           <button
             type="submit"
             disabled={submitting || token.trim().length === 0}
-            className="w-full px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {submitting ? "Pairing..." : "Pair browser"}
+            {submitting ? "Pairing…" : "Pair browser"}
           </button>
         </form>
-        {error && (
-          <p className="text-xs text-red-400 mt-3" role="alert">
+        {error ? (
+          <p className="dm-pairing-error" role="alert">
             {error}
           </p>
-        )}
-        <p className="text-xs text-zinc-500 mt-4">
-          Pairing is remembered for this browser on this DevManager instance,
-          so you usually only need to do this once unless you clear cookies or
-          the host revokes browser access.
+        ) : null}
+        <p className="dm-pairing-help">
+          <LockKeyhole size={14} aria-hidden="true" />
+          Find the token in the desktop app under Remote, Host, Browser Access.
         </p>
       </div>
-    </div>
+    </main>
   );
 }
