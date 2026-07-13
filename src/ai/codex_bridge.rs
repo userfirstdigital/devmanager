@@ -831,11 +831,10 @@ impl CodexSemanticReducer {
     }
 
     fn visible_text(&self, text: &str) -> String {
-        truncate_utf8(
-            &sanitize_text(text),
+        canonical_codex_visible_text(
+            text,
             self.limits.item_bytes.min(self.limits.total_bytes),
         )
-        .to_string()
     }
 
     fn capture_protocol_state(&mut self, message: &Value) {
@@ -2180,6 +2179,22 @@ fn user_message_text(item: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(crate) fn canonical_codex_composer_prompt(text: &str, image_count: usize) -> String {
+    let mut parts = Vec::with_capacity(image_count + usize::from(!text.is_empty()));
+    parts.extend(std::iter::repeat_n("[Image]", image_count));
+    if !text.is_empty() {
+        parts.push(text);
+    }
+    canonical_codex_visible_text(
+        &parts.join("\n"),
+        DEFAULT_ITEM_BYTES.min(DEFAULT_TOTAL_BYTES),
+    )
+}
+
+fn canonical_codex_visible_text(text: &str, max_bytes: usize) -> String {
+    truncate_utf8(&sanitize_text(text), max_bytes).to_string()
 }
 
 fn tool_name(item: &Value, item_type: &str) -> String {

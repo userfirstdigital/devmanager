@@ -53,6 +53,7 @@ use super::wire::{
     ResumeState, SemanticReplayDescriptor, SemanticReplayPage, WsInbound, WsOutbound,
 };
 use super::{authenticate_request, record_browser_connection, WebState};
+use crate::ai::codex_bridge::canonical_codex_composer_prompt;
 use crate::state::{SessionDimensions, SessionKind};
 
 /// Frame type byte prefixed to binary WS frames carrying terminal output.
@@ -3297,11 +3298,13 @@ fn dispatch_composer_submit_for_connection(
                 );
             }
             if reconcile_codex_prompt {
+                let provider_visible_text =
+                    canonical_codex_composer_prompt(&text, decoded_attachments.len());
                 host_service.reserve_codex_composer_prompt(
                     &mutation_id,
                     &session_id,
                     &stable_session_key,
-                    &text,
+                    &provider_visible_text,
                 );
             }
             let handler = fence
@@ -6739,6 +6742,146 @@ mod tests {
             &event.kind,
             SemanticEventKind::UserMessage { text } if text == "local TUI prompt"
         )), "unreserved local-TUI prompts must remain visible");
+    }
+
+    #[test]
+    fn codex_composer_reconciles_provider_visible_long_text_and_image_markers_once() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        codex_session(&service, "tab-codex", "session-codex");
+        let stable_key = StableSessionKey::from_tab("tab-codex");
+        let identity = crate::remote::CodexSemanticIdentity {
+            pty_session_id: "session-codex".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 17,
+        };
+        service.push_codex_adapter_registered(identity.clone());
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(stable_key.clone()),
+                "tab-codex",
+            ),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let provider_service = service.clone();
+        let provider_identity = identity.clone();
+        let provider_number = Arc::new(AtomicUsize::new(0));
+        let callback_number = provider_number.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            let RemoteTerminalInput::ComposerBatch {
+                text, attachments, ..
+            } = input
+            else {
+                return Ok(());
+            };
+            let text = text.trim_end_matches('\r');
+            let mut provider_parts = vec!["[Image]"; attachments.len()];
+            if !text.is_empty() {
+                provider_parts.push(text);
+            }
+            let provider_text = provider_parts.join("\n");
+            let provider_text = provider_text[..provider_text.len().min(64 * 1024)].to_string();
+            let number = callback_number.fetch_add(1, Ordering::SeqCst) + 1;
+            provider_service.push_codex_semantic_draft(
+                provider_identity.clone(),
+                SemanticEventDraft {
+                    stable_session_key: provider_identity.stable_session_key.clone(),
+                    occurred_at_epoch_ms: 1_100 + number as u64,
+                    source: SemanticSource::Codex,
+                    kind: SemanticEventKind::UserMessage {
+                        text: provider_text,
+                    },
+                    retention: SemanticRetention::Canonical,
+                    deduplication_key: Some(format!("codex:user:canonical-{number}")),
+                },
+            );
+            Ok(())
+        })));
+
+        let long_text = "x".repeat(70 * 1024);
+        process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "codex-long-prompt".to_string(),
+            stable_key.clone(),
+            long_text.clone(),
+            Vec::new(),
+            generation,
+            1_100,
+        )
+        .expect("long Codex composer prompt accepted");
+        process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "codex-image-prompt".to_string(),
+            stable_key.clone(),
+            "inspect both images".to_string(),
+            vec![
+                ComposerAttachment {
+                    mime_type: "image/png".to_string(),
+                    file_name: Some("first.png".to_string()),
+                    data_base64: "AQID".to_string(),
+                },
+                ComposerAttachment {
+                    mime_type: "image/jpeg".to_string(),
+                    file_name: Some("second.jpg".to_string()),
+                    data_base64: "BAUG".to_string(),
+                },
+            ],
+            generation,
+            1_101,
+        )
+        .expect("image Codex composer prompt accepted");
+
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        let messages = replay
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SemanticEventKind::UserMessage { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["inspect both images"]);
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::Status { state, .. }
+                        if state == "semanticEventTruncated"
+                ))
+                .count(),
+            1,
+            "the local oversized prompt may truncate, but its provider echo must be reconciled"
+        );
+
+        service.push_codex_semantic_draft(
+            identity,
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_200,
+                source: SemanticSource::Codex,
+                kind: SemanticEventKind::UserMessage {
+                    text: "local TUI prompt".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("codex:user:local-tui-canonical-test".to_string()),
+            },
+        );
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.kind,
+            SemanticEventKind::UserMessage { text } if text == "local TUI prompt"
+        )));
     }
 
     #[test]
