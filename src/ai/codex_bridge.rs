@@ -1455,7 +1455,9 @@ impl CodexBridgeHandle {
                         .stderr(Stdio::piped())
                         .kill_on_drop(true);
                     #[cfg(windows)]
-                    command.creation_flags(0x0800_0000);
+                    command.creation_flags(
+                        crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS,
+                    );
                     #[cfg(unix)]
                     command.process_group(0);
 
@@ -1475,8 +1477,7 @@ impl CodexBridgeHandle {
                         return;
                     };
                     let managed_job =
-                        match crate::services::platform_service::attach_process_to_managed_job(pid)
-                        {
+                        match crate::services::platform_service::claim_suspended_process(pid) {
                             Ok(managed_job) => managed_job,
                             Err(error) => {
                                 terminate_sidecar(
@@ -2116,7 +2117,7 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
+        command.creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
     }
     #[cfg(unix)]
     {
@@ -2134,9 +2135,15 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
     // wrapper that exits before its descendants. Unix probes are placed in a
     // dedicated process group above. Tree termination remains the portable
     // first attempt on every completion path.
-    let managed_job = crate::services::platform_service::attach_process_to_managed_job(pid)
-        .ok()
-        .flatten();
+    let managed_job = match crate::services::platform_service::claim_suspended_process(pid) {
+        Ok(managed_job) => managed_job,
+        Err(error) => {
+            terminate_probe_tree(&mut child, pid, None);
+            return Err(format!(
+                "Cannot own Codex capability probe process tree: {error}"
+            ));
+        }
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut stdout_reader = spawn_probe_pipe_reader(stdout);

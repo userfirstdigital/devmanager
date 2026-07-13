@@ -12,6 +12,10 @@ use std::time::Instant;
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x00000004;
+#[cfg(windows)]
+pub const MANAGED_PROCESS_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 
 pub fn snapshot_listener_pids(ports: &[u16]) -> Result<HashMap<u16, u32>, String> {
     if ports.is_empty() {
@@ -252,6 +256,11 @@ extern "system" {
         job_object_info_length: u32,
     ) -> i32;
     fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+    fn Thread32First(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
+    fn Thread32Next(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
+    fn OpenThread(desired_access: u32, inherit_handle: i32, thread_id: u32) -> *mut c_void;
+    fn ResumeThread(thread: *mut c_void) -> u32;
 }
 
 #[cfg(windows)]
@@ -264,6 +273,27 @@ const SYNCHRONIZE: u32 = 0x00100000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
 #[cfg(windows)]
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
+#[cfg(windows)]
+const TH32CS_SNAPTHREAD: u32 = 0x00000004;
+#[cfg(windows)]
+const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+#[cfg(windows)]
+const RESUME_THREAD_FAILED: u32 = u32::MAX;
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct ThreadEntry32 {
+    size: u32,
+    usage_count: u32,
+    thread_id: u32,
+    owner_process_id: u32,
+    base_priority: i32,
+    priority_delta: i32,
+    flags: u32,
+}
 
 #[cfg(windows)]
 #[repr(C)]
@@ -373,6 +403,96 @@ pub fn attach_process_to_managed_job(pid: u32) -> Result<Option<ManagedProcessJo
     {
         let _ = pid;
         Ok(None)
+    }
+}
+
+fn claim_suspended_process_with<Job, Attach, Resume>(
+    pid: u32,
+    attach: Attach,
+    resume: Resume,
+) -> Result<Option<Job>, String>
+where
+    Attach: FnOnce(u32) -> Result<Option<Job>, String>,
+    Resume: FnOnce(u32) -> Result<(), String>,
+{
+    let job = attach(pid)?;
+    resume(pid)?;
+    Ok(job)
+}
+
+/// Claims a process created with [`MANAGED_PROCESS_CREATION_FLAGS`] before
+/// allowing any of its code to execute. On Windows the returned job must stay
+/// alive for as long as the process tree is owned.
+pub fn claim_suspended_process(pid: u32) -> Result<Option<ManagedProcessJob>, String> {
+    #[cfg(windows)]
+    {
+        claim_suspended_process_with(pid, attach_process_to_managed_job, resume_suspended_process)
+    }
+
+    #[cfg(not(windows))]
+    {
+        attach_process_to_managed_job(pid)
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(pid: u32) -> Result<(), String> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "CreateToolhelp32Snapshot failed while resuming process {pid}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let mut entry = ThreadEntry32 {
+            size: std::mem::size_of::<ThreadEntry32>() as u32,
+            ..ThreadEntry32::default()
+        };
+        let mut thread_ids = Vec::new();
+        let mut has_entry = Thread32First(snapshot, &mut entry) != 0;
+        while has_entry {
+            if entry.owner_process_id == pid {
+                thread_ids.push(entry.thread_id);
+            }
+            entry.size = std::mem::size_of::<ThreadEntry32>() as u32;
+            has_entry = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        let _ = CloseHandle(snapshot);
+
+        if thread_ids.is_empty() {
+            return Err(format!(
+                "Cannot resume process {pid}: no process threads were found"
+            ));
+        }
+
+        let mut resumed_suspended_thread = false;
+        for thread_id in thread_ids {
+            let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id);
+            if thread.is_null() {
+                return Err(format!(
+                    "OpenThread({thread_id}) failed while resuming process {pid}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let previous_suspend_count = ResumeThread(thread);
+            let resume_error = std::io::Error::last_os_error();
+            let _ = CloseHandle(thread);
+            if previous_suspend_count == RESUME_THREAD_FAILED {
+                return Err(format!(
+                    "ResumeThread({thread_id}) failed for process {pid}: {resume_error}"
+                ));
+            }
+            resumed_suspended_thread |= previous_suspend_count > 0;
+        }
+
+        if !resumed_suspended_thread {
+            return Err(format!(
+                "Cannot resume process {pid}: no suspended process thread was found"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -566,7 +686,12 @@ fn normalize_process_name(name: &OsStr) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::terminate_owned_process_group_with;
+    use super::{claim_suspended_process_with, terminate_owned_process_group_with};
+    use std::cell::RefCell;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::time::Duration;
 
     #[cfg(windows)]
@@ -577,6 +702,89 @@ mod tests {
     fn windows_port_decodes_network_order_port() {
         assert_eq!(windows_port(0x5000), 80);
         assert_eq!(windows_port(0x3614), 5174);
+    }
+
+    #[test]
+    fn suspended_process_claim_assigns_job_before_resume() {
+        let events = RefCell::new(Vec::new());
+
+        let job = claim_suspended_process_with(
+            42,
+            |pid| {
+                events.borrow_mut().push(("assign", pid));
+                Ok(Some("job"))
+            },
+            |pid| {
+                events.borrow_mut().push(("resume", pid));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(job, Some("job"));
+        assert_eq!(events.into_inner(), [("assign", 42), ("resume", 42)]);
+    }
+
+    #[test]
+    fn suspended_process_claim_releases_job_when_resume_fails() {
+        #[derive(Debug)]
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let marker = released.clone();
+        let result = claim_suspended_process_with(
+            42,
+            move |_| Ok(Some(DropMarker(marker))),
+            |_| Err("resume failed".to_string()),
+        );
+
+        assert_eq!(result.unwrap_err(), "resume failed");
+        assert!(released.load(Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_managed_process_stays_suspended_until_claimed() {
+        use super::{claim_suspended_process, MANAGED_PROCESS_CREATION_FLAGS};
+        use std::os::windows::process::CommandExt;
+
+        let unique = format!(
+            "devmanager-suspended-process-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let marker = std::env::temp_dir().join(unique);
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[IO.File]::WriteAllText($env:DEVMANAGER_SUSPENDED_MARKER, 'resumed')",
+            ])
+            .env("DEVMANAGER_SUSPENDED_MARKER", &marker)
+            .creation_flags(MANAGED_PROCESS_CREATION_FLAGS)
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!marker.exists(), "suspended child must not execute early");
+
+        let job = claim_suspended_process(child.id()).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "resumed");
+
+        drop(job);
+        let _ = std::fs::remove_file(marker);
     }
 
     #[test]
