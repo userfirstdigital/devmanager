@@ -13,9 +13,14 @@ export function App() {
   const init = useStore((s) => s.init);
   const status = useStore((s) => s.status);
   const snapshot = useStore((s) => s.snapshot);
-  const activeSessionId = useStore((s) => s.activeSessionId);
+  const activeSessionId = useStore(
+    (s) => s.rawTerminal.activeStreamSessionId,
+  );
   const closeActiveTab = useStore((s) => s.closeActiveTab);
   const refreshActiveConnection = useStore((s) => s.refreshActiveConnection);
+  const setConnectionVisibility = useStore(
+    (s) => s.setConnectionVisibility,
+  );
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   useEffect(() => {
@@ -25,7 +30,7 @@ export function App() {
   useEffect(() => {
     const wake = () => refreshActiveConnection();
     const handleVisibility = () => {
-      if (document.visibilityState === "visible") wake();
+      setConnectionVisibility(document.visibilityState === "visible");
     };
     document.addEventListener("visibilitychange", handleVisibility);
     window.addEventListener("focus", wake);
@@ -37,7 +42,7 @@ export function App() {
       window.removeEventListener("pageshow", wake);
       window.removeEventListener("online", wake);
     };
-  }, [refreshActiveConnection]);
+  }, [refreshActiveConnection, setConnectionVisibility]);
 
   if (status.kind === "unauthorized") {
     return <PairingGate />;
@@ -98,6 +103,7 @@ export function App() {
                 session={
                   activeSession ?? {
                     session_id: activeSessionId,
+                    stable_session_key: null,
                     pid: null,
                     status: "Starting",
                     session_kind: null,

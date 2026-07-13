@@ -104,7 +104,9 @@ function findSshSession(
 
 function SshRow({ connection }: { connection: SSHConnection }) {
   const snapshot = useStore((s) => s.snapshot);
-  const activeSessionId = useStore((s) => s.activeSessionId);
+  const activeSessionId = useStore(
+    (s) => s.rawTerminal.activeStreamSessionId,
+  );
   const setActiveSession = useStore((s) => s.setActiveSession);
   const openSshTab = useStore((s) => s.openSshTab);
   const connectSsh = useStore((s) => s.connectSsh);

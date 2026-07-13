@@ -230,7 +230,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerm | null>(null);
   const scheduleLayoutRef = useRef<() => void>(() => {});
-  const client = useStore((s) => s.client);
   const subscribeTerminal = useStore((s) => s.subscribeTerminal);
   const subscribeBootstrap = useStore((s) => s.subscribeBootstrap);
   const drainBootstrap = useStore((s) => s.drainBootstrap);
@@ -415,12 +414,8 @@ export function TerminalView({ sessionId }: TerminalProps) {
       terminalRef.current = terminal;
       (window as unknown as { __dmTerm?: unknown }).__dmTerm = terminal;
 
-      // Re-send the subscription once the terminal is actually mounted.
-      // This gives the host another chance to eagerly push bootstrap bytes
-      // if the earlier sidebar-level subscribe happened before the PTY was
-      // fully ready.
-      client?.send({ type: "subscribeSessions", sessionIds: [sessionId] });
-      client?.send({ type: "focusSession", sessionId });
+      // Resume atomically owns raw subscription, focus, and writer-lease
+      // reconciliation. Mounting xterm must not replay legacy frames.
       refreshActiveConnection();
 
       // Copy-on-Ctrl+C when there's a selection, paste handled by browser
@@ -583,7 +578,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sessionId,
-    client,
     subscribeTerminal,
     subscribeBootstrap,
     drainBootstrap,

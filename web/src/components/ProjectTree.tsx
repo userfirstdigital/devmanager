@@ -14,7 +14,6 @@ import {
   X,
 } from "lucide-react";
 import {
-  DEFAULT_DIMENSIONS,
   isLiveStatus,
   type Project,
   type ProjectFolder,
@@ -139,7 +138,9 @@ interface CommandRowProps {
 }
 
 function CommandRow({ command, session, indent }: CommandRowProps) {
-  const activeSessionId = useStore((s) => s.activeSessionId);
+  const activeSessionId = useStore(
+    (s) => s.rawTerminal.activeStreamSessionId,
+  );
   const setActiveSession = useStore((s) => s.setActiveSession);
   const sendAction = useStore((s) => s.sendAction);
   const youHaveControl = useStore((s) => s.snapshot?.youHaveControl ?? false);
@@ -158,8 +159,6 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
       sendAction({
         type: "startServer",
         command_id: command.id,
-        focus: false,
-        dimensions: DEFAULT_DIMENSIONS,
       });
     }
   };
@@ -170,8 +169,6 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
     sendAction({
       type: "startServer",
       command_id: command.id,
-      focus: false,
-      dimensions: DEFAULT_DIMENSIONS,
     });
   };
 
@@ -185,7 +182,6 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
     sendAction({
       type: "restartServer",
       command_id: command.id,
-      dimensions: DEFAULT_DIMENSIONS,
     });
   };
 
@@ -248,7 +244,9 @@ interface FolderSectionProps {
 
 function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
   const [expanded, setExpanded] = useState(true);
-  const activeSessionId = useStore((s) => s.activeSessionId);
+  const activeSessionId = useStore(
+    (s) => s.rawTerminal.activeStreamSessionId,
+  );
   const setActiveSession = useStore((s) => s.setActiveSession);
   const sendAction = useStore((s) => s.sendAction);
   const youHaveControl = useStore((s) => s.snapshot?.youHaveControl ?? false);
@@ -274,8 +272,6 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
         sendAction({
           type: "startServer",
           command_id: command.id,
-          focus: false,
-          dimensions: DEFAULT_DIMENSIONS,
         });
       }
     };
@@ -286,8 +282,6 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
       sendAction({
         type: "startServer",
         command_id: command.id,
-        focus: false,
-        dimensions: DEFAULT_DIMENSIONS,
       });
     };
 
@@ -301,7 +295,6 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
       sendAction({
         type: "restartServer",
         command_id: command.id,
-        dimensions: DEFAULT_DIMENSIONS,
       });
     };
 
@@ -402,7 +395,9 @@ interface AiTabRowProps {
 }
 
 function AiTabRow({ tab, session, indent }: AiTabRowProps) {
-  const activeSessionId = useStore((s) => s.activeSessionId);
+  const activeSessionId = useStore(
+    (s) => s.rawTerminal.activeStreamSessionId,
+  );
   const setActiveSession = useStore((s) => s.setActiveSession);
   const openAiTab = useStore((s) => s.openAiTab);
   const sendAction = useStore((s) => s.sendAction);
@@ -422,7 +417,7 @@ function AiTabRow({ tab, session, indent }: AiTabRowProps) {
 
   const onClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    sendAction({ type: "closeAiTab", tab_id: tab.id });
+    sendAction({ type: "closeTab", tab_id: tab.id });
     if (isActive) setActiveSession(null);
   };
 

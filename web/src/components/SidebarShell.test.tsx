@@ -12,7 +12,6 @@ describe("Sidebar shell model", () => {
         host: "example.com",
         port: 22,
         username: "deploy",
-        password: null,
       },
     ];
 

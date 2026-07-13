@@ -3,6 +3,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RemoteAction } from "./types";
 import { WsClient } from "./ws";
 
+const resumeContext = {
+  seenRuntimeInstanceId: "runtime-1",
+  seenRevision: 7,
+  route: "/session/tab/tab-1",
+  desiredSessionKey: "tab:tab-1",
+  semanticAfterSequence: 12,
+  visible: true,
+  wantsWriterLease: true,
+};
+
+function jsonFrames(socket: FakeWebSocket): Array<Record<string, unknown>> {
+  return socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>);
+}
+
+function clientCallbacks(overrides: Record<string, unknown> = {}) {
+  return {
+    onStatus: vi.fn(),
+    onMessage: vi.fn(),
+    onSessionOutput: vi.fn(),
+    getResumeContext: vi.fn(() => resumeContext),
+    ...overrides,
+  };
+}
+
 class FakeWebSocket {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
@@ -40,6 +64,11 @@ class FakeWebSocket {
   emitMessage(data: string | ArrayBuffer): void {
     this.onmessage?.({ data } as MessageEvent);
   }
+
+  emitClose(reason = "network lost"): void {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.({ code: 1006, reason } as CloseEvent);
+  }
 }
 
 describe("WsClient request handling", () => {
@@ -48,6 +77,10 @@ describe("WsClient request handling", () => {
     vi.stubGlobal("window", globalThis);
     vi.stubGlobal("location", { protocol: "http:", host: "example.test" });
     vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("sessionStorage", {
       getItem: vi.fn(() => null),
       setItem: vi.fn(),
     });
@@ -67,11 +100,7 @@ describe("WsClient request handling", () => {
   });
 
   it("sends request frames and resolves matching responses", async () => {
-    const client = new WsClient({
-      onStatus: vi.fn(),
-      onMessage: vi.fn(),
-      onSessionOutput: vi.fn(),
-    });
+    const client = new WsClient(clientCallbacks());
 
     await client.start();
     const socket = FakeWebSocket.instances[0];
@@ -80,17 +109,30 @@ describe("WsClient request handling", () => {
       "ws://example.test/api/ws?browserInstallId=browser-install-uuid",
     );
     socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 2,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
 
     const action: RemoteAction = { type: "closeTab", tab_id: "tab-1" };
     const requestPromise = (
       client as unknown as { request(action: RemoteAction): Promise<unknown> }
     ).request(action);
 
-    expect(socket.sent).toHaveLength(1);
-    expect(JSON.parse(socket.sent[0] ?? "")).toEqual({
+    expect(jsonFrames(socket).filter((frame) => frame.type === "resume")).toHaveLength(1);
+    const frames = jsonFrames(socket);
+    expect(frames[frames.length - 1]).toEqual({
       type: "request",
       id: 1,
       action,
+      expectedLeaseGeneration: 2,
     });
 
     socket.emitMessage(
@@ -107,6 +149,250 @@ describe("WsClient request handling", () => {
       payload: null,
     });
   });
+
+  it("sends exactly one atomic resume frame whenever a socket opens", async () => {
+    const client = new WsClient(clientCallbacks());
+
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+
+    expect(jsonFrames(socket)).toEqual([
+      {
+        type: "resume",
+        ...resumeContext,
+        clientInstanceId: "browser-install-uuid",
+      },
+    ]);
+  });
+
+  it("uses one sessionStorage client instance id for every client in the tab", async () => {
+    let stored: string | null = null;
+    const storage = {
+      getItem: vi.fn(() => stored),
+      setItem: vi.fn((_key: string, value: string) => {
+        stored = value;
+      }),
+    };
+    vi.stubGlobal("sessionStorage", storage);
+    const first = new WsClient(clientCallbacks());
+    const second = new WsClient(clientCallbacks());
+
+    await first.start();
+    FakeWebSocket.instances[0]?.emitOpen();
+    await second.start();
+    FakeWebSocket.instances[1]?.emitOpen();
+
+    const firstResume = jsonFrames(FakeWebSocket.instances[0] ?? ({} as FakeWebSocket))[0];
+    const secondResume = jsonFrames(FakeWebSocket.instances[1] ?? ({} as FakeWebSocket))[0];
+    expect(firstResume?.clientInstanceId).toBe(secondResume?.clientInstanceId);
+    expect(storage.setItem).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps one in-memory tab id when sessionStorage is unavailable", async () => {
+    vi.stubGlobal("sessionStorage", {
+      getItem: vi.fn(() => {
+        throw new Error("blocked");
+      }),
+      setItem: vi.fn(() => {
+        throw new Error("blocked");
+      }),
+    });
+    let nextId = 0;
+    vi.stubGlobal("crypto", {
+      randomUUID: vi.fn(() => `generated-${++nextId}`),
+    });
+    const first = new WsClient(clientCallbacks());
+    const second = new WsClient(clientCallbacks());
+
+    await first.start();
+    FakeWebSocket.instances[0]?.emitOpen();
+    await second.start();
+    FakeWebSocket.instances[1]?.emitOpen();
+
+    const firstResume = jsonFrames(FakeWebSocket.instances[0] ?? ({} as FakeWebSocket))[0];
+    const secondResume = jsonFrames(FakeWebSocket.instances[1] ?? ({} as FakeWebSocket))[0];
+    expect(firstResume?.clientInstanceId).toBe(secondResume?.clientInstanceId);
+  });
+
+  it("resolves and rejects composer submissions by mutation id", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 9,
+          expiresAtEpochMs: 9_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    const submit = client as unknown as {
+      submitComposer(input: {
+        mutationId: string;
+        stableSessionKey: string;
+        text: string;
+        attachments: never[];
+      }): Promise<unknown>;
+    };
+    const accepted = submit.submitComposer({
+      mutationId: "mutation-accepted",
+      stableSessionKey: "tab:tab-1",
+      text: "hello",
+      attachments: [],
+    });
+    const frames = jsonFrames(socket);
+    expect(frames[frames.length - 1]).toEqual({
+      type: "composerSubmit",
+      mutationId: "mutation-accepted",
+      stableSessionKey: "tab:tab-1",
+      text: "hello",
+      attachments: [],
+      expectedLeaseGeneration: 9,
+    });
+    socket.emitMessage(
+      JSON.stringify({
+        type: "composerAccepted",
+        mutationId: "mutation-accepted",
+        stableSessionKey: "tab:tab-1",
+        acceptedSequence: 13,
+        leaseGeneration: 9,
+      }),
+    );
+    await expect(accepted).resolves.toMatchObject({
+      mutationId: "mutation-accepted",
+      acceptedSequence: 13,
+    });
+
+    const rejected = submit.submitComposer({
+      mutationId: "mutation-rejected",
+      stableSessionKey: "tab:tab-1",
+      text: "again",
+      attachments: [],
+    });
+    socket.emitMessage(
+      JSON.stringify({
+        type: "composerRejected",
+        mutationId: "mutation-rejected",
+        code: "mutationConflict",
+        message: "mutation content changed",
+        writerLease: {
+          ownerClientInstanceId: null,
+          generation: 10,
+          expiresAtEpochMs: null,
+          youAreOwner: false,
+        },
+      }),
+    );
+    await expect(rejected).rejects.toMatchObject({
+      mutationId: "mutation-rejected",
+      code: "mutationConflict",
+      message: "mutation content changed",
+    });
+
+    const capacityRejected = submit.submitComposer({
+      mutationId: "mutation-capacity",
+      stableSessionKey: "tab:tab-1",
+      text: "later",
+      attachments: [],
+    });
+    socket.emitMessage(
+      JSON.stringify({
+        type: "composerRejected",
+        mutationId: "mutation-capacity",
+        code: "capacityExceeded",
+        message: "retry after older mutations expire",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 10,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    await expect(capacityRejected).rejects.toMatchObject({
+      mutationId: "mutation-capacity",
+      code: "capacityExceeded",
+    });
+  });
+
+  it("rejects every pending mutation when the host runtime changes", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    FakeWebSocket.instances[0]?.emitOpen();
+
+    let actionRejected = false;
+    let composerRejected = false;
+    void client
+      .request({ type: "stopAllServers" })
+      .catch(() => {
+        actionRejected = true;
+      });
+    void client
+      .submitComposer({
+        mutationId: "mutation-reset",
+        stableSessionKey: "tab:tab-1",
+        text: "hello",
+        attachments: [],
+      })
+      .catch(() => {
+        composerRejected = true;
+      });
+
+    client.resetRuntime("host runtime changed");
+    await Promise.resolve();
+
+    expect(actionRejected).toBe(true);
+    expect(composerRejected).toBe(true);
+  });
+
+  it("requests a visible writer lease for actions without replaying the action", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.sent.length = 0;
+
+    const result = client.request({ type: "stopAllServers" });
+    expect(jsonFrames(socket).map((frame) => frame.type)).toEqual([
+      "acquireWriterLease",
+    ]);
+
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 3,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    expect(jsonFrames(socket).map((frame) => frame.type)).toEqual([
+      "acquireWriterLease",
+      "request",
+    ]);
+    expect(jsonFrames(socket)[1]).toMatchObject({
+      expectedLeaseGeneration: 3,
+    });
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "request"),
+    ).toHaveLength(1);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "response",
+        id: 1,
+        result: { ok: true, message: null, payload: null },
+      }),
+    );
+    await expect(result).resolves.toMatchObject({ ok: true });
+  });
 });
 
 describe("WsClient reconnect wake handling", () => {
@@ -117,6 +403,10 @@ describe("WsClient reconnect wake handling", () => {
     vi.stubGlobal("window", globalThis);
     vi.stubGlobal("location", { protocol: "http:", host: "example.test" });
     vi.stubGlobal("localStorage", {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(),
+    });
+    vi.stubGlobal("sessionStorage", {
       getItem: vi.fn(() => null),
       setItem: vi.fn(),
     });
@@ -139,11 +429,7 @@ describe("WsClient reconnect wake handling", () => {
         .mockRejectedValueOnce(new Error("offline"))
         .mockResolvedValue({ ok: true, status: 200 }),
     );
-    const client = new WsClient({
-      onStatus: vi.fn(),
-      onMessage: vi.fn(),
-      onSessionOutput: vi.fn(),
-    });
+    const client = new WsClient(clientCallbacks());
 
     await client.start();
     expect(FakeWebSocket.instances).toHaveLength(0);
@@ -164,11 +450,7 @@ describe("WsClient reconnect wake handling", () => {
         }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const client = new WsClient({
-      onStatus: vi.fn(),
-      onMessage: vi.fn(),
-      onSessionOutput: vi.fn(),
-    });
+    const client = new WsClient(clientCallbacks());
 
     const firstStart = client.start();
     await client.start();
@@ -184,14 +466,27 @@ describe("WsClient reconnect wake handling", () => {
       "fetch",
       vi.fn().mockResolvedValue({ ok: true, status: 200 }),
     );
-    const client = new WsClient({
-      onStatus: vi.fn(),
-      onMessage: vi.fn(),
-      onSessionOutput: vi.fn(),
-    });
+    const onMessage = vi.fn();
+    const onStatus = vi.fn();
+    const client = new WsClient(clientCallbacks({ onMessage, onStatus }));
 
     await client.start();
     FakeWebSocket.instances[0]?.emitOpen();
+    FakeWebSocket.instances[0]?.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 2,
+          expiresAtEpochMs: 40_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    let actionRejected = false;
+    void client.request({ type: "stopAllServers" }).catch(() => {
+      actionRejected = true;
+    });
     vi.setSystemTime(31_000);
 
     client.wake();
@@ -199,5 +494,443 @@ describe("WsClient reconnect wake handling", () => {
     await Promise.resolve();
 
     expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(actionRejected).toBe(true);
+
+    const stale = FakeWebSocket.instances[0];
+    stale?.emitMessage(JSON.stringify({ type: "error", message: "stale" }));
+    stale?.onclose?.({ code: 1006, reason: "stale close" } as CloseEvent);
+    expect(onMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ message: "stale" }),
+    );
+    expect(onStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "stale close" }),
+    );
   });
+
+  it("wake sends one resume immediately on a healthy open socket", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.sent.length = 0;
+
+    client.wake();
+
+    expect(jsonFrames(socket)).toEqual([
+      expect.objectContaining({ type: "resume" }),
+    ]);
+  });
+
+  it("retries a lease-busy composer send after the guard with one mutation id", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 4,
+          expiresAtEpochMs: 8_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    let rejected = false;
+    const submission = client
+      .submitComposer({
+        mutationId: "mutation-guard",
+        stableSessionKey: "tab:tab-1",
+        text: "send once",
+        attachments: [],
+      })
+      .catch((error: unknown) => {
+        rejected = true;
+        throw error;
+      });
+    socket.emitMessage(
+      JSON.stringify({
+        type: "composerRejected",
+        mutationId: "mutation-guard",
+        code: "leaseBusy",
+        message: "active input guard",
+        writerLease: {
+          ownerClientInstanceId: "other-tab",
+          generation: 5,
+          expiresAtEpochMs: 8_700,
+          youAreOwner: false,
+        },
+      }),
+    );
+    await Promise.resolve();
+    expect(rejected).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(250);
+    const afterGuard = jsonFrames(socket);
+    expect(afterGuard[afterGuard.length - 1]).toMatchObject({
+      type: "acquireWriterLease",
+      clientInstanceId: "browser-install-uuid",
+      visible: true,
+    });
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 6,
+          expiresAtEpochMs: 9_500,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    const sends = jsonFrames(socket).filter(
+      (frame) => frame.type === "composerSubmit",
+    );
+    expect(sends).toHaveLength(2);
+    expect(new Set(sends.map((frame) => frame.mutationId))).toEqual(
+      new Set(["mutation-guard"]),
+    );
+    expect(sends[1]?.expectedLeaseGeneration).toBe(6);
+
+    socket.emitMessage(
+      JSON.stringify({
+        type: "composerAccepted",
+        mutationId: "mutation-guard",
+        stableSessionKey: "tab:tab-1",
+        acceptedSequence: 20,
+        leaseGeneration: 6,
+      }),
+    );
+    await expect(submission).resolves.toMatchObject({ acceptedSequence: 20 });
+  });
+
+  it.each([
+    "staleGeneration",
+    "nativeControllerActive",
+    "mutationInFlight",
+  ] as const)("keeps the same promise for transient %s rejection", async (code) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 7,
+          expiresAtEpochMs: 8_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    let rejected = false;
+    const submission = client
+      .submitComposer({
+        mutationId: `mutation-${code}`,
+        stableSessionKey: "tab:tab-1",
+        text: code,
+        attachments: [],
+      })
+      .catch((error: unknown) => {
+        rejected = true;
+        throw error;
+      });
+    socket.emitMessage(
+      JSON.stringify({
+        type: "composerRejected",
+        mutationId: `mutation-${code}`,
+        code,
+        message: "retry",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 8,
+          expiresAtEpochMs: 9_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    await Promise.resolve();
+    expect(rejected).toBe(false);
+
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
+    ).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(249);
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
+    ).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const sends = jsonFrames(socket).filter(
+      (frame) => frame.type === "composerSubmit",
+    );
+    expect(sends).toHaveLength(2);
+    expect(sends[1]?.mutationId).toBe(`mutation-${code}`);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "composerAccepted",
+        mutationId: `mutation-${code}`,
+        stableSessionKey: "tab:tab-1",
+        acceptedSequence: 21,
+        leaseGeneration: 8,
+      }),
+    );
+    await expect(submission).resolves.toMatchObject({ acceptedSequence: 21 });
+  });
+
+  it("resends an unacknowledged composer mutation after reconnect Resume ownership", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const firstSocket = FakeWebSocket.instances[0];
+    firstSocket.emitOpen();
+    firstSocket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 11,
+          expiresAtEpochMs: 8_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    let rejected = false;
+    const submission = client
+      .submitComposer({
+        mutationId: "mutation-reconnect",
+        stableSessionKey: "tab:tab-1",
+        text: "survive reconnect",
+        attachments: [],
+      })
+      .catch((error: unknown) => {
+        rejected = true;
+        throw error;
+      });
+    firstSocket.emitClose();
+    await Promise.resolve();
+    expect(rejected).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await Promise.resolve();
+    const secondSocket = FakeWebSocket.instances[1];
+    expect(secondSocket).toBeDefined();
+    secondSocket.emitOpen();
+    secondSocket.emitMessage(
+      JSON.stringify({
+        type: "resumeState",
+        runtimeInstanceId: "runtime-1",
+        revision: 7,
+        hardReset: false,
+        route: "/session/tab/tab-1",
+        desiredSessionKey: "tab:tab-1",
+        workspace: null,
+        semanticReplay: null,
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 12,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    const retrySends = jsonFrames(secondSocket).filter(
+      (frame) => frame.type === "composerSubmit",
+    );
+    expect(retrySends).toHaveLength(1);
+    expect(retrySends[0]).toMatchObject({
+      mutationId: "mutation-reconnect",
+      expectedLeaseGeneration: 12,
+    });
+    secondSocket.emitMessage(
+      JSON.stringify({
+        type: "composerAccepted",
+        mutationId: "mutation-reconnect",
+        stableSessionKey: "tab:tab-1",
+        acceptedSequence: 22,
+        leaseGeneration: 12,
+      }),
+    );
+    await expect(submission).resolves.toMatchObject({ acceptedSequence: 22 });
+  });
+
+  it("keeps an unsent action staged across reconnect, then sends it once", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const firstSocket = FakeWebSocket.instances[0];
+    firstSocket.emitOpen();
+    firstSocket.sent.length = 0;
+
+    let rejected = false;
+    const result = client.request({ type: "stopAllServers" }).catch((error) => {
+      rejected = true;
+      throw error;
+    });
+    expect(jsonFrames(firstSocket).map((frame) => frame.type)).toEqual([
+      "acquireWriterLease",
+    ]);
+    firstSocket.emitClose();
+    await Promise.resolve();
+    expect(rejected).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const secondSocket = FakeWebSocket.instances[1];
+    secondSocket.emitOpen();
+    secondSocket.emitMessage(
+      JSON.stringify({
+        type: "resumeState",
+        runtimeInstanceId: "runtime-1",
+        revision: 7,
+        hardReset: false,
+        route: "/sessions",
+        desiredSessionKey: null,
+        workspace: null,
+        semanticReplay: null,
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 30,
+          expiresAtEpochMs: 12_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    const requests = jsonFrames(secondSocket).filter(
+      (frame) => frame.type === "request",
+    );
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.expectedLeaseGeneration).toBe(30);
+    secondSocket.emitMessage(
+      JSON.stringify({
+        type: "response",
+        id: 1,
+        result: { ok: true, message: null, payload: null },
+      }),
+    );
+    await expect(result).resolves.toMatchObject({ ok: true });
+  });
+
+  it("rejects a sent action on disconnect and never replays it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const firstSocket = FakeWebSocket.instances[0];
+    firstSocket.emitOpen();
+    firstSocket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 31,
+          expiresAtEpochMs: 12_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    const result = client.request({ type: "stopAllServers" });
+    expect(
+      jsonFrames(firstSocket).filter((frame) => frame.type === "request"),
+    ).toHaveLength(1);
+    firstSocket.emitClose();
+    await expect(result).rejects.toThrow("websocket closed");
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const secondSocket = FakeWebSocket.instances[1];
+    secondSocket.emitOpen();
+    secondSocket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 32,
+          expiresAtEpochMs: 14_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    expect(
+      jsonFrames(secondSocket).filter((frame) => frame.type === "request"),
+    ).toHaveLength(0);
+  });
+
+  it.each(["stop", "runtime reset"] as const)(
+    "cancels bounded composer retry timers on %s",
+    async (operation) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+      );
+      const client = new WsClient(clientCallbacks());
+      await client.start();
+      const socket = FakeWebSocket.instances[0];
+      socket.emitOpen();
+      socket.emitMessage(
+        JSON.stringify({
+          type: "writerLeaseState",
+          writerLease: {
+            ownerClientInstanceId: "browser-install-uuid",
+            generation: 40,
+            expiresAtEpochMs: 10_000,
+            youAreOwner: true,
+          },
+        }),
+      );
+      const outcome = client
+        .submitComposer({
+          mutationId: `mutation-${operation}`,
+          stableSessionKey: "tab:tab-1",
+          text: "cancel retry",
+          attachments: [],
+        })
+        .catch((error: unknown) => error);
+      socket.emitMessage(
+        JSON.stringify({
+          type: "composerRejected",
+          mutationId: `mutation-${operation}`,
+          code: "mutationInFlight",
+          message: "wait",
+          writerLease: {
+            ownerClientInstanceId: "browser-install-uuid",
+            generation: 40,
+            expiresAtEpochMs: 10_000,
+            youAreOwner: true,
+          },
+        }),
+      );
+
+      if (operation === "stop") client.stop();
+      else client.resetRuntime("host runtime changed");
+      await expect(outcome).resolves.toBeInstanceOf(Error);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(
+        jsonFrames(socket).filter((frame) => frame.type === "composerSubmit"),
+      ).toHaveLength(1);
+    },
+  );
 });

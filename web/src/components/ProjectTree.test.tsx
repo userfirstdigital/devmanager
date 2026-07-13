@@ -11,13 +11,12 @@ describe("sidebarModel", () => {
     const folder: ProjectFolder = {
       id: "folder-1",
       name: "folder-alpha",
-      folderPath: "C:\\Code\\project\\folder-alpha",
       commands: [
         {
           id: "command-1",
           label: "dev server",
-          command: "npm",
-          args: ["run", "dev"],
+          port: null,
+          status: "Stopped",
         },
       ],
     };
@@ -34,24 +33,16 @@ describe("sidebarModel", () => {
       {
         id: "project-unpinned",
         name: "Unpinned Project",
-        rootPath: "C:\\Code\\unpinned",
         folders: [],
         color: null,
         pinned: false,
-        notes: null,
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
       },
       {
         id: "project-pinned",
         name: "Pinned Project",
-        rootPath: "C:\\Code\\pinned",
         folders: [],
         color: "#6366f1",
         pinned: true,
-        notes: "important",
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
       },
     ];
 
