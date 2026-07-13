@@ -18,7 +18,10 @@ useStore.subscribe((state) => {
   const nextSafetyState = readStoreUpdateSafetyState(state);
   if (
     nextSafetyState.hasDraft !== previousSafetyState.hasDraft ||
-    nextSafetyState.pendingMutations !== previousSafetyState.pendingMutations
+    nextSafetyState.pendingMutations !== previousSafetyState.pendingMutations ||
+    nextSafetyState.selectedAttachments !==
+      previousSafetyState.selectedAttachments ||
+    nextSafetyState.attachmentLoads !== previousSafetyState.attachmentLoads
   ) {
     previousSafetyState = nextSafetyState;
     notifyPwaSafetyStateChanged();

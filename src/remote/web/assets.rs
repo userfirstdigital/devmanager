@@ -87,13 +87,22 @@ fn apply_static_headers(response: &mut Response, content_type: &str, cache_contr
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; base-uri 'self'; connect-src 'self' ws: wss:; \
+        content_security_policy(None),
+    );
+}
+
+pub(crate) fn content_security_policy(websocket_authority: Option<&str>) -> HeaderValue {
+    let connect_src = websocket_authority.map_or_else(
+        || "connect-src 'self';".to_string(),
+        |authority| format!("connect-src 'self' ws://{authority} wss://{authority};"),
+    );
+    HeaderValue::from_str(&format!(
+        "default-src 'self'; base-uri 'self'; {connect_src} \
 font-src 'self' data:; img-src 'self' data: blob:; manifest-src 'self'; \
 object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-worker-src 'self' blob:; frame-ancestors 'none'; form-action 'self'",
-        ),
-    );
+worker-src 'self' blob:; frame-ancestors 'none'; form-action 'self'"
+    ))
+    .expect("validated websocket authority produces a valid CSP")
 }
 
 fn not_found_response() -> Response {
@@ -192,7 +201,8 @@ mod tests {
         assert_eq!(header_value(&response, "x-content-type-options"), "nosniff");
         assert_eq!(header_value(&response, "x-frame-options"), "DENY");
         let csp = header_value(&response, "content-security-policy");
-        assert!(csp.contains("connect-src 'self' ws: wss:"));
+        assert!(csp.contains("connect-src 'self';"));
+        assert!(!csp.contains(" ws: wss:"));
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("worker-src 'self'"));
     }

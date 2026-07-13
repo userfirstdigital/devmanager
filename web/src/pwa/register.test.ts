@@ -20,6 +20,25 @@ describe("canActivateUpdate", () => {
     expect(canActivateUpdate({ hasDraft: false, pendingMutations: 1 })).toBe(false);
   });
 
+  it("defers activation while attachments are selected or loading", () => {
+    expect(
+      canActivateUpdate({
+        hasDraft: false,
+        pendingMutations: 0,
+        selectedAttachments: 1,
+        attachmentLoads: 0,
+      }),
+    ).toBe(false);
+    expect(
+      canActivateUpdate({
+        hasDraft: false,
+        pendingMutations: 0,
+        selectedAttachments: 0,
+        attachmentLoads: 1,
+      }),
+    ).toBe(false);
+  });
+
   it("allows activation when there is no draft or pending mutation", () => {
     expect(canActivateUpdate({ hasDraft: false, pendingMutations: 0 })).toBe(true);
   });
@@ -28,6 +47,8 @@ describe("canActivateUpdate", () => {
     expect(defaultUpdateSafetyState()).toEqual({
       hasDraft: true,
       pendingMutations: 0,
+      selectedAttachments: 0,
+      attachmentLoads: 0,
     });
     expect(canActivateUpdate(defaultUpdateSafetyState())).toBe(false);
   });
@@ -104,6 +125,44 @@ describe("isPwaRuntimeSupported", () => {
 });
 
 describe("registerPwaServiceWorker", () => {
+  it("uses the waiting worker protocol and delegates controller reload locally", async () => {
+    let viteOptions: ViteServiceWorkerRegistrationOptions | undefined;
+    const viteUpdate = vi.fn(async () => undefined);
+    const waitingWorker = { postMessage: vi.fn() };
+    const requestActivation = vi.fn(async () => true);
+    const onNeedReload = vi.fn();
+    const registerSW = vi.fn(
+      (options: ViteServiceWorkerRegistrationOptions) => {
+        viteOptions = options;
+        return viteUpdate;
+      },
+    );
+    const registration = registerPwaServiceWorker({
+      capabilities: {
+        isSecureContext: true,
+        serviceWorkerAvailable: true,
+      },
+      readSafetyState: () => ({ hasDraft: false, pendingMutations: 0 }),
+      isVisible: () => true,
+      onNeedReload,
+      registerServiceWorker: createViteServiceWorkerRegistrar(
+        registerSW,
+        requestActivation,
+      ),
+    });
+
+    viteOptions?.onRegisteredSW("/sw.js", {
+      waiting: waitingWorker,
+      update: vi.fn(async () => undefined),
+    });
+    expect(await registration.notifyStartupNavigationSafePoint()).toBe(true);
+    expect(requestActivation).toHaveBeenCalledWith(waitingWorker);
+    expect(viteUpdate).not.toHaveBeenCalled();
+
+    viteOptions?.onNeedReload?.();
+    expect(onNeedReload).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves the plain HTTP UI operating without registering a worker", () => {
     const registerServiceWorker = vi.fn();
 
@@ -147,7 +206,7 @@ describe("registerPwaServiceWorker", () => {
 
     safety = { hasDraft: false, pendingMutations: 0 };
     expect(await registration.activateWaitingUpdateIfSafe()).toBe(true);
-    expect(updateServiceWorker).toHaveBeenCalledWith(true);
+    expect(updateServiceWorker).toHaveBeenCalledWith();
   });
 
   it("survives a synchronous update callback and still uses the returned updater", async () => {
@@ -172,7 +231,7 @@ describe("registerPwaServiceWorker", () => {
     expect(registration.hasWaitingUpdate()).toBe(true);
     expect(updateServiceWorker).not.toHaveBeenCalled();
     expect(await registration.activateWaitingUpdateIfSafe()).toBe(true);
-    expect(updateServiceWorker).toHaveBeenCalledWith(true);
+    expect(updateServiceWorker).toHaveBeenCalledWith();
   });
 
   it("uses a startup pageshow that occurs before initial waiting-worker discovery", async () => {
@@ -199,7 +258,7 @@ describe("registerPwaServiceWorker", () => {
     await Promise.resolve();
 
     expect(updateServiceWorker).toHaveBeenCalledTimes(1);
-    expect(updateServiceWorker).toHaveBeenCalledWith(true);
+    expect(updateServiceWorker).toHaveBeenCalledWith();
     onRegistered?.(true);
     await Promise.resolve();
     expect(updateServiceWorker).toHaveBeenCalledTimes(1);
@@ -304,7 +363,13 @@ describe("registerPwaServiceWorker", () => {
       },
       readSafetyState: () => ({ hasDraft: false, pendingMutations: 0 }),
       isVisible: () => true,
-      registerServiceWorker: createViteServiceWorkerRegistrar(registerSW),
+      registerServiceWorker: createViteServiceWorkerRegistrar(
+        registerSW,
+        async () => {
+          await updateServiceWorker();
+          return true;
+        },
+      ),
     });
     const serviceWorkerRegistration = {
       waiting: {},
@@ -337,7 +402,13 @@ describe("registerPwaServiceWorker", () => {
       },
       readSafetyState: () => ({ hasDraft: false, pendingMutations: 0 }),
       isVisible: () => true,
-      registerServiceWorker: createViteServiceWorkerRegistrar(registerSW),
+      registerServiceWorker: createViteServiceWorkerRegistrar(
+        registerSW,
+        async () => {
+          await updateServiceWorker();
+          return true;
+        },
+      ),
     });
     const serviceWorkerRegistration = {
       waiting: {},
@@ -371,7 +442,13 @@ describe("registerPwaServiceWorker", () => {
       },
       readSafetyState: () => ({ hasDraft: false, pendingMutations: 0 }),
       isVisible: () => true,
-      registerServiceWorker: createViteServiceWorkerRegistrar(registerSW),
+      registerServiceWorker: createViteServiceWorkerRegistrar(
+        registerSW,
+        async () => {
+          await updateServiceWorker();
+          return true;
+        },
+      ),
     });
     const firstWaitingWorker = {};
     const secondWaitingWorker = {};

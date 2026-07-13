@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RemoteAction } from "./types";
+import { WEB_PROTOCOL_VERSION } from "./types";
+import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
 import { WsClient } from "./ws";
 
 const resumeContext = {
@@ -56,9 +58,20 @@ class FakeWebSocket {
     this.onclose?.({ code: 1006, reason: "" } as CloseEvent);
   }
 
-  emitOpen(): void {
+  emitOpen(sendHello = true): void {
     this.readyState = FakeWebSocket.OPEN;
     this.onopen?.({} as Event);
+    if (sendHello) {
+      this.emitMessage(
+        JSON.stringify({
+          type: "hello",
+          clientId: "web-client",
+          serverId: "server-1",
+          protocolVersion: WEB_PROTOCOL_VERSION,
+          webBuildId: CLIENT_WEB_BUILD_ID,
+        }),
+      );
+    }
   }
 
   emitMessage(data: string | ArrayBuffer): void {
@@ -97,6 +110,110 @@ describe("WsClient request handling", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("does not open, resume, lease, or mutate before the mandatory hello", async () => {
+    const callbacks = clientCallbacks();
+    const client = new WsClient(callbacks);
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+
+    socket.emitOpen(false);
+    void client.request({ type: "stopAllServers" }).catch(() => undefined);
+    client.sendWithWriterLease({
+      type: "input",
+      sessionId: "pty-a",
+      text: "must wait",
+    });
+
+    expect(callbacks.onStatus).not.toHaveBeenCalledWith({ kind: "open" });
+    expect(jsonFrames(socket)).toEqual([]);
+
+    socket.emitMessage(
+      JSON.stringify({ type: "snapshot", workspace: { revision: 1 } }),
+    );
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(callbacks.onMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["null", '{"type":"hello","protocolVersion":"2"}']) (
+    "closes safely for a malformed first frame: %s",
+    async (frame) => {
+      const callbacks = clientCallbacks();
+      const client = new WsClient(callbacks);
+      await client.start();
+      const socket = FakeWebSocket.instances[0];
+      socket.emitOpen(false);
+
+      expect(() => socket.emitMessage(frame)).not.toThrow();
+      expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+      expect(callbacks.onStatus).not.toHaveBeenCalledWith({ kind: "open" });
+    },
+  );
+
+  it.each([
+    {
+      name: "protocol",
+      hello: {
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION + 1,
+        webBuildId: CLIENT_WEB_BUILD_ID,
+      },
+      failure: "protocolMismatch",
+    },
+    {
+      name: "build",
+      hello: {
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION,
+        webBuildId: "different-host-build",
+      },
+      failure: "buildMismatch",
+    },
+  ])("rejects a $name mismatch before opening", async ({ hello, failure }) => {
+    const onHelloFailure = vi.fn();
+    const callbacks = clientCallbacks({ onHelloFailure });
+    const client = new WsClient(callbacks);
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+
+    socket.emitOpen(false);
+    socket.emitMessage(JSON.stringify(hello));
+
+    expect(callbacks.onStatus).not.toHaveBeenCalledWith({ kind: "open" });
+    expect(jsonFrames(socket)).toEqual([]);
+    expect(onHelloFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: failure }),
+    );
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+  });
+
+  it("opens and resumes only after a compatible hello", async () => {
+    const callbacks = clientCallbacks();
+    const client = new WsClient(callbacks);
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+
+    socket.emitOpen(false);
+    expect(jsonFrames(socket)).toEqual([]);
+    socket.emitMessage(
+      JSON.stringify({
+        type: "hello",
+        clientId: "web-client",
+        serverId: "server-1",
+        protocolVersion: WEB_PROTOCOL_VERSION,
+        webBuildId: CLIENT_WEB_BUILD_ID,
+      }),
+    );
+
+    expect(callbacks.onStatus).toHaveBeenLastCalledWith({ kind: "open" });
+    expect(jsonFrames(socket)).toEqual([
+      expect.objectContaining({ type: "resume" }),
+    ]);
   });
 
   it("sends request frames and resolves matching responses", async () => {
@@ -747,6 +864,23 @@ describe("WsClient reconnect wake handling", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("closes a transport that stays silent instead of waiting forever for hello", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const callbacks = clientCallbacks();
+    const client = new WsClient(callbacks);
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen(false);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(callbacks.onStatus).not.toHaveBeenCalledWith({ kind: "open" });
   });
 
   it("wake retries immediately instead of waiting for reconnect backoff", async () => {

@@ -18,6 +18,7 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
       onMessage(message: unknown): void;
       onSessionOutput(frame: unknown): void;
       getResumeContext?(): unknown;
+      onHelloFailure?(failure: unknown): void;
     };
     readonly start = vi.fn(async () => {});
     readonly stop = vi.fn();
@@ -1460,7 +1461,7 @@ describe("safe compatibility and raw terminal IO", () => {
     });
   });
 
-  it("stops incompatible frames and requests automatic recovery without replacing the UI", () => {
+  it("requests automatic recovery for a rejected build hello without replacing the UI", () => {
     useStore.getState().init();
     const client = wsClientState.instance;
     expect(client).toBeTruthy();
@@ -1470,12 +1471,10 @@ describe("safe compatibility and raw terminal IO", () => {
       activeSessionKey: "tab:a",
     });
 
-    client?.callbacks.onMessage({
-      type: "hello",
-      clientId: "web-client",
-      serverId: "server-1",
-      protocolVersion: 2,
-      webBuildId: "different-host-build",
+    client?.callbacks.onHelloFailure?.({
+      kind: "buildMismatch",
+      expectedBuildId: "client-build",
+      receivedBuildId: "different-host-build",
     });
     client?.callbacks.onMessage({
       type: "snapshot",
@@ -1483,7 +1482,6 @@ describe("safe compatibility and raw terminal IO", () => {
     });
 
     const state = useStore.getState();
-    expect(client?.stop).toHaveBeenCalledTimes(1);
     expect(requestCompatibleBuild).toHaveBeenCalledWith("different-host-build");
     expect(state.status.kind).toBe("closed");
     expect(state.snapshot).toBe(existingSnapshot);

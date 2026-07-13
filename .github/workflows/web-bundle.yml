@@ -1,0 +1,46 @@
+name: Web bundle
+
+on:
+  pull_request:
+    paths:
+      - ".gitattributes"
+      - ".github/workflows/web-bundle.yml"
+      - "build.rs"
+      - "src/remote/web/assets.rs"
+      - "src/remote/web/mod.rs"
+      - "web/**"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install browser dependencies
+        run: npm --prefix web ci --no-audit --no-fund
+
+      - name: Test and rebuild tracked browser bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix web test
+          npm --prefix web run typecheck
+          npm --prefix web run build
+          if [ -n "$(git status --porcelain -- web/bundle)" ]; then
+            git status --short -- web/bundle
+            git diff -- web/bundle
+            echo "Generated web/bundle differs from the tracked bundle." >&2
+            exit 1
+          fi
+
+      - name: Validate embedded browser assets
+        run: cargo test remote::web::assets --lib -j 1

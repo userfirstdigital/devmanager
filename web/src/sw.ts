@@ -11,6 +11,12 @@ import { NetworkOnly } from "workbox-strategies";
 import { isNetworkOnlyPath } from "./pwa/cachePolicy";
 import { safeRoute } from "./pwa/notificationRoute";
 import { parsePushPayload, type PushPayload } from "./pwa/pushPayload";
+import {
+  UPDATE_ACTIVATION_RESULT,
+  createWorkerUpdateGate,
+  isUpdateActivationRequest,
+  isUpdateSafetyAck,
+} from "./pwa/updateProtocol";
 
 declare let self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: Array<{ revision?: string; url: string }>;
@@ -33,9 +39,48 @@ registerRoute(
   }),
 );
 
+const updateGate = createWorkerUpdateGate({
+  listClients: async () => {
+    const windows = await self.clients.matchAll({
+      type: "window",
+      includeUncontrolled: true,
+    });
+    return windows.map((client) => ({
+      id: client.id,
+      visibilityState:
+        "visibilityState" in client && client.visibilityState === "hidden"
+          ? "hidden"
+          : "visible",
+      postMessage: (message: unknown) => client.postMessage(message),
+    }));
+  },
+  skipWaiting: () => self.skipWaiting(),
+});
+
 self.addEventListener("message", (event) => {
-  if (event.data?.type === "SKIP_WAITING") {
-    void self.skipWaiting();
+  if (isUpdateSafetyAck(event.data)) {
+    if (event.source && "id" in event.source) {
+      updateGate.acknowledge(
+        event.data.nonce,
+        event.source.id,
+        event.data.safe,
+      );
+    }
+    return;
+  }
+
+  if (isUpdateActivationRequest(event.data)) {
+    const source = event.source;
+    event.waitUntil(
+      (async () => {
+        const activated = await updateGate.requestActivation(event.data.nonce);
+        source?.postMessage({
+          type: UPDATE_ACTIVATION_RESULT,
+          nonce: event.data.nonce,
+          activated,
+        });
+      })(),
+    );
   }
 });
 

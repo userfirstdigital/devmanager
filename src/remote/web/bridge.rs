@@ -126,11 +126,42 @@ fn initial_web_hello(client_id: &str, snapshot: &RemoteWorkspaceSnapshot) -> WsO
     }
 }
 
+fn queue_initial_browser_hello(
+    outbound: &BrowserOutboundSender,
+    inner: &Arc<RemoteHostInner>,
+    client_id: &str,
+) -> Result<(), BrowserEnqueueError> {
+    let snapshot = light_snapshot(inner, client_id);
+    outbound.try_send(initial_web_hello(client_id, &snapshot))
+}
+
+fn queue_initial_browser_snapshot(
+    outbound: &BrowserOutboundSender,
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+) -> Result<(), BrowserEnqueueError> {
+    let snapshot = light_snapshot(inner, client_id);
+    outbound.try_send_server_message(
+        &ServerMessage::Snapshot { snapshot },
+        inner,
+        connection_id,
+        client_id,
+    )
+}
+
 async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: String) {
     let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
     let (outbound, outbound_rx) =
         BrowserOutboundSender::channel(WEB_PUSH_CHANNEL_CAPACITY, WEB_OUTBOUND_MAX_BYTES);
     let tombstone = outbound.tombstone();
+    // Seed hello while this sender is still private. Once the client enters
+    // the broadcaster map, concurrent deltas may enqueue immediately; keeping
+    // hello ahead of registration makes the first-frame contract absolute.
+    if queue_initial_browser_hello(&outbound, &inner, &client_id).is_err() {
+        tombstone.deactivate();
+        return;
+    }
     if !register_browser_client(&inner, connection_id, &client_id, outbound.clone()) {
         let _ = outbound
             .try_send_disconnect("This browser is no longer paired with the host.".to_string());
@@ -149,17 +180,7 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // `auto_bootstrap_subscribed_clients` which sends the bootstrap as a
     // `SessionStream { Bootstrap }` event. That path is async to the initial
     // snapshot and can't stall the handshake.
-    {
-        let snapshot = light_snapshot(&inner, &client_id);
-        let initial_hello = initial_web_hello(&client_id, &snapshot);
-        let _ = outbound.try_send(initial_hello);
-        let _ = outbound.try_send_server_message(
-            &ServerMessage::Snapshot { snapshot },
-            &inner,
-            connection_id,
-            &client_id,
-        );
-    }
+    let _ = queue_initial_browser_snapshot(&outbound, &inner, connection_id, &client_id);
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let writer_inner = inner.clone();
@@ -7154,6 +7175,47 @@ mod tests {
             web_build_id,
             include_str!("../../../web/bundle/source-fingerprint.txt").trim()
         );
+    }
+
+    #[test]
+    fn initial_browser_queue_places_hello_before_snapshot() {
+        let service = RemoteHostService::new(RemoteHostConfig {
+            server_id: "host-first-frame".to_string(),
+            ..RemoteHostConfig::default()
+        });
+        let (sender, mut receiver) = test_web_channel();
+
+        queue_initial_browser_hello(&sender, &service.inner, "web-client")
+            .expect("initial hello queues before registration");
+        pair_web_client(&service, "web-client");
+        let (native, _native_rx) = std_mpsc::channel();
+        assert!(register_client(
+            &service.inner,
+            1,
+            "web-client",
+            native,
+            sender.clone(),
+        ));
+        sender
+            .try_send_server_message(
+                &ServerMessage::Delta {
+                    delta: super::super::super::RemoteWorkspaceDelta::default(),
+                },
+                &service.inner,
+                1,
+                "web-client",
+            )
+            .expect("concurrent broadcaster frame queues");
+        queue_initial_browser_snapshot(&sender, &service.inner, 1, "web-client")
+            .expect("initial snapshot queues");
+
+        let hello = try_recv_web_json(&mut receiver);
+        let broadcaster = try_recv_web_json(&mut receiver);
+        let snapshot = try_recv_web_json(&mut receiver);
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["webBuildId"], WEB_BUILD_ID);
+        assert_eq!(broadcaster["type"], "snapshot");
+        assert_eq!(snapshot["type"], "snapshot");
     }
 
     #[test]

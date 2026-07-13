@@ -1,0 +1,2 @@
+# Generated PWA artifacts are embedded and fingerprinted byte-for-byte.
+web/bundle/** -text

@@ -1,4 +1,10 @@
 import { CLIENT_WEB_BUILD_ID } from "./buildCompatibility";
+import {
+  UPDATE_SAFETY_ACK,
+  createLocalReloadGate,
+  isUpdateSafetyQuery,
+  requestWaitingWorkerActivation,
+} from "./updateProtocol";
 
 export const WEB_BUILD_ID = CLIENT_WEB_BUILD_ID;
 const COMPATIBLE_BUILD_RELOAD_GUARD_KEY =
@@ -7,6 +13,8 @@ const COMPATIBLE_BUILD_RELOAD_GUARD_KEY =
 export interface UpdateSafetyState {
   hasDraft: boolean;
   pendingMutations: number;
+  selectedAttachments?: number;
+  attachmentLoads?: number;
 }
 
 export interface PwaRuntimeCapabilities {
@@ -17,6 +25,7 @@ export interface PwaRuntimeCapabilities {
 export interface ServiceWorkerRegistrationOptions {
   immediate: boolean;
   onNeedRefresh: (waitingWorker?: object | null) => void;
+  onNeedReload: () => void;
   onRegistered: (
     hasWaitingWorker: boolean,
     requestUpdate?: () => Promise<object | null>,
@@ -26,7 +35,7 @@ export interface ServiceWorkerRegistrationOptions {
 
 export type RegisterServiceWorker = (
   options: ServiceWorkerRegistrationOptions,
-) => (reloadPage?: boolean) => Promise<void>;
+) => (reloadPage?: boolean) => Promise<boolean | void>;
 
 export interface PwaRegistration {
   supported: boolean;
@@ -45,6 +54,7 @@ export interface ViteServiceWorkerRegistration {
 export interface ViteServiceWorkerRegistrationOptions {
   immediate: boolean;
   onNeedRefresh: () => void;
+  onNeedReload?: () => void;
   onRegisteredSW: (
     scriptUrl: string,
     registration: ViteServiceWorkerRegistration | undefined,
@@ -70,8 +80,15 @@ interface ReloadGuardStorage {
 export function canActivateUpdate({
   hasDraft,
   pendingMutations,
+  selectedAttachments = 0,
+  attachmentLoads = 0,
 }: UpdateSafetyState): boolean {
-  return !hasDraft && pendingMutations === 0;
+  return (
+    !hasDraft &&
+    pendingMutations === 0 &&
+    selectedAttachments === 0 &&
+    attachmentLoads === 0
+  );
 }
 
 export function isPwaRuntimeSupported({
@@ -83,12 +100,14 @@ export function isPwaRuntimeSupported({
 
 export function createViteServiceWorkerRegistrar(
   registerSW: ViteRegisterServiceWorker,
+  requestActivation: (waitingWorker: object) => Promise<boolean>,
 ): RegisterServiceWorker {
   return (options) => {
     let registration: ViteServiceWorkerRegistration | undefined;
-    return registerSW({
+    registerSW({
       immediate: options.immediate,
       onNeedRefresh: () => options.onNeedRefresh(registration?.waiting),
+      onNeedReload: options.onNeedReload,
       onRegisteredSW: (_scriptUrl, nextRegistration) => {
         registration = nextRegistration;
         options.onRegistered(
@@ -102,6 +121,11 @@ export function createViteServiceWorkerRegistrar(
         );
       },
     });
+    return async () => {
+      const waitingWorker = registration?.waiting;
+      if (!waitingWorker) return false;
+      return requestActivation(waitingWorker);
+    };
   };
 }
 
@@ -256,7 +280,7 @@ function installCompatibleBuildRecovery(
 
 export function createPwaUpdateCoordinator(
   readSafetyState: () => UpdateSafetyState,
-  activateUpdate: () => Promise<void>,
+  activateUpdate: () => Promise<boolean | void>,
 ) {
   let updateWaiting = false;
   let activationInProgress = false;
@@ -272,7 +296,8 @@ export function createPwaUpdateCoordinator(
 
     activationInProgress = true;
     try {
-      await activateUpdate();
+      const activated = await activateUpdate();
+      if (activated === false) return false;
       updateWaiting = false;
       return true;
     } finally {
@@ -287,6 +312,9 @@ export function createPwaUpdateCoordinator(
       updateWaiting = true;
       return false;
     },
+    notifyActivated: () => {
+      updateWaiting = false;
+    },
   };
 }
 
@@ -296,12 +324,14 @@ export function registerPwaServiceWorker({
   registerServiceWorker,
   isVisible = () => true,
   onUpdateWaiting = () => undefined,
+  onNeedReload = () => undefined,
 }: {
   capabilities: PwaRuntimeCapabilities;
   readSafetyState: () => UpdateSafetyState;
   registerServiceWorker: RegisterServiceWorker;
   isVisible?: () => boolean;
   onUpdateWaiting?: () => void;
+  onNeedReload?: () => void;
 }): PwaRegistration {
   if (!isPwaRuntimeSupported(capabilities)) {
     return {
@@ -314,7 +344,9 @@ export function registerPwaServiceWorker({
     };
   }
 
-  let updateServiceWorker: (reloadPage?: boolean) => Promise<void> =
+  let updateServiceWorker: (
+    reloadPage?: boolean,
+  ) => Promise<boolean | void> =
     async () => undefined;
   let requestRegisteredUpdate = async (): Promise<object | null> => null;
   let updaterReady = false;
@@ -326,7 +358,7 @@ export function registerPwaServiceWorker({
   let startupAttemptConsumed = false;
   const coordinator = createPwaUpdateCoordinator(
     readSafetyState,
-    async () => updateServiceWorker(true),
+    async () => updateServiceWorker(),
   );
 
   const activateInitialWaitingAtStartup = async (): Promise<boolean> => {
@@ -355,6 +387,10 @@ export function registerPwaServiceWorker({
 
   updateServiceWorker = registerServiceWorker({
     immediate: true,
+    onNeedReload: () => {
+      coordinator.notifyActivated();
+      onNeedReload();
+    },
     onNeedRefresh: (waitingWorker) => {
       if (!initialRegistrationSettled) {
         needRefreshBeforeRegistration = true;
@@ -418,6 +454,8 @@ export const defaultUpdateSafetyState = (): UpdateSafetyState => ({
   // state must leave a new worker waiting rather than risk discarding input.
   hasDraft: true,
   pendingMutations: 0,
+  selectedAttachments: 0,
+  attachmentLoads: 0,
 });
 
 export async function registerPwa(
@@ -427,6 +465,11 @@ export async function registerPwa(
   document.documentElement.dataset.webBuildId = WEB_BUILD_ID;
 
   const isVisible = () => document.visibilityState === "visible";
+  const localReloadGate = createLocalReloadGate({
+    isVisible,
+    readSafetyState,
+    reload: () => window.location.reload(),
+  });
   const capabilities = {
     isSecureContext: window.isSecureContext,
     serviceWorkerAvailable: "serviceWorker" in navigator,
@@ -463,11 +506,13 @@ export async function registerPwa(
       startupNavigationPending = true;
     }
     void recovery.notifySafePoint();
+    localReloadGate.notifySafePoint();
   };
   const activateOnSafeForeground = () => {
     if (!isVisible()) return;
     if (registration) void registration.notifyForegroundSafePoint();
     void recovery.notifySafePoint();
+    localReloadGate.notifySafePoint();
   };
   activePwaSafetyStateNotifier = activateOnSafeForeground;
   window.addEventListener("pageshow", activateOnPageShow);
@@ -484,13 +529,43 @@ export async function registerPwa(
     return registration;
   }
 
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (!isUpdateSafetyQuery(event.data)) return;
+    const source = event.source as
+      | { postMessage(message: unknown): void }
+      | null;
+    if (!source || typeof source.postMessage !== "function") return;
+    source.postMessage({
+      type: UPDATE_SAFETY_ACK,
+      nonce: event.data.nonce,
+      safe: canActivateUpdate(readSafetyState()),
+    });
+  });
+
   const { registerSW } = await import("virtual:pwa-register");
   registration = registerPwaServiceWorker({
     capabilities,
     readSafetyState,
     isVisible,
     onUpdateWaiting: () => void recovery.notifySafePoint(),
-    registerServiceWorker: createViteServiceWorkerRegistrar(registerSW),
+    onNeedReload: () => localReloadGate.notifyControllerChanged(),
+    registerServiceWorker: createViteServiceWorkerRegistrar(
+      registerSW,
+      async (waitingWorker) => {
+        const worker = waitingWorker as {
+          postMessage(message: unknown): void;
+        };
+        if (typeof worker.postMessage !== "function") return false;
+        const nonce =
+          globalThis.crypto?.randomUUID?.() ??
+          `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        return requestWaitingWorkerActivation({
+          worker,
+          messages: navigator.serviceWorker,
+          nonce,
+        });
+      },
+    ),
   });
   recovery.attachRegistration(registration);
 

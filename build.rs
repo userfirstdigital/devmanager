@@ -438,6 +438,25 @@ fn relative_asset_references(current: &str, contents: &str) -> Vec<String> {
         }
     }
 
+    // Vite's preload dependency map records split-chunk companion assets as
+    // bundle-root paths (for example "assets/Terminal-<hash>.css") while the
+    // dynamic import itself remains "./Terminal-<hash>.js". Follow both forms
+    // so legitimate lazy CSS is part of the same validated asset graph.
+    for (marker, quote) in [("\"assets/", '"'), ("'assets/", '\'')] {
+        let mut remaining = contents;
+        while let Some(start) = remaining.find(marker) {
+            let value = &remaining[start + marker.len()..];
+            let Some(end) = value.find(quote) else {
+                break;
+            };
+            let target = value[..end].split(['?', '#']).next().unwrap_or("");
+            if !target.is_empty() {
+                references.push(format!("assets/{target}"));
+            }
+            remaining = &value[end + 1..];
+        }
+    }
+
     references.sort();
     references.dedup();
     references

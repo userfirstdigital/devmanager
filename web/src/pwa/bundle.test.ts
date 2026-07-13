@@ -1,10 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const webRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const bundleRoot = join(webRoot, "bundle");
+const repoRoot = join(webRoot, "..");
 
 function readBundleFile(path: string): string {
   return readFileSync(join(bundleRoot, path), "utf8");
@@ -98,5 +100,54 @@ describe("production PWA bundle", () => {
       expect(worker).toContain(precached);
     }
     expect(worker).not.toContain("source-fingerprint.txt");
+  });
+});
+
+describe("tracked bundle determinism", () => {
+  it("disables checkout text conversion for every generated bundle byte", () => {
+    const attributes = readFileSync(join(repoRoot, ".gitattributes"), "utf8");
+    expect(attributes).toMatch(/^web\/bundle\/\*\*\s+-text$/m);
+
+    const tracked = execFileSync(
+      "git",
+      ["ls-files", "web/bundle"],
+      { cwd: repoRoot, encoding: "utf8" },
+    )
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean);
+    expect(tracked.length).toBeGreaterThan(0);
+    for (const path of tracked) {
+      const blob = execFileSync("git", ["show", `:${path}`], {
+        cwd: repoRoot,
+      });
+      const filtered = execFileSync(
+        "git",
+        [
+          "-c",
+          "core.autocrlf=true",
+          "cat-file",
+          "--filters",
+          `--path=${path}`,
+          `:${path}`,
+        ],
+        { cwd: repoRoot },
+      );
+      expect(filtered.equals(blob), path).toBe(true);
+    }
+  });
+
+  it("has pull-request CI that rebuilds and rejects a dirty bundle", () => {
+    const workflow = readFileSync(
+      join(repoRoot, ".github", "workflows", "web-bundle.yml"),
+      "utf8",
+    );
+    expect(workflow).toMatch(/pull_request:/);
+    expect(workflow).toContain("npm --prefix web ci");
+    expect(workflow).toContain("npm --prefix web test");
+    expect(workflow).toContain("npm --prefix web run typecheck");
+    expect(workflow).toContain("npm --prefix web run build");
+    expect(workflow).toContain("cargo test remote::web::assets --lib");
+    expect(workflow).toContain("git status --porcelain -- web/bundle");
   });
 });

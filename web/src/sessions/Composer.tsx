@@ -42,6 +42,10 @@ export interface ComposerProps {
   onChange(value: string): void;
   onSubmit(text: string, attachments: ComposerAttachment[]): Promise<unknown>;
   onFocus?(): void;
+  onSafetyStateChange?(state: {
+    selectedAttachments: number;
+    attachmentLoads: number;
+  }): void;
 }
 
 function attachmentId(): string {
@@ -60,6 +64,7 @@ export function Composer({
   onChange,
   onSubmit,
   onFocus,
+  onSafetyStateChange,
 }: ComposerProps) {
   const [localValue, setLocalValue] = useState(value);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -73,6 +78,15 @@ export function Composer({
   const attachmentReadPendingRef = useRef(false);
   const busy = pending || submitting || readingAttachments;
   const canSend = !disabled && !busy && (localValue.trim().length > 0 || attachments.length > 0);
+  const publishSafety = (
+    nextAttachments = attachmentsRef.current,
+    loading = attachmentReadPendingRef.current,
+  ) => {
+    onSafetyStateChange?.({
+      selectedAttachments: nextAttachments.length,
+      attachmentLoads: loading ? 1 : 0,
+    });
+  };
 
   useLayoutEffect(() => {
     if (scopeRef.current === scopeKey) return;
@@ -80,6 +94,7 @@ export function Composer({
     scopeGenerationRef.current += 1;
     attachmentReadPendingRef.current = false;
     attachmentsRef.current = [];
+    publishSafety([], false);
     setLocalValue(value);
     setAttachments([]);
     setSubmitting(false);
@@ -138,6 +153,7 @@ export function Composer({
     const operationScope = scopeRef.current;
     const operationGeneration = scopeGenerationRef.current;
     attachmentReadPendingRef.current = true;
+    publishSafety(current, true);
     setReadingAttachments(true);
     try {
       const additions: PendingAttachment[] = [];
@@ -159,6 +175,7 @@ export function Composer({
       }
       const next = [...current, ...additions];
       attachmentsRef.current = next;
+      publishSafety(next, true);
       setAttachments(next);
     } catch (caught) {
       if (
@@ -173,6 +190,7 @@ export function Composer({
         scopeGenerationRef.current === operationGeneration
       ) {
         attachmentReadPendingRef.current = false;
+        publishSafety(attachmentsRef.current, false);
         setReadingAttachments(false);
       }
     }
@@ -196,6 +214,7 @@ export function Composer({
         return;
       }
       attachmentsRef.current = [];
+      publishSafety([], false);
       setAttachments([]);
       updateValue("");
     } catch (caught) {
@@ -263,6 +282,7 @@ export function Composer({
                     (item) => item.id !== attachment.id,
                   );
                   attachmentsRef.current = next;
+                  publishSafety(next, attachmentReadPendingRef.current);
                   setAttachments(next);
                 }}
               >

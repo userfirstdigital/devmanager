@@ -24,10 +24,10 @@ import {
 import type {
   SessionBootstrapFrame,
   SessionOutputFrame,
+  WsHelloFailure,
   WsStatus,
 } from "../api/ws";
 import { isTransientComposerRejection, WsClient } from "../api/ws";
-import { evaluateBuildCompatibility } from "../pwa/buildCompatibility";
 import { requestCompatibleBuild } from "../pwa/register";
 
 const ACTIVE_PROJECT_KEY = "devmanager-active-project-id";
@@ -46,6 +46,11 @@ export interface PendingComposerMutation {
   stableSessionKey: StableSessionKey;
   text: string;
   attachments: ComposerAttachment[];
+}
+
+export interface ComposerSafetyState {
+  selectedAttachments: number;
+  attachmentLoads: number;
 }
 
 export interface PendingSemanticReplay extends SemanticReplayDescriptor {
@@ -94,6 +99,7 @@ export interface StoreState {
   /** Highest live sequence observed while each gap waits for Resume. */
   semanticGapSequences: Record<StableSessionKey, number>;
   drafts: Record<StableSessionKey, string>;
+  composerSafety: Record<StableSessionKey, ComposerSafetyState>;
   unread: Record<StableSessionKey, number>;
   /** In-memory route handoff only; Task 6 owns durable route restoration. */
   pendingRoute: string | null;
@@ -111,6 +117,11 @@ export interface StoreState {
   applySemanticReplayPage(page: SemanticReplayPage): void;
   appendSemanticEvent(event: SemanticEvent): void;
   setDraft(stableSessionKey: StableSessionKey, text: string): void;
+  setComposerSafety(
+    stableSessionKey: StableSessionKey,
+    safety: ComposerSafetyState,
+  ): void;
+  clearComposerSafety(stableSessionKey: StableSessionKey): void;
   submitComposer(
     stableSessionKey: StableSessionKey,
     text: string,
@@ -631,6 +642,7 @@ export const useStore = create<StoreState>((set, get) => {
         semanticGapKeys: new Set(),
         semanticGapSequences: {},
         drafts: {},
+        composerSafety: {},
         unread: {},
         pendingRoute: null,
         pendingMutations: {},
@@ -753,6 +765,9 @@ export const useStore = create<StoreState>((set, get) => {
         ? {}
         : filterRecord(current.semanticGapSequences, validStableKeys),
       drafts: runtimeChanged ? {} : filterRecord(current.drafts, validStableKeys),
+      composerSafety: runtimeChanged
+        ? {}
+        : filterRecord(current.composerSafety, validStableKeys),
       unread: unreadIndex(snapshot),
       pendingRoute: runtimeChanged
         ? null
@@ -800,6 +815,7 @@ export const useStore = create<StoreState>((set, get) => {
         semanticGapKeys: new Set(),
         semanticGapSequences: {},
         drafts: {},
+        composerSafety: {},
         unread: {},
         pendingRoute: null,
         pendingMutations: {},
@@ -973,6 +989,7 @@ export const useStore = create<StoreState>((set, get) => {
           const sessions = { ...state.sessions };
           const journals = { ...state.journals };
           const drafts = { ...state.drafts };
+          const composerSafety = { ...state.composerSafety };
           const unread = { ...state.unread };
           const semanticGapKeys = new Set(state.semanticGapKeys);
           const semanticGapSequences = { ...state.semanticGapSequences };
@@ -981,6 +998,7 @@ export const useStore = create<StoreState>((set, get) => {
             delete sessions[stableSessionKey];
             delete journals[stableSessionKey];
             delete drafts[stableSessionKey];
+            delete composerSafety[stableSessionKey];
             delete unread[stableSessionKey];
             semanticGapKeys.delete(stableSessionKey);
             delete semanticGapSequences[stableSessionKey];
@@ -1000,6 +1018,7 @@ export const useStore = create<StoreState>((set, get) => {
             semanticGapKeys,
             semanticGapSequences,
             drafts,
+            composerSafety,
             unread,
             pendingRoute: removedActiveSession ? "/sessions" : state.pendingRoute,
             pendingMutations,
@@ -1037,6 +1056,7 @@ export const useStore = create<StoreState>((set, get) => {
             semanticGapKeys: new Set(),
             semanticGapSequences: {},
             drafts: {},
+            composerSafety: {},
             unread: {},
             pendingRoute: null,
             pendingMutations: {},
@@ -1138,6 +1158,7 @@ export const useStore = create<StoreState>((set, get) => {
     semanticGapKeys: new Set(),
     semanticGapSequences: {},
     drafts: {},
+    composerSafety: {},
     unread: {},
     pendingRoute: null,
     pendingMutations: {},
@@ -1149,6 +1170,33 @@ export const useStore = create<StoreState>((set, get) => {
     init() {
       if (get().client) return;
       let compatibleBuildPending = false;
+      const handleHelloFailure = (failure: WsHelloFailure) => {
+        compatibleBuildPending = true;
+        if (failure.kind === "buildMismatch") {
+          requestCompatibleBuild(failure.receivedBuildId);
+          set({
+            status: { kind: "closed", reason: "host web bundle changed" },
+            lastError:
+              "DevManager is reconciling this web app with the updated host automatically.",
+          });
+          return;
+        }
+        if (failure.kind === "protocolMismatch") {
+          set({
+            status: { kind: "closed", reason: "incompatible web protocol" },
+            compatibilityDiagnostic: {
+              expectedProtocolVersion: failure.expectedProtocolVersion,
+              receivedProtocolVersion: failure.receivedProtocolVersion,
+            },
+            lastError: `Host web protocol ${failure.receivedProtocolVersion} is incompatible with browser protocol ${failure.expectedProtocolVersion}.`,
+          });
+          return;
+        }
+        set({
+          status: { kind: "closed", reason: "invalid websocket handshake" },
+          lastError: "The host did not send a valid web hello before session data.",
+        });
+      };
       const client = new WsClient({
         onStatus: (status) => {
           if (compatibleBuildPending) return;
@@ -1164,25 +1212,9 @@ export const useStore = create<StoreState>((set, get) => {
         },
         onMessage: (message) => {
           if (compatibleBuildPending) return;
-          if (message.type === "hello") {
-            const compatibility = evaluateBuildCompatibility(message.webBuildId);
-            if (compatibility.kind === "reloadRequired") {
-              compatibleBuildPending = true;
-              client.stop();
-              requestCompatibleBuild(compatibility.hostBuildId);
-              set({
-                status: {
-                  kind: "closed",
-                  reason: "host web bundle changed",
-                },
-                lastError:
-                  "DevManager is reconciling this web app with the updated host automatically.",
-              });
-              return;
-            }
-          }
           handleMessage(message);
         },
+        onHelloFailure: handleHelloFailure,
         onSessionOutput: handleSessionOutput,
         getResumeContext: (): ResumeContext => {
           const state = get();
@@ -1396,6 +1428,32 @@ export const useStore = create<StoreState>((set, get) => {
               )
             : state.pendingMutations,
       }));
+    },
+
+    setComposerSafety(stableSessionKey, safety) {
+      const selectedAttachments = Math.max(0, safety.selectedAttachments);
+      const attachmentLoads = Math.max(0, safety.attachmentLoads);
+      set((state) => {
+        const composerSafety = { ...state.composerSafety };
+        if (selectedAttachments === 0 && attachmentLoads === 0) {
+          delete composerSafety[stableSessionKey];
+        } else {
+          composerSafety[stableSessionKey] = {
+            selectedAttachments,
+            attachmentLoads,
+          };
+        }
+        return { composerSafety };
+      });
+    },
+
+    clearComposerSafety(stableSessionKey) {
+      set((state) => {
+        if (!state.composerSafety[stableSessionKey]) return state;
+        const composerSafety = { ...state.composerSafety };
+        delete composerSafety[stableSessionKey];
+        return { composerSafety };
+      });
     },
 
     async submitComposer(stableSessionKey, text, attachments = []) {

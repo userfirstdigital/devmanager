@@ -14,8 +14,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Query, Request, State};
+use axum::http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
@@ -447,7 +448,39 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/me", get(me_handler))
         .route("/api/ws", get(bridge::ws_handler))
         .route("/*path", get(assets::static_handler))
+        .layer(middleware::from_fn(web_response_policy))
         .with_state(state)
+}
+
+fn is_dynamic_web_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/") || path == "/pair" || path.starts_with("/pair/")
+}
+
+async fn web_response_policy(request: Request, next: Next) -> Response {
+    let dynamic = is_dynamic_web_path(request.uri().path());
+    let websocket_authority = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Authority>().ok())
+        .map(|authority| authority.to_string());
+    let mut response = next.run(request).await;
+
+    if dynamic {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    if response
+        .headers()
+        .contains_key(header::CONTENT_SECURITY_POLICY)
+    {
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            assets::content_security_policy(websocket_authority.as_deref()),
+        );
+    }
+    response
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -768,6 +801,8 @@ mod tests {
         load_remote_machine_state, save_remote_machine_state, test_support::TestProfileGuard,
         KnownRemoteHost, RemoteHostConfig, RemoteHostService, RemoteMachineState,
     };
+    use axum::body::Body;
+    use tower::ServiceExt;
 
     fn test_service(server_id: &str) -> RemoteHostService {
         let mut config = RemoteHostConfig::default();
@@ -797,6 +832,75 @@ mod tests {
             );
         }
         headers
+    }
+
+    async fn route_response(state: Arc<WebState>, uri: &str) -> Response {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, "devmanager.test:43872")
+                    .extension(ConnectInfo(test_addr()))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response")
+    }
+
+    #[test]
+    fn dynamic_routes_are_no_store_on_success_errors_and_redirects() {
+        let _profile = TestProfileGuard::new("web-dynamic-no-store");
+        let service = test_service("host-no-store");
+        let state = test_state(&service);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                for uri in [
+                    "/api/health",
+                    "/api/me",
+                    "/api/not-a-real-route",
+                    "/api/ws",
+                    "/pair",
+                    "/pair?t=wrong",
+                    "/pair?t=PAIR1234",
+                    "/pair/unknown",
+                ] {
+                    let response = route_response(state.clone(), uri).await;
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CACHE_CONTROL)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("no-store"),
+                        "{uri} returned {} without no-store",
+                        response.status()
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn routed_static_csp_allows_only_the_request_host_for_websockets() {
+        let service = test_service("host-csp");
+        let state = test_state(&service);
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(route_response(state, "/"));
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("CSP")
+            .to_str()
+            .expect("CSP text");
+
+        assert!(csp
+            .contains("connect-src 'self' ws://devmanager.test:43872 wss://devmanager.test:43872"));
+        assert!(!csp.contains(" ws: wss:"));
     }
 
     #[test]

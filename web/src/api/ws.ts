@@ -10,8 +10,9 @@ import type {
   WsInbound,
   WsOutbound,
 } from "./types";
-import { EMPTY_WRITER_LEASE } from "./types";
+import { EMPTY_WRITER_LEASE, WEB_PROTOCOL_VERSION } from "./types";
 import { buildWebSocketUrl } from "../lib/browserIdentity";
+import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
 
 export type WsStatus =
   | { kind: "idle" }
@@ -46,7 +47,21 @@ export interface WsClientCallbacks {
   onMessage(message: WsOutbound): void;
   onSessionOutput(frame: SessionOutputFrame): void;
   getResumeContext?(): ResumeContext;
+  onHelloFailure?(failure: WsHelloFailure): void;
 }
+
+export type WsHelloFailure =
+  | { kind: "missingHello" }
+  | {
+      kind: "protocolMismatch";
+      expectedProtocolVersion: number;
+      receivedProtocolVersion: number;
+    }
+  | {
+      kind: "buildMismatch";
+      expectedBuildId: string;
+      receivedBuildId: string;
+    };
 
 interface PendingRequest {
   action: RemoteAction;
@@ -89,6 +104,7 @@ export class ComposerRejectedError extends Error {
 const BINARY_FRAME_SESSION_OUTPUT = 0x01;
 const STALE_SOCKET_MS = 30_000;
 const LEASE_HEARTBEAT_MS = 4_000;
+const HELLO_TIMEOUT_MS = 5_000;
 const COMPOSER_RETRY_MIN_MS = 250;
 const COMPOSER_RETRY_MAX_MS = 1_000;
 const COMPOSER_ACK_TIMEOUT_MS = 5_000;
@@ -222,6 +238,7 @@ export class WsClient {
   private reconnectDelayMs = 1000;
   private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof globalThis.setInterval> | null = null;
+  private helloTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   private composerRetryTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   private composerRetryDelayMs = COMPOSER_RETRY_MIN_MS;
   private lastWriterLeaseRequestAt = Number.NEGATIVE_INFINITY;
@@ -237,6 +254,7 @@ export class WsClient {
   private readonly pendingWriterFrames: PendingWriterFrame[] = [];
   private pendingOutboundItems = 0;
   private pendingOutboundBytes = 0;
+  private handshakeReady = false;
 
   constructor(private readonly cb: WsClientCallbacks) {}
 
@@ -287,27 +305,62 @@ export class WsClient {
         } catch {}
         return;
       }
-      this.lastFrameAt = Date.now();
-      this.reconnectDelayMs = 1000;
-      this.cb.onStatus({ kind: "open" });
-      this.startHeartbeat();
-      this.resume();
-      this.lastForegroundWakeAt = this.visible
-        ? Date.now()
-        : Number.NEGATIVE_INFINITY;
-      this.scheduleComposerRetry(true);
+      this.startHelloTimeout(socket, epoch);
     };
 
     socket.onmessage = (event) => {
       if (!this.isCurrentSocket(socket, epoch)) return;
-      this.lastFrameAt = Date.now();
       if (typeof event.data === "string") {
-        let parsed: WsOutbound;
+        let parsedValue: unknown;
         try {
-          parsed = JSON.parse(event.data) as WsOutbound;
+          parsedValue = JSON.parse(event.data) as unknown;
         } catch {
+          if (!this.handshakeReady) {
+            this.failHello(socket, epoch, { kind: "missingHello" });
+          }
           return;
         }
+        if (typeof parsedValue !== "object" || parsedValue === null) {
+          if (!this.handshakeReady) {
+            this.failHello(socket, epoch, { kind: "missingHello" });
+          }
+          return;
+        }
+        const parsed = parsedValue as WsOutbound;
+        if (!this.handshakeReady) {
+          if (
+            parsed.type !== "hello" ||
+            typeof parsed.clientId !== "string" ||
+            typeof parsed.serverId !== "string" ||
+            typeof parsed.protocolVersion !== "number" ||
+            !Number.isInteger(parsed.protocolVersion) ||
+            typeof parsed.webBuildId !== "string" ||
+            parsed.webBuildId.length === 0
+          ) {
+            this.failHello(socket, epoch, { kind: "missingHello" });
+            return;
+          }
+          if (parsed.protocolVersion !== WEB_PROTOCOL_VERSION) {
+            this.failHello(socket, epoch, {
+              kind: "protocolMismatch",
+              expectedProtocolVersion: WEB_PROTOCOL_VERSION,
+              receivedProtocolVersion: parsed.protocolVersion,
+            });
+            return;
+          }
+          if (parsed.webBuildId !== CLIENT_WEB_BUILD_ID) {
+            this.failHello(socket, epoch, {
+              kind: "buildMismatch",
+              expectedBuildId: CLIENT_WEB_BUILD_ID,
+              receivedBuildId: parsed.webBuildId,
+            });
+            return;
+          }
+          this.completeHello(socket, epoch);
+          this.cb.onMessage(parsed);
+          return;
+        }
+        this.lastFrameAt = Date.now();
         if (parsed.type === "response") {
           this.resolvePendingRequest(parsed.id, parsed.result);
           return;
@@ -324,6 +377,11 @@ export class WsClient {
         this.observeWriterLease(parsed);
         this.continueComposerRetriesAfter(parsed);
       } else if (event.data instanceof ArrayBuffer) {
+        if (!this.handshakeReady) {
+          this.failHello(socket, epoch, { kind: "missingHello" });
+          return;
+        }
+        this.lastFrameAt = Date.now();
         const frame = decodeSessionOutputFrame(event.data);
         if (frame) this.cb.onSessionOutput(frame);
       }
@@ -331,6 +389,8 @@ export class WsClient {
 
     socket.onclose = (event) => {
       if (!this.isCurrentSocket(socket, epoch)) return;
+      this.clearHelloTimeout();
+      this.handshakeReady = false;
       this.stopHeartbeat();
       const reason = event.reason || `code ${event.code}`;
       this.handleRequestDisconnect(`websocket closed: ${reason}`);
@@ -349,7 +409,13 @@ export class WsClient {
   }
 
   send(message: WsInbound): boolean {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    if (
+      !this.handshakeReady ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    ) {
+      return false;
+    }
     try {
       this.ws.send(JSON.stringify(message));
       return true;
@@ -506,6 +572,8 @@ export class WsClient {
     this.starting = false;
     ++this.connectionEpoch;
     this.stopHeartbeat();
+    this.clearHelloTimeout();
+    this.handshakeReady = false;
     this.cancelComposerRetry();
     this.rejectPendingRequests("websocket stopped");
     this.rejectPendingComposers("websocket stopped");
@@ -537,6 +605,7 @@ export class WsClient {
     this.reconnectDelayMs = 1000;
 
     if (this.ws?.readyState === WebSocket.OPEN) {
+      if (!this.handshakeReady) return;
       if (Date.now() - this.lastFrameAt <= STALE_SOCKET_MS) {
         this.resume();
         return;
@@ -622,6 +691,53 @@ export class WsClient {
 
   private isCurrentSocket(socket: WebSocket, epoch: number): boolean {
     return this.isCurrentEpoch(epoch) && this.ws === socket;
+  }
+
+  private startHelloTimeout(socket: WebSocket, epoch: number): void {
+    this.clearHelloTimeout();
+    this.helloTimer = globalThis.setTimeout(() => {
+      this.helloTimer = null;
+      this.failHello(socket, epoch, { kind: "missingHello" });
+    }, HELLO_TIMEOUT_MS);
+  }
+
+  private clearHelloTimeout(): void {
+    if (this.helloTimer !== null) {
+      globalThis.clearTimeout(this.helloTimer);
+      this.helloTimer = null;
+    }
+  }
+
+  private failHello(
+    socket: WebSocket,
+    epoch: number,
+    failure: WsHelloFailure,
+  ): void {
+    if (!this.isCurrentSocket(socket, epoch) || this.handshakeReady) return;
+    const reason =
+      failure.kind === "missingHello"
+        ? "host did not send hello as the first websocket frame"
+        : failure.kind === "protocolMismatch"
+          ? "host web protocol is incompatible"
+          : "host web bundle changed";
+    this.cb.onHelloFailure?.(failure);
+    this.stop();
+    this.cb.onStatus({ kind: "closed", reason });
+  }
+
+  private completeHello(socket: WebSocket, epoch: number): void {
+    if (!this.isCurrentSocket(socket, epoch) || this.handshakeReady) return;
+    this.clearHelloTimeout();
+    this.handshakeReady = true;
+    this.lastFrameAt = Date.now();
+    this.reconnectDelayMs = 1000;
+    this.cb.onStatus({ kind: "open" });
+    this.startHeartbeat();
+    this.resume();
+    this.lastForegroundWakeAt = this.visible
+      ? Date.now()
+      : Number.NEGATIVE_INFINITY;
+    this.scheduleComposerRetry(true);
   }
 
   private scheduleReconnect(_reason: string): void {

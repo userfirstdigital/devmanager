@@ -85,6 +85,8 @@ export function SessionScreen({
   );
   const writerLease = useStore((state) => state.writerLease);
   const setDraft = useStore((state) => state.setDraft);
+  const setComposerSafety = useStore((state) => state.setComposerSafety);
+  const clearComposerSafety = useStore((state) => state.clearComposerSafety);
   const submitComposer = useStore((state) => state.submitComposer);
   const prepareComposer = useStore((state) => state.prepareComposer);
   const interruptSession = useStore((state) => state.interruptSession);
@@ -122,6 +124,11 @@ export function SessionScreen({
       setDraft(stableSessionKey, persisted);
     }
   }, [setDraft, stableSessionKey, workspace.runtimeInstanceId]);
+
+  useEffect(() => {
+    if (!stableSessionKey) return;
+    return () => clearComposerSafety(stableSessionKey);
+  }, [clearComposerSafety, stableSessionKey]);
 
   useEffect(() => {
     if (!stableSessionKey) return;
@@ -178,6 +185,9 @@ export function SessionScreen({
       placeholder={ai ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}` : "Enter a command"}
       note={controlNote}
       onFocus={prepareComposer}
+      onSafetyStateChange={(safety) =>
+        setComposerSafety(stableSessionKey, safety)
+      }
       onChange={(value) => {
         setDraft(stableSessionKey, value);
         saveDraft(workspace.runtimeInstanceId, stableSessionKey, value);
