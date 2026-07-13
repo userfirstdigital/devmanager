@@ -33,6 +33,7 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const BRIDGE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BRIDGE_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+pub(crate) const CODEX_BRIDGE_AUTH_TOKEN_ENV: &str = "DEVMANAGER_CODEX_BRIDGE_TOKEN";
 
 #[derive(Debug, Clone, Copy)]
 pub struct CodexReducerLimits {
@@ -1013,47 +1014,57 @@ pub fn peer_is_allowed(peer: SocketAddr) -> bool {
     peer.ip().is_loopback()
 }
 
-fn random_bridge_path() -> Result<String, String> {
+fn random_bridge_token() -> Result<String, String> {
     const TOKEN_BYTES: usize = 32;
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut token = [0_u8; TOKEN_BYTES];
     getrandom::fill(&mut token)
-        .map_err(|error| format!("Cannot generate Codex bridge bearer path: {error}"))?;
-    let mut path = String::with_capacity("/bridge/".len() + TOKEN_BYTES * 2);
-    path.push_str("/bridge/");
+        .map_err(|error| format!("Cannot generate Codex bridge bearer token: {error}"))?;
+    let mut encoded = String::with_capacity(TOKEN_BYTES * 2);
     for byte in token {
-        path.push(HEX[(byte >> 4) as usize] as char);
-        path.push(HEX[(byte & 0x0f) as usize] as char);
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    Ok(path)
+    Ok(encoded)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let compared = left.len().max(right.len());
+    for index in 0..compared {
+        let left = left.get(index).copied().unwrap_or_default();
+        let right = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }
 
 fn authorize_bridge_handshake(
     request: &Request,
     response: Response,
-    expected_path: &str,
+    expected_authorization: &str,
 ) -> Result<Response, ErrorResponse> {
-    let exact_path = request
-        .uri()
-        .path_and_query()
-        .is_some_and(|path| path.as_str() == expected_path);
-    if exact_path {
+    let authorized = request.headers().get("Authorization").is_some_and(|value| {
+        constant_time_eq(value.as_bytes(), expected_authorization.as_bytes())
+    });
+    if authorized {
         return Ok(response);
     }
 
-    let mut rejection = ErrorResponse::new(Some("Not Found".to_string()));
-    *rejection.status_mut() = StatusCode::NOT_FOUND;
+    let mut rejection = ErrorResponse::new(Some("Unauthorized".to_string()));
+    *rejection.status_mut() = StatusCode::UNAUTHORIZED;
     Err(rejection)
 }
 
 /// Serves exactly one TUI WebSocket and transparently connects it to one
 /// app-server stdio stream. JSONL delimiters are transport framing; every byte
-/// inside a frame is otherwise preserved. `expected_path` is a per-bridge
-/// bearer secret; rejected handshakes do not consume the legitimate TUI slot.
+/// inside a frame is otherwise preserved. `expected_authorization` is a
+/// per-bridge bearer secret; rejected handshakes do not consume the legitimate
+/// TUI slot.
 pub async fn serve_one_loopback_client<S>(
     listener: TcpListener,
-    expected_path: String,
+    expected_authorization: String,
     stdio: S,
     observer: SemanticObserverSender,
     shutdown: oneshot::Receiver<()>,
@@ -1063,7 +1074,7 @@ where
 {
     serve_one_loopback_client_with_activation(
         listener,
-        expected_path,
+        expected_authorization,
         stdio,
         observer,
         shutdown,
@@ -1075,7 +1086,7 @@ where
 
 async fn serve_one_loopback_client_with_activation<S>(
     listener: TcpListener,
-    expected_path: String,
+    expected_authorization: String,
     stdio: S,
     observer: SemanticObserverSender,
     mut shutdown: oneshot::Receiver<()>,
@@ -1105,14 +1116,14 @@ where
             max_write_buffer_size: MAX_CODEX_FRAME_BYTES * 2,
             ..WebSocketConfig::default()
         };
-        let handshake_path = expected_path.clone();
+        let handshake_authorization = expected_authorization.clone();
         let handshake = tokio::select! {
             result = tokio::time::timeout(
                 BRIDGE_IO_TIMEOUT,
                 accept_hdr_async_with_config(
                     socket,
                     move |request: &Request, response: Response| {
-                        authorize_bridge_handshake(request, response, &handshake_path)
+                        authorize_bridge_handshake(request, response, &handshake_authorization)
                     },
                     Some(websocket_config),
                 ),
@@ -1306,14 +1317,36 @@ pub struct CodexBridgeHandle {
     observer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+pub(crate) struct StartedCodexBridge {
+    handle: CodexBridgeHandle,
+    terminal_env: HashMap<String, String>,
+}
+
+impl StartedCodexBridge {
+    pub(crate) fn into_parts(self) -> (CodexBridgeHandle, HashMap<String, String>) {
+        (self.handle, self.terminal_env)
+    }
+
+    #[cfg(test)]
+    fn handle_mut(&mut self) -> &mut CodexBridgeHandle {
+        &mut self.handle
+    }
+
+    #[cfg(test)]
+    fn terminal_env(&self) -> &HashMap<String, String> {
+        &self.terminal_env
+    }
+}
+
 impl CodexBridgeHandle {
-    pub fn start<OnEvent, OnExit>(
+    #[cfg(test)]
+    pub(crate) fn start<OnEvent, OnExit>(
         prepared: PreparedCodexAdapter,
         cwd: PathBuf,
         stable_session_key: StableSessionKey,
         on_event: OnEvent,
         on_exit: OnExit,
-    ) -> Result<Self, String>
+    ) -> Result<StartedCodexBridge, String>
     where
         OnEvent: Fn(SemanticEventDraft) + Send + Sync + 'static,
         OnExit: Fn(String) + Send + Sync + 'static,
@@ -1337,7 +1370,7 @@ impl CodexBridgeHandle {
         on_activated: OnActivated,
         on_exit: OnExit,
         activation_timeout: std::time::Duration,
-    ) -> Result<Self, String>
+    ) -> Result<StartedCodexBridge, String>
     where
         OnEvent: Fn(SemanticEventDraft) + Send + Sync + 'static,
         OnActivated: Fn() + Send + Sync + 'static,
@@ -1348,13 +1381,13 @@ impl CodexBridgeHandle {
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("Cannot configure Codex loopback bridge: {error}"))?;
-        let bridge_path = random_bridge_path()?;
+        let token = random_bridge_token()?;
+        let expected_authorization = format!("Bearer {token}");
         let endpoint = format!(
-            "ws://{}{}",
+            "ws://{}",
             listener
                 .local_addr()
                 .map_err(|error| format!("Cannot inspect Codex loopback bridge: {error}"))?,
-            bridge_path,
         );
         let (observer, receiver) = semantic_observer_channel(256);
         let on_event = std::sync::Arc::new(on_event);
@@ -1471,7 +1504,7 @@ impl CodexBridgeHandle {
                         });
                     let bridge = serve_one_loopback_client_with_activation(
                         listener,
-                        bridge_path,
+                        expected_authorization,
                         stdio,
                         observer,
                         shutdown_rx,
@@ -1509,14 +1542,17 @@ impl CodexBridgeHandle {
         };
 
         match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Self {
-                endpoint,
-                alive,
-                activated,
-                stopping,
-                shutdown: Some(shutdown_tx),
-                bridge_thread: Some(bridge_thread),
-                observer_thread: Some(observer_thread),
+            Ok(Ok(())) => Ok(StartedCodexBridge {
+                handle: Self {
+                    endpoint,
+                    alive,
+                    activated,
+                    stopping,
+                    shutdown: Some(shutdown_tx),
+                    bridge_thread: Some(bridge_thread),
+                    observer_thread: Some(observer_thread),
+                },
+                terminal_env: HashMap::from([(CODEX_BRIDGE_AUTH_TOKEN_ENV.to_string(), token)]),
             }),
             Ok(Err(error)) => {
                 drop(shutdown_tx);
@@ -1664,11 +1700,13 @@ impl PreparedCodexAdapter {
     }
 
     pub fn tui_command(&self, endpoint: &str, shell_program: &str) -> String {
-        let mut tokens = Vec::with_capacity(self.tui_args.len() + 3);
+        let mut tokens = Vec::with_capacity(self.tui_args.len() + 5);
         tokens.push(self.executable.to_string_lossy().into_owned());
         tokens.extend(self.tui_args.iter().cloned());
         tokens.push("--remote".to_string());
         tokens.push(endpoint.to_string());
+        tokens.push("--remote-auth-token-env".to_string());
+        tokens.push(CODEX_BRIDGE_AUTH_TOKEN_ENV.to_string());
         quote_command_for_shell(&tokens, shell_program)
     }
 }
@@ -1756,16 +1794,21 @@ where
     let mut tui_help_args = sidecar_prefix_args.clone();
     tui_help_args.push("--help".to_string());
     let tui_help = probe(&executable, &tui_help_args)?;
-    if !tui_help.contains("--remote") {
+    if !help_advertises_flag(&tui_help, "--remote") {
         return Err(format!(
             "Codex {version} does not advertise the required --remote capability"
+        ));
+    }
+    if !help_advertises_flag(&tui_help, "--remote-auth-token-env") {
+        return Err(format!(
+            "Codex {version} does not advertise the required --remote-auth-token-env capability"
         ));
     }
 
     let mut app_server_help_args = sidecar_prefix_args.clone();
     app_server_help_args.extend(["app-server".to_string(), "--help".to_string()]);
     let app_server_help = probe(&executable, &app_server_help_args)?;
-    if !app_server_help.contains("--listen") {
+    if !help_advertises_flag(&app_server_help, "--listen") {
         return Err(format!(
             "Codex {version} does not advertise the required app-server --listen capability"
         ));
@@ -1777,6 +1820,10 @@ where
         tui_args,
         version,
     })
+}
+
+fn help_advertises_flag(help: &str, flag: &str) -> bool {
+    help.split_ascii_whitespace().any(|token| token == flag)
 }
 
 fn parse_codex_command(startup_command: &str) -> Result<ParsedCodexCommand, String> {
@@ -2205,6 +2252,10 @@ mod tests {
         SemanticEventKind, SemanticRetention, SemanticSource, StableSessionKey,
     };
     use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{
+        client::IntoClientRequest,
+        http::HeaderValue,
+    };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2212,6 +2263,18 @@ mod tests {
 
     fn reducer() -> CodexSemanticReducer {
         CodexSemanticReducer::new(StableSessionKey::from_tab("codex-tab"))
+    }
+
+    fn authorized_request(
+        endpoint: &str,
+        authorization: &str,
+    ) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        let mut request = endpoint.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(authorization).unwrap(),
+        );
+        request
     }
 
     fn read_probe_child_pid(path: &Path, timeout: std::time::Duration) -> Option<u32> {
@@ -2597,20 +2660,22 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let expected_path = random_bridge_path().unwrap();
-        let endpoint = format!("ws://{}{}", listener.local_addr().unwrap(), expected_path);
+        let expected_authorization = "Bearer round-trip-test-token".to_string();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
         let (observer, _receiver) = semantic_observer_channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let proxy = tokio::spawn(serve_one_loopback_client(
             listener,
-            expected_path,
+            expected_authorization.clone(),
             bridge_stdio,
             observer,
             shutdown_rx,
         ));
 
-        let (mut tui, _) = connect_async(&endpoint).await.unwrap();
+        let (mut tui, _) = connect_async(authorized_request(&endpoint, &expected_authorization))
+            .await
+            .unwrap();
         let (fake_read, mut fake_write) = tokio::io::split(fake_server_stdio);
         let mut fake_read = BufReader::new(fake_read);
 
@@ -2645,19 +2710,18 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
     }
 
     #[tokio::test]
-    async fn proxy_rejects_wrong_path_without_consuming_authenticated_endpoint() {
+    async fn proxy_requires_exact_bearer_header_without_consuming_authenticated_endpoint() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let base_endpoint = format!("ws://{}", listener.local_addr().unwrap());
-        let expected_path = random_bridge_path().unwrap();
-        let other_random_path = random_bridge_path().unwrap();
+        let expected_authorization = "Bearer exact-test-token".to_string();
         let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
         let (observer, _receiver) = semantic_observer_channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let proxy = tokio::spawn(serve_one_loopback_client(
             listener,
-            expected_path.clone(),
+            expected_authorization.clone(),
             bridge_stdio,
             observer,
             shutdown_rx,
@@ -2665,34 +2729,28 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
 
         assert!(
             connect_async(&base_endpoint).await.is_err(),
-            "the unauthenticated root path must be rejected"
+            "a missing bearer header must be rejected"
+        );
+        let mut wrong = base_endpoint.clone().into_client_request().unwrap();
+        wrong.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer wrong-test-token"),
         );
         assert!(
-            connect_async(format!("{base_endpoint}/bridge/wrong"))
-                .await
-                .is_err(),
-            "the port alone must not authorize a loopback client"
-        );
-        assert!(
-            connect_async(format!("{base_endpoint}{other_random_path}"))
-                .await
-                .is_err(),
-            "a different random bearer path must be rejected"
-        );
-        assert!(
-            connect_async(format!("{base_endpoint}{expected_path}?extra=1"))
-                .await
-                .is_err(),
-            "the bearer path must match exactly"
+            connect_async(wrong).await.is_err(),
+            "a wrong bearer token must be rejected"
         );
         assert!(
             !proxy.is_finished(),
             "unauthorized handshakes must not consume the one legitimate bridge"
         );
 
-        let (mut tui, _) = connect_async(format!("{base_endpoint}{expected_path}"))
-            .await
-            .unwrap();
+        let (mut tui, _) = connect_async(authorized_request(
+            &base_endpoint,
+            &expected_authorization,
+        ))
+        .await
+        .unwrap();
         let (fake_read, _fake_write) = tokio::io::split(fake_server_stdio);
         let mut fake_read = BufReader::new(fake_read);
         let request = r#"{"id":93,"method":"future/authenticated","params":{}}"#;
@@ -2708,15 +2766,12 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
     }
 
     #[test]
-    fn bridge_paths_are_random_bearer_tokens() {
-        let first = random_bridge_path().unwrap();
-        let second = random_bridge_path().unwrap();
+    fn bridge_auth_tokens_are_256_bit_random_hex() {
+        let first = random_bridge_token().unwrap();
+        let second = random_bridge_token().unwrap();
 
-        assert!(first.starts_with("/bridge/"));
-        assert_eq!(first.len(), "/bridge/".len() + 64);
-        assert!(first["/bridge/".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_ne!(first, second);
     }
 
@@ -2725,8 +2780,8 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let expected_path = random_bridge_path().unwrap();
-        let endpoint = format!("ws://{}{}", listener.local_addr().unwrap(), expected_path);
+        let expected_authorization = "Bearer activation-test-token".to_string();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
         let (observer, _receiver) = semantic_observer_channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -2738,14 +2793,16 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             });
         let proxy = tokio::spawn(serve_one_loopback_client_with_activation(
             listener,
-            expected_path,
+            expected_authorization.clone(),
             bridge_stdio,
             observer,
             shutdown_rx,
             Some(activation_callback),
             std::time::Duration::from_secs(1),
         ));
-        let (mut tui, _) = connect_async(&endpoint).await.unwrap();
+        let (mut tui, _) = connect_async(authorized_request(&endpoint, &expected_authorization))
+            .await
+            .unwrap();
         let (fake_read, mut fake_write) = tokio::io::split(fake_server_stdio);
         let mut fake_read = BufReader::new(fake_read);
         tui.send(Message::Text(
@@ -2808,7 +2865,10 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
                     return Ok("Usage: codex app-server --listen <URI>".to_string());
                 }
                 if args.last().is_some_and(|arg| arg == "--help") {
-                    return Ok("Usage: codex [OPTIONS]\n  --remote <WS_URL>".to_string());
+                    return Ok(
+                        "Usage: codex [OPTIONS]\n  --remote <WS_URL>\n  --remote-auth-token-env <ENV>"
+                            .to_string(),
+                    );
                 }
                 Err("unexpected probe".to_string())
             },
@@ -2836,6 +2896,9 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         assert!(command.starts_with("& 'C:/Program Files/nodejs/npx.cmd'"));
         assert!(command.contains("'@openai/codex@0.144.3'"));
         assert!(command.contains("'--remote' 'ws://127.0.0.1:49152'"));
+        assert!(command.contains(
+            "'--remote-auth-token-env' 'DEVMANAGER_CODEX_BRIDGE_TOKEN'"
+        ));
         assert!(!command.contains("@latest"));
     }
 
@@ -2878,6 +2941,23 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             },
         );
         assert!(missing_remote.unwrap_err().contains("--remote"));
+
+        let missing_remote_auth = prepare_codex_adapter_with(
+            "codex --dangerously-bypass-approvals-and-sandbox",
+            |_| Ok(std::path::PathBuf::from("C:/tools/codex.exe")),
+            |_, args| {
+                if args.last().is_some_and(|arg| arg == "--version") {
+                    Ok("codex-cli 0.144.3".to_string())
+                } else if args.iter().any(|arg| arg == "app-server") {
+                    Ok("--listen".to_string())
+                } else {
+                    Ok("--remote".to_string())
+                }
+            },
+        );
+        assert!(missing_remote_auth
+            .unwrap_err()
+            .contains("--remote-auth-token-env"));
     }
 
     #[test]
@@ -2891,7 +2971,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
                 } else if args.iter().any(|arg| arg == "app-server") {
                     Ok("--listen".to_string())
                 } else {
-                    Ok("--remote".to_string())
+                    Ok("--remote --remote-auth-token-env".to_string())
                 }
             },
         )
@@ -2903,7 +2983,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         );
         assert_eq!(
             prepared.tui_command("ws://127.0.0.1:1", "bash"),
-            "'C:/exact/codex.exe' '--full-auto' '--remote' 'ws://127.0.0.1:1'"
+            "'C:/exact/codex.exe' '--full-auto' '--remote' 'ws://127.0.0.1:1' '--remote-auth-token-env' 'DEVMANAGER_CODEX_BRIDGE_TOKEN'"
         );
     }
 
@@ -2939,7 +3019,12 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             |_| {},
         )
         .unwrap();
-        let (mut tui, _) = connect_async(bridge.endpoint()).await.unwrap();
+        let authorization = format!(
+            "Bearer {}",
+            bridge.terminal_env()[CODEX_BRIDGE_AUTH_TOKEN_ENV]
+        );
+        let request = authorized_request(bridge.handle.endpoint(), &authorization);
+        let (mut tui, _) = connect_async(request).await.unwrap();
         let raw = r#"{"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"idle"}}}"#;
         tui.send(Message::Text(raw.to_string().into()))
             .await
@@ -2958,7 +3043,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         })
         .await
         .unwrap();
-        bridge.shutdown();
+        bridge.handle_mut().shutdown();
     }
 
     #[tokio::test]
@@ -2975,7 +3060,12 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             },
         )
         .unwrap();
-        let (mut tui, _) = connect_async(bridge.endpoint()).await.unwrap();
+        let authorization = format!(
+            "Bearer {}",
+            bridge.terminal_env()[CODEX_BRIDGE_AUTH_TOKEN_ENV]
+        );
+        let request = authorized_request(bridge.handle.endpoint(), &authorization);
+        let (mut tui, _) = connect_async(request).await.unwrap();
 
         tui.close(None).await.unwrap();
 
@@ -2986,7 +3076,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         .unwrap()
         .expect("unexpected disconnect must degrade the adapter");
         assert!(error.contains("closed"), "unexpected exit reason: {error}");
-        bridge.shutdown();
+        bridge.handle_mut().shutdown();
     }
 
     #[test]
@@ -3030,7 +3120,10 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             |_| {},
             |_| {},
         );
-        let error = result.unwrap_err();
+        let error = match result {
+            Ok(_) => panic!("missing sidecar must fail"),
+            Err(error) => error,
+        };
         assert!(
             error.contains("start Codex app-server"),
             "unexpected bridge error: {error}"

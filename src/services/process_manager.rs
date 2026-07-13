@@ -1292,9 +1292,13 @@ impl ProcessManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = ops;
     }
 
-    fn prepare_codex_launch_for_session(&self, launch: &mut AiLaunchSpec, session_id: &str) {
+    fn prepare_codex_launch_for_session(
+        &self,
+        launch: &mut AiLaunchSpec,
+        session_id: &str,
+    ) -> HashMap<String, String> {
         if launch.tool != SessionKind::Codex {
-            return;
+            return HashMap::new();
         }
         let stable_session_key = StableSessionKey::from_tab(&launch.tab_id);
         let Some(generation) = next_codex_adapter_generation(&self.inner.codex_adapter_generation)
@@ -1306,7 +1310,7 @@ impl ProcessManager {
                     health: SemanticAdapterHealth::Degraded,
                 },
             );
-            return;
+            return HashMap::new();
         };
         let identity = CodexAdapterIdentity {
             stable_session_key,
@@ -1346,7 +1350,7 @@ impl ProcessManager {
             Ok(prepared) => prepared,
             Err(_) => {
                 mark_codex_adapter_degraded(&self.inner, session_id, &identity);
-                return;
+                return HashMap::new();
             }
         };
 
@@ -1364,7 +1368,7 @@ impl ProcessManager {
             .codex_adapter_activation_timeout
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut handle = match CodexBridgeHandle::start_with_activation_timeout(
+        let started = match CodexBridgeHandle::start_with_activation_timeout(
             prepared.clone(),
             launch.cwd.clone(),
             identity.stable_session_key.clone(),
@@ -1401,13 +1405,14 @@ impl ProcessManager {
             Ok(handle) => handle,
             Err(_) => {
                 mark_codex_adapter_degraded(&self.inner, session_id, &identity);
-                return;
+                return HashMap::new();
             }
         };
+        let (mut handle, terminal_env) = started.into_parts();
         if !handle.is_running() {
             handle.shutdown();
             mark_codex_adapter_degraded(&self.inner, session_id, &identity);
-            return;
+            return HashMap::new();
         }
 
         let endpoint = handle.endpoint().to_string();
@@ -1445,7 +1450,7 @@ impl ProcessManager {
             }
         };
         if !installed {
-            return;
+            return HashMap::new();
         }
         emit_remote_session_event(
             &self.inner,
@@ -1454,6 +1459,7 @@ impl ProcessManager {
             },
         );
         launch.startup_command = prepared.tui_command(&endpoint, &launch.shell_program);
+        terminal_env
     }
 
     fn cleanup_codex_adapter_session(&self, session_id: &str) {
@@ -5706,7 +5712,7 @@ fn spawn_ai_session_with_inner(
     }
     let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
     let mut effective_launch = launch.clone();
-    manager.prepare_codex_launch_for_session(&mut effective_launch, session_id);
+    let terminal_env = manager.prepare_codex_launch_for_session(&mut effective_launch, session_id);
     let codex_identity = inner
         .codex_adapter_registry
         .lock()
@@ -5727,7 +5733,7 @@ fn spawn_ai_session_with_inner(
         dimensions,
         effective_launch.shell_program.clone(),
         effective_launch.shell_args.clone(),
-        HashMap::new(),
+        terminal_env,
         inner
             .scrollback_lines
             .read()
@@ -5849,7 +5855,10 @@ mod tests {
     use std::fs;
     use std::sync::Condvar;
     use std::thread;
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
+    };
 
     #[derive(Default)]
     struct RecordingCodexFallbackTerminalOps {
@@ -6083,11 +6092,25 @@ mod tests {
             startup_command: "codex --full-auto".to_string(),
         };
 
-        manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
+        let terminal_env =
+            manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
 
         assert!(launch.startup_command.contains("--full-auto"));
         assert!(launch.startup_command.contains("--remote"));
         assert!(launch.startup_command.contains("ws://127.0.0.1:"));
+        assert!(launch
+            .startup_command
+            .contains("--remote-auth-token-env"));
+        let token = terminal_env
+            .get("DEVMANAGER_CODEX_BRIDGE_TOKEN")
+            .expect("bridge bearer token must be scoped to this terminal");
+        assert_eq!(token.len(), 64, "bridge token must contain 256 random bits");
+        assert!(!launch.startup_command.contains(token));
+        let endpoint = websocket_endpoint_from_command(&launch.startup_command);
+        let parsed = endpoint
+            .parse::<tokio_tungstenite::tungstenite::http::Uri>()
+            .unwrap();
+        assert_eq!(parsed.path(), "/", "Codex accepts only host:port URLs");
         {
             let registry = manager.inner.codex_adapter_registry.lock().unwrap();
             assert!(matches!(
@@ -6119,8 +6142,12 @@ mod tests {
             } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
         )));
 
-        let endpoint = websocket_endpoint_from_command(&launch.startup_command);
-        let (mut tui, _) = connect_async(endpoint).await.unwrap();
+        let mut request = endpoint.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let (mut tui, _) = connect_async(request).await.unwrap();
         tui.send(Message::Text(
             r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","version":"test"}}}"#
                 .to_string()
@@ -6247,7 +6274,8 @@ mod tests {
         let mut stale = launch_spec("stale");
         manager.prepare_codex_launch_for_session(&mut stale, "stale-session");
         let mut current = launch_spec("current");
-        manager.prepare_codex_launch_for_session(&mut current, "current-session");
+        let current_env =
+            manager.prepare_codex_launch_for_session(&mut current, "current-session");
 
         let current_identity = manager
             .inner
@@ -6265,7 +6293,15 @@ mod tests {
             &current_identity,
         ));
         let endpoint = websocket_endpoint_from_command(&current.startup_command);
-        let (mut tui, _) = connect_async(endpoint).await.unwrap();
+        let token = current_env
+            .get("DEVMANAGER_CODEX_BRIDGE_TOKEN")
+            .expect("current Codex bridge token");
+        let mut request = endpoint.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let (mut tui, _) = connect_async(request).await.unwrap();
         tui.send(Message::Text(
             r#"{"id":1,"method":"initialize","params":{}}"#
                 .to_string()
