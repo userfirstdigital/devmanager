@@ -1,4 +1,4 @@
-import { ArrowLeft, TerminalSquare } from "lucide-react";
+import { TerminalSquare } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AppShell } from "./app/AppShell";
@@ -19,14 +19,13 @@ import {
   writeSavedRoute,
 } from "./app/restore";
 import { PairingGate } from "./components/PairingGate";
-import { MobileKeyRow } from "./components/MobileKeyRow";
-import { TerminalView } from "./components/Terminal";
-import { makeDemoWorkspace } from "./dev/demoWorkspace";
+import { makeDemoEvents, makeDemoWorkspace } from "./dev/demoWorkspace";
+import { clearOtherRuntimes, pruneDrafts } from "./drafts/draftStore";
 import { bindAppLifecycle } from "./platform/lifecycle";
 import { ProjectScreen } from "./projects/ProjectScreen";
 import { ProjectsScreen } from "./projects/ProjectsScreen";
+import { SessionScreen } from "./sessions/SessionScreen";
 import { SessionsScreen } from "./sessions/SessionsScreen";
-import { describeSession } from "./sessions/sessionModel";
 import { SettingsScreen } from "./settings/SettingsScreen";
 import { useStore } from "./store";
 
@@ -56,54 +55,6 @@ function LoadingHost({ offline }: { offline: boolean }) {
       <p>{offline ? "Waiting for the DevManager host…" : "Connecting to your workspace…"}</p>
       <span className="dm-native-spinner" aria-hidden="true" />
     </main>
-  );
-}
-
-function LegacySessionSurface({
-  route,
-  workspace,
-  onNavigate,
-}: {
-  route: Extract<AppRoute, { name: "session" }>;
-  workspace: NonNullable<ReturnType<typeof useStore.getState>["workspace"]>;
-  onNavigate(route: AppRoute): void;
-}) {
-  const key = stableSessionKeyForRoute(route);
-  const summary = workspace.sessions.find((session) => session.stableSessionKey === key);
-  const item = summary ? describeSession(workspace, summary) : null;
-
-  if (!summary || !item) return null;
-
-  return (
-    <section className="dm-screen dm-session-detail-screen" aria-labelledby="session-title">
-      <header className="dm-session-header">
-        <button type="button" className="dm-nav-back dm-session-back" onClick={() => onNavigate({ name: "sessions" })}>
-          <ArrowLeft size={21} aria-hidden="true" />
-          Sessions
-        </button>
-        <div className="dm-session-title-block">
-          <h1 id="session-title">{item.label}</h1>
-          <p>{item.projectName} · {item.stateLabel}</p>
-        </div>
-        <span className="dm-header-balance" aria-hidden="true" />
-      </header>
-      {DEMO_MODE ? (
-        <div className="dm-screen-scroll">
-          <div className="dm-native-empty">
-            <span className="dm-native-empty-icon" aria-hidden="true">
-              <TerminalSquare size={28} />
-            </span>
-            <h2>Session ready</h2>
-            <p>The semantic conversation timeline mounts here in the complete mobile interface.</p>
-          </div>
-        </div>
-      ) : (
-        <div className="dm-legacy-terminal-wrap">
-          <TerminalView sessionId={summary.sessionId} />
-          <MobileKeyRow sessionId={summary.sessionId} />
-        </div>
-      )}
-    </section>
   );
 }
 
@@ -161,6 +112,16 @@ export function App() {
 
   useEffect(() => {
     if (!workspace) return;
+
+    clearOtherRuntimes(workspace.runtimeInstanceId);
+    pruneDrafts(
+      workspace.runtimeInstanceId,
+      new Set(
+        workspace.sessions.flatMap((session) =>
+          session.stableSessionKey ? [session.stableSessionKey] : [],
+        ),
+      ),
+    );
 
     if (resolvedRuntime.current === null) {
       const resolved = resolveColdStart(initialRoute.current, savedRoute.current, {
@@ -242,10 +203,16 @@ export function App() {
       break;
     case "session":
       screen = (
-        <LegacySessionSurface
+        <SessionScreen
           route={route}
           workspace={workspace}
+          status={status}
           onNavigate={moveTo}
+          demoEvents={
+            DEMO_MODE
+              ? makeDemoEvents(stableSessionKeyForRoute(route) ?? "")
+              : undefined
+          }
         />
       );
       break;

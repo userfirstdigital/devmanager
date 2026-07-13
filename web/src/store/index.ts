@@ -131,6 +131,8 @@ export interface StoreState {
   drainBootstrap(sessionId: string): SessionBootstrapFrame | null;
   drainTerminalFrames(sessionId: string): SessionOutputFrame[];
   refreshActiveConnection(): void;
+  prepareComposer(): void;
+  interruptSession(stableSessionKey: StableSessionKey): void;
   sendInput(sessionId: string, text: string): void;
   pasteImage(sessionId: string, payload: WebImagePastePayload): void;
   sendResize(sessionId: string, rows: number, cols: number): void;
@@ -1607,6 +1609,20 @@ export const useStore = create<StoreState>((set, get) => {
 
     refreshActiveConnection() {
       get().client?.wake();
+    },
+
+    prepareComposer() {
+      get().client?.ensureWriterLease();
+    },
+
+    interruptSession(stableSessionKey) {
+      const accepted = get().client?.sendWithWriterLease({
+        type: "interruptSession",
+        stableSessionKey,
+      });
+      if (accepted === false) {
+        set({ lastError: "Too many actions are waiting to be sent." });
+      }
     },
 
     sendInput(sessionId, text) {

@@ -38,7 +38,7 @@ type WithoutExpectedLeaseGeneration<T> = T extends unknown
   : never;
 
 export type WriterLeaseFrame = WithoutExpectedLeaseGeneration<
-  Extract<WsInbound, { type: "input" | "pasteImage" | "resize" }>
+  Extract<WsInbound, { type: "input" | "pasteImage" | "resize" | "interruptSession" }>
 >;
 
 export interface WsClientCallbacks {

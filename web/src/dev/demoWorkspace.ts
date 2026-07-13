@@ -1,9 +1,91 @@
 import type {
+  SemanticEvent,
   SessionStatus,
   WebSessionKind,
   WebSessionSummary,
   WebWorkspaceSnapshot,
 } from "../api/types";
+
+type DemoEventPayload<E extends SemanticEvent = SemanticEvent> = E extends SemanticEvent
+  ? Omit<E, "stableSessionKey" | "sequence" | "occurredAtEpochMs" | "source">
+  : never;
+
+function demoEvent(
+  stableSessionKey: string,
+  sequence: number,
+  occurredAtEpochMs: number,
+  event: DemoEventPayload,
+): SemanticEvent {
+  return {
+    stableSessionKey,
+    sequence,
+    occurredAtEpochMs,
+    source: stableSessionKey.includes("mobile-ui") ? "claude" : "system",
+    ...event,
+  } as SemanticEvent;
+}
+
+export function makeDemoEvents(stableSessionKey: string, now = Date.now()): SemanticEvent[] {
+  if (stableSessionKey === "tab:mobile-ui") {
+    return [
+      demoEvent(stableSessionKey, 79, now - 90_000, {
+        kind: "userMessage",
+        text: "Make the remote interface feel completely native on iPhone, including seamless return after multitasking.",
+      }),
+      demoEvent(stableSessionKey, 80, now - 72_000, {
+        kind: "assistantMessage",
+        message_id: "demo-message",
+        text: "I’ve built the session home around projects and recent activity. The current session now returns exactly where you left it, while the DevManager host remains the source of truth.",
+        streaming: false,
+      }),
+      demoEvent(stableSessionKey, 81, now - 48_000, {
+        kind: "tool",
+        tool_id: "demo-tool",
+        name: "Run web tests",
+        state: "completed",
+        summary: "101 tests passed, including runtime resume and composer behavior.",
+      }),
+      demoEvent(stableSessionKey, 82, now - 34_000, {
+        kind: "diff",
+        item_id: "demo-diff",
+        unified_diff: "+ Native semantic timeline\n+ Runtime-scoped drafts\n+ Automatic terminal fallback",
+      }),
+      demoEvent(stableSessionKey, 83, now - 12_000, {
+        kind: "question",
+        question_id: "demo-question",
+        prompt: "The native session experience is ready for a visual pass.",
+        choices: ["Review now", "Keep working"],
+      }),
+    ];
+  }
+  if (stableSessionKey.startsWith("server:")) {
+    return [
+      demoEvent(stableSessionKey, 17, now - 52_000, {
+        kind: "status",
+        state: "Server started",
+        detail: "Watching for changes",
+      }),
+      demoEvent(stableSessionKey, 18, now - 31_000, {
+        kind: "output",
+        stream: "stdout",
+        text: "Local: http://localhost:5199/\nready in 284 ms\n",
+      }),
+    ];
+  }
+  return [
+    demoEvent(stableSessionKey, 1, now - 60_000, {
+      kind: "command",
+      command_id: "demo-command",
+      text: "git status --short",
+      exit_code: 0,
+    }),
+    demoEvent(stableSessionKey, 2, now - 58_000, {
+      kind: "output",
+      stream: "stdout",
+      text: "Working tree clean\n",
+    }),
+  ];
+}
 
 function session(
   stableSessionKey: string,

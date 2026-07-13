@@ -73,6 +73,27 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function readBlobBytes(blob: Blob): Promise<Uint8Array> {
+  const withArrayBuffer = blob as Blob & {
+    arrayBuffer?: () => Promise<ArrayBuffer>;
+  };
+  if (typeof withArrayBuffer.arrayBuffer === "function") {
+    return withArrayBuffer.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Image could not be read."));
+    reader.onload = () => {
+      if (!(reader.result instanceof ArrayBuffer)) {
+        reject(new Error("Image could not be read."));
+        return;
+      }
+      resolve(new Uint8Array(reader.result));
+    };
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
 export async function buildImagePastePayload(
   file: Blob,
 ): Promise<WebImagePastePayload> {
@@ -88,7 +109,7 @@ export async function buildImagePastePayload(
     file instanceof File && file.name
       ? file.name
       : defaultFileNameForMimeType(mimeType);
-  const bytes = new Uint8Array(await file.arrayBuffer());
+  const bytes = await readBlobBytes(file);
 
   return {
     mimeType,

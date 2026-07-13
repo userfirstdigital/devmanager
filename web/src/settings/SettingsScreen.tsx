@@ -9,6 +9,7 @@ import {
 
 import type { WsStatus } from "../api/ws";
 import { isStandaloneDisplayMode } from "../app/restore";
+import { useDensityPreference } from "./densityPreference";
 
 interface SettingsScreenProps {
   status: WsStatus;
@@ -24,6 +25,7 @@ function statusLabel(status: WsStatus): string {
 export function SettingsScreen({ status }: SettingsScreenProps) {
   const secure = globalThis.isSecureContext === true;
   const installed = isStandaloneDisplayMode();
+  const [density, setDensity] = useDensityPreference();
 
   return (
     <section className="dm-screen" aria-labelledby="settings-title">
@@ -41,10 +43,19 @@ export function SettingsScreen({ status }: SettingsScreenProps) {
               <span className="dm-setting-icon dm-icon-blue" aria-hidden="true"><MoonStar size={18} /></span>
               <span className="dm-row-copy"><strong>Appearance</strong><small>Matches your system</small></span>
             </div>
-            <div className="dm-setting-row">
+            <label className="dm-setting-row">
               <span className="dm-setting-icon dm-icon-purple" aria-hidden="true"><MonitorSmartphone size={18} /></span>
-              <span className="dm-row-copy"><strong>Interface density</strong><small>Calm</small></span>
-            </div>
+              <span className="dm-row-copy"><strong>Interface density</strong><small>Calm is the native default</small></span>
+              <select
+                aria-label="Interface density"
+                value={density}
+                onChange={(event) => setDensity(event.currentTarget.value as typeof density)}
+              >
+                <option value="calm">Calm</option>
+                <option value="minimal">Minimal</option>
+                <option value="full">Full detail</option>
+              </select>
+            </label>
           </div>
         </section>
 
