@@ -1390,7 +1390,8 @@ impl NativeShell {
                     on_complete(this, result, cx);
                 });
             },
-        );
+        )
+        .detach();
         true
     }
 
