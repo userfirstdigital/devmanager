@@ -1,5 +1,6 @@
 use crate::models::{SessionTab, TabType};
 use crate::state::{SessionKind, SessionRuntimeState, SessionStatus};
+use crate::terminal::session::TerminalModeSnapshot;
 use alacritty_terminal::vte::{Parser, Perform};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -9,7 +10,6 @@ const DEFAULT_CANONICAL_EVENTS: usize = 50_000;
 const DEFAULT_CANONICAL_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_VERBOSE_EVENTS: usize = 5_000;
 const DEFAULT_VERBOSE_BYTES: usize = 8 * 1024 * 1024;
-const VERBOSE_TRUNCATION_DEDUP_KEY: &str = "semantic:verbose-truncation";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -212,16 +212,25 @@ pub struct SemanticReplay {
     pub events: Vec<SemanticEvent>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalCursorMetadata {
+    pub oldest_sequence: u64,
+    pub latest_sequence: u64,
+}
+
 #[derive(Debug)]
 pub struct SemanticJournal {
     limits: JournalLimits,
     next_sequence: u64,
     canonical: VecDeque<StoredSemanticEvent>,
     verbose: VecDeque<StoredSemanticEvent>,
+    verbose_truncation_marker: Option<StoredSemanticEvent>,
     canonical_bytes: usize,
     verbose_bytes: usize,
     highest_evicted_sequence: u64,
     deduplication_sequences: HashMap<String, u64>,
+    #[cfg(test)]
+    replay_invocations: std::cell::Cell<u64>,
 }
 
 impl Default for SemanticJournal {
@@ -237,50 +246,82 @@ impl SemanticJournal {
             next_sequence: 1,
             canonical: VecDeque::new(),
             verbose: VecDeque::new(),
+            verbose_truncation_marker: None,
             canonical_bytes: 0,
             verbose_bytes: 0,
             highest_evicted_sequence: 0,
             deduplication_sequences: HashMap::new(),
+            #[cfg(test)]
+            replay_invocations: std::cell::Cell::new(0),
         }
     }
 
     pub fn push(&mut self, draft: SemanticEventDraft) -> SemanticEvent {
-        if let Some(sequence) = draft
+        let replaced_sequence = draft
             .deduplication_key
             .as_ref()
             .and_then(|key| self.deduplication_sequences.get(key))
-            .copied()
-        {
+            .copied();
+        let sequence = self.allocate_sequence();
+        if let Some(sequence) = replaced_sequence {
             self.remove_sequence(sequence);
-            return self.insert_draft(draft, sequence);
         }
-
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
         self.insert_draft(draft, sequence)
     }
 
+    pub fn cursor_metadata(&self) -> JournalCursorMetadata {
+        let oldest_sequence = self
+            .canonical
+            .front()
+            .into_iter()
+            .chain(self.verbose.front())
+            .chain(self.verbose_truncation_marker.as_ref())
+            .map(|stored| stored.event.sequence)
+            .min()
+            .unwrap_or(0);
+        JournalCursorMetadata {
+            oldest_sequence,
+            latest_sequence: self.next_sequence - 1,
+        }
+    }
+
     pub fn replay_after(&self, cursor: u64) -> SemanticReplay {
+        #[cfg(test)]
+        self.replay_invocations
+            .set(self.replay_invocations.get().saturating_add(1));
         let mut available = self
             .canonical
             .iter()
             .chain(self.verbose.iter())
+            .chain(self.verbose_truncation_marker.iter())
             .map(|stored| stored.event.clone())
             .collect::<Vec<_>>();
         available.sort_by_key(|event| event.sequence);
-        let oldest_sequence = available.first().map(|event| event.sequence).unwrap_or(0);
-        let latest_sequence = self.next_sequence.saturating_sub(1);
+        let cursor_metadata = self.cursor_metadata();
         let cursor_rolled_over = cursor != 0 && cursor <= self.highest_evicted_sequence;
         let events = available
             .into_iter()
             .filter(|event| event.sequence > cursor)
             .collect();
         SemanticReplay {
-            oldest_sequence,
-            latest_sequence,
+            oldest_sequence: cursor_metadata.oldest_sequence,
+            latest_sequence: cursor_metadata.latest_sequence,
             cursor_rolled_over,
             events,
         }
+    }
+
+    #[cfg(test)]
+    fn replay_invocations(&self) -> u64 {
+        self.replay_invocations.get()
+    }
+
+    fn allocate_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence
+            .checked_add(1)
+            .expect("semantic journal sequence exhausted");
+        sequence
     }
 
     fn insert_draft(&mut self, draft: SemanticEventDraft, sequence: u64) -> SemanticEvent {
@@ -372,8 +413,9 @@ impl SemanticJournal {
     }
 
     fn upsert_verbose_truncation_marker(&mut self, key: &StableSessionKey) {
-        let marker = SemanticEventDraft {
+        let event = SemanticEvent {
             stable_session_key: key.clone(),
+            sequence: self.allocate_sequence(),
             occurred_at_epoch_ms: 0,
             source: SemanticSource::System,
             kind: SemanticEventKind::Status {
@@ -382,10 +424,12 @@ impl SemanticJournal {
                     "Earlier verbose output was discarded by the rolling limit.".to_string(),
                 ),
             },
-            retention: SemanticRetention::Canonical,
-            deduplication_key: Some(VERBOSE_TRUNCATION_DEDUP_KEY.to_string()),
         };
-        self.push(marker);
+        self.verbose_truncation_marker = Some(StoredSemanticEvent {
+            encoded_bytes: serde_json::to_vec(&event).map_or(0, |encoded| encoded.len()),
+            event,
+            deduplication_key: None,
+        });
     }
 
     fn remove_deduplication_for(&mut self, stored: &StoredSemanticEvent) {
@@ -588,15 +632,36 @@ impl SemanticJournalStore {
         true
     }
 
+    pub fn observe_native_terminal_mode(
+        &mut self,
+        session_id: &str,
+        mode: TerminalModeSnapshot,
+        occurred_at_epoch_ms: u64,
+    ) -> bool {
+        let Some(source) = self
+            .session_bindings
+            .get(session_id)
+            .map(|binding| binding.source)
+        else {
+            return false;
+        };
+        let raw_required = if matches!(source, SemanticSource::Claude | SemanticSource::Codex) {
+            mode.mouse_reporting()
+        } else {
+            mode.alternate_screen || mode.mouse_reporting()
+        };
+        self.observe_terminal_mode(session_id, raw_required, occurred_at_epoch_ms)
+    }
+
     pub fn record(&mut self, draft: SemanticEventDraft) -> SemanticEvent {
         let key = draft.stable_session_key.clone();
         let occurred_at_epoch_ms = draft.occurred_at_epoch_ms;
         let session = self.ensure_session(&key, false);
         let event = session.journal.push(draft);
-        let replay = session.journal.replay_after(0);
+        let cursor = session.journal.cursor_metadata();
         session.metadata.last_activity_epoch_ms = Some(occurred_at_epoch_ms);
-        session.metadata.oldest_sequence = replay.oldest_sequence;
-        session.metadata.latest_sequence = replay.latest_sequence;
+        session.metadata.oldest_sequence = cursor.oldest_sequence;
+        session.metadata.latest_sequence = cursor.latest_sequence;
         event
     }
 
@@ -781,7 +846,7 @@ mod tests {
     use super::*;
     use crate::models::{SessionTab, TabType};
     use crate::state::{SessionKind, SessionRuntimeState};
-    use crate::terminal::session::TerminalBackend;
+    use crate::terminal::session::{TerminalBackend, TerminalModeSnapshot};
     use std::path::PathBuf;
 
     fn output_draft(
@@ -909,6 +974,59 @@ mod tests {
     }
 
     #[test]
+    fn verbose_truncation_marker_does_not_consume_canonical_capacity() {
+        let key = StableSessionKey::from_server("cmd-1");
+        let mut journal = SemanticJournal::with_limits(JournalLimits {
+            canonical_events: 2,
+            canonical_bytes: 1024,
+            verbose_events: 1,
+            verbose_bytes: 1024,
+        });
+        journal.push(output_draft(
+            key.clone(),
+            "canonical-one",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        journal.push(output_draft(
+            key.clone(),
+            "canonical-two",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        journal.push(output_draft(
+            key.clone(),
+            "verbose-one",
+            SemanticRetention::Verbose,
+            None,
+        ));
+        journal.push(output_draft(
+            key,
+            "verbose-two",
+            SemanticRetention::Verbose,
+            None,
+        ));
+
+        let replay = journal.replay_after(0);
+        let output = replay
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output,
+            vec!["canonical-one", "canonical-two", "verbose-two"]
+        );
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.kind,
+            SemanticEventKind::Status { state, .. } if state == "verboseOutputTruncated"
+        )));
+    }
+
+    #[test]
     fn replay_reports_rollover_for_a_verbose_gap_after_retained_canonical_history() {
         let key = StableSessionKey::from_server("cmd-1");
         let mut journal = SemanticJournal::with_limits(JournalLimits {
@@ -941,24 +1059,149 @@ mod tests {
     }
 
     #[test]
-    fn deduplication_replaces_an_existing_event_without_advancing_sequence() {
+    fn deduplication_replacement_gets_a_fresh_sequence_and_preserves_eviction_order() {
         let key = StableSessionKey::from_tab("tab-1");
-        let mut journal = SemanticJournal::default();
+        let mut journal = SemanticJournal::with_limits(JournalLimits {
+            canonical_events: 2,
+            canonical_bytes: 1024,
+            verbose_events: 2,
+            verbose_bytes: 1024,
+        });
         let first = journal.push(output_draft(
             key.clone(),
             "partial",
             SemanticRetention::Canonical,
             Some("message-1"),
         ));
+        let middle = journal.push(output_draft(
+            key.clone(),
+            "middle",
+            SemanticRetention::Canonical,
+            None,
+        ));
         let replacement = journal.push(output_draft(
-            key,
+            key.clone(),
             "complete",
             SemanticRetention::Canonical,
             Some("message-1"),
         ));
 
-        assert_eq!(replacement.sequence, first.sequence);
-        assert_eq!(journal.replay_after(0).events.len(), 1);
+        assert!(replacement.sequence > middle.sequence);
+        assert!(replacement.sequence > first.sequence);
+        assert_eq!(
+            journal
+                .replay_after(first.sequence)
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![middle.sequence, replacement.sequence]
+        );
+
+        let last = journal.push(output_draft(
+            key,
+            "last",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        assert_eq!(
+            journal
+                .replay_after(0)
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![replacement.sequence, last.sequence]
+        );
+    }
+
+    #[test]
+    fn cursor_metadata_tracks_retained_bounds_without_replaying_payloads() {
+        let key = StableSessionKey::from_server("cmd-1");
+        let mut journal = SemanticJournal::with_limits(JournalLimits {
+            canonical_events: 2,
+            canonical_bytes: 1024,
+            verbose_events: 1,
+            verbose_bytes: 1024,
+        });
+        journal.push(output_draft(
+            key.clone(),
+            "canonical",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        journal.push(output_draft(
+            key.clone(),
+            "verbose-one",
+            SemanticRetention::Verbose,
+            None,
+        ));
+        journal.push(output_draft(
+            key,
+            "verbose-two",
+            SemanticRetention::Verbose,
+            None,
+        ));
+
+        let cursor = journal.cursor_metadata();
+        fn assert_copy<T: Copy>(_: T) {}
+        assert_copy(cursor);
+        assert_eq!(cursor.oldest_sequence, 1);
+        assert_eq!(cursor.latest_sequence, 4);
+    }
+
+    #[test]
+    fn store_metadata_updates_do_not_replay_retained_payloads() {
+        let key = StableSessionKey::from_server("cmd-1");
+        let mut store = SemanticJournalStore::default();
+        let retained_payload = "retained-payload".repeat(1_000);
+        store.record(output_draft(
+            key.clone(),
+            &retained_payload,
+            SemanticRetention::Canonical,
+            None,
+        ));
+        let replay_calls = {
+            let journal = &store.sessions.get(&key).expect("journal").journal;
+            assert_eq!(journal.replay_after(0).events.len(), 1);
+            journal.replay_invocations()
+        };
+
+        store.record(output_draft(
+            key.clone(),
+            "next-event",
+            SemanticRetention::Canonical,
+            None,
+        ));
+
+        assert_eq!(
+            store
+                .sessions
+                .get(&key)
+                .expect("journal")
+                .journal
+                .replay_invocations(),
+            replay_calls
+        );
+    }
+
+    #[test]
+    fn sequence_exhaustion_fails_closed_before_inserting_an_event() {
+        let key = StableSessionKey::from_server("cmd-1");
+        let mut journal = SemanticJournal::default();
+        journal.next_sequence = u64::MAX;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            journal.push(output_draft(
+                key,
+                "must-not-be-inserted",
+                SemanticRetention::Canonical,
+                None,
+            ));
+        }));
+
+        assert!(result.is_err());
+        assert!(journal.replay_after(0).events.is_empty());
     }
 
     #[test]
@@ -966,6 +1209,36 @@ mod tests {
         let mut projector = PlainTextProjector::default();
         assert_eq!(projector.push(b"ok\x1b[3"), "ok");
         assert_eq!(projector.push(b"1mred\x1b[0m\rnext\n"), "red\nnext\n");
+    }
+
+    #[test]
+    fn ansi_projector_ignores_osc_terminated_by_bel() {
+        let mut projector = PlainTextProjector::default();
+        assert_eq!(
+            projector.push(b"before\x1b]0;title\x07after"),
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn ansi_projector_handles_split_osc_string_terminator() {
+        let mut projector = PlainTextProjector::default();
+        assert_eq!(projector.push(b"before\x1b]0;title\x1b"), "before");
+        assert_eq!(projector.push(b"\\after"), "after");
+    }
+
+    #[test]
+    fn ansi_projector_handles_utf8_split_across_chunks() {
+        let mut projector = PlainTextProjector::default();
+        assert_eq!(projector.push(&[b'b', 0xc3]), "b");
+        assert_eq!(projector.push(&[0xa9, b'!']), "é!");
+    }
+
+    #[test]
+    fn ansi_projector_does_not_leak_malformed_or_incomplete_tails() {
+        let mut projector = PlainTextProjector::default();
+        assert_eq!(projector.push(b"ok\x1b["), "ok");
+        assert_eq!(projector.push(b"999999999999999999999999"), "");
     }
 
     #[test]
@@ -1031,5 +1304,62 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(modes, vec![false, true]);
+    }
+
+    #[test]
+    fn native_terminal_mode_keeps_ai_alternate_screens_semantic_but_shells_raw() {
+        let mut ai_runtime = SessionRuntimeState::new(
+            "ai-runtime",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        ai_runtime.session_kind = SessionKind::Claude;
+        ai_runtime.tab_id = Some("ai-tab".to_string());
+        let mut shell_runtime = SessionRuntimeState::new(
+            "shell-runtime",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        shell_runtime.session_kind = SessionKind::Shell;
+        shell_runtime.command_id = Some("shell-command".to_string());
+        let mut store = SemanticJournalStore::default();
+        assert!(store.observe_runtime(&ai_runtime, &[], 100));
+        assert!(store.observe_runtime(&shell_runtime, &[], 100));
+        let alternate_screen = TerminalModeSnapshot {
+            alternate_screen: true,
+            ..TerminalModeSnapshot::default()
+        };
+
+        assert!(store.observe_native_terminal_mode("ai-runtime", alternate_screen, 101));
+        assert!(store.observe_native_terminal_mode("shell-runtime", alternate_screen, 101));
+        assert!(
+            !store
+                .metadata(&StableSessionKey::from_tab("ai-tab"))
+                .expect("AI metadata")
+                .raw_required
+        );
+        assert!(
+            store
+                .metadata(&StableSessionKey::from_server("shell-command"))
+                .expect("shell metadata")
+                .raw_required
+        );
+
+        assert!(store.observe_native_terminal_mode(
+            "ai-runtime",
+            TerminalModeSnapshot {
+                mouse_report_click: true,
+                ..alternate_screen
+            },
+            102,
+        ));
+        assert!(
+            store
+                .metadata(&StableSessionKey::from_tab("ai-tab"))
+                .expect("AI metadata")
+                .raw_required
+        );
     }
 }

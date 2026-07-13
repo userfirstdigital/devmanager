@@ -22,7 +22,8 @@ use crate::models::{
 use crate::persistence::{self, PersistenceError};
 use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
 use crate::terminal::session::{
-    TerminalReplica, TerminalScreenSnapshot, TerminalSearchMatch, TerminalSessionView,
+    TerminalModeSnapshot, TerminalReplica, TerminalScreenSnapshot, TerminalSearchMatch,
+    TerminalSessionView,
 };
 use rmp_serde::{decode::from_slice as from_messagepack_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
@@ -1248,15 +1249,28 @@ impl RemoteHostService {
     }
 
     pub fn push_session_output(&self, session_id: &str, bytes: Vec<u8>) {
+        self.push_session_output_inner(session_id, bytes, None);
+    }
+
+    pub fn push_session_output_with_mode(
+        &self,
+        session_id: &str,
+        bytes: Vec<u8>,
+        mode: TerminalModeSnapshot,
+    ) {
+        self.push_session_output_inner(session_id, bytes, Some(mode));
+    }
+
+    fn push_session_output_inner(
+        &self,
+        session_id: &str,
+        bytes: Vec<u8>,
+        mode: Option<TerminalModeSnapshot>,
+    ) {
         if bytes.is_empty() {
             return;
         }
         let emitted_at_epoch_ms = now_epoch_ms();
-        let _snapshot_guard = self
-            .inner
-            .snapshot_state_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tabs = self
             .inner
             .shared_state
@@ -1277,15 +1291,26 @@ impl RemoteHostService {
                 let runtime_changed = runtime.as_ref().is_some_and(|runtime| {
                     journals.observe_runtime(runtime, &tabs, emitted_at_epoch_ms)
                 });
+                let mode_changed = mode.is_some_and(|mode| {
+                    journals.observe_native_terminal_mode(
+                        session_id,
+                        mode,
+                        emitted_at_epoch_ms,
+                    )
+                });
                 let output_changed =
                     journals.observe_output(session_id, &bytes, emitted_at_epoch_ms);
-                runtime_changed || output_changed
+                runtime_changed || mode_changed || output_changed
             })
             .unwrap_or(false);
         if semantic_changed {
+            let _snapshot_guard = self
+                .inner
+                .snapshot_state_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
         }
-        drop(_snapshot_guard);
         self.mark_subscribed_clients_bootstrap_pending(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
@@ -1316,11 +1341,6 @@ impl RemoteHostService {
     }
 
     pub fn push_session_runtime(&self, session_id: &str, runtime: SessionRuntimeState) {
-        let _snapshot_guard = self
-            .inner
-            .snapshot_state_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tabs = self
             .inner
             .shared_state
@@ -1334,9 +1354,13 @@ impl RemoteHostService {
             .map(|mut journals| journals.observe_runtime(&runtime, &tabs, now_epoch_ms()))
             .unwrap_or(false);
         if semantic_changed {
+            let _snapshot_guard = self
+                .inner
+                .snapshot_state_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
         }
-        drop(_snapshot_guard);
         self.mark_subscribed_clients_bootstrap_pending(session_id);
         let Ok(mut clients) = self.inner.clients.lock() else {
             return;
@@ -2667,10 +2691,6 @@ pub(crate) fn deliver_pending_bootstraps(
     if bootstraps.is_empty() {
         return;
     }
-    for bootstrap in bootstraps.values() {
-        record_semantic_bootstrap(inner, bootstrap);
-    }
-
     let Ok(mut clients) = inner.clients.lock() else {
         return;
     };
@@ -2713,34 +2733,6 @@ pub(crate) fn deliver_pending_bootstraps(
     }
     for connection_id in dead_connections {
         clients.remove(&connection_id);
-    }
-}
-
-fn record_semantic_bootstrap(inner: &Arc<RemoteHostInner>, bootstrap: &RemoteSessionBootstrap) {
-    let _snapshot_guard = inner
-        .snapshot_state_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let tabs = inner
-        .shared_state
-        .read()
-        .map(|state| state.open_tabs.clone())
-        .unwrap_or_default();
-    let raw_required =
-        bootstrap.screen.mode.alternate_screen || bootstrap.screen.mode.mouse_reporting();
-    let changed = inner
-        .semantic_journals
-        .lock()
-        .map(|mut journals| {
-            let runtime_changed =
-                journals.observe_runtime(&bootstrap.runtime, &tabs, now_epoch_ms());
-            let mode_changed =
-                journals.observe_terminal_mode(&bootstrap.session_id, raw_required, now_epoch_ms());
-            runtime_changed || mode_changed
-        })
-        .unwrap_or(false);
-    if changed {
-        inner.snapshot_revision.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -4471,6 +4463,116 @@ mod tests {
     }
 
     #[test]
+    fn native_terminal_modes_are_recorded_without_raw_terminal_subscribers() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app = AppState::default();
+        app.open_tabs.push(SessionTab {
+            id: "ai-tab".to_string(),
+            tab_type: TabType::Claude,
+            pty_session_id: Some("ai-runtime".to_string()),
+            ..SessionTab::default()
+        });
+        let mut ai_runtime = SessionRuntimeState::new(
+            "ai-runtime",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        ai_runtime.session_kind = SessionKind::Claude;
+        ai_runtime.tab_id = Some("ai-tab".to_string());
+        let mut shell_runtime = SessionRuntimeState::new(
+            "shell-runtime",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        shell_runtime.session_kind = SessionKind::Shell;
+        shell_runtime.command_id = Some("shell-command".to_string());
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .sessions
+            .insert(ai_runtime.session_id.clone(), ai_runtime);
+        runtime_state
+            .sessions
+            .insert(shell_runtime.session_id.clone(), shell_runtime);
+        service.update_snapshot(app, runtime_state, HashMap::new());
+        let alternate_screen = TerminalModeSnapshot {
+            alternate_screen: true,
+            ..TerminalModeSnapshot::default()
+        };
+
+        service.push_session_output_with_mode(
+            "ai-runtime",
+            b"ai".to_vec(),
+            alternate_screen,
+        );
+        service.push_session_output_with_mode(
+            "shell-runtime",
+            b"shell".to_vec(),
+            alternate_screen,
+        );
+
+        assert!(!service
+            .semantic_session_metadata(&StableSessionKey::from_tab("ai-tab"))
+            .expect("AI metadata")
+            .raw_required);
+        assert!(service
+            .semantic_session_metadata(&StableSessionKey::from_server("shell-command"))
+            .expect("shell metadata")
+            .raw_required);
+        assert!(service.inner.clients.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn semantic_projection_runs_outside_the_snapshot_state_lock() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app = AppState::default();
+        app.open_tabs.push(SessionTab {
+            id: "tab-stable".to_string(),
+            tab_type: TabType::Claude,
+            pty_session_id: Some("pty-ephemeral".to_string()),
+            ..SessionTab::default()
+        });
+        let mut runtime = SessionRuntimeState::new(
+            "pty-ephemeral",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Claude;
+        runtime.tab_id = Some("tab-stable".to_string());
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .sessions
+            .insert(runtime.session_id.clone(), runtime);
+        service.update_snapshot(app, runtime_state, HashMap::new());
+
+        let snapshot_guard = service.inner.snapshot_state_lock.lock().unwrap();
+        let background = service.clone();
+        let worker = thread::spawn(move || {
+            background.push_session_output("pty-ephemeral", b"projected".to_vec());
+        });
+
+        wait_for(
+            || {
+                service
+                    .semantic_replay(&StableSessionKey::from_tab("tab-stable"), 0)
+                    .is_some_and(|replay| {
+                        replay.events.iter().any(|event| matches!(
+                            &event.kind,
+                            SemanticEventKind::Output { text, .. } if text == "projected"
+                        ))
+                    })
+            },
+            Duration::from_millis(250),
+            "semantic projection remained blocked behind snapshot state",
+        );
+
+        drop(snapshot_guard);
+        worker.join().expect("output worker should complete");
+    }
+
+    #[test]
     fn runtime_feed_updates_status_attention_and_adapter_metadata_without_clients() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let mut app = AppState::default();
@@ -4638,7 +4740,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_feed_records_raw_terminal_mode_and_advances_revision() {
+    fn raw_bootstrap_delivery_does_not_publish_semantic_terminal_mode() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let mut app = AppState::default();
         app.open_tabs.push(SessionTab {
@@ -4693,21 +4795,18 @@ mod tests {
                 replay_bytes: Vec::new(),
             })
         })));
-        let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
-
         deliver_pending_bootstraps(&service.inner, &mut HashMap::new());
 
         let key = StableSessionKey::from_server("command-stable");
         let metadata = service
             .semantic_session_metadata(&key)
             .expect("semantic metadata");
-        assert!(metadata.raw_required);
+        assert!(!metadata.raw_required);
         let replay = service.semantic_replay(&key, 0).expect("semantic replay");
-        assert!(replay.events.iter().any(|event| matches!(
-            event.kind,
-            SemanticEventKind::TerminalMode { raw_required: true }
-        )));
-        assert!(service.inner.snapshot_revision.load(Ordering::Relaxed) > before_revision);
+        assert!(!replay
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, SemanticEventKind::TerminalMode { .. })));
     }
 
     #[test]

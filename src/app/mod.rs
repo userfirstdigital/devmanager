@@ -677,8 +677,12 @@ impl NativeShell {
         )));
         let event_host_service = remote_host_service.clone();
         process_manager.set_remote_session_handler(Some(Arc::new(move |event| match event {
-            RemoteSessionEvent::Output { session_id, bytes } => {
-                event_host_service.push_session_output(&session_id, bytes);
+            RemoteSessionEvent::Output {
+                session_id,
+                bytes,
+                mode,
+            } => {
+                event_host_service.push_session_output_with_mode(&session_id, bytes, mode);
             }
             RemoteSessionEvent::Runtime {
                 session_id,

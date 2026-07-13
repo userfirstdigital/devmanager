@@ -15,7 +15,7 @@ use crate::state::{
 };
 use crate::terminal::session::{
     bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalSession,
-    TerminalSessionView,
+    TerminalModeSnapshot, TerminalSessionView,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -65,6 +65,7 @@ pub enum RemoteSessionEvent {
     Output {
         session_id: String,
         bytes: Vec<u8>,
+        mode: TerminalModeSnapshot,
     },
     Runtime {
         session_id: String,
@@ -3699,8 +3700,8 @@ fn session_change_notifier(
 fn session_output_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
-) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
-    Arc::new(move |bytes| {
+) -> Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync> {
+    Arc::new(move |bytes, mode| {
         if bytes.is_empty() {
             return;
         }
@@ -3709,6 +3710,7 @@ fn session_output_notifier(
                 handler(RemoteSessionEvent::Output {
                     session_id: session_id.clone(),
                     bytes,
+                    mode,
                 });
             }
         }
@@ -4497,6 +4499,27 @@ mod tests {
     use crate::services::pid_file;
     use std::fs;
     use std::thread;
+
+    #[test]
+    fn output_notifier_forwards_the_native_terminal_mode() {
+        let manager = ProcessManager::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            if let RemoteSessionEvent::Output { mode, .. } = event {
+                tx.send(mode).expect("mode receiver should remain open");
+            }
+        })));
+        let notifier = session_output_notifier(manager.inner.clone(), "alpha".to_string());
+        let mode = crate::terminal::session::TerminalModeSnapshot {
+            alternate_screen: true,
+            mouse_report_click: true,
+            ..crate::terminal::session::TerminalModeSnapshot::default()
+        };
+
+        notifier(b"output".to_vec(), mode);
+
+        assert_eq!(rx.recv_timeout(Duration::from_millis(100)), Ok(mode));
+    }
 
     #[test]
     fn clear_virtual_output_resets_terminal_snapshot() {

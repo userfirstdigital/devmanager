@@ -26,7 +26,7 @@ use std::time::Duration;
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_REPLAY_BYTES: usize = 4 * 1024 * 1024;
 type SessionStateNotifier = Arc<dyn Fn() + Send + Sync>;
-type SessionOutputNotifier = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+type SessionOutputNotifier = Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TerminalBackend {
@@ -1528,7 +1528,7 @@ fn spawn_reader_thread(
                     break;
                 }
                 Ok(bytes_read) => {
-                    apply_terminal_output_chunk(
+                    let mode = apply_terminal_output_chunk(
                         &session_id,
                         &buffer[..bytes_read],
                         &term,
@@ -1543,7 +1543,7 @@ fn spawn_reader_thread(
                     }
 
                     if let Some(notifier) = output_notifier.as_ref() {
-                        notifier(buffer[..bytes_read].to_vec());
+                        notifier(buffer[..bytes_read].to_vec(), mode);
                     }
                     if let Some(notifier) = state_notifier.as_ref() {
                         notifier();
@@ -2311,15 +2311,18 @@ fn apply_terminal_output_chunk(
     parser: &mut Processor<StdSyncHandler>,
     shell_sequences: &mut ShellSequenceParser,
     runtime_state: &Arc<RwLock<RuntimeState>>,
-) {
+) -> TerminalModeSnapshot {
     let parsed_sequences = shell_sequences.push_chunk(bytes);
-    let cursor_buffer_line = {
+    let (cursor_buffer_line, mode) = {
         let mut term = match term.lock() {
             Ok(term) => term,
             Err(error) => error.into_inner(),
         };
         parser.advance(&mut *term, bytes);
-        terminal_cursor_buffer_line(&term)
+        (
+            terminal_cursor_buffer_line(&term),
+            mode_snapshot(*term.mode()),
+        )
     };
 
     if let Ok(mut runtime) = runtime_state.write() {
@@ -2329,6 +2332,7 @@ fn apply_terminal_output_chunk(
             apply_shell_sequences(session, &parsed_sequences, cursor_buffer_line);
         }
     }
+    mode
 }
 
 fn append_replay_bytes(buffer: &Arc<Mutex<Vec<u8>>>, bytes: &[u8]) {
