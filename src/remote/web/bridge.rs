@@ -7724,6 +7724,67 @@ mod tests {
     }
 
     #[test]
+    fn stale_generation_activity_after_expiry_clears_controller_and_status() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let connection_id = 123;
+        let client_id = "expired-stale-owner";
+        pair_web_client(&service, client_id);
+        let (native, _native_rx) = std_mpsc::channel();
+        let (web_sender, mut web_receiver) = test_web_channel();
+        register_client(&service.inner, connection_id, client_id, native, web_sender);
+        let acquired = acquire_writer_lease(
+            &service.inner,
+            connection_id,
+            client_id,
+            "expired-stale-tab",
+            now_epoch_ms().saturating_sub(10_000),
+        );
+        assert!(acquired.you_are_owner);
+        assert_eq!(
+            try_recv_web_json(&mut web_receiver)["type"],
+            "writerLeaseState"
+        );
+
+        let (response_tx, mut response_rx) = tokio_mpsc::unbounded_channel();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::Request {
+                id: 93,
+                action: WebAction::StopAllServers,
+                expected_lease_generation: Some(acquired.generation + 99),
+            },
+            &response_tx,
+        );
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(ServerMessage::Response { request_id: 93, result }) if !result.ok
+        ));
+        assert_eq!(
+            service
+                .inner
+                .controller_client_id
+                .read()
+                .expect("controller lock")
+                .as_deref(),
+            None
+        );
+        assert!(service
+            .inner
+            .web_control
+            .lock()
+            .expect("web control lock")
+            .writer_leases()
+            .peek()
+            .is_none());
+        let status = try_recv_web_json(&mut web_receiver);
+        assert_eq!(status["type"], "writerLeaseState");
+        assert!(status["writerLease"]["ownerClientInstanceId"].is_null());
+        assert!(status["writerLease"]["generation"].as_u64().unwrap() > acquired.generation);
+    }
+
+    #[test]
     fn saturated_host_request_queue_rejects_web_request_immediately() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let connection_id = 122;

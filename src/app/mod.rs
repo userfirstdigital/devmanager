@@ -2379,6 +2379,15 @@ impl NativeShell {
             _ => return false,
         };
 
+        let Some(work_permit) = self.remote_host_service.try_acquire_work_permit() else {
+            if let Some(response) = response {
+                let _ = response.send(RemoteActionResult::error(
+                    "Remote host Git work is busy. Retry shortly.",
+                ));
+            }
+            return true;
+        };
+
         let projects = self.state.projects().to_vec();
         let host_token = self
             .state
@@ -2394,7 +2403,7 @@ impl NativeShell {
                 let (result, mutation) = cx
                     .background_executor()
                     .spawn(async move {
-                        match action {
+                        work_permit.run(|| match action {
                             RemoteAction::GitListRepos => (
                                 RemoteActionResult::ok(
                                     None,
@@ -2703,7 +2712,7 @@ impl NativeShell {
                                 }
                             }
                             _ => unreachable!("non-git action dispatched to git worker"),
-                        }
+                        })
                     })
                     .await;
 

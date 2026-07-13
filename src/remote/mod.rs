@@ -39,7 +39,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,6 +55,7 @@ pub(crate) const REMOTE_ACCESS_LOG_LIMIT: usize = 100;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_OUTBOUND_MESSAGES_PER_TICK: usize = 128;
 pub(crate) const MAX_PENDING_REMOTE_REQUESTS: usize = 256;
+const MAX_CONCURRENT_REMOTE_HOST_WORK: usize = 8;
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler =
@@ -730,6 +731,68 @@ pub struct PendingRemoteRequest {
     pub response: Option<mpsc::Sender<RemoteActionResult>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RemoteHostWorkLimiter {
+    inner: Arc<RemoteHostWorkLimiterInner>,
+}
+
+struct RemoteHostWorkLimiterInner {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+pub(crate) struct RemoteHostWorkPermit {
+    inner: Arc<RemoteHostWorkLimiterInner>,
+}
+
+impl RemoteHostWorkPermit {
+    pub(crate) fn run<T>(self, work: impl FnOnce() -> T) -> T {
+        let result = work();
+        drop(self);
+        result
+    }
+}
+
+impl RemoteHostWorkLimiter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(RemoteHostWorkLimiterInner {
+                active: AtomicUsize::new(0),
+                limit: limit.max(1),
+            }),
+        }
+    }
+
+    pub(crate) fn try_acquire(&self) -> Option<RemoteHostWorkPermit> {
+        let mut active = self.inner.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.inner.limit {
+                return None;
+            }
+            match self.inner.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(RemoteHostWorkPermit {
+                        inner: self.inner.clone(),
+                    });
+                }
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+impl Drop for RemoteHostWorkPermit {
+    fn drop(&mut self) {
+        let previous = self.inner.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
 pub(crate) fn try_enqueue_pending_request(
     inner: &RemoteHostInner,
     request: PendingRemoteRequest,
@@ -1004,6 +1067,7 @@ pub(crate) struct RemoteHostInner {
     web_composer_mutations: Mutex<HashMap<String, WebComposerMutationRecord>>,
     web_input_executor: WebInputExecutor,
     web_request_executor: WebRequestExecutor,
+    host_work_limiter: RemoteHostWorkLimiter,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
@@ -1219,6 +1283,7 @@ impl RemoteHostService {
                 web_composer_mutations: Mutex::new(HashMap::new()),
                 web_input_executor: WebInputExecutor::default(),
                 web_request_executor: WebRequestExecutor::default(),
+                host_work_limiter: RemoteHostWorkLimiter::new(MAX_CONCURRENT_REMOTE_HOST_WORK),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
                 controller_client_id: RwLock::new(None),
@@ -1245,6 +1310,10 @@ impl RemoteHostService {
         authority: &RemoteWebMutationAuthority,
     ) -> bool {
         web::bridge::web_mutation_authority_is_current(&self.inner, authority)
+    }
+
+    pub(crate) fn try_acquire_work_permit(&self) -> Option<RemoteHostWorkPermit> {
+        self.inner.host_work_limiter.try_acquire()
     }
 
     pub fn apply_config(&self, config: RemoteHostConfig) {
@@ -4382,9 +4451,9 @@ mod tests {
         ConnectedRemoteClient, KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient,
         PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
-        RemoteHostService, RemoteLatencyStats, RemoteMachineState, RemoteSessionBootstrap,
-        RemoteSessionStreamEvent, RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage,
-        MAX_PENDING_REMOTE_REQUESTS,
+        RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
+        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteWorkspaceDelta,
+        RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
     };
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::remote::presentation::{
@@ -4404,7 +4473,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -4473,6 +4542,59 @@ mod tests {
             service.inner.pending_requests.lock().unwrap().len(),
             MAX_PENDING_REMOTE_REQUESTS
         );
+    }
+
+    #[test]
+    fn host_work_permits_survive_response_timeouts_until_jobs_finish() {
+        let limiter = RemoteHostWorkLimiter::new(2);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut waiters = Vec::new();
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let permit = limiter.try_acquire().expect("work slot");
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let entered_tx = entered_tx.clone();
+            let release_rx = release_rx.clone();
+            let (response_tx, response_rx) = mpsc::channel();
+            waiters.push(response_rx);
+            workers.push(thread::spawn(move || {
+                permit.run(|| {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = response_tx.send(());
+                });
+            }));
+        }
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        for waiter in waiters {
+            assert_eq!(
+                waiter.recv_timeout(Duration::from_millis(10)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+        }
+        assert!(
+            limiter.try_acquire().is_none(),
+            "response timeout released a permit before Git work completed"
+        );
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(limiter.try_acquire().is_some());
     }
 
     #[test]
