@@ -14,6 +14,5 @@ pub use ports_service::*;
 pub(crate) use process_manager::ai_session_needs_restore;
 pub use process_manager::{ManagedShutdownReport, ProcessManager, RemoteSessionEvent};
 pub use process_ops::{ProcessOpCompletion, ProcessOpKind};
-pub(crate) use process_ops::{next_op_id, ProcessOp, ProcessOpContext, ProcessOpQueue};
 pub use scanner_service::*;
 pub use session_manager::{ConfigImportMode, SessionManager};
