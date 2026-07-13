@@ -158,10 +158,45 @@ export async function readPushRegistrationState(
     readPushStatus(dependencies.fetch),
     dependencies.serviceWorker.ready,
   ]);
-  const subscription = await registration.pushManager.getSubscription();
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    if (
+      !hostStatus.subscribed ||
+      dependencies.notification.permission !== "granted"
+    ) {
+      return { publicKey: hostStatus.publicKey, subscribed: false };
+    }
+    const applicationServerKey = decodeBase64Url(hostStatus.publicKey);
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey,
+    });
+    try {
+      await registerHostSubscription(
+        subscription,
+        dependencies.fetch,
+        "Refreshing notifications",
+      );
+    } catch (error) {
+      await subscription.unsubscribe().catch(() => false);
+      throw error;
+    }
+    return { publicKey: hostStatus.publicKey, subscribed: true };
+  }
+  const applicationServerKey = decodeBase64Url(hostStatus.publicKey);
+  if (
+    !sameBytes(subscription.options?.applicationServerKey, applicationServerKey)
+  ) {
+    return { publicKey: hostStatus.publicKey, subscribed: false };
+  }
+  await registerHostSubscription(
+    subscription,
+    dependencies.fetch,
+    "Refreshing notifications",
+  );
   return {
     publicKey: hostStatus.publicKey,
-    subscribed: hostStatus.subscribed && subscription !== null,
+    subscribed: true,
   };
 }
 
@@ -225,6 +260,93 @@ async function unregisterHostEndpoint(
   );
 }
 
+async function registerHostSubscription(
+  subscription: PushSubscriptionLike,
+  fetchImpl: FetchLike,
+  action: string,
+): Promise<void> {
+  const p256dh = subscription.getKey("p256dh");
+  const auth = subscription.getKey("auth");
+  if (!p256dh || !auth) {
+    throw new Error("The browser did not provide notification keys.");
+  }
+  assertSuccessful(
+    await fetchImpl("/api/push", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        endpoint: subscription.endpoint,
+        keys: {
+          p256dh: encodeBase64Url(p256dh),
+          auth: encodeBase64Url(auth),
+        },
+      }),
+    }),
+    action,
+  );
+}
+
+export async function reconcilePushNotificationsOnForeground(
+  dependencies?: PushBrowserDependencies,
+): Promise<PushStatus | null> {
+  if (!dependencies && !currentNotificationAvailability().supported) return null;
+  const resolved = dependencies ?? browserDependencies();
+  if (resolved.notification.permission !== "granted") return null;
+  return readPushRegistrationState(resolved);
+}
+
+export async function reconcileChangedPushSubscription(
+  dependencies: Pick<PushBrowserDependencies, "fetch"> & {
+    pushManager: PushManagerLike;
+  },
+  changed: {
+    oldSubscription?: PushSubscriptionLike | null;
+    newSubscription?: PushSubscriptionLike | null;
+  } = {},
+): Promise<PushStatus> {
+  const hostStatus = await readPushStatus(dependencies.fetch);
+  const applicationServerKey = decodeBase64Url(hostStatus.publicKey);
+  let subscription =
+    changed.newSubscription ??
+    (await dependencies.pushManager.getSubscription());
+
+  if (
+    subscription &&
+    !sameBytes(subscription.options?.applicationServerKey, applicationServerKey)
+  ) {
+    await subscription.unsubscribe().catch(() => false);
+    subscription = null;
+  }
+
+  const created = subscription === null;
+  subscription ??= await dependencies.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey,
+  });
+  try {
+    await registerHostSubscription(
+      subscription,
+      dependencies.fetch,
+      "Refreshing notifications",
+    );
+  } catch (error) {
+    if (created) await subscription.unsubscribe().catch(() => false);
+    throw error;
+  }
+
+  if (
+    changed.oldSubscription &&
+    changed.oldSubscription.endpoint !== subscription.endpoint
+  ) {
+    await unregisterHostEndpoint(
+      changed.oldSubscription.endpoint,
+      dependencies.fetch,
+    ).catch(() => undefined);
+  }
+  return { publicKey: hostStatus.publicKey, subscribed: true };
+}
+
 export async function enablePushNotifications(
   dependencies: PushBrowserDependencies = browserDependencies(),
 ): Promise<PushStatus> {
@@ -258,27 +380,10 @@ export async function enablePushNotifications(
     applicationServerKey,
   });
 
-  const p256dh = subscription.getKey("p256dh");
-  const auth = subscription.getKey("auth");
-  if (!p256dh || !auth) {
-    if (created) await subscription.unsubscribe().catch(() => false);
-    throw new Error("The browser did not provide notification keys.");
-  }
-
   try {
-    assertSuccessful(
-      await dependencies.fetch("/api/push", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          endpoint: subscription.endpoint,
-          keys: {
-            p256dh: encodeBase64Url(p256dh),
-            auth: encodeBase64Url(auth),
-          },
-        }),
-      }),
+    await registerHostSubscription(
+      subscription,
+      dependencies.fetch,
       "Enabling notifications",
     );
   } catch (error) {

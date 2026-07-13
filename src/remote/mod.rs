@@ -2198,6 +2198,16 @@ impl RemoteHostService {
     }
 
     pub fn push_session_runtime(&self, session_id: &str, runtime: SessionRuntimeState) {
+        let mut runtime = runtime;
+        if runtime.session_kind == SessionKind::Ssh
+            && runtime.status == SessionStatus::Exited
+            && runtime
+                .exit
+                .as_ref()
+                .is_none_or(|exit| !exit.closed_by_user)
+        {
+            runtime.status = SessionStatus::Failed;
+        }
         let visibility_guard = self
             .inner
             .web_control_operation_lock
@@ -6349,6 +6359,49 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_ssh_disconnect_is_persistently_actionable_before_push_aggregation() {
+        let (service, receiver) = service_with_push_subscription("phone-ssh-disconnect");
+        let running = attention_runtime("ssh-disconnect", SessionKind::Ssh, SessionStatus::Running);
+        service.push_session_runtime("ssh-disconnect", running.clone());
+
+        let mut disconnected = running;
+        disconnected.status = SessionStatus::Exited;
+        disconnected.exit = Some(crate::state::SessionExitState {
+            closed_by_user: false,
+            summary: "connection lost".to_string(),
+            ..Default::default()
+        });
+        service.push_session_runtime("ssh-disconnect", disconnected.clone());
+
+        let delivery = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("unexpected SSH disconnect push");
+        assert_eq!(delivery.payload.action, PushAttentionKind::SshDisconnected);
+        assert_eq!(delivery.payload.badge, 1);
+        let key = StableSessionKey::from_tab("ssh-disconnect");
+        assert_eq!(
+            service
+                .semantic_session_metadata(&key)
+                .expect("SSH disconnect metadata")
+                .attention,
+            SemanticAttention::Failed
+        );
+
+        service.push_session_runtime("ssh-disconnect", disconnected);
+        assert_eq!(
+            service
+                .semantic_session_metadata(&key)
+                .expect("persistent SSH disconnect metadata")
+                .attention,
+            SemanticAttention::Failed
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "disconnect push is deduplicated"
+        );
+    }
+
+    #[test]
     fn actionable_runtime_transitions_enqueue_once_with_generic_content() {
         let (service, receiver) = service_with_push_subscription("phone-actions");
 
@@ -6410,6 +6463,13 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "an intentional SSH close is not actionable"
+        );
+        assert_eq!(
+            service
+                .semantic_session_metadata(&StableSessionKey::from_tab("ssh-user"))
+                .expect("intentional SSH close metadata")
+                .attention,
+            SemanticAttention::None
         );
     }
 

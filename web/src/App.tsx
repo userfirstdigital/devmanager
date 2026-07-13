@@ -28,6 +28,7 @@ import { ProjectsScreen } from "./projects/ProjectsScreen";
 import {
   NOTIFICATION_ROUTE_QUERY,
   NOTIFICATION_RUNTIME_QUERY,
+  reconcilePushNotificationsOnForeground,
 } from "./pwa/notifications";
 import { SessionScreen } from "./sessions/SessionScreen";
 import { SessionsScreen } from "./sessions/SessionsScreen";
@@ -109,16 +110,18 @@ export function App() {
     if (!DEMO_MODE) init();
   }, [init]);
 
-  useEffect(
-    () =>
-      DEMO_MODE
-        ? undefined
-        : bindAppLifecycle({
-            foreground: foregroundConnection,
-            setVisibility: setConnectionVisibility,
-          }),
-    [foregroundConnection, setConnectionVisibility],
-  );
+  useEffect(() => {
+    if (DEMO_MODE) return;
+    const foreground = () => {
+      foregroundConnection();
+      void reconcilePushNotificationsOnForeground().catch(() => undefined);
+    };
+    void reconcilePushNotificationsOnForeground().catch(() => undefined);
+    return bindAppLifecycle({
+      foreground,
+      setVisibility: setConnectionVisibility,
+    });
+  }, [foregroundConnection, setConnectionVisibility]);
 
   useEffect(() => {
     const onPopState = () => setRoute(parseRoute(`${window.location.pathname}${window.location.search}`));

@@ -9,6 +9,7 @@ import {
   enablePushNotifications,
   notificationAvailability,
   notificationClickDestination,
+  reconcileChangedPushSubscription,
   readPushRegistrationState,
   readPushStatus,
   type PushBrowserDependencies,
@@ -40,7 +41,7 @@ function pushDependencies(overrides: Partial<PushBrowserDependencies> = {}) {
   const auth = Uint8Array.from({ length: 16 }, (_, index) => 255 - index).buffer;
   const subscription = {
     endpoint: "https://web.push.apple.com/Q1/test-endpoint",
-    options: { applicationServerKey: null },
+    options: { applicationServerKey: null as ArrayBuffer | null },
     getKey: vi.fn((name: PushEncryptionKeyName) =>
       name === "p256dh" ? p256dh : auth,
     ),
@@ -134,7 +135,7 @@ describe("Web Push setup", () => {
     const hostEnabledFetch = vi.fn(async () =>
       response({ publicKey: "public-vapid-key", subscribed: true }),
     );
-    const { dependencies, pushManager, subscription } = pushDependencies({
+    const { dependencies } = pushDependencies({
       fetch: hostEnabledFetch,
     });
 
@@ -142,11 +143,106 @@ describe("Web Push setup", () => {
       publicKey: "public-vapid-key",
       subscribed: false,
     });
+  });
 
-    pushManager.getSubscription.mockResolvedValue(subscription);
+  it("recreates a lost browser subscription when permission and host intent remain enabled", async () => {
+    const { dependencies, fetch, pushManager, vapidPublicKey } =
+      pushDependencies({
+        notification: {
+          permission: "granted",
+          requestPermission: vi.fn(
+            async (): Promise<NotificationPermission> => "granted",
+          ),
+        },
+      });
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/push" && (!init?.method || init.method === "GET")) {
+        return response({
+          publicKey: base64Url(vapidPublicKey),
+          subscribed: true,
+        });
+      }
+      return response(null, 204);
+    });
+
     await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
-      publicKey: "public-vapid-key",
+      publicKey: base64Url(vapidPublicKey),
       subscribed: true,
+    });
+    expect(pushManager.subscribe).toHaveBeenCalledWith({
+      userVisibleOnly: true,
+      applicationServerKey: vapidPublicKey,
+    });
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/push",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("does not silently opt in when neither host nor browser is subscribed", async () => {
+    const { dependencies, pushManager, vapidPublicKey } = pushDependencies({
+      notification: {
+        permission: "granted",
+        requestPermission: vi.fn(
+          async (): Promise<NotificationPermission> => "granted",
+        ),
+      },
+    });
+
+    await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
+      publicKey: base64Url(vapidPublicKey),
+      subscribed: false,
+    });
+    expect(pushManager.subscribe).not.toHaveBeenCalled();
+  });
+
+  it("reconciles the exact local endpoint and keys when the host retains a stale endpoint", async () => {
+    let hostRegistration = {
+      endpoint: "https://web.push.apple.com/Q1/stale-host-endpoint",
+      keys: { p256dh: "stale-p256dh", auth: "stale-auth" },
+    };
+    const {
+      dependencies,
+      pushManager,
+      subscription,
+      vapidPublicKey,
+      p256dh,
+      auth,
+    } = pushDependencies();
+    subscription.options.applicationServerKey = vapidPublicKey.buffer as ArrayBuffer;
+    pushManager.getSubscription.mockResolvedValue(subscription);
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/push" && (!init?.method || init.method === "GET")) {
+        return response({
+          publicKey: base64Url(vapidPublicKey),
+          subscribed: hostRegistration !== null,
+        });
+      }
+      if (String(input) === "/api/push" && init?.method === "POST") {
+        hostRegistration = JSON.parse(String(init.body)) as typeof hostRegistration;
+        return response(null, 204);
+      }
+      throw new Error(`unexpected request: ${String(input)}`);
+    });
+    dependencies.fetch = fetch;
+
+    await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
+      publicKey: base64Url(vapidPublicKey),
+      subscribed: true,
+    });
+
+    expect(hostRegistration).toEqual({
+      endpoint: subscription.endpoint,
+      keys: {
+        p256dh: base64Url(new Uint8Array(p256dh)),
+        auth: base64Url(new Uint8Array(auth)),
+      },
+    });
+    expect(fetch).toHaveBeenLastCalledWith("/api/push", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(hostRegistration),
     });
   });
 
@@ -184,6 +280,55 @@ describe("Web Push setup", () => {
         },
       }),
     });
+  });
+
+  it("registers a changed browser subscription before retiring the old endpoint", async () => {
+    const {
+      dependencies,
+      fetch,
+      pushManager,
+      subscription,
+      vapidPublicKey,
+      p256dh,
+      auth,
+    } = pushDependencies();
+    subscription.options.applicationServerKey = vapidPublicKey.buffer as ArrayBuffer;
+    const oldSubscription = {
+      ...subscription,
+      endpoint: "https://web.push.apple.com/Q1/expired-endpoint",
+    };
+
+    await reconcileChangedPushSubscription(
+      { fetch: dependencies.fetch, pushManager },
+      { oldSubscription, newSubscription: subscription },
+    );
+
+    expect(fetch.mock.calls.slice(1)).toEqual([
+      [
+        "/api/push",
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            endpoint: subscription.endpoint,
+            keys: {
+              p256dh: base64Url(new Uint8Array(p256dh)),
+              auth: base64Url(new Uint8Array(auth)),
+            },
+          }),
+        },
+      ],
+      [
+        "/api/push/unsubscribe",
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: oldSubscription.endpoint }),
+        },
+      ],
+    ]);
   });
 
   it("rejects malformed host application keys before touching PushManager", async () => {

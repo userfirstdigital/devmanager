@@ -13,6 +13,7 @@ import {
   applyAppBadge,
   describePushNotification,
   notificationClickDestination,
+  reconcileChangedPushSubscription,
   type AppBadgeApi,
 } from "./pwa/notifications";
 import { parsePushEventData, type PushPayload } from "./pwa/pushPayload";
@@ -117,6 +118,27 @@ self.addEventListener("push", (event) => {
   }
   event.waitUntil(
     Promise.all(tasks).then(() => undefined),
+  );
+});
+
+interface PushSubscriptionChangeEventLike extends ExtendableEvent {
+  oldSubscription?: PushSubscription | null;
+  newSubscription?: PushSubscription | null;
+}
+
+self.addEventListener("pushsubscriptionchange", (event) => {
+  const changed = event as PushSubscriptionChangeEventLike;
+  changed.waitUntil(
+    reconcileChangedPushSubscription(
+      {
+        pushManager: self.registration.pushManager,
+        fetch: (input, init) => self.fetch(input, init),
+      },
+      {
+        oldSubscription: changed.oldSubscription,
+        newSubscription: changed.newSubscription,
+      },
+    ).then(() => undefined),
   );
 });
 
