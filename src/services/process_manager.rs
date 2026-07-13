@@ -4187,6 +4187,12 @@ fn cleanup_claude_hook_session_if_matches(
     let Some(removed) = removed else {
         return false;
     };
+    emit_remote_session_event(
+        inner,
+        RemoteSessionEvent::ClaudeAdapterRemoved {
+            identity: claude_semantic_identity(session_id, &removed),
+        },
+    );
     inner
         .claude_hook_registry
         .unregister_registration(&removed.registration);
@@ -5342,6 +5348,11 @@ mod tests {
     fn unexpected_pty_exit_without_session_end_cleans_registration() {
         let temp = temp_test_dir("claude-hook-unexpected-exit");
         let manager = ProcessManager::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            observed.lock().unwrap().push(event);
+        })));
         let mut launch = AiLaunchSpec {
             tab_id: "unexpected-tab".to_string(),
             project_id: "project".to_string(),
@@ -5371,6 +5382,7 @@ mod tests {
             .unwrap()
             .settings_path
             .clone();
+        events.lock().unwrap().clear();
 
         manager.update_session_state("unexpected-session", |state| {
             state.status = SessionStatus::Crashed;
@@ -5385,6 +5397,11 @@ mod tests {
             .unwrap()
             .contains_key("unexpected-session"));
         assert!(!settings_path.exists());
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::ClaudeAdapterRemoved { identity }
+                if identity.pty_session_id == "unexpected-session"
+        )));
     }
 
     #[test]
