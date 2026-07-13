@@ -1633,16 +1633,6 @@ impl RemoteHostService {
         self.push_session_output_inner(session_id, bytes, None);
     }
 
-    pub fn push_semantic_draft(&self, draft: SemanticEventDraft) {
-        let changed = self.publish_semantic_change(|journals| {
-            journals.record(draft);
-            true
-        });
-        if changed {
-            let _ = deliver_live_semantic_events(&self.inner);
-        }
-    }
-
     pub fn push_claude_adapter_registered(&self, identity: ClaudeSemanticIdentity) {
         let deferred = {
             let mut state = self
