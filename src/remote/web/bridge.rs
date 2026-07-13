@@ -3287,8 +3287,17 @@ fn dispatch_composer_submit_for_connection(
                 inner: fence.inner.clone(),
             };
             let reconcile_claude_prompt = session_kind == SessionKind::Claude;
+            let reconcile_codex_prompt = session_kind == SessionKind::Codex;
             if reconcile_claude_prompt {
                 host_service.reserve_claude_composer_prompt(
+                    &mutation_id,
+                    &session_id,
+                    &stable_session_key,
+                    &text,
+                );
+            }
+            if reconcile_codex_prompt {
+                host_service.reserve_codex_composer_prompt(
                     &mutation_id,
                     &session_id,
                     &stable_session_key,
@@ -3324,6 +3333,9 @@ fn dispatch_composer_submit_for_connection(
             if let Err(message) = callback_result {
                 if reconcile_claude_prompt {
                     host_service.cancel_claude_composer_prompt(&mutation_id);
+                }
+                if reconcile_codex_prompt {
+                    host_service.cancel_codex_composer_prompt(&mutation_id);
                 }
                 if message == super::image_paste::WEB_COMPOSER_AUTHORITY_CHANGED {
                     clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
@@ -3385,6 +3397,13 @@ fn dispatch_composer_submit_for_connection(
                     host_service.accept_claude_composer_prompt(&mutation_id);
                 } else {
                     host_service.cancel_claude_composer_prompt(&mutation_id);
+                }
+            }
+            if reconcile_codex_prompt {
+                if published.is_ok() {
+                    host_service.accept_codex_composer_prompt(&mutation_id);
+                } else {
+                    host_service.cancel_codex_composer_prompt(&mutation_id);
                 }
             }
             let accepted_sequence = published.map(|event| event.sequence).unwrap_or_else(|_| {
@@ -5737,6 +5756,29 @@ mod tests {
         service.update_snapshot(app, runtime_state, HashMap::new());
     }
 
+    fn codex_session(service: &RemoteHostService, tab_id: &str, session_id: &str) {
+        let mut app = crate::state::AppState::default();
+        app.open_tabs.push(crate::models::SessionTab {
+            id: tab_id.to_string(),
+            tab_type: crate::models::TabType::Codex,
+            pty_session_id: Some(session_id.to_string()),
+            ..crate::models::SessionTab::default()
+        });
+        let mut runtime = SessionRuntimeState::new(
+            session_id,
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Codex;
+        runtime.tab_id = Some(tab_id.to_string());
+        let mut runtime_state = crate::state::RuntimeState::default();
+        runtime_state
+            .sessions
+            .insert(session_id.to_string(), runtime);
+        service.update_snapshot(app, runtime_state, HashMap::new());
+    }
+
     fn resume_request(
         runtime_instance_id: Option<String>,
         desired_session_key: Option<StableSessionKey>,
@@ -6567,6 +6609,233 @@ mod tests {
             1,
             "write rejection must publish the deferred provider hook without duplicating retries"
         );
+    }
+
+    #[test]
+    fn codex_composer_provider_reconciliation_is_fifo_generation_scoped_and_retry_safe() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        codex_session(&service, "tab-codex", "session-codex");
+        let stable_key = StableSessionKey::from_tab("tab-codex");
+        let identity = crate::remote::CodexSemanticIdentity {
+            pty_session_id: "session-codex".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_codex_adapter_registered(identity.clone());
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(stable_key.clone()),
+                "tab-codex",
+            ),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let provider_service = service.clone();
+        let provider_identity = identity.clone();
+        let provider_number = Arc::new(AtomicUsize::new(0));
+        let callback_number = provider_number.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            let RemoteTerminalInput::ComposerBatch { text, .. } = input else {
+                return Ok(());
+            };
+            let number = callback_number.fetch_add(1, Ordering::SeqCst) + 1;
+            provider_service.push_codex_semantic_draft(
+                provider_identity.clone(),
+                SemanticEventDraft {
+                    stable_session_key: provider_identity.stable_session_key.clone(),
+                    occurred_at_epoch_ms: 1_100 + number as u64,
+                    source: SemanticSource::Codex,
+                    kind: SemanticEventKind::UserMessage {
+                        text: text.trim_end_matches('\r').to_string(),
+                    },
+                    retention: SemanticRetention::Canonical,
+                    deduplication_key: Some(format!("codex:user:item-{number}")),
+                },
+            );
+            Ok(())
+        })));
+
+        for mutation_id in ["codex-mutation-1", "codex-mutation-2"] {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                mutation_id.to_string(),
+                stable_key.clone(),
+                "same prompt".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+            .expect("Codex composer prompt accepted");
+        }
+        let prompt_count = || {
+            service
+                .semantic_replay(&stable_key, 0)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "same prompt"
+                ))
+                .count()
+        };
+        assert_eq!(prompt_count(), 2, "FIFO prompts must each appear once");
+
+        service.push_codex_semantic_draft(
+            identity.clone(),
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_200,
+                source: SemanticSource::Codex,
+                kind: SemanticEventKind::UserMessage {
+                    text: "same prompt".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("codex:user:item-2".to_string()),
+            },
+        );
+        assert_eq!(prompt_count(), 2, "official retries remain reconciled");
+
+        service.push_codex_semantic_draft(
+            crate::remote::CodexSemanticIdentity {
+                registration_generation: 8,
+                ..identity.clone()
+            },
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_201,
+                source: SemanticSource::Codex,
+                kind: SemanticEventKind::UserMessage {
+                    text: "same prompt".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("codex:user:different-generation".to_string()),
+            },
+        );
+        assert_eq!(prompt_count(), 3, "generation mismatch must fail open");
+
+        service.push_codex_semantic_draft(
+            identity,
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_202,
+                source: SemanticSource::Codex,
+                kind: SemanticEventKind::UserMessage {
+                    text: "local TUI prompt".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("codex:user:local-tui".to_string()),
+            },
+        );
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.kind,
+            SemanticEventKind::UserMessage { text } if text == "local TUI prompt"
+        )), "unreserved local-TUI prompts must remain visible");
+    }
+
+    #[test]
+    fn codex_reconciliation_survives_removal_and_cancel_releases_deferred_provider() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let stable_key = StableSessionKey::from_tab("tab-codex");
+        let identity = crate::remote::CodexSemanticIdentity {
+            pty_session_id: "session-codex".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 9,
+        };
+        let provider = |text: &str, key: &str, occurred_at_epoch_ms| SemanticEventDraft {
+            stable_session_key: stable_key.clone(),
+            occurred_at_epoch_ms,
+            source: SemanticSource::Codex,
+            kind: SemanticEventKind::UserMessage {
+                text: text.to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some(key.to_string()),
+        };
+        let composer = |text: &str, mutation: &str, occurred_at_epoch_ms| SemanticEventDraft {
+            stable_session_key: stable_key.clone(),
+            occurred_at_epoch_ms,
+            source: SemanticSource::Codex,
+            kind: SemanticEventKind::UserMessage {
+                text: text.to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some(format!("composer:{mutation}")),
+        };
+
+        service.push_codex_adapter_registered(identity.clone());
+        service.reserve_codex_composer_prompt(
+            "reserved-removal",
+            &identity.pty_session_id,
+            &stable_key,
+            "reserved removal",
+        );
+        service.push_codex_semantic_draft(
+            identity.clone(),
+            provider("reserved removal", "codex:user:reserved", 1),
+        );
+        service.push_codex_adapter_removed(&identity);
+        service.push_semantic_draft(composer("reserved removal", "reserved-removal", 2));
+        service.accept_codex_composer_prompt("reserved-removal");
+
+        service.push_codex_adapter_registered(identity.clone());
+        service.reserve_codex_composer_prompt(
+            "accepted-removal",
+            &identity.pty_session_id,
+            &stable_key,
+            "accepted removal",
+        );
+        service.push_semantic_draft(composer("accepted removal", "accepted-removal", 3));
+        service.accept_codex_composer_prompt("accepted-removal");
+        service.push_codex_adapter_removed(&identity);
+        for occurred_at_epoch_ms in [4, 5] {
+            service.push_codex_semantic_draft(
+                identity.clone(),
+                provider("accepted removal", "codex:user:accepted", occurred_at_epoch_ms),
+            );
+        }
+
+        service.push_codex_adapter_registered(identity.clone());
+        service.reserve_codex_composer_prompt(
+            "cancelled",
+            &identity.pty_session_id,
+            &stable_key,
+            "cancelled write",
+        );
+        service.push_codex_semantic_draft(
+            identity.clone(),
+            provider("cancelled write", "codex:user:cancelled", 6),
+        );
+        service.push_codex_adapter_removed(&identity);
+        service.cancel_codex_composer_prompt("cancelled");
+        service.push_codex_semantic_draft(
+            identity,
+            provider("cancelled write", "codex:user:cancelled", 7),
+        );
+
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        for text in ["reserved removal", "accepted removal", "cancelled write"] {
+            assert_eq!(
+                replay
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.kind,
+                        SemanticEventKind::UserMessage { text: actual } if actual == text
+                    ))
+                    .count(),
+                1,
+                "{text} must appear exactly once"
+            );
+        }
     }
 
     #[test]

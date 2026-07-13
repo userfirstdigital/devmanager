@@ -712,6 +712,15 @@ impl NativeShell {
             RemoteSessionEvent::ClaudeAdapterRemoved { identity } => {
                 event_host_service.push_claude_adapter_removed(&identity);
             }
+            RemoteSessionEvent::CodexSemantic { identity, draft } => {
+                event_host_service.push_codex_semantic_draft(identity, draft);
+            }
+            RemoteSessionEvent::CodexAdapterRegistered { identity } => {
+                event_host_service.push_codex_adapter_registered(identity);
+            }
+            RemoteSessionEvent::CodexAdapterRemoved { identity } => {
+                event_host_service.push_codex_adapter_removed(&identity);
+            }
             RemoteSessionEvent::AdapterHealth {
                 stable_session_key,
                 health,

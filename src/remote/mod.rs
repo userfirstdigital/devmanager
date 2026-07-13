@@ -61,6 +61,8 @@ pub(crate) const MAX_PENDING_REMOTE_REQUESTS: usize = 256;
 const MAX_CONCURRENT_REMOTE_HOST_WORK: usize = 8;
 const CLAUDE_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CLAUDE_COMPOSER_RECONCILIATIONS: usize = 1024;
+const CODEX_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_CODEX_COMPOSER_RECONCILIATIONS: usize = 1024;
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler =
@@ -1043,6 +1045,16 @@ pub struct ClaudeSemanticIdentity {
     pub registration_generation: u64,
 }
 
+/// Exact identity of one Codex app-server projection attached to one PTY
+/// launch. The generation prevents provider events from one bridge from
+/// consuming a phone prompt reserved for a replacement bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CodexSemanticIdentity {
+    pub pty_session_id: String,
+    pub stable_session_key: StableSessionKey,
+    pub registration_generation: u64,
+}
+
 #[derive(Default)]
 struct ClaudeComposerReconciliationState {
     adapters_by_pty_session: HashMap<String, ClaudeSemanticIdentity>,
@@ -1067,6 +1079,34 @@ enum PendingClaudeComposerPromptState {
 
 struct ReconciledClaudeProviderKey {
     identity: ClaudeSemanticIdentity,
+    key: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct CodexComposerReconciliationState {
+    adapters_by_pty_session: HashMap<String, CodexSemanticIdentity>,
+    pending: VecDeque<PendingCodexComposerPrompt>,
+    reconciled_provider_keys: VecDeque<ReconciledCodexProviderKey>,
+}
+
+struct PendingCodexComposerPrompt {
+    mutation_id: String,
+    identity: CodexSemanticIdentity,
+    text: String,
+    state: PendingCodexComposerPromptState,
+    expires_at: Instant,
+}
+
+enum PendingCodexComposerPromptState {
+    Reserved {
+        deferred_provider: Option<SemanticEventDraft>,
+    },
+    Accepted,
+}
+
+struct ReconciledCodexProviderKey {
+    identity: CodexSemanticIdentity,
     key: String,
     expires_at: Instant,
 }
@@ -1115,6 +1155,7 @@ pub(crate) struct RemoteHostInner {
     web_request_executor: WebRequestExecutor,
     host_work_limiter: RemoteHostWorkLimiter,
     claude_composer_reconciliation: Mutex<ClaudeComposerReconciliationState>,
+    codex_composer_reconciliation: Mutex<CodexComposerReconciliationState>,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
@@ -1336,6 +1377,9 @@ impl RemoteHostService {
                 host_work_limiter: RemoteHostWorkLimiter::new(MAX_CONCURRENT_REMOTE_HOST_WORK),
                 claude_composer_reconciliation: Mutex::new(
                     ClaudeComposerReconciliationState::default(),
+                ),
+                codex_composer_reconciliation: Mutex::new(
+                    CodexComposerReconciliationState::default(),
                 ),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
@@ -1829,6 +1873,232 @@ impl RemoteHostService {
                 .position(|pending| pending.mutation_id == mutation_id)
                 .and_then(|index| state.pending.remove(index))
                 .and_then(deferred_claude_hook)
+        };
+        if let Some(draft) = deferred {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub fn push_codex_adapter_registered(&self, identity: CodexSemanticIdentity) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .codex_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let deferred = drain_expired_codex_reconciliations(&mut state, Instant::now());
+            state
+                .adapters_by_pty_session
+                .insert(identity.pty_session_id.clone(), identity);
+            deferred
+        };
+        for draft in deferred {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub fn push_codex_adapter_removed(&self, identity: &CodexSemanticIdentity) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .codex_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let deferred = drain_expired_codex_reconciliations(&mut state, Instant::now());
+            if state.adapters_by_pty_session.get(&identity.pty_session_id) == Some(identity) {
+                state
+                    .adapters_by_pty_session
+                    .remove(&identity.pty_session_id);
+            }
+            // Keep generation-scoped reservations and retry tombstones across
+            // bridge exit/replacement. PTY acceptance and provider delivery
+            // are independently asynchronous.
+            deferred
+        };
+        for draft in deferred {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub fn push_codex_semantic_draft(
+        &self,
+        identity: CodexSemanticIdentity,
+        draft: SemanticEventDraft,
+    ) {
+        enum Decision {
+            Publish,
+            Reconciled,
+        }
+
+        let (expired, decision) = {
+            let mut state = self
+                .inner
+                .codex_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let expired = drain_expired_codex_reconciliations(&mut state, Instant::now());
+            let provider_key_reconciled = draft.deduplication_key.as_ref().is_some_and(|key| {
+                state
+                    .reconciled_provider_keys
+                    .iter()
+                    .any(|entry| entry.identity == identity && entry.key == *key)
+            });
+            let text = match &draft.kind {
+                presentation::SemanticEventKind::UserMessage { text } => Some(text.as_str()),
+                _ => None,
+            };
+            let mut decision = Decision::Publish;
+            if provider_key_reconciled {
+                decision = Decision::Reconciled;
+            } else if let Some(text) = text {
+                if let Some(index) = state.pending.iter().position(|pending| {
+                    pending.identity == identity
+                        && pending.text == text
+                        && matches!(
+                            pending.state,
+                            PendingCodexComposerPromptState::Reserved {
+                                deferred_provider: None
+                            } | PendingCodexComposerPromptState::Accepted
+                        )
+                }) {
+                    let accepted = matches!(
+                        state.pending[index].state,
+                        PendingCodexComposerPromptState::Accepted
+                    );
+                    if accepted {
+                        let pending = state
+                            .pending
+                            .remove(index)
+                            .expect("matched Codex reconciliation exists");
+                        if let Some(key) = draft.deduplication_key.clone() {
+                            remember_reconciled_codex_provider_key(
+                                &mut state,
+                                pending.identity,
+                                key,
+                                Instant::now(),
+                            );
+                        }
+                    } else {
+                        state.pending[index].state = PendingCodexComposerPromptState::Reserved {
+                            deferred_provider: Some(draft.clone()),
+                        };
+                    }
+                    decision = Decision::Reconciled;
+                } else if draft.deduplication_key.as_ref().is_some_and(|key| {
+                    state.pending.iter().any(|pending| {
+                        pending.identity == identity
+                            && pending.text == text
+                            && matches!(
+                                &pending.state,
+                                PendingCodexComposerPromptState::Reserved {
+                                    deferred_provider: Some(deferred)
+                                } if deferred.deduplication_key.as_ref() == Some(key)
+                            )
+                    })
+                }) {
+                    decision = Decision::Reconciled;
+                }
+            }
+            (expired, decision)
+        };
+
+        for expired in expired {
+            self.push_semantic_draft(expired);
+        }
+        if matches!(decision, Decision::Publish) {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub(crate) fn reserve_codex_composer_prompt(
+        &self,
+        mutation_id: &str,
+        pty_session_id: &str,
+        stable_session_key: &StableSessionKey,
+        text: &str,
+    ) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .codex_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let deferred = drain_expired_codex_reconciliations(&mut state, Instant::now());
+            let identity = state
+                .adapters_by_pty_session
+                .get(pty_session_id)
+                .filter(|identity| &identity.stable_session_key == stable_session_key)
+                .cloned();
+            if let Some(identity) = identity {
+                if state.pending.len() < MAX_CODEX_COMPOSER_RECONCILIATIONS {
+                    state.pending.push_back(PendingCodexComposerPrompt {
+                        mutation_id: mutation_id.to_string(),
+                        identity,
+                        text: text.to_string(),
+                        state: PendingCodexComposerPromptState::Reserved {
+                            deferred_provider: None,
+                        },
+                        expires_at: Instant::now() + CODEX_COMPOSER_RECONCILIATION_TTL,
+                    });
+                }
+            }
+            deferred
+        };
+        for draft in deferred {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub(crate) fn accept_codex_composer_prompt(&self, mutation_id: &str) {
+        let mut state = self
+            .inner
+            .codex_composer_reconciliation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(index) = state
+            .pending
+            .iter()
+            .position(|pending| pending.mutation_id == mutation_id)
+        else {
+            return;
+        };
+        let deferred = match &mut state.pending[index].state {
+            PendingCodexComposerPromptState::Reserved { deferred_provider } => {
+                deferred_provider.take()
+            }
+            PendingCodexComposerPromptState::Accepted => return,
+        };
+        if let Some(deferred) = deferred {
+            let pending = state
+                .pending
+                .remove(index)
+                .expect("matched Codex reconciliation exists");
+            if let Some(key) = deferred.deduplication_key {
+                remember_reconciled_codex_provider_key(
+                    &mut state,
+                    pending.identity,
+                    key,
+                    Instant::now(),
+                );
+            }
+        } else {
+            state.pending[index].state = PendingCodexComposerPromptState::Accepted;
+        }
+    }
+
+    pub(crate) fn cancel_codex_composer_prompt(&self, mutation_id: &str) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .codex_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .pending
+                .iter()
+                .position(|pending| pending.mutation_id == mutation_id)
+                .and_then(|index| state.pending.remove(index))
+                .and_then(deferred_codex_provider)
         };
         if let Some(draft) = deferred {
             self.push_semantic_draft(draft);
@@ -4293,6 +4563,62 @@ fn remember_reconciled_claude_provider_key(
             identity,
             key,
             expires_at: now + CLAUDE_COMPOSER_RECONCILIATION_TTL,
+        });
+}
+
+fn deferred_codex_provider(pending: PendingCodexComposerPrompt) -> Option<SemanticEventDraft> {
+    match pending.state {
+        PendingCodexComposerPromptState::Reserved { deferred_provider } => deferred_provider,
+        PendingCodexComposerPromptState::Accepted => None,
+    }
+}
+
+fn remove_pending_codex_prompts(
+    state: &mut CodexComposerReconciliationState,
+    mut predicate: impl FnMut(&PendingCodexComposerPrompt) -> bool,
+) -> Vec<SemanticEventDraft> {
+    let mut deferred = Vec::new();
+    let mut index = 0;
+    while index < state.pending.len() {
+        if predicate(&state.pending[index]) {
+            if let Some(draft) = state.pending.remove(index).and_then(deferred_codex_provider) {
+                deferred.push(draft);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    deferred
+}
+
+fn drain_expired_codex_reconciliations(
+    state: &mut CodexComposerReconciliationState,
+    now: Instant,
+) -> Vec<SemanticEventDraft> {
+    state
+        .reconciled_provider_keys
+        .retain(|entry| now <= entry.expires_at);
+    remove_pending_codex_prompts(state, |pending| now > pending.expires_at)
+}
+
+fn remember_reconciled_codex_provider_key(
+    state: &mut CodexComposerReconciliationState,
+    identity: CodexSemanticIdentity,
+    key: String,
+    now: Instant,
+) {
+    state
+        .reconciled_provider_keys
+        .retain(|entry| entry.identity != identity || entry.key != key);
+    while state.reconciled_provider_keys.len() >= MAX_CODEX_COMPOSER_RECONCILIATIONS {
+        state.reconciled_provider_keys.pop_front();
+    }
+    state
+        .reconciled_provider_keys
+        .push_back(ReconciledCodexProviderKey {
+            identity,
+            key,
+            expires_at: now + CODEX_COMPOSER_RECONCILIATION_TTL,
         });
 }
 

@@ -10,7 +10,7 @@ use crate::models::{
 };
 use crate::notifications;
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
-use crate::remote::{ClaudeSemanticIdentity, RemoteActionResult};
+use crate::remote::{ClaudeSemanticIdentity, CodexSemanticIdentity, RemoteActionResult};
 use crate::services::process_ops::{
     next_op_id, ProcessOp, ProcessOpCompletion, ProcessOpContext, ProcessOpKind, ProcessOpQueue,
 };
@@ -95,6 +95,16 @@ pub enum RemoteSessionEvent {
     },
     ClaudeAdapterRemoved {
         identity: ClaudeSemanticIdentity,
+    },
+    CodexSemantic {
+        identity: CodexSemanticIdentity,
+        draft: SemanticEventDraft,
+    },
+    CodexAdapterRegistered {
+        identity: CodexSemanticIdentity,
+    },
+    CodexAdapterRemoved {
+        identity: CodexSemanticIdentity,
     },
     AdapterHealth {
         stable_session_key: StableSessionKey,
@@ -204,6 +214,17 @@ struct CodexAdapterIdentity {
     generation: u64,
 }
 
+fn codex_semantic_identity(
+    pty_session_id: &str,
+    identity: &CodexAdapterIdentity,
+) -> CodexSemanticIdentity {
+    CodexSemanticIdentity {
+        pty_session_id: pty_session_id.to_string(),
+        stable_session_key: identity.stable_session_key.clone(),
+        registration_generation: identity.generation,
+    }
+}
+
 #[derive(Debug)]
 enum CodexAdapterSession {
     Pending(CodexAdapterIdentity),
@@ -256,6 +277,18 @@ impl CodexAdapterSession {
         match self {
             Self::Pending(identity) | Self::Degraded(identity) => identity,
             Self::Running { identity, .. } => identity,
+        }
+    }
+
+    fn registered_semantic_identity(
+        &self,
+        pty_session_id: &str,
+    ) -> Option<CodexSemanticIdentity> {
+        match self {
+            Self::Running { identity, .. } => {
+                Some(codex_semantic_identity(pty_session_id, identity))
+            }
+            Self::Pending(_) | Self::Degraded(_) => None,
         }
     }
 }
@@ -1292,7 +1325,16 @@ impl ProcessManager {
                 CodexAdapterSession::Pending(identity.clone()),
             )
         };
+        let replaced_identity = replaced
+            .as_ref()
+            .and_then(|session| session.registered_semantic_identity(session_id));
         drop(replaced);
+        if let Some(identity) = replaced_identity {
+            emit_remote_session_event(
+                &self.inner,
+                RemoteSessionEvent::CodexAdapterRemoved { identity },
+            );
+        }
 
         let preparer = self
             .inner
@@ -1310,6 +1352,7 @@ impl ProcessManager {
 
         let semantic_inner = Arc::downgrade(&self.inner);
         let semantic_identity = identity.clone();
+        let semantic_session_id = session_id.to_string();
         let activation_inner = Arc::downgrade(&self.inner);
         let activation_identity = identity.clone();
         let activation_session_id = session_id.to_string();
@@ -1327,7 +1370,12 @@ impl ProcessManager {
             identity.stable_session_key.clone(),
             move |draft| {
                 if let Some(inner) = semantic_inner.upgrade() {
-                    emit_codex_semantic_if_current(&inner, &semantic_identity, draft);
+                    emit_codex_semantic_if_current(
+                        &inner,
+                        &semantic_session_id,
+                        &semantic_identity,
+                        draft,
+                    );
                 }
             },
             move || {
@@ -1399,6 +1447,12 @@ impl ProcessManager {
         if !installed {
             return;
         }
+        emit_remote_session_event(
+            &self.inner,
+            RemoteSessionEvent::CodexAdapterRegistered {
+                identity: codex_semantic_identity(session_id, &identity),
+            },
+        );
         launch.startup_command = prepared.tui_command(&endpoint, &launch.shell_program);
     }
 
@@ -1409,7 +1463,16 @@ impl ProcessManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove_session(session_id);
+        let removed_identity = removed
+            .as_ref()
+            .and_then(|session| session.registered_semantic_identity(session_id));
         drop(removed);
+        if let Some(identity) = removed_identity {
+            emit_remote_session_event(
+                &self.inner,
+                RemoteSessionEvent::CodexAdapterRemoved { identity },
+            );
+        }
     }
 
     fn cleanup_ai_adapters_for_session(&self, session_id: &str) {
@@ -4545,6 +4608,7 @@ fn cleanup_claude_hook_session_if_matches(
 
 fn emit_codex_semantic_if_current(
     inner: &ProcessManagerInner,
+    session_id: &str,
     identity: &CodexAdapterIdentity,
     draft: SemanticEventDraft,
 ) {
@@ -4552,8 +4616,19 @@ fn emit_codex_semantic_if_current(
         .codex_adapter_registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if registry.is_current(identity) {
-        emit_remote_session_event(inner, RemoteSessionEvent::Semantic { draft });
+    if registry.is_current(identity)
+        && registry
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.identity() == identity)
+    {
+        emit_remote_session_event(
+            inner,
+            RemoteSessionEvent::CodexSemantic {
+                identity: codex_semantic_identity(session_id, identity),
+                draft,
+            },
+        );
     }
 }
 
@@ -4735,8 +4810,17 @@ fn schedule_codex_original_fallback(
         let Some(removed) = removed else {
             return;
         };
+        let removed_identity = removed
+            .registered_semantic_identity(&session_id)
+            .expect("fallback only removes an installed Codex bridge");
         // Drop the bridge handle on this worker, never from its own exit callback.
         drop(removed);
+        emit_remote_session_event(
+            &inner,
+            RemoteSessionEvent::CodexAdapterRemoved {
+                identity: removed_identity,
+            },
+        );
 
         let _ = terminal_ops
             .terminate_and_reap(&inner, &session_id)
@@ -4865,7 +4949,16 @@ fn cleanup_codex_adapter_session_if_matches(
             .flatten()
     };
     let was_removed = removed.is_some();
+    let removed_identity = removed
+        .as_ref()
+        .and_then(|session| session.registered_semantic_identity(session_id));
     drop(removed);
+    if let Some(identity) = removed_identity {
+        emit_remote_session_event(
+            inner,
+            RemoteSessionEvent::CodexAdapterRemoved { identity },
+        );
+    }
     was_removed
 }
 
@@ -6002,6 +6095,22 @@ mod tests {
                 Some(CodexAdapterSession::Running { _handle, .. }) if _handle.is_running()
             ));
         }
+        let registered_identity = {
+            let registry = manager.inner.codex_adapter_registry.lock().unwrap();
+            codex_semantic_identity(
+                "codex-session",
+                registry
+                    .sessions
+                    .get("codex-session")
+                    .expect("installed Codex adapter")
+                    .identity(),
+            )
+        };
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::CodexAdapterRegistered { identity }
+                if identity == &registered_identity
+        )));
         assert!(!events.lock().unwrap().iter().any(|event| matches!(
             event,
             RemoteSessionEvent::AdapterHealth {
@@ -6037,6 +6146,11 @@ mod tests {
         .expect("successful initialize negotiation must activate the adapter");
 
         manager.cleanup_codex_adapter_session("codex-session");
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::CodexAdapterRemoved { identity }
+                if identity == &registered_identity
+        )));
         assert!(
             manager
                 .inner
@@ -6236,8 +6350,8 @@ mod tests {
             deduplication_key: None,
         };
 
-        emit_codex_semantic_if_current(&manager.inner, &old, draft("old"));
-        emit_codex_semantic_if_current(&manager.inner, &current, draft("current"));
+        emit_codex_semantic_if_current(&manager.inner, "old", &old, draft("old"));
+        emit_codex_semantic_if_current(&manager.inner, "current", &current, draft("current"));
         emit_codex_health_if_current(
             &manager.inner,
             &old,
@@ -6248,13 +6362,14 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, RemoteSessionEvent::Semantic { .. }))
+                .filter(|event| matches!(event, RemoteSessionEvent::CodexSemantic { .. }))
                 .count(),
             1
         );
         assert!(events.iter().any(|event| matches!(
             event,
-            RemoteSessionEvent::Semantic { draft } if matches!(
+            RemoteSessionEvent::CodexSemantic { identity, draft }
+                if identity == &codex_semantic_identity("current", &current) && matches!(
                 &draft.kind,
                 SemanticEventKind::Status { detail: Some(detail), .. } if detail == "current"
             )
@@ -6307,6 +6422,7 @@ mod tests {
         ));
         emit_codex_semantic_if_current(
             &manager.inner,
+            "old",
             &old,
             SemanticEventDraft {
                 stable_session_key,
