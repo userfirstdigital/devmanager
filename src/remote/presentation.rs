@@ -696,11 +696,23 @@ impl SemanticJournalStore {
         let is_new = !self.sessions.contains_key(&key);
         let session = self.ensure_session(&key, runtime.session_kind.is_ai());
         session.active = runtime.status.is_live();
-        let attention = semantic_attention(runtime);
-        let attention_count = if attention == SemanticAttention::None {
-            0
+        let runtime_attention = semantic_attention(runtime);
+        // An explicit provider question remains the highest-priority live
+        // attention state until the user replies. Runtime readiness refreshes
+        // must not silently downgrade it to a generic unread marker.
+        let attention = if session.metadata.attention == SemanticAttention::NeedsInput
+            && runtime_attention != SemanticAttention::Failed
+        {
+            SemanticAttention::NeedsInput
         } else {
-            runtime.notification_count.max(1)
+            runtime_attention
+        };
+        let attention_count = match attention {
+            SemanticAttention::None => 0,
+            SemanticAttention::NeedsInput => session.metadata.attention_count.max(1),
+            SemanticAttention::Unread | SemanticAttention::Failed => {
+                runtime.notification_count.max(1)
+            }
         };
         let metadata_changed = session.metadata.attention != attention
             || session.metadata.attention_count != attention_count;
@@ -816,6 +828,8 @@ impl SemanticJournalStore {
     pub fn record(&mut self, draft: SemanticEventDraft) -> SemanticEvent {
         let key = draft.stable_session_key.clone();
         let occurred_at_epoch_ms = draft.occurred_at_epoch_ms;
+        let is_question = matches!(&draft.kind, SemanticEventKind::Question { .. });
+        let is_user_message = matches!(&draft.kind, SemanticEventKind::UserMessage { .. });
         let event = {
             let session = self.ensure_session(&key, false);
             let event = session.journal.push(draft);
@@ -823,6 +837,22 @@ impl SemanticJournalStore {
             session.metadata.last_activity_epoch_ms = Some(occurred_at_epoch_ms);
             session.metadata.oldest_sequence = cursor.oldest_sequence;
             session.metadata.latest_sequence = cursor.latest_sequence;
+            if is_question {
+                let count = if session.metadata.attention == SemanticAttention::NeedsInput
+                    && event.replaces_sequence.is_none()
+                {
+                    session.metadata.attention_count.saturating_add(1)
+                } else {
+                    session.metadata.attention_count.max(1)
+                };
+                session.metadata.attention = SemanticAttention::NeedsInput;
+                session.metadata.attention_count = count;
+            } else if is_user_message
+                && session.metadata.attention == SemanticAttention::NeedsInput
+            {
+                session.metadata.attention = SemanticAttention::None;
+                session.metadata.attention_count = 0;
+            }
             event
         };
         self.enforce_store_limits();
@@ -862,6 +892,12 @@ impl SemanticJournalStore {
         self.session_bindings
             .get(session_id)
             .map(|binding| binding.key.clone())
+    }
+
+    pub fn status_for_session(&self, session_id: &str) -> Option<SessionStatus> {
+        self.session_bindings
+            .get(session_id)
+            .and_then(|binding| binding.status)
     }
 
     #[cfg(test)]
@@ -1820,6 +1856,68 @@ mod tests {
             &event.kind,
             SemanticEventKind::Output { text, .. } if text == "hello"
         )));
+    }
+
+    #[test]
+    fn needs_input_attention_survives_runtime_refresh_and_clears_on_user_reply() {
+        let mut store = SemanticJournalStore::default();
+        let key = StableSessionKey::from_tab("ai-tab");
+        let tab = SessionTab {
+            id: "ai-tab".to_string(),
+            tab_type: TabType::Claude,
+            pty_session_id: Some("ai-pty".to_string()),
+            ..SessionTab::default()
+        };
+        let mut runtime = SessionRuntimeState::new(
+            "ai-pty",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime.status = crate::state::SessionStatus::Running;
+        runtime.session_kind = SessionKind::Claude;
+        runtime.tab_id = Some("ai-tab".to_string());
+        store.observe_runtime(&runtime, std::slice::from_ref(&tab), 1);
+
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 2,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Question {
+                question_id: "question-1".to_string(),
+                prompt: "Choose".to_string(),
+                choices: vec!["A".to_string(), "B".to_string()],
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("question-1".to_string()),
+        });
+        assert_eq!(
+            store.metadata(&key).unwrap().attention,
+            SemanticAttention::NeedsInput
+        );
+        assert_eq!(store.status_for_session("ai-pty"), Some(crate::state::SessionStatus::Running));
+
+        store.observe_runtime(&runtime, &[tab], 3);
+        assert_eq!(
+            store.metadata(&key).unwrap().attention,
+            SemanticAttention::NeedsInput
+        );
+
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 4,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "A".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        assert_eq!(
+            store.metadata(&key).unwrap().attention,
+            SemanticAttention::None
+        );
+        assert_eq!(store.metadata(&key).unwrap().attention_count, 0);
     }
 
     #[test]

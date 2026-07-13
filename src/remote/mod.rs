@@ -9,8 +9,8 @@ pub use client_pool::RemoteClientPool;
 pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
 
 use presentation::{
-    SemanticEvent, SemanticEventDraft, SemanticJournalStore, SemanticReplay,
-    SemanticSessionMetadata, StableSessionKey,
+    SemanticAttention, SemanticEvent, SemanticEventDraft, SemanticEventKind,
+    SemanticJournalStore, SemanticReplay, SemanticSessionMetadata, StableSessionKey,
 };
 use web::bridge::{BrowserOutboundSender, WebConnectionTombstone};
 use web::input_executor::WebInputExecutor;
@@ -25,7 +25,9 @@ use crate::models::{
     Settings, TabType,
 };
 use crate::persistence::{self, PersistenceError};
-use crate::state::{AppState, RuntimeState, SessionDimensions, SessionRuntimeState};
+use crate::state::{
+    AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
+};
 use crate::terminal::session::{
     TerminalModeSnapshot, TerminalReplica, TerminalScreenSnapshot, TerminalSearchMatch,
     TerminalSessionView,
@@ -1053,6 +1055,9 @@ pub(crate) struct RemoteHostInner {
     semantic_delivery_lock: Mutex<()>,
     #[cfg(test)]
     semantic_delivery_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Non-blocking admission handle for the web listener's bounded Push
+    /// delivery pool. It is absent whenever the listener is stopped.
+    web_push_sender: RwLock<Option<std::sync::mpsc::SyncSender<web::push::PushDelivery>>>,
     session_bootstrap_provider: RwLock<Option<SessionBootstrapProvider>>,
     terminal_input_handler: RwLock<Option<TerminalInputHandler>>,
     terminal_resize_handler: RwLock<Option<TerminalResizeHandler>>,
@@ -1078,6 +1083,7 @@ pub(crate) struct RemoteHostInner {
     latency: RwLock<RemoteLatencyStats>,
     next_connection_id: AtomicU64,
     next_output_chunk_seq: AtomicU64,
+    next_push_event_id: AtomicU64,
     stop_flag: AtomicBool,
     listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
     broadcaster_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -1254,6 +1260,7 @@ struct LocalPortForwardEntry {
 impl RemoteHostService {
     pub fn new(config: RemoteHostConfig) -> Self {
         let mut config = config;
+        config.web.ensure_secrets();
         let _ = transport::ensure_host_tls_material(&mut config);
         let service = Self {
             inner: Arc::new(RemoteHostInner {
@@ -1274,6 +1281,7 @@ impl RemoteHostService {
                 semantic_delivery_lock: Mutex::new(()),
                 #[cfg(test)]
                 semantic_delivery_test_hook: RwLock::new(None),
+                web_push_sender: RwLock::new(None),
                 session_bootstrap_provider: RwLock::new(None),
                 terminal_input_handler: RwLock::new(None),
                 terminal_resize_handler: RwLock::new(None),
@@ -1294,6 +1302,7 @@ impl RemoteHostService {
                 latency: RwLock::new(RemoteLatencyStats::default()),
                 next_connection_id: AtomicU64::new(1),
                 next_output_chunk_seq: AtomicU64::new(1),
+                next_push_event_id: AtomicU64::new(1),
                 stop_flag: AtomicBool::new(false),
                 listener_thread: Mutex::new(None),
                 broadcaster_thread: Mutex::new(None),
@@ -1318,6 +1327,7 @@ impl RemoteHostService {
 
     pub fn apply_config(&self, config: RemoteHostConfig) {
         let mut config = config;
+        config.web.ensure_secrets();
         let _ = transport::ensure_host_tls_material(&mut config);
         let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
             return;
@@ -1489,6 +1499,84 @@ impl RemoteHostService {
         }
     }
 
+    pub fn push_semantic_draft(&self, draft: SemanticEventDraft) {
+        let visibility_guard = self
+            .inner
+            .web_control_operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stable_session_key = draft.stable_session_key.clone();
+        let is_question = matches!(&draft.kind, SemanticEventKind::Question { .. });
+        let is_completion = matches!(
+            &draft.kind,
+            SemanticEventKind::Status { state, .. }
+                if matches!(state.trim().to_ascii_lowercase().as_str(),
+                    "completed" | "complete" | "done" | "idle" | "ready" | "success")
+        );
+        let visibly_focused = self.stable_key_is_visibly_focused(&stable_session_key);
+        let mut push_action = None;
+        let changed = self.publish_semantic_change(|journals| {
+            let previous = journals.metadata(&stable_session_key);
+            journals.record(draft);
+            if is_completion
+                && !visibly_focused
+                && previous
+                    .as_ref()
+                    .is_none_or(|metadata| metadata.attention == SemanticAttention::None)
+            {
+                journals.set_attention(&stable_session_key, SemanticAttention::Unread, 1);
+            }
+            let current = journals.metadata(&stable_session_key);
+            if is_question
+                && previous.as_ref().map(|metadata| metadata.attention)
+                    != Some(SemanticAttention::NeedsInput)
+                && current.as_ref().map(|metadata| metadata.attention)
+                    == Some(SemanticAttention::NeedsInput)
+            {
+                push_action = Some(web::push::PushAttentionKind::NeedsInput);
+            } else if is_completion
+                && previous.as_ref().map(|metadata| metadata.attention)
+                    != Some(SemanticAttention::Unread)
+                && current.as_ref().map(|metadata| metadata.attention)
+                    == Some(SemanticAttention::Unread)
+            {
+                push_action = Some(web::push::PushAttentionKind::Completed);
+            }
+            true
+        });
+        if let Some(action) = push_action {
+            self.enqueue_push_attention(None, &stable_session_key, action);
+        }
+        drop(visibility_guard);
+        if changed {
+            let _ = deliver_live_semantic_events(&self.inner);
+        }
+    }
+
+    fn stable_key_is_visibly_focused(&self, stable_session_key: &StableSessionKey) -> bool {
+        let focused_session_ids = self
+            .inner
+            .clients
+            .lock()
+            .map(|clients| {
+                clients
+                    .values()
+                    .filter_map(|client| client.focused_session_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.inner
+            .semantic_journals
+            .lock()
+            .map(|journals| {
+                focused_session_ids.iter().any(|session_id| {
+                    journals.stable_key_for_session(session_id).as_ref()
+                        == Some(stable_session_key)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     pub fn push_session_output(&self, session_id: &str, bytes: Vec<u8>) {
         self.push_session_output_inner(session_id, bytes, None);
     }
@@ -1573,15 +1661,65 @@ impl RemoteHostService {
     }
 
     pub fn push_session_runtime(&self, session_id: &str, runtime: SessionRuntimeState) {
+        let visibility_guard = self
+            .inner
+            .web_control_operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tabs = self
             .inner
             .shared_state
             .read()
             .map(|state| state.open_tabs.clone())
             .unwrap_or_default();
+        let mut push_transition = None;
         self.publish_semantic_change(|journals| {
-            journals.observe_runtime(&runtime, &tabs, now_epoch_ms())
+            let previous_status = journals.status_for_session(session_id);
+            let previous_attention = journals
+                .stable_key_for_session(session_id)
+                .and_then(|key| journals.metadata(&key))
+                .map(|metadata| metadata.attention);
+            let changed = journals.observe_runtime(&runtime, &tabs, now_epoch_ms());
+            let stable_key = journals.stable_key_for_session(session_id);
+            let current_attention = stable_key
+                .as_ref()
+                .and_then(|key| journals.metadata(key))
+                .map(|metadata| metadata.attention);
+            let action = match runtime.session_kind {
+                SessionKind::Server
+                    if previous_status.is_some_and(SessionStatus::is_live)
+                        && matches!(runtime.status, SessionStatus::Crashed | SessionStatus::Failed) =>
+                {
+                    Some(web::push::PushAttentionKind::ServerCrashed)
+                }
+                SessionKind::Ssh
+                    if previous_status.is_some_and(SessionStatus::is_live)
+                        && !runtime.status.is_live()
+                        && runtime
+                            .exit
+                            .as_ref()
+                            .is_none_or(|exit| !exit.closed_by_user) =>
+                {
+                    Some(web::push::PushAttentionKind::SshDisconnected)
+                }
+                SessionKind::Claude | SessionKind::Codex
+                    if previous_status.is_some()
+                        && previous_attention != Some(SemanticAttention::Unread)
+                        && current_attention == Some(SemanticAttention::Unread) =>
+                {
+                    Some(web::push::PushAttentionKind::Completed)
+                }
+                _ => None,
+            };
+            if let (Some(stable_key), Some(action)) = (stable_key, action) {
+                push_transition = Some((stable_key, action));
+            }
+            changed
         });
+        if let Some((stable_key, action)) = push_transition {
+            self.enqueue_push_attention(Some(session_id), &stable_key, action);
+        }
+        drop(visibility_guard);
         self.mark_subscribed_clients_bootstrap_pending(session_id);
         let targets = self
             .inner
@@ -1624,6 +1762,143 @@ impl RemoteHostService {
                 revoke_failed_delivery(&self.inner, connection_id, target);
             }
         }
+    }
+
+    fn enqueue_push_attention(
+        &self,
+        session_id: Option<&str>,
+        stable_session_key: &StableSessionKey,
+        action: web::push::PushAttentionKind,
+    ) {
+        let sender = self
+            .inner
+            .web_push_sender
+            .read()
+            .ok()
+            .and_then(|sender| sender.clone());
+        let Some(sender) = sender else {
+            return;
+        };
+
+        let focused_sessions = self
+            .inner
+            .clients
+            .lock()
+            .map(|clients| {
+                clients
+                    .values()
+                    .filter_map(|client| {
+                        client
+                            .focused_session_id
+                            .as_ref()
+                            .map(|focused| (client.client_id.clone(), focused.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let focused_clients = if let Some(session_id) = session_id {
+            focused_sessions
+                .iter()
+                .filter(|(_, focused)| focused == session_id)
+                .map(|(client_id, _)| client_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            self.inner
+                .semantic_journals
+                .lock()
+                .map(|journals| {
+                    focused_sessions
+                        .iter()
+                        .filter(|(_, focused)| {
+                            journals.stable_key_for_session(focused).as_ref()
+                                == Some(stable_session_key)
+                        })
+                        .map(|(client_id, _)| client_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let push_config = self
+            .inner
+            .config
+            .read()
+            .map(|config| config.web.push.clone())
+            .unwrap_or_default();
+        let subscriptions =
+            web::push::eligible_subscriptions(&push_config.subscriptions, &focused_clients);
+        if subscriptions.is_empty() {
+            return;
+        }
+
+        let (project_label, session_label) = self.push_labels(stable_session_key);
+        let badge = self
+            .inner
+            .semantic_journals
+            .lock()
+            .map(|journals| {
+                journals
+                    .metadata_snapshot()
+                    .values()
+                    .filter(|metadata| metadata.attention != SemanticAttention::None)
+                    .fold(0_u64, |total, metadata| {
+                        total.saturating_add(metadata.attention_count.max(1))
+                    })
+            })
+            .unwrap_or(1)
+            .min(99);
+        let event_sequence = self
+            .inner
+            .next_push_event_id
+            .fetch_add(1, Ordering::Relaxed);
+        let event_id = format!("{}-{event_sequence}", now_epoch_ms());
+        let payload = web::push::PushPayload::attention(
+            self.inner.runtime_instance_id.clone(),
+            stable_session_key,
+            action,
+            &project_label,
+            &session_label,
+            event_id,
+            badge,
+        );
+        for subscription in subscriptions {
+            let _ = sender.try_send(web::push::PushDelivery {
+                config: push_config.clone(),
+                subscription,
+                payload: payload.clone(),
+            });
+        }
+    }
+
+    fn push_labels(&self, stable_session_key: &StableSessionKey) -> (String, String) {
+        let Ok(state) = self.inner.shared_state.read() else {
+            return ("Project".to_string(), "Session".to_string());
+        };
+        if let Some(command_id) = stable_session_key.as_str().strip_prefix("server:") {
+            if let Some(found) = state.find_command(command_id) {
+                return (found.project.name.clone(), found.command.label.clone());
+            }
+        }
+        if let Some(tab_id) = stable_session_key.as_str().strip_prefix("tab:") {
+            if let Some(tab) = state.open_tabs.iter().find(|tab| tab.id == tab_id) {
+                let project = state
+                    .find_project(&tab.project_id)
+                    .map(|project| project.name.clone())
+                    .unwrap_or_else(|| "Project".to_string());
+                let fallback = match tab.tab_type {
+                    TabType::Claude => "Claude",
+                    TabType::Codex => "Codex",
+                    TabType::Ssh => "SSH",
+                    TabType::Server => "Server",
+                };
+                let session = tab
+                    .label
+                    .clone()
+                    .filter(|label| !label.trim().is_empty())
+                    .unwrap_or_else(|| fallback.to_string());
+                return (project, session);
+            }
+        }
+        ("Project".to_string(), "Session".to_string())
     }
 
     fn publish_semantic_change(
@@ -1692,6 +1967,18 @@ impl RemoteHostService {
         drop(epoch);
         drop(publication_guard);
         changed
+    }
+
+    fn acknowledge_semantic_attention(&self, stable_session_key: &StableSessionKey) {
+        self.publish_semantic_change(|journals| {
+            if journals
+                .metadata(stable_session_key)
+                .is_none_or(|metadata| metadata.attention == SemanticAttention::NeedsInput)
+            {
+                return false;
+            }
+            journals.set_attention(stable_session_key, SemanticAttention::None, 0)
+        });
     }
 
     #[cfg(test)]
@@ -1903,6 +2190,7 @@ impl RemoteHostService {
             config.web.activity_log.retain(|event| {
                 !(event.source == RemoteAccessSource::Browser && event.client_id == client_id)
             });
+            config.web.push.remove_client(client_id);
             config.web.paired_clients.len() != before
         }) {
             Ok(removed) => removed,
@@ -1958,6 +2246,7 @@ impl RemoteHostService {
                 .map(|client| client.client_id.clone())
                 .collect::<Vec<_>>();
             config.web.paired_clients.clear();
+            config.web.push.subscriptions.clear();
             config
                 .web
                 .activity_log
@@ -2104,6 +2393,16 @@ impl RemoteHostService {
             }
         }
     }
+}
+
+pub(crate) fn acknowledge_browser_attention(
+    inner: &Arc<RemoteHostInner>,
+    stable_session_key: &StableSessionKey,
+) {
+    RemoteHostService {
+        inner: inner.clone(),
+    }
+    .acknowledge_semantic_attention(stable_session_key);
 }
 
 impl Drop for RemoteHostService {
@@ -4462,6 +4761,10 @@ mod tests {
         StableSessionKey,
     };
     use crate::remote::web::bridge::BrowserOutboundSender;
+    use crate::remote::web::push::{
+        validate_registration, PushAttentionKind, PushDelivery, PushRegistrationKeys,
+        PushRegistrationRequest,
+    };
     use crate::remote::web::wire::WsOutbound;
     use crate::state::{
         AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
@@ -4469,6 +4772,7 @@ mod tests {
     use crate::terminal::session::{
         TerminalBackend, TerminalModeSnapshot, TerminalScreenSnapshot, TerminalSessionView,
     };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -4791,6 +5095,18 @@ mod tests {
             os_family: Some("Windows".to_string()),
             device_class: Some("desktop".to_string()),
         });
+        let subscription = validate_registration(PushRegistrationRequest {
+            endpoint: "https://web.push.apple.com/QM-revoke".to_string(),
+            keys: PushRegistrationKeys {
+                p256dh: config.web.push.vapid_public_key_base64.clone(),
+                auth: URL_SAFE_NO_PAD.encode([5_u8; 16]),
+            },
+        })
+        .expect("valid push subscription");
+        config
+            .web
+            .push
+            .upsert_subscription("web-client-1", subscription, 1);
         let service = RemoteHostService::new(config);
         let web_sender = BrowserOutboundSender::detached_for_test(8, 1024 * 1024);
         let tombstone = web_sender.tombstone();
@@ -4823,6 +5139,7 @@ mod tests {
 
         assert!(service.revoke_paired_web_client("web-client-1"));
         assert!(service.config().web.paired_clients.is_empty());
+        assert!(service.config().web.push.subscriptions.is_empty());
         assert!(service.status().controller_client_id.is_none());
         assert!(!tombstone.is_active());
     }
@@ -4846,6 +5163,18 @@ mod tests {
             os_family: Some("Windows".to_string()),
             device_class: Some("desktop".to_string()),
         });
+        let subscription = validate_registration(PushRegistrationRequest {
+            endpoint: "https://web.push.apple.com/QM-reset".to_string(),
+            keys: PushRegistrationKeys {
+                p256dh: config.web.push.vapid_public_key_base64.clone(),
+                auth: URL_SAFE_NO_PAD.encode([6_u8; 16]),
+            },
+        })
+        .expect("valid push subscription");
+        config
+            .web
+            .push
+            .upsert_subscription("web-client-1", subscription, 1);
         config.web.activity_log.push(RemoteAccessActivityEvent {
             client_id: "web-client-1".to_string(),
             source: RemoteAccessSource::Browser,
@@ -4924,6 +5253,7 @@ mod tests {
         assert!(service.reset_browser_access());
         let saved = service.config();
         assert!(saved.web.paired_clients.is_empty());
+        assert!(saved.web.push.subscriptions.is_empty());
         assert_eq!(saved.web.activity_log.len(), 1);
         assert_eq!(
             saved.web.activity_log[0].source,
@@ -5321,6 +5651,189 @@ mod tests {
             SemanticEventKind::Status { state, .. } if state == "running"
         )));
         assert!(service.inner.clients.lock().unwrap().is_empty());
+    }
+
+    fn service_with_push_subscription(
+        client_id: &str,
+    ) -> (RemoteHostService, mpsc::Receiver<PushDelivery>) {
+        let mut config = RemoteHostConfig::default();
+        let subscription = validate_registration(PushRegistrationRequest {
+            endpoint: format!("https://web.push.apple.com/QM-{client_id}"),
+            keys: PushRegistrationKeys {
+                p256dh: config.web.push.vapid_public_key_base64.clone(),
+                auth: URL_SAFE_NO_PAD.encode([8_u8; 16]),
+            },
+        })
+        .expect("valid push subscription");
+        config
+            .web
+            .push
+            .upsert_subscription(client_id, subscription, 1);
+        let service = RemoteHostService::new(config);
+        let (sender, receiver) = mpsc::sync_channel(8);
+        *service.inner.web_push_sender.write().unwrap() = Some(sender);
+        (service, receiver)
+    }
+
+    fn attention_runtime(
+        session_id: &str,
+        kind: SessionKind,
+        status: SessionStatus,
+    ) -> SessionRuntimeState {
+        let mut runtime = SessionRuntimeState::new(
+            session_id,
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = kind;
+        runtime.status = status;
+        if matches!(kind, SessionKind::Server | SessionKind::Shell) {
+            runtime.command_id = Some(session_id.to_string());
+        } else {
+            runtime.tab_id = Some(session_id.to_string());
+        }
+        runtime
+    }
+
+    #[test]
+    fn actionable_runtime_transitions_enqueue_once_with_generic_content() {
+        let (service, receiver) = service_with_push_subscription("phone-actions");
+
+        let running = attention_runtime("server-a", SessionKind::Server, SessionStatus::Running);
+        service.push_session_runtime("server-a", running.clone());
+        assert!(receiver.try_recv().is_err());
+
+        let mut crashed = running;
+        crashed.status = SessionStatus::Crashed;
+        service.push_session_runtime("server-a", crashed.clone());
+        let delivery = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("server crash push");
+        assert_eq!(delivery.payload.action, PushAttentionKind::ServerCrashed);
+        assert_eq!(delivery.payload.route, "/session/server/server-a");
+        assert!(!delivery.payload.body.contains("log"));
+
+        service.push_session_runtime("server-a", crashed);
+        assert!(receiver.try_recv().is_err(), "same transition must not notify twice");
+
+        let mut ai = attention_runtime("claude-a", SessionKind::Claude, SessionStatus::Running);
+        service.push_session_runtime("claude-a", ai.clone());
+        ai.unseen_ready = true;
+        ai.notification_count = 1;
+        service.push_session_runtime("claude-a", ai);
+        let delivery = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("AI completion push");
+        assert_eq!(delivery.payload.action, PushAttentionKind::Completed);
+
+        let ssh = attention_runtime("ssh-a", SessionKind::Ssh, SessionStatus::Running);
+        service.push_session_runtime("ssh-a", ssh.clone());
+        let mut disconnected = ssh;
+        disconnected.status = SessionStatus::Exited;
+        disconnected.exit = Some(crate::state::SessionExitState {
+            closed_by_user: false,
+            summary: "connection lost".to_string(),
+            ..Default::default()
+        });
+        service.push_session_runtime("ssh-a", disconnected);
+        let delivery = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("unexpected SSH disconnect push");
+        assert_eq!(delivery.payload.action, PushAttentionKind::SshDisconnected);
+    }
+
+    #[test]
+    fn visibly_focused_install_suppresses_only_its_own_push_subscription() {
+        let (service, receiver) = service_with_push_subscription("phone-visible");
+        if let Ok(mut clients) = service.inner.clients.lock() {
+            clients.insert(
+                1,
+                ConnectedRemoteClient {
+                    client_id: "phone-visible".to_string(),
+                    sender: None,
+                    web_sender: None,
+                    web_tombstone: None,
+                    semantic_cursors: HashMap::new(),
+                    subscribed_session_ids: HashSet::new(),
+                    bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
+                    focused_session_id: Some("server-visible".to_string()),
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                    last_snapshot_revision: 0,
+                },
+            );
+        }
+        let running = attention_runtime(
+            "server-visible",
+            SessionKind::Server,
+            SessionStatus::Running,
+        );
+        service.push_session_runtime("server-visible", running.clone());
+        let mut crashed = running;
+        crashed.status = SessionStatus::Failed;
+        service.push_session_runtime("server-visible", crashed);
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn semantic_completion_and_question_transitions_notify_without_duplicates() {
+        let (service, receiver) = service_with_push_subscription("phone-semantic");
+        let runtime = attention_runtime("claude-semantic", SessionKind::Claude, SessionStatus::Running);
+        service.push_session_runtime("claude-semantic", runtime);
+        let key = StableSessionKey::from_tab("claude-semantic");
+
+        let completed = SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 10,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Status {
+                state: "completed".to_string(),
+                detail: None,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("turn-completed".to_string()),
+        };
+        service.push_semantic_draft(completed.clone());
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap()
+                .payload
+                .action,
+            PushAttentionKind::Completed
+        );
+        service.push_semantic_draft(completed);
+        assert!(receiver.try_recv().is_err());
+
+        service.publish_semantic_change(|journals| {
+            journals.set_attention(&key, SemanticAttention::None, 0)
+        });
+        let question = SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 11,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Question {
+                question_id: "permission-1".to_string(),
+                prompt: "PROMPT_SENTINEL".to_string(),
+                choices: vec!["Allow".to_string(), "Deny".to_string()],
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("permission-1".to_string()),
+        };
+        service.push_semantic_draft(question.clone());
+        let delivery = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("question push");
+        assert_eq!(delivery.payload.action, PushAttentionKind::NeedsInput);
+        assert!(!delivery.payload.body.contains("PROMPT_SENTINEL"));
+        service.push_semantic_draft(question);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

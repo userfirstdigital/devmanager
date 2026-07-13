@@ -7,6 +7,7 @@ pub mod image_paste;
 pub(crate) mod input_executor;
 pub mod lease;
 pub(crate) mod request_executor;
+pub mod push;
 pub mod wire;
 
 use self::auth::{PairingAttemptTracker, PairingThrottleStatus};
@@ -14,11 +15,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Query, Request, State};
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -34,6 +36,7 @@ pub use auth::{
 };
 
 const WEB_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 365 * 10;
+const PUSH_REGISTRATION_BODY_BYTES: usize = 16 * 1024;
 
 /// Persisted configuration for the web listener. Lives inside `RemoteHostConfig`
 /// and is serialized to `remote.json` via serde defaults.
@@ -47,6 +50,7 @@ pub struct WebConfig {
     pub cookie_secret_hex: String,
     pub paired_clients: Vec<PairedWebClient>,
     pub activity_log: Vec<RemoteAccessActivityEvent>,
+    pub push: push::WebPushConfig,
 }
 
 impl Default for WebConfig {
@@ -59,6 +63,7 @@ impl Default for WebConfig {
             cookie_secret_hex: generate_cookie_secret_hex(),
             paired_clients: Vec::new(),
             activity_log: Vec::new(),
+            push: push::WebPushConfig::default(),
         }
     }
 }
@@ -79,6 +84,7 @@ impl WebConfig {
         if self.port == 0 {
             self.port = 43872;
         }
+        self.push.ensure_keys();
     }
 
     /// Human-friendly listener URL for the current bind. When the host binds to
@@ -356,6 +362,8 @@ pub fn discover_lan_ip() -> Option<IpAddr> {
 pub struct WebListenerHandle {
     runtime: Option<tokio::runtime::Runtime>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    push_inner: std::sync::Weak<RemoteHostInner>,
+    push_dispatcher: Option<push::PushDispatcher>,
     pub bind_info: String,
 }
 
@@ -399,11 +407,28 @@ impl WebListenerHandle {
         });
 
         match bind_result_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Self {
-                runtime: Some(runtime),
-                shutdown_tx: Some(shutdown_tx),
-                bind_info,
-            }),
+            Ok(Ok(())) => {
+                let push_inner = Arc::downgrade(&inner);
+                let push_dispatcher = match push::PushDispatcher::start(push_inner.clone()) {
+                    Ok(dispatcher) => {
+                        if let Ok(mut sender) = inner.web_push_sender.write() {
+                            *sender = Some(dispatcher.sender());
+                        }
+                        Some(dispatcher)
+                    }
+                    Err(error) => {
+                        eprintln!("[remote-web] Web Push delivery disabled: {error}");
+                        None
+                    }
+                };
+                Ok(Self {
+                    runtime: Some(runtime),
+                    shutdown_tx: Some(shutdown_tx),
+                    push_inner,
+                    push_dispatcher,
+                    bind_info,
+                })
+            }
             Ok(Err(error)) => Err(error),
             Err(_) => Err("web listener failed to report bind status in time".to_string()),
         }
@@ -413,6 +438,7 @@ impl WebListenerHandle {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        self.stop_push_dispatcher();
         if let Some(runtime) = self.runtime.take() {
             // Drop in a blocking context. tokio's Runtime::drop blocks the
             // calling thread until outstanding tasks finish, which is what we
@@ -421,6 +447,15 @@ impl WebListenerHandle {
             drop(runtime);
         }
     }
+
+    fn stop_push_dispatcher(&mut self) {
+        if let Some(inner) = self.push_inner.upgrade() {
+            if let Ok(mut sender) = inner.web_push_sender.write() {
+                *sender = None;
+            }
+        }
+        self.push_dispatcher.take();
+    }
 }
 
 impl Drop for WebListenerHandle {
@@ -428,6 +463,7 @@ impl Drop for WebListenerHandle {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        self.stop_push_dispatcher();
         if let Some(runtime) = self.runtime.take() {
             drop(runtime);
         }
@@ -446,8 +482,11 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/pair", get(pair_handler))
         .route("/api/health", get(health_handler))
         .route("/api/me", get(me_handler))
+        .route("/api/push", get(push_status_handler).post(push_subscribe_handler))
+        .route("/api/push/unsubscribe", post(push_unsubscribe_handler))
         .route("/api/ws", get(bridge::ws_handler))
         .route("/*path", get(assets::static_handler))
+        .layer(DefaultBodyLimit::max(PUSH_REGISTRATION_BODY_BYTES))
         .layer(middleware::from_fn(web_response_policy))
         .with_state(state)
 }
@@ -755,6 +794,112 @@ async fn me_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> R
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PushStatusResponse {
+    public_key: String,
+    subscribed: bool,
+}
+
+async fn push_status_handler(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(client_id) = authenticate_request(&state, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    };
+    let Ok(config) = state.inner.config.read() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "config unavailable").into_response();
+    };
+    let response = PushStatusResponse {
+        public_key: config.web.push.vapid_public_key_base64.clone(),
+        subscribed: config
+            .web
+            .push
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.client_id == client_id),
+    };
+    match serde_json::to_vec(&response) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response(),
+    }
+}
+
+async fn push_subscribe_handler(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(client_id) = authenticate_request(&state, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    };
+    let request = match serde_json::from_slice::<push::PushRegistrationRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid subscription").into_response(),
+    };
+    let validated = match push::validate_registration(request) {
+        Ok(validated) => validated,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let registered = match super::mutate_host_config(&state.inner, |config| {
+        if !config
+            .web
+            .paired_clients
+            .iter()
+            .any(|client| client.client_id == client_id)
+        {
+            return false;
+        }
+        config
+            .web
+            .push
+            .upsert_subscription(&client_id, validated, now_epoch_ms());
+        true
+    }) {
+        Ok(registered) => registered,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "subscription save failed")
+                .into_response()
+        }
+    };
+    if !registered {
+        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn push_unsubscribe_handler(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(client_id) = authenticate_request(&state, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    };
+    let request = match serde_json::from_slice::<push::PushUnsubscribeRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid subscription").into_response(),
+    };
+    if let Err(error) = push::validate_push_endpoint(&request.endpoint) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    match super::mutate_host_config(&state.inner, |config| {
+        config
+            .web
+            .push
+            .remove_subscription(&client_id, &request.endpoint)
+    }) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "subscription save failed").into_response(),
+    }
+}
+
 /// Shared helper: returns `Some(client_id)` when the request carries a valid
 /// `dm_web` cookie that matches a currently-paired web client and verifies
 /// against the host's cookie secret. Used by `/api/me` and (later) the
@@ -801,7 +946,8 @@ mod tests {
         load_remote_machine_state, save_remote_machine_state, test_support::TestProfileGuard,
         KnownRemoteHost, RemoteHostConfig, RemoteHostService, RemoteMachineState,
     };
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
+    use base64::Engine as _;
     use tower::ServiceExt;
 
     fn test_service(server_id: &str) -> RemoteHostService {
@@ -846,6 +992,211 @@ mod tests {
             )
             .await
             .expect("router response")
+    }
+
+    async fn route_request(
+        state: Arc<WebState>,
+        method: axum::http::Method,
+        uri: &str,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "devmanager.test:43872")
+            .extension(ConnectInfo(test_addr()))
+            .body(Body::from(body))
+            .expect("request");
+        *request.headers_mut() = headers;
+        request
+            .headers_mut()
+            .insert(header::HOST, "devmanager.test:43872".parse().unwrap());
+        build_router(state)
+            .oneshot(request)
+            .await
+            .expect("router response")
+    }
+
+    async fn pair_cookie_headers(state: Arc<WebState>, install_id: &str) -> HeaderMap {
+        let response = pair_handler(
+            State(state),
+            ConnectInfo(test_addr()),
+            test_headers(None),
+            Query(PairQuery {
+                t: Some("PAIR1234".to_string()),
+                label: None,
+                browser_install_id: Some(install_id.to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("paired cookie")
+            .to_str()
+            .expect("cookie text")
+            .split(';')
+            .next()
+            .expect("cookie value");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie.parse().expect("cookie header"));
+        headers
+    }
+
+    fn valid_push_registration(service: &RemoteHostService, endpoint: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "endpoint": endpoint,
+            "keys": {
+                "p256dh": service.config().web.push.vapid_public_key_base64,
+                "auth": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9_u8; 16]),
+            }
+        }))
+        .expect("push registration")
+    }
+
+    #[test]
+    fn push_routes_require_pairing_and_never_expose_private_vapid_material() {
+        let _profile = TestProfileGuard::new("web-push-auth");
+        let service = test_service("host-push-auth");
+        let state = test_state(&service);
+        let private_key = service
+            .config()
+            .web
+            .push
+            .vapid_private_key_base64
+            .clone();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::GET,
+                    "/api/push",
+                    HeaderMap::new(),
+                    Vec::new(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    HeaderMap::new(),
+                    valid_push_registration(
+                        &service,
+                        "https://web.push.apple.com/QM-unauthorized",
+                    ),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+                let headers = pair_cookie_headers(state.clone(), "phone-auth").await;
+                let response = route_request(
+                    state,
+                    axum::http::Method::GET,
+                    "/api/push",
+                    headers,
+                    Vec::new(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 16 * 1024)
+                    .await
+                    .expect("status body");
+                let body = String::from_utf8(body.to_vec()).expect("status text");
+                assert!(body.contains("publicKey"));
+                assert!(!body.contains(&private_key));
+                assert!(!body.contains("private"));
+            });
+    }
+
+    #[test]
+    fn push_subscription_is_bounded_validated_persisted_and_scoped_to_install() {
+        let _profile = TestProfileGuard::new("web-push-registration");
+        let service = test_service("host-push-registration");
+        let state = test_state(&service);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let phone_headers = pair_cookie_headers(state.clone(), "phone-push").await;
+                let tablet_headers = pair_cookie_headers(state.clone(), "tablet-push").await;
+                let endpoint = "https://web.push.apple.com/QM-phone";
+
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    phone_headers.clone(),
+                    valid_push_registration(&service, endpoint),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                assert_eq!(service.config().web.push.subscriptions.len(), 1);
+
+                let saved = load_remote_machine_state().expect("persisted push state");
+                assert_eq!(saved.host.web.push.subscriptions.len(), 1);
+                let phone_id = service
+                    .config()
+                    .web
+                    .paired_clients
+                    .iter()
+                    .find(|client| client.browser_install_id == "phone-push")
+                    .expect("paired phone")
+                    .client_id
+                    .clone();
+                assert_eq!(saved.host.web.push.subscriptions[0].client_id, phone_id);
+
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push/unsubscribe",
+                    tablet_headers,
+                    serde_json::to_vec(&serde_json::json!({ "endpoint": endpoint })).unwrap(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                assert_eq!(service.config().web.push.subscriptions.len(), 1);
+
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    phone_headers.clone(),
+                    vec![b'x'; PUSH_REGISTRATION_BODY_BYTES + 1],
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    phone_headers.clone(),
+                    valid_push_registration(&service, "https://127.0.0.1/private"),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+                for _ in 0..2 {
+                    let response = route_request(
+                        state.clone(),
+                        axum::http::Method::POST,
+                        "/api/push/unsubscribe",
+                        phone_headers.clone(),
+                        serde_json::to_vec(&serde_json::json!({ "endpoint": endpoint })).unwrap(),
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                }
+                assert!(service.config().web.push.subscriptions.is_empty());
+            });
     }
 
     #[test]

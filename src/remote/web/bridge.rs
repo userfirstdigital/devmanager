@@ -36,11 +36,12 @@ use super::super::presentation::{
     SemanticSessionMetadata, SemanticSource, StableSessionKey,
 };
 use super::super::{
-    now_epoch_ms, publish_semantic_event, request_timeout_for_action, requires_control,
-    stable_hash, try_enqueue_pending_request, ConnectedRemoteClient, PendingRemoteRequest,
-    RemoteActionResult, RemoteHostInner, RemoteImageAttachment, RemoteSessionStreamEvent,
-    RemoteTerminalInput, RemoteWebMutationAuthority, RemoteWorkspaceSnapshot, ServerMessage,
-    WebComposerMutationRecord, WebComposerMutationStatus,
+    acknowledge_browser_attention, now_epoch_ms, publish_semantic_event,
+    request_timeout_for_action, requires_control, stable_hash, try_enqueue_pending_request,
+    ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
+    RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput,
+    RemoteWebMutationAuthority, RemoteWorkspaceSnapshot, ServerMessage, WebComposerMutationRecord,
+    WebComposerMutationStatus,
 };
 use super::action::WebActionResult;
 use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState, WEB_BUILD_ID, WEB_PROTOCOL_VERSION};
@@ -2230,7 +2231,10 @@ fn send_resume_state_with_lane(
         client.subscribed_session_ids.clear();
         client.bootstrapped_session_ids.clear();
         client.bootstrap_pending_session_ids.clear();
-        client.focused_session_id = desired_session_id.clone();
+        client.focused_session_id = request
+            .visible
+            .then(|| desired_session_id.clone())
+            .flatten();
         if let Some(session_id) = desired_session_id.as_ref() {
             client.subscribed_session_ids.insert(session_id.clone());
             client
@@ -2245,6 +2249,27 @@ fn send_resume_state_with_lane(
         return;
     }
     broadcast_writer_lease_state_locked_excluding(inner, now_epoch_ms, Some(connection_id));
+    let visible_focus = request.visible.then(|| {
+        (
+            desired_session_id.clone(),
+            desired_session_key.clone(),
+        )
+    });
+    drop(_delivery);
+    drop(_operation);
+    if let Some((Some(session_id), stable_session_key)) = visible_focus {
+        let handler = inner
+            .focused_session_handler
+            .read()
+            .ok()
+            .and_then(|handler| handler.clone());
+        if let Some(handler) = handler {
+            handler(session_id);
+        }
+        if let Some(stable_session_key) = stable_session_key {
+            acknowledge_browser_attention(inner, &stable_session_key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2689,6 +2714,9 @@ fn renew_writer_lease(
     {
         return writer_lease_state_locked(inner, connection_id, now_epoch_ms);
     }
+    if !visible {
+        clear_focused_session_for_connection(inner, connection_id, client_id);
+    }
     let state = {
         let Ok(mut control) = inner.web_control.lock() else {
             return WebWriterLeaseState::default();
@@ -2755,6 +2783,9 @@ fn set_writer_visibility_for_connection(
     {
         return writer_lease_state_locked(inner, connection_id, now_epoch_ms);
     }
+    if !visible {
+        clear_focused_session_for_connection(inner, connection_id, client_id);
+    }
     let state = set_writer_visibility_locked(
         inner,
         connection_id,
@@ -2765,6 +2796,21 @@ fn set_writer_visibility_for_connection(
     );
     broadcast_writer_lease_state_locked(inner, now_epoch_ms);
     state
+}
+
+fn clear_focused_session_for_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+) {
+    if let Ok(mut clients) = inner.clients.lock() {
+        if let Some(client) = clients
+            .get_mut(&connection_id)
+            .filter(|client| client.client_id == client_id)
+        {
+            client.focused_session_id = None;
+        }
+    }
 }
 
 fn set_writer_visibility_locked(
@@ -5887,6 +5933,125 @@ mod tests {
         let client = clients.get(&1).expect("resume connection");
         assert!(client.subscribed_session_ids.contains("session-a"));
         assert!(client.bootstrap_pending_session_ids.contains("session-a"));
+    }
+
+    #[test]
+    fn hidden_resume_and_visibility_loss_never_mark_a_session_visibly_focused() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        pair_web_client(&service, "web-client");
+        ai_session(&service, "tab-a", "session-a");
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, 1, "web-client", std_tx, test_web_sender());
+        let mut ready = SessionRuntimeState::new(
+            "session-a",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        ready.session_kind = SessionKind::Claude;
+        ready.tab_id = Some("tab-a".to_string());
+        ready.status = crate::state::SessionStatus::Running;
+        ready.unseen_ready = true;
+        ready.notification_count = 1;
+        service.push_session_runtime("session-a", ready);
+        let key = StableSessionKey::from_tab("tab-a");
+        assert_eq!(
+            service.semantic_session_metadata(&key).unwrap().attention,
+            crate::remote::presentation::SemanticAttention::Unread
+        );
+        let (focused_tx, focused_rx) = std_mpsc::channel();
+        service.set_focused_session_handler(Some(Arc::new(move |session_id| {
+            let _ = focused_tx.send(session_id);
+        })));
+        let (response_tx, mut response_rx) = tokio_mpsc::unbounded_channel();
+
+        let mut hidden = resume_request(
+            Some(service.inner.runtime_instance_id.clone()),
+            Some(StableSessionKey::from_tab("tab-a")),
+            "phone",
+        );
+        hidden.visible = false;
+        hidden.wants_writer_lease = false;
+        send_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            hidden,
+            1_000,
+            &response_tx,
+        );
+        let _ = response_rx.try_recv().expect("hidden resume response");
+        assert!(service
+            .inner
+            .clients
+            .lock()
+            .unwrap()
+            .get(&1)
+            .unwrap()
+            .focused_session_id
+            .is_none());
+        assert!(focused_rx.try_recv().is_err());
+        assert_eq!(
+            service.semantic_session_metadata(&key).unwrap().attention,
+            crate::remote::presentation::SemanticAttention::Unread
+        );
+
+        send_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "phone",
+            ),
+            1_001,
+            &response_tx,
+        );
+        let _ = response_rx.try_recv().expect("visible resume response");
+        assert_eq!(
+            service
+                .inner
+                .clients
+                .lock()
+                .unwrap()
+                .get(&1)
+                .unwrap()
+                .focused_session_id
+                .as_deref(),
+            Some("session-a")
+        );
+        assert_eq!(
+            focused_rx.recv_timeout(Duration::from_millis(250)).unwrap(),
+            "session-a"
+        );
+        assert_eq!(
+            service.semantic_session_metadata(&key).unwrap().attention,
+            crate::remote::presentation::SemanticAttention::None
+        );
+
+        let (native_tx, _native_rx) = tokio_mpsc::unbounded_channel();
+        let (web_tx, _web_rx) = tokio_mpsc::unbounded_channel();
+        handle_inbound_with_web(
+            &service.inner,
+            1,
+            "web-client",
+            WsInbound::SetVisibility {
+                client_instance_id: "phone".to_string(),
+                visible: false,
+            },
+            &native_tx,
+            &web_tx,
+        );
+        assert!(service
+            .inner
+            .clients
+            .lock()
+            .unwrap()
+            .get(&1)
+            .unwrap()
+            .focused_session_id
+            .is_none());
     }
 
     #[test]
