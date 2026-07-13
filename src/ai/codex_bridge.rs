@@ -14,8 +14,13 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWrite
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_tungstenite::{
-    accept_async_with_config,
-    tungstenite::{protocol::WebSocketConfig, Message},
+    accept_hdr_async_with_config,
+    tungstenite::{
+        handshake::server::{ErrorResponse, Request, Response},
+        http::StatusCode,
+        protocol::WebSocketConfig,
+        Message,
+    },
 };
 
 const DEFAULT_ACTIVE_ITEMS: usize = 64;
@@ -1008,11 +1013,47 @@ pub fn peer_is_allowed(peer: SocketAddr) -> bool {
     peer.ip().is_loopback()
 }
 
+fn random_bridge_path() -> Result<String, String> {
+    const TOKEN_BYTES: usize = 32;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut token = [0_u8; TOKEN_BYTES];
+    getrandom::fill(&mut token)
+        .map_err(|error| format!("Cannot generate Codex bridge bearer path: {error}"))?;
+    let mut path = String::with_capacity("/bridge/".len() + TOKEN_BYTES * 2);
+    path.push_str("/bridge/");
+    for byte in token {
+        path.push(HEX[(byte >> 4) as usize] as char);
+        path.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(path)
+}
+
+fn authorize_bridge_handshake(
+    request: &Request,
+    response: Response,
+    expected_path: &str,
+) -> Result<Response, ErrorResponse> {
+    let exact_path = request
+        .uri()
+        .path_and_query()
+        .is_some_and(|path| path.as_str() == expected_path);
+    if exact_path {
+        return Ok(response);
+    }
+
+    let mut rejection = ErrorResponse::new(Some("Not Found".to_string()));
+    *rejection.status_mut() = StatusCode::NOT_FOUND;
+    Err(rejection)
+}
+
 /// Serves exactly one TUI WebSocket and transparently connects it to one
 /// app-server stdio stream. JSONL delimiters are transport framing; every byte
-/// inside a frame is otherwise preserved.
+/// inside a frame is otherwise preserved. `expected_path` is a per-bridge
+/// bearer secret; rejected handshakes do not consume the legitimate TUI slot.
 pub async fn serve_one_loopback_client<S>(
     listener: TcpListener,
+    expected_path: String,
     stdio: S,
     observer: SemanticObserverSender,
     shutdown: oneshot::Receiver<()>,
@@ -1022,6 +1063,7 @@ where
 {
     serve_one_loopback_client_with_activation(
         listener,
+        expected_path,
         stdio,
         observer,
         shutdown,
@@ -1033,6 +1075,7 @@ where
 
 async fn serve_one_loopback_client_with_activation<S>(
     listener: TcpListener,
+    expected_path: String,
     stdio: S,
     observer: SemanticObserverSender,
     mut shutdown: oneshot::Receiver<()>,
@@ -1044,32 +1087,46 @@ where
 {
     let activation_deadline = tokio::time::sleep(activation_timeout);
     tokio::pin!(activation_deadline);
-    let (socket, peer) = tokio::select! {
-        accepted = listener.accept() => accepted.map_err(|error| format!("Codex bridge accept failed: {error}"))?,
-        _ = &mut shutdown => return Ok(()),
-        _ = &mut activation_deadline, if on_activated.is_some() => {
-            return Err("Codex bridge activation timed out before initialize negotiation".to_string());
+    let websocket = loop {
+        let (socket, peer) = tokio::select! {
+            accepted = listener.accept() => accepted.map_err(|error| format!("Codex bridge accept failed: {error}"))?,
+            _ = &mut shutdown => return Ok(()),
+            _ = &mut activation_deadline, if on_activated.is_some() => {
+                return Err("Codex bridge activation timed out before initialize negotiation".to_string());
+            }
+        };
+        if !peer_is_allowed(peer) {
+            continue;
         }
-    };
-    if !peer_is_allowed(peer) {
-        return Err(format!("Codex bridge rejected non-loopback peer {peer}"));
-    }
 
-    let websocket_config = WebSocketConfig {
-        max_message_size: Some(MAX_CODEX_FRAME_BYTES),
-        max_frame_size: Some(MAX_CODEX_FRAME_BYTES),
-        max_write_buffer_size: MAX_CODEX_FRAME_BYTES * 2,
-        ..WebSocketConfig::default()
-    };
-    let websocket = tokio::select! {
-        result = tokio::time::timeout(BRIDGE_IO_TIMEOUT, accept_async_with_config(socket, Some(websocket_config))) => {
-            result
-                .map_err(|_| "Codex bridge WebSocket handshake timed out".to_string())?
-                .map_err(|error| format!("Codex bridge WebSocket handshake failed: {error}"))?
-        },
-        _ = &mut shutdown => return Ok(()),
-        _ = &mut activation_deadline, if on_activated.is_some() => {
-            return Err("Codex bridge activation timed out during WebSocket negotiation".to_string());
+        let websocket_config = WebSocketConfig {
+            max_message_size: Some(MAX_CODEX_FRAME_BYTES),
+            max_frame_size: Some(MAX_CODEX_FRAME_BYTES),
+            max_write_buffer_size: MAX_CODEX_FRAME_BYTES * 2,
+            ..WebSocketConfig::default()
+        };
+        let handshake_path = expected_path.clone();
+        let handshake = tokio::select! {
+            result = tokio::time::timeout(
+                BRIDGE_IO_TIMEOUT,
+                accept_hdr_async_with_config(
+                    socket,
+                    move |request: &Request, response: Response| {
+                        authorize_bridge_handshake(request, response, &handshake_path)
+                    },
+                    Some(websocket_config),
+                ),
+            ) => result,
+            _ = &mut shutdown => return Ok(()),
+            _ = &mut activation_deadline, if on_activated.is_some() => {
+                return Err("Codex bridge activation timed out during WebSocket negotiation".to_string());
+            }
+        };
+        match handshake {
+            Ok(Ok(websocket)) => break websocket,
+            // Bad, unauthorized, and stalled handshakes are connection-local.
+            // They must never consume the one authenticated TUI slot.
+            Ok(Err(_)) | Err(_) => continue,
         }
     };
     let (mut websocket_write, mut websocket_read) = websocket.split();
@@ -1291,11 +1348,13 @@ impl CodexBridgeHandle {
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("Cannot configure Codex loopback bridge: {error}"))?;
+        let bridge_path = random_bridge_path()?;
         let endpoint = format!(
-            "ws://{}",
+            "ws://{}{}",
             listener
                 .local_addr()
-                .map_err(|error| format!("Cannot inspect Codex loopback bridge: {error}"))?
+                .map_err(|error| format!("Cannot inspect Codex loopback bridge: {error}"))?,
+            bridge_path,
         );
         let (observer, receiver) = semantic_observer_channel(256);
         let on_event = std::sync::Arc::new(on_event);
@@ -1412,6 +1471,7 @@ impl CodexBridgeHandle {
                         });
                     let bridge = serve_one_loopback_client_with_activation(
                         listener,
+                        bridge_path,
                         stdio,
                         observer,
                         shutdown_rx,
@@ -2537,12 +2597,14 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let expected_path = random_bridge_path().unwrap();
+        let endpoint = format!("ws://{}{}", listener.local_addr().unwrap(), expected_path);
         let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
         let (observer, _receiver) = semantic_observer_channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let proxy = tokio::spawn(serve_one_loopback_client(
             listener,
+            expected_path,
             bridge_stdio,
             observer,
             shutdown_rx,
@@ -2583,11 +2645,88 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
     }
 
     #[tokio::test]
+    async fn proxy_rejects_wrong_path_without_consuming_authenticated_endpoint() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base_endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let expected_path = random_bridge_path().unwrap();
+        let other_random_path = random_bridge_path().unwrap();
+        let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
+        let (observer, _receiver) = semantic_observer_channel(4);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let proxy = tokio::spawn(serve_one_loopback_client(
+            listener,
+            expected_path.clone(),
+            bridge_stdio,
+            observer,
+            shutdown_rx,
+        ));
+
+        assert!(
+            connect_async(&base_endpoint).await.is_err(),
+            "the unauthenticated root path must be rejected"
+        );
+        assert!(
+            connect_async(format!("{base_endpoint}/bridge/wrong"))
+                .await
+                .is_err(),
+            "the port alone must not authorize a loopback client"
+        );
+        assert!(
+            connect_async(format!("{base_endpoint}{other_random_path}"))
+                .await
+                .is_err(),
+            "a different random bearer path must be rejected"
+        );
+        assert!(
+            connect_async(format!("{base_endpoint}{expected_path}?extra=1"))
+                .await
+                .is_err(),
+            "the bearer path must match exactly"
+        );
+        assert!(
+            !proxy.is_finished(),
+            "unauthorized handshakes must not consume the one legitimate bridge"
+        );
+
+        let (mut tui, _) = connect_async(format!("{base_endpoint}{expected_path}"))
+            .await
+            .unwrap();
+        let (fake_read, _fake_write) = tokio::io::split(fake_server_stdio);
+        let mut fake_read = BufReader::new(fake_read);
+        let request = r#"{"id":93,"method":"future/authenticated","params":{}}"#;
+        tui.send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        let mut forwarded = Vec::new();
+        fake_read.read_until(b'\n', &mut forwarded).await.unwrap();
+        assert_eq!(forwarded, format!("{request}\n").as_bytes());
+
+        let _ = shutdown_tx.send(());
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn bridge_paths_are_random_bearer_tokens() {
+        let first = random_bridge_path().unwrap();
+        let second = random_bridge_path().unwrap();
+
+        assert!(first.starts_with("/bridge/"));
+        assert_eq!(first.len(), "/bridge/".len() + 64);
+        assert!(first["/bridge/".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
     async fn activation_requires_matching_successful_initialize_response() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let expected_path = random_bridge_path().unwrap();
+        let endpoint = format!("ws://{}{}", listener.local_addr().unwrap(), expected_path);
         let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
         let (observer, _receiver) = semantic_observer_channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -2599,6 +2738,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             });
         let proxy = tokio::spawn(serve_one_loopback_client_with_activation(
             listener,
+            expected_path,
             bridge_stdio,
             observer,
             shutdown_rx,
