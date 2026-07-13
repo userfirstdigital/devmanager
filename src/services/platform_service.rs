@@ -4,8 +4,9 @@ use std::path::Path;
 use std::process::Command;
 #[cfg(not(windows))]
 use std::thread;
+use std::time::Duration;
 #[cfg(not(windows))]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -563,14 +564,40 @@ fn normalize_process_name(name: &OsStr) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
+    use super::terminate_owned_process_group_with;
+    use std::time::Duration;
+
+    #[cfg(windows)]
     use super::windows_port;
 
+    #[cfg(windows)]
     #[test]
     fn windows_port_decodes_network_order_port() {
         assert_eq!(windows_port(0x5000), 80);
         assert_eq!(windows_port(0x3614), 5174);
+    }
+
+    #[test]
+    fn owned_process_group_cleanup_escalates_when_only_descendants_remain() {
+        let mut signals = Vec::new();
+        terminate_owned_process_group_with(
+            "-42",
+            Duration::ZERO,
+            |target, signal| {
+                signals.push((target.to_string(), signal.to_string()));
+                Ok(())
+            },
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            signals,
+            [("-42".to_string(), "TERM".to_string()), ("-42".to_string(), "KILL".to_string())]
+        );
     }
 }
 
@@ -781,6 +808,53 @@ fn kill_unix_target(pid: u32, as_process_group: bool) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
+pub(crate) fn terminate_owned_process_group(
+    pid: u32,
+    term_grace: Duration,
+) -> Result<(), String> {
+    let group_target = format!("-{pid}");
+    terminate_owned_process_group_with(
+        &group_target,
+        term_grace,
+        send_unix_signal,
+        unix_process_group_exists,
+        thread::sleep,
+    )
+}
+
+fn terminate_owned_process_group_with<Signal, Exists, Sleep>(
+    group_target: &str,
+    term_grace: Duration,
+    mut signal: Signal,
+    mut exists: Exists,
+    mut sleep: Sleep,
+) -> Result<(), String>
+where
+    Signal: FnMut(&str, &str) -> Result<(), String>,
+    Exists: FnMut(&str) -> bool,
+    Sleep: FnMut(Duration),
+{
+    let term_error = signal(group_target, "TERM").err();
+    if !exists(group_target) {
+        return Ok(());
+    }
+    sleep(term_grace);
+    if !exists(group_target) {
+        return Ok(());
+    }
+    signal(group_target, "KILL").map_err(|kill_error| {
+        term_error.map_or_else(
+            || format!("Failed to SIGKILL owned process group {group_target}: {kill_error}"),
+            |term_error| {
+                format!(
+                    "Failed to terminate owned process group {group_target}: SIGTERM failed ({term_error}); SIGKILL failed ({kill_error})"
+                )
+            },
+        )
+    })
+}
+
+#[cfg(not(windows))]
 fn send_unix_signal(target: &str, signal: &str) -> Result<(), String> {
     let output = Command::new("kill")
         .args([&format!("-{signal}"), "--", target])
@@ -791,6 +865,14 @@ fn send_unix_signal(target: &str, signal: &str) -> Result<(), String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+#[cfg(not(windows))]
+fn unix_process_group_exists(target: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", "--", target])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(not(windows))]

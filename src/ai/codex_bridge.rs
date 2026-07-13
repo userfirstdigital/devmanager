@@ -29,6 +29,9 @@ const DEFAULT_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 const CODEX_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const CODEX_PROBE_TREE_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const CODEX_PROBE_PIPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(not(windows))]
+const CODEX_PROBE_TERM_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(250);
 const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const BRIDGE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -2042,8 +2045,8 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
             .flatten();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_reader = spawn_probe_pipe_reader(stdout);
-    let stderr_reader = spawn_probe_pipe_reader(stderr);
+    let mut stdout_reader = spawn_probe_pipe_reader(stdout);
+    let mut stderr_reader = spawn_probe_pipe_reader(stderr);
     let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -2061,8 +2064,8 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
 
     terminate_probe_tree(&mut child, pid, managed_job);
     let pipe_deadline = std::time::Instant::now() + CODEX_PROBE_PIPE_DRAIN_TIMEOUT;
-    let stdout = receive_probe_pipe(&stdout_reader, pipe_deadline);
-    let stderr = receive_probe_pipe(&stderr_reader, pipe_deadline);
+    let stdout = receive_probe_pipe(&mut stdout_reader, pipe_deadline);
+    let stderr = receive_probe_pipe(&mut stderr_reader, pipe_deadline);
     let status = status?;
     let output = format!(
         "{}{}",
@@ -2080,21 +2083,38 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
 
 fn spawn_probe_pipe_reader<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
-) -> std::sync::mpsc::Receiver<Vec<u8>> {
+) -> ProbePipeReader {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let _ = sender.send(capture_probe_pipe(pipe));
     });
-    receiver
+    ProbePipeReader {
+        receiver,
+        thread: Some(thread),
+    }
+}
+
+struct ProbePipeReader {
+    receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 fn receive_probe_pipe(
-    receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
+    reader: &mut ProbePipeReader,
     deadline: std::time::Instant,
 ) -> Vec<u8> {
-    receiver
+    match reader
+        .receiver
         .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        .unwrap_or_default()
+    {
+        Ok(bytes) => {
+            if let Some(thread) = reader.thread.take() {
+                let _ = thread.join();
+            }
+            bytes
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 fn terminate_probe_tree(
@@ -2104,7 +2124,13 @@ fn terminate_probe_tree(
 ) {
     let (tree_kill_tx, tree_kill_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
+        #[cfg(windows)]
         let result = crate::services::platform_service::kill_process_tree(pid);
+        #[cfg(not(windows))]
+        let result = crate::services::platform_service::terminate_owned_process_group(
+            pid,
+            CODEX_PROBE_TERM_GRACE,
+        );
         let _ = tree_kill_tx.send(result);
     });
     let _ = tree_kill_rx.recv_timeout(CODEX_PROBE_TREE_KILL_TIMEOUT);
@@ -2392,6 +2418,57 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         }
         let _ = std::fs::remove_dir_all(&temp);
         assert!(!still_running, "probe must not leave its grandchild running");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn capability_probe_force_kills_sigterm_ignoring_grandchild_and_drains_pipes() {
+        let unique = format!(
+            "devmanager-codex-probe-stubborn-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp).unwrap();
+        let pid_path = temp.join("grandchild.pid");
+        let ready_path = temp.join("grandchild.ready");
+        let args = vec![
+            "-c".to_string(),
+            r#"/bin/sh -c 'trap "" TERM; printf ready > "$1"; while :; do sleep 60; done' probe-child "$2" & child=$!; while [ ! -s "$2" ]; do sleep 1; done; printf '%s' "$child" > "$1"; printf 'probe-complete\n'"#.to_string(),
+            "probe-wrapper".to_string(),
+            pid_path.to_string_lossy().into_owned(),
+            ready_path.to_string_lossy().into_owned(),
+        ];
+
+        let started = std::time::Instant::now();
+        let result = run_probe(Path::new("/bin/sh"), &args);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "stubborn descendants and inherited pipes must remain bounded"
+        );
+        assert!(result.unwrap().contains("probe-complete"));
+
+        let grandchild_pid = read_probe_child_pid(&pid_path, std::time::Duration::from_secs(1))
+            .expect("wrapper must record its SIGTERM-ignoring grandchild");
+        let reaped_at = std::time::Instant::now();
+        while crate::services::platform_service::is_pid_running(grandchild_pid)
+            && reaped_at.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let still_running =
+            crate::services::platform_service::is_pid_running(grandchild_pid);
+        if still_running {
+            let _ = crate::services::platform_service::kill_process_tree(grandchild_pid);
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+        assert!(
+            !still_running,
+            "probe must SIGKILL a process-group descendant that ignored SIGTERM"
+        );
     }
 
     #[test]
