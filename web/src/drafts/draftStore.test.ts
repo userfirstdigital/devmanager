@@ -2,6 +2,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
+
 import {
   clearOtherRuntimes,
   hasExactDraftHandoff,
@@ -20,40 +22,132 @@ describe("runtime-scoped draft storage", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
-  it("stages and consumes an exact runtime-scoped compatibility handoff", () => {
+  it("lets only the matching running build consume a handoff once", () => {
     const exactDraft = "  exact draft\n";
+
+    expect(
+      stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(true);
+    expect(
+      hasExactDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(true);
+    expect(loadDraft("runtime-a", "tab:x")).toBe(exactDraft);
+    expect(
+      hasExactDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(false);
+    expect(loadDraft("runtime-a", "tab:x")).toBeNull();
+  });
+
+  it("returns no handoff text when final removal cannot be verified", () => {
+    const exactDraft = "do not resurrect this";
+    expect(
+      stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(true);
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {});
+
+    expect(loadDraft("runtime-a", "tab:x")).toBeNull();
+    expect(
+      hasExactDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(true);
+  });
+
+  it("returns no handoff text when the remaining entries cannot be rewritten", () => {
+    const drafts = {
+      "tab:first": "first prompt",
+      "tab:second": "second prompt",
+    };
+    expect(
+      stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", drafts),
+    ).toBe(true);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("rewrite blocked");
+    });
+
+    expect(loadDraft("runtime-a", "tab:first")).toBeNull();
+    expect(
+      hasExactDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", drafts),
+    ).toBe(true);
+  });
+
+  it("keeps the target-build handoff through an old-build remount", () => {
+    const targetBuildId = `${CLIENT_WEB_BUILD_ID}-future`;
+    const exactDraft = "  survive navigation\n";
     saveDraft("runtime-a", "tab:x", exactDraft);
 
     expect(
-      stageDraftHandoff("runtime-a", { "tab:x": exactDraft }),
-    ).toBe(true);
-    expect(
-      hasExactDraftHandoff("runtime-a", { "tab:x": exactDraft }),
+      stageDraftHandoff(targetBuildId, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
     ).toBe(true);
     expect(loadDraft("runtime-a", "tab:x")).toBe(exactDraft);
     expect(
-      hasExactDraftHandoff("runtime-a", { "tab:x": exactDraft }),
-    ).toBe(false);
-    expect(loadDraft("runtime-a", "tab:x")).toBe(exactDraft);
+      hasExactDraftHandoff(targetBuildId, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(true);
+
+    const stored = sessionStorage.getItem(
+      "devmanager-compatible-draft-handoff:v1",
+    );
+    expect(JSON.parse(stored ?? "null")).toMatchObject({
+      targetBuildId,
+      runtimeInstanceId: "runtime-a",
+      drafts: { "tab:x": exactDraft },
+    });
+  });
+
+  it("does not let a wrong build consume or mutate the handoff", () => {
+    const targetBuildId = `${CLIENT_WEB_BUILD_ID}-future`;
+    const exactDraft = "wrong build must leave this";
+    expect(
+      stageDraftHandoff(targetBuildId, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(true);
+
+    expect(loadDraft("runtime-a", "tab:x")).toBeNull();
+    expect(
+      hasExactDraftHandoff(targetBuildId, "runtime-a", {
+        "tab:x": exactDraft,
+      }),
+    ).toBe(true);
   });
 
   it("rejects a handoff that cannot preserve every exact byte", () => {
     const oversized = "x".repeat(32 * 1024 + 1);
 
-    expect(stageDraftHandoff("runtime-a", { "tab:x": oversized })).toBe(
-      false,
-    );
     expect(
-      hasExactDraftHandoff("runtime-a", { "tab:x": oversized }),
+      stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": oversized,
+      }),
+    ).toBe(false);
+    expect(
+      hasExactDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": oversized,
+      }),
     ).toBe(false);
   });
 
   it("clears a stale handoff when the exact draft set becomes empty", () => {
     expect(
-      stageDraftHandoff("runtime-a", { "tab:x": "stale draft" }),
+      stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": "stale draft",
+      }),
     ).toBe(true);
 
-    expect(stageDraftHandoff("runtime-a", {})).toBe(true);
+    expect(stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {})).toBe(
+      true,
+    );
     expect(loadDraft("runtime-a", "tab:x")).toBeNull();
   });
 
@@ -64,15 +158,17 @@ describe("runtime-scoped draft storage", () => {
         throw new DOMException("quota exceeded");
       });
 
-    expect(stageDraftHandoff("runtime-a", { "tab:x": "keep me" })).toBe(
-      false,
-    );
+    expect(
+      stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:x": "keep me",
+      }),
+    ).toBe(false);
     setItem.mockRestore();
   });
 
   it("prunes and removes handoff-only drafts with the session lifecycle", () => {
     expect(
-      stageDraftHandoff("runtime-a", {
+      stageDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
         "tab:keep": "keep",
         "tab:gone": "gone",
       }),
@@ -80,12 +176,16 @@ describe("runtime-scoped draft storage", () => {
 
     pruneDrafts("runtime-a", new Set(["tab:keep"]));
     expect(
-      hasExactDraftHandoff("runtime-a", { "tab:keep": "keep" }),
+      hasExactDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:keep": "keep",
+      }),
     ).toBe(true);
 
     removeDraft("runtime-a", "tab:keep");
     expect(
-      hasExactDraftHandoff("runtime-a", { "tab:keep": "keep" }),
+      hasExactDraftHandoff(CLIENT_WEB_BUILD_ID, "runtime-a", {
+        "tab:keep": "keep",
+      }),
     ).toBe(false);
   });
 

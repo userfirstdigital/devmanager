@@ -4,7 +4,7 @@ import type { UpdateSafetyState } from "./register";
 interface ComposerSafetyStore {
   runtimeInstanceId?: string | null;
   drafts?: Record<string, string>;
-  compatibleDraftHandoffReady?: boolean;
+  compatibleDraftHandoffTargetBuildId?: string | null;
   pendingMutations?: Record<string, unknown>;
   composerSafety?: Record<
     string,
@@ -42,9 +42,10 @@ export function readStoreUpdateSafetyState(
   );
   const exactHandoffReady =
     hasDraft &&
-    composerState.compatibleDraftHandoffReady === true &&
+    typeof composerState.compatibleDraftHandoffTargetBuildId === "string" &&
     typeof composerState.runtimeInstanceId === "string" &&
     hasExactDraftHandoff(
+      composerState.compatibleDraftHandoffTargetBuildId,
       composerState.runtimeInstanceId,
       composerState.drafts,
     );

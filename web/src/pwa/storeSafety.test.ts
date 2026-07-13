@@ -43,17 +43,28 @@ describe("readStoreUpdateSafetyState", () => {
   });
 
   it("allows only a verified compatibility handoff to cover draft safety", () => {
+    const targetBuildId = "target-build";
     const handedOffState = {
       runtimeInstanceId: "runtime-a",
       drafts: { first: "  preserve exactly\n" },
       pendingMutations: {},
       composerSafety: {},
-      compatibleDraftHandoffReady: true,
+      compatibleDraftHandoffTargetBuildId: targetBuildId,
     };
 
     expect(readStoreUpdateSafetyState(handedOffState).hasDraft).toBe(true);
     expect(
-      stageDraftHandoff("runtime-a", handedOffState.drafts),
+      stageDraftHandoff(
+        targetBuildId,
+        "runtime-a",
+        handedOffState.drafts,
+      ),
+    ).toBe(true);
+    expect(
+      readStoreUpdateSafetyState({
+        ...handedOffState,
+        compatibleDraftHandoffTargetBuildId: "wrong-target-build",
+      }).hasDraft,
     ).toBe(true);
     expect(
       readStoreUpdateSafetyState(handedOffState),
@@ -71,7 +82,6 @@ describe("readStoreUpdateSafetyState", () => {
         composerSafety: {
           first: { selectedAttachments: 1, attachmentLoads: 1 },
         },
-        compatibleDraftHandoffReady: true,
       }),
     ).toEqual({
       hasDraft: false,

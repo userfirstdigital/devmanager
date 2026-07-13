@@ -1,3 +1,5 @@
+import { CLIENT_WEB_BUILD_ID } from "../pwa/buildCompatibility";
+
 const STORAGE_KEY = "devmanager-native-drafts:v1";
 const HANDOFF_STORAGE_KEY = "devmanager-compatible-draft-handoff:v1";
 const VERSION = 1;
@@ -19,9 +21,15 @@ interface StoredDrafts {
 
 interface StoredDraftHandoff {
   version: typeof HANDOFF_VERSION;
+  targetBuildId: string;
   runtimeInstanceId: string;
   drafts: Record<string, string>;
 }
+
+type DraftHandoffConsumption =
+  | { kind: "missing" }
+  | { kind: "consumed"; text: string }
+  | { kind: "integrityFailure" };
 
 function storage(): Storage | null {
   try {
@@ -79,6 +87,8 @@ function readDraftHandoff(): StoredDraftHandoff | null {
     const parsed = JSON.parse(raw) as Partial<StoredDraftHandoff>;
     if (
       parsed.version !== HANDOFF_VERSION ||
+      typeof parsed.targetBuildId !== "string" ||
+      parsed.targetBuildId.length === 0 ||
       typeof parsed.runtimeInstanceId !== "string" ||
       !parsed.drafts ||
       typeof parsed.drafts !== "object" ||
@@ -98,7 +108,7 @@ function writeDraftHandoff(value: StoredDraftHandoff | null): boolean {
     if (!target) return false;
     if (!value || Object.keys(value.drafts).length === 0) {
       target.removeItem(HANDOFF_STORAGE_KEY);
-      return true;
+      return target.getItem(HANDOFF_STORAGE_KEY) === null;
     }
     const serialized = JSON.stringify(value);
     if (new TextEncoder().encode(serialized).byteLength > MAX_HANDOFF_BYTES) {
@@ -135,6 +145,7 @@ function nonEmptyDrafts(
 }
 
 export function hasExactDraftHandoff(
+  targetBuildId: string,
   runtimeInstanceId: string,
   drafts: Record<string, string>,
 ): boolean {
@@ -143,20 +154,22 @@ export function hasExactDraftHandoff(
   const handoff = readDraftHandoff();
   return Boolean(
     handoff &&
+      handoff.targetBuildId === targetBuildId &&
       handoff.runtimeInstanceId === runtimeInstanceId &&
       exactDraftRecordsMatch(handoff.drafts, exactDrafts),
   );
 }
 
 export function stageDraftHandoff(
+  targetBuildId: string,
   runtimeInstanceId: string,
   drafts: Record<string, string>,
 ): boolean {
+  if (!targetBuildId || !runtimeInstanceId) return false;
   const exactDrafts = nonEmptyDrafts(drafts);
   if (Object.keys(exactDrafts).length === 0) {
     return writeDraftHandoff(null);
   }
-  if (!runtimeInstanceId) return false;
   if (
     Object.values(exactDrafts).some(
       (text) => new TextEncoder().encode(text).byteLength > MAX_DRAFT_BYTES,
@@ -167,29 +180,44 @@ export function stageDraftHandoff(
   if (
     !writeDraftHandoff({
       version: HANDOFF_VERSION,
+      targetBuildId,
       runtimeInstanceId,
       drafts: exactDrafts,
     })
   ) {
     return false;
   }
-  return hasExactDraftHandoff(runtimeInstanceId, exactDrafts);
+  return hasExactDraftHandoff(
+    targetBuildId,
+    runtimeInstanceId,
+    exactDrafts,
+  );
 }
 
 function takeDraftHandoff(
   runtimeInstanceId: string,
   stableSessionKey: string,
-): string | null {
+): DraftHandoffConsumption {
   const handoff = readDraftHandoff();
-  if (!handoff || handoff.runtimeInstanceId !== runtimeInstanceId) return null;
+  if (
+    !handoff ||
+    handoff.targetBuildId !== CLIENT_WEB_BUILD_ID ||
+    handoff.runtimeInstanceId !== runtimeInstanceId
+  ) {
+    return { kind: "missing" };
+  }
   const text = handoff.drafts[stableSessionKey];
-  if (typeof text !== "string") return null;
+  if (typeof text !== "string") return { kind: "missing" };
   const drafts = { ...handoff.drafts };
   delete drafts[stableSessionKey];
-  writeDraftHandoff(
-    Object.keys(drafts).length === 0 ? null : { ...handoff, drafts },
-  );
-  return text;
+  if (
+    !writeDraftHandoff(
+      Object.keys(drafts).length === 0 ? null : { ...handoff, drafts },
+    )
+  ) {
+    return { kind: "integrityFailure" };
+  }
+  return { kind: "consumed", text };
 }
 
 function truncateUtf8(text: string, maxBytes = MAX_DRAFT_BYTES): string {
@@ -242,7 +270,8 @@ export function loadDraft(
   now = Date.now(),
 ): string | null {
   const handedOff = takeDraftHandoff(runtimeInstanceId, stableSessionKey);
-  if (handedOff !== null) return handedOff;
+  if (handedOff.kind === "consumed") return handedOff.text;
+  if (handedOff.kind === "integrityFailure") return null;
   const value = readStoredDrafts();
   if (!value || value.runtimeInstanceId !== runtimeInstanceId) return null;
   const cleaned = removeExpired(value, now);

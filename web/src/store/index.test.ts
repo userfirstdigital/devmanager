@@ -1494,14 +1494,20 @@ describe("safe compatibility and raw terminal IO", () => {
     });
 
     const state = useStore.getState();
-    expect(stageDraftHandoff).toHaveBeenCalledWith("runtime-1", {
-      "tab:a": "  preserve exactly\n",
-    });
+    expect(stageDraftHandoff).toHaveBeenCalledWith(
+      "different-host-build",
+      "runtime-1",
+      {
+        "tab:a": "  preserve exactly\n",
+      },
+    );
     expect(stageDraftHandoff.mock.invocationCallOrder[0]).toBeLessThan(
       requestCompatibleBuild.mock.invocationCallOrder[0],
     );
     expect(requestCompatibleBuild).toHaveBeenCalledWith("different-host-build");
-    expect(state.compatibleDraftHandoffReady).toBe(true);
+    expect(state.compatibleDraftHandoffTargetBuildId).toBe(
+      "different-host-build",
+    );
     expect(state.status.kind).toBe("closed");
     expect(state.snapshot).toBe(existingSnapshot);
     expect(state.activeSessionKey).toBe("tab:a");
@@ -1521,11 +1527,17 @@ describe("safe compatibility and raw terminal IO", () => {
       receivedBuildId: "different-host-build",
     });
 
-    expect(stageDraftHandoff).toHaveBeenCalledWith("runtime-1", {
-      "tab:a": "cannot lose this",
-    });
+    expect(stageDraftHandoff).toHaveBeenCalledWith(
+      "different-host-build",
+      "runtime-1",
+      {
+        "tab:a": "cannot lose this",
+      },
+    );
     expect(requestCompatibleBuild).not.toHaveBeenCalled();
-    expect(useStore.getState().compatibleDraftHandoffReady).toBe(false);
+    expect(
+      useStore.getState().compatibleDraftHandoffTargetBuildId,
+    ).toBeNull();
     expect(useStore.getState().lastError).toMatch(/preserve.*draft/i);
   });
 });

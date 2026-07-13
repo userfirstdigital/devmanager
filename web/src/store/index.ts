@@ -100,7 +100,7 @@ export interface StoreState {
   /** Highest live sequence observed while each gap waits for Resume. */
   semanticGapSequences: Record<StableSessionKey, number>;
   drafts: Record<StableSessionKey, string>;
-  compatibleDraftHandoffReady: boolean;
+  compatibleDraftHandoffTargetBuildId: string | null;
   composerSafety: Record<StableSessionKey, ComposerSafetyState>;
   unread: Record<StableSessionKey, number>;
   /** In-memory route handoff only; Task 6 owns durable route restoration. */
@@ -644,7 +644,7 @@ export const useStore = create<StoreState>((set, get) => {
         semanticGapKeys: new Set(),
         semanticGapSequences: {},
         drafts: {},
-        compatibleDraftHandoffReady: false,
+        compatibleDraftHandoffTargetBuildId: null,
         composerSafety: {},
         unread: {},
         pendingRoute: null,
@@ -768,7 +768,7 @@ export const useStore = create<StoreState>((set, get) => {
         ? {}
         : filterRecord(current.semanticGapSequences, validStableKeys),
       drafts: runtimeChanged ? {} : filterRecord(current.drafts, validStableKeys),
-      compatibleDraftHandoffReady: false,
+      compatibleDraftHandoffTargetBuildId: null,
       composerSafety: runtimeChanged
         ? {}
         : filterRecord(current.composerSafety, validStableKeys),
@@ -819,7 +819,7 @@ export const useStore = create<StoreState>((set, get) => {
         semanticGapKeys: new Set(),
         semanticGapSequences: {},
         drafts: {},
-        compatibleDraftHandoffReady: false,
+        compatibleDraftHandoffTargetBuildId: null,
         composerSafety: {},
         unread: {},
         pendingRoute: null,
@@ -1061,7 +1061,7 @@ export const useStore = create<StoreState>((set, get) => {
             semanticGapKeys: new Set(),
             semanticGapSequences: {},
             drafts: {},
-            compatibleDraftHandoffReady: false,
+            compatibleDraftHandoffTargetBuildId: null,
             composerSafety: {},
             unread: {},
             pendingRoute: null,
@@ -1164,7 +1164,7 @@ export const useStore = create<StoreState>((set, get) => {
     semanticGapKeys: new Set(),
     semanticGapSequences: {},
     drafts: {},
-    compatibleDraftHandoffReady: false,
+    compatibleDraftHandoffTargetBuildId: null,
     composerSafety: {},
     unread: {},
     pendingRoute: null,
@@ -1187,11 +1187,15 @@ export const useStore = create<StoreState>((set, get) => {
           const draftHandoffReady =
             Object.keys(drafts).length === 0 ||
             (state.runtimeInstanceId !== null &&
-              stageDraftHandoff(state.runtimeInstanceId, drafts));
+              stageDraftHandoff(
+                failure.receivedBuildId,
+                state.runtimeInstanceId,
+                drafts,
+              ));
           if (!draftHandoffReady) {
             set({
               status: { kind: "closed", reason: "host web bundle changed" },
-              compatibleDraftHandoffReady: false,
+              compatibleDraftHandoffTargetBuildId: null,
               lastError:
                 "DevManager could not preserve the exact draft for an automatic web update, so the current page will not reload.",
             });
@@ -1199,7 +1203,7 @@ export const useStore = create<StoreState>((set, get) => {
           }
           set({
             status: { kind: "closed", reason: "host web bundle changed" },
-            compatibleDraftHandoffReady: true,
+            compatibleDraftHandoffTargetBuildId: failure.receivedBuildId,
             lastError:
               "DevManager is reconciling this web app with the updated host automatically.",
           });
@@ -1442,7 +1446,7 @@ export const useStore = create<StoreState>((set, get) => {
       }
       set((state) => ({
         drafts: { ...state.drafts, [stableSessionKey]: text },
-        compatibleDraftHandoffReady: false,
+        compatibleDraftHandoffTargetBuildId: null,
         pendingMutations:
           pending && pending.text !== text
             ? Object.fromEntries(
@@ -1502,7 +1506,7 @@ export const useStore = create<StoreState>((set, get) => {
             };
       set((current) => ({
         drafts: { ...current.drafts, [stableSessionKey]: text },
-        compatibleDraftHandoffReady: false,
+        compatibleDraftHandoffTargetBuildId: null,
         pendingMutations: {
           ...current.pendingMutations,
           [stableSessionKey]: pending,
@@ -1539,7 +1543,7 @@ export const useStore = create<StoreState>((set, get) => {
           delete pendingMutations[stableSessionKey];
           return {
             pendingMutations,
-            compatibleDraftHandoffReady: false,
+            compatibleDraftHandoffTargetBuildId: null,
             drafts: {
               ...current.drafts,
               [stableSessionKey]:
