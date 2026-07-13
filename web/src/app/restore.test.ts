@@ -89,6 +89,32 @@ describe("installed route restoration", () => {
     ).toEqual(deepLink);
   });
 
+  it("accepts a pushed deep link only for the runtime that created it", () => {
+    const deepLink: AppRoute = {
+      name: "session",
+      kind: "tab",
+      id: "tab-a",
+    };
+    expect(
+      resolveColdStart(sessions, saved, {
+        standalone: true,
+        snapshot: snapshot("runtime-a"),
+        launchEligible: false,
+        notificationRuntimeInstanceId: "runtime-a",
+        notificationRoute: deepLink,
+      }),
+    ).toEqual(deepLink);
+    expect(
+      resolveColdStart(sessions, saved, {
+        standalone: true,
+        snapshot: snapshot("runtime-new", "tab:tab-a"),
+        launchEligible: false,
+        notificationRuntimeInstanceId: "runtime-a",
+        notificationRoute: deepLink,
+      }),
+    ).toEqual(sessions);
+  });
+
   it("rejects a route from an old runtime or a removed session", () => {
     expect(
       resolveColdStart(sessions, saved, {

@@ -4,7 +4,7 @@ import "./index.css";
 import { notifyPwaSafetyStateChanged, registerPwa } from "./pwa/register";
 import { applyAppBadge } from "./pwa/notifications";
 import { readStoreUpdateSafetyState } from "./pwa/storeSafety";
-import { selectAggregateBadgeCount, useStore } from "./store";
+import { selectAppBadgeSyncState, useStore } from "./store";
 
 // Deliberately NOT using <StrictMode>. Double-invoking effects at dev time
 // is useful for surfacing cleanup bugs, but xterm.js's terminal lifecycle
@@ -15,8 +15,10 @@ const root = document.getElementById("root");
 if (!root) throw new Error("root element missing");
 const readSafetyState = () => readStoreUpdateSafetyState(useStore.getState());
 let previousSafetyState = readSafetyState();
-let previousBadgeCount = selectAggregateBadgeCount(useStore.getState());
-if (previousBadgeCount !== null) void applyAppBadge(previousBadgeCount);
+let previousBadgeState = selectAppBadgeSyncState(useStore.getState());
+if (previousBadgeState.count !== null) {
+  void applyAppBadge(previousBadgeState.count);
+}
 useStore.subscribe((state) => {
   const nextSafetyState = readStoreUpdateSafetyState(state);
   if (
@@ -29,11 +31,15 @@ useStore.subscribe((state) => {
     previousSafetyState = nextSafetyState;
     notifyPwaSafetyStateChanged();
   }
-  const nextBadgeCount = selectAggregateBadgeCount(state);
-  if (nextBadgeCount !== null && nextBadgeCount !== previousBadgeCount) {
-    previousBadgeCount = nextBadgeCount;
-    void applyAppBadge(nextBadgeCount);
+  const nextBadgeState = selectAppBadgeSyncState(state);
+  if (
+    nextBadgeState.count !== null &&
+    (nextBadgeState.count !== previousBadgeState.count ||
+      nextBadgeState.authorityKey !== previousBadgeState.authorityKey)
+  ) {
+    void applyAppBadge(nextBadgeState.count);
   }
+  previousBadgeState = nextBadgeState;
 });
 void registerPwa(readSafetyState, () => {
   useStore.setState({

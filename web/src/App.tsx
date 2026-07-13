@@ -25,6 +25,10 @@ import { clearOtherRuntimes, pruneDrafts } from "./drafts/draftStore";
 import { bindAppLifecycle } from "./platform/lifecycle";
 import { ProjectScreen } from "./projects/ProjectScreen";
 import { ProjectsScreen } from "./projects/ProjectsScreen";
+import {
+  NOTIFICATION_ROUTE_QUERY,
+  NOTIFICATION_RUNTIME_QUERY,
+} from "./pwa/notifications";
 import { SessionScreen } from "./sessions/SessionScreen";
 import { SessionsScreen } from "./sessions/SessionsScreen";
 import { SettingsScreen } from "./settings/SettingsScreen";
@@ -77,6 +81,24 @@ export function App() {
   const launchEligible = useRef(
     typeof window !== "undefined" &&
       isInstalledLaunchEligible(window.location.pathname, window.location.search),
+  );
+  const notificationRuntimeInstanceId = useRef(
+    typeof window === "undefined"
+      ? null
+      : new URLSearchParams(window.location.search).get(
+          NOTIFICATION_RUNTIME_QUERY,
+        ),
+  );
+  const notificationRoute = useRef<AppRoute | null>(
+    (() => {
+      if (typeof window === "undefined") return null;
+      const encodedRoute = new URLSearchParams(window.location.search).get(
+        NOTIFICATION_ROUTE_QUERY,
+      );
+      if (!encodedRoute) return null;
+      const parsed = parseRoute(encodedRoute);
+      return parsed.name === "session" ? parsed : null;
+    })(),
   );
   const resolvedRuntime = useRef<string | null>(null);
   const lastPersistedRoute = useRef<string | null>(null);
@@ -131,6 +153,8 @@ export function App() {
         standalone: standalone.current,
         launchEligible: launchEligible.current,
         snapshot: workspace,
+        notificationRuntimeInstanceId: notificationRuntimeInstanceId.current,
+        notificationRoute: notificationRoute.current,
       });
       const validated = routeExists(resolved, workspace) ? resolved : { name: "sessions" } as AppRoute;
       resolvedRuntime.current = workspace.runtimeInstanceId;

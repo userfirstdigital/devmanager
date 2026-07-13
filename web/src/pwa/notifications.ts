@@ -2,6 +2,10 @@ import { isStandaloneDisplayMode } from "../app/restore";
 import { safeRoute } from "./notificationRoute";
 import type { PushPayload } from "./pushPayload";
 
+export const NOTIFICATION_RUNTIME_QUERY = "notificationRuntime";
+export const NOTIFICATION_ROUTE_QUERY = "notificationRoute";
+const MAX_RUNTIME_INSTANCE_ID_LENGTH = 128;
+
 export interface NotificationCapabilities {
   secureContext: boolean;
   standalone: boolean;
@@ -339,4 +343,31 @@ export function describePushNotification(
       action: payload.action,
     },
   };
+}
+
+function isRuntimeInstanceId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_RUNTIME_INSTANCE_ID_LENGTH &&
+    !/\p{Cc}/u.test(value)
+  );
+}
+
+export function notificationClickDestination(
+  data: { route?: unknown; runtimeInstanceId?: unknown } | null | undefined,
+  origin: string,
+): string {
+  const sessions = new URL("/sessions", origin).href;
+  if (!isRuntimeInstanceId(data?.runtimeInstanceId)) return sessions;
+
+  const route = safeRoute(data?.route, origin);
+  if (!route.startsWith("/session/")) return sessions;
+  const destination = new URL("/sessions", origin);
+  destination.searchParams.set(
+    NOTIFICATION_RUNTIME_QUERY,
+    data.runtimeInstanceId,
+  );
+  destination.searchParams.set(NOTIFICATION_ROUTE_QUERY, route);
+  return destination.href;
 }

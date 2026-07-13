@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { parsePushPayload } from "./pushPayload";
+import { describe, expect, it, vi } from "vitest";
+import { parsePushEventData, parsePushPayload } from "./pushPayload";
 
 describe("parsePushPayload", () => {
   it.each([null, [], "message", 42, true])(
@@ -42,5 +42,20 @@ describe("parsePushPayload", () => {
         action: "arbitrary",
       }),
     ).toEqual({});
+  });
+});
+
+describe("parsePushEventData", () => {
+  it("never copies malformed push bytes or text into notification content", () => {
+    const text = vi.fn(() => "PROMPT_SENTINEL raw payload");
+    const data = {
+      json: vi.fn(() => {
+        throw new SyntaxError("not JSON");
+      }),
+      text,
+    };
+
+    expect(parsePushEventData(data)).toEqual({});
+    expect(text).not.toHaveBeenCalled();
   });
 });

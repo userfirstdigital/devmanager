@@ -87,6 +87,7 @@ import {
   type BoundedSemanticJournalState,
   MAX_SEMANTIC_BYTES_PER_SESSION,
   MAX_SEMANTIC_EVENTS_PER_SESSION,
+  selectAppBadgeSyncState,
   selectAggregateBadgeCount,
   useStore,
 } from "./index";
@@ -277,6 +278,8 @@ describe("aggregate app badge", () => {
     expect(
       selectAggregateBadgeCount({
         runtimeInstanceId: "runtime-1",
+        status: { kind: "open" },
+        compatibilityDiagnostic: null,
         sessions: {
           "tab:a": ordinary,
           "tab:input": needsInput,
@@ -288,8 +291,66 @@ describe("aggregate app badge", () => {
 
   it("does not clear a service-worker badge before host state is authoritative", () => {
     expect(
-      selectAggregateBadgeCount({ runtimeInstanceId: null, sessions: {} }),
+      selectAggregateBadgeCount({
+        runtimeInstanceId: null,
+        status: { kind: "connecting" },
+        compatibilityDiagnostic: null,
+        sessions: {},
+      }),
     ).toBeNull();
+  });
+
+  it("clears on pairing loss, protocol reset, and an authoritative empty runtime", () => {
+    expect(
+      selectAggregateBadgeCount({
+        runtimeInstanceId: "runtime-old",
+        status: { kind: "unauthorized" },
+        compatibilityDiagnostic: null,
+        sessions: {
+          "tab:a": {
+            ...makeSnapshot().sessions[0]!,
+            attention: "needsInput",
+          },
+        },
+      }),
+    ).toBe(0);
+    expect(
+      selectAggregateBadgeCount({
+        runtimeInstanceId: null,
+        status: { kind: "closed", reason: "incompatible web protocol" },
+        compatibilityDiagnostic: {
+          expectedProtocolVersion: 2,
+          receivedProtocolVersion: 1,
+        },
+        sessions: {},
+      }),
+    ).toBe(0);
+    expect(
+      selectAggregateBadgeCount({
+        runtimeInstanceId: "runtime-new",
+        status: { kind: "open" },
+        compatibilityDiagnostic: null,
+        sessions: {},
+      }),
+    ).toBe(0);
+  });
+
+  it("forces a zero badge update when authority is revoked even if the old count was zero", () => {
+    const connected = selectAppBadgeSyncState({
+      runtimeInstanceId: "runtime-old",
+      status: { kind: "open" },
+      compatibilityDiagnostic: null,
+      sessions: {},
+    });
+    const revoked = selectAppBadgeSyncState({
+      runtimeInstanceId: "runtime-old",
+      status: { kind: "unauthorized" },
+      compatibilityDiagnostic: null,
+      sessions: {},
+    });
+
+    expect(connected).toEqual({ count: 0, authorityKey: "runtime:runtime-old" });
+    expect(revoked).toEqual({ count: 0, authorityKey: "unauthorized" });
   });
 });
 

@@ -9,6 +9,10 @@ export interface PushPayload {
   badge?: number;
 }
 
+interface PushEventDataLike {
+  json(): unknown;
+}
+
 export function parsePushPayload(value: unknown): PushPayload {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return {};
@@ -42,4 +46,15 @@ export function parsePushPayload(value: unknown): PushPayload {
     payload.badge = record.badge;
   }
   return payload;
+}
+
+export function parsePushEventData(
+  data: PushEventDataLike | null | undefined,
+): PushPayload {
+  if (!data) return {};
+  try {
+    return parsePushPayload(data.json());
+  } catch {
+    return {};
+  }
 }

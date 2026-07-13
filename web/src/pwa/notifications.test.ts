@@ -8,6 +8,7 @@ import {
   disablePushNotifications,
   enablePushNotifications,
   notificationAvailability,
+  notificationClickDestination,
   readPushRegistrationState,
   readPushStatus,
   type PushBrowserDependencies,
@@ -245,6 +246,38 @@ describe("app badge", () => {
 
     expect(badge.setAppBadge).toHaveBeenCalledWith(3);
     expect(badge.clearAppBadge).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries the host runtime through a canonical notification click URL", () => {
+    expect(
+      notificationClickDestination(
+        {
+          route: "/session/tab/tab-1",
+          runtimeInstanceId: "runtime-1",
+        },
+        "https://devmanager.test",
+      ),
+    ).toBe(
+      "https://devmanager.test/sessions?notificationRuntime=runtime-1&notificationRoute=%2Fsession%2Ftab%2Ftab-1",
+    );
+  });
+
+  it("sends missing or malformed runtime handoffs to Sessions", () => {
+    expect(
+      notificationClickDestination(
+        { route: "/session/tab/tab-1" },
+        "https://devmanager.test",
+      ),
+    ).toBe("https://devmanager.test/sessions");
+    expect(
+      notificationClickDestination(
+        {
+          route: "/session/tab/tab-1",
+          runtimeInstanceId: "runtime\nspoof",
+        },
+        "https://devmanager.test",
+      ),
+    ).toBe("https://devmanager.test/sessions");
   });
 
   it("keeps stable routing and action metadata without copying arbitrary content", () => {

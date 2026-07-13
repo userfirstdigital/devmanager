@@ -12,10 +12,10 @@ import { isNetworkOnlyPath } from "./pwa/cachePolicy";
 import {
   applyAppBadge,
   describePushNotification,
+  notificationClickDestination,
   type AppBadgeApi,
 } from "./pwa/notifications";
-import { safeRoute } from "./pwa/notificationRoute";
-import { parsePushPayload, type PushPayload } from "./pwa/pushPayload";
+import { parsePushEventData, type PushPayload } from "./pwa/pushPayload";
 import {
   UPDATE_ACTIVATION_RESULT,
   createWorkerUpdateGate,
@@ -92,12 +92,7 @@ self.addEventListener("message", (event) => {
 clientsClaim();
 
 function readPushPayload(event: PushEvent): PushPayload {
-  if (!event.data) return {};
-  try {
-    return parsePushPayload(event.data.json());
-  } catch {
-    return { body: event.data.text() };
-  }
+  return parsePushEventData(event.data);
 }
 
 self.addEventListener("push", (event) => {
@@ -127,11 +122,12 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const route = safeRoute(
-    (event.notification.data as { route?: unknown } | undefined)?.route,
+  const destination = notificationClickDestination(
+    event.notification.data as
+      | { route?: unknown; runtimeInstanceId?: unknown }
+      | undefined,
     self.location.origin,
   );
-  const destination = new URL(route, self.location.origin).href;
 
   event.waitUntil(
     (async () => {

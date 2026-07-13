@@ -115,8 +115,27 @@ export function resolveColdStart(
     standalone: boolean;
     launchEligible: boolean;
     snapshot: WebWorkspaceSnapshot;
+    notificationRuntimeInstanceId?: string | null;
+    notificationRoute?: AppRoute | null;
   },
 ): AppRoute {
+  if (
+    context.notificationRuntimeInstanceId !== undefined &&
+    context.notificationRuntimeInstanceId !== null
+  ) {
+    if (
+      context.notificationRuntimeInstanceId !==
+      context.snapshot.runtimeInstanceId
+    ) {
+      return { name: "sessions" };
+    }
+    const notificationRoute = context.notificationRoute ?? {
+      name: "sessions",
+    };
+    return routeExists(notificationRoute, context.snapshot)
+      ? notificationRoute
+      : { name: "sessions" };
+  }
   if (!context.standalone || !context.launchEligible || !saved) {
     return initialRoute;
   }

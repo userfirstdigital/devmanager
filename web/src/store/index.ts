@@ -164,13 +164,45 @@ export interface StoreState {
 }
 
 export function selectAggregateBadgeCount(
-  state: Pick<StoreState, "runtimeInstanceId" | "sessions">,
+  state: Pick<
+    StoreState,
+    "runtimeInstanceId" | "sessions" | "status" | "compatibilityDiagnostic"
+  >,
 ): number | null {
+  if (state.status.kind === "unauthorized") return 0;
+  if (state.compatibilityDiagnostic !== null) return 0;
   if (state.runtimeInstanceId === null) return null;
   return Object.values(state.sessions).filter(
     (session) =>
       session.attention === "needsInput" || session.attention === "failed",
   ).length;
+}
+
+export interface AppBadgeSyncState {
+  count: number | null;
+  authorityKey: string | null;
+}
+
+export function selectAppBadgeSyncState(
+  state: Pick<
+    StoreState,
+    "runtimeInstanceId" | "sessions" | "status" | "compatibilityDiagnostic"
+  >,
+): AppBadgeSyncState {
+  const count = selectAggregateBadgeCount(state);
+  if (state.status.kind === "unauthorized") {
+    return { count: 0, authorityKey: "unauthorized" };
+  }
+  if (state.compatibilityDiagnostic !== null) {
+    return { count: 0, authorityKey: "protocolReset" };
+  }
+  return {
+    count,
+    authorityKey:
+      state.runtimeInstanceId === null
+        ? null
+        : `runtime:${state.runtimeInstanceId}`,
+  };
 }
 
 function emptyRawTerminal(): RawTerminalSlice {
