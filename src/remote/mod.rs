@@ -36,7 +36,7 @@ use crate::terminal::session::{
 use rmp_serde::{decode::from_slice as from_messagepack_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
@@ -59,6 +59,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_OUTBOUND_MESSAGES_PER_TICK: usize = 128;
 pub(crate) const MAX_PENDING_REMOTE_REQUESTS: usize = 256;
 const MAX_CONCURRENT_REMOTE_HOST_WORK: usize = 8;
+const CLAUDE_COMPOSER_RECONCILIATION_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_CLAUDE_COMPOSER_RECONCILIATIONS: usize = 1024;
 
 type SessionBootstrapProvider = Arc<dyn Fn(&str) -> Option<RemoteSessionBootstrap> + Send + Sync>;
 type TerminalInputHandler =
@@ -1031,6 +1033,44 @@ pub struct RemoteHostService {
     inner: Arc<RemoteHostInner>,
 }
 
+/// Exact identity of one Claude hook projection attached to one PTY launch.
+/// The generation prevents a late hook from an old overlay from consuming a
+/// prompt submitted to a replacement Claude process that reused the PTY id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClaudeSemanticIdentity {
+    pub pty_session_id: String,
+    pub stable_session_key: StableSessionKey,
+    pub registration_generation: u64,
+}
+
+#[derive(Default)]
+struct ClaudeComposerReconciliationState {
+    adapters_by_pty_session: HashMap<String, ClaudeSemanticIdentity>,
+    pending: VecDeque<PendingClaudeComposerPrompt>,
+    reconciled_provider_keys: VecDeque<ReconciledClaudeProviderKey>,
+}
+
+struct PendingClaudeComposerPrompt {
+    mutation_id: String,
+    identity: ClaudeSemanticIdentity,
+    text: String,
+    state: PendingClaudeComposerPromptState,
+    expires_at: Instant,
+}
+
+enum PendingClaudeComposerPromptState {
+    Reserved {
+        deferred_hook: Option<SemanticEventDraft>,
+    },
+    Accepted,
+}
+
+struct ReconciledClaudeProviderKey {
+    identity: ClaudeSemanticIdentity,
+    key: String,
+    expires_at: Instant,
+}
+
 pub(crate) struct RemoteHostInner {
     config: RwLock<RemoteHostConfig>,
     config_update_lock: Mutex<()>,
@@ -1074,6 +1114,7 @@ pub(crate) struct RemoteHostInner {
     web_input_executor: WebInputExecutor,
     web_request_executor: WebRequestExecutor,
     host_work_limiter: RemoteHostWorkLimiter,
+    claude_composer_reconciliation: Mutex<ClaudeComposerReconciliationState>,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
@@ -1293,6 +1334,9 @@ impl RemoteHostService {
                 web_input_executor: WebInputExecutor::default(),
                 web_request_executor: WebRequestExecutor::default(),
                 host_work_limiter: RemoteHostWorkLimiter::new(MAX_CONCURRENT_REMOTE_HOST_WORK),
+                claude_composer_reconciliation: Mutex::new(
+                    ClaudeComposerReconciliationState::default(),
+                ),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
                 controller_client_id: RwLock::new(None),
@@ -1596,6 +1640,239 @@ impl RemoteHostService {
         });
         if changed {
             let _ = deliver_live_semantic_events(&self.inner);
+        }
+    }
+
+    pub fn push_claude_adapter_registered(&self, identity: ClaudeSemanticIdentity) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .claude_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let deferred = drain_expired_claude_reconciliations(&mut state, Instant::now());
+            state
+                .adapters_by_pty_session
+                .insert(identity.pty_session_id.clone(), identity.clone());
+            let mut invalidated = remove_pending_claude_prompts(&mut state, |pending| {
+                pending.identity.pty_session_id == identity.pty_session_id
+                    && pending.identity != identity
+            });
+            invalidated.extend(deferred);
+            invalidated
+        };
+        for draft in deferred {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub fn push_claude_adapter_removed(&self, identity: &ClaudeSemanticIdentity) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .claude_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.adapters_by_pty_session.get(&identity.pty_session_id) == Some(identity) {
+                state
+                    .adapters_by_pty_session
+                    .remove(&identity.pty_session_id);
+            }
+            state
+                .reconciled_provider_keys
+                .retain(|entry| entry.identity != *identity);
+            remove_pending_claude_prompts(&mut state, |pending| pending.identity == *identity)
+        };
+        for draft in deferred {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub fn push_claude_semantic_draft(
+        &self,
+        identity: ClaudeSemanticIdentity,
+        draft: SemanticEventDraft,
+    ) {
+        enum Decision {
+            Publish,
+            Reconciled,
+        }
+
+        let (expired, decision) = {
+            let mut state = self
+                .inner
+                .claude_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let expired = drain_expired_claude_reconciliations(&mut state, Instant::now());
+            let is_current =
+                state.adapters_by_pty_session.get(&identity.pty_session_id) == Some(&identity);
+            let provider_key_reconciled = draft.deduplication_key.as_ref().is_some_and(|key| {
+                state
+                    .reconciled_provider_keys
+                    .iter()
+                    .any(|entry| entry.identity == identity && entry.key == *key)
+            });
+            let text = match &draft.kind {
+                presentation::SemanticEventKind::UserMessage { text } => Some(text.as_str()),
+                _ => None,
+            };
+            let mut decision = Decision::Publish;
+            if is_current && provider_key_reconciled {
+                decision = Decision::Reconciled;
+            } else if is_current {
+                if let Some(text) = text {
+                    if let Some(index) = state.pending.iter().position(|pending| {
+                        pending.identity == identity
+                            && pending.text == text
+                            && matches!(
+                                pending.state,
+                                PendingClaudeComposerPromptState::Reserved {
+                                    deferred_hook: None
+                                } | PendingClaudeComposerPromptState::Accepted
+                            )
+                    }) {
+                        let accepted = matches!(
+                            state.pending[index].state,
+                            PendingClaudeComposerPromptState::Accepted
+                        );
+                        if accepted {
+                            let pending = state
+                                .pending
+                                .remove(index)
+                                .expect("matched Claude reconciliation exists");
+                            if let Some(key) = draft.deduplication_key.clone() {
+                                remember_reconciled_claude_provider_key(
+                                    &mut state,
+                                    pending.identity,
+                                    key,
+                                    Instant::now(),
+                                );
+                            }
+                        } else {
+                            state.pending[index].state =
+                                PendingClaudeComposerPromptState::Reserved {
+                                    deferred_hook: Some(draft.clone()),
+                                };
+                        }
+                        decision = Decision::Reconciled;
+                    } else if draft.deduplication_key.as_ref().is_some_and(|key| {
+                        state.pending.iter().any(|pending| {
+                            pending.identity == identity
+                                && pending.text == text
+                                && matches!(
+                                    &pending.state,
+                                    PendingClaudeComposerPromptState::Reserved {
+                                        deferred_hook: Some(deferred)
+                                    } if deferred.deduplication_key.as_ref() == Some(key)
+                                )
+                        })
+                    }) {
+                        decision = Decision::Reconciled;
+                    }
+                }
+            }
+            (expired, decision)
+        };
+
+        for expired in expired {
+            self.push_semantic_draft(expired);
+        }
+        if matches!(decision, Decision::Publish) {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub(crate) fn reserve_claude_composer_prompt(
+        &self,
+        mutation_id: &str,
+        pty_session_id: &str,
+        stable_session_key: &StableSessionKey,
+        text: &str,
+    ) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .claude_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let deferred = drain_expired_claude_reconciliations(&mut state, Instant::now());
+            let identity = state
+                .adapters_by_pty_session
+                .get(pty_session_id)
+                .filter(|identity| &identity.stable_session_key == stable_session_key)
+                .cloned();
+            if let Some(identity) = identity {
+                if state.pending.len() < MAX_CLAUDE_COMPOSER_RECONCILIATIONS {
+                    state.pending.push_back(PendingClaudeComposerPrompt {
+                        mutation_id: mutation_id.to_string(),
+                        identity,
+                        text: text.to_string(),
+                        state: PendingClaudeComposerPromptState::Reserved {
+                            deferred_hook: None,
+                        },
+                        expires_at: Instant::now() + CLAUDE_COMPOSER_RECONCILIATION_TTL,
+                    });
+                }
+            }
+            deferred
+        };
+        for draft in deferred {
+            self.push_semantic_draft(draft);
+        }
+    }
+
+    pub(crate) fn accept_claude_composer_prompt(&self, mutation_id: &str) {
+        let mut state = self
+            .inner
+            .claude_composer_reconciliation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(index) = state
+            .pending
+            .iter()
+            .position(|pending| pending.mutation_id == mutation_id)
+        else {
+            return;
+        };
+        let deferred = match &mut state.pending[index].state {
+            PendingClaudeComposerPromptState::Reserved { deferred_hook } => deferred_hook.take(),
+            PendingClaudeComposerPromptState::Accepted => return,
+        };
+        if let Some(deferred) = deferred {
+            let pending = state
+                .pending
+                .remove(index)
+                .expect("matched Claude reconciliation exists");
+            if let Some(key) = deferred.deduplication_key {
+                remember_reconciled_claude_provider_key(
+                    &mut state,
+                    pending.identity,
+                    key,
+                    Instant::now(),
+                );
+            }
+        } else {
+            state.pending[index].state = PendingClaudeComposerPromptState::Accepted;
+        }
+    }
+
+    pub(crate) fn cancel_claude_composer_prompt(&self, mutation_id: &str) {
+        let deferred = {
+            let mut state = self
+                .inner
+                .claude_composer_reconciliation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .pending
+                .iter()
+                .position(|pending| pending.mutation_id == mutation_id)
+                .and_then(|index| state.pending.remove(index))
+                .and_then(deferred_claude_hook)
+        };
+        if let Some(draft) = deferred {
+            self.push_semantic_draft(draft);
         }
     }
 
@@ -4002,6 +4279,62 @@ pub(crate) fn publish_semantic_event(
         true
     });
     published.expect("semantic event publication completed without an event")
+}
+
+fn deferred_claude_hook(pending: PendingClaudeComposerPrompt) -> Option<SemanticEventDraft> {
+    match pending.state {
+        PendingClaudeComposerPromptState::Reserved { deferred_hook } => deferred_hook,
+        PendingClaudeComposerPromptState::Accepted => None,
+    }
+}
+
+fn remove_pending_claude_prompts(
+    state: &mut ClaudeComposerReconciliationState,
+    mut predicate: impl FnMut(&PendingClaudeComposerPrompt) -> bool,
+) -> Vec<SemanticEventDraft> {
+    let mut deferred = Vec::new();
+    let mut index = 0;
+    while index < state.pending.len() {
+        if predicate(&state.pending[index]) {
+            if let Some(draft) = state.pending.remove(index).and_then(deferred_claude_hook) {
+                deferred.push(draft);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    deferred
+}
+
+fn drain_expired_claude_reconciliations(
+    state: &mut ClaudeComposerReconciliationState,
+    now: Instant,
+) -> Vec<SemanticEventDraft> {
+    state
+        .reconciled_provider_keys
+        .retain(|entry| now <= entry.expires_at);
+    remove_pending_claude_prompts(state, |pending| now > pending.expires_at)
+}
+
+fn remember_reconciled_claude_provider_key(
+    state: &mut ClaudeComposerReconciliationState,
+    identity: ClaudeSemanticIdentity,
+    key: String,
+    now: Instant,
+) {
+    state
+        .reconciled_provider_keys
+        .retain(|entry| entry.identity != identity || entry.key != key);
+    while state.reconciled_provider_keys.len() >= MAX_CLAUDE_COMPOSER_RECONCILIATIONS {
+        state.reconciled_provider_keys.pop_front();
+    }
+    state
+        .reconciled_provider_keys
+        .push_back(ReconciledClaudeProviderKey {
+            identity,
+            key,
+            expires_at: now + CLAUDE_COMPOSER_RECONCILIATION_TTL,
+        });
 }
 
 /// Fan semantic journal changes out through the bounded browser-only channel.

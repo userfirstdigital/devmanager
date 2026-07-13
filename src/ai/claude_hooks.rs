@@ -23,6 +23,7 @@ const MAX_PROVIDER_TEXT_BYTES: usize = 48 * 1024;
 const MAX_CLAUDE_SETTINGS_BYTES: usize = 1024 * 1024;
 const CLAUDE_NONCE_BYTES: usize = 32;
 const CLAUDE_SETTINGS_TOKEN_BYTES: usize = 16;
+const CLAUDE_ACTIVATION_GRACE: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeReducerLimits {
@@ -57,7 +58,14 @@ struct ToolRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ToolKey {
+    provider_session_id: String,
+    tool_use_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MessageKey {
+    provider_session_id: String,
     turn_id: String,
     message_id: String,
 }
@@ -103,8 +111,9 @@ impl ClaudeReduceOutcome {
 
 pub struct ClaudeReducer {
     stable_session_key: StableSessionKey,
+    fallback_provider_session_id: String,
     limits: ClaudeReducerLimits,
-    tools: HashMap<String, ToolRecord>,
+    tools: HashMap<ToolKey, ToolRecord>,
     tool_clock: u64,
     messages: HashMap<MessageKey, MessageRecord>,
     message_clock: u64,
@@ -113,8 +122,21 @@ pub struct ClaudeReducer {
 
 impl ClaudeReducer {
     pub fn new(stable_session_key: StableSessionKey, limits: ClaudeReducerLimits) -> Self {
+        Self::with_fallback_provider_session_id(
+            stable_session_key,
+            limits,
+            "standalone".to_string(),
+        )
+    }
+
+    fn with_fallback_provider_session_id(
+        stable_session_key: StableSessionKey,
+        limits: ClaudeReducerLimits,
+        fallback_provider_session_id: String,
+    ) -> Self {
         Self {
             stable_session_key,
+            fallback_provider_session_id,
             limits,
             tools: HashMap::new(),
             tool_clock: 0,
@@ -126,7 +148,10 @@ impl ClaudeReducer {
 
     pub fn tool(&self, tool_use_id: &str) -> Option<ClaudeToolSnapshot> {
         self.tools
-            .get(tool_use_id)
+            .iter()
+            .filter(|(key, _)| key.tool_use_id == tool_use_id)
+            .max_by_key(|(_, record)| record.touched)
+            .map(|(_, record)| record)
             .map(|record| record.snapshot.clone())
     }
 
@@ -171,13 +196,17 @@ impl ClaudeReducer {
                 value.get("source").and_then(Value::as_str),
                 None,
             ),
-            "UserPromptSubmit" => self.text_event(
-                occurred_at_epoch_ms,
-                value.get("prompt").and_then(Value::as_str),
-                |text| SemanticEventKind::UserMessage { text },
-                SemanticRetention::Canonical,
-                None,
-            ),
+            "UserPromptSubmit" => {
+                let deduplication_key =
+                    self.official_deduplication_key(&value, "prompt_id", "claude-user-prompt");
+                self.text_event(
+                    occurred_at_epoch_ms,
+                    value.get("prompt").and_then(Value::as_str),
+                    |text| SemanticEventKind::UserMessage { text },
+                    SemanticRetention::Canonical,
+                    deduplication_key,
+                )
+            }
             "MessageDisplay" => self.message_display(&value, occurred_at_epoch_ms),
             "PreToolUse" => self.tool_event(
                 &value,
@@ -207,7 +236,11 @@ impl ClaudeReducer {
                 occurred_at_epoch_ms,
                 "questionAnswered",
                 value.get("action").and_then(Value::as_str),
-                official_deduplication_key(&value, "elicitation_id", "claude-elicitation-result"),
+                self.official_deduplication_key(
+                    &value,
+                    "elicitation_id",
+                    "claude-elicitation-result",
+                ),
             ),
             "Stop" => self.stop(occurred_at_epoch_ms),
             "StopFailure" => self.stop_failure(&value, occurred_at_epoch_ms),
@@ -297,6 +330,7 @@ impl ClaudeReducer {
         let Some(name) = value.get("tool_name").and_then(Value::as_str) else {
             return ClaudeReduceOutcome::malformed();
         };
+        let provider_session_id = self.provider_session_id(value);
         let tool_use_id = bounded_identifier(tool_use_id);
         let name = bounded_identifier(name);
         if tool_use_id.is_empty() || name.is_empty() {
@@ -305,7 +339,11 @@ impl ClaudeReducer {
 
         self.tool_clock = self.tool_clock.wrapping_add(1);
         let mut changed = false;
-        let record = self.tools.entry(tool_use_id.clone()).or_insert_with(|| {
+        let key = ToolKey {
+            provider_session_id: provider_session_id.clone(),
+            tool_use_id: tool_use_id.clone(),
+        };
+        let record = self.tools.entry(key).or_insert_with(|| {
             changed = true;
             ToolRecord {
                 snapshot: ClaudeToolSnapshot {
@@ -354,7 +392,11 @@ impl ClaudeReducer {
                     summary,
                 },
                 SemanticRetention::Canonical,
-                Some(format!("claude-tool:{tool_use_id}")),
+                Some(scoped_deduplication_key(
+                    "claude-tool",
+                    &provider_session_id,
+                    &tool_use_id,
+                )),
             )],
             degraded: false,
         }
@@ -390,7 +432,9 @@ impl ClaudeReducer {
             return ClaudeReduceOutcome::ignored();
         }
 
+        let provider_session_id = self.provider_session_id(value);
         let key = MessageKey {
+            provider_session_id: provider_session_id.clone(),
             turn_id,
             message_id,
         };
@@ -467,7 +511,12 @@ impl ClaudeReducer {
                     streaming,
                 },
                 SemanticRetention::Canonical,
-                Some(format!("claude-message:{}:{}", key.turn_id, key.message_id)),
+                Some(scoped_message_deduplication_key(
+                    "claude-message",
+                    &provider_session_id,
+                    &key.turn_id,
+                    &key.message_id,
+                )),
             )],
             degraded: false,
         }
@@ -568,7 +617,9 @@ impl ClaudeReducer {
         let question_id = official_id
             .clone()
             .unwrap_or_else(|| format!("elicitation-{occurrence}"));
-        let deduplication_key = official_id.map(|id| format!("claude-elicitation:{id}"));
+        let deduplication_key = official_id.as_ref().map(|id| {
+            scoped_deduplication_key("claude-elicitation", &self.provider_session_id(value), id)
+        });
         ClaudeReduceOutcome {
             drafts: vec![self.draft(
                 occurred_at_epoch_ms,
@@ -642,7 +693,7 @@ impl ClaudeReducer {
             _ => None,
         };
         let deduplication_key = identity_field.and_then(|field| {
-            official_deduplication_key(value, field, &format!("claude-{event_name}"))
+            self.official_deduplication_key(value, field, &format!("claude-{event_name}"))
         });
         ClaudeReduceOutcome {
             drafts: vec![self.draft(
@@ -685,6 +736,21 @@ impl ClaudeReducer {
             };
             self.messages.remove(&oldest);
         }
+    }
+
+    fn provider_session_id(&self, value: &Value) -> String {
+        official_identifier(value, "session_id")
+            .unwrap_or_else(|| self.fallback_provider_session_id.clone())
+    }
+
+    fn official_deduplication_key(
+        &self,
+        value: &Value,
+        field: &str,
+        prefix: &str,
+    ) -> Option<String> {
+        official_identifier(value, field)
+            .map(|id| scoped_deduplication_key(prefix, &self.provider_session_id(value), &id))
     }
 }
 
@@ -733,8 +799,26 @@ fn official_identifier(value: &Value, field: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn official_deduplication_key(value: &Value, field: &str, prefix: &str) -> Option<String> {
-    official_identifier(value, field).map(|id| format!("{prefix}:{id}"))
+fn scoped_deduplication_key(prefix: &str, provider_session_id: &str, id: &str) -> String {
+    format!(
+        "{prefix}:{}:{provider_session_id}:{}:{id}",
+        provider_session_id.len(),
+        id.len()
+    )
+}
+
+fn scoped_message_deduplication_key(
+    prefix: &str,
+    provider_session_id: &str,
+    turn_id: &str,
+    message_id: &str,
+) -> String {
+    format!(
+        "{prefix}:{}:{provider_session_id}:{}:{turn_id}:{}:{message_id}",
+        provider_session_id.len(),
+        turn_id.len(),
+        message_id.len()
+    )
 }
 
 fn bounded_identifier(value: &str) -> String {
@@ -796,6 +880,7 @@ struct RegisteredClaudeSession {
     stable_session_key: StableSessionKey,
     generation: u64,
     expires_at: Instant,
+    activated: bool,
     reducer: ClaudeReducer,
     ingress_degraded: bool,
     cleanup_paths: Vec<PathBuf>,
@@ -919,8 +1004,13 @@ impl ClaudeHookRegistry {
             RegisteredClaudeSession {
                 stable_session_key: stable_session_key.clone(),
                 generation,
-                expires_at: now + self.limits.registration_ttl,
-                reducer: ClaudeReducer::new(stable_session_key.clone(), self.limits.reducer),
+                expires_at: now + self.limits.registration_ttl.min(CLAUDE_ACTIVATION_GRACE),
+                activated: false,
+                reducer: ClaudeReducer::with_fallback_provider_session_id(
+                    stable_session_key.clone(),
+                    self.limits.reducer,
+                    format!("registration-{generation}"),
+                ),
                 ingress_degraded: false,
                 cleanup_paths: Vec::new(),
             },
@@ -1006,12 +1096,15 @@ impl ClaudeHookRegistry {
             stable_session_key: registration.stable_session_key.clone(),
             nonce: nonce.to_string(),
             generation: registration.generation,
+            admitted_at: now,
         };
         let registration = state
             .registrations
             .get_mut(nonce)
             .expect("registration checked above");
-        registration.expires_at = now + self.limits.registration_ttl;
+        if registration.activated {
+            registration.expires_at = now + self.limits.registration_ttl;
+        }
         Ok(context)
     }
 
@@ -1043,15 +1136,18 @@ impl ClaudeHookRegistry {
             stable_session_key: registration.stable_session_key.clone(),
             nonce: nonce.to_string(),
             generation: registration.generation,
+            admitted_at: now,
         };
         if !context_is_current(&state, &context) {
             return Err(RelayIngestStatus::Accepted(ClaudeReduceOutcome::ignored()));
         }
-        state
+        let registration = state
             .registrations
             .get_mut(nonce)
-            .expect("registration checked above")
-            .expires_at = now + self.limits.registration_ttl;
+            .expect("registration checked above");
+        if registration.activated {
+            registration.expires_at = now + self.limits.registration_ttl;
+        }
         drop(state);
         Ok(enqueue(context))
     }
@@ -1069,17 +1165,29 @@ impl ClaudeHookRegistry {
             return CapturedClaudeIngest {
                 status: RelayIngestStatus::Accepted(ClaudeReduceOutcome::ignored()),
                 context: Some(context),
+                promoted_healthy: false,
             };
         }
-        let outcome = state
+        let is_session_start = serde_json::from_slice::<Value>(body)
+            .ok()
+            .is_some_and(|value| {
+                value.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart")
+                    && official_identifier(&value, "session_id").is_some()
+            });
+        let registration = state
             .registrations
             .get_mut(&context.nonce)
-            .expect("current registration exists")
-            .reducer
-            .apply_json(body, occurred_at_epoch_ms);
+            .expect("current registration exists");
+        let outcome = registration.reducer.apply_json(body, occurred_at_epoch_ms);
+        let promoted_healthy = is_session_start && !outcome.degraded && !registration.activated;
+        if promoted_healthy {
+            registration.activated = true;
+            registration.expires_at = context.admitted_at + self.limits.registration_ttl;
+        }
         CapturedClaudeIngest {
             status: RelayIngestStatus::Accepted(outcome),
             context: Some(context),
+            promoted_healthy,
         }
     }
 
@@ -1110,7 +1218,11 @@ impl ClaudeHookRegistry {
         captured: CapturedClaudeIngest,
         before_publication: impl FnOnce(),
     ) -> RelayIngestStatus {
-        let CapturedClaudeIngest { status, context } = captured;
+        let CapturedClaudeIngest {
+            status,
+            context,
+            promoted_healthy,
+        } = captured;
         let RelayIngestStatus::Accepted(outcome) = &status else {
             return status;
         };
@@ -1138,10 +1250,20 @@ impl ClaudeHookRegistry {
             if outcome.degraded {
                 invoke_registry_handler(
                     handler,
-                    registration,
+                    registration.clone(),
                     ClaudeRegistryEvent::AdapterHealth {
                         stable_session_key: context.stable_session_key.clone(),
                         health: SemanticAdapterHealth::Degraded,
+                    },
+                );
+            }
+            if promoted_healthy {
+                invoke_registry_handler(
+                    handler,
+                    registration,
+                    ClaudeRegistryEvent::AdapterHealth {
+                        stable_session_key: context.stable_session_key.clone(),
+                        health: SemanticAdapterHealth::Healthy,
                     },
                 );
             }
@@ -1247,6 +1369,7 @@ impl ClaudeHookRegistry {
                         stable_session_key: registration.stable_session_key.clone(),
                         nonce: nonce.clone(),
                         generation: registration.generation,
+                        admitted_at: Instant::now(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1431,6 +1554,7 @@ impl Eq for RelayIngestStatus {}
 struct CapturedClaudeIngest {
     status: RelayIngestStatus,
     context: Option<ClaudeRegistrationContext>,
+    promoted_healthy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1438,6 +1562,7 @@ struct ClaudeRegistrationContext {
     stable_session_key: StableSessionKey,
     nonce: String,
     generation: u64,
+    admitted_at: Instant,
 }
 
 impl ClaudeRegistrationContext {
@@ -1455,6 +1580,7 @@ impl CapturedClaudeIngest {
         Self {
             status,
             context: None,
+            promoted_healthy: false,
         }
     }
 }
@@ -2182,7 +2308,10 @@ pub fn prepare_claude_launch_overlay(
         endpoint: endpoint.to_string(),
         registration: Some(registration),
         settings_path: Some(settings_path),
-        health: SemanticAdapterHealth::Healthy,
+        // Writing an overlay proves only that launch preparation succeeded.
+        // The adapter becomes healthy after the matching Claude process calls
+        // the relay with its current-generation SessionStart hook.
+        health: SemanticAdapterHealth::Degraded,
         diagnostic: None,
     }
 }
@@ -2513,6 +2642,10 @@ mod registry_race_tests {
                 "draft",
             ),
             (&br#"{"hook_event_name":"PreToolUse""#[..], "adapter health"),
+            (
+                &br#"{"hook_event_name":"SessionStart","session_id":"stale-session","source":"startup"}"#[..],
+                "healthy promotion",
+            ),
         ] {
             let registry = Arc::new(ClaudeHookRegistry::default());
             let old = registry

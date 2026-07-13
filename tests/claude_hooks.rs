@@ -194,6 +194,131 @@ fn identical_user_prompts_without_unique_event_ids_are_both_projected() {
 }
 
 #[test]
+fn official_prompt_ids_deduplicate_only_within_the_provider_session() {
+    let mut reducer = reducer();
+    let prompt = |session_id: &str, prompt_id: Option<&str>| {
+        let mut value = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": session_id,
+            "prompt": "repeat me",
+        });
+        if let Some(prompt_id) = prompt_id {
+            value["prompt_id"] = serde_json::Value::String(prompt_id.to_string());
+        }
+        serde_json::to_vec(&value).unwrap()
+    };
+
+    let first = reducer.apply_json(&prompt("session-a", Some("prompt-1")), 10);
+    let retry = reducer.apply_json(&prompt("session-a", Some("prompt-1")), 11);
+    let other_session = reducer.apply_json(&prompt("session-b", Some("prompt-1")), 12);
+    let without_id = reducer.apply_json(&prompt("session-a", None), 13);
+    let repeated_without_id = reducer.apply_json(&prompt("session-a", None), 14);
+
+    let first_key = first.drafts[0]
+        .deduplication_key
+        .as_ref()
+        .expect("official prompt id should produce a retry key");
+    assert_eq!(retry.drafts[0].deduplication_key.as_ref(), Some(first_key));
+    assert_ne!(
+        other_session.drafts[0].deduplication_key.as_ref(),
+        Some(first_key),
+        "the same provider id in another Claude session must not replace history"
+    );
+    assert_eq!(without_id.drafts[0].deduplication_key, None);
+    assert_eq!(repeated_without_id.drafts[0].deduplication_key, None);
+}
+
+#[test]
+fn provider_session_id_namespaces_tool_message_and_lifecycle_identity() {
+    let mut reducer = reducer();
+    let tool = |session_id: &str, state: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": state,
+            "session_id": session_id,
+            "tool_use_id": "shared-tool",
+            "tool_name": "Read",
+        }))
+        .unwrap()
+    };
+    let message = |session_id: &str, delta: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "MessageDisplay",
+            "session_id": session_id,
+            "turn_id": "shared-turn",
+            "message_id": "shared-message",
+            "index": 0,
+            "final": true,
+            "delta": delta,
+        }))
+        .unwrap()
+    };
+    let task = |session_id: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "TaskCompleted",
+            "session_id": session_id,
+            "task_id": "shared-task",
+            "task_subject": "same official id",
+        }))
+        .unwrap()
+    };
+
+    let tool_a = reducer.apply_json(&tool("session-a", "PreToolUse"), 20);
+    let tool_b = reducer.apply_json(&tool("session-b", "PreToolUse"), 21);
+    let message_a = reducer.apply_json(&message("session-a", "first"), 22);
+    let message_b = reducer.apply_json(&message("session-b", "second"), 23);
+    let task_a = reducer.apply_json(&task("session-a"), 24);
+    let task_b = reducer.apply_json(&task("session-b"), 25);
+
+    assert_eq!(tool_a.drafts.len(), 1);
+    assert_eq!(tool_b.drafts.len(), 1, "tool state must not cross sessions");
+    assert_eq!(message_a.drafts.len(), 1);
+    assert_eq!(
+        message_b.drafts.len(),
+        1,
+        "message batches must not cross sessions"
+    );
+    assert_ne!(
+        tool_a.drafts[0].deduplication_key,
+        tool_b.drafts[0].deduplication_key
+    );
+    assert_ne!(
+        message_a.drafts[0].deduplication_key,
+        message_b.drafts[0].deduplication_key
+    );
+    assert_ne!(
+        task_a.drafts[0].deduplication_key,
+        task_b.drafts[0].deduplication_key
+    );
+}
+
+#[test]
+fn message_deduplication_identity_is_unambiguous_for_provider_punctuation() {
+    let mut reducer = reducer();
+    let event = |turn_id: &str, message_id: &str, delta: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "MessageDisplay",
+            "session_id": "session-a",
+            "turn_id": turn_id,
+            "message_id": message_id,
+            "index": 0,
+            "final": true,
+            "delta": delta,
+        }))
+        .unwrap()
+    };
+
+    let first = reducer.apply_json(&event("a:b", "c", "first"), 30);
+    let second = reducer.apply_json(&event("a", "b:c", "second"), 31);
+
+    assert_eq!(first.drafts.len(), 1);
+    assert_eq!(second.drafts.len(), 1);
+    assert_ne!(
+        first.drafts[0].deduplication_key, second.drafts[0].deduplication_key,
+        "length-delimited official fields must not collapse into one journal key"
+    );
+}
+
+#[test]
 fn identical_session_start_resume_events_without_unique_event_ids_are_both_projected() {
     let mut reducer = reducer();
     let resume =
@@ -525,7 +650,7 @@ fn registry_authenticates_loopback_nonce_caps_bodies_and_expires_entries() {
         registry.ingest_at(
             loopback,
             &registration.nonce,
-            fixture("prompt"),
+            fixture("session_start"),
             now + Duration::from_secs(20),
             1_020,
         ),
@@ -592,7 +717,7 @@ fn recognized_commands_generate_exec_form_hooks_and_cleanup_with_registration() 
         Instant::now(),
     );
 
-    assert_eq!(overlay.health, SemanticAdapterHealth::Healthy);
+    assert_eq!(overlay.health, SemanticAdapterHealth::Degraded);
     let registration = overlay.registration.as_ref().expect("registration");
     let settings_path = overlay.settings_path.as_ref().expect("settings path");
     assert!(settings_path.is_file());
@@ -683,6 +808,103 @@ fn registry_capacity_eviction_removes_ephemeral_settings_and_reports_the_nonce()
         event,
         ClaudeRegistryEvent::RegistrationDropped { nonce, .. } if nonce == &first.nonce
     )));
+}
+
+#[test]
+fn adapter_health_promotes_only_after_current_session_start_handshake() {
+    let registry = Arc::new(ClaudeHookRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
+        observed.lock().unwrap().push(event);
+    })));
+    let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
+    let registration = registry
+        .register_at(StableSessionKey::from_tab("activation-tab"), Instant::now())
+        .unwrap();
+
+    ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .send(br#"{"hook_event_name":"UserPromptSubmit","session_id":"provider-1","prompt":"before start"}"#)
+        .unwrap();
+    wait_for(Duration::from_secs(2), || {
+        events.lock().unwrap().iter().any(|event| {
+            matches!(event, ClaudeRegistryEvent::Semantic(draft)
+                if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "before start"))
+        })
+    });
+    assert!(!events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        ClaudeRegistryEvent::AdapterHealth {
+            health: SemanticAdapterHealth::Healthy,
+            ..
+        }
+    )));
+
+    ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .send(br#"{"hook_event_name":"SessionStart","source":"startup"}"#)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(
+        !events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ClaudeRegistryEvent::AdapterHealth {
+                health: SemanticAdapterHealth::Healthy,
+                ..
+            }
+        )),
+        "an incomplete SessionStart cannot prove provider activation"
+    );
+
+    for _ in 0..2 {
+        ureq::post(listener.endpoint())
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(br#"{"hook_event_name":"SessionStart","session_id":"provider-1","source":"startup"}"#)
+            .unwrap();
+    }
+    wait_for(Duration::from_secs(2), || {
+        events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                ClaudeRegistryEvent::AdapterHealth {
+                    health: SemanticAdapterHealth::Healthy,
+                    ..
+                }
+            )
+        })
+    });
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ClaudeRegistryEvent::AdapterHealth {
+                    health: SemanticAdapterHealth::Healthy,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "a registration should promote exactly once"
+    );
+}
+
+#[test]
+fn registration_without_session_start_expires_after_bounded_activation_grace() {
+    let registry = ClaudeHookRegistry::default();
+    let now = Instant::now();
+    registry
+        .register_at(StableSessionKey::from_tab("never-activated"), now)
+        .unwrap();
+
+    assert_eq!(
+        registry.cleanup_expired_at(now + Duration::from_secs(6 * 60)),
+        1,
+        "an overlay that never proves hook activation must not retain secrets for the full session TTL"
+    );
 }
 
 #[test]
@@ -848,7 +1070,7 @@ fn existing_settings_are_merged_without_overwriting_the_user_file() {
         Instant::now(),
     );
 
-    assert_eq!(overlay.health, SemanticAdapterHealth::Healthy);
+    assert_eq!(overlay.health, SemanticAdapterHealth::Degraded);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&fs::read(&user_settings).unwrap()).unwrap(),
         original,

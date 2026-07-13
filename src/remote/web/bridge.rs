@@ -39,7 +39,7 @@ use super::super::{
     acknowledge_browser_attention, now_epoch_ms, publish_semantic_event,
     request_timeout_for_action, requires_control, stable_hash, try_enqueue_pending_request,
     ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
-    RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput,
+    RemoteHostService, RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput,
     RemoteWebMutationAuthority, RemoteWorkspaceSnapshot, ServerMessage, WebComposerMutationRecord,
     WebComposerMutationStatus,
 };
@@ -3283,6 +3283,18 @@ fn dispatch_composer_submit_for_connection(
                         return;
                     }
                 };
+            let host_service = RemoteHostService {
+                inner: fence.inner.clone(),
+            };
+            let reconcile_claude_prompt = session_kind == SessionKind::Claude;
+            if reconcile_claude_prompt {
+                host_service.reserve_claude_composer_prompt(
+                    &mutation_id,
+                    &session_id,
+                    &stable_session_key,
+                    &text,
+                );
+            }
             let handler = fence
                 .inner
                 .terminal_input_handler
@@ -3310,6 +3322,9 @@ fn dispatch_composer_submit_for_connection(
                 },
             );
             if let Err(message) = callback_result {
+                if reconcile_claude_prompt {
+                    host_service.cancel_claude_composer_prompt(&mutation_id);
+                }
                 if message == super::image_paste::WEB_COMPOSER_AUTHORITY_CHANGED {
                     clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
                     completion.send(Err(composer_rejected(
@@ -3365,6 +3380,13 @@ fn dispatch_composer_submit_for_connection(
                     },
                 )
             }));
+            if reconcile_claude_prompt {
+                if published.is_ok() {
+                    host_service.accept_claude_composer_prompt(&mutation_id);
+                } else {
+                    host_service.cancel_claude_composer_prompt(&mutation_id);
+                }
+            }
             let accepted_sequence = published.map(|event| event.sequence).unwrap_or_else(|_| {
                 fence
                     .inner
@@ -6171,6 +6193,205 @@ mod tests {
         assert_eq!(submit().code, ComposerRejectCode::StaleGeneration);
         assert_eq!(submit().code, ComposerRejectCode::StaleGeneration);
         assert_eq!(writes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn claude_composer_hook_reconciliation_is_one_to_one_and_generation_scoped() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let stable_key = StableSessionKey::from_tab("tab-a");
+        let identity = crate::remote::ClaudeSemanticIdentity {
+            pty_session_id: "session-a".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_claude_adapter_registered(identity.clone());
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(stable_key.clone()),
+                "tab-a",
+            ),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+
+        let hook_service = service.clone();
+        let hook_identity = identity.clone();
+        let hook_number = Arc::new(AtomicUsize::new(0));
+        let callback_hook_number = hook_number.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            if let RemoteTerminalInput::ComposerBatch { text, .. } = input {
+                let number = callback_hook_number.fetch_add(1, Ordering::SeqCst) + 1;
+                hook_service.push_claude_semantic_draft(
+                    hook_identity.clone(),
+                    SemanticEventDraft {
+                        stable_session_key: hook_identity.stable_session_key.clone(),
+                        occurred_at_epoch_ms: 1_100 + number as u64,
+                        source: SemanticSource::Claude,
+                        kind: SemanticEventKind::UserMessage {
+                            text: text.trim_end_matches('\r').to_string(),
+                        },
+                        retention: SemanticRetention::Canonical,
+                        deduplication_key: Some(format!("provider-prompt-{number}")),
+                    },
+                );
+            }
+            Ok(())
+        })));
+
+        for mutation_id in ["mutation-one", "mutation-two"] {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                mutation_id.to_string(),
+                stable_key.clone(),
+                "same legitimate text".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+            .expect("composer prompt accepted");
+        }
+
+        let prompt_count = || {
+            service
+                .semantic_replay(&stable_key, 0)
+                .expect("semantic replay")
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "same legitimate text"
+                ))
+                .count()
+        };
+        assert_eq!(prompt_count(), 2, "each phone prompt appears exactly once");
+
+        service.push_claude_semantic_draft(
+            identity.clone(),
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_200,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "same legitimate text".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("provider-prompt-2".to_string()),
+            },
+        );
+        assert_eq!(
+            prompt_count(),
+            2,
+            "official provider retries remain reconciled"
+        );
+
+        service.push_claude_semantic_draft(
+            crate::remote::ClaudeSemanticIdentity {
+                registration_generation: identity.registration_generation + 1,
+                ..identity.clone()
+            },
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_201,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "same legitimate text".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("different-generation".to_string()),
+            },
+        );
+        assert_eq!(prompt_count(), 3, "a generation mismatch must fail open");
+
+        for occurred_at_epoch_ms in [1_202, 1_203] {
+            service.push_claude_semantic_draft(
+                identity.clone(),
+                SemanticEventDraft {
+                    stable_session_key: stable_key.clone(),
+                    occurred_at_epoch_ms,
+                    source: SemanticSource::Claude,
+                    kind: SemanticEventKind::UserMessage {
+                        text: "same legitimate text".to_string(),
+                    },
+                    retention: SemanticRetention::Canonical,
+                    deduplication_key: None,
+                },
+            );
+        }
+        assert_eq!(prompt_count(), 5, "no-ID provider events remain distinct");
+    }
+
+    #[test]
+    fn rejected_pty_write_releases_a_deferred_claude_prompt_fail_open() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let stable_key = StableSessionKey::from_tab("tab-a");
+        let identity = crate::remote::ClaudeSemanticIdentity {
+            pty_session_id: "session-a".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 1,
+        };
+        service.push_claude_adapter_registered(identity.clone());
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(None, Some(stable_key.clone()), "tab-a"),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let hook_service = service.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            hook_service.push_claude_semantic_draft(
+                identity.clone(),
+                SemanticEventDraft {
+                    stable_session_key: identity.stable_session_key.clone(),
+                    occurred_at_epoch_ms: 1_101,
+                    source: SemanticSource::Claude,
+                    kind: SemanticEventKind::UserMessage {
+                        text: "provider observed it".to_string(),
+                    },
+                    retention: SemanticRetention::Canonical,
+                    deduplication_key: Some("observed-prompt".to_string()),
+                },
+            );
+            Err("synthetic PTY rejection".to_string())
+        })));
+
+        process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "rejected-mutation".to_string(),
+            stable_key.clone(),
+            "provider observed it".to_string(),
+            Vec::new(),
+            generation,
+            1_100,
+        )
+        .expect_err("PTY rejection remains authoritative");
+
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "provider observed it"
+                ))
+                .count(),
+            1,
+            "a deferred provider event must not be lost when the composer write reports failure"
+        );
     }
 
     #[test]

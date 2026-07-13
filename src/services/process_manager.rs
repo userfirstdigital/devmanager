@@ -7,7 +7,7 @@ use crate::models::{
 };
 use crate::notifications;
 use crate::remote::presentation::{SemanticAdapterHealth, SemanticEventDraft, StableSessionKey};
-use crate::remote::RemoteActionResult;
+use crate::remote::{ClaudeSemanticIdentity, RemoteActionResult};
 use crate::services::process_ops::{
     next_op_id, ProcessOp, ProcessOpCompletion, ProcessOpContext, ProcessOpKind, ProcessOpQueue,
 };
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::Sender,
-    Arc, Mutex, RwLock,
+    Arc, Mutex, RwLock, Weak,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +63,7 @@ pub(crate) fn ai_session_needs_restore(
 pub struct ProcessManager {
     inner: Arc<ProcessManagerInner>,
     op_queue: Arc<ProcessOpQueue>,
+    _claude_overlay_owner: Arc<ClaudeOverlayOwner>,
 }
 
 #[derive(Clone)]
@@ -81,6 +82,16 @@ pub enum RemoteSessionEvent {
     },
     Semantic {
         draft: SemanticEventDraft,
+    },
+    ClaudeSemantic {
+        identity: ClaudeSemanticIdentity,
+        draft: SemanticEventDraft,
+    },
+    ClaudeAdapterRegistered {
+        identity: ClaudeSemanticIdentity,
+    },
+    ClaudeAdapterRemoved {
+        identity: ClaudeSemanticIdentity,
     },
     AdapterHealth {
         stable_session_key: StableSessionKey,
@@ -106,6 +117,8 @@ pub(crate) struct ProcessManagerInner {
     claude_hook_registry: Arc<ClaudeHookRegistry>,
     claude_hook_listener: Mutex<Option<ClaudeHookRelayListener>>,
     claude_hook_sessions: Mutex<HashMap<String, ClaudeHookSession>>,
+    claude_hook_temp_root: PathBuf,
+    claude_overlay_owner: Mutex<Weak<ClaudeOverlayOwner>>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
     op_queue: Mutex<Option<Arc<ProcessOpQueue>>>,
@@ -115,6 +128,43 @@ pub(crate) struct ProcessManagerInner {
 struct ClaudeHookSession {
     registration: ClaudeHookRegistration,
     settings_path: PathBuf,
+}
+
+struct ClaudeOverlayOwner {
+    inner: Weak<ProcessManagerInner>,
+    process_root: PathBuf,
+}
+
+impl Drop for ClaudeOverlayOwner {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            drain_claude_hook_sessions_inner(&inner);
+        }
+        remove_owned_claude_overlay_root(&self.process_root);
+    }
+}
+
+fn claude_semantic_identity(
+    pty_session_id: &str,
+    session: &ClaudeHookSession,
+) -> ClaudeSemanticIdentity {
+    ClaudeSemanticIdentity {
+        pty_session_id: pty_session_id.to_string(),
+        stable_session_key: session.registration.stable_session_key.clone(),
+        registration_generation: session.registration.generation,
+    }
+}
+
+fn claude_semantic_identity_for_registration(
+    inner: &ProcessManagerInner,
+    registration: &ClaudeHookRegistration,
+) -> Option<ClaudeSemanticIdentity> {
+    inner.claude_hook_sessions.lock().ok().and_then(|sessions| {
+        sessions
+            .iter()
+            .find(|(_, session)| session.registration == *registration)
+            .map(|(session_id, session)| claude_semantic_identity(session_id, session))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +197,7 @@ pub struct ManagedShutdownReport {
 
 static AI_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SSH_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CLAUDE_OVERLAY_OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_CLAUDE_COMMAND: &str =
     "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions";
@@ -170,6 +221,7 @@ impl ProcessManager {
     pub fn new() -> Self {
         let debug_enabled = debug_enabled();
         let claude_hook_registry = Arc::new(ClaudeHookRegistry::default());
+        let claude_hook_temp_root = prepare_claude_overlay_process_root();
         let inner = Arc::new(ProcessManagerInner {
             sessions: Mutex::new(HashMap::new()),
             runtime_state: Arc::new(RwLock::new(RuntimeState::new(debug_enabled))),
@@ -186,10 +238,19 @@ impl ProcessManager {
             claude_hook_registry: claude_hook_registry.clone(),
             claude_hook_listener: Mutex::new(None),
             claude_hook_sessions: Mutex::new(HashMap::new()),
+            claude_hook_temp_root: claude_hook_temp_root.clone(),
+            claude_overlay_owner: Mutex::new(Weak::new()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
             op_queue: Mutex::new(None),
         });
+        let claude_overlay_owner = Arc::new(ClaudeOverlayOwner {
+            inner: Arc::downgrade(&inner),
+            process_root: claude_hook_temp_root,
+        });
+        if let Ok(mut owner) = inner.claude_overlay_owner.lock() {
+            *owner = Arc::downgrade(&claude_overlay_owner);
+        }
 
         let registry_inner = Arc::downgrade(&inner);
         claude_hook_registry.set_event_handler(Some(Arc::new(move |registration, event| {
@@ -200,7 +261,22 @@ impl ProcessManager {
                 ClaudeRegistryEvent::Semantic(draft) => {
                     let registry = inner.claude_hook_registry.clone();
                     registry.publish_if_current(&registration, || {
-                        emit_remote_session_event(&inner, RemoteSessionEvent::Semantic { draft });
+                        let identity =
+                            claude_semantic_identity_for_registration(&inner, &registration);
+                        if let Some(identity) = identity {
+                            emit_remote_session_event(
+                                &inner,
+                                RemoteSessionEvent::ClaudeSemantic { identity, draft },
+                            );
+                        } else {
+                            // Correlation is an optimization. If tracking was
+                            // lost, preserve the provider event rather than
+                            // hiding it behind an uncertain match.
+                            emit_remote_session_event(
+                                &inner,
+                                RemoteSessionEvent::Semantic { draft },
+                            );
+                        }
                     });
                 }
                 ClaudeRegistryEvent::AdapterHealth {
@@ -224,15 +300,32 @@ impl ProcessManager {
                     generation,
                     was_latest,
                 } => {
-                    {
+                    let removed_identities = {
                         let mut sessions = inner
                             .claude_hook_sessions
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let removed = sessions
+                            .iter()
+                            .filter(|(_, session)| {
+                                session.registration.nonce == nonce
+                                    && session.registration.generation == generation
+                            })
+                            .map(|(session_id, session)| {
+                                claude_semantic_identity(session_id, session)
+                            })
+                            .collect::<Vec<_>>();
                         sessions.retain(|_, session| {
                             session.registration.nonce != nonce
                                 || session.registration.generation != generation
                         });
+                        removed
+                    };
+                    for identity in removed_identities {
+                        emit_remote_session_event(
+                            &inner,
+                            RemoteSessionEvent::ClaudeAdapterRemoved { identity },
+                        );
                     }
                     if was_latest {
                         let checked_key = stable_session_key.clone();
@@ -266,7 +359,11 @@ impl ProcessManager {
 
         let op_queue = Arc::new(ProcessOpQueue::new(inner.clone()));
 
-        Self { inner, op_queue }
+        Self {
+            inner,
+            op_queue,
+            _claude_overlay_owner: claude_overlay_owner,
+        }
     }
 
     pub fn drain_process_op_completions(&self) -> Vec<ProcessOpCompletion> {
@@ -883,20 +980,29 @@ impl ProcessManager {
         if let (Some(registration), Some(settings_path)) =
             (overlay.registration, overlay.settings_path)
         {
+            let session = ClaudeHookSession {
+                registration,
+                settings_path,
+            };
+            let identity = claude_semantic_identity(session_id, &session);
             let previous = self
                 .inner
                 .claude_hook_sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(
-                    session_id.to_string(),
-                    ClaudeHookSession {
-                        registration,
-                        settings_path,
+                .insert(session_id.to_string(), session);
+            launch.startup_command = overlay.startup_command;
+            emit_remote_session_event(
+                &self.inner,
+                RemoteSessionEvent::ClaudeAdapterRegistered { identity },
+            );
+            if let Some(previous) = previous {
+                emit_remote_session_event(
+                    &self.inner,
+                    RemoteSessionEvent::ClaudeAdapterRemoved {
+                        identity: claude_semantic_identity(session_id, &previous),
                     },
                 );
-            launch.startup_command = overlay.startup_command;
-            if let Some(previous) = previous {
                 self.inner
                     .claude_hook_registry
                     .unregister_registration(&previous.registration);
@@ -919,11 +1025,22 @@ impl ProcessManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(session_id);
         if let Some(registration) = registration {
+            emit_remote_session_event(
+                &self.inner,
+                RemoteSessionEvent::ClaudeAdapterRemoved {
+                    identity: claude_semantic_identity(session_id, &registration),
+                },
+            );
             self.inner
                 .claude_hook_registry
                 .unregister_registration(&registration.registration);
             let _ = std::fs::remove_file(registration.settings_path);
         }
+    }
+
+    pub fn drain_claude_hook_adapter(&self) {
+        drain_claude_hook_sessions_inner(&self.inner);
+        remove_owned_claude_overlay_root(&self.inner.claude_hook_temp_root);
     }
 
     pub fn set_notification_sound(&self, sound_id: Option<String>) {
@@ -1396,7 +1513,11 @@ impl ProcessManager {
         let session_id = next_ai_session_id(&tab.tab_type);
         let mut launch =
             build_ai_launch_spec(&app_state.config.settings, &project, &tab, &session_id)?;
-        self.prepare_claude_launch_for_session(&mut launch, &session_id, &claude_hook_temp_root());
+        self.prepare_claude_launch_for_session(
+            &mut launch,
+            &session_id,
+            &self.inner.claude_hook_temp_root,
+        );
 
         let _ = app_state.update_ai_tab_session(&tab.id, session_id.clone());
         if activate_tab {
@@ -1478,7 +1599,11 @@ impl ProcessManager {
         let session_id = next_ai_session_id(&tab.tab_type);
         let mut launch =
             build_ai_launch_spec(&app_state.config.settings, &project, &tab, &session_id)?;
-        self.prepare_claude_launch_for_session(&mut launch, &session_id, &claude_hook_temp_root());
+        self.prepare_claude_launch_for_session(
+            &mut launch,
+            &session_id,
+            &self.inner.claude_hook_temp_root,
+        );
 
         let _ = app_state.update_ai_tab_session(&tab.id, session_id.clone());
         if activate_tab {
@@ -2634,6 +2759,28 @@ impl ProcessManager {
     }
 }
 
+fn drain_claude_hook_sessions_inner(inner: &ProcessManagerInner) {
+    let sessions = {
+        let mut sessions = inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *sessions)
+    };
+    for (session_id, session) in sessions {
+        emit_remote_session_event(
+            inner,
+            RemoteSessionEvent::ClaudeAdapterRemoved {
+                identity: claude_semantic_identity(&session_id, &session),
+            },
+        );
+        inner
+            .claude_hook_registry
+            .unregister_registration(&session.registration);
+        let _ = std::fs::remove_file(session.settings_path);
+    }
+}
+
 impl Drop for ProcessManagerInner {
     fn drop(&mut self) {
         self.background_stop.store(true, Ordering::SeqCst);
@@ -2652,6 +2799,8 @@ impl Drop for ProcessManagerInner {
                 let _ = session.close(false);
             }
         }
+        drain_claude_hook_sessions_inner(self);
+        remove_owned_claude_overlay_root(&self.claude_hook_temp_root);
     }
 }
 
@@ -3627,8 +3776,107 @@ fn claude_shell_kind(shell_program: &str) -> ClaudeShellKind {
     }
 }
 
-fn claude_hook_temp_root() -> PathBuf {
+fn claude_hook_base_root() -> PathBuf {
     std::env::temp_dir().join("devmanager").join("claude-hooks")
+}
+
+fn prepare_claude_overlay_process_root() -> PathBuf {
+    let base = claude_hook_base_root();
+    let _ = std::fs::create_dir_all(&base);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+    }
+    cleanup_orphaned_claude_overlay_roots_at(&base, |pid, started_at| {
+        platform_service::process_matches_identity(pid, started_at, None)
+    });
+
+    let pid = std::process::id();
+    let started_at = platform_service::capture_process_identity(pid)
+        .map(|identity| identity.started_at_unix_secs)
+        .unwrap_or(0);
+    let token = claude_overlay_owner_token();
+    base.join(format!("owner-{pid}-{started_at}-{token}"))
+}
+
+fn claude_overlay_owner_token() -> String {
+    let mut bytes = [0_u8; 16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        let mut encoded = String::with_capacity(32);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        return encoded;
+    }
+    let counter = CLAUDE_OVERLAY_OWNER_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:032x}", time ^ counter)
+}
+
+fn parse_claude_overlay_owner(path: &Path) -> Option<(u32, u64)> {
+    let name = path.file_name()?.to_str()?.strip_prefix("owner-")?;
+    let mut fields = name.split('-');
+    let pid = fields.next()?.parse().ok()?;
+    let started_at = fields.next()?.parse().ok()?;
+    let token = fields.next()?;
+    if fields.next().is_some()
+        || token.len() != 32
+        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((pid, started_at))
+}
+
+fn cleanup_orphaned_claude_overlay_roots_at(
+    base: &Path,
+    mut owner_is_alive: impl FnMut(u32, u64) -> bool,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some((pid, started_at)) = parse_claude_overlay_owner(&path) else {
+            continue;
+        };
+        // A zero start time cannot distinguish PID reuse. Preserve it rather
+        // than risking another live DevManager instance.
+        if started_at == 0 || owner_is_alive(pid, started_at) {
+            continue;
+        }
+        if remove_owned_claude_overlay_root(&path) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn remove_owned_claude_overlay_root(process_root: &Path) -> bool {
+    let Some(base) = process_root.parent() else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(process_root) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let (Ok(canonical_base), Ok(canonical_root)) =
+        (base.canonicalize(), process_root.canonicalize())
+    else {
+        return false;
+    };
+    if canonical_root.parent() != Some(canonical_base.as_path()) {
+        return false;
+    }
+    std::fs::remove_dir_all(canonical_root).is_ok()
 }
 
 fn interactive_shell_command_from_inner(inner: &ProcessManagerInner) -> (String, Vec<String>) {
@@ -4069,7 +4317,17 @@ fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> ProcessManager
         .ok()
         .and_then(|guard| guard.clone())
         .expect("process op queue missing");
-    ProcessManager { inner, op_queue }
+    let claude_overlay_owner = inner
+        .claude_overlay_owner
+        .lock()
+        .ok()
+        .and_then(|owner| owner.upgrade())
+        .expect("Claude overlay owner missing");
+    ProcessManager {
+        inner,
+        op_queue,
+        _claude_overlay_owner: claude_overlay_owner,
+    }
 }
 
 pub(crate) fn execute_process_op_inner(
@@ -4779,6 +5037,7 @@ fn shutdown_managed_processes_inner(
     if report.remaining_live_sessions == 0 && report.remaining_tracked_pids == 0 {
         pid_file::clear_all();
     }
+    manager.drain_claude_hook_adapter();
     report
 }
 
@@ -4859,9 +5118,15 @@ mod tests {
         assert_eq!(manager.inner.claude_hook_registry.registration_count(), 1);
         assert!(events.lock().unwrap().iter().any(|event| matches!(
             event,
+            RemoteSessionEvent::ClaudeAdapterRegistered { identity }
+                if identity.pty_session_id == "claude-session"
+                    && identity.stable_session_key == crate::remote::presentation::StableSessionKey::from_tab("claude-tab")
+        )));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
             RemoteSessionEvent::AdapterHealth {
                 stable_session_key,
-                health: crate::remote::presentation::SemanticAdapterHealth::Healthy,
+                health: crate::remote::presentation::SemanticAdapterHealth::Degraded,
             } if stable_session_key == &crate::remote::presentation::StableSessionKey::from_tab("claude-tab")
         )));
         let (registration, settings_path) = manager
@@ -4879,7 +5144,45 @@ mod tests {
             .to_string_lossy()
             .contains(&registration.nonce));
 
+        events.lock().unwrap().clear();
+        let endpoint = manager.claude_hook_endpoint().unwrap();
+        ureq::post(&endpoint)
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(br#"{"hook_event_name":"SessionStart","session_id":"provider-session","source":"startup"}"#)
+            .unwrap();
+        let started_at = Instant::now();
+        while started_at.elapsed() < Duration::from_secs(2)
+            && !events.lock().unwrap().iter().any(|event| matches!(
+                event,
+                RemoteSessionEvent::AdapterHealth {
+                    stable_session_key,
+                    health: crate::remote::presentation::SemanticAdapterHealth::Healthy,
+                } if stable_session_key == &crate::remote::presentation::StableSessionKey::from_tab("claude-tab")
+            ))
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key,
+                health: crate::remote::presentation::SemanticAdapterHealth::Healthy,
+            } if stable_session_key == &crate::remote::presentation::StableSessionKey::from_tab("claude-tab")
+        )));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::ClaudeSemantic { identity, draft }
+                if identity.pty_session_id == "claude-session"
+                    && matches!(&draft.kind, crate::remote::presentation::SemanticEventKind::Status { state, .. } if state == "started")
+        )));
+
         manager.cleanup_claude_hook_session("claude-session");
+
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::ClaudeAdapterRemoved { identity }
+                if identity.pty_session_id == "claude-session"
+        )));
 
         assert_eq!(manager.inner.claude_hook_registry.registration_count(), 0);
         assert!(!settings_path.exists());
@@ -5108,7 +5411,7 @@ mod tests {
         let removed = manager
             .inner
             .claude_hook_registry
-            .cleanup_expired_at(Instant::now() + Duration::from_secs(25 * 60 * 60));
+            .cleanup_expired_at(Instant::now() + Duration::from_secs(6 * 60));
 
         assert_eq!(removed, 1);
         assert!(!manager
@@ -5167,6 +5470,100 @@ mod tests {
             .unwrap()
             .contains_key("failure-session"));
         assert!(!settings_path.exists());
+    }
+
+    #[test]
+    fn claude_overlay_orphan_sweep_never_removes_a_live_or_unverifiable_owner() {
+        let base = temp_test_dir("claude-hook-orphan-sweep");
+        let live = base.join("owner-101-1001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let dead = base.join("owner-202-2002-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let unverifiable = base.join("owner-malformed");
+        for root in [&live, &dead, &unverifiable] {
+            fs::create_dir_all(root).unwrap();
+            fs::write(root.join("copied-settings.json"), b"secret").unwrap();
+        }
+
+        let removed = cleanup_orphaned_claude_overlay_roots_at(&base, |pid, started_at| {
+            pid == 101 && started_at == 1001
+        });
+
+        assert_eq!(removed, 1);
+        assert!(live.exists(), "a live DevManager instance owns this root");
+        assert!(!dead.exists(), "a verified dead owner is safe to clean");
+        assert!(
+            unverifiable.exists(),
+            "malformed ownership must fail closed rather than risk another instance"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn explicit_claude_adapter_drain_removes_all_settings_and_the_process_root() {
+        let manager = ProcessManager::new();
+        let process_root = manager.inner.claude_hook_temp_root.clone();
+        let mut launch = AiLaunchSpec {
+            tab_id: "drain-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Claude,
+            cwd: process_root.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        };
+        manager.prepare_claude_launch_for_session(&mut launch, "drain-session", &process_root);
+        let settings_path = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("drain-session")
+            .unwrap()
+            .settings_path
+            .clone();
+        assert!(settings_path.exists());
+
+        manager.drain_claude_hook_adapter();
+
+        assert_eq!(manager.inner.claude_hook_registry.registration_count(), 0);
+        assert!(manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(!settings_path.exists());
+        assert!(!process_root.exists());
+    }
+
+    #[test]
+    fn dropping_the_last_process_manager_handle_drains_claude_overlays() {
+        let manager = ProcessManager::new();
+        let process_root = manager.inner.claude_hook_temp_root.clone();
+        let mut launch = AiLaunchSpec {
+            tab_id: "drop-drain-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Claude,
+            cwd: process_root.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        };
+        manager.prepare_claude_launch_for_session(&mut launch, "drop-drain-session", &process_root);
+        let settings_path = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("drop-drain-session")
+            .unwrap()
+            .settings_path
+            .clone();
+        assert!(settings_path.exists());
+
+        drop(manager);
+
+        assert!(!settings_path.exists());
+        assert!(!process_root.exists());
     }
 
     #[test]
