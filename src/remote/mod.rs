@@ -9,8 +9,9 @@ pub use client_pool::RemoteClientPool;
 pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
 
 use presentation::{
-    SemanticAttention, SemanticEvent, SemanticEventDraft, SemanticEventKind, SemanticJournalStore,
-    SemanticReplay, SemanticSessionMetadata, SemanticSource, StableSessionKey,
+    SemanticAdapterHealth, SemanticAttention, SemanticEvent, SemanticEventDraft,
+    SemanticEventKind, SemanticJournalStore, SemanticReplay, SemanticSessionMetadata,
+    SemanticSource, StableSessionKey,
 };
 use web::bridge::{BrowserOutboundSender, WebConnectionTombstone};
 use web::input_executor::WebInputExecutor;
@@ -1586,6 +1587,29 @@ impl RemoteHostService {
 
     pub fn push_session_output(&self, session_id: &str, bytes: Vec<u8>) {
         self.push_session_output_inner(session_id, bytes, None);
+    }
+
+    pub fn push_semantic_draft(&self, draft: SemanticEventDraft) {
+        let changed = self.publish_semantic_change(|journals| {
+            journals.record(draft);
+            true
+        });
+        if changed {
+            let _ = deliver_live_semantic_events(&self.inner);
+        }
+    }
+
+    pub fn push_semantic_adapter_health(
+        &self,
+        stable_session_key: StableSessionKey,
+        health: SemanticAdapterHealth,
+    ) {
+        let changed = self.publish_semantic_change(|journals| {
+            journals.set_adapter_health(&stable_session_key, health)
+        });
+        if changed {
+            let _ = deliver_live_semantic_events(&self.inner);
+        }
     }
 
     pub fn push_session_output_with_mode(
@@ -5902,6 +5926,29 @@ mod tests {
                 .payload
                 .action,
             PushAttentionKind::Completed
+        );
+    }
+
+    #[test]
+    fn native_semantic_adapter_uses_the_existing_journal_store() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let key = StableSessionKey::from_tab("native-claude");
+
+        service.push_semantic_draft(semantic_status_draft(key.clone(), "ready", 42));
+        service.push_semantic_adapter_health(key.clone(), SemanticAdapterHealth::Degraded);
+
+        let replay = service.semantic_replay(&key, 0).expect("semantic replay");
+        assert_eq!(replay.events.len(), 1);
+        assert!(matches!(
+            &replay.events[0].kind,
+            SemanticEventKind::Status { state, .. } if state == "ready"
+        ));
+        assert_eq!(
+            service
+                .semantic_session_metadata(&key)
+                .expect("semantic metadata")
+                .adapter_health,
+            SemanticAdapterHealth::Degraded
         );
     }
 

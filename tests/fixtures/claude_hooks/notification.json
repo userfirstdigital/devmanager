@@ -1,0 +1,9 @@
+{
+  "session_id": "session-1",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "hook_event_name": "Notification",
+  "notification_type": "idle_prompt",
+  "title": "Claude is ready",
+  "message": "Claude is waiting for input"
+}

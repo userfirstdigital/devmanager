@@ -1,0 +1,9 @@
+{
+  "session_id": "session-1",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "hook_event_name": "PreToolUse",
+  "tool_use_id": "tool-a",
+  "tool_name": "Read",
+  "tool_input": { "file_path": "SECRET_COMMAND_SENTINEL" }
+}

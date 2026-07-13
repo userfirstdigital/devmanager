@@ -1,0 +1,11 @@
+{
+  "session_id": "session-1",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "hook_event_name": "PostToolUse",
+  "tool_use_id": "tool-b",
+  "tool_name": "Bash",
+  "tool_input": { "command": "SECRET_COMMAND_SENTINEL" },
+  "tool_response": { "stdout": "SECRET_COMMAND_SENTINEL", "success": true },
+  "duration_ms": 12
+}

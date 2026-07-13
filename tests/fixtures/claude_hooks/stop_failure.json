@@ -1,0 +1,9 @@
+{
+  "session_id": "session-1",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "hook_event_name": "StopFailure",
+  "error": "rate_limit",
+  "error_details": "SECRET_COMMAND_SENTINEL",
+  "last_assistant_message": "API Error: Rate limit reached"
+}

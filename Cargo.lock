@@ -1731,6 +1731,7 @@ dependencies = [
  "cargo-packager-updater",
  "dirs 6.0.0",
  "futures-util",
+ "getrandom 0.3.4",
  "gpui",
  "hmac",
  "image",

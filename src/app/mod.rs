@@ -700,6 +700,15 @@ impl NativeShell {
             RemoteSessionEvent::Removed { session_id } => {
                 event_host_service.push_session_removed(&session_id);
             }
+            RemoteSessionEvent::Semantic { draft } => {
+                event_host_service.push_semantic_draft(draft);
+            }
+            RemoteSessionEvent::AdapterHealth {
+                stable_session_key,
+                health,
+            } => {
+                event_host_service.push_semantic_adapter_health(stable_session_key, health);
+            }
         })));
         let focus_manager = process_manager.clone();
         remote_host_service.set_focused_session_handler(Some(Arc::new(move |session_id| {

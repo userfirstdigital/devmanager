@@ -1,0 +1,8 @@
+{
+  "session_id": "session-1",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "The reducer is ready."
+}

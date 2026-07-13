@@ -1,0 +1,10 @@
+{
+  "session_id": "session-1",
+  "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
+  "cwd": "SECRET_CWD_SENTINEL",
+  "hook_event_name": "Elicitation",
+  "mcp_server_name": "test-server",
+  "elicitation_id": "elicit-1",
+  "message": "Choose a deployment region",
+  "requested_schema": { "default": "SECRET_ELICITATION_RESPONSE_SENTINEL" }
+}
