@@ -1098,7 +1098,7 @@ pub(crate) struct RemoteHostInner {
     semantic_delivery_test_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Non-blocking admission handle for the web listener's bounded Push
     /// delivery pool. It is absent whenever the listener is stopped.
-    web_push_sender: RwLock<Option<std::sync::mpsc::SyncSender<web::push::PushDelivery>>>,
+    web_push_sender: RwLock<Option<web::push::PushSender>>,
     session_bootstrap_provider: RwLock<Option<SessionBootstrapProvider>>,
     terminal_input_handler: RwLock<Option<TerminalInputHandler>>,
     terminal_resize_handler: RwLock<Option<TerminalResizeHandler>>,
@@ -1566,13 +1566,11 @@ impl RemoteHostService {
             }
             _ => false,
         };
-        let visibly_focused = self.stable_key_is_visibly_focused(&stable_session_key);
         let mut push_action = None;
         let changed = self.publish_semantic_change(|journals| {
             let previous = journals.metadata(&stable_session_key);
             journals.record(draft);
             if is_completion
-                && !visibly_focused
                 && previous
                     .as_ref()
                     .is_none_or(|metadata| metadata.attention == SemanticAttention::None)
@@ -1604,29 +1602,6 @@ impl RemoteHostService {
         if changed {
             let _ = deliver_live_semantic_events(&self.inner);
         }
-    }
-
-    fn stable_key_is_visibly_focused(&self, stable_session_key: &StableSessionKey) -> bool {
-        let focused_session_ids = self
-            .inner
-            .clients
-            .lock()
-            .map(|clients| {
-                clients
-                    .values()
-                    .filter_map(|client| client.focused_session_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        self.inner
-            .semantic_journals
-            .lock()
-            .map(|journals| {
-                focused_session_ids.iter().any(|session_id| {
-                    journals.stable_key_for_session(session_id).as_ref() == Some(stable_session_key)
-                })
-            })
-            .unwrap_or(false)
     }
 
     pub fn push_session_output(&self, session_id: &str, bytes: Vec<u8>) {
@@ -5114,7 +5089,7 @@ mod tests {
     use crate::remote::web::bridge::BrowserOutboundSender;
     use crate::remote::web::push::{
         validate_registration, PushAttentionKind, PushDelivery, PushRegistrationKeys,
-        PushRegistrationRequest,
+        PushRegistrationRequest, PushSender,
     };
     use crate::remote::web::wire::WsOutbound;
     use crate::state::{
@@ -6022,7 +5997,7 @@ mod tests {
             .upsert_subscription(client_id, subscription, 1);
         let service = RemoteHostService::new(config);
         let (sender, receiver) = mpsc::sync_channel(8);
-        *service.inner.web_push_sender.write().unwrap() = Some(sender);
+        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
         (service, receiver)
     }
 
@@ -6151,6 +6126,90 @@ mod tests {
     }
 
     #[test]
+    fn visible_install_preserves_host_completion_and_notifies_other_installs() {
+        let mut config = RemoteHostConfig::default();
+        for (client_id, endpoint) in [
+            (
+                "phone-visible",
+                "https://web.push.apple.com/QM-phone-visible",
+            ),
+            (
+                "tablet-hidden",
+                "https://web.push.apple.com/QM-tablet-hidden",
+            ),
+        ] {
+            let subscription = validate_registration(PushRegistrationRequest {
+                endpoint: endpoint.to_string(),
+                keys: PushRegistrationKeys {
+                    p256dh: config.web.push.vapid_public_key_base64.clone(),
+                    auth: URL_SAFE_NO_PAD.encode([8_u8; 16]),
+                },
+            })
+            .expect("valid push subscription");
+            config
+                .web
+                .push
+                .upsert_subscription(client_id, subscription, 1);
+        }
+        let service = RemoteHostService::new(config);
+        let (sender, receiver) = mpsc::sync_channel(8);
+        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
+
+        let runtime =
+            attention_runtime("claude-shared", SessionKind::Claude, SessionStatus::Running);
+        service.push_session_runtime("claude-shared", runtime);
+        if let Ok(mut clients) = service.inner.clients.lock() {
+            clients.insert(
+                1,
+                ConnectedRemoteClient {
+                    client_id: "phone-visible".to_string(),
+                    sender: None,
+                    web_sender: None,
+                    web_tombstone: None,
+                    semantic_cursors: HashMap::new(),
+                    subscribed_session_ids: HashSet::new(),
+                    bootstrapped_session_ids: HashSet::new(),
+                    bootstrap_pending_session_ids: HashSet::new(),
+                    focused_session_id: Some("claude-shared".to_string()),
+                    last_app_hash: 0,
+                    last_runtime_hash: 0,
+                    last_port_hash: 0,
+                    last_controller_client_id: None,
+                    last_you_have_control: false,
+                    last_snapshot_revision: 0,
+                },
+            );
+        }
+
+        let key = StableSessionKey::from_tab("claude-shared");
+        service.push_semantic_draft(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 10,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Status {
+                state: "completed".to_string(),
+                detail: None,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("shared-completion".to_string()),
+        });
+
+        let delivery = receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("background tablet receives completion push");
+        assert_eq!(delivery.subscription.client_id, "tablet-hidden");
+        assert_eq!(delivery.payload.action, PushAttentionKind::Completed);
+        assert_eq!(
+            service
+                .semantic_session_metadata(&key)
+                .expect("host completion metadata")
+                .attention,
+            SemanticAttention::Unread
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn semantic_completion_and_question_transitions_notify_without_duplicates() {
         let (service, receiver) = service_with_push_subscription("phone-semantic");
         let runtime = attention_runtime(
@@ -6207,6 +6266,76 @@ mod tests {
         assert!(!delivery.payload.body.contains("PROMPT_SENTINEL"));
         service.push_semantic_draft(question);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn removed_session_attention_does_not_inflate_later_push_badges() {
+        let (service, receiver) = service_with_push_subscription("phone-badge");
+
+        let removed_runtime = attention_runtime(
+            "claude-removed",
+            SessionKind::Claude,
+            SessionStatus::Running,
+        );
+        service.push_session_runtime("claude-removed", removed_runtime);
+        let removed_key = StableSessionKey::from_tab("claude-removed");
+        service.push_semantic_draft(SemanticEventDraft {
+            stable_session_key: removed_key.clone(),
+            occurred_at_epoch_ms: 20,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Status {
+                state: "completed".to_string(),
+                detail: None,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("removed-completion".to_string()),
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_millis(250))
+                .expect("first completion push")
+                .payload
+                .badge,
+            1
+        );
+
+        service.push_session_removed("claude-removed");
+
+        let current_runtime = attention_runtime(
+            "claude-current",
+            SessionKind::Claude,
+            SessionStatus::Running,
+        );
+        service.push_session_runtime("claude-current", current_runtime);
+        let current_key = StableSessionKey::from_tab("claude-current");
+        service.push_semantic_draft(SemanticEventDraft {
+            stable_session_key: current_key,
+            occurred_at_epoch_ms: 21,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::Status {
+                state: "completed".to_string(),
+                detail: None,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("current-completion".to_string()),
+        });
+
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_millis(250))
+                .expect("current completion push")
+                .payload
+                .badge,
+            1,
+            "removed session attention must not remain in the aggregate badge"
+        );
+        assert_eq!(
+            service
+                .semantic_session_metadata(&removed_key)
+                .expect("removed history remains retained")
+                .attention,
+            SemanticAttention::None
+        );
     }
 
     #[test]

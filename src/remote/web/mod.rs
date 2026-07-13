@@ -482,7 +482,10 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/pair", get(pair_handler))
         .route("/api/health", get(health_handler))
         .route("/api/me", get(me_handler))
-        .route("/api/push", get(push_status_handler).post(push_subscribe_handler))
+        .route(
+            "/api/push",
+            get(push_status_handler).post(push_subscribe_handler),
+        )
         .route("/api/push/unsubscribe", post(push_unsubscribe_handler))
         .route("/api/ws", get(bridge::ws_handler))
         .route("/*path", get(assets::static_handler))
@@ -801,10 +804,106 @@ struct PushStatusResponse {
     subscribed: bool,
 }
 
-async fn push_status_handler(
-    State(state): State<Arc<WebState>>,
-    headers: HeaderMap,
-) -> Response {
+fn single_request_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a str>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?.trim();
+    if value.is_empty() || value.contains(',') {
+        return Err(());
+    }
+    Ok(Some(value))
+}
+
+fn push_mutation_is_same_origin(headers: &HeaderMap) -> bool {
+    let Ok(Some(origin)) = single_request_header(headers, "origin") else {
+        return false;
+    };
+    let Ok(origin) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let (Some(origin_scheme), Some(origin_authority)) = (origin.scheme_str(), origin.authority())
+    else {
+        return false;
+    };
+    if !matches!(origin_scheme, "http" | "https")
+        || origin_authority.as_str().contains('@')
+        || origin
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+    {
+        return false;
+    }
+
+    let effective_authority = match single_request_header(headers, "x-forwarded-host") {
+        Ok(Some(authority)) => authority,
+        Ok(None) => match single_request_header(headers, "host") {
+            Ok(Some(authority)) => authority,
+            _ => return false,
+        },
+        Err(()) => return false,
+    };
+    let Ok(effective_authority) = effective_authority.parse::<Authority>() else {
+        return false;
+    };
+
+    // The listener itself is HTTP. A trusted HTTPS proxy must overwrite the
+    // standard forwarding headers, as it already does for WebSocket routing.
+    let effective_scheme = match single_request_header(headers, "x-forwarded-proto") {
+        Ok(Some(scheme))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            scheme
+        }
+        Ok(Some(_)) | Err(()) => return false,
+        Ok(None) => "http",
+    };
+    if !origin_scheme.eq_ignore_ascii_case(effective_scheme) {
+        return false;
+    }
+    let default_port = if origin_scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    if effective_authority.as_str().contains('@')
+        || !origin_authority
+            .host()
+            .eq_ignore_ascii_case(effective_authority.host())
+        || origin_authority.port_u16().unwrap_or(default_port)
+            != effective_authority.port_u16().unwrap_or(default_port)
+    {
+        return false;
+    }
+    true
+}
+
+fn validate_push_mutation_request(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let content_type = single_request_header(headers, "content-type")
+        .map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?
+        .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+    let media_type = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    if !push_mutation_is_same_origin(headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+async fn push_status_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     let Some(client_id) = authenticate_request(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, "not paired").into_response();
     };
@@ -839,6 +938,9 @@ async fn push_subscribe_handler(
     let Some(client_id) = authenticate_request(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, "not paired").into_response();
     };
+    if let Err(status) = validate_push_mutation_request(&headers) {
+        return status.into_response();
+    }
     let request = match serde_json::from_slice::<push::PushRegistrationRequest>(&body) {
         Ok(request) => request,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid subscription").into_response(),
@@ -864,7 +966,10 @@ async fn push_subscribe_handler(
     }) {
         Ok(registered) => registered,
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "subscription save failed")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "subscription save failed",
+            )
                 .into_response()
         }
     };
@@ -882,6 +987,9 @@ async fn push_unsubscribe_handler(
     let Some(client_id) = authenticate_request(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, "not paired").into_response();
     };
+    if let Err(status) = validate_push_mutation_request(&headers) {
+        return status.into_response();
+    }
     let request = match serde_json::from_slice::<push::PushUnsubscribeRequest>(&body) {
         Ok(request) => request,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid subscription").into_response(),
@@ -896,7 +1004,11 @@ async fn push_unsubscribe_handler(
             .remove_subscription(&client_id, &request.endpoint)
     }) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "subscription save failed").into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subscription save failed",
+        )
+            .into_response(),
     }
 }
 
@@ -1045,6 +1157,15 @@ mod tests {
         headers
     }
 
+    fn push_mutation_headers(mut headers: HeaderMap) -> HeaderMap {
+        headers.insert(
+            header::ORIGIN,
+            "http://devmanager.test:43872".parse().unwrap(),
+        );
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers
+    }
+
     fn valid_push_registration(service: &RemoteHostService, endpoint: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "endpoint": endpoint,
@@ -1061,12 +1182,7 @@ mod tests {
         let _profile = TestProfileGuard::new("web-push-auth");
         let service = test_service("host-push-auth");
         let state = test_state(&service);
-        let private_key = service
-            .config()
-            .web
-            .push
-            .vapid_private_key_base64
-            .clone();
+        let private_key = service.config().web.push.vapid_private_key_base64.clone();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1087,10 +1203,7 @@ mod tests {
                     axum::http::Method::POST,
                     "/api/push",
                     HeaderMap::new(),
-                    valid_push_registration(
-                        &service,
-                        "https://web.push.apple.com/QM-unauthorized",
-                    ),
+                    valid_push_registration(&service, "https://web.push.apple.com/QM-unauthorized"),
                 )
                 .await;
                 assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1125,8 +1238,10 @@ mod tests {
             .build()
             .expect("test runtime")
             .block_on(async {
-                let phone_headers = pair_cookie_headers(state.clone(), "phone-push").await;
-                let tablet_headers = pair_cookie_headers(state.clone(), "tablet-push").await;
+                let phone_headers =
+                    push_mutation_headers(pair_cookie_headers(state.clone(), "phone-push").await);
+                let tablet_headers =
+                    push_mutation_headers(pair_cookie_headers(state.clone(), "tablet-push").await);
                 let endpoint = "https://web.push.apple.com/QM-phone";
 
                 let response = route_request(
@@ -1196,6 +1311,93 @@ mod tests {
                     assert_eq!(response.status(), StatusCode::NO_CONTENT);
                 }
                 assert!(service.config().web.push.subscriptions.is_empty());
+            });
+    }
+
+    #[test]
+    fn push_mutations_require_same_origin_json_through_a_trusted_proxy() {
+        let _profile = TestProfileGuard::new("web-push-csrf");
+        let service = test_service("host-push-csrf");
+        let state = test_state(&service);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let paired = pair_cookie_headers(state.clone(), "phone-csrf").await;
+                let endpoint = "https://web.push.apple.com/QM-csrf";
+
+                let mut text_headers = paired.clone();
+                text_headers.insert(
+                    header::ORIGIN,
+                    "https://devmanager.test:43872".parse().unwrap(),
+                );
+                text_headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    text_headers,
+                    valid_push_registration(&service, endpoint),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                assert!(service.config().web.push.subscriptions.is_empty());
+
+                let mut cross_origin_headers = paired.clone();
+                cross_origin_headers.insert(
+                    header::ORIGIN,
+                    "https://evil.devmanager.test:43872".parse().unwrap(),
+                );
+                cross_origin_headers
+                    .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    cross_origin_headers,
+                    valid_push_registration(&service, endpoint),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert!(service.config().web.push.subscriptions.is_empty());
+
+                let mut proxy_headers = paired;
+                proxy_headers.insert(
+                    header::ORIGIN,
+                    "https://mobile.example.test".parse().unwrap(),
+                );
+                proxy_headers.insert(
+                    header::CONTENT_TYPE,
+                    "application/json; charset=utf-8".parse().unwrap(),
+                );
+                proxy_headers.insert(
+                    "x-forwarded-host",
+                    "mobile.example.test:443".parse().unwrap(),
+                );
+                proxy_headers.insert("x-forwarded-proto", "https".parse().unwrap());
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    proxy_headers.clone(),
+                    valid_push_registration(&service, endpoint),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                assert_eq!(service.config().web.push.subscriptions.len(), 1);
+
+                proxy_headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+                let response = route_request(
+                    state,
+                    axum::http::Method::POST,
+                    "/api/push/unsubscribe",
+                    proxy_headers,
+                    serde_json::to_vec(&serde_json::json!({ "endpoint": endpoint })).unwrap(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                assert_eq!(service.config().web.push.subscriptions.len(), 1);
             });
     }
 

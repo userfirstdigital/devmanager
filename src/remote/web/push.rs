@@ -2,9 +2,10 @@ use crate::remote::presentation::StableSessionKey;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use ureq::http::{Request, Uri};
@@ -211,11 +212,54 @@ pub(crate) struct PushDelivery {
 
 type PushTransport = Arc<dyn Fn(Request<Vec<u8>>) -> Result<u16, String> + Send + Sync>;
 
+#[derive(Clone)]
+pub(crate) struct PushSender {
+    shards: Arc<[SyncSender<PushDelivery>]>,
+}
+
+impl PushSender {
+    fn new(shards: Vec<SyncSender<PushDelivery>>) -> Self {
+        debug_assert!(!shards.is_empty());
+        Self {
+            shards: Arc::from(shards),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn single(sender: SyncSender<PushDelivery>) -> Self {
+        Self::new(vec![sender])
+    }
+
+    fn shard_index(&self, delivery: &PushDelivery) -> usize {
+        let mut hasher = DefaultHasher::new();
+        delivery.subscription.client_id.hash(&mut hasher);
+        delivery.subscription.endpoint.hash(&mut hasher);
+        hasher.finish() as usize % self.shards.len()
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        delivery: PushDelivery,
+    ) -> Result<(), TrySendError<PushDelivery>> {
+        let shard = self.shard_index(&delivery);
+        self.shards[shard].try_send(delivery)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send(
+        &self,
+        delivery: PushDelivery,
+    ) -> Result<(), std::sync::mpsc::SendError<PushDelivery>> {
+        let shard = self.shard_index(&delivery);
+        self.shards[shard].send(delivery)
+    }
+}
+
 /// Bounded, off-PTY Web Push delivery pool. Queue admission is always a
 /// non-blocking `try_send`; slow or unavailable push services can never hold a
 /// terminal, semantic-journal, or browser-control lock.
 pub(crate) struct PushDispatcher {
-    sender: Option<SyncSender<PushDelivery>>,
+    sender: Option<PushSender>,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
 }
@@ -245,24 +289,29 @@ impl PushDispatcher {
         worker_count: usize,
         transport: PushTransport,
     ) -> Result<Self, String> {
-        let (sender, receiver) = mpsc::sync_channel(queue_capacity.max(1));
-        let receiver = Arc::new(Mutex::new(receiver));
+        let worker_count = worker_count.max(1);
+        let queue_capacity_per_worker = queue_capacity.max(1).div_ceil(worker_count);
         let stop = Arc::new(AtomicBool::new(false));
-        let mut workers = Vec::with_capacity(worker_count.max(1));
-        for worker_index in 0..worker_count.max(1) {
-            let worker_receiver = receiver.clone();
+        let mut workers = Vec::with_capacity(worker_count);
+        let mut shard_senders = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let (sender, receiver) = mpsc::sync_channel(queue_capacity_per_worker);
             let worker_stop = stop.clone();
             let worker_inner = inner.clone();
             let worker_transport = transport.clone();
             match thread::Builder::new()
                 .name(format!("devmanager-push-{worker_index}"))
                 .spawn(move || {
-                    push_worker_loop(worker_receiver, worker_stop, worker_inner, worker_transport)
+                    push_worker_loop(receiver, worker_stop, worker_inner, worker_transport)
                 }) {
-                Ok(worker) => workers.push(worker),
+                Ok(worker) => {
+                    workers.push(worker);
+                    shard_senders.push(sender);
+                }
                 Err(error) => {
                     stop.store(true, Ordering::Release);
                     drop(sender);
+                    drop(shard_senders);
                     for worker in workers {
                         let _ = worker.join();
                     }
@@ -271,13 +320,13 @@ impl PushDispatcher {
             }
         }
         Ok(Self {
-            sender: Some(sender),
+            sender: Some(PushSender::new(shard_senders)),
             stop,
             workers,
         })
     }
 
-    pub(crate) fn sender(&self) -> SyncSender<PushDelivery> {
+    pub(crate) fn sender(&self) -> PushSender {
         self.sender
             .as_ref()
             .expect("active push dispatcher must own a sender")
@@ -296,19 +345,16 @@ impl Drop for PushDispatcher {
 }
 
 fn push_worker_loop(
-    receiver: Arc<Mutex<Receiver<PushDelivery>>>,
+    receiver: Receiver<PushDelivery>,
     stop: Arc<AtomicBool>,
     inner: Weak<crate::remote::RemoteHostInner>,
     transport: PushTransport,
 ) {
     while !stop.load(Ordering::Acquire) {
-        let received = receiver
-            .lock()
-            .map(|receiver| receiver.recv_timeout(DELIVERY_POLL_INTERVAL));
-        let delivery = match received {
-            Ok(Ok(delivery)) => delivery,
-            Ok(Err(RecvTimeoutError::Timeout)) => continue,
-            Ok(Err(RecvTimeoutError::Disconnected)) | Err(_) => break,
+        let delivery = match receiver.recv_timeout(DELIVERY_POLL_INTERVAL) {
+            Ok(delivery) => delivery,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         if stop.load(Ordering::Acquire) {
             break;
@@ -624,7 +670,7 @@ mod tests {
     use crate::remote::{RemoteHostConfig, RemoteHostService};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::time::Instant;
 
     fn valid_registration() -> PushRegistrationRequest {
@@ -907,7 +953,57 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_preserves_delivery_order_for_each_subscription() {
+        let mut config = RemoteHostConfig::default();
+        let validated = validate_registration(valid_registration()).unwrap();
+        config.web.push.upsert_subscription("phone", validated, 1);
+        let service = RemoteHostService::new(config);
+        let push = service.config().web.push;
+        let subscription = push.subscriptions[0].clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let worker_release = release_rx.clone();
+        let transport: PushTransport = Arc::new(move |_| {
+            let call = worker_calls.fetch_add(1, Ordering::AcqRel);
+            started_tx.send(call).expect("record transport start");
+            if call == 0 {
+                worker_release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(500))
+                    .expect("release first delivery");
+            }
+            Ok(201)
+        });
+        let dispatcher =
+            PushDispatcher::start_with_transport(Arc::downgrade(&service.inner), 8, 2, transport)
+                .unwrap();
+        let sender = dispatcher.sender();
+
+        sender
+            .send(delivery(&push, &subscription, "badge-1"))
+            .unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        sender
+            .send(delivery(&push, &subscription, "badge-2"))
+            .unwrap();
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "later delivery reached transport before the first completed"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        drop(sender);
+        drop(dispatcher);
+    }
+
+    #[test]
     fn stale_terminal_response_cannot_remove_a_replacement_subscription() {
+        let _profile = TestProfileGuard::new("push-stale-terminal-response");
         let mut config = RemoteHostConfig::default();
         let validated = validate_registration(valid_registration()).unwrap();
         config

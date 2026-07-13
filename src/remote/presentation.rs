@@ -847,8 +847,7 @@ impl SemanticJournalStore {
                 };
                 session.metadata.attention = SemanticAttention::NeedsInput;
                 session.metadata.attention_count = count;
-            } else if is_user_message
-                && session.metadata.attention == SemanticAttention::NeedsInput
+            } else if is_user_message && session.metadata.attention == SemanticAttention::NeedsInput
             {
                 session.metadata.attention = SemanticAttention::None;
                 session.metadata.attention_count = 0;
@@ -953,8 +952,16 @@ impl SemanticJournalStore {
         let still_active = self.session_bindings.values().any(|binding| {
             binding.key == key && binding.status.is_some_and(SessionStatus::is_live)
         });
+        let still_bound = self
+            .session_bindings
+            .values()
+            .any(|binding| binding.key == key);
         if let Some(session) = self.sessions.get_mut(&key) {
             session.active = still_active;
+            if !still_bound {
+                session.metadata.attention = SemanticAttention::None;
+                session.metadata.attention_count = 0;
+            }
         }
         self.enforce_store_limits();
         Some(key)
@@ -1895,7 +1902,10 @@ mod tests {
             store.metadata(&key).unwrap().attention,
             SemanticAttention::NeedsInput
         );
-        assert_eq!(store.status_for_session("ai-pty"), Some(crate::state::SessionStatus::Running));
+        assert_eq!(
+            store.status_for_session("ai-pty"),
+            Some(crate::state::SessionStatus::Running)
+        );
 
         store.observe_runtime(&runtime, &[tab], 3);
         assert_eq!(
