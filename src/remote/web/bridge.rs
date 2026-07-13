@@ -858,17 +858,19 @@ fn handle_inbound_core(
                 });
                 return;
             }
-            let writer_lease = if visible {
-                acquire_writer_lease_for_connection(
+            // The helper broadcasts connection-specific state to every
+            // browser, including this requester; a direct reply would race it.
+            if visible {
+                let _ = acquire_writer_lease_for_connection(
                     inner,
                     connection_id,
                     client_id,
                     &client_instance_id,
                     now_epoch_ms(),
                     expected_tombstone.as_ref(),
-                )
+                );
             } else {
-                set_writer_visibility_for_connection(
+                let _ = set_writer_visibility_for_connection(
                     inner,
                     connection_id,
                     client_id,
@@ -876,9 +878,8 @@ fn handle_inbound_core(
                     false,
                     now_epoch_ms(),
                     expected_tombstone.as_ref(),
-                )
-            };
-            let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
+                );
+            }
         }
         WsInbound::WriterLeaseHeartbeat {
             client_instance_id,
@@ -891,17 +892,18 @@ fn handle_inbound_core(
                 });
                 return;
             }
-            let writer_lease = renew_writer_lease(
+            // Renewal broadcasts its authoritative result to this requester.
+            let heartbeat_at_epoch_ms = now_epoch_ms();
+            let _ = renew_writer_lease(
                 inner,
                 connection_id,
                 client_id,
                 &client_instance_id,
                 expected_lease_generation,
                 visible,
-                now_epoch_ms(),
+                heartbeat_at_epoch_ms,
                 expected_tombstone.as_ref(),
             );
-            let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
         }
         WsInbound::SetVisibility {
             client_instance_id,
@@ -913,7 +915,8 @@ fn handle_inbound_core(
                 });
                 return;
             }
-            let writer_lease = set_writer_visibility_for_connection(
+            // Visibility changes use the same ordered broadcast-only path.
+            let _ = set_writer_visibility_for_connection(
                 inner,
                 connection_id,
                 client_id,
@@ -922,7 +925,6 @@ fn handle_inbound_core(
                 now_epoch_ms(),
                 expected_tombstone.as_ref(),
             );
-            let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
         }
         WsInbound::ComposerSubmit {
             mutation_id,
@@ -7782,6 +7784,128 @@ mod tests {
         assert_eq!(status["type"], "writerLeaseState");
         assert!(status["writerLease"]["ownerClientInstanceId"].is_null());
         assert!(status["writerLease"]["generation"].as_u64().unwrap() > acquired.generation);
+    }
+
+    #[test]
+    fn lease_actions_publish_one_ordered_state_through_expiry_and_handoff() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let expired_connection = 124;
+        let expired_client = "expired-heartbeat-owner";
+        let replacement_connection = 125;
+        let replacement_client = "replacement-heartbeat-owner";
+        pair_web_client(&service, expired_client);
+        pair_web_client(&service, replacement_client);
+        let (expired_native, _expired_native_rx) = std_mpsc::channel();
+        let (expired_sender, mut expired_receiver) = test_web_channel();
+        register_client(
+            &service.inner,
+            expired_connection,
+            expired_client,
+            expired_native,
+            expired_sender.clone(),
+        );
+        let (replacement_native, _replacement_native_rx) = std_mpsc::channel();
+        let (replacement_sender, mut replacement_receiver) = test_web_channel();
+        register_client(
+            &service.inner,
+            replacement_connection,
+            replacement_client,
+            replacement_native,
+            replacement_sender.clone(),
+        );
+        let expired = acquire_writer_lease(
+            &service.inner,
+            expired_connection,
+            expired_client,
+            "expired-heartbeat-tab",
+            now_epoch_ms().saturating_sub(10_000),
+        );
+        assert!(expired.you_are_owner);
+        assert_eq!(
+            try_recv_web_json(&mut expired_receiver)["type"],
+            "writerLeaseState"
+        );
+        assert_eq!(
+            try_recv_web_json(&mut replacement_receiver)["type"],
+            "writerLeaseState"
+        );
+
+        handle_inbound_browser(
+            &service.inner,
+            expired_connection,
+            expired_client,
+            WsInbound::WriterLeaseHeartbeat {
+                client_instance_id: "expired-heartbeat-tab".to_string(),
+                expected_lease_generation: expired.generation + 99,
+                visible: true,
+            },
+            &expired_sender,
+        );
+        handle_inbound_browser(
+            &service.inner,
+            replacement_connection,
+            replacement_client,
+            WsInbound::AcquireWriterLease {
+                client_instance_id: "replacement-heartbeat-tab".to_string(),
+                visible: true,
+            },
+            &replacement_sender,
+        );
+
+        let expired_view = [
+            try_recv_web_json(&mut expired_receiver),
+            try_recv_web_json(&mut expired_receiver),
+        ];
+        assert!(expired_view
+            .iter()
+            .all(|frame| frame["type"] == "writerLeaseState"));
+        assert!(expired_view[0]["writerLease"]["ownerClientInstanceId"].is_null());
+        assert_eq!(
+            expired_view[1]["writerLease"]["ownerClientInstanceId"],
+            "replacement-heartbeat-tab"
+        );
+        let generations = expired_view
+            .iter()
+            .map(|frame| frame["writerLease"]["generation"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            generations.windows(2).all(|pair| pair[0] <= pair[1]),
+            "writer lease frames regressed from a newer expiry or handoff generation"
+        );
+        assert!(expired_receiver.rx.try_recv().is_err());
+
+        let replacement_view = [
+            try_recv_web_json(&mut replacement_receiver),
+            try_recv_web_json(&mut replacement_receiver),
+        ];
+        assert!(replacement_view[0]["writerLease"]["ownerClientInstanceId"].is_null());
+        assert_eq!(
+            replacement_view[1]["writerLease"]["ownerClientInstanceId"],
+            "replacement-heartbeat-tab"
+        );
+        assert_eq!(replacement_view[1]["writerLease"]["youAreOwner"], true);
+        assert!(replacement_receiver.rx.try_recv().is_err());
+
+        handle_inbound_browser(
+            &service.inner,
+            replacement_connection,
+            replacement_client,
+            WsInbound::SetVisibility {
+                client_instance_id: "replacement-heartbeat-tab".to_string(),
+                visible: false,
+            },
+            &replacement_sender,
+        );
+        assert_eq!(
+            try_recv_web_json(&mut expired_receiver)["writerLease"]["ownerClientInstanceId"],
+            "replacement-heartbeat-tab"
+        );
+        assert_eq!(
+            try_recv_web_json(&mut replacement_receiver)["writerLease"]["ownerClientInstanceId"],
+            "replacement-heartbeat-tab"
+        );
+        assert!(expired_receiver.rx.try_recv().is_err());
+        assert!(replacement_receiver.rx.try_recv().is_err());
     }
 
     #[test]

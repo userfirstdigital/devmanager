@@ -394,16 +394,19 @@ impl WriterLeaseManager {
         visible: bool,
         now_epoch_ms: u64,
     ) -> Result<WriterLease, LeaseError> {
-        if expected_generation != self.generation {
-            return Err(LeaseError::StaleGeneration {
-                current_generation: self.generation,
-            });
-        }
+        let generation_matched_before_expiry = expected_generation == self.generation;
         if self.current.as_ref().is_some_and(|lease| {
             lease.active_mutation_id.is_none() && now_epoch_ms >= lease.expires_at_epoch_ms
         }) {
             self.invalidate();
-            return Err(LeaseError::Expired);
+            if generation_matched_before_expiry {
+                return Err(LeaseError::Expired);
+            }
+        }
+        if expected_generation != self.generation {
+            return Err(LeaseError::StaleGeneration {
+                current_generation: self.generation,
+            });
         }
         let Some(current) = self.current.as_mut() else {
             return Err(LeaseError::StaleGeneration {
@@ -622,6 +625,26 @@ mod tests {
 
         let error = leases
             .authorize(1, "phone", lease.generation + 99, 9_000)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LeaseError::StaleGeneration {
+                current_generation
+            } if current_generation > lease.generation
+        ));
+        assert_eq!(leases.peek(), None);
+    }
+
+    #[test]
+    fn stale_generation_renewal_still_expires_current_lease() {
+        let mut leases = WriterLeaseManager::new(Duration::from_secs(8));
+        let lease = leases
+            .acquire(1, "phone", "pwa", 1_000)
+            .expect("phone acquires");
+
+        let error = leases
+            .renew(1, "phone", "pwa", lease.generation + 99, true, 9_000)
             .unwrap_err();
 
         assert!(matches!(
