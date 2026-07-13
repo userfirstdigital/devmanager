@@ -2,7 +2,7 @@ use crate::remote::presentation::{
     SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource, SemanticStream,
     SemanticToolState, StableSessionKey,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -34,6 +34,7 @@ const CODEX_PROBE_TERM_GRACE: std::time::Duration =
     std::time::Duration::from_millis(250);
 const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_CODEX_HANDSHAKES: usize = 16;
 const BRIDGE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BRIDGE_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 pub(crate) const CODEX_BRIDGE_AUTH_TOKEN_ENV: &str = "DEVMANAGER_CODEX_BRIDGE_TOKEN";
@@ -1100,46 +1101,53 @@ where
 {
     let activation_deadline = tokio::time::sleep(activation_timeout);
     tokio::pin!(activation_deadline);
+    let mut pending_handshakes = FuturesUnordered::new();
     let websocket = loop {
-        let (socket, peer) = tokio::select! {
-            accepted = listener.accept() => accepted.map_err(|error| format!("Codex bridge accept failed: {error}"))?,
+        tokio::select! {
+            accepted = listener.accept(), if pending_handshakes.len() < MAX_PENDING_CODEX_HANDSHAKES => {
+                let (socket, peer) = accepted
+                    .map_err(|error| format!("Codex bridge accept failed: {error}"))?;
+                if !peer_is_allowed(peer) {
+                    continue;
+                }
+
+                let websocket_config = WebSocketConfig {
+                    max_message_size: Some(MAX_CODEX_FRAME_BYTES),
+                    max_frame_size: Some(MAX_CODEX_FRAME_BYTES),
+                    max_write_buffer_size: MAX_CODEX_FRAME_BYTES * 2,
+                    ..WebSocketConfig::default()
+                };
+                let handshake_authorization = expected_authorization.clone();
+                pending_handshakes.push(async move {
+                    tokio::time::timeout(
+                        BRIDGE_IO_TIMEOUT,
+                        accept_hdr_async_with_config(
+                            socket,
+                            move |request: &Request, response: Response| {
+                                authorize_bridge_handshake(
+                                    request,
+                                    response,
+                                    &handshake_authorization,
+                                )
+                            },
+                            Some(websocket_config),
+                        ),
+                    )
+                    .await
+                });
+            }
+            Some(handshake) = pending_handshakes.next(), if !pending_handshakes.is_empty() => {
+                match handshake {
+                    Ok(Ok(websocket)) => break websocket,
+                    // Bad, unauthorized, and stalled handshakes are connection-local.
+                    // They must never consume the one authenticated TUI slot.
+                    Ok(Err(_)) | Err(_) => continue,
+                }
+            }
             _ = &mut shutdown => return Ok(()),
             _ = &mut activation_deadline, if on_activated.is_some() => {
                 return Err("Codex bridge activation timed out before initialize negotiation".to_string());
             }
-        };
-        if !peer_is_allowed(peer) {
-            continue;
-        }
-
-        let websocket_config = WebSocketConfig {
-            max_message_size: Some(MAX_CODEX_FRAME_BYTES),
-            max_frame_size: Some(MAX_CODEX_FRAME_BYTES),
-            max_write_buffer_size: MAX_CODEX_FRAME_BYTES * 2,
-            ..WebSocketConfig::default()
-        };
-        let handshake_authorization = expected_authorization.clone();
-        let handshake = tokio::select! {
-            result = tokio::time::timeout(
-                BRIDGE_IO_TIMEOUT,
-                accept_hdr_async_with_config(
-                    socket,
-                    move |request: &Request, response: Response| {
-                        authorize_bridge_handshake(request, response, &handshake_authorization)
-                    },
-                    Some(websocket_config),
-                ),
-            ) => result,
-            _ = &mut shutdown => return Ok(()),
-            _ = &mut activation_deadline, if on_activated.is_some() => {
-                return Err("Codex bridge activation timed out during WebSocket negotiation".to_string());
-            }
-        };
-        match handshake {
-            Ok(Ok(websocket)) => break websocket,
-            // Bad, unauthorized, and stalled handshakes are connection-local.
-            // They must never consume the one authenticated TUI slot.
-            Ok(Err(_)) | Err(_) => continue,
         }
     };
     let (mut websocket_write, mut websocket_read) = websocket.split();
@@ -2851,6 +2859,61 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             .unwrap();
         let mut forwarded = Vec::new();
         fake_read.read_until(b'\n', &mut forwarded).await.unwrap();
+        assert_eq!(forwarded, format!("{request}\n").as_bytes());
+
+        let _ = shutdown_tx.send(());
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_handshakes_do_not_block_authenticated_tui() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("ws://{address}");
+        let expected_authorization = "Bearer concurrent-test-token".to_string();
+        let (bridge_stdio, fake_server_stdio) = tokio::io::duplex(64 * 1024);
+        let (observer, _receiver) = semantic_observer_channel(4);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let activation_callback: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(|| {});
+        let proxy = tokio::spawn(serve_one_loopback_client_with_activation(
+            listener,
+            expected_authorization.clone(),
+            bridge_stdio,
+            observer,
+            shutdown_rx,
+            Some(activation_callback),
+            std::time::Duration::from_secs(1),
+        ));
+
+        let _first_stall = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let _second_stall = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let (mut tui, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            connect_async(authorized_request(&endpoint, &expected_authorization)),
+        )
+        .await
+        .expect("silent TCP clients must not delay an authenticated handshake")
+        .unwrap();
+        let (fake_read, _fake_write) = tokio::io::split(fake_server_stdio);
+        let mut fake_read = BufReader::new(fake_read);
+        let request = r#"{"id":94,"method":"future/concurrent","params":{}}"#;
+        tui.send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        let mut forwarded = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            fake_read.read_until(b'\n', &mut forwarded),
+        )
+        .await
+        .expect("authenticated traffic must be admitted before activation timeout")
+        .unwrap();
         assert_eq!(forwarded, format!("{request}\n").as_bytes());
 
         let _ = shutdown_tx.send(());
