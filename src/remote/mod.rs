@@ -1055,6 +1055,13 @@ pub struct CodexSemanticIdentity {
     pub registration_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComposerReconciliationReservation {
+    Reserved,
+    NotNeeded,
+    CapacityExceeded,
+}
+
 #[derive(Default)]
 struct ClaudeComposerReconciliationState {
     adapters_by_pty_session: HashMap<String, ClaudeSemanticIdentity>,
@@ -1786,27 +1793,33 @@ impl RemoteHostService {
         }
     }
 
+    #[must_use]
     pub(crate) fn reserve_claude_composer_prompt(
         &self,
         mutation_id: &str,
         pty_session_id: &str,
         stable_session_key: &StableSessionKey,
         text: &str,
-    ) {
-        let deferred = {
+    ) -> ComposerReconciliationReservation {
+        let (deferred, reservation) = {
             let mut state = self
                 .inner
                 .claude_composer_reconciliation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let deferred = drain_expired_claude_reconciliations(&mut state, Instant::now());
+            let now = Instant::now();
+            let deferred = drain_expired_claude_reconciliations(&mut state, now);
             let identity = state
                 .adapters_by_pty_session
                 .get(pty_session_id)
                 .filter(|identity| &identity.stable_session_key == stable_session_key)
                 .cloned();
-            if let Some(identity) = identity {
-                if state.pending.len() < MAX_CLAUDE_COMPOSER_RECONCILIATIONS {
+            let reservation = match identity {
+                None => ComposerReconciliationReservation::NotNeeded,
+                Some(_) if state.pending.len() >= MAX_CLAUDE_COMPOSER_RECONCILIATIONS => {
+                    ComposerReconciliationReservation::CapacityExceeded
+                }
+                Some(identity) => {
                     state.pending.push_back(PendingClaudeComposerPrompt {
                         mutation_id: mutation_id.to_string(),
                         identity,
@@ -1814,15 +1827,17 @@ impl RemoteHostService {
                         state: PendingClaudeComposerPromptState::Reserved {
                             deferred_hook: None,
                         },
-                        expires_at: Instant::now() + CLAUDE_COMPOSER_RECONCILIATION_TTL,
+                        expires_at: now + CLAUDE_COMPOSER_RECONCILIATION_TTL,
                     });
+                    ComposerReconciliationReservation::Reserved
                 }
-            }
-            deferred
+            };
+            (deferred, reservation)
         };
         for draft in deferred {
             self.push_semantic_draft(draft);
         }
+        reservation
     }
 
     pub(crate) fn accept_claude_composer_prompt(&self, mutation_id: &str) {
@@ -2010,27 +2025,33 @@ impl RemoteHostService {
         }
     }
 
+    #[must_use]
     pub(crate) fn reserve_codex_composer_prompt(
         &self,
         mutation_id: &str,
         pty_session_id: &str,
         stable_session_key: &StableSessionKey,
         text: &str,
-    ) {
-        let deferred = {
+    ) -> ComposerReconciliationReservation {
+        let (deferred, reservation) = {
             let mut state = self
                 .inner
                 .codex_composer_reconciliation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let deferred = drain_expired_codex_reconciliations(&mut state, Instant::now());
+            let now = Instant::now();
+            let deferred = drain_expired_codex_reconciliations(&mut state, now);
             let identity = state
                 .adapters_by_pty_session
                 .get(pty_session_id)
                 .filter(|identity| &identity.stable_session_key == stable_session_key)
                 .cloned();
-            if let Some(identity) = identity {
-                if state.pending.len() < MAX_CODEX_COMPOSER_RECONCILIATIONS {
+            let reservation = match identity {
+                None => ComposerReconciliationReservation::NotNeeded,
+                Some(_) if state.pending.len() >= MAX_CODEX_COMPOSER_RECONCILIATIONS => {
+                    ComposerReconciliationReservation::CapacityExceeded
+                }
+                Some(identity) => {
                     state.pending.push_back(PendingCodexComposerPrompt {
                         mutation_id: mutation_id.to_string(),
                         identity,
@@ -2038,15 +2059,17 @@ impl RemoteHostService {
                         state: PendingCodexComposerPromptState::Reserved {
                             deferred_provider: None,
                         },
-                        expires_at: Instant::now() + CODEX_COMPOSER_RECONCILIATION_TTL,
+                        expires_at: now + CODEX_COMPOSER_RECONCILIATION_TTL,
                     });
+                    ComposerReconciliationReservation::Reserved
                 }
-            }
-            deferred
+            };
+            (deferred, reservation)
         };
         for draft in deferred {
             self.push_semantic_draft(draft);
         }
+        reservation
     }
 
     pub(crate) fn accept_codex_composer_prompt(&self, mutation_id: &str) {

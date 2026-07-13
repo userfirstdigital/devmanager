@@ -38,10 +38,10 @@ use super::super::presentation::{
 use super::super::{
     acknowledge_browser_attention, now_epoch_ms, publish_semantic_event,
     request_timeout_for_action, requires_control, stable_hash, try_enqueue_pending_request,
-    ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
-    RemoteHostService, RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput,
-    RemoteWebMutationAuthority, RemoteWorkspaceSnapshot, ServerMessage, WebComposerMutationRecord,
-    WebComposerMutationStatus,
+    ComposerReconciliationReservation, ConnectedRemoteClient, PendingRemoteRequest,
+    RemoteActionResult, RemoteHostInner, RemoteHostService, RemoteImageAttachment,
+    RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWebMutationAuthority,
+    RemoteWorkspaceSnapshot, ServerMessage, WebComposerMutationRecord, WebComposerMutationStatus,
 };
 use super::action::WebActionResult;
 use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState, WEB_BUILD_ID, WEB_PROTOCOL_VERSION};
@@ -3287,26 +3287,43 @@ fn dispatch_composer_submit_for_connection(
             let host_service = RemoteHostService {
                 inner: fence.inner.clone(),
             };
-            let reconcile_claude_prompt = session_kind == SessionKind::Claude;
-            let reconcile_codex_prompt = session_kind == SessionKind::Codex;
-            if reconcile_claude_prompt {
-                host_service.reserve_claude_composer_prompt(
+            let reconciliation = match session_kind {
+                SessionKind::Claude => host_service.reserve_claude_composer_prompt(
                     &mutation_id,
                     &session_id,
                     &stable_session_key,
                     &text,
-                );
+                ),
+                SessionKind::Codex => {
+                    let provider_visible_text =
+                        canonical_codex_composer_prompt(&text, decoded_attachments.len());
+                    host_service.reserve_codex_composer_prompt(
+                        &mutation_id,
+                        &session_id,
+                        &stable_session_key,
+                        &provider_visible_text,
+                    )
+                }
+                SessionKind::Shell | SessionKind::Server | SessionKind::Ssh => {
+                    ComposerReconciliationReservation::NotNeeded
+                }
+            };
+            if reconciliation == ComposerReconciliationReservation::CapacityExceeded {
+                clear_in_flight_composer(&fence.inner, &mutation_id, fingerprint);
+                completion.send(Err(composer_rejected(
+                    &fence.inner,
+                    connection_id,
+                    mutation_id,
+                    ComposerRejectCode::CapacityExceeded,
+                    "AI prompt reconciliation is full. Retry after pending prompts settle.",
+                    execution_epoch_ms,
+                )));
+                return;
             }
-            if reconcile_codex_prompt {
-                let provider_visible_text =
-                    canonical_codex_composer_prompt(&text, decoded_attachments.len());
-                host_service.reserve_codex_composer_prompt(
-                    &mutation_id,
-                    &session_id,
-                    &stable_session_key,
-                    &provider_visible_text,
-                );
-            }
+            let reconcile_claude_prompt = session_kind == SessionKind::Claude
+                && reconciliation == ComposerReconciliationReservation::Reserved;
+            let reconcile_codex_prompt = session_kind == SessionKind::Codex
+                && reconciliation == ComposerReconciliationReservation::Reserved;
             let handler = fence
                 .inner
                 .terminal_input_handler
@@ -6241,6 +6258,241 @@ mod tests {
     }
 
     #[test]
+    fn full_claude_reconciliation_queue_rejects_1025th_before_pty_write() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let stable_key = StableSessionKey::from_tab("tab-a");
+        let identity = crate::remote::ClaudeSemanticIdentity {
+            pty_session_id: "session-a".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_claude_adapter_registered(identity.clone());
+        for index in 0..1_024 {
+            let _ = service.reserve_claude_composer_prompt(
+                &format!("reserved-{index}"),
+                &identity.pty_session_id,
+                &stable_key,
+                &format!("reserved prompt {index}"),
+            );
+        }
+        assert_eq!(
+            service
+                .inner
+                .claude_composer_reconciliation
+                .lock()
+                .unwrap()
+                .pending
+                .len(),
+            1_024
+        );
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(stable_key.clone()),
+                "tab-a",
+            ),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed_writes = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            observed_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+
+        let submit = || {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                "overflow-claude".to_string(),
+                stable_key.clone(),
+                "overflow prompt".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+            .unwrap_err()
+        };
+        assert_eq!(submit().code, ComposerRejectCode::CapacityExceeded);
+        assert_eq!(submit().code, ComposerRejectCode::CapacityExceeded);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service
+                .inner
+                .claude_composer_reconciliation
+                .lock()
+                .unwrap()
+                .pending
+                .len(),
+            1_024
+        );
+
+        service.push_claude_semantic_draft(
+            identity,
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_200,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "overflow prompt".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("provider-overflow-claude".to_string()),
+            },
+        );
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "overflow prompt"
+                ))
+                .count(),
+            1,
+            "an unreserved provider event remains visible exactly once"
+        );
+    }
+
+    #[test]
+    fn full_codex_reconciliation_queue_rejects_1025th_before_pty_write() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        codex_session(&service, "tab-codex", "session-codex");
+        let stable_key = StableSessionKey::from_tab("tab-codex");
+        let identity = crate::remote::CodexSemanticIdentity {
+            pty_session_id: "session-codex".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_codex_adapter_registered(identity.clone());
+        for index in 0..1_024 {
+            let _ = service.reserve_codex_composer_prompt(
+                &format!("reserved-{index}"),
+                &identity.pty_session_id,
+                &stable_key,
+                &format!("reserved prompt {index}"),
+            );
+        }
+        assert_eq!(
+            service
+                .inner
+                .codex_composer_reconciliation
+                .lock()
+                .unwrap()
+                .pending
+                .len(),
+            1_024
+        );
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(stable_key.clone()),
+                "tab-codex",
+            ),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed_writes = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            observed_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+
+        let submit = || {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                "overflow-codex".to_string(),
+                stable_key.clone(),
+                "overflow prompt".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+            .unwrap_err()
+        };
+        assert_eq!(submit().code, ComposerRejectCode::CapacityExceeded);
+        assert_eq!(submit().code, ComposerRejectCode::CapacityExceeded);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service
+                .inner
+                .codex_composer_reconciliation
+                .lock()
+                .unwrap()
+                .pending
+                .len(),
+            1_024
+        );
+
+        service.push_codex_semantic_draft(
+            identity,
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_200,
+                source: SemanticSource::Codex,
+                kind: SemanticEventKind::UserMessage {
+                    text: "overflow prompt".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("provider-overflow-codex".to_string()),
+            },
+        );
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "overflow prompt"
+                ))
+                .count(),
+            1,
+            "an unreserved provider event remains visible exactly once"
+        );
+    }
+
+    #[test]
+    fn missing_adapter_does_not_require_composer_reconciliation() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let stable_key = StableSessionKey::from_tab("tab-a");
+
+        assert_eq!(
+            service.reserve_claude_composer_prompt(
+                "claude-no-adapter",
+                "session-a",
+                &stable_key,
+                "prompt",
+            ),
+            ComposerReconciliationReservation::NotNeeded
+        );
+        assert_eq!(
+            service.reserve_codex_composer_prompt(
+                "codex-no-adapter",
+                "session-a",
+                &stable_key,
+                "prompt",
+            ),
+            ComposerReconciliationReservation::NotNeeded
+        );
+    }
+
+    #[test]
     fn claude_composer_hook_reconciliation_is_one_to_one_and_generation_scoped() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         ai_session(&service, "tab-a", "session-a");
@@ -6383,7 +6635,7 @@ mod tests {
             registration_generation: 7,
         };
         service.push_claude_adapter_registered(identity.clone());
-        service.reserve_claude_composer_prompt(
+        let _ = service.reserve_claude_composer_prompt(
             "mutation-a",
             &identity.pty_session_id,
             &stable_key,
@@ -6441,7 +6693,7 @@ mod tests {
             registration_generation: 7,
         };
         service.push_claude_adapter_registered(identity.clone());
-        service.reserve_claude_composer_prompt(
+        let _ = service.reserve_claude_composer_prompt(
             "mutation-a",
             &identity.pty_session_id,
             &stable_key,
@@ -6502,7 +6754,7 @@ mod tests {
             registration_generation: 7,
         };
         service.push_claude_adapter_registered(identity.clone());
-        service.reserve_claude_composer_prompt(
+        let _ = service.reserve_claude_composer_prompt(
             "mutation-a",
             &identity.pty_session_id,
             &stable_key,
@@ -6562,7 +6814,7 @@ mod tests {
             registration_generation: 7,
         };
         service.push_claude_adapter_registered(identity.clone());
-        service.reserve_claude_composer_prompt(
+        let _ = service.reserve_claude_composer_prompt(
             "mutation-a",
             &identity.pty_session_id,
             &stable_key,
@@ -6915,7 +7167,7 @@ mod tests {
         };
 
         service.push_codex_adapter_registered(identity.clone());
-        service.reserve_codex_composer_prompt(
+        let _ = service.reserve_codex_composer_prompt(
             "reserved-removal",
             &identity.pty_session_id,
             &stable_key,
@@ -6930,7 +7182,7 @@ mod tests {
         service.accept_codex_composer_prompt("reserved-removal");
 
         service.push_codex_adapter_registered(identity.clone());
-        service.reserve_codex_composer_prompt(
+        let _ = service.reserve_codex_composer_prompt(
             "accepted-removal",
             &identity.pty_session_id,
             &stable_key,
@@ -6947,7 +7199,7 @@ mod tests {
         }
 
         service.push_codex_adapter_registered(identity.clone());
-        service.reserve_codex_composer_prompt(
+        let _ = service.reserve_codex_composer_prompt(
             "cancelled",
             &identity.pty_session_id,
             &stable_key,
