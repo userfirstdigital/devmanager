@@ -60,7 +60,6 @@ interface ServerActionButtonsProps {
   command: RunCommand;
   live: boolean;
   session: SessionRuntimeState | null;
-  youHaveControl: boolean;
   onOpenSite(e: React.MouseEvent): void;
   onStart(e: React.MouseEvent): void;
   onStop(e: React.MouseEvent): void;
@@ -71,7 +70,6 @@ function ServerActionButtons({
   command,
   live,
   session,
-  youHaveControl,
   onOpenSite,
   onStart,
   onStop,
@@ -84,9 +82,8 @@ function ServerActionButtons({
           type="button"
           data-sidebar-action="true"
           onClick={onStart}
-          disabled={!youHaveControl}
-          title={youHaveControl ? "Start server" : "Take control to start"}
-          className="p-1 rounded hover:bg-zinc-600 text-emerald-400 disabled:opacity-40 disabled:hover:bg-transparent"
+          title="Start server"
+          className="p-1 rounded hover:bg-zinc-600 text-emerald-400"
         >
           <Play className="size-3.5" />
         </button>
@@ -111,9 +108,8 @@ function ServerActionButtons({
         type="button"
         data-sidebar-action="true"
         onClick={onRestart}
-        disabled={!youHaveControl}
-        title={youHaveControl ? `Restart ${command.label}` : "Take control to restart"}
-        className="p-1 rounded hover:bg-zinc-600 text-amber-400 disabled:opacity-40 disabled:hover:bg-transparent"
+        title={`Restart ${command.label}`}
+        className="p-1 rounded hover:bg-zinc-600 text-amber-400"
       >
         <RotateCcw className="size-3.5" />
       </button>
@@ -121,9 +117,8 @@ function ServerActionButtons({
         type="button"
         data-sidebar-action="true"
         onClick={onStop}
-        disabled={!youHaveControl}
-        title={youHaveControl ? `Stop ${command.label}` : "Take control to stop"}
-        className="p-1 rounded hover:bg-zinc-600 text-red-400 disabled:opacity-40 disabled:hover:bg-transparent"
+        title={`Stop ${command.label}`}
+        className="p-1 rounded hover:bg-zinc-600 text-red-400"
       >
         <Square className="size-3.5" />
       </button>
@@ -143,7 +138,6 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
   );
   const setActiveSession = useStore((s) => s.setActiveSession);
   const sendAction = useStore((s) => s.sendAction);
-  const youHaveControl = useStore((s) => s.snapshot?.youHaveControl ?? false);
 
   const live = isLiveStatus(session?.status);
   const rowSessionId = session?.session_id ?? command.id;
@@ -154,13 +148,11 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
       setActiveSession(session.session_id);
       return;
     }
-    if (youHaveControl) {
-      setActiveSession(command.id);
-      sendAction({
-        type: "startServer",
-        command_id: command.id,
-      });
-    }
+    setActiveSession(command.id);
+    sendAction({
+      type: "startServer",
+      command_id: command.id,
+    });
   };
 
   const onStart = (e: React.MouseEvent) => {
@@ -226,7 +218,6 @@ function CommandRow({ command, session, indent }: CommandRowProps) {
         command={command}
         live={live}
         session={session}
-        youHaveControl={youHaveControl}
         onOpenSite={onOpenSite}
         onStart={onStart}
         onStop={onStop}
@@ -249,7 +240,6 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
   );
   const setActiveSession = useStore((s) => s.setActiveSession);
   const sendAction = useStore((s) => s.sendAction);
-  const youHaveControl = useStore((s) => s.snapshot?.youHaveControl ?? false);
 
   if (folder.hidden) return null;
 
@@ -267,13 +257,11 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
         setActiveSession(session.session_id);
         return;
       }
-      if (youHaveControl) {
-        setActiveSession(command.id);
-        sendAction({
-          type: "startServer",
-          command_id: command.id,
-        });
-      }
+      setActiveSession(command.id);
+      sendAction({
+        type: "startServer",
+        command_id: command.id,
+      });
     };
 
     const onStart = (e: React.MouseEvent) => {
@@ -344,7 +332,6 @@ function FolderSection({ folder, sessions, indent }: FolderSectionProps) {
           command={command}
           live={live}
           session={session}
-          youHaveControl={youHaveControl}
           onOpenSite={onOpenSite}
           onStart={onStart}
           onStop={onStop}
@@ -401,7 +388,6 @@ function AiTabRow({ tab, session, indent }: AiTabRowProps) {
   const setActiveSession = useStore((s) => s.setActiveSession);
   const openAiTab = useStore((s) => s.openAiTab);
   const sendAction = useStore((s) => s.sendAction);
-  const youHaveControl = useStore((s) => s.snapshot?.youHaveControl ?? false);
 
   const sessionId = tab.ptySessionId ?? tab.commandId ?? tab.id;
   const isActive = activeSessionId === sessionId;
@@ -410,9 +396,7 @@ function AiTabRow({ tab, session, indent }: AiTabRowProps) {
 
   const onClick = () => {
     setActiveSession(sessionId);
-    if (youHaveControl) {
-      void openAiTab(tab.id);
-    }
+    void openAiTab(tab.id);
   };
 
   const onClose = (e: React.MouseEvent) => {
@@ -451,9 +435,8 @@ function AiTabRow({ tab, session, indent }: AiTabRowProps) {
         type="button"
         data-sidebar-action="true"
         onClick={onClose}
-        disabled={!youHaveControl}
-        title={youHaveControl ? "Close tab" : "Take control to close"}
-        className="p-1 rounded hover:bg-zinc-600 text-zinc-400 hover:text-zinc-100 opacity-100 md:opacity-0 md:group-hover:opacity-100 disabled:opacity-20 transition-opacity shrink-0"
+        title="Close tab"
+        className="p-1 rounded hover:bg-zinc-600 text-zinc-400 hover:text-zinc-100 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity shrink-0"
       >
         <X className="size-3.5" />
       </button>
@@ -473,7 +456,6 @@ function ProjectSection({ project, sessions, tabs }: ProjectSectionProps) {
   const collapsed = useStore((s) => s.collapsedProjects.has(project.id));
   const toggle = useStore((s) => s.toggleProjectCollapsed);
   const launchAiTab = useStore((s) => s.launchAiTab);
-  const youHaveControl = useStore((s) => s.snapshot?.youHaveControl ?? false);
 
   const folders = project.folders.filter((folder) => !folder.hidden);
   const aiTabs = tabs.filter(
@@ -539,9 +521,8 @@ function ProjectSection({ project, sessions, tabs }: ProjectSectionProps) {
               e.stopPropagation();
               launchAi("claude");
             }}
-            disabled={!youHaveControl}
-            title={youHaveControl ? "New Claude tab" : "Take control to launch Claude"}
-            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-amber-300 hover:bg-amber-600/20 disabled:opacity-40 disabled:hover:bg-transparent"
+            title="New Claude tab"
+            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-amber-300 hover:bg-amber-600/20"
           >
             <Sparkles className="size-3" />
             Claude
@@ -553,9 +534,8 @@ function ProjectSection({ project, sessions, tabs }: ProjectSectionProps) {
               e.stopPropagation();
               launchAi("codex");
             }}
-            disabled={!youHaveControl}
-            title={youHaveControl ? "New Codex tab" : "Take control to launch Codex"}
-            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-violet-300 hover:bg-violet-600/20 disabled:opacity-40 disabled:hover:bg-transparent"
+            title="New Codex tab"
+            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-violet-300 hover:bg-violet-600/20"
           >
             <Bot className="size-3" />
             Codex

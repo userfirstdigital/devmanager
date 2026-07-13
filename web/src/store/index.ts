@@ -31,6 +31,13 @@ import { isTransientComposerRejection, WsClient } from "../api/ws";
 const ACTIVE_PROJECT_KEY = "devmanager-active-project-id";
 const COLLAPSED_PROJECTS_KEY = "devmanager-collapsed-projects";
 const MAX_PENDING_TERMINAL_FRAMES = 256;
+export const MAX_SEMANTIC_EVENTS_PER_SESSION = 5_000;
+/** Per-session UTF-8 JSON payload budget suitable for long-running mobile tabs. */
+export const MAX_SEMANTIC_BYTES_PER_SESSION = 2 * 1_024 * 1_024;
+
+export interface BoundedSemanticJournalState extends SemanticJournalState {
+  retainedBytes: number;
+}
 
 export interface PendingComposerMutation {
   mutationId: string;
@@ -71,8 +78,12 @@ export interface StoreState {
   activeSessionKey: StableSessionKey | null;
   activeProjectId: string | null;
   collapsedProjects: Set<string>;
-  journals: Record<StableSessionKey, SemanticJournalState>;
+  journals: Record<StableSessionKey, BoundedSemanticJournalState>;
   semanticReplay: PendingSemanticReplay | null;
+  /** Sessions waiting for an authoritative replay after a detected live gap. */
+  semanticGapKeys: Set<StableSessionKey>;
+  /** Highest live sequence observed while each gap waits for Resume. */
+  semanticGapSequences: Record<StableSessionKey, number>;
   drafts: Record<StableSessionKey, string>;
   unread: Record<StableSessionKey, number>;
   /** In-memory route handoff only; Task 6 owns durable route restoration. */
@@ -98,6 +109,7 @@ export interface StoreState {
   setActiveProject(projectId: string | null): void;
   setActiveSession(sessionIdentifier: string | null): void;
   setConnectionVisibility(visible: boolean): void;
+  foregroundConnection(): void;
   toggleProjectCollapsed(projectId: string): void;
   subscribeTerminal(
     sessionId: string,
@@ -110,8 +122,6 @@ export interface StoreState {
   drainBootstrap(sessionId: string): SessionBootstrapFrame | null;
   drainTerminalFrames(sessionId: string): SessionOutputFrame[];
   refreshActiveConnection(): void;
-  takeControl(): void;
-  releaseControl(): void;
   sendInput(sessionId: string, text: string): void;
   pasteImage(sessionId: string, payload: WebImagePastePayload): void;
   sendResize(sessionId: string, rows: number, cols: number): void;
@@ -333,10 +343,141 @@ function sameSubmission(
     JSON.stringify(pending.attachments) === JSON.stringify(attachments);
 }
 
-function deduplicateEvents(events: SemanticEvent[]): SemanticEvent[] {
-  const bySequence = new Map<number, SemanticEvent>();
-  for (const event of events) bySequence.set(event.sequence, event);
-  return [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
+interface BoundedSemanticEvents {
+  events: SemanticEvent[];
+  retainedBytes: number;
+  evicted: boolean;
+}
+
+const semanticEventEncoder = new TextEncoder();
+
+function semanticEventBytes(event: SemanticEvent): number {
+  return semanticEventEncoder.encode(JSON.stringify(event)).byteLength;
+}
+
+function capSemanticEvents(events: SemanticEvent[]): BoundedSemanticEvents {
+  let start = events.length;
+  let retainedBytes = 0;
+  while (
+    start > 0 &&
+    events.length - start < MAX_SEMANTIC_EVENTS_PER_SESSION
+  ) {
+    const nextBytes = semanticEventBytes(events[start - 1]);
+    if (retainedBytes + nextBytes > MAX_SEMANTIC_BYTES_PER_SESSION) break;
+    retainedBytes += nextBytes;
+    start -= 1;
+  }
+  return {
+    events: start === 0 ? events : events.slice(start),
+    retainedBytes,
+    evicted: start > 0,
+  };
+}
+
+function appendCappedSemanticEvent(
+  existing: BoundedSemanticJournalState | undefined,
+  event: SemanticEvent,
+): BoundedSemanticEvents {
+  const events = [...(existing?.events ?? []), event];
+  let retainedBytes =
+    (existing?.retainedBytes ?? 0) + semanticEventBytes(event);
+  let removeCount = Math.max(
+    0,
+    events.length - MAX_SEMANTIC_EVENTS_PER_SESSION,
+  );
+  for (let index = 0; index < removeCount; index += 1) {
+    retainedBytes -= semanticEventBytes(events[index]);
+  }
+  while (
+    removeCount < events.length &&
+    retainedBytes > MAX_SEMANTIC_BYTES_PER_SESSION
+  ) {
+    retainedBytes -= semanticEventBytes(events[removeCount]);
+    removeCount += 1;
+  }
+  return {
+    events: removeCount === 0 ? events : events.slice(removeCount),
+    retainedBytes: Math.max(0, retainedBytes),
+    evicted: removeCount > 0,
+  };
+}
+
+function mergeOrderedEvents(
+  left: SemanticEvent[],
+  right: SemanticEvent[],
+): SemanticEvent[] {
+  const merged: SemanticEvent[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length || rightIndex < right.length) {
+    const leftEvent = left[leftIndex];
+    const rightEvent = right[rightIndex];
+    if (!rightEvent || (leftEvent && leftEvent.sequence < rightEvent.sequence)) {
+      merged.push(leftEvent);
+      leftIndex += 1;
+    } else if (!leftEvent || rightEvent.sequence < leftEvent.sequence) {
+      merged.push(rightEvent);
+      rightIndex += 1;
+    } else {
+      // A replay page is authoritative for a repeated sequence.
+      merged.push(rightEvent);
+      leftIndex += 1;
+      rightIndex += 1;
+    }
+  }
+  return merged;
+}
+
+function filterRecord<T>(
+  record: Record<StableSessionKey, T>,
+  validKeys: Set<StableSessionKey>,
+): Record<StableSessionKey, T> {
+  return Object.fromEntries(
+    Object.entries(record).filter(([key]) => validKeys.has(key)),
+  );
+}
+
+function filterSessionMap<T>(map: Map<string, T>, validIds: Set<string>): Map<string, T> {
+  return new Map([...map].filter(([sessionId]) => validIds.has(sessionId)));
+}
+
+function reconcileJournals(
+  journals: Record<StableSessionKey, BoundedSemanticJournalState>,
+  sessions: Record<StableSessionKey, WebSessionSummary>,
+): Record<StableSessionKey, BoundedSemanticJournalState> {
+  const reconciled: Record<StableSessionKey, BoundedSemanticJournalState> = {};
+  for (const [stableSessionKey, session] of Object.entries(sessions)) {
+    const journal = journals[stableSessionKey];
+    if (!journal) continue;
+    const firstRetainedSequence = journal.events[0]?.sequence ?? 0;
+    const hasValidBoundMetadata =
+      Number.isSafeInteger(journal.retainedBytes) &&
+      journal.retainedBytes >= 0 &&
+      journal.retainedBytes <= MAX_SEMANTIC_BYTES_PER_SESSION &&
+      journal.events.length <= MAX_SEMANTIC_EVENTS_PER_SESSION &&
+      journal.oldestSequence === firstRetainedSequence;
+    const hostRequiresTrim =
+      session.oldestSequence > 0 &&
+      journal.events.length > 0 &&
+      firstRetainedSequence < session.oldestSequence;
+    if (hasValidBoundMetadata && !hostRequiresTrim) {
+      reconciled[stableSessionKey] = journal;
+      continue;
+    }
+    const hostRetained = session.oldestSequence > 0
+      ? journal.events.filter((event) => event.sequence >= session.oldestSequence)
+      : journal.events;
+    const bounded = capSemanticEvents(hostRetained);
+    const trimmed = bounded.events.length !== journal.events.length;
+    reconciled[stableSessionKey] = {
+      ...journal,
+      oldestSequence: bounded.events[0]?.sequence ?? 0,
+      cursorRolledOver: journal.cursorRolledOver || trimmed,
+      events: bounded.events,
+      retainedBytes: bounded.retainedBytes,
+    };
+  }
+  return reconciled;
 }
 
 function pageContinuesReplay(
@@ -397,6 +538,42 @@ function isAiTabPayload(payload: WebActionPayload | null | undefined): payload i
 }
 
 export const useStore = create<StoreState>((set, get) => {
+  let runtimeOperationEpoch = 0;
+  let nextAsyncOperationId = 1;
+  const activeAsyncOperations = new Set<number>();
+
+  interface AsyncOperationToken {
+    id: number;
+    runtimeEpoch: number;
+    runtimeInstanceId: string | null;
+    client: WsClient;
+  }
+
+  const beginAsyncOperation = (client: WsClient): AsyncOperationToken => {
+    const token = {
+      id: nextAsyncOperationId++,
+      runtimeEpoch: runtimeOperationEpoch,
+      runtimeInstanceId: get().runtimeInstanceId,
+      client,
+    };
+    activeAsyncOperations.add(token.id);
+    return token;
+  };
+
+  const completeAsyncOperation = (token: AsyncOperationToken): boolean => {
+    if (!activeAsyncOperations.delete(token.id)) return false;
+    return (
+      token.runtimeEpoch === runtimeOperationEpoch &&
+      token.runtimeInstanceId === get().runtimeInstanceId &&
+      token.client === get().client
+    );
+  };
+
+  const invalidateAsyncOperations = (): void => {
+    runtimeOperationEpoch += 1;
+    activeAsyncOperations.clear();
+  };
+
   const reconcileSnapshot = (
     snapshot: WebWorkspaceSnapshot,
     forceRuntimeReset = false,
@@ -413,10 +590,29 @@ export const useStore = create<StoreState>((set, get) => {
       forceRuntimeReset ||
       (current.runtimeInstanceId !== null &&
         current.runtimeInstanceId !== snapshot.runtimeInstanceId);
-    if (runtimeChanged) current.client?.resetRuntime("host runtime changed");
+    if (runtimeChanged) {
+      invalidateAsyncOperations();
+      current.client?.resetRuntime("host runtime changed");
+    }
 
     const nextSessions = sessionIndex(snapshot);
     const nextStreamIds = streamSessionIndex(snapshot);
+    const validStableKeys = new Set(Object.keys(nextSessions));
+    const validStreamSessionIds = new Set(
+      snapshot.sessions.map((session) => session.sessionId),
+    );
+    if (!runtimeChanged) {
+      for (const [stableSessionKey, mutation] of Object.entries(
+        current.pendingMutations,
+      )) {
+        if (!validStableKeys.has(stableSessionKey)) {
+          current.client?.cancelComposer(
+            mutation.mutationId,
+            "session removed by host",
+          );
+        }
+      }
+    }
     const activeSessionKey =
       !runtimeChanged &&
       current.activeSessionKey &&
@@ -438,6 +634,22 @@ export const useStore = create<StoreState>((set, get) => {
             activeSessionKey,
           ),
           streamSessionIdByStableKey: nextStreamIds,
+          terminalSubscribers: filterSessionMap(
+            current.rawTerminal.terminalSubscribers,
+            validStreamSessionIds,
+          ),
+          pendingTerminalFrames: filterSessionMap(
+            current.rawTerminal.pendingTerminalFrames,
+            validStreamSessionIds,
+          ),
+          bootstrapSubscribers: filterSessionMap(
+            current.rawTerminal.bootstrapSubscribers,
+            validStreamSessionIds,
+          ),
+          pendingBootstraps: filterSessionMap(
+            current.rawTerminal.pendingBootstraps,
+            validStreamSessionIds,
+          ),
         };
     const activeProjectId =
       current.activeProjectId &&
@@ -454,12 +666,31 @@ export const useStore = create<StoreState>((set, get) => {
       writerLease: snapshot.writerLease,
       activeSessionKey,
       activeProjectId,
-      journals: runtimeChanged ? {} : current.journals,
-      semanticReplay: runtimeChanged ? null : current.semanticReplay,
-      drafts: runtimeChanged ? {} : current.drafts,
+      journals: runtimeChanged ? {} : reconcileJournals(current.journals, nextSessions),
+      semanticReplay:
+        runtimeChanged ||
+        !current.semanticReplay ||
+        !validStableKeys.has(current.semanticReplay.stableSessionKey)
+          ? null
+          : current.semanticReplay,
+      semanticGapKeys: runtimeChanged
+        ? new Set()
+        : new Set(
+            [...current.semanticGapKeys].filter((key) => validStableKeys.has(key)),
+          ),
+      semanticGapSequences: runtimeChanged
+        ? {}
+        : filterRecord(current.semanticGapSequences, validStableKeys),
+      drafts: runtimeChanged ? {} : filterRecord(current.drafts, validStableKeys),
       unread: unreadIndex(snapshot),
-      pendingRoute: runtimeChanged ? null : current.pendingRoute,
-      pendingMutations: runtimeChanged ? {} : current.pendingMutations,
+      pendingRoute: runtimeChanged
+        ? null
+        : current.activeSessionKey && !activeSessionKey
+          ? "/sessions"
+          : current.pendingRoute,
+      pendingMutations: runtimeChanged
+        ? {}
+        : filterRecord(current.pendingMutations, validStableKeys),
       rawTerminal,
       lastError: null,
     });
@@ -482,6 +713,7 @@ export const useStore = create<StoreState>((set, get) => {
       (get().runtimeInstanceId !== null &&
         get().runtimeInstanceId !== resumeState.runtimeInstanceId)
     ) {
+      invalidateAsyncOperations();
       get().client?.resetRuntime("host runtime changed");
       set({
         workspace: null,
@@ -493,6 +725,8 @@ export const useStore = create<StoreState>((set, get) => {
         activeSessionKey: null,
         journals: {},
         semanticReplay: null,
+        semanticGapKeys: new Set(),
+        semanticGapSequences: {},
         drafts: {},
         unread: {},
         pendingRoute: null,
@@ -532,7 +766,42 @@ export const useStore = create<StoreState>((set, get) => {
     ) {
       get().beginSemanticReplay(resumeState.semanticReplay);
     } else {
-      set({ semanticReplay: null });
+      // Resume is authoritative: if the host has no replay for a live gap,
+      // advance past the live frames we already observed and mark the local
+      // history rolled over. This loses only the unavailable gap while letting
+      // the next contiguous event flow without a Resume storm.
+      set((state) => {
+        const stableSessionKey = get().activeSessionKey;
+        if (!stableSessionKey || !state.semanticGapKeys.has(stableSessionKey)) {
+          return { semanticReplay: null };
+        }
+        const existing = state.journals[stableSessionKey];
+        const latestSequence = Math.max(
+          existing?.latestSequence ?? 0,
+          state.sessions[stableSessionKey]?.latestSequence ?? 0,
+          state.semanticGapSequences[stableSessionKey] ?? 0,
+        );
+        const semanticGapKeys = new Set(state.semanticGapKeys);
+        semanticGapKeys.delete(stableSessionKey);
+        const semanticGapSequences = { ...state.semanticGapSequences };
+        delete semanticGapSequences[stableSessionKey];
+        return {
+          journals: {
+            ...state.journals,
+            [stableSessionKey]: {
+              stableSessionKey,
+              oldestSequence: existing?.events[0]?.sequence ?? 0,
+              latestSequence,
+              cursorRolledOver: true,
+              events: existing?.events ?? [],
+              retainedBytes: existing?.retainedBytes ?? 0,
+            },
+          },
+          semanticReplay: null,
+          semanticGapKeys,
+          semanticGapSequences,
+        };
+      });
     }
   };
 
@@ -605,6 +874,7 @@ export const useStore = create<StoreState>((set, get) => {
           message.message.includes("no longer trusted") ||
           message.message.includes("revoked");
         if (requiresPairing) {
+          invalidateAsyncOperations();
           get().client?.stop();
           get().client?.resetRuntime("browser pairing was revoked");
           set({
@@ -618,6 +888,8 @@ export const useStore = create<StoreState>((set, get) => {
             activeSessionKey: null,
             journals: {},
             semanticReplay: null,
+            semanticGapKeys: new Set(),
+            semanticGapSequences: {},
             drafts: {},
             unread: {},
             pendingRoute: null,
@@ -668,8 +940,10 @@ export const useStore = create<StoreState>((set, get) => {
       set({ lastError: "WebSocket is not connected." });
       return;
     }
+    const operation = beginAsyncOperation(client);
     try {
       const result = await client.request(action);
+      if (!completeAsyncOperation(operation)) return;
       if (!result.ok || !isAiTabPayload(result.payload)) {
         set({ lastError: result.message ?? "Remote AI action failed." });
         return;
@@ -692,6 +966,7 @@ export const useStore = create<StoreState>((set, get) => {
       }));
       client.wake();
     } catch (error) {
+      if (!completeAsyncOperation(operation)) return;
       set({
         lastError:
           error instanceof Error ? error.message : "Remote AI action failed.",
@@ -712,6 +987,8 @@ export const useStore = create<StoreState>((set, get) => {
     collapsedProjects: loadCollapsedProjects(),
     journals: {},
     semanticReplay: null,
+    semanticGapKeys: new Set(),
+    semanticGapSequences: {},
     drafts: {},
     unread: {},
     pendingRoute: null,
@@ -785,6 +1062,7 @@ export const useStore = create<StoreState>((set, get) => {
                 latestSequence: descriptor.fromSequence,
                 cursorRolledOver: true,
                 events: [],
+                retainedBytes: 0,
               },
             }
           : state.journals;
@@ -805,20 +1083,28 @@ export const useStore = create<StoreState>((set, get) => {
         if (!replay || !pageContinuesReplay(replay, page)) return state;
 
         const existing = state.journals[page.stableSessionKey];
-        const events = deduplicateEvents([
-          ...(existing?.events ?? []),
-          ...page.events,
-        ]);
-        const journal: SemanticJournalState = {
+        const mergedEvents = mergeOrderedEvents(existing?.events ?? [], page.events);
+        const bounded = capSemanticEvents(mergedEvents);
+        const journal: BoundedSemanticJournalState = {
           stableSessionKey: page.stableSessionKey,
-          oldestSequence: events[0]?.sequence ?? 0,
+          oldestSequence: bounded.events[0]?.sequence ?? 0,
           latestSequence: Math.max(
             existing?.latestSequence ?? page.fromSequence,
             page.nextSequence,
           ),
-          cursorRolledOver: page.rollover,
-          events,
+          cursorRolledOver:
+            page.rollover ||
+            (existing?.cursorRolledOver ?? false) ||
+            bounded.evicted,
+          events: bounded.events,
+          retainedBytes: bounded.retainedBytes,
         };
+        const semanticGapKeys = new Set(state.semanticGapKeys);
+        const semanticGapSequences = { ...state.semanticGapSequences };
+        if (page.complete) {
+          semanticGapKeys.delete(page.stableSessionKey);
+          delete semanticGapSequences[page.stableSessionKey];
+        }
         return {
           journals: {
             ...state.journals,
@@ -827,13 +1113,48 @@ export const useStore = create<StoreState>((set, get) => {
           semanticReplay: page.complete
             ? null
             : { ...replay, nextSequence: page.nextSequence },
+          semanticGapKeys,
+          semanticGapSequences,
         };
       });
     },
 
     appendSemanticEvent(event) {
+      let requestReplay = false;
       set((state) => {
         const existing = state.journals[event.stableSessionKey];
+        const retainedStart = state.sessions[event.stableSessionKey]?.oldestSequence ?? 1;
+        const contiguousCursor = existing?.latestSequence ?? Math.max(0, retainedStart - 1);
+        if (event.sequence <= contiguousCursor) return state;
+        if (state.semanticReplay?.stableSessionKey === event.stableSessionKey) {
+          return state;
+        }
+        if (state.semanticGapKeys.has(event.stableSessionKey)) {
+          if (
+            event.sequence <=
+            (state.semanticGapSequences[event.stableSessionKey] ?? 0)
+          ) {
+            return state;
+          }
+          return {
+            semanticGapSequences: {
+              ...state.semanticGapSequences,
+              [event.stableSessionKey]: event.sequence,
+            },
+          };
+        }
+        if (event.sequence !== contiguousCursor + 1) {
+          const semanticGapKeys = new Set(state.semanticGapKeys);
+          semanticGapKeys.add(event.stableSessionKey);
+          requestReplay = state.activeSessionKey === event.stableSessionKey;
+          return {
+            semanticGapKeys,
+            semanticGapSequences: {
+              ...state.semanticGapSequences,
+              [event.stableSessionKey]: event.sequence,
+            },
+          };
+        }
         if (
           existing?.cursorRolledOver &&
           existing.oldestSequence > 0 &&
@@ -841,14 +1162,16 @@ export const useStore = create<StoreState>((set, get) => {
         ) {
           return state;
         }
-        const events = deduplicateEvents([...(existing?.events ?? []), event]);
-        const journal: SemanticJournalState = {
+        const bounded = appendCappedSemanticEvent(existing, event);
+        const journal: BoundedSemanticJournalState = {
           stableSessionKey: event.stableSessionKey,
-          oldestSequence:
-            existing?.oldestSequence || events[0]?.sequence || event.sequence,
+          oldestSequence: bounded.events[0]?.sequence ?? 0,
           latestSequence: Math.max(existing?.latestSequence ?? 0, event.sequence),
-          cursorRolledOver: existing?.cursorRolledOver ?? false,
-          events,
+          cursorRolledOver:
+            (existing?.cursorRolledOver ?? false) ||
+            bounded.evicted,
+          events: bounded.events,
+          retainedBytes: bounded.retainedBytes,
         };
         return {
           journals: {
@@ -857,6 +1180,7 @@ export const useStore = create<StoreState>((set, get) => {
           },
         };
       });
+      if (requestReplay) get().client?.wake();
     },
 
     setDraft(stableSessionKey, text) {
@@ -910,11 +1234,23 @@ export const useStore = create<StoreState>((set, get) => {
       const client = get().client;
       if (!client) {
         const error = new Error("WebSocket is not connected.");
-        set({ lastError: error.message });
+        set((current) => {
+          if (
+            current.pendingMutations[stableSessionKey]?.mutationId !==
+            pending.mutationId
+          ) {
+            return { lastError: error.message };
+          }
+          const pendingMutations = { ...current.pendingMutations };
+          delete pendingMutations[stableSessionKey];
+          return { pendingMutations, lastError: error.message };
+        });
         throw error;
       }
+      const operation = beginAsyncOperation(client);
       try {
         const accepted = await client.submitComposer(pending);
+        if (!completeAsyncOperation(operation)) return accepted;
         set((current) => {
           if (
             current.pendingMutations[stableSessionKey]?.mutationId !==
@@ -938,15 +1274,22 @@ export const useStore = create<StoreState>((set, get) => {
         });
         return accepted;
       } catch (error) {
-        if (
-          get().pendingMutations[stableSessionKey]?.mutationId ===
-          pending.mutationId
-        ) {
-          set({
+        if (!completeAsyncOperation(operation)) throw error;
+        set((current) => {
+          if (
+            current.pendingMutations[stableSessionKey]?.mutationId !==
+            pending.mutationId
+          ) {
+            return current;
+          }
+          const pendingMutations = { ...current.pendingMutations };
+          delete pendingMutations[stableSessionKey];
+          return {
+            pendingMutations,
             lastError:
               error instanceof Error ? error.message : "Composer submission failed.",
-          });
-        }
+          };
+        });
         throw error;
       }
     },
@@ -957,9 +1300,11 @@ export const useStore = create<StoreState>((set, get) => {
         set({ lastError: "WebSocket is not connected." });
         return;
       }
+      const operation = beginAsyncOperation(client);
       void client
         .request(action)
         .then((result) => {
+          if (!completeAsyncOperation(operation)) return;
           set({
             lastError: result.ok
               ? null
@@ -967,6 +1312,7 @@ export const useStore = create<StoreState>((set, get) => {
           });
         })
         .catch((error: unknown) => {
+          if (!completeAsyncOperation(operation)) return;
           set({
             lastError:
               error instanceof Error ? error.message : "Remote action failed.",
@@ -1007,6 +1353,10 @@ export const useStore = create<StoreState>((set, get) => {
 
     setConnectionVisibility(visible) {
       get().client?.setVisibility(visible);
+    },
+
+    foregroundConnection() {
+      get().client?.foreground();
     },
 
     toggleProjectCollapsed(projectId) {
@@ -1103,49 +1453,41 @@ export const useStore = create<StoreState>((set, get) => {
       get().client?.wake();
     },
 
-    takeControl() {
-      get().client?.wake();
-    },
-
-    releaseControl() {
-      get().client?.setVisibility(false);
-    },
-
     sendInput(sessionId, text) {
-      const state = get();
-      state.client?.ensureWriterLease();
-      state.client?.send({
+      const accepted = get().client?.sendWithWriterLease({
         type: "input",
         sessionId,
         text,
-        expectedLeaseGeneration: state.writerLease.generation,
       });
+      if (accepted === false) {
+        set({ lastError: "Too much terminal input is waiting to be sent." });
+      }
     },
 
     pasteImage(sessionId, payload) {
-      const state = get();
-      state.client?.ensureWriterLease();
-      const sent = state.client?.send({
+      const accepted = get().client?.sendWithWriterLease({
         type: "pasteImage",
         sessionId,
         mimeType: payload.mimeType,
         fileName: payload.fileName ?? null,
         dataBase64: payload.dataBase64,
-        expectedLeaseGeneration: state.writerLease.generation,
       });
-      set({ lastError: sent ? null : "WebSocket is not connected." });
+      set({
+        lastError:
+          accepted === false ? "Too much terminal input is waiting to be sent." : null,
+      });
     },
 
     sendResize(sessionId, rows, cols) {
-      const state = get();
-      state.client?.ensureWriterLease();
-      state.client?.send({
+      const accepted = get().client?.sendWithWriterLease({
         type: "resize",
         sessionId,
         rows,
         cols,
-        expectedLeaseGeneration: state.writerLease.generation,
       });
+      if (accepted === false) {
+        set({ lastError: "Too much terminal input is waiting to be sent." });
+      }
     },
 
     launchAiTab(projectId, tabType) {

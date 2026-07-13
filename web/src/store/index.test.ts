@@ -3,9 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ComposerAccepted,
   SemanticEvent,
-  SemanticJournalState,
   SemanticReplayDescriptor,
   SemanticReplayPage,
+  WebActionResult,
   WebWorkspaceSnapshot,
 } from "../api/types";
 
@@ -22,8 +22,12 @@ const { wsClientState, MockWsClient } = vi.hoisted(() => {
     readonly start = vi.fn(async () => {});
     readonly stop = vi.fn();
     readonly send = vi.fn((_frame: { type: string }) => true);
-    readonly request = vi.fn(async () => ({ ok: true, payload: null }));
+    readonly sendWithWriterLease = vi.fn((_frame: { type: string }) => true);
+    readonly request = vi.fn(
+      async (): Promise<WebActionResult> => ({ ok: true, payload: null }),
+    );
     readonly wake = vi.fn();
+    readonly foreground = vi.fn();
     readonly setVisibility = vi.fn();
     readonly resetRuntime = vi.fn();
     readonly ensureWriterLease = vi.fn();
@@ -61,7 +65,12 @@ vi.mock("../api/ws", () => ({
     ].includes(code),
 }));
 
-import { useStore } from "./index";
+import {
+  type BoundedSemanticJournalState,
+  MAX_SEMANTIC_BYTES_PER_SESSION,
+  MAX_SEMANTIC_EVENTS_PER_SESSION,
+  useStore,
+} from "./index";
 
 const writerLease = {
   ownerClientInstanceId: "tab-client",
@@ -158,13 +167,18 @@ function outputEvent(sequence: number, text = `event-${sequence}`): SemanticEven
   };
 }
 
-function journal(events: SemanticEvent[]): SemanticJournalState {
+function journal(events: SemanticEvent[]): BoundedSemanticJournalState {
   return {
     stableSessionKey: "tab:a",
     oldestSequence: events[0]?.sequence ?? 0,
     latestSequence: events[events.length - 1]?.sequence ?? 0,
     cursorRolledOver: false,
     events,
+    retainedBytes: events.reduce(
+      (total, event) =>
+        total + new TextEncoder().encode(JSON.stringify(event)).byteLength,
+      0,
+    ),
   };
 }
 
@@ -293,6 +307,205 @@ describe("host runtime reconciliation", () => {
     expect(useStore.getState().revision).toBe(2);
   });
 
+  it("removes every session and PTY scoped value omitted by a same-runtime snapshot", () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    const goneEvent = { ...outputEvent(1), stableSessionKey: "tab:gone" };
+    useStore.setState((state) => ({
+      activeSessionKey: "tab:gone",
+      journals: {
+        "tab:a": journal([outputEvent(1)]),
+        "tab:gone": {
+          ...journal([goneEvent]),
+          stableSessionKey: "tab:gone",
+        },
+      },
+      semanticReplay: {
+        ...replayDescriptor({ stableSessionKey: "tab:gone" }),
+        nextSequence: 2,
+      },
+      semanticGapKeys: new Set(["tab:a", "tab:gone"]),
+      drafts: { "tab:a": "keep", "tab:gone": "remove" },
+      unread: { "tab:a": 2, "tab:gone": 3 },
+      pendingMutations: {
+        "tab:a": {
+          mutationId: "keep-mutation",
+          stableSessionKey: "tab:a",
+          text: "keep",
+          attachments: [],
+        },
+        "tab:gone": {
+          mutationId: "gone-mutation",
+          stableSessionKey: "tab:gone",
+          text: "remove",
+          attachments: [],
+        },
+      },
+      rawTerminal: {
+        ...state.rawTerminal,
+        activeStreamSessionId: "pty-gone",
+        streamSessionIdByStableKey: {
+          "tab:a": "pty-a",
+          "tab:gone": "pty-gone",
+        },
+        terminalSubscribers: new Map([
+          ["pty-a", new Set()],
+          ["pty-gone", new Set()],
+        ]),
+        pendingTerminalFrames: new Map([
+          ["pty-a", []],
+          ["pty-gone", []],
+        ]),
+        bootstrapSubscribers: new Map([
+          ["pty-a", new Set()],
+          ["pty-gone", new Set()],
+        ]),
+        pendingBootstraps: new Map([
+          ["pty-a", {} as never],
+          ["pty-gone", {} as never],
+        ]),
+      },
+    }));
+
+    useStore.getState().applySnapshot(makeSnapshot({ revision: 2 }));
+
+    const state = useStore.getState();
+    expect(Object.keys(state.journals)).toEqual(["tab:a"]);
+    expect(Object.keys(state.drafts)).toEqual(["tab:a"]);
+    expect(Object.keys(state.pendingMutations)).toEqual(["tab:a"]);
+    expect(Object.keys(state.unread)).toEqual(["tab:a"]);
+    expect([...state.semanticGapKeys]).toEqual(["tab:a"]);
+    expect(state.semanticReplay).toBeNull();
+    expect(state.activeSessionKey).toBeNull();
+    expect(state.rawTerminal.activeStreamSessionId).toBeNull();
+    expect([...state.rawTerminal.terminalSubscribers.keys()]).toEqual(["pty-a"]);
+    expect([...state.rawTerminal.pendingTerminalFrames.keys()]).toEqual(["pty-a"]);
+    expect([...state.rawTerminal.bootstrapSubscribers.keys()]).toEqual(["pty-a"]);
+    expect([...state.rawTerminal.pendingBootstraps.keys()]).toEqual(["pty-a"]);
+    expect(wsClientState.instance?.cancelComposer).toHaveBeenCalledWith(
+      "gone-mutation",
+      "session removed by host",
+    );
+  });
+
+  it("trims journals to host retention and the browser memory cap", () => {
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({
+      journals: {
+        "tab:a": journal(Array.from({ length: 6 }, (_, index) => outputEvent(index + 1))),
+      },
+    });
+    useStore.getState().applySnapshot(
+      makeSnapshot({
+        revision: 2,
+        sessions: [
+          {
+            ...makeSnapshot().sessions[0],
+            oldestSequence: 4,
+            latestSequence: 6,
+          },
+        ],
+      }),
+    );
+    expect(
+      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+    ).toEqual([4, 5, 6]);
+
+    const total = MAX_SEMANTIC_EVENTS_PER_SESSION + 25;
+    useStore.setState({
+      journals: {
+        "tab:a": journal(
+          Array.from({ length: total }, (_, index) => outputEvent(index + 1)),
+        ),
+      },
+    });
+    useStore.getState().applySnapshot(
+      makeSnapshot({
+        revision: 3,
+        sessions: [
+          {
+            ...makeSnapshot().sessions[0],
+            oldestSequence: 1,
+            latestSequence: total,
+          },
+        ],
+      }),
+    );
+    let events = useStore.getState().journals["tab:a"]?.events ?? [];
+    expect(events).toHaveLength(MAX_SEMANTIC_EVENTS_PER_SESSION);
+    expect(events[0]?.sequence).toBe(26);
+
+    useStore.getState().appendSemanticEvent(outputEvent(total + 1));
+    events = useStore.getState().journals["tab:a"]?.events ?? [];
+    expect(events).toHaveLength(MAX_SEMANTIC_EVENTS_PER_SESSION);
+    expect(events[0]?.sequence).toBe(27);
+    expect(useStore.getState().journals["tab:a"]?.oldestSequence).toBe(27);
+    expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(total + 1);
+  });
+
+  it("reuses a bounded journal when host retention has not advanced", () => {
+    useStore.getState().applySnapshot(makeSnapshot());
+    const existing = journal([outputEvent(1), outputEvent(2)]);
+    useStore.setState({ journals: { "tab:a": existing } });
+
+    useStore.getState().applySnapshot(makeSnapshot({ revision: 2 }));
+
+    expect(useStore.getState().journals["tab:a"]).toBe(existing);
+  });
+
+  it("also bounds retained semantic history by encoded bytes", () => {
+    const eventCount = 64;
+    const largeText = "x".repeat(64 * 1_024);
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({
+      journals: {
+        "tab:a": journal(
+          Array.from({ length: eventCount }, (_, index) =>
+            outputEvent(index + 1, largeText),
+          ),
+        ),
+      },
+    });
+    useStore.getState().applySnapshot(
+      makeSnapshot({
+        revision: 2,
+        sessions: [
+          {
+            ...makeSnapshot().sessions[0],
+            oldestSequence: 1,
+            latestSequence: eventCount,
+          },
+        ],
+      }),
+    );
+
+    let journalState = useStore.getState().journals["tab:a"];
+    const retainedBytes = journalState?.events.reduce(
+      (total, event) => total + new TextEncoder().encode(JSON.stringify(event)).byteLength,
+      0,
+    );
+    expect(retainedBytes).toBeLessThanOrEqual(MAX_SEMANTIC_BYTES_PER_SESSION);
+    expect(journalState?.events.length).toBeLessThan(eventCount);
+    expect(journalState?.oldestSequence).toBe(
+      journalState?.events[0]?.sequence,
+    );
+    expect(journalState?.latestSequence).toBe(eventCount);
+
+    const oldestBeforeAppend = journalState?.oldestSequence ?? 0;
+    useStore.getState().appendSemanticEvent(outputEvent(eventCount + 1, largeText));
+    journalState = useStore.getState().journals["tab:a"];
+    const appendedBytes = journalState?.events.reduce(
+      (total, event) => total + new TextEncoder().encode(JSON.stringify(event)).byteLength,
+      0,
+    );
+    expect(appendedBytes).toBeLessThanOrEqual(MAX_SEMANTIC_BYTES_PER_SESSION);
+    expect(journalState?.oldestSequence).toBeGreaterThan(oldestBeforeAppend);
+    expect(journalState?.oldestSequence).toBe(
+      journalState?.events[0]?.sequence,
+    );
+    expect(journalState?.latestSequence).toBe(eventCount + 1);
+  });
+
   it("drops the connection-scoped writer lease on close without losing retry state", () => {
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
@@ -354,6 +567,115 @@ describe("host runtime reconciliation", () => {
     expect(persistedKeys).not.toContain("devmanager-drafts");
     expect(persistedKeys).not.toContain("devmanager-active-terminal");
   });
+
+  it("ignores an old runtime composer settlement even when ids collide", async () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    const client = wsClientState.instance;
+    const oldRuntime = deferred<ComposerAccepted>();
+    const newRuntime = deferred<ComposerAccepted>();
+    client?.submitComposer
+      .mockReturnValueOnce(oldRuntime.promise)
+      .mockReturnValueOnce(newRuntime.promise);
+
+    const oldSubmission = useStore.getState().submitComposer("tab:a", "old");
+    useStore.getState().applySnapshot(
+      makeSnapshot({ runtimeInstanceId: "runtime-2", revision: 1 }),
+    );
+    const newSubmission = useStore.getState().submitComposer("tab:a", "new");
+    const collidedId = client?.submitComposer.mock.calls[1]?.[0].mutationId ?? "";
+
+    oldRuntime.resolve({
+      mutationId: collidedId,
+      stableSessionKey: "tab:a",
+      acceptedSequence: 3,
+      leaseGeneration: 7,
+    });
+    await oldSubmission;
+
+    expect(useStore.getState().drafts["tab:a"]).toBe("new");
+    expect(useStore.getState().pendingMutations["tab:a"]?.mutationId).toBe(
+      collidedId,
+    );
+
+    newRuntime.resolve({
+      mutationId: collidedId,
+      stableSessionKey: "tab:a",
+      acceptedSequence: 1,
+      leaseGeneration: 7,
+    });
+    await newSubmission;
+  });
+
+  it("ignores resolved and rejected action promises from an old runtime", async () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    const client = wsClientState.instance;
+    const resolved = deferred<{ ok: boolean; message: string; payload: null }>();
+    client?.request.mockReturnValueOnce(resolved.promise);
+
+    useStore.getState().sendAction({ type: "stopAllServers" });
+    useStore.getState().applySnapshot(
+      makeSnapshot({ runtimeInstanceId: "runtime-2", revision: 1 }),
+    );
+    resolved.resolve({ ok: false, message: "old failure", payload: null });
+    await resolved.promise;
+    await Promise.resolve();
+    expect(useStore.getState().lastError).toBeNull();
+
+    const rejected = deferred<{ ok: boolean; payload: null }>();
+    client?.request.mockReturnValueOnce(rejected.promise);
+    useStore.getState().sendAction({ type: "stopAllServers" });
+    useStore.getState().applySnapshot(
+      makeSnapshot({ runtimeInstanceId: "runtime-3", revision: 1 }),
+    );
+    rejected.reject(new Error("stale rejection"));
+    await rejected.promise.catch(() => {});
+    await Promise.resolve();
+    expect(useStore.getState().lastError).toBeNull();
+  });
+
+  it("does not navigate from an old runtime AI launch result", async () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    const client = wsClientState.instance;
+    const result = deferred<{
+      ok: boolean;
+      message: null;
+      payload: {
+        type: "aiTab";
+        tabId: string;
+        projectId: string;
+        tabType: "claude";
+        sessionId: string;
+        label: null;
+      };
+    }>();
+    client?.request.mockReturnValueOnce(result.promise);
+
+    const launch = useStore.getState().launchAiTab("project-1", "claude");
+    useStore.getState().applySnapshot(
+      makeSnapshot({ runtimeInstanceId: "runtime-2", sessions: [], tabs: [] }),
+    );
+    result.resolve({
+      ok: true,
+      message: null,
+      payload: {
+        type: "aiTab",
+        tabId: "old-tab",
+        projectId: "project-1",
+        tabType: "claude",
+        sessionId: "old-pty",
+        label: null,
+      },
+    });
+    await launch;
+
+    expect(useStore.getState().activeSessionKey).toBeNull();
+    expect(
+      useStore.getState().rawTerminal.streamSessionIdByStableKey["tab:old-tab"],
+    ).toBeUndefined();
+  });
 });
 
 describe("semantic journal reconciliation", () => {
@@ -376,7 +698,7 @@ describe("semantic journal reconciliation", () => {
     });
   });
 
-  it("applies immutable pages in order, deduplicates repeats, and advances gaps", () => {
+  it("applies immutable pages in order and trusts their authoritative cursor", () => {
     useStore.getState().applySnapshot(makeSnapshot());
     useStore.setState({ journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) } });
 
@@ -398,7 +720,7 @@ describe("semantic journal reconciliation", () => {
 
     const reconciled = useStore.getState().journals["tab:a"];
     expect(reconciled?.events.map((event) => event.sequence)).toEqual([
-      1, 2, 3, 4, 6, 7,
+      1, 2, 3, 4, 6,
     ]);
     expect(reconciled?.latestSequence).toBe(7);
     expect(useStore.getState().semanticReplay).toBeNull();
@@ -480,6 +802,83 @@ describe("semantic journal reconciliation", () => {
     ).toEqual([1, 2]);
     expect(useStore.getState().semanticReplay).toBeNull();
   });
+
+  it("requests one atomic replay for a live gap without advancing the cursor", () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({
+      activeSessionKey: "tab:a",
+      journals: { "tab:a": journal([outputEvent(1), outputEvent(2)]) },
+    });
+    const client = wsClientState.instance;
+    client?.wake.mockClear();
+
+    useStore.getState().appendSemanticEvent(outputEvent(4));
+    useStore.getState().appendSemanticEvent(outputEvent(5));
+
+    expect(
+      useStore.getState().journals["tab:a"]?.events.map((event) => event.sequence),
+    ).toEqual([1, 2]);
+    expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(2);
+    expect(client?.callbacks.getResumeContext?.()).toMatchObject({
+      semanticAfterSequence: 2,
+    });
+    expect(client?.wake).toHaveBeenCalledTimes(1);
+
+    useStore.getState().applyResumeState({
+      runtimeInstanceId: "runtime-1",
+      revision: 1,
+      hardReset: false,
+      route: "/session/tab/a",
+      desiredSessionKey: "tab:a",
+      workspace: null,
+      semanticReplay: null,
+      writerLease,
+    });
+    useStore.getState().appendSemanticEvent(outputEvent(6));
+    expect(client?.wake).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(6);
+    expect(useStore.getState().journals["tab:a"]?.cursorRolledOver).toBe(true);
+    expect([...useStore.getState().semanticGapKeys]).toEqual([]);
+
+    useStore.getState().appendSemanticEvent(outputEvent(8));
+    expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(6);
+    expect(client?.wake).toHaveBeenCalledTimes(2);
+  });
+
+  it("rebases a gap with no local journal when Resume has no replay", () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.setState({ activeSessionKey: "tab:a", journals: {} });
+    const client = wsClientState.instance;
+    client?.wake.mockClear();
+
+    useStore.getState().appendSemanticEvent(outputEvent(4));
+    useStore.getState().appendSemanticEvent(outputEvent(5));
+    expect(useStore.getState().journals["tab:a"]).toBeUndefined();
+    expect(client?.wake).toHaveBeenCalledTimes(1);
+
+    useStore.getState().applyResumeState({
+      runtimeInstanceId: "runtime-1",
+      revision: 1,
+      hardReset: false,
+      route: "/session/tab/a",
+      desiredSessionKey: "tab:a",
+      workspace: null,
+      semanticReplay: null,
+      writerLease,
+    });
+    expect(useStore.getState().journals["tab:a"]).toMatchObject({
+      oldestSequence: 0,
+      latestSequence: 5,
+      cursorRolledOver: true,
+      events: [],
+    });
+
+    useStore.getState().appendSemanticEvent(outputEvent(6));
+    expect(useStore.getState().journals["tab:a"]?.latestSequence).toBe(6);
+    expect(client?.wake).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("resume ownership and stable session identity", () => {
@@ -509,7 +908,7 @@ describe("resume ownership and stable session identity", () => {
     );
   });
 
-  it("refresh and control affordances never emit legacy focus/subscribe/control frames", () => {
+  it("foreground recovery never lies about visibility or emits legacy control frames", () => {
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
     useStore.getState().setActiveSession("tab:a");
@@ -517,11 +916,11 @@ describe("resume ownership and stable session identity", () => {
     client?.wake.mockClear();
 
     useStore.getState().refreshActiveConnection();
-    useStore.getState().takeControl();
-    useStore.getState().releaseControl();
+    useStore.getState().foregroundConnection();
 
-    expect(client?.wake).toHaveBeenCalledTimes(2);
-    expect(client?.setVisibility).toHaveBeenCalledWith(false);
+    expect(client?.wake).toHaveBeenCalledTimes(1);
+    expect(client?.foreground).toHaveBeenCalledTimes(1);
+    expect(client?.setVisibility).not.toHaveBeenCalledWith(false);
     const sentTypes = client?.send.mock.calls.map(([frame]) => frame.type) ?? [];
     expect(sentTypes).not.toEqual(
       expect.arrayContaining([
@@ -546,7 +945,13 @@ describe("resume ownership and stable session identity", () => {
 });
 
 describe("composer acknowledgement and retries", () => {
-  it("keeps the draft through rejection and reuses the mutation id on retry", async () => {
+  it("keeps the draft but gives a retry a new id after terminal rejection", async () => {
+    vi.stubGlobal("crypto", {
+      randomUUID: vi
+        .fn()
+        .mockReturnValueOnce("mutation-first")
+        .mockReturnValueOnce("mutation-retry"),
+    });
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
     const client = wsClientState.instance;
@@ -563,14 +968,13 @@ describe("composer acknowledgement and retries", () => {
     first.reject(new Error("websocket closed"));
     await expect(firstAttempt).rejects.toThrow("websocket closed");
     expect(useStore.getState().drafts["tab:a"]).toBe("hello");
-    expect(useStore.getState().pendingMutations["tab:a"]?.mutationId).toBe(
-      firstMutationId,
-    );
+    expect(useStore.getState().pendingMutations["tab:a"]).toBeUndefined();
 
     const retry = useStore.getState().submitComposer("tab:a", "hello");
-    expect(client?.submitComposer.mock.calls[1]?.[0].mutationId).toBe(firstMutationId);
+    const retryMutationId = client?.submitComposer.mock.calls[1]?.[0].mutationId;
+    expect(retryMutationId).not.toBe(firstMutationId);
     second.resolve({
-      mutationId: firstMutationId ?? "",
+      mutationId: retryMutationId ?? "",
       stableSessionKey: "tab:a",
       acceptedSequence: 3,
       leaseGeneration: 7,
@@ -602,7 +1006,7 @@ describe("composer acknowledgement and retries", () => {
     expect(useStore.getState().pendingMutations).toEqual({});
   });
 
-  it("retains the draft and mutation id when host mutation capacity is full", async () => {
+  it("retains the draft but clears the mutation id when host capacity rejects it", async () => {
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
     const client = wsClientState.instance;
@@ -621,9 +1025,8 @@ describe("composer acknowledgement and retries", () => {
     });
 
     expect(useStore.getState().drafts["tab:a"]).toBe("try later");
-    expect(useStore.getState().pendingMutations["tab:a"]?.mutationId).toBe(
-      mutationId,
-    );
+    expect(mutationId).toBeDefined();
+    expect(useStore.getState().pendingMutations["tab:a"]).toBeUndefined();
   });
 
   it("cancels the old automatic retry when edited content becomes a new mutation", async () => {
@@ -688,22 +1091,39 @@ describe("safe compatibility and raw terminal IO", () => {
     expect(JSON.stringify(state.snapshot)).not.toContain("password");
   });
 
-  it("adds the automatic lease generation to raw input and safe actions", () => {
+  it("stages raw input and safe actions for automatic writer acquisition", () => {
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
     const client = wsClientState.instance;
 
     useStore.getState().sendInput("pty-a", "ls\r");
+    useStore.getState().pasteImage("pty-a", {
+      mimeType: "image/png",
+      fileName: "screen.png",
+      dataBase64: "aGVsbG8=",
+    });
+    useStore.getState().sendResize("pty-a", 30, 100);
     useStore.getState().sendAction({ type: "startServer", command_id: "command-1" });
 
-    expect(client?.ensureWriterLease).toHaveBeenCalledTimes(1);
-    expect(client?.send).toHaveBeenNthCalledWith(1, {
+    expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(1, {
       type: "input",
       sessionId: "pty-a",
       text: "ls\r",
-      expectedLeaseGeneration: 7,
     });
-    expect(client?.send).toHaveBeenCalledTimes(1);
+    expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(2, {
+      type: "pasteImage",
+      sessionId: "pty-a",
+      mimeType: "image/png",
+      fileName: "screen.png",
+      dataBase64: "aGVsbG8=",
+    });
+    expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(3, {
+      type: "resize",
+      sessionId: "pty-a",
+      rows: 30,
+      cols: 100,
+    });
+    expect(client?.send).not.toHaveBeenCalled();
     expect(client?.request).toHaveBeenCalledWith({
       type: "startServer",
       command_id: "command-1",

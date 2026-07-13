@@ -17,7 +17,7 @@ export function App() {
     (s) => s.rawTerminal.activeStreamSessionId,
   );
   const closeActiveTab = useStore((s) => s.closeActiveTab);
-  const refreshActiveConnection = useStore((s) => s.refreshActiveConnection);
+  const foregroundConnection = useStore((s) => s.foregroundConnection);
   const setConnectionVisibility = useStore(
     (s) => s.setConnectionVisibility,
   );
@@ -28,7 +28,7 @@ export function App() {
   }, [init]);
 
   useEffect(() => {
-    const wake = () => refreshActiveConnection();
+    const wake = () => foregroundConnection();
     const handleVisibility = () => {
       setConnectionVisibility(document.visibilityState === "visible");
     };
@@ -42,7 +42,7 @@ export function App() {
       window.removeEventListener("pageshow", wake);
       window.removeEventListener("online", wake);
     };
-  }, [refreshActiveConnection, setConnectionVisibility]);
+  }, [foregroundConnection, setConnectionVisibility]);
 
   if (status.kind === "unauthorized") {
     return <PairingGate />;

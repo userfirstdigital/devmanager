@@ -236,10 +236,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
   const drainTerminalFrames = useStore((s) => s.drainTerminalFrames);
   const sendInput = useStore((s) => s.sendInput);
   const pasteImage = useStore((s) => s.pasteImage);
-  const refreshActiveConnection = useStore((s) => s.refreshActiveConnection);
-  const youHaveControl = useStore(
-    (s) => s.snapshot?.youHaveControl ?? false,
-  );
   const sessionKind = useStore(
     (s) => s.snapshot?.runtimeState?.sessions?.[sessionId]?.session_kind,
   );
@@ -261,8 +257,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
       fontSize: DESKTOP_TERMINAL_FONT_SIZE,
       allowHorizontalPan: false,
     });
-  const controlRef = useRef(youHaveControl);
-  controlRef.current = youHaveControl;
   const sessionKindRef = useRef(sessionKind);
   sessionKindRef.current = sessionKind;
   const pasteImageRef = useRef(pasteImage);
@@ -414,10 +408,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
       terminalRef.current = terminal;
       (window as unknown as { __dmTerm?: unknown }).__dmTerm = terminal;
 
-      // Resume atomically owns raw subscription, focus, and writer-lease
-      // reconciliation. Mounting xterm must not replay legacy frames.
-      refreshActiveConnection();
-
       // Copy-on-Ctrl+C when there's a selection, paste handled by browser
       // default on Ctrl+V. Matches the archive's custom handler at
       // InteractiveTerminal.tsx lines 304-327.
@@ -441,12 +431,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
         }
         event.preventDefault();
 
-        if (!controlRef.current) {
-          useStore.setState({
-            lastError: "This client is in viewer mode. Take control first.",
-          });
-          return;
-        }
         if (!isAiSessionKind(sessionKindRef.current)) {
           useStore.setState({
             lastError: "Image paste is only supported in Claude and Codex terminals.",
@@ -475,10 +459,9 @@ export function TerminalView({ sessionId }: TerminalProps) {
       };
       container.addEventListener("paste", handlePaste, true);
 
-      // Forward user keystrokes to the host — but only when this client
-      // holds control. Viewer-mode input silently drops.
+      // Forward user keystrokes; writer ownership is acquired automatically
+      // before the host accepts input from this browser.
       const dataDisposable = terminal.onData((text) => {
-        if (!controlRef.current) return;
         sendInput(sessionId, text);
       });
       // We intentionally do NOT hook `terminal.onResize` to `sendResize`.
@@ -539,7 +522,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
       // Focus after first paint.
       const focusTimer = window.setTimeout(() => {
         if (!cancelled) {
-          refreshActiveConnection();
           terminal.focus();
         }
       }, 50);
@@ -582,7 +564,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
     subscribeBootstrap,
     drainBootstrap,
     drainTerminalFrames,
-    refreshActiveConnection,
     sendInput,
   ]);
 
@@ -605,8 +586,6 @@ export function TerminalView({ sessionId }: TerminalProps) {
       ref={shellRef}
       className="dm-terminal-shell flex flex-1 min-h-0 min-w-0 bg-[#09090b]"
       data-terminal-pan={responsiveLayout.allowHorizontalPan ? "true" : "false"}
-      onFocusCapture={refreshActiveConnection}
-      onPointerDown={refreshActiveConnection}
     >
       <div
         ref={containerRef}

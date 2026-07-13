@@ -150,6 +150,81 @@ describe("WsClient request handling", () => {
     });
   });
 
+  it("stages raw input until the authoritative writer generation arrives", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+
+    expect(
+      client.sendWithWriterLease({
+        type: "input",
+        sessionId: "pty-a",
+        text: "hello",
+      }),
+    ).toBe(true);
+    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([]);
+
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 12,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 12,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([
+      {
+        type: "input",
+        sessionId: "pty-a",
+        text: "hello",
+        expectedLeaseGeneration: 12,
+      },
+    ]);
+  });
+
+  it("drops staged raw input when the host runtime resets", async () => {
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+    client.sendWithWriterLease({
+      type: "input",
+      sessionId: "pty-a",
+      text: "old runtime",
+    });
+
+    client.resetRuntime();
+    socket.emitMessage(
+      JSON.stringify({
+        type: "writerLeaseState",
+        writerLease: {
+          ownerClientInstanceId: "browser-install-uuid",
+          generation: 13,
+          expiresAtEpochMs: 10_000,
+          youAreOwner: true,
+        },
+      }),
+    );
+
+    expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([]);
+  });
+
   it("sends exactly one atomic resume frame whenever a socket opens", async () => {
     const client = new WsClient(clientCallbacks());
 
@@ -213,6 +288,17 @@ describe("WsClient request handling", () => {
     const firstResume = jsonFrames(FakeWebSocket.instances[0] ?? ({} as FakeWebSocket))[0];
     const secondResume = jsonFrames(FakeWebSocket.instances[1] ?? ({} as FakeWebSocket))[0];
     expect(firstResume?.clientInstanceId).toBe(secondResume?.clientInstanceId);
+  });
+
+  it("falls back when reading the sessionStorage property itself throws", async () => {
+    Object.defineProperty(globalThis, "sessionStorage", {
+      configurable: true,
+      get() {
+        throw new DOMException("blocked", "SecurityError");
+      },
+    });
+
+    expect(() => new WsClient(clientCallbacks())).not.toThrow();
   });
 
   it("resolves and rejects composer submissions by mutation id", async () => {
@@ -523,6 +609,63 @@ describe("WsClient reconnect wake handling", () => {
     expect(jsonFrames(socket)).toEqual([
       expect.objectContaining({ type: "resume" }),
     ]);
+  });
+
+  it("coalesces one foreground return burst without superseding its replay", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    const client = new WsClient(clientCallbacks());
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+
+    // visibilitychange, focus, pageshow, and online can all describe the same
+    // foreground transition. The socket-open Resume is already sufficient.
+    client.setVisibility(true);
+    client.foreground();
+    client.foreground();
+    client.foreground();
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "resume"),
+    ).toHaveLength(1);
+
+    // A later foreground episode still performs recovery.
+    await vi.advanceTimersByTimeAsync(1_001);
+    client.foreground();
+    client.foreground();
+    expect(
+      jsonFrames(socket).filter((frame) => frame.type === "resume"),
+    ).toHaveLength(2);
+  });
+
+  it("never suppresses the visible transition after a socket opened hidden", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, status: 200 }),
+    );
+    let visible = false;
+    const client = new WsClient(
+      clientCallbacks({
+        getResumeContext: vi.fn(() => ({
+          ...resumeContext,
+          visible,
+          wantsWriterLease: visible,
+        })),
+      }),
+    );
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+
+    visible = true;
+    client.setVisibility(true);
+
+    const resumes = jsonFrames(socket).filter((frame) => frame.type === "resume");
+    expect(resumes).toHaveLength(2);
+    expect(resumes[0]).toMatchObject({ visible: false, wantsWriterLease: false });
+    expect(resumes[1]).toMatchObject({ visible: true, wantsWriterLease: true });
   });
 
   it("retries a lease-busy composer send after the guard with one mutation id", async () => {

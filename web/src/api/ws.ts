@@ -33,6 +33,14 @@ export interface SessionBootstrapFrame {
   screen: TerminalScreenSnapshot;
 }
 
+type WithoutExpectedLeaseGeneration<T> = T extends unknown
+  ? Omit<T, "expectedLeaseGeneration">
+  : never;
+
+export type WriterLeaseFrame = WithoutExpectedLeaseGeneration<
+  Extract<WsInbound, { type: "input" | "pasteImage" | "resize" }>
+>;
+
 export interface WsClientCallbacks {
   onStatus(status: WsStatus): void;
   onMessage(message: WsOutbound): void;
@@ -77,6 +85,8 @@ const LEASE_HEARTBEAT_MS = 4_000;
 const COMPOSER_RETRY_MIN_MS = 250;
 const COMPOSER_RETRY_MAX_MS = 1_000;
 const COMPOSER_ACK_TIMEOUT_MS = 5_000;
+const FOREGROUND_WAKE_COALESCE_MS = 1_000;
+const MAX_PENDING_WRITER_FRAMES = 256;
 const CLIENT_INSTANCE_ID_KEY = "devmanager.clientInstanceId";
 let fallbackClientInstanceId: string | null = null;
 
@@ -102,12 +112,12 @@ function createClientInstanceId(): string {
 }
 
 export function getClientInstanceId(): string {
-  const storage = globalThis.sessionStorage;
-  if (!storage) {
-    fallbackClientInstanceId ??= createClientInstanceId();
-    return fallbackClientInstanceId;
-  }
   try {
+    const storage = globalThis.sessionStorage;
+    if (!storage) {
+      fallbackClientInstanceId ??= createClientInstanceId();
+      return fallbackClientInstanceId;
+    }
     const existing = storage.getItem(CLIENT_INSTANCE_ID_KEY)?.trim();
     if (existing) return existing;
     const created = createClientInstanceId();
@@ -196,6 +206,7 @@ export class WsClient {
   private composerRetryTimer: number | null = null;
   private composerRetryDelayMs = COMPOSER_RETRY_MIN_MS;
   private lastWriterLeaseRequestAt = Number.NEGATIVE_INFINITY;
+  private lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
   private lastFrameAt = 0;
   private nextRequestId = 1;
   private connectionEpoch = 0;
@@ -204,6 +215,7 @@ export class WsClient {
   private readonly clientInstanceId = getClientInstanceId();
   private readonly pendingRequests = new Map<number, PendingRequest>();
   private readonly pendingComposers = new Map<string, PendingComposer>();
+  private readonly pendingWriterFrames: WriterLeaseFrame[] = [];
 
   constructor(private readonly cb: WsClientCallbacks) {}
 
@@ -259,6 +271,9 @@ export class WsClient {
       this.cb.onStatus({ kind: "open" });
       this.startHeartbeat();
       this.resume();
+      this.lastForegroundWakeAt = this.visible
+        ? Date.now()
+        : Number.NEGATIVE_INFINITY;
       this.scheduleComposerRetry(true);
     };
 
@@ -297,6 +312,7 @@ export class WsClient {
       this.handleRequestDisconnect(`websocket closed: ${reason}`);
       this.markPendingComposersForRetry();
       this.ws = null;
+      this.lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
       this.writerLease = { ...EMPTY_WRITER_LEASE };
       this.cb.onStatus({ kind: "closed", reason });
       if (!this.stopped) this.scheduleReconnect(reason);
@@ -343,6 +359,31 @@ export class WsClient {
         this.scheduleComposerRetry();
       }
     });
+  }
+
+  /**
+   * Send a raw terminal mutation once, but only after ownership is
+   * authoritative. Frames staged before acquisition are safe to retain across
+   * reconnect because they have never reached the socket.
+   */
+  sendWithWriterLease(message: WriterLeaseFrame): boolean {
+    if (this.stopped || this.pendingWriterFrames.length >= MAX_PENDING_WRITER_FRAMES) {
+      return false;
+    }
+    if (
+      this.ws?.readyState === WebSocket.OPEN &&
+      this.writerLease.youAreOwner &&
+      this.send({
+        ...message,
+        expectedLeaseGeneration: this.writerLease.generation,
+      } as WsInbound)
+    ) {
+      return true;
+    }
+    this.pendingWriterFrames.push(message);
+    this.ensureWriterLease();
+    this.scheduleComposerRetry();
+    return true;
   }
 
   submitComposer(submission: ComposerSubmission): Promise<ComposerAccepted> {
@@ -408,6 +449,7 @@ export class WsClient {
     this.cancelComposerRetry();
     this.rejectPendingRequests("websocket stopped");
     this.rejectPendingComposers("websocket stopped");
+    this.pendingWriterFrames.length = 0;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -457,12 +499,26 @@ export class WsClient {
     void this.start();
   }
 
+  /**
+   * Coalesce the browser event burst which represents one foreground return.
+   * Explicit state changes continue to use wake() and are never suppressed.
+   */
+  foreground(): void {
+    const now = Date.now();
+    if (now - this.lastForegroundWakeAt <= FOREGROUND_WAKE_COALESCE_MS) return;
+    this.wake();
+    this.lastForegroundWakeAt = this.visible
+      ? now
+      : Number.NEGATIVE_INFINITY;
+  }
+
   setVisibility(visible: boolean): void {
     this.visible = visible;
     if (visible) {
-      this.wake();
+      this.foreground();
       return;
     }
+    this.lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
     this.send({
       type: "setVisibility",
       clientInstanceId: this.clientInstanceId,
@@ -474,6 +530,7 @@ export class WsClient {
     this.cancelComposerRetry();
     this.rejectPendingRequests(reason);
     this.rejectPendingComposers(reason);
+    this.pendingWriterFrames.length = 0;
     this.writerLease = { ...EMPTY_WRITER_LEASE };
   }
 
@@ -585,7 +642,30 @@ export class WsClient {
   }
 
   private hasPendingRetryWork(): boolean {
-    return this.pendingComposers.size > 0 || this.hasUnsentRequests();
+    return (
+      this.pendingComposers.size > 0 ||
+      this.hasUnsentRequests() ||
+      this.pendingWriterFrames.length > 0
+    );
+  }
+
+  private flushPendingWriterFrames(): void {
+    while (
+      this.pendingWriterFrames.length > 0 &&
+      this.ws?.readyState === WebSocket.OPEN &&
+      this.writerLease.youAreOwner
+    ) {
+      const message = this.pendingWriterFrames[0];
+      if (
+        !this.send({
+          ...message,
+          expectedLeaseGeneration: this.writerLease.generation,
+        } as WsInbound)
+      ) {
+        return;
+      }
+      this.pendingWriterFrames.shift();
+    }
   }
 
   private flushStagedRequests(): void {
@@ -638,6 +718,7 @@ export class WsClient {
       return;
     }
 
+    this.flushPendingWriterFrames();
     this.flushStagedRequests();
     const now = Date.now();
     for (const pending of this.pendingComposers.values()) {
