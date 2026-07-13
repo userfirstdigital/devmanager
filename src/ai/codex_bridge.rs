@@ -1686,9 +1686,16 @@ fn terminate_owned_sidecar_with<Job, Terminate>(
 where
     Terminate: FnOnce(u32) -> Result<(), String>,
 {
-    let result = terminate(pid);
-    drop(managed_job);
-    result
+    match managed_job {
+        Some(managed_job) => {
+            // Closing the retained kill-on-close job is both atomic and
+            // identity-safe. Avoid walking raw descendant PIDs after the
+            // process tree has already been enrolled in the job.
+            drop(managed_job);
+            Ok(())
+        }
+        None => terminate(pid),
+    }
 }
 
 struct SidecarOwnership {
@@ -2220,22 +2227,27 @@ fn terminate_probe_tree(
     pid: u32,
     managed_job: Option<crate::services::platform_service::ManagedProcessJob>,
 ) {
-    let (tree_kill_tx, tree_kill_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        #[cfg(windows)]
-        let result = crate::services::platform_service::kill_process_tree(pid);
-        #[cfg(not(windows))]
-        let result = crate::services::platform_service::terminate_owned_process_group(
-            pid,
-            CODEX_PROCESS_GROUP_TERM_GRACE,
-        );
-        let _ = tree_kill_tx.send(result);
-    });
-    let _ = tree_kill_rx.recv_timeout(CODEX_PROBE_TREE_KILL_TIMEOUT);
+    if let Some(managed_job) = managed_job {
+        // Normal Windows probes are enrolled before execution. Closing this
+        // identity-bound job is safer than snapshotting and killing raw PIDs.
+        drop(managed_job);
+    } else {
+        // Unix process groups and the Windows pre-claim failure path do not
+        // have a retained job, so retain the bounded portable cleanup.
+        let (tree_kill_tx, tree_kill_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            let result = crate::services::platform_service::kill_process_tree(pid);
+            #[cfg(not(windows))]
+            let result = crate::services::platform_service::terminate_owned_process_group(
+                pid,
+                CODEX_PROCESS_GROUP_TERM_GRACE,
+            );
+            let _ = tree_kill_tx.send(result);
+        });
+        let _ = tree_kill_rx.recv_timeout(CODEX_PROBE_TREE_KILL_TIMEOUT);
+    }
 
-    // Closing a Windows kill-on-close job terminates descendants even when the
-    // wrapper has already exited and can no longer be walked as a live root.
-    drop(managed_job);
     let _ = child.kill();
     let reap_deadline = std::time::Instant::now() + CODEX_PROBE_TREE_KILL_TIMEOUT;
     while std::time::Instant::now() < reap_deadline {
@@ -3321,7 +3333,7 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
     }
 
     #[test]
-    fn sidecar_cleanup_policy_uses_retained_pid_and_always_releases_job() {
+    fn sidecar_cleanup_policy_prefers_owned_job_and_walks_only_unowned_tree() {
         struct DropMarker(std::sync::Arc<AtomicBool>);
 
         impl Drop for DropMarker {
@@ -3339,9 +3351,19 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
                 Err("wrapper root already exited".to_string())
             });
 
-        assert_eq!(observed_pid.load(Ordering::Acquire), 42);
+        assert_eq!(observed_pid.load(Ordering::Acquire), 0);
         assert!(released.load(Ordering::Acquire));
-        assert_eq!(result.unwrap_err(), "wrapper root already exited");
+        assert!(result.is_ok());
+
+        let observed_pid = std::sync::Arc::new(AtomicUsize::new(0));
+        let captured_pid = observed_pid.clone();
+        let result = terminate_owned_sidecar_with::<DropMarker, _>(42, None, move |pid| {
+            captured_pid.store(pid as usize, Ordering::Release);
+            Err("unowned tree cleanup failed".to_string())
+        });
+
+        assert_eq!(observed_pid.load(Ordering::Acquire), 42);
+        assert_eq!(result.unwrap_err(), "unowned tree cleanup failed");
     }
 
     #[cfg(windows)]

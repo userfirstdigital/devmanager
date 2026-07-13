@@ -34,6 +34,15 @@ Enable **Settings → Browser Web UI** in the native app. The default listener b
 
 Plain LAN HTTP remains useful for diagnostics and control, but modern iPhone platform features require a secure context. Use a trusted HTTPS tunnel or reverse proxy for the installed experience. The proxy must preserve WebSocket upgrades and forward `/api/**`, `/pair`, the app shell, the manifest, and the service worker to the same DevManager listener.
 
+The trusted proxy must remove any client-supplied forwarding headers and set exactly one value for each of these headers on every forwarded HTTP and WebSocket request:
+
+```text
+X-Forwarded-Proto: https
+X-Forwarded-Host: <the public host, including a non-default port>
+```
+
+`X-Forwarded-Host` may be omitted only when the proxy preserves that same public authority in `Host`. Do not append forwarding values or send comma-separated lists. DevManager uses this exact public scheme and authority to issue `Secure` cookies and reject cross-origin WebSocket and push mutations.
+
 Do not expose port `43872` directly to the public internet. Keep DevManager's cookie and pairing boundaries intact; do not add a proxy cache in front of authenticated API routes.
 
 ## Install on iPhone
