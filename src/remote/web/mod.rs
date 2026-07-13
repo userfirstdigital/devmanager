@@ -704,7 +704,7 @@ async fn pair_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, "cookie signing failed").into_response();
     };
 
-    let cookie = auth_cookie_header(&cookie_name, &signed);
+    let cookie = auth_cookie_header(&cookie_name, &signed, &headers);
 
     let mut response = Redirect::to("/").into_response();
     response
@@ -748,13 +748,19 @@ fn response_with_retry_after(
     response
 }
 
-fn auth_cookie_header(cookie_name: &str, signed: &str) -> String {
-    // HttpOnly + SameSite=Lax. `Secure` is intentionally omitted because MVP
-    // ships over plain HTTP on LAN; later TLS modes will add it conditionally.
-    format!(
+fn auth_cookie_header(cookie_name: &str, signed: &str, headers: &HeaderMap) -> String {
+    let mut cookie = format!(
         "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
         cookie_name, signed, WEB_COOKIE_MAX_AGE_SECS,
-    )
+    );
+    if single_request_header(headers, "x-forwarded-proto")
+        .ok()
+        .flatten()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+    {
+        cookie.push_str("; Secure");
+    }
+    cookie
 }
 
 fn request_auth_cookie(state: &WebState, headers: &HeaderMap) -> Option<(String, String)> {
@@ -781,7 +787,7 @@ async fn me_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> R
             )
                 .into_response();
             if let Some((cookie_name, cookie_value)) = request_auth_cookie(&state, &headers) {
-                let cookie = auth_cookie_header(&cookie_name, &cookie_value);
+                let cookie = auth_cookie_header(&cookie_name, &cookie_value, &headers);
                 if let Ok(value) = cookie.parse() {
                     response.headers_mut().insert(header::SET_COOKIE, value);
                 }
@@ -1689,6 +1695,36 @@ mod tests {
     }
 
     #[test]
+    fn auth_cookie_header_preserves_raw_http_cookie_attributes() {
+        let cookie = auth_cookie_header("dm_web_host", "signed-value", &HeaderMap::new());
+
+        assert_eq!(
+            cookie,
+            "dm_web_host=signed-value; HttpOnly; SameSite=Lax; Path=/; Max-Age=315360000"
+        );
+    }
+
+    #[test]
+    fn auth_cookie_header_requires_one_valid_forwarded_https_scheme() {
+        let mut https = HeaderMap::new();
+        https.insert("x-forwarded-proto", "HTTPS".parse().unwrap());
+        assert!(auth_cookie_header("dm_web", "signed", &https).ends_with("; Secure"));
+
+        let mut http = HeaderMap::new();
+        http.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!auth_cookie_header("dm_web", "signed", &http).contains("; Secure"));
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert!(!auth_cookie_header("dm_web", "signed", &malformed).contains("; Secure"));
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("x-forwarded-proto", "https".parse().unwrap());
+        duplicate.append("x-forwarded-proto", "https".parse().unwrap());
+        assert!(!auth_cookie_header("dm_web", "signed", &duplicate).contains("; Secure"));
+    }
+
+    #[test]
     fn pair_handler_sets_effectively_permanent_cookie() {
         let _profile = TestProfileGuard::new("web-cookie-max-age");
         let service = test_service("host-a");
@@ -1724,6 +1760,39 @@ mod tests {
             set_cookie.contains("Max-Age=315360000"),
             "expected 10-year Max-Age, got: {set_cookie}"
         );
+        assert!(!set_cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn pair_handler_marks_forwarded_https_cookie_secure() {
+        let _profile = TestProfileGuard::new("web-cookie-secure-pair");
+        let service = test_service("host-secure-pair");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut headers = test_headers(None);
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        let response = runtime.block_on(route_request(
+            state,
+            axum::http::Method::GET,
+            "/pair?t=PAIR1234",
+            headers,
+            Vec::new(),
+        ));
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8");
+        assert!(set_cookie.contains("; Secure"), "cookie was: {set_cookie}");
+        assert!(set_cookie.contains("; HttpOnly; SameSite=Lax; Path=/;"));
     }
 
     #[test]
@@ -1779,6 +1848,61 @@ mod tests {
             set_cookie.contains("Max-Age=315360000"),
             "expected refreshed 10-year Max-Age, got: {set_cookie}"
         );
+        assert!(!set_cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn me_handler_marks_forwarded_https_refresh_secure() {
+        let _profile = TestProfileGuard::new("web-cookie-secure-refresh");
+        let service = test_service("host-secure-refresh");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let pair_response = runtime.block_on(route_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/pair?t=PAIR1234",
+            HeaderMap::new(),
+            Vec::new(),
+        ));
+        let cookie_header = pair_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("pair response should set auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8")
+            .split(';')
+            .next()
+            .expect("cookie name/value")
+            .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            cookie_header.parse().expect("cookie header"),
+        );
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        let response = runtime.block_on(route_request(
+            state,
+            axum::http::Method::GET,
+            "/api/me",
+            headers,
+            Vec::new(),
+        ));
+        drop(runtime);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("me response should refresh auth cookie")
+            .to_str()
+            .expect("cookie should be utf-8");
+        assert!(set_cookie.contains("; Secure"), "cookie was: {set_cookie}");
+        assert!(set_cookie.contains("; HttpOnly; SameSite=Lax; Path=/;"));
     }
 
     #[test]
