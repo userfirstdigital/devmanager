@@ -10,6 +10,7 @@ import {
   notificationAvailability,
   notificationClickDestination,
   reconcileChangedPushSubscription,
+  reconcilePushNotificationsOnForeground,
   readPushRegistrationState,
   readPushStatus,
   type PushBrowserDependencies,
@@ -58,8 +59,12 @@ function pushDependencies(overrides: Partial<PushBrowserDependencies> = {}) {
     if (url === "/api/push" && (!init?.method || init.method === "GET")) {
       return response({
         publicKey: base64Url(vapidPublicKey),
+        enabled: false,
         subscribed: false,
       });
+    }
+    if (url === "/api/push" && init?.method === "POST") {
+      return response({ enabled: true });
     }
     return response(null, 204);
   });
@@ -116,6 +121,7 @@ describe("Web Push setup", () => {
     const fetch = vi.fn(async () =>
       response({
         publicKey: "public-vapid-key",
+        enabled: true,
         subscribed: true,
         vapidPrivateKey: "must-never-enter-the-browser-model",
       }),
@@ -123,6 +129,7 @@ describe("Web Push setup", () => {
 
     await expect(readPushStatus(fetch)).resolves.toEqual({
       publicKey: "public-vapid-key",
+      enabled: true,
       subscribed: true,
     });
     expect(fetch).toHaveBeenCalledWith("/api/push", {
@@ -141,6 +148,7 @@ describe("Web Push setup", () => {
 
     await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
       publicKey: "public-vapid-key",
+      enabled: true,
       subscribed: false,
     });
   });
@@ -159,14 +167,16 @@ describe("Web Push setup", () => {
       if (String(input) === "/api/push" && (!init?.method || init.method === "GET")) {
         return response({
           publicKey: base64Url(vapidPublicKey),
+          enabled: true,
           subscribed: true,
         });
       }
-      return response(null, 204);
+      return response({ enabled: true });
     });
 
     await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
       publicKey: base64Url(vapidPublicKey),
+      enabled: true,
       subscribed: true,
     });
     expect(pushManager.subscribe).toHaveBeenCalledWith({
@@ -191,9 +201,75 @@ describe("Web Push setup", () => {
 
     await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
       publicKey: base64Url(vapidPublicKey),
+      enabled: false,
       subscribed: false,
     });
     expect(pushManager.subscribe).not.toHaveBeenCalled();
+  });
+
+  it("removes a local subscription when host intent is disabled without registering it", async () => {
+    const { dependencies, fetch, pushManager, subscription, vapidPublicKey } =
+      pushDependencies({
+        notification: {
+          permission: "granted",
+          requestPermission: vi.fn(
+            async (): Promise<NotificationPermission> => "granted",
+          ),
+        },
+      });
+    subscription.options.applicationServerKey =
+      vapidPublicKey.buffer as ArrayBuffer;
+    pushManager.getSubscription.mockResolvedValue(subscription);
+
+    await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
+      publicKey: base64Url(vapidPublicKey),
+      enabled: false,
+      subscribed: false,
+    });
+
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(pushManager.subscribe).not.toHaveBeenCalled();
+    expect(
+      fetch.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toEqual([]);
+  });
+
+  it("replaces a wrong-key browser subscription while preserving enabled host intent", async () => {
+    const { dependencies, fetch, pushManager, subscription, vapidPublicKey } =
+      pushDependencies({
+        notification: {
+          permission: "granted",
+          requestPermission: vi.fn(
+            async (): Promise<NotificationPermission> => "granted",
+          ),
+        },
+      });
+    subscription.options.applicationServerKey = new Uint8Array([4, 1, 2]).buffer;
+    pushManager.getSubscription.mockResolvedValue(subscription);
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/push" && !init?.method) {
+        return response({
+          publicKey: base64Url(vapidPublicKey),
+          enabled: true,
+          subscribed: true,
+        });
+      }
+      return response({ enabled: true });
+    });
+
+    await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
+      publicKey: base64Url(vapidPublicKey),
+      enabled: true,
+      subscribed: true,
+    });
+
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(pushManager.subscribe).toHaveBeenCalledTimes(1);
+    const lastCall = fetch.mock.calls[fetch.mock.calls.length - 1];
+    const registration = JSON.parse(String(lastCall?.[1]?.body)) as {
+      mode: string;
+    };
+    expect(registration.mode).toBe("reconcile");
   });
 
   it("reconciles the exact local endpoint and keys when the host retains a stale endpoint", async () => {
@@ -215,12 +291,13 @@ describe("Web Push setup", () => {
       if (String(input) === "/api/push" && (!init?.method || init.method === "GET")) {
         return response({
           publicKey: base64Url(vapidPublicKey),
+          enabled: true,
           subscribed: hostRegistration !== null,
         });
       }
       if (String(input) === "/api/push" && init?.method === "POST") {
         hostRegistration = JSON.parse(String(init.body)) as typeof hostRegistration;
-        return response(null, 204);
+        return response({ enabled: true });
       }
       throw new Error(`unexpected request: ${String(input)}`);
     });
@@ -228,10 +305,12 @@ describe("Web Push setup", () => {
 
     await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
       publicKey: base64Url(vapidPublicKey),
+      enabled: true,
       subscribed: true,
     });
 
     expect(hostRegistration).toEqual({
+      mode: "reconcile",
       endpoint: subscription.endpoint,
       keys: {
         p256dh: base64Url(new Uint8Array(p256dh)),
@@ -244,6 +323,38 @@ describe("Web Push setup", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(hostRegistration),
     });
+  });
+
+  it("removes the local subscription when atomic reconcile loses to host disable", async () => {
+    const { dependencies, pushManager, subscription, vapidPublicKey } =
+      pushDependencies({
+        notification: {
+          permission: "granted",
+          requestPermission: vi.fn(
+            async (): Promise<NotificationPermission> => "granted",
+          ),
+        },
+      });
+    subscription.options.applicationServerKey =
+      vapidPublicKey.buffer as ArrayBuffer;
+    pushManager.getSubscription.mockResolvedValue(subscription);
+    dependencies.fetch = vi.fn(async (input, init) => {
+      if (String(input) === "/api/push" && !init?.method) {
+        return response({
+          publicKey: base64Url(vapidPublicKey),
+          enabled: true,
+          subscribed: true,
+        });
+      }
+      return response({ enabled: false });
+    });
+
+    await expect(readPushRegistrationState(dependencies)).resolves.toEqual({
+      publicKey: base64Url(vapidPublicKey),
+      enabled: false,
+      subscribed: false,
+    });
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   it("requests permission, subscribes with the host key, and registers exact browser keys", async () => {
@@ -260,6 +371,7 @@ describe("Web Push setup", () => {
 
     await expect(enablePushNotifications(dependencies)).resolves.toEqual({
       publicKey: base64Url(vapidPublicKey),
+      enabled: true,
       subscribed: true,
     });
 
@@ -273,6 +385,7 @@ describe("Web Push setup", () => {
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        mode: "enable",
         endpoint: subscription.endpoint,
         keys: {
           p256dh: base64Url(new Uint8Array(p256dh)),
@@ -282,7 +395,7 @@ describe("Web Push setup", () => {
     });
   });
 
-  it("registers a changed browser subscription before retiring the old endpoint", async () => {
+  it("atomically registers a changed browser subscription without stale cleanup", async () => {
     const {
       dependencies,
       fetch,
@@ -293,6 +406,16 @@ describe("Web Push setup", () => {
       auth,
     } = pushDependencies();
     subscription.options.applicationServerKey = vapidPublicKey.buffer as ArrayBuffer;
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input) === "/api/push" && !init?.method) {
+        return response({
+          publicKey: base64Url(vapidPublicKey),
+          enabled: true,
+          subscribed: true,
+        });
+      }
+      return response({ enabled: true });
+    });
     const oldSubscription = {
       ...subscription,
       endpoint: "https://web.push.apple.com/Q1/expired-endpoint",
@@ -311,6 +434,7 @@ describe("Web Push setup", () => {
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            mode: "reconcile",
             endpoint: subscription.endpoint,
             keys: {
               p256dh: base64Url(new Uint8Array(p256dh)),
@@ -319,21 +443,32 @@ describe("Web Push setup", () => {
           }),
         },
       ],
-      [
-        "/api/push/unsubscribe",
-        {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: oldSubscription.endpoint }),
-        },
-      ],
     ]);
+  });
+
+  it("follows disabled host intent during service-worker subscription rotation", async () => {
+    const { dependencies, fetch, pushManager, subscription } =
+      pushDependencies();
+
+    await expect(
+      reconcileChangedPushSubscription(
+        { fetch: dependencies.fetch, pushManager },
+        { newSubscription: subscription },
+      ),
+    ).resolves.toEqual(
+      expect.objectContaining({ enabled: false, subscribed: false }),
+    );
+
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(pushManager.subscribe).not.toHaveBeenCalled();
+    expect(
+      fetch.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toEqual([]);
   });
 
   it("rejects malformed host application keys before touching PushManager", async () => {
     const invalidFetch = vi.fn(async () =>
-      response({ publicKey: "BAMCAQ", subscribed: false }),
+      response({ publicKey: "BAMCAQ", enabled: false, subscribed: false }),
     );
     const { dependencies, pushManager } = pushDependencies({
       fetch: invalidFetch,
@@ -362,7 +497,7 @@ describe("Web Push setup", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("removes the authenticated host endpoint and browser subscription", async () => {
+  it("atomically disables host intent and then removes the browser subscription", async () => {
     const { dependencies, fetch, pushManager, subscription } =
       pushDependencies();
     pushManager.getSubscription.mockResolvedValue(subscription);
@@ -373,8 +508,112 @@ describe("Web Push setup", () => {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ endpoint: subscription.endpoint }),
+      body: JSON.stringify({ disable: true }),
     });
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables host intent even when the browser has already lost its subscription", async () => {
+    const { dependencies, fetch } = pushDependencies();
+
+    await expect(disablePushNotifications(dependencies)).resolves.toBe(false);
+
+    expect(fetch).toHaveBeenCalledWith("/api/push/unsubscribe", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disable: true }),
+    });
+  });
+
+  it("coalesces simultaneous automatic foreground reconciliation", async () => {
+    const { dependencies, fetch, vapidPublicKey } = pushDependencies({
+      notification: {
+        permission: "granted",
+        requestPermission: vi.fn(
+          async (): Promise<NotificationPermission> => "granted",
+        ),
+      },
+    });
+    let releaseStatus!: () => void;
+    const statusGate = new Promise<void>((resolve) => {
+      releaseStatus = resolve;
+    });
+    fetch.mockImplementation(async () => {
+      await statusGate;
+      return response({
+        publicKey: base64Url(vapidPublicKey),
+        enabled: false,
+        subscribed: false,
+      });
+    });
+
+    const first = reconcilePushNotificationsOnForeground(dependencies);
+    const second = reconcilePushNotificationsOnForeground(dependencies);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    releaseStatus();
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes explicit disable behind in-flight foreground repair so disable wins", async () => {
+    const { dependencies, pushManager, subscription, vapidPublicKey } =
+      pushDependencies({
+        notification: {
+          permission: "granted",
+          requestPermission: vi.fn(
+            async (): Promise<NotificationPermission> => "granted",
+          ),
+        },
+      });
+    subscription.options.applicationServerKey =
+      vapidPublicKey.buffer as ArrayBuffer;
+    pushManager.getSubscription.mockResolvedValue(subscription);
+    let hostEnabled = true;
+    let releaseRepair!: () => void;
+    const repairGate = new Promise<void>((resolve) => {
+      releaseRepair = resolve;
+    });
+    let repairStarted!: () => void;
+    const repairStartedGate = new Promise<void>((resolve) => {
+      repairStarted = resolve;
+    });
+    const mutations: string[] = [];
+    dependencies.fetch = vi.fn(async (input, init) => {
+      if (String(input) === "/api/push" && !init?.method) {
+        return response({
+          publicKey: base64Url(vapidPublicKey),
+          enabled: hostEnabled,
+          subscribed: hostEnabled,
+        });
+      }
+      const body = JSON.parse(String(init?.body)) as {
+        mode?: string;
+        disable?: boolean;
+      };
+      if (String(input) === "/api/push") {
+        mutations.push(body.mode ?? "unknown");
+        repairStarted();
+        await repairGate;
+        return response({ enabled: hostEnabled });
+      }
+      mutations.push(body.disable ? "disable" : "unknown");
+      hostEnabled = false;
+      return response(null, 204);
+    });
+
+    const foreground = reconcilePushNotificationsOnForeground(dependencies);
+    await repairStartedGate;
+    const disable = disablePushNotifications(dependencies);
+    await Promise.resolve();
+    expect(mutations).toEqual(["reconcile"]);
+    releaseRepair();
+
+    await foreground;
+    await expect(disable).resolves.toBe(true);
+    expect(mutations).toEqual(["reconcile", "disable"]);
+    expect(hostEnabled).toBe(false);
     expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
   });
 });

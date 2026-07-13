@@ -23,8 +23,11 @@ export type NotificationAvailability =
 
 export interface PushStatus {
   publicKey: string;
+  enabled: boolean;
   subscribed: boolean;
 }
+
+type PushRegistrationMode = "enable" | "reconcile";
 
 interface NotificationApi {
   permission: NotificationPermission;
@@ -118,6 +121,18 @@ function browserDependencies(): PushBrowserDependencies {
   };
 }
 
+let pushOperationTail: Promise<void> = Promise.resolve();
+let automaticReconciliation: Promise<PushStatus | null> | null = null;
+
+function serializePushOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = pushOperationTail.then(operation, operation);
+  pushOperationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 function assertSuccessful(response: Response, action: string): Response {
   if (!response.ok) {
     throw new Error(`${action} failed (${response.status}).`);
@@ -136,66 +151,106 @@ export async function readPushStatus(
     "Reading notification status",
   );
   const value = (await response.json()) as unknown;
+  const record = value as Record<string, unknown>;
+  const enabled =
+    typeof record?.enabled === "boolean"
+      ? record.enabled
+      : record?.subscribed;
   if (
     value === null ||
     typeof value !== "object" ||
-    typeof (value as Record<string, unknown>).publicKey !== "string" ||
-    (value as Record<string, unknown>).publicKey === "" ||
-    typeof (value as Record<string, unknown>).subscribed !== "boolean"
+    typeof record.publicKey !== "string" ||
+    record.publicKey === "" ||
+    typeof enabled !== "boolean"
   ) {
     throw new Error("The host returned an invalid notification status.");
   }
   return {
-    publicKey: (value as { publicKey: string }).publicKey,
-    subscribed: (value as { subscribed: boolean }).subscribed,
+    publicKey: record.publicKey,
+    enabled,
+    subscribed: enabled,
   };
 }
 
 export async function readPushRegistrationState(
   dependencies: PushBrowserDependencies = browserDependencies(),
 ): Promise<PushStatus> {
+  return serializePushOperation(() =>
+    readPushRegistrationStateNow(dependencies),
+  );
+}
+
+async function readPushRegistrationStateNow(
+  dependencies: PushBrowserDependencies,
+): Promise<PushStatus> {
   const [hostStatus, registration] = await Promise.all([
     readPushStatus(dependencies.fetch),
     dependencies.serviceWorker.ready,
   ]);
   let subscription = await registration.pushManager.getSubscription();
-  if (!subscription) {
-    if (
-      !hostStatus.subscribed ||
-      dependencies.notification.permission !== "granted"
-    ) {
-      return { publicKey: hostStatus.publicKey, subscribed: false };
-    }
-    const applicationServerKey = decodeBase64Url(hostStatus.publicKey);
-    subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey,
-    });
-    try {
-      await registerHostSubscription(
-        subscription,
-        dependencies.fetch,
-        "Refreshing notifications",
-      );
-    } catch (error) {
-      await subscription.unsubscribe().catch(() => false);
-      throw error;
-    }
-    return { publicKey: hostStatus.publicKey, subscribed: true };
+  if (!hostStatus.enabled) {
+    if (subscription) await subscription.unsubscribe().catch(() => false);
+    return {
+      publicKey: hostStatus.publicKey,
+      enabled: false,
+      subscribed: false,
+    };
+  }
+  if (
+    subscription === null &&
+    dependencies.notification.permission !== "granted"
+  ) {
+    return {
+      publicKey: hostStatus.publicKey,
+      enabled: true,
+      subscribed: false,
+    };
   }
   const applicationServerKey = decodeBase64Url(hostStatus.publicKey);
   if (
+    subscription &&
     !sameBytes(subscription.options?.applicationServerKey, applicationServerKey)
   ) {
-    return { publicKey: hostStatus.publicKey, subscribed: false };
+    await subscription.unsubscribe().catch(() => false);
+    subscription = null;
   }
-  await registerHostSubscription(
-    subscription,
-    dependencies.fetch,
-    "Refreshing notifications",
-  );
+  if (
+    subscription === null &&
+    dependencies.notification.permission !== "granted"
+  ) {
+    return {
+      publicKey: hostStatus.publicKey,
+      enabled: true,
+      subscribed: false,
+    };
+  }
+  const created = subscription === null;
+  subscription ??= await registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey,
+  });
+  try {
+    const enabled = await registerHostSubscription(
+      subscription,
+      dependencies.fetch,
+      "Refreshing notifications",
+      "reconcile",
+    );
+    if (!enabled) {
+      await subscription.unsubscribe().catch(() => false);
+      return {
+        publicKey: hostStatus.publicKey,
+        enabled: false,
+        subscribed: false,
+      };
+    }
+  } catch (error) {
+    if (created) await subscription.unsubscribe().catch(() => false);
+    throw error;
+  }
   return {
     publicKey: hostStatus.publicKey,
+    enabled: true,
     subscribed: true,
   };
 }
@@ -245,16 +300,13 @@ function sameBytes(left: ArrayBuffer | null | undefined, right: Uint8Array) {
   );
 }
 
-async function unregisterHostEndpoint(
-  endpoint: string,
-  fetchImpl: FetchLike,
-): Promise<void> {
+async function disableHostIntent(fetchImpl: FetchLike): Promise<void> {
   assertSuccessful(
     await fetchImpl("/api/push/unsubscribe", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ endpoint }),
+      body: JSON.stringify({ disable: true }),
     }),
     "Disabling notifications",
   );
@@ -264,18 +316,20 @@ async function registerHostSubscription(
   subscription: PushSubscriptionLike,
   fetchImpl: FetchLike,
   action: string,
-): Promise<void> {
+  mode: PushRegistrationMode,
+): Promise<boolean> {
   const p256dh = subscription.getKey("p256dh");
   const auth = subscription.getKey("auth");
   if (!p256dh || !auth) {
     throw new Error("The browser did not provide notification keys.");
   }
-  assertSuccessful(
+  const response = assertSuccessful(
     await fetchImpl("/api/push", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        mode,
         endpoint: subscription.endpoint,
         keys: {
           p256dh: encodeBase64Url(p256dh),
@@ -285,6 +339,16 @@ async function registerHostSubscription(
     }),
     action,
   );
+  if (response.status === 204) return true;
+  const value = (await response.json()) as unknown;
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    typeof (value as Record<string, unknown>).enabled !== "boolean"
+  ) {
+    throw new Error("The host returned an invalid notification result.");
+  }
+  return (value as { enabled: boolean }).enabled;
 }
 
 export async function reconcilePushNotificationsOnForeground(
@@ -293,7 +357,20 @@ export async function reconcilePushNotificationsOnForeground(
   if (!dependencies && !currentNotificationAvailability().supported) return null;
   const resolved = dependencies ?? browserDependencies();
   if (resolved.notification.permission !== "granted") return null;
-  return readPushRegistrationState(resolved);
+  if (automaticReconciliation) return automaticReconciliation;
+  const pending = serializePushOperation(() =>
+    readPushRegistrationStateNow(resolved),
+  );
+  automaticReconciliation = pending;
+  pending.then(
+    () => {
+      if (automaticReconciliation === pending) automaticReconciliation = null;
+    },
+    () => {
+      if (automaticReconciliation === pending) automaticReconciliation = null;
+    },
+  );
+  return pending;
 }
 
 export async function reconcileChangedPushSubscription(
@@ -305,11 +382,35 @@ export async function reconcileChangedPushSubscription(
     newSubscription?: PushSubscriptionLike | null;
   } = {},
 ): Promise<PushStatus> {
+  return serializePushOperation(() =>
+    reconcileChangedPushSubscriptionNow(dependencies, changed),
+  );
+}
+
+async function reconcileChangedPushSubscriptionNow(
+  dependencies: Pick<PushBrowserDependencies, "fetch"> & {
+    pushManager: PushManagerLike;
+  },
+  changed: {
+    oldSubscription?: PushSubscriptionLike | null;
+    newSubscription?: PushSubscriptionLike | null;
+  },
+): Promise<PushStatus> {
   const hostStatus = await readPushStatus(dependencies.fetch);
-  const applicationServerKey = decodeBase64Url(hostStatus.publicKey);
   let subscription =
     changed.newSubscription ??
     (await dependencies.pushManager.getSubscription());
+
+  if (!hostStatus.enabled) {
+    if (subscription) await subscription.unsubscribe().catch(() => false);
+    return {
+      publicKey: hostStatus.publicKey,
+      enabled: false,
+      subscribed: false,
+    };
+  }
+
+  const applicationServerKey = decodeBase64Url(hostStatus.publicKey);
 
   if (
     subscription &&
@@ -324,31 +425,37 @@ export async function reconcileChangedPushSubscription(
     userVisibleOnly: true,
     applicationServerKey,
   });
+  let enabled: boolean;
   try {
-    await registerHostSubscription(
+    enabled = await registerHostSubscription(
       subscription,
       dependencies.fetch,
       "Refreshing notifications",
+      "reconcile",
     );
   } catch (error) {
     if (created) await subscription.unsubscribe().catch(() => false);
     throw error;
   }
-
-  if (
-    changed.oldSubscription &&
-    changed.oldSubscription.endpoint !== subscription.endpoint
-  ) {
-    await unregisterHostEndpoint(
-      changed.oldSubscription.endpoint,
-      dependencies.fetch,
-    ).catch(() => undefined);
+  if (!enabled) {
+    await subscription.unsubscribe().catch(() => false);
+    return {
+      publicKey: hostStatus.publicKey,
+      enabled: false,
+      subscribed: false,
+    };
   }
-  return { publicKey: hostStatus.publicKey, subscribed: true };
+  return { publicKey: hostStatus.publicKey, enabled: true, subscribed: true };
 }
 
 export async function enablePushNotifications(
   dependencies: PushBrowserDependencies = browserDependencies(),
+): Promise<PushStatus> {
+  return serializePushOperation(() => enablePushNotificationsNow(dependencies));
+}
+
+async function enablePushNotificationsNow(
+  dependencies: PushBrowserDependencies,
 ): Promise<PushStatus> {
   const permission =
     dependencies.notification.permission === "granted"
@@ -367,10 +474,7 @@ export async function enablePushNotifications(
     subscription &&
     !sameBytes(subscription.options?.applicationServerKey, applicationServerKey)
   ) {
-    await Promise.allSettled([
-      unregisterHostEndpoint(subscription.endpoint, dependencies.fetch),
-      subscription.unsubscribe(),
-    ]);
+    await subscription.unsubscribe().catch(() => false);
     subscription = null;
   }
 
@@ -381,32 +485,36 @@ export async function enablePushNotifications(
   });
 
   try {
-    await registerHostSubscription(
+    const enabled = await registerHostSubscription(
       subscription,
       dependencies.fetch,
       "Enabling notifications",
+      "enable",
     );
+    if (!enabled) throw new Error("The host did not enable notifications.");
   } catch (error) {
     if (created) await subscription.unsubscribe().catch(() => false);
     throw error;
   }
 
-  return { publicKey: hostStatus.publicKey, subscribed: true };
+  return { publicKey: hostStatus.publicKey, enabled: true, subscribed: true };
 }
 
 export async function disablePushNotifications(
   dependencies: PushBrowserDependencies = browserDependencies(),
 ): Promise<boolean> {
-  const registration = await dependencies.serviceWorker.ready;
+  return serializePushOperation(() => disablePushNotificationsNow(dependencies));
+}
+
+async function disablePushNotificationsNow(
+  dependencies: PushBrowserDependencies,
+): Promise<boolean> {
+  const registrationPromise = dependencies.serviceWorker.ready;
+  await disableHostIntent(dependencies.fetch);
+  const registration = await registrationPromise;
   const subscription = await registration.pushManager.getSubscription();
   if (!subscription) return false;
-
-  const [host, browser] = await Promise.allSettled([
-    unregisterHostEndpoint(subscription.endpoint, dependencies.fetch),
-    subscription.unsubscribe(),
-  ]);
-  if (host.status === "rejected") throw host.reason;
-  if (browser.status === "rejected") throw browser.reason;
+  await subscription.unsubscribe();
   return true;
 }
 
