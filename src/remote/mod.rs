@@ -9,8 +9,10 @@ pub use client_pool::RemoteClientPool;
 pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
 
 use presentation::{
-    SemanticJournalStore, SemanticReplay, SemanticSessionMetadata, StableSessionKey,
+    SemanticEvent, SemanticEventDraft, SemanticJournalStore, SemanticReplay,
+    SemanticSessionMetadata, StableSessionKey,
 };
+use web::lease::WriterLeaseManager;
 
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
@@ -952,6 +954,11 @@ pub(crate) struct RemoteHostInner {
     terminal_input_handler: RwLock<Option<TerminalInputHandler>>,
     terminal_resize_handler: RwLock<Option<TerminalResizeHandler>>,
     focused_session_handler: RwLock<Option<FocusedSessionHandler>>,
+    /// Browser mutation coordination. Lock order is writer lease -> native
+    /// controller; neither this nor the mutation registry may be held while a
+    /// terminal/bootstrap callback runs.
+    web_writer_leases: Mutex<WriterLeaseManager>,
+    web_composer_mutations: Mutex<HashMap<String, WebComposerMutationRecord>>,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
@@ -971,6 +978,25 @@ pub(crate) struct RemoteHostInner {
     web_listener: Mutex<Option<WebListenerHandle>>,
     #[allow(dead_code)]
     web_listener_error: RwLock<Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WebComposerMutationRecord {
+    pub(crate) fingerprint: u64,
+    pub(crate) status: WebComposerMutationStatus,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WebComposerMutationStatus {
+    InFlight,
+    PtyRejected {
+        message: String,
+    },
+    Accepted {
+        stable_session_key: StableSessionKey,
+        accepted_sequence: u64,
+        lease_generation: u64,
+    },
 }
 
 struct SemanticPublicationEpoch<'a> {
@@ -1074,6 +1100,8 @@ impl RemoteHostService {
                 terminal_input_handler: RwLock::new(None),
                 terminal_resize_handler: RwLock::new(None),
                 focused_session_handler: RwLock::new(None),
+                web_writer_leases: Mutex::new(WriterLeaseManager::new(Duration::from_secs(8))),
+                web_composer_mutations: Mutex::new(HashMap::new()),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
                 controller_client_id: RwLock::new(None),
@@ -1337,9 +1365,9 @@ impl RemoteHostService {
                 dead_connections.push(*connection_id);
             }
         }
-        for connection_id in dead_connections {
-            clients.remove(&connection_id);
-        }
+        let removed = remove_client_records(&mut clients, dead_connections);
+        drop(clients);
+        release_removed_web_connections(&self.inner, removed);
     }
 
     pub fn push_session_runtime(&self, session_id: &str, runtime: SessionRuntimeState) {
@@ -1384,9 +1412,9 @@ impl RemoteHostService {
                 dead_connections.push(*connection_id);
             }
         }
-        for connection_id in dead_connections {
-            clients.remove(&connection_id);
-        }
+        let removed = remove_client_records(&mut clients, dead_connections);
+        drop(clients);
+        release_removed_web_connections(&self.inner, removed);
     }
 
     fn publish_semantic_change(
@@ -1495,9 +1523,9 @@ impl RemoteHostService {
                 dead_connections.push(*connection_id);
             }
         }
-        for connection_id in dead_connections {
-            clients.remove(&connection_id);
-        }
+        let removed = remove_client_records(&mut clients, dead_connections);
+        drop(clients);
+        release_removed_web_connections(&self.inner, removed);
     }
 
     pub fn drain_requests(&self) -> Vec<PendingRemoteRequest> {
@@ -1657,22 +1685,29 @@ impl RemoteHostService {
             Err(_) => return false,
         };
 
-        if let Ok(mut clients) = self.inner.clients.lock() {
+        let removed_connections = if let Ok(mut clients) = self.inner.clients.lock() {
             let connection_ids: Vec<u64> = clients
                 .iter()
                 .filter_map(|(connection_id, client)| {
                     (client.client_id == client_id).then_some(*connection_id)
                 })
                 .collect();
-            for connection_id in connection_ids {
-                if let Some(client) = clients.remove(&connection_id) {
-                    let _ = client.sender.send(ServerMessage::Disconnected {
-                        message: "This browser invite was revoked. Pair again to reconnect."
-                            .to_string(),
-                    });
-                }
-            }
-        }
+            connection_ids
+                .into_iter()
+                .filter_map(|connection_id| {
+                    clients.remove(&connection_id).map(|client| {
+                        let _ = client.sender.send(ServerMessage::Disconnected {
+                            message: "This browser invite was revoked. Pair again to reconnect."
+                                .to_string(),
+                        });
+                        (connection_id, client.client_id)
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        release_removed_web_connections(&self.inner, removed_connections);
 
         if let Ok(mut controller) = self.inner.controller_client_id.write() {
             if controller.as_deref() == Some(client_id) {
@@ -1704,7 +1739,7 @@ impl RemoteHostService {
         };
         let removed_client_ids: HashSet<String> = removed_client_ids.into_iter().collect();
 
-        if let Ok(mut clients) = self.inner.clients.lock() {
+        let removed_connections = if let Ok(mut clients) = self.inner.clients.lock() {
             let connection_ids: Vec<u64> = clients
                 .iter()
                 .filter_map(|(connection_id, client)| {
@@ -1713,14 +1748,22 @@ impl RemoteHostService {
                     .then_some(*connection_id)
                 })
                 .collect();
-            for connection_id in connection_ids {
-                if let Some(client) = clients.remove(&connection_id) {
-                    let _ = client.sender.send(ServerMessage::Disconnected {
-                        message: "Browser access was reset. Pair again to reconnect.".to_string(),
-                    });
-                }
-            }
-        }
+            connection_ids
+                .into_iter()
+                .filter_map(|connection_id| {
+                    clients.remove(&connection_id).map(|client| {
+                        let _ = client.sender.send(ServerMessage::Disconnected {
+                            message: "Browser access was reset. Pair again to reconnect."
+                                .to_string(),
+                        });
+                        (connection_id, client.client_id)
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        release_removed_web_connections(&self.inner, removed_connections);
 
         if let Ok(mut controller) = self.inner.controller_client_id.write() {
             if controller
@@ -1744,9 +1787,7 @@ impl RemoteHostService {
     }
 
     pub fn take_local_control(&self) {
-        if let Ok(mut controller) = self.inner.controller_client_id.write() {
-            *controller = None;
-        }
+        set_native_controller(&self.inner, None);
     }
 
     fn bump_config_revision(&self) {
@@ -2683,9 +2724,9 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             client.last_you_have_control = you_have_control;
         }
 
-        for connection_id in dead_connections {
-            clients.remove(&connection_id);
-        }
+        let removed = remove_client_records(&mut clients, dead_connections);
+        drop(clients);
+        release_removed_web_connections(&inner, removed);
 
         last_snapshot_revision = snapshot_revision;
         last_controller_client_id = controller_client_id;
@@ -2805,9 +2846,9 @@ pub(crate) fn deliver_pending_bootstraps(
             }
         }
     }
-    for connection_id in dead_connections {
-        clients.remove(&connection_id);
-    }
+    let removed = remove_client_records(&mut clients, dead_connections);
+    drop(clients);
+    release_removed_web_connections(inner, removed);
 }
 
 fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, stream: TcpStream) {
@@ -3057,9 +3098,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
                 }
             }
             Ok(Some(ClientMessage::TakeControl)) => {
-                if let Ok(mut controller) = inner.controller_client_id.write() {
-                    *controller = Some(client_id.clone());
-                }
+                set_native_controller(&inner, Some(client_id.clone()));
             }
             Ok(Some(ClientMessage::ReleaseControl)) => {
                 if let Ok(mut controller) = inner.controller_client_id.write() {
@@ -3349,6 +3388,75 @@ fn set_last_connection_note(inner: &Arc<RemoteHostInner>, note: String, is_error
     inner
         .last_connection_is_error
         .store(is_error, Ordering::Relaxed);
+}
+
+pub(crate) fn publish_semantic_event(
+    inner: &Arc<RemoteHostInner>,
+    draft: SemanticEventDraft,
+) -> SemanticEvent {
+    let service = RemoteHostService {
+        inner: inner.clone(),
+    };
+    let mut published = None;
+    service.publish_semantic_change(|journals| {
+        published = Some(journals.record(draft));
+        true
+    });
+    published.expect("semantic event publication completed without an event")
+}
+
+pub(crate) fn set_native_controller(
+    inner: &Arc<RemoteHostInner>,
+    controller_client_id: Option<String>,
+) {
+    // Global lock order: browser writer lease before the native controller.
+    // This invalidates every outstanding browser generation before native or
+    // local desktop input can become authoritative.
+    if let Ok(mut leases) = inner.web_writer_leases.lock() {
+        leases.invalidate();
+        if let Ok(mut controller) = inner.controller_client_id.write() {
+            *controller = controller_client_id;
+        }
+    }
+}
+
+pub(crate) fn release_web_writer_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+) -> bool {
+    let Ok(mut leases) = inner.web_writer_leases.lock() else {
+        return false;
+    };
+    let released = leases.disconnect(connection_id, client_id);
+    if released {
+        if let Ok(mut controller) = inner.controller_client_id.write() {
+            if controller.as_deref() == Some(client_id) {
+                *controller = None;
+            }
+        }
+    }
+    released
+}
+
+fn remove_client_records(
+    clients: &mut HashMap<u64, ConnectedRemoteClient>,
+    connection_ids: Vec<u64>,
+) -> Vec<(u64, String)> {
+    connection_ids
+        .into_iter()
+        .filter_map(|connection_id| {
+            clients
+                .remove(&connection_id)
+                .map(|client| (connection_id, client.client_id))
+        })
+        .collect()
+}
+
+fn release_removed_web_connections(inner: &Arc<RemoteHostInner>, removed: Vec<(u64, String)>) {
+    for (connection_id, client_id) in removed {
+        release_web_writer_connection(inner, connection_id, &client_id);
+    }
 }
 
 pub(crate) fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {

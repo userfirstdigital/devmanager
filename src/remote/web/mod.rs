@@ -4,6 +4,7 @@ pub mod auth;
 pub mod bridge;
 pub mod dto;
 pub mod image_paste;
+pub mod lease;
 pub mod wire;
 
 use self::auth::{PairingAttemptTracker, PairingThrottleStatus};

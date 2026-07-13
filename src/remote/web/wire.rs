@@ -6,8 +6,85 @@
 use serde::{Deserialize, Serialize};
 
 use super::action::{WebAction, WebActionResult};
-use super::dto::{WebWorkspaceDelta, WebWorkspaceSnapshot};
+use super::dto::{WebWorkspaceDelta, WebWorkspaceSnapshot, WebWriterLeaseState};
+use crate::remote::presentation::{SemanticEvent, StableSessionKey};
 use crate::terminal::session::TerminalScreenSnapshot;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResumeRequest {
+    pub seen_runtime_instance_id: Option<String>,
+    pub seen_revision: Option<u64>,
+    pub route: String,
+    pub desired_session_key: Option<StableSessionKey>,
+    pub semantic_after_sequence: Option<u64>,
+    pub client_instance_id: String,
+    pub visible: bool,
+    pub wants_writer_lease: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeState {
+    pub runtime_instance_id: String,
+    pub revision: u64,
+    pub hard_reset: bool,
+    pub route: String,
+    pub desired_session_key: Option<StableSessionKey>,
+    pub workspace: Option<WebWorkspaceSnapshot>,
+    pub semantic_bootstrap: Option<SemanticBootstrap>,
+    pub writer_lease: WebWriterLeaseState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticBootstrap {
+    pub stable_session_key: StableSessionKey,
+    pub oldest_sequence: u64,
+    pub latest_sequence: u64,
+    pub cursor_rolled_over: bool,
+    pub events: Vec<SemanticEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComposerAttachment {
+    pub mime_type: String,
+    pub file_name: Option<String>,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerAccepted {
+    pub mutation_id: String,
+    pub stable_session_key: StableSessionKey,
+    pub accepted_sequence: u64,
+    pub lease_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ComposerRejectCode {
+    InvalidRequest,
+    SessionNotFound,
+    AmbiguousSession,
+    NativeControllerActive,
+    LeaseBusy,
+    StaleGeneration,
+    MutationInFlight,
+    MutationConflict,
+    PtyRejected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerRejected {
+    pub mutation_id: String,
+    pub code: ComposerRejectCode,
+    pub message: String,
+    pub writer_lease: WebWriterLeaseState,
+}
 
 /// Messages the browser sends to the host over the `/api/ws` text channel.
 #[derive(Debug, Clone, Deserialize)]
@@ -17,6 +94,30 @@ use crate::terminal::session::TerminalScreenSnapshot;
     rename_all_fields = "camelCase"
 )]
 pub enum WsInbound {
+    Resume {
+        #[serde(flatten)]
+        request: ResumeRequest,
+    },
+    AcquireWriterLease {
+        client_instance_id: String,
+        visible: bool,
+    },
+    WriterLeaseHeartbeat {
+        client_instance_id: String,
+        expected_lease_generation: u64,
+        visible: bool,
+    },
+    SetVisibility {
+        client_instance_id: String,
+        visible: bool,
+    },
+    ComposerSubmit {
+        mutation_id: String,
+        stable_session_key: StableSessionKey,
+        text: String,
+        attachments: Vec<ComposerAttachment>,
+        expected_lease_generation: u64,
+    },
     SubscribeSessions {
         session_ids: Vec<String>,
     },
@@ -76,6 +177,25 @@ pub enum WsOutbound {
     Delta {
         delta: WebWorkspaceDelta,
     },
+    ResumeState {
+        #[serde(flatten)]
+        state: ResumeState,
+    },
+    WriterLeaseState {
+        writer_lease: WebWriterLeaseState,
+    },
+    SemanticBootstrap {
+        #[serde(flatten)]
+        bootstrap: SemanticBootstrap,
+    },
+    ComposerAccepted {
+        #[serde(flatten)]
+        accepted: ComposerAccepted,
+    },
+    ComposerRejected {
+        #[serde(flatten)]
+        rejected: ComposerRejected,
+    },
     ControlState {
         controller_client_id: Option<String>,
         you_have_control: bool,
@@ -112,6 +232,7 @@ pub enum WsOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::presentation::StableSessionKey;
     use serde_json::json;
 
     #[test]
@@ -223,5 +344,71 @@ mod tests {
                 "youHaveControl": true
             })
         );
+    }
+
+    #[test]
+    fn resume_deserializes_as_one_atomic_request() {
+        let raw = json!({
+            "type": "resume",
+            "seenRuntimeInstanceId": "runtime-old",
+            "seenRevision": 41,
+            "route": "/session/tab/tab-a",
+            "desiredSessionKey": "tab:tab-a",
+            "semanticAfterSequence": 12,
+            "clientInstanceId": "tab-instance-a",
+            "visible": true,
+            "wantsWriterLease": true
+        });
+
+        let parsed: WsInbound = serde_json::from_value(raw).expect("parse resume");
+        let WsInbound::Resume { request } = parsed else {
+            panic!("expected resume frame");
+        };
+        assert_eq!(
+            request.seen_runtime_instance_id.as_deref(),
+            Some("runtime-old")
+        );
+        assert_eq!(request.seen_revision, Some(41));
+        assert_eq!(request.route, "/session/tab/tab-a");
+        assert_eq!(
+            request
+                .desired_session_key
+                .as_ref()
+                .map(StableSessionKey::as_str),
+            Some("tab:tab-a")
+        );
+        assert_eq!(request.semantic_after_sequence, Some(12));
+        assert_eq!(request.client_instance_id, "tab-instance-a");
+        assert!(request.visible);
+        assert!(request.wants_writer_lease);
+    }
+
+    #[test]
+    fn composer_submit_deserializes_with_mutation_and_generation() {
+        let raw = json!({
+            "type": "composerSubmit",
+            "mutationId": "mutation-1",
+            "stableSessionKey": "tab:tab-a",
+            "text": "run tests",
+            "attachments": [],
+            "expectedLeaseGeneration": 7
+        });
+
+        let parsed: WsInbound = serde_json::from_value(raw).expect("parse composer submit");
+        let WsInbound::ComposerSubmit {
+            mutation_id,
+            stable_session_key,
+            text,
+            attachments,
+            expected_lease_generation,
+        } = parsed
+        else {
+            panic!("expected composer submit");
+        };
+        assert_eq!(mutation_id, "mutation-1");
+        assert_eq!(stable_session_key.as_str(), "tab:tab-a");
+        assert_eq!(text, "run tests");
+        assert!(attachments.is_empty());
+        assert_eq!(expected_lease_generation, 7);
     }
 }

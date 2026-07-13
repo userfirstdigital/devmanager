@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::{mpsc as std_mpsc, Arc, MutexGuard};
 use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -30,18 +30,26 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::super::presentation::{SemanticSessionMetadata, StableSessionKey};
+use super::super::presentation::{
+    SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSessionMetadata,
+    SemanticSource, StableSessionKey,
+};
 use super::super::{
-    current_controller_allows, now_epoch_ms, request_timeout_for_action, requires_control,
-    stable_hash, ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
-    RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot,
-    ServerMessage,
+    current_controller_allows, now_epoch_ms, publish_semantic_event, release_web_writer_connection,
+    request_timeout_for_action, requires_control, stable_hash, ConnectedRemoteClient,
+    PendingRemoteRequest, RemoteActionResult, RemoteHostInner, RemoteImageAttachment,
+    RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot, ServerMessage,
+    WebComposerMutationRecord, WebComposerMutationStatus,
 };
 use super::action::WebActionResult;
 use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState};
-use super::wire::{WsInbound, WsOutbound};
+use super::lease::{LeaseError, WriterLease};
+use super::wire::{
+    ComposerAccepted, ComposerAttachment, ComposerRejectCode, ComposerRejected, ResumeRequest,
+    ResumeState, SemanticBootstrap, WsInbound, WsOutbound,
+};
 use super::{authenticate_request, record_browser_connection, WebState};
-use crate::state::SessionDimensions;
+use crate::state::{SessionDimensions, SessionKind};
 
 /// Frame type byte prefixed to binary WS frames carrying terminal output.
 const BINARY_FRAME_SESSION_OUTPUT: u8 = 0x01;
@@ -92,6 +100,7 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
 
     // tokio channel the WS writer actually awaits on.
     let (tokio_tx, mut tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+    let (web_tx, mut web_rx) = tokio_mpsc::unbounded_channel::<WsOutbound>();
 
     // Register in the shared clients map so the broadcaster and
     // push_session_* methods see us.
@@ -140,8 +149,35 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     let writer_inner = inner.clone();
     let writer_client_id = client_id.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(message) = tokio_rx.recv().await {
-            match translate_outbound(&message, &writer_inner, &writer_client_id) {
+        let mut native_open = true;
+        let mut web_open = true;
+        while native_open || web_open {
+            let encoded = tokio::select! {
+                message = tokio_rx.recv(), if native_open => {
+                    match message {
+                        Some(message) => translate_outbound(
+                            &message,
+                            &writer_inner,
+                            connection_id,
+                            &writer_client_id,
+                        ),
+                        None => {
+                            native_open = false;
+                            None
+                        }
+                    }
+                }
+                message = web_rx.recv(), if web_open => {
+                    match message {
+                        Some(message) => serialize_text(&message),
+                        None => {
+                            web_open = false;
+                            None
+                        }
+                    }
+                }
+            };
+            match encoded {
                 Some(EncodedFrame::Text(text)) => {
                     if ws_sink.send(WsMessage::Text(text)).await.is_err() {
                         break;
@@ -167,7 +203,14 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
         match frame {
             Ok(WsMessage::Text(text)) => match serde_json::from_str::<WsInbound>(&text) {
                 Ok(inbound) => {
-                    handle_inbound(&inner, connection_id, &client_id, inbound, &tokio_tx);
+                    handle_inbound_with_web(
+                        &inner,
+                        connection_id,
+                        &client_id,
+                        inbound,
+                        &tokio_tx,
+                        &web_tx,
+                    );
                 }
                 Err(error) => {
                     let _ = tokio_tx.send(ServerMessage::Disconnected {
@@ -194,6 +237,7 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // down.
     unregister_client(&inner, connection_id, &client_id);
     drop(tokio_tx);
+    drop(web_tx);
     let _ = drainer_handle.await;
     writer_task.abort();
     let _ = writer_task.await;
@@ -293,25 +337,12 @@ fn register_client(
 }
 
 fn unregister_client(inner: &Arc<RemoteHostInner>, connection_id: u64, client_id: &str) {
-    // Remove this specific connection, then check whether any OTHER client
-    // from the same cookie (same client_id) is still attached. If so, the
-    // controller bit belongs to them, so leave it alone — otherwise a second
-    // browser tab closing would silently pull control away from the first.
-    let still_attached = {
-        let Ok(mut clients) = inner.clients.lock() else {
-            return;
-        };
+    // Remove this specific connection. Other same-cookie tabs remain attached,
+    // viewer tab therefore cannot clear the owner tab's controller state.
+    if let Ok(mut clients) = inner.clients.lock() {
         clients.remove(&connection_id);
-        clients.values().any(|client| client.client_id == client_id)
-    };
-    if still_attached {
-        return;
     }
-    if let Ok(mut controller) = inner.controller_client_id.write() {
-        if controller.as_deref() == Some(client_id) {
-            *controller = None;
-        }
-    }
+    release_web_writer_connection(inner, connection_id, client_id);
 }
 
 fn web_client_is_still_paired(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {
@@ -328,6 +359,7 @@ fn web_client_is_still_paired(inner: &Arc<RemoteHostInner>, client_id: &str) -> 
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn handle_inbound(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
@@ -335,15 +367,20 @@ fn handle_inbound(
     message: WsInbound,
     tokio_tx: &tokio_mpsc::UnboundedSender<ServerMessage>,
 ) {
+    let (web_tx, _web_rx) = tokio_mpsc::unbounded_channel();
+    handle_inbound_with_web(inner, connection_id, client_id, message, tokio_tx, &web_tx);
+}
+
+fn handle_inbound_with_web(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    message: WsInbound,
+    tokio_tx: &tokio_mpsc::UnboundedSender<ServerMessage>,
+    web_tx: &tokio_mpsc::UnboundedSender<WsOutbound>,
+) {
     if !web_client_is_still_paired(inner, client_id) {
-        if let Ok(mut clients) = inner.clients.lock() {
-            clients.remove(&connection_id);
-        }
-        if let Ok(mut controller) = inner.controller_client_id.write() {
-            if controller.as_deref() == Some(client_id) {
-                *controller = None;
-            }
-        }
+        unregister_client(inner, connection_id, client_id);
         let _ = tokio_tx.send(ServerMessage::Disconnected {
             message: "This browser is no longer trusted. Pair again to reconnect.".to_string(),
         });
@@ -351,6 +388,91 @@ fn handle_inbound(
     }
 
     match message {
+        WsInbound::Resume { request } => {
+            let state =
+                build_resume_state(inner, connection_id, client_id, request, now_epoch_ms());
+            let _ = web_tx.send(WsOutbound::ResumeState { state });
+        }
+        WsInbound::AcquireWriterLease {
+            client_instance_id,
+            visible,
+        } => {
+            let writer_lease = if visible {
+                acquire_writer_lease(
+                    inner,
+                    connection_id,
+                    client_id,
+                    &client_instance_id,
+                    now_epoch_ms(),
+                )
+            } else {
+                set_writer_visibility(
+                    inner,
+                    connection_id,
+                    client_id,
+                    &client_instance_id,
+                    false,
+                    now_epoch_ms(),
+                )
+            };
+            let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
+        }
+        WsInbound::WriterLeaseHeartbeat {
+            client_instance_id,
+            expected_lease_generation,
+            visible,
+        } => {
+            let writer_lease = renew_writer_lease(
+                inner,
+                connection_id,
+                client_id,
+                &client_instance_id,
+                expected_lease_generation,
+                visible,
+                now_epoch_ms(),
+            );
+            let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
+        }
+        WsInbound::SetVisibility {
+            client_instance_id,
+            visible,
+        } => {
+            let writer_lease = set_writer_visibility(
+                inner,
+                connection_id,
+                client_id,
+                &client_instance_id,
+                visible,
+                now_epoch_ms(),
+            );
+            let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
+        }
+        WsInbound::ComposerSubmit {
+            mutation_id,
+            stable_session_key,
+            text,
+            attachments,
+            expected_lease_generation,
+        } => {
+            match process_composer_submit(
+                inner,
+                connection_id,
+                client_id,
+                mutation_id,
+                stable_session_key,
+                text,
+                attachments,
+                expected_lease_generation,
+                now_epoch_ms(),
+            ) {
+                Ok(accepted) => {
+                    let _ = web_tx.send(WsOutbound::ComposerAccepted { accepted });
+                }
+                Err(rejected) => {
+                    let _ = web_tx.send(WsOutbound::ComposerRejected { rejected });
+                }
+            }
+        }
         WsInbound::Ping => {
             let _ = tokio_tx.send(ServerMessage::Pong);
         }
@@ -592,6 +714,745 @@ fn handle_inbound(
     }
 }
 
+fn build_resume_state(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    request: ResumeRequest,
+    now_epoch_ms: u64,
+) -> ResumeState {
+    let hard_reset = request
+        .seen_runtime_instance_id
+        .as_deref()
+        .is_some_and(|seen| seen != inner.runtime_instance_id);
+    let writer_lease = if request.wants_writer_lease && request.visible {
+        acquire_writer_lease(
+            inner,
+            connection_id,
+            client_id,
+            &request.client_instance_id,
+            now_epoch_ms,
+        )
+    } else {
+        set_writer_visibility(
+            inner,
+            connection_id,
+            client_id,
+            &request.client_instance_id,
+            request.visible,
+            now_epoch_ms,
+        )
+    };
+    let requested_key = (!hard_reset)
+        .then_some(request.desired_session_key.clone())
+        .flatten();
+    let (projection, semantic_bootstrap) = capture_resume_projection(
+        inner,
+        client_id,
+        &writer_lease,
+        requested_key.as_ref(),
+        request.semantic_after_sequence.unwrap_or(0),
+    );
+    let (route, desired_session_key) = if hard_reset {
+        ("/sessions".to_string(), None)
+    } else {
+        validate_resume_route(&request.route, requested_key.as_ref(), &projection)
+    };
+    let semantic_bootstrap = desired_session_key.as_ref().and_then(|desired| {
+        semantic_bootstrap.filter(|bootstrap| &bootstrap.stable_session_key == desired)
+    });
+
+    mark_resume_subscription(
+        inner,
+        connection_id,
+        desired_session_key.as_ref(),
+        &projection,
+    );
+
+    let revision = projection.revision;
+    let runtime_matches =
+        request.seen_runtime_instance_id.as_deref() == Some(inner.runtime_instance_id.as_str());
+    let workspace = (hard_reset || !runtime_matches || request.seen_revision != Some(revision))
+        .then_some(projection);
+    ResumeState {
+        runtime_instance_id: inner.runtime_instance_id.clone(),
+        revision,
+        hard_reset,
+        route,
+        desired_session_key,
+        workspace,
+        semantic_bootstrap,
+        writer_lease,
+    }
+}
+
+fn capture_resume_projection(
+    inner: &Arc<RemoteHostInner>,
+    client_id: &str,
+    writer_lease: &WebWriterLeaseState,
+    desired_session_key: Option<&StableSessionKey>,
+    semantic_after_sequence: u64,
+) -> (WebWorkspaceSnapshot, Option<SemanticBootstrap>) {
+    loop {
+        let generation_before = inner
+            .semantic_publication_generation
+            .load(Ordering::Acquire);
+        if generation_before % 2 != 0 {
+            std::thread::yield_now();
+            continue;
+        }
+        let (snapshot, revision, semantic_metadata, replay) = {
+            let _snapshot_guard = inner
+                .snapshot_state_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let semantic_journals = match inner.semantic_journals.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    let guard = poisoned.into_inner();
+                    inner.semantic_journals.clear_poison();
+                    guard
+                }
+            };
+            let replay = desired_session_key
+                .and_then(|key| semantic_journals.replay_after(key, semantic_after_sequence))
+                .map(|replay| {
+                    let key = desired_session_key
+                        .expect("semantic replay requires a desired key")
+                        .clone();
+                    SemanticBootstrap {
+                        stable_session_key: key,
+                        oldest_sequence: replay.oldest_sequence,
+                        latest_sequence: replay.latest_sequence,
+                        cursor_rolled_over: replay.cursor_rolled_over,
+                        events: replay.events,
+                    }
+                });
+            (
+                light_snapshot(inner, client_id),
+                inner.snapshot_revision.load(Ordering::Relaxed),
+                semantic_journals.metadata_snapshot(),
+                replay,
+            )
+        };
+        let generation_after = inner
+            .semantic_publication_generation
+            .load(Ordering::Acquire);
+        if generation_before == generation_after {
+            return (
+                project_web_snapshot(inner, &snapshot, revision, &semantic_metadata, writer_lease),
+                replay,
+            );
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn validate_resume_route(
+    route: &str,
+    requested_key: Option<&StableSessionKey>,
+    workspace: &WebWorkspaceSnapshot,
+) -> (String, Option<StableSessionKey>) {
+    let path = route
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/sessions")
+        .trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    match path {
+        "/sessions" | "/projects" | "/settings" => (path.to_string(), None),
+        _ => {
+            if let Some(project_id) = path.strip_prefix("/projects/") {
+                if !project_id.is_empty()
+                    && !project_id.contains('/')
+                    && workspace
+                        .projects
+                        .iter()
+                        .any(|project| project.id == project_id)
+                {
+                    return (path.to_string(), None);
+                }
+            }
+            if let Some(rest) = path.strip_prefix("/session/") {
+                let mut parts = rest.split('/');
+                let kind = parts.next();
+                let id = parts.next();
+                if parts.next().is_none() {
+                    let route_key = match (kind, id) {
+                        (Some("tab"), Some(id)) if !id.is_empty() => {
+                            Some(StableSessionKey::from_tab(id))
+                        }
+                        (Some("server"), Some(id)) if !id.is_empty() => {
+                            Some(StableSessionKey::from_server(id))
+                        }
+                        _ => None,
+                    };
+                    if let Some(route_key) = route_key {
+                        let requested_matches = requested_key == Some(&route_key);
+                        let exists = workspace
+                            .sessions
+                            .iter()
+                            .any(|session| session.stable_session_key.as_ref() == Some(&route_key));
+                        if requested_matches && exists {
+                            return (path.to_string(), Some(route_key));
+                        }
+                    }
+                }
+            }
+            ("/sessions".to_string(), None)
+        }
+    }
+}
+
+fn mark_resume_subscription(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    desired_session_key: Option<&StableSessionKey>,
+    workspace: &WebWorkspaceSnapshot,
+) {
+    let desired_session_id = desired_session_key.and_then(|key| {
+        workspace
+            .sessions
+            .iter()
+            .find(|session| session.stable_session_key.as_ref() == Some(key))
+            .map(|session| session.session_id.clone())
+    });
+    let Ok(mut clients) = inner.clients.lock() else {
+        return;
+    };
+    let Some(client) = clients.get_mut(&connection_id) else {
+        return;
+    };
+    client.subscribed_session_ids.clear();
+    client.bootstrapped_session_ids.clear();
+    client.bootstrap_pending_session_ids.clear();
+    client.focused_session_id = desired_session_id.clone();
+    if let Some(session_id) = desired_session_id {
+        client.subscribed_session_ids.insert(session_id.clone());
+        client.bootstrap_pending_session_ids.insert(session_id);
+    }
+}
+
+fn writer_lease_state(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    now_epoch_ms: u64,
+) -> WebWriterLeaseState {
+    let Ok(mut leases) = inner.web_writer_leases.lock() else {
+        return WebWriterLeaseState::default();
+    };
+    let before = leases.peek();
+    let current = leases.current(now_epoch_ms);
+    clear_controller_after_lease_removal(inner, before.as_ref(), current.as_ref());
+    writer_lease_state_from(current.as_ref(), leases.generation(), connection_id)
+}
+
+fn clear_controller_after_lease_removal(
+    inner: &Arc<RemoteHostInner>,
+    previous: Option<&WriterLease>,
+    current: Option<&WriterLease>,
+) {
+    let (Some(previous), None) = (previous, current) else {
+        return;
+    };
+    if let Ok(mut controller) = inner.controller_client_id.write() {
+        if controller.as_deref() == Some(previous.owner_client_id.as_str()) {
+            *controller = None;
+        }
+    }
+}
+
+fn writer_lease_state_from(
+    current: Option<&WriterLease>,
+    generation: u64,
+    connection_id: u64,
+) -> WebWriterLeaseState {
+    WebWriterLeaseState {
+        owner_client_instance_id: current.map(|lease| lease.owner_client_instance_id.clone()),
+        generation,
+        expires_at_epoch_ms: current.map(|lease| lease.expires_at_epoch_ms),
+        you_are_owner: current.is_some_and(|lease| lease.owner_connection_id == connection_id),
+    }
+}
+
+fn acquire_writer_lease(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    client_instance_id: &str,
+    now_epoch_ms: u64,
+) -> WebWriterLeaseState {
+    let Ok(mut leases) = inner.web_writer_leases.lock() else {
+        return WebWriterLeaseState::default();
+    };
+    let before = leases.peek();
+    let current = leases.current(now_epoch_ms);
+    let Ok(mut controller) = inner.controller_client_id.write() else {
+        return writer_lease_state_from(current.as_ref(), leases.generation(), connection_id);
+    };
+    if let (Some(expired), None) = (before, current.as_ref()) {
+        if controller.as_deref() == Some(expired.owner_client_id.as_str()) {
+            *controller = None;
+        }
+    }
+    let controller_is_current_web_owner = controller.as_deref().is_some_and(|controller_id| {
+        current
+            .as_ref()
+            .is_some_and(|lease| lease.owner_client_id == controller_id)
+    });
+    if controller.is_some() && !controller_is_current_web_owner {
+        return writer_lease_state_from(current.as_ref(), leases.generation(), connection_id);
+    }
+    if let Ok(lease) = leases.acquire(connection_id, client_id, client_instance_id, now_epoch_ms) {
+        *controller = Some(client_id.to_string());
+        return writer_lease_state_from(Some(&lease), leases.generation(), connection_id);
+    }
+    let current = leases.peek();
+    writer_lease_state_from(current.as_ref(), leases.generation(), connection_id)
+}
+
+fn renew_writer_lease(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    client_instance_id: &str,
+    expected_generation: u64,
+    visible: bool,
+    now_epoch_ms: u64,
+) -> WebWriterLeaseState {
+    let Ok(mut leases) = inner.web_writer_leases.lock() else {
+        return WebWriterLeaseState::default();
+    };
+    let before = leases.peek();
+    let _ = leases.renew(
+        connection_id,
+        client_id,
+        client_instance_id,
+        expected_generation,
+        visible,
+        now_epoch_ms,
+    );
+    let current = leases.peek();
+    clear_controller_after_lease_removal(inner, before.as_ref(), current.as_ref());
+    writer_lease_state_from(current.as_ref(), leases.generation(), connection_id)
+}
+
+fn set_writer_visibility(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    client_instance_id: &str,
+    visible: bool,
+    now_epoch_ms: u64,
+) -> WebWriterLeaseState {
+    let Ok(mut leases) = inner.web_writer_leases.lock() else {
+        return WebWriterLeaseState::default();
+    };
+    let before = leases.peek();
+    let _ = leases.set_visibility(
+        connection_id,
+        client_id,
+        client_instance_id,
+        visible,
+        now_epoch_ms,
+    );
+    let current = leases.peek();
+    clear_controller_after_lease_removal(inner, before.as_ref(), current.as_ref());
+    writer_lease_state_from(current.as_ref(), leases.generation(), connection_id)
+}
+
+fn process_composer_submit(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    mutation_id: String,
+    stable_session_key: StableSessionKey,
+    text: String,
+    attachments: Vec<ComposerAttachment>,
+    expected_lease_generation: u64,
+    now_epoch_ms: u64,
+) -> Result<ComposerAccepted, ComposerRejected> {
+    if mutation_id.trim().is_empty() || (text.is_empty() && attachments.is_empty()) {
+        return Err(composer_rejected(
+            inner,
+            connection_id,
+            mutation_id,
+            ComposerRejectCode::InvalidRequest,
+            "Composer submissions require a mutation ID and content.",
+            now_epoch_ms,
+        ));
+    }
+    let decoded_attachments = match decode_composer_attachments(&attachments) {
+        Ok(attachments) => attachments,
+        Err(message) => {
+            return Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::InvalidRequest,
+                message,
+                now_epoch_ms,
+            ));
+        }
+    };
+    let (session_id, session_kind) = match resolve_unique_session(inner, &stable_session_key) {
+        Ok(session) => session,
+        Err(code) => {
+            let message = if code == ComposerRejectCode::AmbiguousSession {
+                "The stable session key resolves to more than one PTY."
+            } else {
+                "The requested session no longer exists."
+            };
+            return Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                code,
+                message,
+                now_epoch_ms,
+            ));
+        }
+    };
+
+    let lease_generation = {
+        let Ok(mut leases) = inner.web_writer_leases.lock() else {
+            return Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::LeaseBusy,
+                "Writer lease state is unavailable.",
+                now_epoch_ms,
+            ));
+        };
+        let previous = leases.peek();
+        let authorization = leases.authorize(
+            connection_id,
+            client_id,
+            expected_lease_generation,
+            now_epoch_ms,
+        );
+        let current = leases.peek();
+        clear_controller_after_lease_removal(inner, previous.as_ref(), current.as_ref());
+        let code = match &authorization {
+            Err(LeaseError::StaleGeneration { .. } | LeaseError::Expired) => {
+                Some(ComposerRejectCode::StaleGeneration)
+            }
+            Err(LeaseError::ActiveOwner | LeaseError::NotOwner) => {
+                Some(ComposerRejectCode::LeaseBusy)
+            }
+            Ok(_) => None,
+        };
+        if let Some(code) = code {
+            drop(leases);
+            return Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                code,
+                "The writer lease changed before the prompt was accepted.",
+                now_epoch_ms,
+            ));
+        }
+        let controller_matches = inner
+            .controller_client_id
+            .read()
+            .map(|controller| controller.as_deref() == Some(client_id))
+            .unwrap_or(false);
+        if !controller_matches {
+            leases.invalidate();
+            drop(leases);
+            return Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::NativeControllerActive,
+                "A native desktop controller is active.",
+                now_epoch_ms,
+            ));
+        }
+        authorization.expect("authorization was checked").generation
+    };
+
+    let fingerprint = stable_hash(&(stable_session_key.as_str(), text.as_str(), &attachments));
+    let existing_mutation = {
+        let mut mutations = composer_mutations(inner);
+        let existing = mutations.get(&mutation_id).cloned();
+        if existing.is_none() {
+            mutations.insert(
+                mutation_id.clone(),
+                WebComposerMutationRecord {
+                    fingerprint,
+                    status: WebComposerMutationStatus::InFlight,
+                },
+            );
+        }
+        existing
+    };
+    if let Some(existing) = existing_mutation {
+        if existing.fingerprint != fingerprint {
+            return Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::MutationConflict,
+                "This mutation ID was already used for different content.",
+                now_epoch_ms,
+            ));
+        }
+        return match existing.status {
+            WebComposerMutationStatus::InFlight => Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::MutationInFlight,
+                "This mutation is still being accepted by the PTY.",
+                now_epoch_ms,
+            )),
+            WebComposerMutationStatus::PtyRejected { message } => Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::PtyRejected,
+                message,
+                now_epoch_ms,
+            )),
+            WebComposerMutationStatus::Accepted {
+                stable_session_key,
+                accepted_sequence,
+                lease_generation,
+            } => Ok(ComposerAccepted {
+                mutation_id,
+                stable_session_key,
+                accepted_sequence,
+                lease_generation,
+            }),
+        };
+    }
+
+    let handler = inner
+        .terminal_input_handler
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    let Some(handler) = handler else {
+        remove_inflight_mutation(inner, &mutation_id, fingerprint);
+        return Err(composer_rejected(
+            inner,
+            connection_id,
+            mutation_id,
+            ComposerRejectCode::PtyRejected,
+            "The target PTY is not ready for input.",
+            now_epoch_ms,
+        ));
+    };
+
+    for attachment in decoded_attachments {
+        if let Err(message) = handler(
+            RemoteTerminalInput::Image {
+                session_id: session_id.clone(),
+                attachment,
+            },
+            now_epoch_ms,
+        ) {
+            store_pty_rejection(inner, &mutation_id, fingerprint, &message);
+            return Err(composer_rejected(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::PtyRejected,
+                message,
+                now_epoch_ms,
+            ));
+        }
+    }
+    let submitted_text = format!("{text}\r");
+    if let Err(message) = handler(
+        RemoteTerminalInput::Text {
+            session_id,
+            text: submitted_text,
+        },
+        now_epoch_ms,
+    ) {
+        store_pty_rejection(inner, &mutation_id, fingerprint, &message);
+        return Err(composer_rejected(
+            inner,
+            connection_id,
+            mutation_id,
+            ComposerRejectCode::PtyRejected,
+            message,
+            now_epoch_ms,
+        ));
+    }
+
+    let source = match session_kind {
+        SessionKind::Claude => SemanticSource::Claude,
+        SessionKind::Codex => SemanticSource::Codex,
+        SessionKind::Shell => SemanticSource::Shell,
+        SessionKind::Server => SemanticSource::Server,
+        SessionKind::Ssh => SemanticSource::Ssh,
+    };
+    let kind = if session_kind.is_ai() {
+        SemanticEventKind::UserMessage { text: text.clone() }
+    } else {
+        SemanticEventKind::Command {
+            command_id: mutation_id.clone(),
+            text: text.clone(),
+            exit_code: None,
+        }
+    };
+    let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        publish_semantic_event(
+            inner,
+            SemanticEventDraft {
+                stable_session_key: stable_session_key.clone(),
+                occurred_at_epoch_ms: now_epoch_ms,
+                source,
+                kind,
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some(format!("composer:{mutation_id}")),
+            },
+        )
+    }));
+    let accepted_sequence = published.map(|event| event.sequence).unwrap_or_else(|_| {
+        inner
+            .semantic_journals
+            .lock()
+            .ok()
+            .and_then(|journals| journals.metadata(&stable_session_key))
+            .map(|metadata| metadata.latest_sequence)
+            .unwrap_or(0)
+    });
+    let accepted = ComposerAccepted {
+        mutation_id: mutation_id.clone(),
+        stable_session_key: stable_session_key.clone(),
+        accepted_sequence,
+        lease_generation,
+    };
+    composer_mutations(inner).insert(
+        mutation_id,
+        WebComposerMutationRecord {
+            fingerprint,
+            status: WebComposerMutationStatus::Accepted {
+                stable_session_key,
+                accepted_sequence,
+                lease_generation,
+            },
+        },
+    );
+    Ok(accepted)
+}
+
+fn resolve_unique_session(
+    inner: &Arc<RemoteHostInner>,
+    stable_session_key: &StableSessionKey,
+) -> Result<(String, SessionKind), ComposerRejectCode> {
+    let _snapshot_guard = inner
+        .snapshot_state_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tabs = inner
+        .shared_state
+        .read()
+        .map(|state| state.open_tabs.clone())
+        .unwrap_or_default();
+    let sessions = inner
+        .runtime_state
+        .read()
+        .map(|state| state.sessions.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut matches = sessions.into_iter().filter(|session| {
+        StableSessionKey::resolve(session, &tabs).as_ref() == Some(stable_session_key)
+    });
+    let Some(first) = matches.next() else {
+        return Err(ComposerRejectCode::SessionNotFound);
+    };
+    if matches.next().is_some() {
+        return Err(ComposerRejectCode::AmbiguousSession);
+    }
+    Ok((first.session_id, first.session_kind))
+}
+
+fn decode_composer_attachments(
+    attachments: &[ComposerAttachment],
+) -> Result<Vec<RemoteImageAttachment>, String> {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let bytes = BASE64
+                .decode(attachment.data_base64.as_bytes())
+                .map_err(|error| format!("Invalid composer attachment: {error}"))?;
+            Ok(RemoteImageAttachment {
+                mime_type: attachment.mime_type.clone(),
+                file_name: attachment.file_name.clone(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn remove_inflight_mutation(inner: &Arc<RemoteHostInner>, mutation_id: &str, fingerprint: u64) {
+    let mut mutations = composer_mutations(inner);
+    if mutations.get(mutation_id).is_some_and(|record| {
+        record.fingerprint == fingerprint
+            && matches!(record.status, WebComposerMutationStatus::InFlight)
+    }) {
+        mutations.remove(mutation_id);
+    }
+}
+
+fn store_pty_rejection(
+    inner: &Arc<RemoteHostInner>,
+    mutation_id: &str,
+    fingerprint: u64,
+    message: &str,
+) {
+    let mut mutations = composer_mutations(inner);
+    if mutations.get(mutation_id).is_some_and(|record| {
+        record.fingerprint == fingerprint
+            && matches!(record.status, WebComposerMutationStatus::InFlight)
+    }) {
+        mutations.insert(
+            mutation_id.to_string(),
+            WebComposerMutationRecord {
+                fingerprint,
+                status: WebComposerMutationStatus::PtyRejected {
+                    message: message.to_string(),
+                },
+            },
+        );
+    }
+}
+
+fn composer_mutations(
+    inner: &Arc<RemoteHostInner>,
+) -> MutexGuard<'_, HashMap<String, WebComposerMutationRecord>> {
+    match inner.web_composer_mutations.lock() {
+        Ok(mutations) => mutations,
+        Err(poisoned) => {
+            let mutations = poisoned.into_inner();
+            inner.web_composer_mutations.clear_poison();
+            mutations
+        }
+    }
+}
+
+fn composer_rejected(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    mutation_id: String,
+    code: ComposerRejectCode,
+    message: impl Into<String>,
+    now_epoch_ms: u64,
+) -> ComposerRejected {
+    ComposerRejected {
+        mutation_id,
+        code,
+        message: message.into(),
+        writer_lease: writer_lease_state(inner, connection_id, now_epoch_ms),
+    }
+}
+
 enum EncodedFrame {
     Text(String),
     Binary(Vec<u8>),
@@ -604,17 +1465,22 @@ enum EncodedFrame {
 fn translate_outbound(
     message: &ServerMessage,
     inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
     client_id: &str,
 ) -> Option<EncodedFrame> {
     match message {
         ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. } => {
-            serialize_web_snapshot(capture_web_snapshot(inner, client_id))
+            serialize_web_snapshot(capture_web_snapshot(inner, connection_id, client_id))
         }
         _ => encode_outbound(message),
     }
 }
 
-fn capture_web_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> WebWorkspaceSnapshot {
+fn capture_web_snapshot(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+) -> WebWorkspaceSnapshot {
     loop {
         let generation_before = inner
             .semantic_publication_generation
@@ -647,7 +1513,14 @@ fn capture_web_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> WebWor
             .semantic_publication_generation
             .load(Ordering::Acquire);
         if generation_before == generation_after {
-            return project_web_snapshot(inner, &snapshot, revision, &semantic_metadata);
+            let writer_lease = writer_lease_state(inner, connection_id, now_epoch_ms());
+            return project_web_snapshot(
+                inner,
+                &snapshot,
+                revision,
+                &semantic_metadata,
+                &writer_lease,
+            );
         }
         std::thread::yield_now();
     }
@@ -658,20 +1531,15 @@ fn project_web_snapshot(
     snapshot: &RemoteWorkspaceSnapshot,
     revision: u64,
     semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
+    lease: &WebWriterLeaseState,
 ) -> WebWorkspaceSnapshot {
-    let lease = WebWriterLeaseState {
-        owner_client_instance_id: snapshot.controller_client_id.clone(),
-        generation: 0,
-        expires_at_epoch_ms: None,
-        you_are_owner: snapshot.you_have_control,
-    };
     let mut projected = WebWorkspaceSnapshot::from_host(
         inner.runtime_instance_id.clone(),
         revision,
         &snapshot.app_state,
         &snapshot.runtime_state,
         &snapshot.port_statuses,
-        &lease,
+        lease,
         semantic_metadata,
     );
     projected.server_id = snapshot.server_id.clone();
@@ -812,7 +1680,7 @@ mod tests {
             .sessions
             .insert(runtime.session_id.clone(), runtime.clone());
         service.update_snapshot(app, runtime_state, HashMap::new());
-        let initial = capture_web_snapshot(&service.inner, "web-client");
+        let initial = capture_web_snapshot(&service.inner, 1, "web-client");
         let initial_latest_sequence = initial
             .sessions
             .iter()
@@ -855,7 +1723,7 @@ mod tests {
         let (capture_tx, capture_rx) = std_mpsc::channel();
         let capture = std::thread::spawn(move || {
             capture_tx
-                .send(capture_web_snapshot(&capture_inner, "web-client"))
+                .send(capture_web_snapshot(&capture_inner, 1, "web-client"))
                 .expect("capture receiver should remain open");
         });
         let premature = capture_rx.recv_timeout(Duration::from_millis(100)).ok();
@@ -926,7 +1794,7 @@ mod tests {
         }
 
         service.update_snapshot(app, runtime_state, HashMap::new());
-        let initial = capture_web_snapshot(&service.inner, "web-client");
+        let initial = capture_web_snapshot(&service.inner, 1, "web-client");
         let initial_exhausted = initial
             .sessions
             .iter()
@@ -972,7 +1840,7 @@ mod tests {
             "publication generation should recover to an even value"
         );
 
-        let recovered = capture_web_snapshot(&service.inner, "web-client");
+        let recovered = capture_web_snapshot(&service.inner, 1, "web-client");
         assert!(
             recovered.revision > initial.revision,
             "panic recovery must conservatively publish a new revision"
@@ -989,7 +1857,7 @@ mod tests {
         );
 
         service.push_session_output("healthy-runtime", b"publication still works".to_vec());
-        let subsequent = capture_web_snapshot(&service.inner, "web-client");
+        let subsequent = capture_web_snapshot(&service.inner, 1, "web-client");
         assert!(subsequent.revision > recovered.revision);
         assert!(
             subsequent
@@ -1029,6 +1897,559 @@ mod tests {
         });
     }
 
+    fn ai_session(service: &RemoteHostService, tab_id: &str, session_id: &str) {
+        let mut app = crate::state::AppState::default();
+        app.open_tabs.push(crate::models::SessionTab {
+            id: tab_id.to_string(),
+            tab_type: crate::models::TabType::Claude,
+            pty_session_id: Some(session_id.to_string()),
+            ..crate::models::SessionTab::default()
+        });
+        let mut runtime = SessionRuntimeState::new(
+            session_id,
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Claude;
+        runtime.tab_id = Some(tab_id.to_string());
+        let mut runtime_state = crate::state::RuntimeState::default();
+        runtime_state
+            .sessions
+            .insert(session_id.to_string(), runtime);
+        service.update_snapshot(app, runtime_state, HashMap::new());
+    }
+
+    fn resume_request(
+        runtime_instance_id: Option<String>,
+        desired_session_key: Option<StableSessionKey>,
+        client_instance_id: &str,
+    ) -> ResumeRequest {
+        ResumeRequest {
+            seen_runtime_instance_id: runtime_instance_id,
+            seen_revision: None,
+            route: desired_session_key
+                .as_ref()
+                .map(|key| format!("/session/{}", key.as_str().replace(':', "/")))
+                .unwrap_or_else(|| "/sessions".to_string()),
+            desired_session_key,
+            semantic_after_sequence: Some(0),
+            client_instance_id: client_instance_id.to_string(),
+            visible: true,
+            wants_writer_lease: true,
+        }
+    }
+
+    #[test]
+    fn resume_runtime_mismatch_is_a_hard_reset_to_sessions() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let state = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some("stale-runtime".to_string()),
+                Some(StableSessionKey::from_tab("gone")),
+                "tab-a",
+            ),
+            1_000,
+        );
+
+        assert!(state.hard_reset);
+        assert_eq!(state.route, "/sessions");
+        assert!(state.desired_session_key.is_none());
+        assert!(state.semantic_bootstrap.is_none());
+        assert!(state.workspace.is_some());
+    }
+
+    #[test]
+    fn same_cookie_tabs_get_connection_specific_lease_state() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let now = now_epoch_ms();
+        let first = build_resume_state(
+            &service.inner,
+            1,
+            "same-cookie-client",
+            resume_request(Some(current_runtime), None, "tab-a"),
+            now,
+        );
+
+        let owner_snapshot = capture_web_snapshot(&service.inner, 1, "same-cookie-client");
+        let viewer_snapshot = capture_web_snapshot(&service.inner, 2, "same-cookie-client");
+        assert!(first.writer_lease.you_are_owner);
+        assert!(owner_snapshot.writer_lease.you_are_owner);
+        assert!(!viewer_snapshot.writer_lease.you_are_owner);
+        assert_eq!(
+            owner_snapshot.writer_lease.generation,
+            viewer_snapshot.writer_lease.generation
+        );
+    }
+
+    #[test]
+    fn native_controller_blocks_automatic_web_acquisition() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        *service
+            .inner
+            .controller_client_id
+            .write()
+            .expect("controller lock") = Some("native-desktop".to_string());
+        let current_runtime = service.inner.runtime_instance_id.clone();
+
+        let state = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(Some(current_runtime), None, "tab-a"),
+            1_000,
+        );
+
+        assert!(!state.writer_lease.you_are_owner);
+        assert_eq!(
+            service
+                .inner
+                .controller_client_id
+                .read()
+                .expect("controller lock")
+                .as_deref(),
+            Some("native-desktop")
+        );
+    }
+
+    #[test]
+    fn disconnect_releases_only_the_exact_same_cookie_owner() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (owner_tx, _owner_rx) = std_mpsc::channel();
+        let (viewer_tx, _viewer_rx) = std_mpsc::channel();
+        register_client(&service.inner, 1, "same-cookie", owner_tx);
+        register_client(&service.inner, 2, "same-cookie", viewer_tx);
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let now = now_epoch_ms();
+        let state = build_resume_state(
+            &service.inner,
+            1,
+            "same-cookie",
+            resume_request(Some(current_runtime), None, "tab-a"),
+            now,
+        );
+        assert!(state.writer_lease.you_are_owner);
+
+        unregister_client(&service.inner, 2, "same-cookie");
+        assert!(writer_lease_state(&service.inner, 1, now + 1).you_are_owner);
+        unregister_client(&service.inner, 1, "same-cookie");
+
+        let released = writer_lease_state(&service.inner, 1, now + 2);
+        assert!(!released.you_are_owner);
+        assert!(released.owner_client_instance_id.is_none());
+        assert!(service
+            .inner
+            .controller_client_id
+            .read()
+            .expect("controller lock")
+            .is_none());
+    }
+
+    #[test]
+    fn local_desktop_takeover_invalidates_the_web_generation() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let state = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(Some(current_runtime), None, "tab-a"),
+            1_000,
+        );
+        let generation = state.writer_lease.generation;
+
+        service.take_local_control();
+
+        let result = service
+            .inner
+            .web_writer_leases
+            .lock()
+            .expect("lease lock")
+            .authorize(1, "web-client", generation, 1_001);
+        assert!(matches!(result, Err(LeaseError::StaleGeneration { .. })));
+        assert!(service
+            .inner
+            .controller_client_id
+            .read()
+            .expect("controller lock")
+            .is_none());
+    }
+
+    #[test]
+    fn resume_marks_raw_bootstrap_pending_without_calling_the_provider() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, 1, "web-client", std_tx);
+        let provider_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = provider_called.clone();
+        service.set_session_bootstrap_provider(Some(Arc::new(move |_| {
+            called.store(true, Ordering::SeqCst);
+            None
+        })));
+
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let state = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(current_runtime),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "tab-a",
+            ),
+            1_000,
+        );
+
+        assert_eq!(
+            state
+                .desired_session_key
+                .as_ref()
+                .map(StableSessionKey::as_str),
+            Some("tab:tab-a")
+        );
+        assert!(!provider_called.load(Ordering::SeqCst));
+        let clients = service.inner.clients.lock().expect("clients lock");
+        let client = clients.get(&1).expect("resume connection");
+        assert!(client.subscribed_session_ids.contains("session-a"));
+        assert!(client.bootstrap_pending_session_ids.contains("session-a"));
+    }
+
+    #[test]
+    fn composer_ack_follows_pty_acceptance_and_identical_retry_is_deduplicated() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let resume = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(current_runtime),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "tab-a",
+            ),
+            1_000,
+        );
+        let generation = resume.writer_lease.generation;
+        let (seen_tx, seen_rx) = std_mpsc::channel();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            seen_tx.send(input).expect("capture input");
+            Ok(())
+        })));
+
+        let submit = || {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                "mutation-1".to_string(),
+                StableSessionKey::from_tab("tab-a"),
+                "hello".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+        };
+        let first = submit().expect("first submit accepted");
+        let duplicate = submit().expect("identical retry returns stored ack");
+
+        assert_eq!(first, duplicate);
+        match seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("PTY write")
+        {
+            RemoteTerminalInput::Text { session_id, text } => {
+                assert_eq!(session_id, "session-a");
+                assert_eq!(text, "hello\r");
+            }
+            other => panic!("unexpected PTY input: {other:?}"),
+        }
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "duplicate must not write twice"
+        );
+        let replay = service
+            .semantic_replay(&StableSessionKey::from_tab("tab-a"), 0)
+            .expect("semantic replay");
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    crate::remote::presentation::SemanticEventKind::UserMessage { text }
+                        if text == "hello"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(first.accepted_sequence, replay.latest_sequence);
+    }
+
+    #[test]
+    fn composer_retry_never_replays_attachments_after_the_text_write_fails() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let resume = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(current_runtime),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "tab-a",
+            ),
+            1_000,
+        );
+        let generation = resume.writer_lease.generation;
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_count = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            write_count.fetch_add(1, Ordering::SeqCst);
+            match input {
+                RemoteTerminalInput::Image { .. } => Ok(()),
+                RemoteTerminalInput::Text { .. } => Err("text write failed".to_string()),
+                other => panic!("unexpected composer input: {other:?}"),
+            }
+        })));
+        let attachments = vec![
+            ComposerAttachment {
+                mime_type: "image/png".to_string(),
+                file_name: Some("first.png".to_string()),
+                data_base64: "Zmlyc3Q=".to_string(),
+            },
+            ComposerAttachment {
+                mime_type: "image/png".to_string(),
+                file_name: Some("second.png".to_string()),
+                data_base64: "c2Vjb25k".to_string(),
+            },
+        ];
+        let submit = || {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                "partial-mutation".to_string(),
+                StableSessionKey::from_tab("tab-a"),
+                "hello".to_string(),
+                attachments.clone(),
+                generation,
+                1_100,
+            )
+        };
+
+        let first = submit().expect_err("text failure rejects mutation");
+        let retry = submit().expect_err("terminal rejection is remembered");
+
+        assert_eq!(first.code, ComposerRejectCode::PtyRejected);
+        assert_eq!(retry.code, ComposerRejectCode::PtyRejected);
+        assert_eq!(writes.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn composer_ack_is_stored_even_if_the_registry_is_poisoned_after_pty_write() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let resume = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(current_runtime),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "tab-a",
+            ),
+            1_000,
+        );
+        let generation = resume.writer_lease.generation;
+        let poison_inner = service.inner.clone();
+        let poison_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poison_once_handler = poison_once.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            if !poison_once_handler.swap(true, Ordering::SeqCst) {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _registry = poison_inner
+                        .web_composer_mutations
+                        .lock()
+                        .expect("registry starts healthy");
+                    panic!("poison mutation registry after PTY write");
+                }));
+            }
+            Ok(())
+        })));
+        let submit = || {
+            process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                "poisoned-registry-mutation".to_string(),
+                StableSessionKey::from_tab("tab-a"),
+                "hello".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+        };
+
+        let first = submit().expect("first submit accepted");
+        let duplicate = submit().expect("stored ack survives registry poison");
+
+        assert_eq!(first, duplicate);
+    }
+
+    #[test]
+    fn stale_generation_and_mutation_conflicts_never_write_to_the_pty() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let resume = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(
+                Some(current_runtime),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "tab-a",
+            ),
+            1_000,
+        );
+        let generation = resume.writer_lease.generation;
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_count = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            write_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+
+        let accepted = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "mutation-1".to_string(),
+            StableSessionKey::from_tab("tab-a"),
+            "first".to_string(),
+            Vec::new(),
+            generation,
+            1_100,
+        )
+        .expect("first accepted");
+        assert!(accepted.accepted_sequence > 0);
+        let conflict = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "mutation-1".to_string(),
+            StableSessionKey::from_tab("tab-a"),
+            "different".to_string(),
+            Vec::new(),
+            generation,
+            1_101,
+        )
+        .expect_err("mutation ID conflict rejected");
+        assert_eq!(conflict.code, ComposerRejectCode::MutationConflict);
+        let stale = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "mutation-2".to_string(),
+            StableSessionKey::from_tab("tab-a"),
+            "stale".to_string(),
+            Vec::new(),
+            generation.saturating_sub(1),
+            1_102,
+        )
+        .expect_err("stale generation rejected");
+        assert_eq!(stale.code, ComposerRejectCode::StaleGeneration);
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn expired_composer_lease_clears_controller_and_allows_reacquire() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let first = build_resume_state(
+            &service.inner,
+            1,
+            "web-client-a",
+            resume_request(
+                Some(current_runtime.clone()),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "tab-a",
+            ),
+            1_000,
+        );
+
+        let rejected = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client-a",
+            "expired-mutation".to_string(),
+            StableSessionKey::from_tab("tab-a"),
+            "hello".to_string(),
+            Vec::new(),
+            first.writer_lease.generation,
+            9_001,
+        )
+        .expect_err("expired generation rejected");
+        assert_eq!(rejected.code, ComposerRejectCode::StaleGeneration);
+        assert!(service
+            .inner
+            .controller_client_id
+            .read()
+            .expect("controller lock")
+            .is_none());
+
+        let second = build_resume_state(
+            &service.inner,
+            2,
+            "web-client-b",
+            resume_request(Some(current_runtime), None, "tab-b"),
+            9_002,
+        );
+        assert!(second.writer_lease.you_are_owner);
+    }
+
+    #[test]
+    fn expired_visibility_update_clears_controller_and_allows_reacquire() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let first = build_resume_state(
+            &service.inner,
+            1,
+            "web-client-a",
+            resume_request(Some(current_runtime.clone()), None, "tab-a"),
+            1_000,
+        );
+        assert!(first.writer_lease.you_are_owner);
+
+        let expired =
+            set_writer_visibility(&service.inner, 1, "web-client-a", "tab-a", false, 9_001);
+        assert!(!expired.you_are_owner);
+        assert!(service
+            .inner
+            .controller_client_id
+            .read()
+            .expect("controller lock")
+            .is_none());
+
+        let second = build_resume_state(
+            &service.inner,
+            2,
+            "web-client-b",
+            resume_request(Some(current_runtime), None, "tab-b"),
+            9_002,
+        );
+        assert!(second.writer_lease.you_are_owner);
+    }
+
     #[test]
     fn binary_frame_layout_is_stable() {
         let frame = encode_session_output_frame("srv-1", 42, b"hello");
@@ -1054,6 +2475,7 @@ mod tests {
         let frame = translate_outbound(
             &ServerMessage::Snapshot { snapshot },
             &service.inner,
+            1,
             "web-client",
         )
         .expect("snapshot encodes");
@@ -1104,7 +2526,7 @@ mod tests {
         );
         let expected_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
 
-        let frame = translate_outbound(&queued, &service.inner, "web-client")
+        let frame = translate_outbound(&queued, &service.inner, 1, "web-client")
             .expect("queued snapshot encodes");
         let EncodedFrame::Text(text) = frame else {
             panic!("snapshot should be text");
@@ -1127,6 +2549,7 @@ mod tests {
                 delta: RemoteWorkspaceDelta::default(),
             },
             &service.inner,
+            1,
             "web-client",
         )
         .expect("delta projects");
@@ -1176,7 +2599,7 @@ mod tests {
             ),
         };
 
-        let frame = translate_outbound(&message, &service.inner, "web-client")
+        let frame = translate_outbound(&message, &service.inner, 1, "web-client")
             .expect("AI response encodes");
         let EncodedFrame::Text(text) = frame else {
             panic!("AI response should be text");
