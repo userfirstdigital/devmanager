@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, MutexGuard};
 use std::time::Duration;
 
@@ -26,27 +26,27 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::watch;
 
 use super::super::presentation::{
-    SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSessionMetadata,
-    SemanticSource, StableSessionKey,
+    SemanticEventDraft, SemanticEventKind, SemanticReplay, SemanticRetention,
+    SemanticSessionMetadata, SemanticSource, StableSessionKey,
 };
 use super::super::{
-    now_epoch_ms, publish_semantic_event, release_web_writer_connection,
-    request_timeout_for_action, requires_control, stable_hash, ConnectedRemoteClient,
-    PendingRemoteRequest, RemoteActionResult, RemoteHostInner, RemoteImageAttachment,
-    RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot, ServerMessage,
-    WebComposerMutationRecord, WebComposerMutationStatus,
+    now_epoch_ms, publish_semantic_event, request_timeout_for_action, requires_control,
+    stable_hash, ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
+    RemoteImageAttachment, RemoteSessionStreamEvent, RemoteTerminalInput, RemoteWorkspaceSnapshot,
+    ServerMessage, WebComposerMutationRecord, WebComposerMutationStatus,
 };
 use super::action::WebActionResult;
 use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState};
 use super::lease::{LeaseError, MutationBegin, WriterLease};
 use super::wire::{
     ComposerAccepted, ComposerAttachment, ComposerRejectCode, ComposerRejected, ResumeRequest,
-    ResumeState, SemanticBootstrap, WsInbound, WsOutbound,
+    ResumeState, SemanticReplayDescriptor, SemanticReplayPage, WsInbound, WsOutbound,
 };
 use super::{authenticate_request, record_browser_connection, WebState};
 use crate::state::{SessionDimensions, SessionKind};
@@ -54,6 +54,11 @@ use crate::state::{SessionDimensions, SessionKind};
 /// Frame type byte prefixed to binary WS frames carrying terminal output.
 const BINARY_FRAME_SESSION_OUTPUT: u8 = 0x01;
 const WEB_PUSH_CHANNEL_CAPACITY: usize = 256;
+const WEB_OUTBOUND_MAX_BYTES: usize = 4 * 1024 * 1024;
+const WEB_OUTBOUND_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_SEMANTIC_REPLAY_PAGE_EVENTS: usize = 256;
+const MAX_SEMANTIC_REPLAY_PAGE_BYTES: usize = 256 * 1024;
+static NEXT_WEB_AUTHORITY_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_COMPOSER_MUTATION_ID_BYTES: usize = 128;
 const MAX_COMPOSER_ERROR_BYTES: usize = 1024;
 // At the mutation-ID limit, new prompts fail closed until this host runtime
@@ -109,20 +114,14 @@ pub(crate) async fn ws_handler(
 
 async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: String) {
     let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
-
-    // std channel used by the existing broadcaster / push_session_* paths.
-    // The broadcaster pushes here; we drain from another task.
-    let (std_tx, std_rx) = std_mpsc::channel::<ServerMessage>();
-
-    // tokio channel the WS writer actually awaits on.
-    let (tokio_tx, mut tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
-    let (web_tx, mut web_rx) = tokio_mpsc::unbounded_channel::<WsOutbound>();
-    let (web_push_tx, mut web_push_rx) =
-        tokio_mpsc::channel::<WsOutbound>(WEB_PUSH_CHANNEL_CAPACITY);
-
-    // Register in the shared clients map so the broadcaster and
-    // push_session_* methods see us.
-    register_client(&inner, connection_id, &client_id, std_tx, web_push_tx);
+    let (outbound, outbound_rx) =
+        BrowserOutboundSender::channel(WEB_PUSH_CHANNEL_CAPACITY, WEB_OUTBOUND_MAX_BYTES);
+    let tombstone = outbound.tombstone();
+    if !register_browser_client(&inner, connection_id, &client_id, outbound.clone()) {
+        let _ = outbound
+            .try_send_disconnect("This browser is no longer paired with the host.".to_string());
+        tombstone.deactivate();
+    }
 
     // Push an initial snapshot so the browser has state to render before any
     // delta arrives. We deliberately use a *lightweight* snapshot that omits
@@ -138,92 +137,29 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // snapshot and can't stall the handshake.
     {
         let snapshot = light_snapshot(&inner, &client_id);
-        let _ = tokio_tx.send(ServerMessage::Snapshot { snapshot });
+        let _ = outbound.try_send_server_message(
+            &ServerMessage::Snapshot { snapshot },
+            &inner,
+            connection_id,
+            &client_id,
+        );
     }
 
-    // Spawn a blocking drainer that forwards from the std receiver into the
-    // tokio channel. Checks the stop flag + channel disconnect on every poll
-    // so shutdown is prompt when the WS task drops its side.
-    let drainer_inner = inner.clone();
-    let drainer_tokio_tx = tokio_tx.clone();
-    let drainer_handle = tokio::task::spawn_blocking(move || loop {
-        if drainer_inner.stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        match std_rx.recv_timeout(Duration::from_millis(150)) {
-            Ok(message) => {
-                if drainer_tokio_tx.send(message).is_err() {
-                    break;
-                }
-            }
-            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    });
-
     let (mut ws_sink, mut ws_stream) = socket.split();
-
-    // Writer task: serialize `ServerMessage`s and push out on the WS.
     let writer_inner = inner.clone();
     let writer_client_id = client_id.clone();
+    let writer_tombstone = tombstone.clone();
     let writer_task = tokio::spawn(async move {
-        let mut native_open = true;
-        let mut web_open = true;
-        loop {
-            let encoded = tokio::select! {
-                message = tokio_rx.recv(), if native_open => {
-                    match message {
-                        Some(message) => translate_outbound(
-                            &message,
-                            &writer_inner,
-                            connection_id,
-                            &writer_client_id,
-                        ),
-                        None => {
-                            native_open = false;
-                            None
-                        }
-                    }
-                }
-                message = web_rx.recv(), if web_open => {
-                    match message {
-                        Some(message) => serialize_text(&message),
-                        None => {
-                            web_open = false;
-                            None
-                        }
-                    }
-                }
-                message = web_push_rx.recv() => {
-                    match message {
-                        Some(message) => serialize_text(&message),
-                        // The shared client record owns the only bounded push
-                        // sender. Fanout drops that record on saturation or a
-                        // dead receiver; closing the socket here makes that
-                        // eviction real instead of leaving an unregistered
-                        // reader able to reclaim control through direct frames.
-                        None => break,
-                    }
-                }
-            };
-            match encoded {
-                Some(EncodedFrame::Text(text)) => {
-                    if ws_sink.send(WsMessage::Text(text)).await.is_err() {
-                        break;
-                    }
-                }
-                Some(EncodedFrame::Binary(bytes)) => {
-                    if ws_sink.send(WsMessage::Binary(bytes)).await.is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    // Unsupported/ignored server messages (e.g., HelloOk which
-                    // only makes sense on the TCP path).
-                }
-            }
-        }
-        let _ = ws_sink.close().await;
+        run_browser_writer(
+            &mut ws_sink,
+            outbound_rx,
+            writer_inner,
+            connection_id,
+            writer_client_id,
+            writer_tombstone,
+            WEB_OUTBOUND_STALL_TIMEOUT,
+        )
+        .await;
     });
 
     // Reader loop: handle inbound WS messages directly against
@@ -232,19 +168,10 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
         match frame {
             Ok(WsMessage::Text(text)) => match serde_json::from_str::<WsInbound>(&text) {
                 Ok(inbound) => {
-                    handle_inbound_with_web(
-                        &inner,
-                        connection_id,
-                        &client_id,
-                        inbound,
-                        &tokio_tx,
-                        &web_tx,
-                    );
+                    handle_inbound_browser(&inner, connection_id, &client_id, inbound, &outbound);
                 }
                 Err(error) => {
-                    let _ = tokio_tx.send(ServerMessage::Disconnected {
-                        message: format!("invalid inbound frame: {error}"),
-                    });
+                    let _ = outbound.try_send_disconnect(format!("invalid inbound frame: {error}"));
                     break;
                 }
             },
@@ -264,12 +191,138 @@ async fn run_session(socket: WebSocket, inner: Arc<RemoteHostInner>, client_id: 
     // Teardown order matters: remove from clients first so the broadcaster
     // stops pushing into a dying channel, then let the drainer + writer wind
     // down.
-    unregister_client(&inner, connection_id, &client_id);
-    drop(tokio_tx);
-    drop(web_tx);
-    let _ = drainer_handle.await;
-    writer_task.abort();
+    unregister_browser_client(&inner, connection_id, &client_id, &tombstone);
+    drop(outbound);
     let _ = writer_task.await;
+}
+
+async fn run_browser_writer<S>(
+    ws_sink: &mut S,
+    mut outbound: BrowserOutboundReceiver,
+    inner: Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: String,
+    tombstone: Arc<WebConnectionTombstone>,
+    stall_timeout: Duration,
+) where
+    S: Sink<WsMessage> + Unpin,
+{
+    let mut cancellation = outbound.tombstone.subscribe();
+    let mut delivery_failed = false;
+    'commands: loop {
+        let accounted = tokio::select! {
+            biased;
+            command = outbound.rx.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+            changed = cancellation.changed() => {
+                if changed.is_err() || !*cancellation.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+        match &accounted.command {
+            BrowserOutboundCommand::Frame {
+                frame,
+                deliver_when_inactive,
+                closes_connection,
+            } => {
+                if tombstone.is_active() || *deliver_when_inactive {
+                    if send_browser_frame(ws_sink, frame, stall_timeout)
+                        .await
+                        .is_err()
+                    {
+                        delivery_failed = true;
+                        break;
+                    }
+                }
+                if *closes_connection {
+                    break;
+                }
+            }
+            BrowserOutboundCommand::ReplayWake { epoch } => {
+                if !tombstone.is_active() || outbound.replay_epoch.load(Ordering::Acquire) != *epoch
+                {
+                    continue;
+                }
+                loop {
+                    if !tombstone.is_active()
+                        || outbound.replay_epoch.load(Ordering::Acquire) != *epoch
+                    {
+                        break;
+                    }
+                    let (frame, complete) = {
+                        let mut slot = outbound
+                            .replay_slot
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let Some(pending) = slot.as_mut().filter(|pending| pending.epoch == *epoch)
+                        else {
+                            break;
+                        };
+                        let (frame, complete) = if let Some(prefix) = pending.prefix.take() {
+                            (Ok(Some(prefix)), false)
+                        } else {
+                            let frame = pending.encoder.next_frame();
+                            let complete = pending.encoder.finished;
+                            (frame, complete)
+                        };
+                        if complete {
+                            *slot = None;
+                        }
+                        (frame, complete)
+                    };
+                    let frame = match frame {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break,
+                        Err(_) => {
+                            delivery_failed = true;
+                            break 'commands;
+                        }
+                    };
+                    if !tombstone.is_active()
+                        || outbound.replay_epoch.load(Ordering::Acquire) != *epoch
+                    {
+                        break;
+                    }
+                    if send_browser_frame(ws_sink, &frame, stall_timeout)
+                        .await
+                        .is_err()
+                    {
+                        delivery_failed = true;
+                        break 'commands;
+                    }
+                    if complete {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if delivery_failed {
+        unregister_browser_client(&inner, connection_id, &client_id, &tombstone);
+    }
+    let _ = tokio::time::timeout(stall_timeout, ws_sink.close()).await;
+}
+
+async fn send_browser_frame<S>(
+    ws_sink: &mut S,
+    frame: &EncodedFrame,
+    stall_timeout: Duration,
+) -> Result<(), ()>
+where
+    S: Sink<WsMessage> + Unpin,
+{
+    let message = match frame {
+        EncodedFrame::Text(text) => WsMessage::Text(text.clone()),
+        EncodedFrame::Binary(bytes) => WsMessage::Binary(bytes.clone()),
+    };
+    match tokio::time::timeout(stall_timeout, ws_sink.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(()),
+    }
 }
 
 /// Lightweight snapshot for web client handshakes. Reads only
@@ -316,16 +369,12 @@ fn light_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> RemoteWorksp
     }
 }
 
-fn register_client(
+fn register_browser_client(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
     client_id: &str,
-    sender: std_mpsc::Sender<ServerMessage>,
-    web_sender: tokio_mpsc::Sender<WsOutbound>,
-) {
-    let Ok(mut clients) = inner.clients.lock() else {
-        return;
-    };
+    web_sender: BrowserOutboundSender,
+) -> bool {
     let app_state = inner
         .shared_state
         .read()
@@ -347,13 +396,28 @@ fn register_client(
         .map(|slot| slot.clone())
         .unwrap_or_default();
     let you_have_control = controller_client_id.as_deref() == Some(client_id);
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !web_client_is_still_paired(inner, client_id) {
+        return false;
+    }
+    let Ok(mut clients) = inner.clients.lock() else {
+        return false;
+    };
+    if clients.contains_key(&connection_id) {
+        return false;
+    }
+    let tombstone = web_sender.tombstone();
 
     clients.insert(
         connection_id,
         ConnectedRemoteClient {
             client_id: client_id.to_string(),
-            sender,
+            sender: None,
             web_sender: Some(web_sender),
+            web_tombstone: Some(tombstone),
             semantic_cursors: HashMap::new(),
             subscribed_session_ids: HashSet::new(),
             bootstrapped_session_ids: HashSet::new(),
@@ -367,15 +431,124 @@ fn register_client(
             last_snapshot_revision: inner.snapshot_revision.load(Ordering::Relaxed),
         },
     );
+    true
 }
 
+fn unregister_browser_client(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    tombstone: &Arc<WebConnectionTombstone>,
+) {
+    revoke_web_connection(inner, connection_id, client_id, tombstone, None);
+}
+
+#[cfg(test)]
+fn register_client(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    _native_sender: std_mpsc::Sender<ServerMessage>,
+    web_sender: BrowserOutboundSender,
+) -> bool {
+    register_browser_client(inner, connection_id, client_id, web_sender)
+}
+
+#[cfg(test)]
 fn unregister_client(inner: &Arc<RemoteHostInner>, connection_id: u64, client_id: &str) {
-    // Remove this specific connection. Other same-cookie tabs remain attached,
-    // viewer tab therefore cannot clear the owner tab's controller state.
-    if let Ok(mut clients) = inner.clients.lock() {
-        clients.remove(&connection_id);
+    let tombstone = inner.clients.lock().ok().and_then(|clients| {
+        clients
+            .get(&connection_id)
+            .filter(|client| client.client_id == client_id)
+            .and_then(|client| client.web_tombstone.clone())
+    });
+    if let Some(tombstone) = tombstone {
+        unregister_browser_client(inner, connection_id, client_id, &tombstone);
     }
-    release_web_writer_connection(inner, connection_id, client_id);
+}
+
+pub(crate) fn revoke_web_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    tombstone: &Arc<WebConnectionTombstone>,
+    reason: Option<String>,
+) -> bool {
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let revoked = revoke_web_connection_locked(inner, connection_id, client_id, tombstone, reason);
+    if revoked {
+        broadcast_writer_lease_state_locked(inner, now_epoch_ms());
+    }
+    revoked
+}
+
+pub(crate) fn revoke_web_connection_locked(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    tombstone: &Arc<WebConnectionTombstone>,
+    reason: Option<String>,
+) -> bool {
+    let (removed, tombstone_registered_elsewhere) = inner
+        .clients
+        .lock()
+        .map(|mut clients| {
+            let exact = clients.get(&connection_id).is_some_and(|client| {
+                client.client_id == client_id
+                    && client
+                        .web_tombstone
+                        .as_ref()
+                        .is_some_and(|registered| Arc::ptr_eq(registered, tombstone))
+            });
+            let removed = exact.then(|| clients.remove(&connection_id)).flatten();
+            let tombstone_registered_elsewhere = removed.is_none()
+                && clients.values().any(|client| {
+                    client
+                        .web_tombstone
+                        .as_ref()
+                        .is_some_and(|registered| Arc::ptr_eq(registered, tombstone))
+                });
+            (removed, tombstone_registered_elsewhere)
+        })
+        .unwrap_or((None, false));
+    let Some(removed) = removed else {
+        if !tombstone_registered_elsewhere {
+            tombstone.deactivate();
+        }
+        return false;
+    };
+    if let (Some(sender), Some(reason)) = (removed.web_sender.as_ref(), reason) {
+        let _ = sender.try_send_disconnect(reason);
+    }
+    tombstone.deactivate();
+    let release = inner
+        .web_control
+        .lock()
+        .map(|mut control| control.release_connection(connection_id, client_id))
+        .unwrap_or_default();
+    let same_client_browser_remains = inner.clients.lock().ok().is_some_and(|clients| {
+        clients.values().any(|client| {
+            client.client_id == client_id
+                && client
+                    .web_tombstone
+                    .as_ref()
+                    .is_some_and(|registered| registered.is_active())
+        })
+    });
+    let clear_controller = release.released_lease.is_some()
+        || release.legacy_released
+        || (!release.lease_release_deferred && !same_client_browser_remains);
+    if clear_controller {
+        if let Ok(mut controller) = inner.controller_client_id.write() {
+            if controller.as_deref() == Some(client_id) {
+                *controller = None;
+            }
+        }
+    }
+    true
 }
 
 fn web_client_is_still_paired(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {
@@ -396,16 +569,50 @@ fn web_connection_is_registered(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
     client_id: &str,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
 ) -> bool {
     inner
         .clients
         .lock()
         .map(|clients| {
-            clients
-                .get(&connection_id)
-                .is_some_and(|client| client.web_sender.is_some() && client.client_id == client_id)
+            clients.get(&connection_id).is_some_and(|client| {
+                client.client_id == client_id
+                    && client.web_sender.is_some()
+                    && client.web_tombstone.as_ref().is_some_and(|registered| {
+                        registered.is_active()
+                            && expected_tombstone
+                                .is_none_or(|expected| Arc::ptr_eq(registered, expected))
+                    })
+            })
         })
         .unwrap_or(false)
+}
+
+fn web_connection_is_authoritative_locked(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+) -> bool {
+    web_client_is_still_paired(inner, client_id)
+        && registered_web_tombstone(inner, connection_id, client_id, expected_tombstone).is_some()
+}
+
+fn registered_web_tombstone(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+) -> Option<Arc<WebConnectionTombstone>> {
+    inner.clients.lock().ok().and_then(|clients| {
+        let client = clients.get(&connection_id)?;
+        let registered = client.web_tombstone.as_ref()?;
+        (client.client_id == client_id
+            && client.web_sender.is_some()
+            && registered.is_active()
+            && expected_tombstone.is_none_or(|expected| Arc::ptr_eq(registered, expected)))
+        .then(|| registered.clone())
+    })
 }
 
 #[cfg(test)]
@@ -420,6 +627,7 @@ fn handle_inbound(
     handle_inbound_with_web(inner, connection_id, client_id, message, tokio_tx, &web_tx);
 }
 
+#[cfg(test)]
 fn handle_inbound_with_web(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
@@ -428,10 +636,169 @@ fn handle_inbound_with_web(
     tokio_tx: &tokio_mpsc::UnboundedSender<ServerMessage>,
     web_tx: &tokio_mpsc::UnboundedSender<WsOutbound>,
 ) {
+    handle_inbound_core(
+        inner,
+        connection_id,
+        client_id,
+        message,
+        InboundResponder::Test {
+            native: tokio_tx.clone(),
+            web: web_tx.clone(),
+        },
+    );
+}
+
+fn handle_inbound_browser(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    message: WsInbound,
+    sender: &BrowserOutboundSender,
+) {
+    handle_inbound_core(
+        inner,
+        connection_id,
+        client_id,
+        message,
+        InboundResponder::Browser {
+            sender: sender.clone(),
+            inner: inner.clone(),
+            connection_id,
+            client_id: client_id.to_string(),
+        },
+    );
+}
+
+#[derive(Clone)]
+enum InboundResponder {
+    Browser {
+        sender: BrowserOutboundSender,
+        inner: Arc<RemoteHostInner>,
+        connection_id: u64,
+        client_id: String,
+    },
+    #[cfg(test)]
+    Test {
+        native: tokio_mpsc::UnboundedSender<ServerMessage>,
+        web: tokio_mpsc::UnboundedSender<WsOutbound>,
+    },
+}
+
+impl InboundResponder {
+    fn tombstone(&self) -> Option<Arc<WebConnectionTombstone>> {
+        match self {
+            Self::Browser { sender, .. } => Some(sender.tombstone()),
+            #[cfg(test)]
+            Self::Test { .. } => None,
+        }
+    }
+
+    fn send_server(&self, message: ServerMessage) -> Result<(), BrowserEnqueueError> {
+        match self {
+            Self::Browser {
+                sender,
+                inner,
+                connection_id,
+                client_id,
+            } => {
+                let result =
+                    sender.try_send_server_message(&message, inner, *connection_id, client_id);
+                if result.is_err() {
+                    revoke_web_connection(
+                        inner,
+                        *connection_id,
+                        client_id,
+                        &sender.tombstone(),
+                        None,
+                    );
+                }
+                result
+            }
+            #[cfg(test)]
+            Self::Test { native, .. } => native
+                .send(message)
+                .map_err(|_| BrowserEnqueueError::Closed),
+        }
+    }
+
+    fn send_web(&self, message: WsOutbound) -> Result<(), BrowserEnqueueError> {
+        match self {
+            Self::Browser {
+                sender,
+                inner,
+                connection_id,
+                client_id,
+            } => {
+                let result = sender.try_send(message);
+                if result.is_err() {
+                    revoke_web_connection(
+                        inner,
+                        *connection_id,
+                        client_id,
+                        &sender.tombstone(),
+                        None,
+                    );
+                }
+                result
+            }
+            #[cfg(test)]
+            Self::Test { web, .. } => web.send(message).map_err(|_| BrowserEnqueueError::Closed),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ServerResponseLane(InboundResponder);
+
+impl ServerResponseLane {
+    fn send(&self, message: ServerMessage) -> Result<(), BrowserEnqueueError> {
+        self.0.send_server(message)
+    }
+}
+
+#[derive(Clone)]
+struct WebResponseLane(InboundResponder);
+
+impl WebResponseLane {
+    fn send(&self, message: WsOutbound) -> Result<(), BrowserEnqueueError> {
+        self.0.send_web(message)
+    }
+
+    fn is_test_lane(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self.0, InboundResponder::Test { .. })
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+fn handle_inbound_core(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    message: WsInbound,
+    outbound: InboundResponder,
+) {
+    let tokio_tx = ServerResponseLane(outbound.clone());
+    let web_tx = WebResponseLane(outbound);
+    let expected_tombstone = web_tx.0.tombstone();
     if !web_client_is_still_paired(inner, client_id)
-        || !web_connection_is_registered(inner, connection_id, client_id)
+        || !web_connection_is_registered(
+            inner,
+            connection_id,
+            client_id,
+            expected_tombstone.as_ref(),
+        )
     {
-        unregister_client(inner, connection_id, client_id);
+        if let InboundResponder::Browser { sender, .. } = &web_tx.0 {
+            unregister_browser_client(inner, connection_id, client_id, &sender.tombstone());
+        } else if let Ok(mut clients) = inner.clients.lock() {
+            clients.remove(&connection_id);
+        }
         let _ = tokio_tx.send(ServerMessage::Disconnected {
             message: "This browser connection is no longer active. Reconnect or pair again."
                 .to_string(),
@@ -441,13 +808,14 @@ fn handle_inbound_with_web(
 
     match message {
         WsInbound::Resume { request } => {
-            send_resume_state(
+            send_resume_state_with_lane(
                 inner,
                 connection_id,
                 client_id,
                 request,
                 now_epoch_ms(),
-                web_tx,
+                &web_tx,
+                expected_tombstone.as_ref(),
             );
         }
         WsInbound::AcquireWriterLease {
@@ -461,21 +829,23 @@ fn handle_inbound_with_web(
                 return;
             }
             let writer_lease = if visible {
-                acquire_writer_lease(
+                acquire_writer_lease_for_connection(
                     inner,
                     connection_id,
                     client_id,
                     &client_instance_id,
                     now_epoch_ms(),
+                    expected_tombstone.as_ref(),
                 )
             } else {
-                set_writer_visibility(
+                set_writer_visibility_for_connection(
                     inner,
                     connection_id,
                     client_id,
                     &client_instance_id,
                     false,
                     now_epoch_ms(),
+                    expected_tombstone.as_ref(),
                 )
             };
             let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
@@ -499,6 +869,7 @@ fn handle_inbound_with_web(
                 expected_lease_generation,
                 visible,
                 now_epoch_ms(),
+                expected_tombstone.as_ref(),
             );
             let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
         }
@@ -512,13 +883,14 @@ fn handle_inbound_with_web(
                 });
                 return;
             }
-            let writer_lease = set_writer_visibility(
+            let writer_lease = set_writer_visibility_for_connection(
                 inner,
                 connection_id,
                 client_id,
                 &client_instance_id,
                 visible,
                 now_epoch_ms(),
+                expected_tombstone.as_ref(),
             );
             let _ = web_tx.send(WsOutbound::WriterLeaseState { writer_lease });
         }
@@ -529,7 +901,7 @@ fn handle_inbound_with_web(
             attachments,
             expected_lease_generation,
         } => {
-            match process_composer_submit(
+            match process_composer_submit_for_connection(
                 inner,
                 connection_id,
                 client_id,
@@ -539,6 +911,7 @@ fn handle_inbound_with_web(
                 attachments,
                 expected_lease_generation,
                 now_epoch_ms(),
+                expected_tombstone.as_ref(),
             ) {
                 Ok(accepted) => {
                     let _ = web_tx.send(WsOutbound::ComposerAccepted { accepted });
@@ -557,7 +930,14 @@ fn handle_inbound_with_web(
                     message: "Semantic session key is empty or too long.".to_string(),
                 });
             } else {
-                subscribe_semantic(inner, connection_id, stable_session_key, after_sequence)
+                subscribe_semantic(
+                    inner,
+                    connection_id,
+                    client_id,
+                    stable_session_key,
+                    after_sequence,
+                    expected_tombstone.as_ref(),
+                )
             }
         }
         WsInbound::UnsubscribeSemantic { stable_session_key } => {
@@ -566,7 +946,13 @@ fn handle_inbound_with_web(
                     message: "Semantic session key is empty or too long.".to_string(),
                 });
             } else {
-                unsubscribe_semantic(inner, connection_id, &stable_session_key)
+                unsubscribe_semantic(
+                    inner,
+                    connection_id,
+                    client_id,
+                    &stable_session_key,
+                    expected_tombstone.as_ref(),
+                )
             }
         }
         WsInbound::InterruptSession {
@@ -579,41 +965,42 @@ fn handle_inbound_with_web(
                 });
                 return;
             }
-            if !web_mutation_authorized(
+            let result = with_web_mutation_authority(
                 inner,
                 connection_id,
                 client_id,
+                expected_tombstone.as_ref(),
                 Some(expected_lease_generation),
                 now_epoch_ms(),
-            ) {
+                || {
+                    let (session_id, _) = resolve_unique_session(inner, &stable_session_key)
+                        .map_err(|_| "The requested session no longer exists.".to_string())?;
+                    let handler = inner
+                        .terminal_input_handler
+                        .read()
+                        .ok()
+                        .and_then(|slot| slot.as_ref().cloned());
+                    handler.map_or(Ok(()), |handler| {
+                        invoke_terminal_input(
+                            &handler,
+                            RemoteTerminalInput::Bytes {
+                                session_id,
+                                bytes: vec![0x03],
+                            },
+                            now_epoch_ms(),
+                        )
+                    })
+                },
+            );
+            let Some(result) = result else {
                 let _ = tokio_tx.send(ServerMessage::Error {
                     message: "The writer lease changed before the interrupt was accepted."
                         .to_string(),
                 });
                 return;
-            }
-            let Ok((session_id, _)) = resolve_unique_session(inner, &stable_session_key) else {
-                let _ = tokio_tx.send(ServerMessage::Error {
-                    message: "The requested session no longer exists.".to_string(),
-                });
-                return;
             };
-            let handler = inner
-                .terminal_input_handler
-                .read()
-                .ok()
-                .and_then(|slot| slot.as_ref().cloned());
-            if let Some(handler) = handler {
-                if let Err(error) = invoke_terminal_input(
-                    &handler,
-                    RemoteTerminalInput::Bytes {
-                        session_id,
-                        bytes: vec![0x03],
-                    },
-                    now_epoch_ms(),
-                ) {
-                    let _ = tokio_tx.send(ServerMessage::Error { message: error });
-                }
+            if let Err(message) = result {
+                let _ = tokio_tx.send(ServerMessage::Error { message });
             }
         }
         WsInbound::Ping => {
@@ -631,7 +1018,14 @@ fn handle_inbound_with_web(
                 return;
             }
             if let Ok(mut clients) = inner.clients.lock() {
-                if let Some(client) = clients.get_mut(&connection_id) {
+                if let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+                    client.client_id == client_id
+                        && client.web_tombstone.as_ref().is_some_and(|registered| {
+                            expected_tombstone
+                                .as_ref()
+                                .is_none_or(|expected| Arc::ptr_eq(registered, expected))
+                        })
+                }) {
                     for session_id in &session_ids {
                         client.subscribed_session_ids.insert(session_id.clone());
                         if !client.bootstrapped_session_ids.contains(session_id) {
@@ -657,30 +1051,38 @@ fn handle_inbound_with_web(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if let Ok(mut clients) = inner.clients.lock() {
-                if let Some(client) = clients.get_mut(&connection_id) {
-                    for (session_id, bootstrap) in bootstraps {
-                        if !client.subscribed_session_ids.contains(&session_id) {
-                            client.bootstrap_pending_session_ids.remove(&session_id);
-                            continue;
-                        }
-                        if tokio_tx
-                            .send(ServerMessage::SessionStream {
-                                event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
+            for (session_id, bootstrap) in bootstraps {
+                let still_subscribed = inner.clients.lock().ok().is_some_and(|clients| {
+                    clients.get(&connection_id).is_some_and(|client| {
+                        client.client_id == client_id
+                            && client.web_tombstone.as_ref().is_some_and(|registered| {
+                                expected_tombstone
+                                    .as_ref()
+                                    .is_none_or(|expected| Arc::ptr_eq(registered, expected))
                             })
-                            .is_ok()
-                        {
-                            // `bootstrapped_session_ids` must mean "this
-                            // connection has actually been sent a bootstrap",
-                            // not merely "it subscribed". Otherwise a
-                            // late-attaching browser can miss the snapshot
-                            // forever if the first lookup returns `None`.
+                            && client.subscribed_session_ids.contains(&session_id)
+                    })
+                });
+                if !still_subscribed {
+                    continue;
+                }
+                if tokio_tx
+                    .send(ServerMessage::SessionStream {
+                        event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
+                    })
+                    .is_ok()
+                {
+                    if let Ok(mut clients) = inner.clients.lock() {
+                        if let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+                            client.client_id == client_id
+                                && client.web_tombstone.as_ref().is_some_and(|registered| {
+                                    expected_tombstone
+                                        .as_ref()
+                                        .is_none_or(|expected| Arc::ptr_eq(registered, expected))
+                                })
+                                && client.subscribed_session_ids.contains(&session_id)
+                        }) {
                             client.bootstrapped_session_ids.insert(session_id.clone());
-                            // Only clear the pending bit after a bootstrap has
-                            // really been delivered. Clearing it on an eager
-                            // subscribe miss regressed late-attaching AI tabs:
-                            // the browser stayed subscribed, but no later host
-                            // retry was allowed to send the first snapshot.
                             client.bootstrap_pending_session_ids.remove(&session_id);
                         }
                     }
@@ -699,7 +1101,14 @@ fn handle_inbound_with_web(
                 return;
             }
             if let Ok(mut clients) = inner.clients.lock() {
-                if let Some(client) = clients.get_mut(&connection_id) {
+                if let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+                    client.client_id == client_id
+                        && client.web_tombstone.as_ref().is_some_and(|registered| {
+                            expected_tombstone
+                                .as_ref()
+                                .is_none_or(|expected| Arc::ptr_eq(registered, expected))
+                        })
+                }) {
                     for session_id in &session_ids {
                         client.subscribed_session_ids.remove(session_id);
                         client.bootstrapped_session_ids.remove(session_id);
@@ -716,7 +1125,14 @@ fn handle_inbound_with_web(
                 return;
             }
             if let Ok(mut clients) = inner.clients.lock() {
-                if let Some(client) = clients.get_mut(&connection_id) {
+                if let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+                    client.client_id == client_id
+                        && client.web_tombstone.as_ref().is_some_and(|registered| {
+                            expected_tombstone
+                                .as_ref()
+                                .is_none_or(|expected| Arc::ptr_eq(registered, expected))
+                        })
+                }) {
                     client.focused_session_id = Some(session_id);
                 }
             }
@@ -732,30 +1148,35 @@ fn handle_inbound_with_web(
                 });
                 return;
             }
-            if !web_mutation_authorized(
-                inner,
-                connection_id,
-                client_id,
-                expected_lease_generation,
-                now_epoch_ms(),
-            ) {
-                // Viewer-mode typing is a no-op on the host, matching the
-                // native TCP client's behavior.
-                return;
-            }
             let handler = inner
                 .terminal_input_handler
                 .read()
                 .ok()
                 .and_then(|slot| slot.as_ref().cloned());
-            if let Some(handler) = handler {
-                if let Err(error) = invoke_terminal_input(
-                    &handler,
-                    RemoteTerminalInput::Text { session_id, text },
-                    now_epoch_ms(),
-                ) {
-                    let _ = tokio_tx.send(ServerMessage::Error { message: error });
-                }
+            let result = with_web_mutation_authority(
+                inner,
+                connection_id,
+                client_id,
+                expected_tombstone.as_ref(),
+                expected_lease_generation,
+                now_epoch_ms(),
+                || {
+                    handler.map_or(Ok(()), |handler| {
+                        invoke_terminal_input(
+                            &handler,
+                            RemoteTerminalInput::Text { session_id, text },
+                            now_epoch_ms(),
+                        )
+                    })
+                },
+            );
+            let Some(result) = result else {
+                // Viewer-mode typing is a no-op on the host, matching the
+                // native TCP client's behavior.
+                return;
+            };
+            if let Err(message) = result {
+                let _ = tokio_tx.send(ServerMessage::Error { message });
             }
         }
         WsInbound::PasteImage {
@@ -782,18 +1203,6 @@ fn handle_inbound_with_web(
                 });
                 return;
             }
-            if !web_mutation_authorized(
-                inner,
-                connection_id,
-                client_id,
-                expected_lease_generation,
-                now_epoch_ms(),
-            ) {
-                let _ = tokio_tx.send(ServerMessage::Error {
-                    message: "This client is in viewer mode. Take control first.".to_string(),
-                });
-                return;
-            }
             let bytes = match BASE64.decode(data_base64.as_bytes()) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -814,21 +1223,38 @@ fn handle_inbound_with_web(
                 .read()
                 .ok()
                 .and_then(|slot| slot.as_ref().cloned());
-            if let Some(handler) = handler {
-                if let Err(error) = invoke_terminal_input(
-                    &handler,
-                    RemoteTerminalInput::Image {
-                        session_id,
-                        attachment: RemoteImageAttachment {
-                            mime_type,
-                            file_name,
-                            bytes,
-                        },
-                    },
-                    now_epoch_ms(),
-                ) {
-                    let _ = tokio_tx.send(ServerMessage::Error { message: error });
-                }
+            let result = with_web_mutation_authority(
+                inner,
+                connection_id,
+                client_id,
+                expected_tombstone.as_ref(),
+                expected_lease_generation,
+                now_epoch_ms(),
+                || {
+                    handler.map_or(Ok(()), |handler| {
+                        invoke_terminal_input(
+                            &handler,
+                            RemoteTerminalInput::Image {
+                                session_id,
+                                attachment: RemoteImageAttachment {
+                                    mime_type,
+                                    file_name,
+                                    bytes,
+                                },
+                            },
+                            now_epoch_ms(),
+                        )
+                    })
+                },
+            );
+            let Some(result) = result else {
+                let _ = tokio_tx.send(ServerMessage::Error {
+                    message: "This client is in viewer mode. Take control first.".to_string(),
+                });
+                return;
+            };
+            if let Err(message) = result {
+                let _ = tokio_tx.send(ServerMessage::Error { message });
             }
         }
         WsInbound::Resize {
@@ -843,61 +1269,77 @@ fn handle_inbound_with_web(
                 });
                 return;
             }
-            if !web_mutation_authorized(
-                inner,
-                connection_id,
-                client_id,
-                expected_lease_generation,
-                now_epoch_ms(),
-            ) {
-                return;
-            }
             let handler = inner
                 .terminal_resize_handler
                 .read()
                 .ok()
                 .and_then(|slot| slot.as_ref().cloned());
-            if let Some(handler) = handler {
-                // The SPA only knows rows/cols; the host's `SessionDimensions`
-                // carries cell pixel size too. Use sensible defaults so the
-                // PTY sizing math still works — the host recomputes its own
-                // pixel dimensions when it paints.
-                handler(
-                    session_id,
-                    SessionDimensions {
-                        rows,
-                        cols,
-                        cell_width: 10,
-                        cell_height: 20,
-                    },
-                );
-            }
+            let _ = with_web_mutation_authority(
+                inner,
+                connection_id,
+                client_id,
+                expected_tombstone.as_ref(),
+                expected_lease_generation,
+                now_epoch_ms(),
+                || {
+                    if let Some(handler) = handler {
+                        // The SPA only knows rows/cols; the host's `SessionDimensions`
+                        // carries cell pixel size too. Use sensible defaults so the
+                        // PTY sizing math still works — the host recomputes its own
+                        // pixel dimensions when it paints.
+                        handler(
+                            session_id,
+                            SessionDimensions {
+                                rows,
+                                cols,
+                                cell_width: 10,
+                                cell_height: 20,
+                            },
+                        );
+                    }
+                },
+            );
         }
         WsInbound::Action {
             action,
             expected_lease_generation,
         } => {
             let action = action.into_remote();
-            if requires_control(&action)
-                && !web_mutation_authorized(
+            let requires_writer = requires_control(&action);
+            let enqueue = || {
+                inner.pending_requests.lock().is_ok_and(|mut requests| {
+                    requests.push(PendingRemoteRequest {
+                        client_id: client_id.to_string(),
+                        action,
+                        response: None,
+                    });
+                    true
+                })
+            };
+            let accepted = if requires_writer {
+                with_web_mutation_authority(
                     inner,
                     connection_id,
                     client_id,
+                    expected_tombstone.as_ref(),
                     expected_lease_generation,
                     now_epoch_ms(),
+                    enqueue,
                 )
-            {
+            } else {
+                with_registered_web_operation(
+                    inner,
+                    connection_id,
+                    client_id,
+                    expected_tombstone.as_ref(),
+                    enqueue,
+                )
+            };
+            if accepted.is_none() && requires_writer {
                 let _ = tokio_tx.send(ServerMessage::Disconnected {
                     message: "viewer mode: take control before acting".to_string(),
                 });
                 return;
-            }
-            if let Ok(mut requests) = inner.pending_requests.lock() {
-                requests.push(PendingRemoteRequest {
-                    client_id: client_id.to_string(),
-                    action,
-                    response: None,
-                });
             }
         }
         WsInbound::Request {
@@ -906,15 +1348,42 @@ fn handle_inbound_with_web(
             expected_lease_generation,
         } => {
             let action = action.into_remote();
-            if requires_control(&action)
-                && !web_mutation_authorized(
+            let requires_writer = requires_control(&action);
+            let (response_tx, response_rx) = std_mpsc::channel();
+            let timeout = request_timeout_for_action(&action);
+            let enqueue = || {
+                inner.pending_requests.lock().is_ok_and(|mut requests| {
+                    requests.push(PendingRemoteRequest {
+                        client_id: client_id.to_string(),
+                        action,
+                        response: Some(response_tx),
+                    });
+                    true
+                })
+            };
+            let accepted = if requires_writer {
+                with_web_mutation_authority(
                     inner,
                     connection_id,
                     client_id,
+                    expected_tombstone.as_ref(),
                     expected_lease_generation,
                     now_epoch_ms(),
+                    enqueue,
                 )
-            {
+            } else {
+                with_registered_web_operation(
+                    inner,
+                    connection_id,
+                    client_id,
+                    expected_tombstone.as_ref(),
+                    enqueue,
+                )
+            };
+            if accepted.is_none() {
+                if !requires_writer {
+                    return;
+                }
                 let _ = tokio_tx.send(ServerMessage::Response {
                     request_id: id,
                     result: RemoteActionResult::error(
@@ -922,16 +1391,6 @@ fn handle_inbound_with_web(
                     ),
                 });
                 return;
-            }
-
-            let (response_tx, response_rx) = std_mpsc::channel();
-            let timeout = request_timeout_for_action(&action);
-            if let Ok(mut requests) = inner.pending_requests.lock() {
-                requests.push(PendingRemoteRequest {
-                    client_id: client_id.to_string(),
-                    action,
-                    response: Some(response_tx),
-                });
             }
 
             let response_tx = tokio_tx.clone();
@@ -946,13 +1405,30 @@ fn handle_inbound_with_web(
             });
         }
         WsInbound::TakeControl => {
-            claim_legacy_control(inner, connection_id, client_id, true);
+            claim_legacy_control_for_connection(
+                inner,
+                connection_id,
+                client_id,
+                true,
+                expected_tombstone.as_ref(),
+            );
         }
         WsInbound::ClaimControlIfAvailable => {
-            claim_legacy_control(inner, connection_id, client_id, false);
+            claim_legacy_control_for_connection(
+                inner,
+                connection_id,
+                client_id,
+                false,
+                expected_tombstone.as_ref(),
+            );
         }
         WsInbound::ReleaseControl => {
-            release_legacy_control(inner, connection_id, client_id);
+            release_legacy_control_for_connection(
+                inner,
+                connection_id,
+                client_id,
+                expected_tombstone.as_ref(),
+            );
         }
     }
 }
@@ -960,154 +1436,185 @@ fn handle_inbound_with_web(
 fn subscribe_semantic(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
+    client_id: &str,
     stable_session_key: StableSessionKey,
     after_sequence: u64,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
 ) {
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _delivery = inner
         .semantic_delivery_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Make the subscription pending before cloning replay. A delivery that
-    // took an older cursor snapshot must fail its cursor recheck, while the
-    // delivery-only lock prevents two concurrent Subscribe frames from
-    // committing duplicate bootstraps.
-    let registered = inner
-        .clients
-        .lock()
-        .map(|mut clients| {
-            clients.get_mut(&connection_id).is_some_and(|client| {
-                if client.web_sender.is_none() {
-                    return false;
-                }
-                client.semantic_cursors.remove(&stable_session_key);
-                true
-            })
-        })
-        .unwrap_or(false);
-    if !registered {
+    if !web_connection_is_authoritative_locked(inner, connection_id, client_id, expected_tombstone)
+    {
         return;
     }
-    loop {
-        let generation = inner
-            .semantic_publication_generation
-            .load(Ordering::Acquire);
-        if generation % 2 != 0 {
-            std::thread::yield_now();
-            continue;
-        }
-        // Potentially large replay cloning happens without excluding PTY
-        // publishers. A brief commit lock below verifies this optimistic view.
-        let replay = inner
-            .semantic_journals
-            .lock()
-            .ok()
-            .and_then(|journals| journals.replay_after(&stable_session_key, after_sequence));
-        let bootstrap = replay.map_or_else(
-            || SemanticBootstrap {
-                stable_session_key: stable_session_key.clone(),
-                oldest_sequence: 0,
-                latest_sequence: 0,
-                cursor_rolled_over: false,
-                events: Vec::new(),
-            },
-            |replay| SemanticBootstrap {
-                stable_session_key: stable_session_key.clone(),
-                oldest_sequence: replay.oldest_sequence,
-                latest_sequence: replay.latest_sequence,
-                cursor_rolled_over: replay.cursor_rolled_over,
-                events: replay.events,
-            },
-        );
-        let latest_sequence = bootstrap.latest_sequence;
-        let publication_guard = inner
-            .semantic_publication_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner
-            .semantic_publication_generation
-            .load(Ordering::Acquire)
-            != generation
+    let Some((sender, tombstone)) = inner.clients.lock().ok().and_then(|clients| {
+        let client = clients.get(&connection_id)?;
+        if client.client_id != client_id
+            || client.web_tombstone.as_ref().is_none_or(|registered| {
+                expected_tombstone.is_some_and(|expected| !Arc::ptr_eq(registered, expected))
+            })
         {
-            drop(publication_guard);
-            std::thread::yield_now();
-            continue;
+            return None;
         }
-        let send_result = inner.clients.lock().ok().and_then(|mut clients| {
-            let client = clients.get_mut(&connection_id)?;
-            let sender = client.web_sender.as_ref()?;
-            let result = sender.try_send(WsOutbound::SemanticBootstrap { bootstrap });
-            if result.is_ok() {
+        Some((client.web_sender.clone()?, client.web_tombstone.clone()?))
+    }) else {
+        return;
+    };
+    let capture =
+        inner.semantic_journals.lock().ok().and_then(|journals| {
+            journals.capture_replay_after(&stable_session_key, after_sequence)
+        });
+    let replay = Arc::new(capture.map_or(
+        SemanticReplay {
+            oldest_sequence: 0,
+            through_sequence: 0,
+            cursor_rolled_over: false,
+            events: Vec::new(),
+        },
+        |capture| capture.into_replay(),
+    ));
+    let through_sequence = replay.through_sequence;
+    let epoch = sender.next_replay_epoch();
+    let replay_id = sender.next_replay_id();
+    let delivered = sender
+        .try_send_replay(
+            None,
+            replay_id,
+            stable_session_key.clone(),
+            after_sequence,
+            replay,
+            epoch,
+        )
+        .is_ok();
+    if delivered {
+        if let Ok(mut clients) = inner.clients.lock() {
+            if let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+                client.client_id == client_id
+                    && client
+                        .web_tombstone
+                        .as_ref()
+                        .is_some_and(|registered| Arc::ptr_eq(registered, &tombstone))
+            }) {
                 client
                     .semantic_cursors
-                    .insert(stable_session_key.clone(), latest_sequence);
-            }
-            Some(result)
-        });
-        let delivered = send_result.as_ref().is_some_and(Result::is_ok);
-        drop(publication_guard);
-        // Any rejected frame (and its potentially large replay Vec) is dropped
-        // only after PTY publication is free to continue.
-        drop(send_result);
-        if !delivered {
-            let client_id = inner
-                .clients
-                .lock()
-                .ok()
-                .and_then(|mut clients| clients.remove(&connection_id))
-                .map(|client| client.client_id);
-            if let Some(client_id) = client_id {
-                release_web_writer_connection(inner, connection_id, &client_id);
+                    .insert(stable_session_key, through_sequence);
+                return;
             }
         }
-        break;
     }
+    drop(_delivery);
+    revoke_web_connection_locked(inner, connection_id, client_id, &tombstone, None);
 }
 
 fn unsubscribe_semantic(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
-    stable_session_key: &StableSessionKey,
-) {
-    let _delivery = inner
-        .semantic_delivery_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _publication = inner
-        .semantic_publication_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Ok(mut clients) = inner.clients.lock() {
-        if let Some(client) = clients.get_mut(&connection_id) {
-            client.semantic_cursors.remove(stable_session_key);
-        }
-    }
-}
-
-fn web_mutation_authorized(
-    inner: &Arc<RemoteHostInner>,
-    connection_id: u64,
     client_id: &str,
-    expected_lease_generation: Option<u64>,
-    now_epoch_ms: u64,
-) -> bool {
+    stable_session_key: &StableSessionKey,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+) {
     let _operation = inner
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (authorized, lease_changed) = {
+    let _delivery = inner
+        .semantic_delivery_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !web_connection_is_authoritative_locked(inner, connection_id, client_id, expected_tombstone)
+    {
+        return;
+    }
+    if let Ok(mut clients) = inner.clients.lock() {
+        if let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+            client.client_id == client_id
+                && client.web_tombstone.as_ref().is_some_and(|registered| {
+                    expected_tombstone.is_none_or(|expected| Arc::ptr_eq(registered, expected))
+                })
+        }) {
+            client.semantic_cursors.remove(stable_session_key);
+            if let Some(sender) = client.web_sender.as_ref() {
+                sender.supersede_replay();
+            }
+        }
+    }
+}
+
+struct WebAuthorityReservation {
+    inner: Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: String,
+    lease_generation: u64,
+    mutation_id: String,
+}
+
+impl Drop for WebAuthorityReservation {
+    fn drop(&mut self) {
+        finish_composer_mutation(
+            &self.inner,
+            self.connection_id,
+            &self.client_id,
+            self.lease_generation,
+            &self.mutation_id,
+            now_epoch_ms(),
+        );
+    }
+}
+
+fn with_web_mutation_authority<R>(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+    expected_lease_generation: Option<u64>,
+    now_epoch_ms: u64,
+    operation: impl FnOnce() -> R,
+) -> Option<R> {
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !web_client_is_still_paired(inner, client_id) {
+        return None;
+    }
+    let permit = registered_web_tombstone(inner, connection_id, client_id, expected_tombstone)?;
+    let operation_id = NEXT_WEB_AUTHORITY_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    let mutation_id = format!("__web_authority_operation:{operation_id}");
+    let (authorized, lease_changed, reservation) = {
         let Ok(mut control) = inner.web_control.lock() else {
-            return false;
+            return None;
         };
         let before = control.writer_leases().peek();
-        let authorized = match expected_lease_generation {
-            Some(generation) => control
-                .writer_leases_mut()
-                .authorize(connection_id, client_id, generation, now_epoch_ms)
-                .is_ok(),
-            None => control.legacy_authorizes(connection_id, client_id),
+        let (authorized, reservation) = match expected_lease_generation {
+            Some(generation) => match control.writer_leases_mut().begin_mutation(
+                connection_id,
+                client_id,
+                generation,
+                &mutation_id,
+                now_epoch_ms,
+            ) {
+                Ok(MutationBegin::Started(lease)) => (
+                    true,
+                    Some(WebAuthorityReservation {
+                        inner: inner.clone(),
+                        connection_id,
+                        client_id: client_id.to_string(),
+                        lease_generation: lease.generation,
+                        mutation_id: mutation_id.clone(),
+                    }),
+                ),
+                Ok(MutationBegin::AlreadyInFlight(_)) | Err(_) => (false, None),
+            },
+            None => (control.legacy_authorizes(connection_id, client_id), None),
         };
         let after = control.writer_leases().peek();
-        (authorized, before != after)
+        (authorized, before != after, reservation)
     };
     let controller_matches = inner
         .controller_client_id
@@ -1117,7 +1624,32 @@ fn web_mutation_authorized(
     if lease_changed {
         broadcast_writer_lease_state_locked(inner, now_epoch_ms);
     }
-    authorized && controller_matches
+    let permitted = authorized && controller_matches && permit.is_active();
+    drop(_operation);
+    if !permitted {
+        drop(reservation);
+        return None;
+    }
+    let result = operation();
+    drop(reservation);
+    Some(result)
+}
+
+fn with_registered_web_operation<R>(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+    operation: impl FnOnce() -> R,
+) -> Option<R> {
+    let _operation = inner
+        .web_control_operation_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let permit = web_client_is_still_paired(inner, client_id)
+        .then(|| registered_web_tombstone(inner, connection_id, client_id, expected_tombstone))??;
+    drop(_operation);
+    permit.is_active().then(operation)
 }
 
 fn claim_legacy_control(
@@ -1126,10 +1658,30 @@ fn claim_legacy_control(
     client_id: &str,
     force: bool,
 ) {
+    claim_legacy_control_for_connection(inner, connection_id, client_id, force, None);
+}
+
+fn claim_legacy_control_for_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    force: bool,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+) {
     let _operation = inner
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if expected_tombstone.is_some()
+        && !web_connection_is_authoritative_locked(
+            inner,
+            connection_id,
+            client_id,
+            expected_tombstone,
+        )
+    {
+        return;
+    }
     let controller_id = inner
         .controller_client_id
         .read()
@@ -1149,11 +1701,26 @@ fn claim_legacy_control(
     }
 }
 
-fn release_legacy_control(inner: &Arc<RemoteHostInner>, connection_id: u64, client_id: &str) {
+fn release_legacy_control_for_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+) {
     let _operation = inner
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if expected_tombstone.is_some()
+        && !web_connection_is_authoritative_locked(
+            inner,
+            connection_id,
+            client_id,
+            expected_tombstone,
+        )
+    {
+        return;
+    }
     let released = inner
         .web_control
         .lock()
@@ -1179,19 +1746,20 @@ fn build_resume_state(
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (state, _) =
-        build_resume_state_locked(inner, connection_id, client_id, request, now_epoch_ms);
+    let (state, _, _) =
+        build_resume_state_locked(inner, connection_id, client_id, request, now_epoch_ms, 1);
     broadcast_writer_lease_state_locked(inner, now_epoch_ms);
     state
 }
 
-fn send_resume_state(
+fn send_resume_state_with_lane(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
     client_id: &str,
     request: ResumeRequest,
     now_epoch_ms: u64,
-    web_tx: &tokio_mpsc::UnboundedSender<WsOutbound>,
+    web_tx: &WebResponseLane,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
 ) {
     let valid = valid_client_instance_id(&request.client_instance_id)
         && request.route.len() <= MAX_RESUME_ROUTE_BYTES
@@ -1209,50 +1777,130 @@ fn send_resume_state(
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    loop {
-        let (mut state, semantic_generation) = build_resume_state_locked(
-            inner,
-            connection_id,
-            client_id,
-            request.clone(),
-            now_epoch_ms,
-        );
-        let publication_guard = inner
-            .semantic_publication_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner
-            .semantic_publication_generation
-            .load(Ordering::Acquire)
-            != semantic_generation
-        {
-            drop(publication_guard);
-            std::thread::yield_now();
-            continue;
-        }
-        if let Ok(mut clients) = inner.clients.lock() {
-            if let Some(client) = clients.get_mut(&connection_id) {
-                client.semantic_cursors.clear();
-                if let Some(key) = state.desired_session_key.clone() {
-                    let latest = state
-                        .semantic_bootstrap
-                        .as_ref()
-                        .map(|bootstrap| bootstrap.latest_sequence)
-                        .unwrap_or(0);
-                    client.semantic_cursors.insert(key, latest);
-                }
-            }
-        }
-        // Broadcasting can evict a saturated connection and release its
-        // lease. Read once more afterwards so the response enqueued under the
-        // operation lock is the final authoritative state, not a pre-eviction
-        // snapshot. The grant itself carries the 700ms handoff guard.
-        broadcast_writer_lease_state_locked(inner, now_epoch_ms);
-        state.writer_lease = writer_lease_state_locked(inner, connection_id, now_epoch_ms);
-        let _ = web_tx.send(WsOutbound::ResumeState { state });
-        drop(publication_guard);
-        break;
+    let _delivery = inner
+        .semantic_delivery_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !web_connection_is_authoritative_locked(inner, connection_id, client_id, expected_tombstone)
+    {
+        return;
     }
+    let Some((sender, tombstone)) = inner.clients.lock().ok().and_then(|clients| {
+        let client = clients.get(&connection_id)?;
+        if client.client_id != client_id
+            || client.web_tombstone.as_ref().is_none_or(|registered| {
+                expected_tombstone.is_some_and(|expected| !Arc::ptr_eq(registered, expected))
+            })
+        {
+            return None;
+        }
+        Some((client.web_sender.clone()?, client.web_tombstone.clone()?))
+    }) else {
+        return;
+    };
+    if !sender.is_active() {
+        return;
+    }
+    let replay_epoch = sender.next_replay_epoch();
+    let replay_id = sender.next_replay_id();
+    let (state, replay, _) = build_resume_state_locked(
+        inner,
+        connection_id,
+        client_id,
+        request.clone(),
+        now_epoch_ms,
+        replay_id,
+    );
+    let desired_session_key = state.desired_session_key.clone();
+    let through_sequence = state
+        .semantic_replay
+        .as_ref()
+        .map(|descriptor| descriptor.through_sequence);
+    let desired_session_id = desired_session_key.as_ref().and_then(|key| {
+        resolve_unique_session(inner, key)
+            .ok()
+            .map(|(session_id, _)| session_id)
+    });
+    let delivered = if web_tx.is_test_lane() {
+        web_tx.send(WsOutbound::ResumeState { state }).is_ok()
+    } else {
+        let prefix = serialize_text(&WsOutbound::ResumeState { state });
+        match (prefix, replay, desired_session_key.as_ref()) {
+            (Some(prefix), Some(replay), Some(key)) => sender
+                .try_send_replay(
+                    Some(prefix),
+                    replay_id,
+                    key.clone(),
+                    request.semantic_after_sequence.unwrap_or(0),
+                    replay,
+                    replay_epoch,
+                )
+                .is_ok(),
+            (Some(prefix), None, _) => sender.try_send_frame(prefix).is_ok(),
+            _ => false,
+        }
+    };
+    if !delivered {
+        drop(_delivery);
+        revoke_web_connection_locked(inner, connection_id, client_id, &tombstone, None);
+        return;
+    }
+    let committed = inner.clients.lock().ok().is_some_and(|mut clients| {
+        let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+            client.client_id == client_id
+                && client
+                    .web_tombstone
+                    .as_ref()
+                    .is_some_and(|registered| Arc::ptr_eq(registered, &tombstone))
+        }) else {
+            return false;
+        };
+        client.semantic_cursors.clear();
+        if let (Some(key), Some(through)) = (desired_session_key.clone(), through_sequence) {
+            client.semantic_cursors.insert(key, through);
+        }
+        client.subscribed_session_ids.clear();
+        client.bootstrapped_session_ids.clear();
+        client.bootstrap_pending_session_ids.clear();
+        client.focused_session_id = desired_session_id.clone();
+        if let Some(session_id) = desired_session_id.as_ref() {
+            client.subscribed_session_ids.insert(session_id.clone());
+            client
+                .bootstrap_pending_session_ids
+                .insert(session_id.clone());
+        }
+        true
+    });
+    if !committed {
+        drop(_delivery);
+        revoke_web_connection_locked(inner, connection_id, client_id, &tombstone, None);
+        return;
+    }
+    broadcast_writer_lease_state_locked_excluding(inner, now_epoch_ms, Some(connection_id));
+}
+
+#[cfg(test)]
+fn send_resume_state(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    request: ResumeRequest,
+    now_epoch_ms: u64,
+    web_tx: &tokio_mpsc::UnboundedSender<WsOutbound>,
+) {
+    let (native, _) = tokio_mpsc::unbounded_channel();
+    send_resume_state_with_lane(
+        inner,
+        connection_id,
+        client_id,
+        request,
+        now_epoch_ms,
+        &WebResponseLane(InboundResponder::Test {
+            native,
+            web: web_tx.clone(),
+        }),
+        None,
+    );
 }
 
 fn build_resume_state_locked(
@@ -1261,7 +1909,8 @@ fn build_resume_state_locked(
     client_id: &str,
     request: ResumeRequest,
     now_epoch_ms: u64,
-) -> (ResumeState, u64) {
+    replay_id: u64,
+) -> (ResumeState, Option<Arc<SemanticReplay>>, u64) {
     let hard_reset = request
         .seen_runtime_instance_id
         .as_deref()
@@ -1287,28 +1936,37 @@ fn build_resume_state_locked(
     let requested_key = (!hard_reset)
         .then_some(request.desired_session_key.clone())
         .flatten();
-    let (projection, semantic_bootstrap, semantic_generation) = capture_resume_projection(
+    let semantic_after_sequence = request.semantic_after_sequence.unwrap_or(0);
+    let (projection, captured_replay, semantic_generation) = capture_resume_projection(
         inner,
         client_id,
         &writer_lease,
         requested_key.as_ref(),
-        request.semantic_after_sequence.unwrap_or(0),
+        semantic_after_sequence,
     );
     let (route, desired_session_key) = if hard_reset {
         ("/sessions".to_string(), None)
     } else {
         validate_resume_route(&request.route, requested_key.as_ref(), &projection)
     };
-    let semantic_bootstrap = desired_session_key.as_ref().and_then(|desired| {
-        semantic_bootstrap.filter(|bootstrap| &bootstrap.stable_session_key == desired)
+    let semantic_replay_snapshot = desired_session_key.as_ref().map(|_| {
+        Arc::new(captured_replay.unwrap_or(SemanticReplay {
+            oldest_sequence: 0,
+            through_sequence: 0,
+            cursor_rolled_over: false,
+            events: Vec::new(),
+        }))
     });
-
-    mark_resume_subscription(
-        inner,
-        connection_id,
-        desired_session_key.as_ref(),
-        &projection,
-    );
+    let semantic_replay = desired_session_key
+        .as_ref()
+        .zip(semantic_replay_snapshot.as_ref())
+        .map(|(key, replay)| SemanticReplayDescriptor {
+            replay_id,
+            stable_session_key: key.clone(),
+            from_sequence: semantic_after_sequence,
+            through_sequence: replay.through_sequence,
+            rollover: replay.cursor_rolled_over,
+        });
 
     let revision = projection.revision;
     let runtime_matches =
@@ -1323,9 +1981,10 @@ fn build_resume_state_locked(
             route,
             desired_session_key,
             workspace,
-            semantic_bootstrap,
+            semantic_replay,
             writer_lease,
         },
+        semantic_replay_snapshot,
         semantic_generation,
     )
 }
@@ -1336,7 +1995,7 @@ fn capture_resume_projection(
     writer_lease: &WebWriterLeaseState,
     desired_session_key: Option<&StableSessionKey>,
     semantic_after_sequence: u64,
-) -> (WebWorkspaceSnapshot, Option<SemanticBootstrap>, u64) {
+) -> (WebWorkspaceSnapshot, Option<SemanticReplay>, u64) {
     loop {
         let generation_before = inner
             .semantic_publication_generation
@@ -1345,7 +2004,7 @@ fn capture_resume_projection(
             std::thread::yield_now();
             continue;
         }
-        let (snapshot, revision, semantic_metadata, replay) = {
+        let (snapshot, revision, semantic_metadata, replay_capture) = {
             let _snapshot_guard = inner
                 .snapshot_state_lock
                 .lock()
@@ -1358,20 +2017,9 @@ fn capture_resume_projection(
                     guard
                 }
             };
-            let replay = desired_session_key
-                .and_then(|key| semantic_journals.replay_after(key, semantic_after_sequence))
-                .map(|replay| {
-                    let key = desired_session_key
-                        .expect("semantic replay requires a desired key")
-                        .clone();
-                    SemanticBootstrap {
-                        stable_session_key: key,
-                        oldest_sequence: replay.oldest_sequence,
-                        latest_sequence: replay.latest_sequence,
-                        cursor_rolled_over: replay.cursor_rolled_over,
-                        events: replay.events,
-                    }
-                });
+            let replay = desired_session_key.and_then(|key| {
+                semantic_journals.capture_replay_after(key, semantic_after_sequence)
+            });
             (
                 light_snapshot(inner, client_id),
                 inner.snapshot_revision.load(Ordering::Relaxed),
@@ -1379,6 +2027,7 @@ fn capture_resume_projection(
                 replay,
             )
         };
+        let replay = replay_capture.map(|capture| capture.into_replay());
         let generation_after = inner
             .semantic_publication_generation
             .load(Ordering::Acquire);
@@ -1449,35 +2098,6 @@ fn validate_resume_route(
     }
 }
 
-fn mark_resume_subscription(
-    inner: &Arc<RemoteHostInner>,
-    connection_id: u64,
-    desired_session_key: Option<&StableSessionKey>,
-    workspace: &WebWorkspaceSnapshot,
-) {
-    let desired_session_id = desired_session_key.and_then(|key| {
-        workspace
-            .sessions
-            .iter()
-            .find(|session| session.stable_session_key.as_ref() == Some(key))
-            .map(|session| session.session_id.clone())
-    });
-    let Ok(mut clients) = inner.clients.lock() else {
-        return;
-    };
-    let Some(client) = clients.get_mut(&connection_id) else {
-        return;
-    };
-    client.subscribed_session_ids.clear();
-    client.bootstrapped_session_ids.clear();
-    client.bootstrap_pending_session_ids.clear();
-    client.focused_session_id = desired_session_id.clone();
-    if let Some(session_id) = desired_session_id {
-        client.subscribed_session_ids.insert(session_id.clone());
-        client.bootstrap_pending_session_ids.insert(session_id);
-    }
-}
-
 fn writer_lease_state(
     inner: &Arc<RemoteHostInner>,
     connection_id: u64,
@@ -1542,10 +2162,38 @@ fn acquire_writer_lease(
     client_instance_id: &str,
     now_epoch_ms: u64,
 ) -> WebWriterLeaseState {
+    acquire_writer_lease_for_connection(
+        inner,
+        connection_id,
+        client_id,
+        client_instance_id,
+        now_epoch_ms,
+        None,
+    )
+}
+
+fn acquire_writer_lease_for_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    client_instance_id: &str,
+    now_epoch_ms: u64,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+) -> WebWriterLeaseState {
     let _operation = inner
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if expected_tombstone.is_some()
+        && !web_connection_is_authoritative_locked(
+            inner,
+            connection_id,
+            client_id,
+            expected_tombstone,
+        )
+    {
+        return writer_lease_state_locked(inner, connection_id, now_epoch_ms);
+    }
     let state = acquire_writer_lease_locked(
         inner,
         connection_id,
@@ -1617,11 +2265,16 @@ fn renew_writer_lease(
     expected_generation: u64,
     visible: bool,
     now_epoch_ms: u64,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
 ) -> WebWriterLeaseState {
     let _operation = inner
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !web_connection_is_authoritative_locked(inner, connection_id, client_id, expected_tombstone)
+    {
+        return writer_lease_state_locked(inner, connection_id, now_epoch_ms);
+    }
     let state = {
         let Ok(mut control) = inner.web_control.lock() else {
             return WebWriterLeaseState::default();
@@ -1653,10 +2306,40 @@ fn set_writer_visibility(
     visible: bool,
     now_epoch_ms: u64,
 ) -> WebWriterLeaseState {
+    set_writer_visibility_for_connection(
+        inner,
+        connection_id,
+        client_id,
+        client_instance_id,
+        visible,
+        now_epoch_ms,
+        None,
+    )
+}
+
+fn set_writer_visibility_for_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    client_instance_id: &str,
+    visible: bool,
+    now_epoch_ms: u64,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
+) -> WebWriterLeaseState {
     let _operation = inner
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if expected_tombstone.is_some()
+        && !web_connection_is_authoritative_locked(
+            inner,
+            connection_id,
+            client_id,
+            expected_tombstone,
+        )
+    {
+        return writer_lease_state_locked(inner, connection_id, now_epoch_ms);
+    }
     let state = set_writer_visibility_locked(
         inner,
         connection_id,
@@ -1696,6 +2379,14 @@ fn set_writer_visibility_locked(
 }
 
 pub(crate) fn broadcast_writer_lease_state_locked(inner: &Arc<RemoteHostInner>, now_epoch_ms: u64) {
+    broadcast_writer_lease_state_locked_excluding(inner, now_epoch_ms, None);
+}
+
+fn broadcast_writer_lease_state_locked_excluding(
+    inner: &Arc<RemoteHostInner>,
+    now_epoch_ms: u64,
+    excluded_connection_id: Option<u64>,
+) {
     for _ in 0..2 {
         let (current, generation) = {
             let Ok(mut control) = inner.web_control.lock() else {
@@ -1715,58 +2406,39 @@ pub(crate) fn broadcast_writer_lease_state_locked(inner: &Arc<RemoteHostInner>, 
                 clients
                     .iter()
                     .filter_map(|(connection_id, client)| {
+                        if Some(*connection_id) == excluded_connection_id {
+                            return None;
+                        }
                         client
                             .web_sender
                             .clone()
-                            .map(|sender| (*connection_id, sender))
+                            .zip(client.web_tombstone.clone())
+                            .map(|(sender, tombstone)| {
+                                (*connection_id, client.client_id.clone(), sender, tombstone)
+                            })
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let mut dead = Vec::new();
-        for (connection_id, sender) in targets {
+        for (connection_id, client_id, sender, tombstone) in targets {
             let writer_lease = writer_lease_state_from(current.as_ref(), generation, connection_id);
             if sender
                 .try_send(WsOutbound::WriterLeaseState { writer_lease })
                 .is_err()
             {
-                dead.push(connection_id);
+                dead.push((connection_id, client_id, tombstone));
             }
         }
         if dead.is_empty() {
             return;
         }
-        let removed = inner
-            .clients
-            .lock()
-            .map(|mut clients| {
-                dead.into_iter()
-                    .filter_map(|connection_id| {
-                        clients
-                            .remove(&connection_id)
-                            .map(|client| (connection_id, client.client_id))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut authority_changed = false;
-        for (connection_id, client_id) in removed {
-            let release = inner
-                .web_control
-                .lock()
-                .map(|mut control| control.release_connection(connection_id, &client_id))
-                .unwrap_or_default();
-            let released_now = release.released_lease.is_some() || release.legacy_released;
-            authority_changed |= released_now || release.lease_release_deferred;
-            if released_now {
-                if let Ok(mut controller) = inner.controller_client_id.write() {
-                    if controller.as_deref() == Some(client_id.as_str()) {
-                        *controller = None;
-                    }
-                }
-            }
+        let mut revoked_any = false;
+        for (connection_id, client_id, tombstone) in dead {
+            revoked_any |=
+                revoke_web_connection_locked(inner, connection_id, &client_id, &tombstone, None);
         }
-        if !authority_changed {
+        if !revoked_any {
             return;
         }
     }
@@ -1782,6 +2454,32 @@ fn process_composer_submit(
     attachments: Vec<ComposerAttachment>,
     expected_lease_generation: u64,
     now_epoch_ms: u64,
+) -> Result<ComposerAccepted, ComposerRejected> {
+    process_composer_submit_for_connection(
+        inner,
+        connection_id,
+        client_id,
+        mutation_id,
+        stable_session_key,
+        text,
+        attachments,
+        expected_lease_generation,
+        now_epoch_ms,
+        None,
+    )
+}
+
+fn process_composer_submit_for_connection(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    client_id: &str,
+    mutation_id: String,
+    stable_session_key: StableSessionKey,
+    text: String,
+    attachments: Vec<ComposerAttachment>,
+    expected_lease_generation: u64,
+    now_epoch_ms: u64,
+    expected_tombstone: Option<&Arc<WebConnectionTombstone>>,
 ) -> Result<ComposerAccepted, ComposerRejected> {
     if !valid_composer_mutation_id(&mutation_id)
         || !valid_stable_session_key(&stable_session_key)
@@ -1839,6 +2537,23 @@ fn process_composer_submit(
             .web_control_operation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if expected_tombstone.is_some()
+            && !web_connection_is_authoritative_locked(
+                inner,
+                connection_id,
+                client_id,
+                expected_tombstone,
+            )
+        {
+            return Err(composer_rejected_locked(
+                inner,
+                connection_id,
+                mutation_id,
+                ComposerRejectCode::LeaseBusy,
+                "This browser connection is no longer active.",
+                now_epoch_ms,
+            ));
+        }
         let authorization = {
             let mut control = match inner.web_control.lock() {
                 Ok(control) => control,
@@ -2344,9 +3059,482 @@ fn composer_rejected(
     }
 }
 
-enum EncodedFrame {
+fn composer_rejected_locked(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    mutation_id: String,
+    code: ComposerRejectCode,
+    message: impl Into<String>,
+    now_epoch_ms: u64,
+) -> ComposerRejected {
+    ComposerRejected {
+        mutation_id,
+        code,
+        message: message.into(),
+        writer_lease: writer_lease_state_locked(inner, connection_id, now_epoch_ms),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EncodedFrame {
     Text(String),
     Binary(Vec<u8>),
+}
+
+impl EncodedFrame {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary(bytes) => bytes.len(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WebConnectionTombstone {
+    active: AtomicBool,
+    cancellation: watch::Sender<bool>,
+}
+
+impl WebConnectionTombstone {
+    fn new() -> Arc<Self> {
+        let (cancellation, _) = watch::channel(true);
+        Arc::new(Self {
+            active: AtomicBool::new(true),
+            cancellation,
+        })
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn deactivate(&self) -> bool {
+        if self
+            .active
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.cancellation.send_replace(false);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.cancellation.subscribe()
+    }
+}
+
+#[derive(Debug)]
+enum BrowserOutboundCommand {
+    Frame {
+        frame: EncodedFrame,
+        deliver_when_inactive: bool,
+        closes_connection: bool,
+    },
+    ReplayWake {
+        epoch: u64,
+    },
+}
+
+#[derive(Debug)]
+struct ByteReservation {
+    accounted_bytes: usize,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for ByteReservation {
+    fn drop(&mut self) {
+        self.queued_bytes
+            .fetch_sub(self.accounted_bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+struct PendingReplay {
+    epoch: u64,
+    prefix: Option<EncodedFrame>,
+    encoder: SemanticReplayPageEncoder,
+    _reservation: ByteReservation,
+}
+
+type ReplaySlot = Arc<std::sync::Mutex<Option<PendingReplay>>>;
+
+#[derive(Debug)]
+struct AccountedBrowserCommand {
+    command: BrowserOutboundCommand,
+    accounted_bytes: usize,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for AccountedBrowserCommand {
+    fn drop(&mut self) {
+        self.queued_bytes
+            .fetch_sub(self.accounted_bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowserEnqueueError {
+    Revoked,
+    CommandFull,
+    ByteFull,
+    Closed,
+    Serialization,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BrowserOutboundSender {
+    tx: tokio_mpsc::Sender<AccountedBrowserCommand>,
+    queued_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+    tombstone: Arc<WebConnectionTombstone>,
+    replay_epoch: Arc<AtomicU64>,
+    next_replay_id: Arc<AtomicU64>,
+    replay_slot: ReplaySlot,
+}
+
+struct BrowserOutboundReceiver {
+    rx: tokio_mpsc::Receiver<AccountedBrowserCommand>,
+    tombstone: Arc<WebConnectionTombstone>,
+    replay_epoch: Arc<AtomicU64>,
+    replay_slot: ReplaySlot,
+}
+
+impl BrowserOutboundSender {
+    fn channel(command_capacity: usize, max_bytes: usize) -> (Self, BrowserOutboundReceiver) {
+        let (tx, rx) = tokio_mpsc::channel(command_capacity);
+        let tombstone = WebConnectionTombstone::new();
+        let replay_slot = Arc::new(std::sync::Mutex::new(None));
+        let sender = Self {
+            tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+            tombstone: tombstone.clone(),
+            replay_epoch: Arc::new(AtomicU64::new(0)),
+            next_replay_id: Arc::new(AtomicU64::new(0)),
+            replay_slot: replay_slot.clone(),
+        };
+        let replay_epoch = sender.replay_epoch.clone();
+        (
+            sender,
+            BrowserOutboundReceiver {
+                rx,
+                tombstone,
+                replay_epoch,
+                replay_slot,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(command_capacity: usize, max_bytes: usize) -> Self {
+        let (sender, receiver) = Self::channel(command_capacity, max_bytes);
+        std::mem::forget(receiver);
+        sender
+    }
+
+    pub(crate) fn tombstone(&self) -> Arc<WebConnectionTombstone> {
+        self.tombstone.clone()
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.tombstone.is_active()
+    }
+
+    fn reserve_and_send(
+        &self,
+        command: BrowserOutboundCommand,
+        accounted_bytes: usize,
+    ) -> Result<(), BrowserEnqueueError> {
+        let reservation = self.reserve_bytes(accounted_bytes)?;
+        let accounted = AccountedBrowserCommand {
+            command,
+            accounted_bytes: reservation.accounted_bytes,
+            queued_bytes: reservation.queued_bytes.clone(),
+        };
+        std::mem::forget(reservation);
+        self.tx.try_send(accounted).map_err(|error| match error {
+            tokio_mpsc::error::TrySendError::Full(_) => BrowserEnqueueError::CommandFull,
+            tokio_mpsc::error::TrySendError::Closed(_) => BrowserEnqueueError::Closed,
+        })
+    }
+
+    fn reserve_bytes(
+        &self,
+        accounted_bytes: usize,
+    ) -> Result<ByteReservation, BrowserEnqueueError> {
+        if !self.is_active() {
+            return Err(BrowserEnqueueError::Revoked);
+        }
+        let mut current = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(accounted_bytes) else {
+                return Err(BrowserEnqueueError::ByteFull);
+            };
+            if next > self.max_bytes {
+                return Err(BrowserEnqueueError::ByteFull);
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        Ok(ByteReservation {
+            accounted_bytes,
+            queued_bytes: self.queued_bytes.clone(),
+        })
+    }
+
+    pub(crate) fn try_send(&self, outbound: WsOutbound) -> Result<(), BrowserEnqueueError> {
+        let frame = serialize_text(&outbound).ok_or(BrowserEnqueueError::Serialization)?;
+        self.try_send_frame(frame)
+    }
+
+    pub(crate) fn try_send_server_message(
+        &self,
+        message: &ServerMessage,
+        inner: &Arc<RemoteHostInner>,
+        connection_id: u64,
+        client_id: &str,
+    ) -> Result<(), BrowserEnqueueError> {
+        let frame = translate_outbound(message, inner, connection_id, client_id)
+            .ok_or(BrowserEnqueueError::Serialization)?;
+        self.try_send_frame(frame)
+    }
+
+    pub(crate) fn try_send_frame(&self, frame: EncodedFrame) -> Result<(), BrowserEnqueueError> {
+        let bytes = frame.encoded_len();
+        self.reserve_and_send(
+            BrowserOutboundCommand::Frame {
+                frame,
+                deliver_when_inactive: false,
+                closes_connection: false,
+            },
+            bytes,
+        )
+    }
+
+    fn try_send_disconnect(&self, message: String) -> Result<(), BrowserEnqueueError> {
+        let frame = serialize_text(&WsOutbound::Disconnected { message })
+            .ok_or(BrowserEnqueueError::Serialization)?;
+        let bytes = frame.encoded_len();
+        self.reserve_and_send(
+            BrowserOutboundCommand::Frame {
+                frame,
+                deliver_when_inactive: true,
+                closes_connection: true,
+            },
+            bytes,
+        )
+    }
+
+    pub(crate) fn next_replay_epoch(&self) -> u64 {
+        let epoch = self.replay_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut slot = self
+            .replay_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+        epoch
+    }
+
+    pub(crate) fn next_replay_id(&self) -> u64 {
+        self.next_replay_id.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub(crate) fn supersede_replay(&self) {
+        self.next_replay_epoch();
+    }
+
+    pub(crate) fn try_send_replay(
+        &self,
+        prefix: Option<EncodedFrame>,
+        replay_id: u64,
+        stable_session_key: StableSessionKey,
+        from_sequence: u64,
+        replay: Arc<SemanticReplay>,
+        epoch: u64,
+    ) -> Result<(), BrowserEnqueueError> {
+        let accounted_bytes = prefix.as_ref().map_or(0, EncodedFrame::encoded_len)
+            + replay.events.len()
+                * std::mem::size_of::<Arc<super::super::presentation::SemanticEvent>>()
+            + stable_session_key.as_str().len()
+            + std::mem::size_of::<PendingReplay>();
+        let mut slot = self
+            .replay_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+        let reservation = self.reserve_bytes(accounted_bytes)?;
+        *slot = Some(PendingReplay {
+            epoch,
+            prefix,
+            encoder: SemanticReplayPageEncoder::new(
+                replay_id,
+                stable_session_key,
+                from_sequence,
+                replay,
+            ),
+            _reservation: reservation,
+        });
+        let result = self.reserve_and_send(
+            BrowserOutboundCommand::ReplayWake { epoch },
+            std::mem::size_of::<BrowserOutboundCommand>(),
+        );
+        if result.is_err() && slot.as_ref().is_some_and(|pending| pending.epoch == epoch) {
+            *slot = None;
+        }
+        result
+    }
+
+    pub(crate) fn try_send_live_replay(
+        &self,
+        replay_id: u64,
+        stable_session_key: StableSessionKey,
+        from_sequence: u64,
+        replay: Arc<SemanticReplay>,
+    ) -> Result<(), BrowserEnqueueError> {
+        let mut encoder =
+            SemanticReplayPageEncoder::new(replay_id, stable_session_key, from_sequence, replay);
+        while let Some(frame) = encoder
+            .next_frame()
+            .map_err(|_| BrowserEnqueueError::Serialization)?
+        {
+            self.try_send_frame(frame)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct SemanticReplayPageEncoder {
+    replay_id: u64,
+    stable_session_key: StableSessionKey,
+    next_from_sequence: u64,
+    replay: Arc<SemanticReplay>,
+    next_event: usize,
+    finished: bool,
+    validated: bool,
+}
+
+impl SemanticReplayPageEncoder {
+    fn new(
+        replay_id: u64,
+        stable_session_key: StableSessionKey,
+        from_sequence: u64,
+        replay: Arc<SemanticReplay>,
+    ) -> Self {
+        Self {
+            replay_id,
+            stable_session_key,
+            next_from_sequence: from_sequence,
+            replay,
+            next_event: 0,
+            finished: false,
+            validated: false,
+        }
+    }
+
+    fn next_frame(&mut self) -> Result<Option<EncodedFrame>, String> {
+        if self.finished {
+            return Ok(None);
+        }
+        if !self.validated {
+            let mut previous = self.next_from_sequence;
+            for event in &self.replay.events {
+                if event.sequence <= previous || event.sequence > self.replay.through_sequence {
+                    return Err(format!(
+                        "invalid semantic replay sequence {} after {} through {}",
+                        event.sequence, previous, self.replay.through_sequence
+                    ));
+                }
+                previous = event.sequence;
+            }
+            self.validated = true;
+        }
+
+        let base_len = serde_json::to_vec(&WsOutbound::SemanticReplayPage {
+            page: SemanticReplayPage {
+                replay_id: self.replay_id,
+                stable_session_key: self.stable_session_key.clone(),
+                from_sequence: u64::MAX,
+                through_sequence: self.replay.through_sequence,
+                next_sequence: u64::MAX,
+                rollover: self.replay.cursor_rolled_over,
+                complete: false,
+                events: Vec::new(),
+            },
+        })
+        .map_err(|error| error.to_string())?
+        .len();
+
+        let start = self.next_event;
+        let mut estimated_len = base_len;
+        while self.next_event < self.replay.events.len()
+            && self.next_event - start < MAX_SEMANTIC_REPLAY_PAGE_EVENTS
+        {
+            let event_len = serde_json::to_vec(self.replay.events[self.next_event].as_ref())
+                .map_err(|error| error.to_string())?
+                .len();
+            let separator_len = usize::from(self.next_event > start);
+            if self.next_event > start
+                && estimated_len + separator_len + event_len > MAX_SEMANTIC_REPLAY_PAGE_BYTES
+            {
+                break;
+            }
+            if self.next_event == start
+                && estimated_len + event_len > MAX_SEMANTIC_REPLAY_PAGE_BYTES
+            {
+                return Err(format!(
+                    "semantic event {} cannot fit in a replay page",
+                    self.replay.events[self.next_event].sequence
+                ));
+            }
+            estimated_len += separator_len + event_len;
+            self.next_event += 1;
+        }
+
+        let complete = self.next_event == self.replay.events.len();
+        let next_sequence = if complete {
+            self.replay.through_sequence
+        } else {
+            self.replay.events[self.next_event - 1].sequence
+        };
+        let page = SemanticReplayPage {
+            replay_id: self.replay_id,
+            stable_session_key: self.stable_session_key.clone(),
+            from_sequence: self.next_from_sequence,
+            through_sequence: self.replay.through_sequence,
+            next_sequence,
+            rollover: self.replay.cursor_rolled_over,
+            complete,
+            events: self.replay.events[start..self.next_event].to_vec(),
+        };
+        let text = serde_json::to_string(&WsOutbound::SemanticReplayPage { page })
+            .map_err(|error| error.to_string())?;
+        if text.len() > MAX_SEMANTIC_REPLAY_PAGE_BYTES {
+            return Err(format!(
+                "semantic replay page exceeded byte cap: {} > {}",
+                text.len(),
+                MAX_SEMANTIC_REPLAY_PAGE_BYTES
+            ));
+        }
+        self.next_from_sequence = next_sequence;
+        self.finished = complete;
+        Ok(Some(EncodedFrame::Text(text)))
+    }
 }
 
 /// Convert native broadcaster messages into browser-only wire frames. Native
@@ -2539,17 +3727,844 @@ mod tests {
     };
     use crate::state::{AiLaunchSpec, SessionDimensions, SessionKind, SessionRuntimeState};
     use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
+    use futures_util::Sink;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::sync::mpsc as std_mpsc;
+    use std::task::{Context, Poll};
 
-    fn test_web_sender() -> tokio_mpsc::Sender<WsOutbound> {
-        let (sender, receiver) = tokio_mpsc::channel(4096);
+    fn test_web_sender() -> BrowserOutboundSender {
+        let (sender, receiver) = BrowserOutboundSender::channel(4096, WEB_OUTBOUND_MAX_BYTES * 4);
         // Focused bridge tests drive the synchronous handler directly rather
         // than a Tokio writer task. Keep the bounded receiver alive so lease
         // fanout exercises try_send without treating the fixture as dead.
         std::mem::forget(receiver);
         sender
+    }
+
+    fn test_web_channel() -> (BrowserOutboundSender, BrowserOutboundReceiver) {
+        BrowserOutboundSender::channel(4096, WEB_OUTBOUND_MAX_BYTES * 4)
+    }
+
+    fn try_recv_web_text(receiver: &mut BrowserOutboundReceiver) -> String {
+        let accounted = receiver.rx.try_recv().expect("browser command");
+        let frame = match &accounted.command {
+            BrowserOutboundCommand::Frame { frame, .. } => frame.clone(),
+            BrowserOutboundCommand::ReplayWake { epoch } => {
+                let mut slot = receiver
+                    .replay_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let pending = slot
+                    .as_mut()
+                    .filter(|pending| pending.epoch == *epoch)
+                    .expect("matching replay slot");
+                let frame = if let Some(prefix) = pending.prefix.take() {
+                    prefix
+                } else {
+                    pending
+                        .encoder
+                        .next_frame()
+                        .expect("encode replay frame")
+                        .expect("replay frame")
+                };
+                if pending.encoder.finished {
+                    *slot = None;
+                }
+                frame
+            }
+        };
+        match frame {
+            EncodedFrame::Text(text) => text,
+            EncodedFrame::Binary(_) => panic!("expected browser text frame"),
+        }
+    }
+
+    fn try_recv_web_json(receiver: &mut BrowserOutboundReceiver) -> serde_json::Value {
+        serde_json::from_str(&try_recv_web_text(receiver)).expect("browser json frame")
+    }
+
+    fn try_recv_web_binary(receiver: &mut BrowserOutboundReceiver) -> Vec<u8> {
+        let accounted = receiver.rx.try_recv().expect("browser command");
+        match &accounted.command {
+            BrowserOutboundCommand::Frame {
+                frame: EncodedFrame::Binary(bytes),
+                ..
+            } => bytes.clone(),
+            other => panic!("expected browser binary frame, got {other:?}"),
+        }
+    }
+
+    fn assert_session_output_frame(frame: &[u8], session_id: &str, expected: &[u8]) {
+        assert_eq!(frame[0], BINARY_FRAME_SESSION_OUTPUT);
+        let id_len =
+            u32::from_be_bytes(frame[1..5].try_into().expect("session id length")) as usize;
+        assert_eq!(&frame[5..5 + id_len], session_id.as_bytes());
+        assert_eq!(&frame[5 + id_len + 8..], expected);
+    }
+
+    struct StalledSink;
+
+    impl Sink<WsMessage> for StalledSink {
+        type Error = ();
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: WsMessage) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn replay_event(
+        sequence: u64,
+        text_bytes: usize,
+    ) -> Arc<super::super::super::presentation::SemanticEvent> {
+        Arc::new(super::super::super::presentation::SemanticEvent {
+            stable_session_key: StableSessionKey::from_server("paged"),
+            sequence,
+            occurred_at_epoch_ms: sequence,
+            source: SemanticSource::Server,
+            kind: SemanticEventKind::Output {
+                stream: super::super::super::presentation::SemanticStream::Stdout,
+                text: "x".repeat(text_bytes),
+            },
+        })
+    }
+
+    #[test]
+    fn semantic_replay_pages_obey_exact_event_and_serialized_byte_caps() {
+        let key = StableSessionKey::from_server("paged");
+        let replay = Arc::new(super::super::super::presentation::SemanticReplay {
+            oldest_sequence: 3,
+            through_sequence: 1_401,
+            cursor_rolled_over: true,
+            events: (0..700)
+                .map(|index| replay_event(3 + index * 2, 2_000))
+                .collect(),
+        });
+        let mut encoder = SemanticReplayPageEncoder::new(77, key.clone(), 1, replay);
+        let mut frames = Vec::new();
+        while let Some(frame) = encoder.next_frame().expect("page encode") {
+            frames.push(frame);
+        }
+
+        assert!(frames.len() > 3, "byte cap should split before count alone");
+        let mut observed = Vec::new();
+        let mut prior_next = 1;
+        for (index, frame) in frames.iter().enumerate() {
+            let EncodedFrame::Text(text) = frame else {
+                panic!("semantic pages must be JSON text");
+            };
+            assert!(text.len() <= MAX_SEMANTIC_REPLAY_PAGE_BYTES);
+            let value: serde_json::Value = serde_json::from_str(text).expect("page json");
+            let events = value["events"].as_array().expect("events");
+            assert!(events.len() <= MAX_SEMANTIC_REPLAY_PAGE_EVENTS);
+            assert_eq!(value["type"], "semanticReplayPage");
+            assert_eq!(value["replayId"], 77);
+            assert_eq!(value["stableSessionKey"], key.as_str());
+            assert_eq!(value["fromSequence"], prior_next);
+            assert_eq!(value["throughSequence"], 1_401);
+            assert_eq!(value["rollover"], true);
+            observed.extend(
+                events
+                    .iter()
+                    .map(|event| event["sequence"].as_u64().expect("sequence")),
+            );
+            prior_next = value["nextSequence"].as_u64().expect("next sequence");
+            assert_eq!(value["complete"], index + 1 == frames.len());
+        }
+        assert_eq!(
+            observed,
+            (0..700).map(|index| 3 + index * 2).collect::<Vec<_>>()
+        );
+        assert_eq!(prior_next, 1_401);
+    }
+
+    #[test]
+    fn empty_semantic_replay_has_one_complete_highwater_page() {
+        let key = StableSessionKey::from_server("empty-page");
+        let replay = Arc::new(super::super::super::presentation::SemanticReplay {
+            oldest_sequence: 0,
+            through_sequence: 41,
+            cursor_rolled_over: false,
+            events: Vec::new(),
+        });
+        let mut encoder = SemanticReplayPageEncoder::new(9, key, 40, replay);
+
+        let EncodedFrame::Text(text) = encoder
+            .next_frame()
+            .expect("encode")
+            .expect("empty completion page")
+        else {
+            panic!("text frame");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("page json");
+        assert_eq!(value["fromSequence"], 40);
+        assert_eq!(value["throughSequence"], 41);
+        assert_eq!(value["nextSequence"], 41);
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["events"], serde_json::json!([]));
+        assert!(encoder.next_frame().expect("finished").is_none());
+    }
+
+    #[test]
+    fn replay_replacement_and_supersession_drop_old_snapshot_ownership() {
+        let (sender, _receiver) = BrowserOutboundSender::channel(8, WEB_OUTBOUND_MAX_BYTES);
+        let key = StableSessionKey::from_server("paged");
+        let first = Arc::new(SemanticReplay {
+            oldest_sequence: 1,
+            through_sequence: 1,
+            cursor_rolled_over: false,
+            events: vec![replay_event(1, 8)],
+        });
+        let second = Arc::new(SemanticReplay {
+            oldest_sequence: 2,
+            through_sequence: 2,
+            cursor_rolled_over: false,
+            events: vec![replay_event(2, 8)],
+        });
+        let wake_bytes = std::mem::size_of::<BrowserOutboundCommand>();
+
+        let first_epoch = sender.next_replay_epoch();
+        sender
+            .try_send_replay(
+                None,
+                sender.next_replay_id(),
+                key.clone(),
+                0,
+                first.clone(),
+                first_epoch,
+            )
+            .expect("first replay");
+        assert_eq!(Arc::strong_count(&first), 2);
+
+        let second_epoch = sender.next_replay_epoch();
+        assert_eq!(Arc::strong_count(&first), 1, "replacement drops old Arc");
+        sender
+            .try_send_replay(
+                None,
+                sender.next_replay_id(),
+                key,
+                1,
+                second.clone(),
+                second_epoch,
+            )
+            .expect("replacement replay");
+        assert_eq!(Arc::strong_count(&second), 2);
+
+        sender.supersede_replay();
+        assert_eq!(Arc::strong_count(&second), 1, "supersede drops replay Arc");
+        assert_eq!(
+            sender.queued_bytes(),
+            wake_bytes * 2,
+            "only the two bounded stale wake tokens remain queued"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_clears_pending_replay_slot_and_cursor() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "unsubscribe-client";
+        pair_web_client(&service, client_id);
+        let (native, _native_rx) = std_mpsc::channel();
+        let (sender, _receiver) = test_web_channel();
+        let tombstone = sender.tombstone();
+        assert!(register_client(
+            &service.inner,
+            1,
+            client_id,
+            native,
+            sender.clone(),
+        ));
+        let key = StableSessionKey::from_server("paged");
+        service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .get_mut(&1)
+            .expect("registered client")
+            .semantic_cursors
+            .insert(key.clone(), 0);
+        let replay = Arc::new(SemanticReplay {
+            oldest_sequence: 1,
+            through_sequence: 1,
+            cursor_rolled_over: false,
+            events: vec![replay_event(1, 8)],
+        });
+        let epoch = sender.next_replay_epoch();
+        sender
+            .try_send_replay(
+                None,
+                sender.next_replay_id(),
+                key.clone(),
+                0,
+                replay.clone(),
+                epoch,
+            )
+            .expect("pending replay");
+
+        unsubscribe_semantic(&service.inner, 1, client_id, &key, Some(&tombstone));
+
+        assert_eq!(Arc::strong_count(&replay), 1);
+        assert_eq!(
+            sender.queued_bytes(),
+            std::mem::size_of::<BrowserOutboundCommand>()
+        );
+        assert!(!service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .get(&1)
+            .expect("registered client")
+            .semantic_cursors
+            .contains_key(&key));
+    }
+
+    #[test]
+    fn resume_without_replay_clears_old_slot_and_queues_response_after_stale_wake() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "resume-no-replay";
+        pair_web_client(&service, client_id);
+        let (native, _native_rx) = std_mpsc::channel();
+        let (sender, mut receiver) = test_web_channel();
+        let tombstone = sender.tombstone();
+        assert!(register_client(
+            &service.inner,
+            1,
+            client_id,
+            native,
+            sender.clone(),
+        ));
+        let replay = Arc::new(SemanticReplay {
+            oldest_sequence: 1,
+            through_sequence: 1,
+            cursor_rolled_over: false,
+            events: vec![replay_event(1, 8)],
+        });
+        let epoch = sender.next_replay_epoch();
+        sender
+            .try_send_replay(
+                None,
+                sender.next_replay_id(),
+                StableSessionKey::from_server("paged"),
+                0,
+                replay.clone(),
+                epoch,
+            )
+            .expect("old replay");
+        let lane = WebResponseLane(InboundResponder::Browser {
+            sender: sender.clone(),
+            inner: service.inner.clone(),
+            connection_id: 1,
+            client_id: client_id.to_string(),
+        });
+
+        send_resume_state_with_lane(
+            &service.inner,
+            1,
+            client_id,
+            resume_request(None, None, "tab-a"),
+            1_000,
+            &lane,
+            Some(&tombstone),
+        );
+
+        assert_eq!(Arc::strong_count(&replay), 1);
+        let stale = receiver.rx.try_recv().expect("stale replay wake");
+        assert!(matches!(
+            &stale.command,
+            BrowserOutboundCommand::ReplayWake { .. }
+        ));
+        let resume = try_recv_web_json(&mut receiver);
+        assert_eq!(resume["type"], "resumeState");
+        assert!(resume["semanticReplay"].is_null());
+    }
+
+    #[test]
+    fn byte_budget_saturates_before_command_count_limit() {
+        let pong_bytes = serialize_text(&WsOutbound::Pong)
+            .expect("pong frame")
+            .encoded_len();
+        let (sender, _receiver) = BrowserOutboundSender::channel(8, pong_bytes);
+
+        sender.try_send(WsOutbound::Pong).expect("first pong");
+        assert_eq!(
+            sender.try_send(WsOutbound::Pong),
+            Err(BrowserEnqueueError::ByteFull)
+        );
+        assert!(sender.is_active());
+    }
+
+    #[test]
+    fn revoked_tombstone_lease_paths_return_without_deadlock() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "revoked-lease-client";
+        pair_web_client(&service, client_id);
+        let (native, _native_rx) = std_mpsc::channel();
+        let (sender, _receiver) = test_web_channel();
+        let tombstone = sender.tombstone();
+        assert!(register_client(
+            &service.inner,
+            1,
+            client_id,
+            native,
+            sender,
+        ));
+        let granted = acquire_writer_lease_for_connection(
+            &service.inner,
+            1,
+            client_id,
+            "phone",
+            1_000,
+            Some(&tombstone),
+        );
+        assert!(granted.you_are_owner);
+        assert!(revoke_web_connection(
+            &service.inner,
+            1,
+            client_id,
+            &tombstone,
+            None,
+        ));
+
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let inner = service.inner.clone();
+        let tombstone_for_thread = tombstone.clone();
+        std::thread::spawn(move || {
+            let acquire = acquire_writer_lease_for_connection(
+                &inner,
+                1,
+                client_id,
+                "phone",
+                1_001,
+                Some(&tombstone_for_thread),
+            );
+            let renew = renew_writer_lease(
+                &inner,
+                1,
+                client_id,
+                "phone",
+                granted.generation,
+                true,
+                1_002,
+                Some(&tombstone_for_thread),
+            );
+            let visibility = set_writer_visibility_for_connection(
+                &inner,
+                1,
+                client_id,
+                "phone",
+                false,
+                1_003,
+                Some(&tombstone_for_thread),
+            );
+            done_tx
+                .send((acquire, renew, visibility))
+                .expect("timeout observer");
+        });
+        let (acquire, renew, visibility) = done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("revoked branches must not deadlock");
+        assert!(!acquire.you_are_owner);
+        assert!(!renew.you_are_owner);
+        assert!(!visibility.you_are_owner);
+    }
+
+    #[test]
+    fn exact_tombstone_revoke_is_idempotent_and_preserves_same_cookie_viewer() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "same-cookie-exact";
+        pair_web_client(&service, client_id);
+        let (native_one, _native_one_rx) = std_mpsc::channel();
+        let (native_two, _native_two_rx) = std_mpsc::channel();
+        let (owner, _owner_rx) = test_web_channel();
+        let (viewer, _viewer_rx) = test_web_channel();
+        let owner_tombstone = owner.tombstone();
+        let viewer_tombstone = viewer.tombstone();
+        assert!(register_client(
+            &service.inner,
+            1,
+            client_id,
+            native_one,
+            owner,
+        ));
+        assert!(register_client(
+            &service.inner,
+            2,
+            client_id,
+            native_two,
+            viewer,
+        ));
+        assert!(
+            acquire_writer_lease_for_connection(
+                &service.inner,
+                1,
+                client_id,
+                "owner-tab",
+                1_000,
+                Some(&owner_tombstone),
+            )
+            .you_are_owner
+        );
+
+        assert!(!revoke_web_connection(
+            &service.inner,
+            1,
+            client_id,
+            &viewer_tombstone,
+            None,
+        ));
+        assert!(viewer_tombstone.is_active());
+        assert!(writer_lease_state(&service.inner, 1, 1_001).you_are_owner);
+
+        assert!(revoke_web_connection(
+            &service.inner,
+            1,
+            client_id,
+            &owner_tombstone,
+            None,
+        ));
+        assert!(!revoke_web_connection(
+            &service.inner,
+            1,
+            client_id,
+            &owner_tombstone,
+            None,
+        ));
+        let clients = service.inner.clients.lock().expect("clients lock");
+        assert!(!clients.contains_key(&1));
+        assert!(clients.contains_key(&2));
+        drop(clients);
+        assert!(viewer_tombstone.is_active());
+        assert!(writer_lease_state(&service.inner, 2, 1_002)
+            .owner_client_instance_id
+            .is_none());
+    }
+
+    #[test]
+    fn duplicate_connection_registration_cannot_replace_live_tombstone() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "duplicate-registration";
+        pair_web_client(&service, client_id);
+        let (native_one, _native_one_rx) = std_mpsc::channel();
+        let (native_two, _native_two_rx) = std_mpsc::channel();
+        let (first, _first_rx) = test_web_channel();
+        let (replacement, _replacement_rx) = test_web_channel();
+        let first_tombstone = first.tombstone();
+        assert!(register_client(
+            &service.inner,
+            7,
+            client_id,
+            native_one,
+            first,
+        ));
+        assert!(!register_client(
+            &service.inner,
+            7,
+            client_id,
+            native_two,
+            replacement,
+        ));
+        let registered = service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .get(&7)
+            .and_then(|client| client.web_tombstone.clone())
+            .expect("original registration");
+        assert!(Arc::ptr_eq(&registered, &first_tombstone));
+        assert!(registered.is_active());
+    }
+
+    #[test]
+    fn stalled_writer_times_out_and_revokes_exact_registration() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "stalled-writer";
+        pair_web_client(&service, client_id);
+        let (native, _native_rx) = std_mpsc::channel();
+        let (sender, receiver) = test_web_channel();
+        let tombstone = sender.tombstone();
+        assert!(register_client(
+            &service.inner,
+            1,
+            client_id,
+            native,
+            sender.clone(),
+        ));
+        sender.try_send(WsOutbound::Pong).expect("queued frame");
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                run_browser_writer(
+                    &mut StalledSink,
+                    receiver,
+                    service.inner.clone(),
+                    1,
+                    client_id.to_string(),
+                    tombstone.clone(),
+                    Duration::from_millis(10),
+                )
+                .await;
+            });
+
+        assert!(!tombstone.is_active());
+        assert!(!service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .contains_key(&1));
+    }
+
+    #[test]
+    fn one_browser_queue_orders_initial_resume_replay_lease_live_and_raw_frames() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "fifo-client";
+        pair_web_client(&service, client_id);
+        let (native, _native_rx) = std_mpsc::channel();
+        let (sender, mut receiver) = test_web_channel();
+        assert!(register_client(
+            &service.inner,
+            1,
+            client_id,
+            native,
+            sender.clone(),
+        ));
+        sender
+            .try_send_server_message(
+                &ServerMessage::Snapshot {
+                    snapshot: RemoteWorkspaceSnapshot::default(),
+                },
+                &service.inner,
+                1,
+                client_id,
+            )
+            .expect("initial snapshot");
+        let key = StableSessionKey::from_server("paged");
+        let replay = Arc::new(SemanticReplay {
+            oldest_sequence: 1,
+            through_sequence: 1,
+            cursor_rolled_over: false,
+            events: vec![replay_event(1, 8)],
+        });
+        let replay_id = sender.next_replay_id();
+        let prefix = serialize_text(&WsOutbound::ResumeState {
+            state: ResumeState {
+                runtime_instance_id: "runtime".to_string(),
+                revision: 1,
+                hard_reset: false,
+                route: "/sessions".to_string(),
+                desired_session_key: Some(key.clone()),
+                workspace: None,
+                semantic_replay: Some(SemanticReplayDescriptor {
+                    replay_id,
+                    stable_session_key: key.clone(),
+                    from_sequence: 0,
+                    through_sequence: 1,
+                    rollover: false,
+                }),
+                writer_lease: WebWriterLeaseState::default(),
+            },
+        })
+        .expect("resume prefix");
+        let epoch = sender.next_replay_epoch();
+        sender
+            .try_send_replay(Some(prefix), replay_id, key.clone(), 0, replay, epoch)
+            .expect("resume replay");
+        sender
+            .try_send(WsOutbound::WriterLeaseState {
+                writer_lease: WebWriterLeaseState::default(),
+            })
+            .expect("lease frame");
+        sender
+            .try_send_live_replay(
+                sender.next_replay_id(),
+                key,
+                1,
+                Arc::new(SemanticReplay {
+                    oldest_sequence: 2,
+                    through_sequence: 2,
+                    cursor_rolled_over: false,
+                    events: vec![replay_event(2, 8)],
+                }),
+            )
+            .expect("live semantic frame");
+        sender
+            .try_send_server_message(
+                &ServerMessage::SessionStream {
+                    event: RemoteSessionStreamEvent::Output {
+                        session_id: "raw".to_string(),
+                        chunk_seq: 1,
+                        emitted_at_epoch_ms: 1,
+                        bytes: b"raw".to_vec(),
+                    },
+                },
+                &service.inner,
+                1,
+                client_id,
+            )
+            .expect("raw frame");
+
+        assert_eq!(try_recv_web_json(&mut receiver)["type"], "snapshot");
+        let wake = receiver.rx.try_recv().expect("resume replay wake");
+        let wake_epoch = match &wake.command {
+            BrowserOutboundCommand::ReplayWake { epoch } => *epoch,
+            other => panic!("expected replay wake, got {other:?}"),
+        };
+        let mut slot = receiver.replay_slot.lock().expect("replay slot");
+        let pending = slot
+            .as_mut()
+            .filter(|pending| pending.epoch == wake_epoch)
+            .expect("pending replay");
+        let EncodedFrame::Text(resume) = pending.prefix.take().expect("resume prefix") else {
+            panic!("resume is text");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&resume).expect("resume json")["type"],
+            "resumeState"
+        );
+        let EncodedFrame::Text(page) = pending
+            .encoder
+            .next_frame()
+            .expect("replay encode")
+            .expect("replay page")
+        else {
+            panic!("replay is text");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&page).expect("page json")["type"],
+            "semanticReplayPage"
+        );
+        drop(slot);
+        drop(wake);
+        assert_eq!(try_recv_web_json(&mut receiver)["type"], "writerLeaseState");
+        assert_eq!(
+            try_recv_web_json(&mut receiver)["type"],
+            "semanticReplayPage"
+        );
+        let raw = try_recv_web_binary(&mut receiver);
+        assert_session_output_frame(&raw, "raw", b"raw");
+    }
+
+    #[test]
+    fn saturation_revocation_blocks_composer_raw_action_and_request_side_effects() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let client_id = "saturation-race";
+        pair_web_client(&service, client_id);
+        ai_session(&service, "tab-a", "session-a");
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed_writes = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            observed_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+        let (native, _native_rx) = std_mpsc::channel();
+        let (sender, _receiver) = BrowserOutboundSender::channel(1, WEB_OUTBOUND_MAX_BYTES);
+        let tombstone = sender.tombstone();
+        assert!(register_client(
+            &service.inner,
+            1,
+            client_id,
+            native,
+            sender.clone(),
+        ));
+        let lease = acquire_writer_lease_for_connection(
+            &service.inner,
+            1,
+            client_id,
+            "phone",
+            1_000,
+            Some(&tombstone),
+        );
+        assert!(lease.you_are_owner);
+        {
+            let _operation = service
+                .inner
+                .web_control_operation_lock
+                .lock()
+                .expect("operation lock");
+            broadcast_writer_lease_state_locked(&service.inner, 1_001);
+        }
+        assert!(!tombstone.is_active());
+
+        let composer = process_composer_submit_for_connection(
+            &service.inner,
+            1,
+            client_id,
+            "saturated-composer".to_string(),
+            StableSessionKey::from_tab("tab-a"),
+            "hello".to_string(),
+            Vec::new(),
+            lease.generation,
+            1_002,
+            Some(&tombstone),
+        );
+        assert!(composer.is_err());
+        handle_inbound_browser(
+            &service.inner,
+            1,
+            client_id,
+            WsInbound::Input {
+                session_id: "session-a".to_string(),
+                text: "raw".to_string(),
+                expected_lease_generation: Some(lease.generation),
+            },
+            &sender,
+        );
+        handle_inbound_browser(
+            &service.inner,
+            1,
+            client_id,
+            WsInbound::Action {
+                action: WebAction::StopAllServers,
+                expected_lease_generation: Some(lease.generation),
+            },
+            &sender,
+        );
+        handle_inbound_browser(
+            &service.inner,
+            1,
+            client_id,
+            WsInbound::Request {
+                id: 9,
+                action: WebAction::StopAllServers,
+                expected_lease_generation: Some(lease.generation),
+            },
+            &sender,
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(service
+            .inner
+            .pending_requests
+            .lock()
+            .expect("pending requests")
+            .is_empty());
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -2858,7 +4873,7 @@ mod tests {
         assert!(state.hard_reset);
         assert_eq!(state.route, "/sessions");
         assert!(state.desired_session_key.is_none());
-        assert!(state.semantic_bootstrap.is_none());
+        assert!(state.semantic_replay.is_none());
         assert!(state.workspace.is_some());
     }
 
@@ -2919,6 +4934,7 @@ mod tests {
     #[test]
     fn disconnect_releases_only_the_exact_same_cookie_owner() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
+        pair_web_client(&service, "same-cookie");
         let (owner_tx, _owner_rx) = std_mpsc::channel();
         let (viewer_tx, _viewer_rx) = std_mpsc::channel();
         register_client(
@@ -2995,6 +5011,7 @@ mod tests {
     #[test]
     fn resume_marks_raw_bootstrap_pending_without_calling_the_provider() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
+        pair_web_client(&service, "web-client");
         ai_session(&service, "tab-a", "session-a");
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
         register_client(&service.inner, 1, "web-client", std_tx, test_web_sender());
@@ -3006,7 +5023,8 @@ mod tests {
         })));
 
         let current_runtime = service.inner.runtime_instance_id.clone();
-        let state = build_resume_state(
+        let (response_tx, mut response_rx) = tokio_mpsc::unbounded_channel();
+        send_resume_state(
             &service.inner,
             1,
             "web-client",
@@ -3016,7 +5034,12 @@ mod tests {
                 "tab-a",
             ),
             1_000,
+            &response_tx,
         );
+        let state = match response_rx.try_recv().expect("resume response") {
+            WsOutbound::ResumeState { state } => state,
+            other => panic!("unexpected response: {other:?}"),
+        };
 
         assert_eq!(
             state
@@ -3101,7 +5124,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(first.accepted_sequence, replay.latest_sequence);
+        assert_eq!(first.accepted_sequence, replay.through_sequence);
     }
 
     #[test]
@@ -5009,23 +7032,19 @@ mod tests {
         let mut receivers = Vec::new();
         for connection_id in [1, 2] {
             let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
-            let (web_tx, web_rx) = tokio_mpsc::channel(8);
+            let (web_tx, web_rx) = test_web_channel();
             register_client(&service.inner, connection_id, client_id, std_tx, web_tx);
             receivers.push(web_rx);
         }
 
         let state = acquire_writer_lease(&service.inner, 1, client_id, "tab-a", 1_000);
         assert!(state.you_are_owner);
-        let first = receivers[0].try_recv().expect("owner lease push");
-        let second = receivers[1].try_recv().expect("viewer lease push");
-        assert!(matches!(
-            first,
-            WsOutbound::WriterLeaseState { writer_lease } if writer_lease.you_are_owner
-        ));
-        assert!(matches!(
-            second,
-            WsOutbound::WriterLeaseState { writer_lease } if !writer_lease.you_are_owner
-        ));
+        let first = try_recv_web_json(&mut receivers[0]);
+        let second = try_recv_web_json(&mut receivers[1]);
+        assert_eq!(first["type"], "writerLeaseState");
+        assert_eq!(first["writerLease"]["youAreOwner"], true);
+        assert_eq!(second["type"], "writerLeaseState");
+        assert_eq!(second["writerLease"]["youAreOwner"], false);
     }
 
     #[test]
@@ -5090,28 +7109,36 @@ mod tests {
         let client_id = "web-client";
         pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
-        let (push_tx, _push_rx) = tokio_mpsc::channel(1);
+        let (push_tx, _push_rx) = BrowserOutboundSender::channel(1, WEB_OUTBOUND_MAX_BYTES);
         push_tx
             .try_send(WsOutbound::Pong)
             .expect("prefill bounded push channel");
-        register_client(&service.inner, 1, client_id, std_tx, push_tx);
-        let (response_tx, mut response_rx) = tokio_mpsc::unbounded_channel();
+        let tombstone = push_tx.tombstone();
+        register_client(&service.inner, 1, client_id, std_tx, push_tx.clone());
+        let lane = WebResponseLane(InboundResponder::Browser {
+            sender: push_tx.clone(),
+            inner: service.inner.clone(),
+            connection_id: 1,
+            client_id: client_id.to_string(),
+        });
 
-        send_resume_state(
+        send_resume_state_with_lane(
             &service.inner,
             1,
             client_id,
             resume_request(None, None, "tab-a"),
             1_000,
-            &response_tx,
+            &lane,
+            Some(&tombstone),
         );
 
-        let state = match response_rx.try_recv().expect("resume response") {
-            WsOutbound::ResumeState { state } => state,
-            other => panic!("unexpected response: {other:?}"),
-        };
-        assert!(!state.writer_lease.you_are_owner);
-        assert!(state.writer_lease.owner_client_instance_id.is_none());
+        assert!(!tombstone.is_active());
+        assert!(!service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .contains_key(&1));
         assert!(service
             .inner
             .web_control
@@ -5120,13 +7147,12 @@ mod tests {
             .writer_leases()
             .peek()
             .is_none());
-        let (native_tx, _native_rx) = tokio_mpsc::unbounded_channel();
-        handle_inbound(
+        handle_inbound_browser(
             &service.inner,
             1,
             client_id,
             WsInbound::ClaimControlIfAvailable,
-            &native_tx,
+            &push_tx,
         );
         assert!(
             service
@@ -5177,7 +7203,7 @@ mod tests {
         let client_id = "web-client";
         pair_web_client(&service, client_id);
         let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
-        let (web_tx, mut web_rx) = tokio_mpsc::channel(8);
+        let (web_tx, mut web_rx) = test_web_channel();
         register_client(&service.inner, connection_id, client_id, std_tx, web_tx);
         let key = StableSessionKey::from_tab("semantic-tab");
         let retained = publish_semantic_event(
@@ -5206,13 +7232,11 @@ mod tests {
             },
             &tokio_tx,
         );
-        match web_rx.try_recv().expect("semantic bootstrap") {
-            WsOutbound::SemanticBootstrap { bootstrap } => {
-                assert_eq!(bootstrap.events, vec![retained.clone()]);
-                assert_eq!(bootstrap.latest_sequence, retained.sequence);
-            }
-            other => panic!("unexpected subscribe frame: {other:?}"),
-        }
+        let bootstrap = try_recv_web_json(&mut web_rx);
+        assert_eq!(bootstrap["type"], "semanticReplayPage");
+        assert_eq!(bootstrap["events"][0]["sequence"], retained.sequence);
+        assert_eq!(bootstrap["throughSequence"], retained.sequence);
+        assert_eq!(bootstrap["complete"], true);
 
         let live = publish_semantic_event(
             &service.inner,
@@ -5229,12 +7253,11 @@ mod tests {
             },
         );
         assert!(crate::remote::deliver_live_semantic_events(&service.inner));
-        assert!(matches!(
-            web_rx.try_recv(),
-            Ok(WsOutbound::SemanticEvent { event }) if event == live
-        ));
+        let live_page = try_recv_web_json(&mut web_rx);
+        assert_eq!(live_page["type"], "semanticReplayPage");
+        assert_eq!(live_page["events"][0]["sequence"], live.sequence);
         assert!(crate::remote::deliver_live_semantic_events(&service.inner));
-        assert!(web_rx.try_recv().is_err());
+        assert!(web_rx.rx.try_recv().is_err());
 
         handle_inbound(
             &service.inner,
@@ -5260,7 +7283,7 @@ mod tests {
             },
         );
         assert!(crate::remote::deliver_live_semantic_events(&service.inner));
-        assert!(web_rx.try_recv().is_err());
+        assert!(web_rx.rx.try_recv().is_err());
     }
 
     #[test]
@@ -5342,14 +7365,9 @@ mod tests {
         let connection_id = 12;
         let client_id = "web-client";
         pair_web_client(&service, client_id);
-        let (std_tx, std_rx) = std_mpsc::channel::<ServerMessage>();
-        register_client(
-            &service.inner,
-            connection_id,
-            client_id,
-            std_tx,
-            test_web_sender(),
-        );
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        let (web_tx, mut web_rx) = test_web_channel();
+        register_client(&service.inner, connection_id, client_id, std_tx, web_tx);
 
         let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
         let inner = service.inner.clone();
@@ -5370,18 +7388,8 @@ mod tests {
             .expect("provider entered");
 
         service.push_session_output("alpha", b"hello".to_vec());
-        match std_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(ServerMessage::SessionStream {
-                event:
-                    RemoteSessionStreamEvent::Output {
-                        session_id, bytes, ..
-                    },
-            }) => {
-                assert_eq!(session_id, "alpha");
-                assert_eq!(bytes, b"hello".to_vec());
-            }
-            other => panic!("expected output while bootstrap lookup blocks, got {other:?}"),
-        }
+        let frame = try_recv_web_binary(&mut web_rx);
+        assert_session_output_frame(&frame, "alpha", b"hello");
 
         let (lock, cvar) = &*gate;
         *lock.lock().expect("gate lock") = true;
@@ -5395,14 +7403,9 @@ mod tests {
         let connection_id = 15;
         let client_id = "web-client";
         pair_web_client(&service, client_id);
-        let (std_tx, std_rx) = std_mpsc::channel::<ServerMessage>();
-        register_client(
-            &service.inner,
-            connection_id,
-            client_id,
-            std_tx,
-            test_web_sender(),
-        );
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        let (web_tx, mut web_rx) = test_web_channel();
+        register_client(&service.inner, connection_id, client_id, std_tx, web_tx);
 
         let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
         handle_inbound(
@@ -5416,18 +7419,8 @@ mod tests {
         );
 
         service.push_session_output("alpha", b"before-ready".to_vec());
-        match std_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(ServerMessage::SessionStream {
-                event:
-                    RemoteSessionStreamEvent::Output {
-                        session_id, bytes, ..
-                    },
-            }) => {
-                assert_eq!(session_id, "alpha");
-                assert_eq!(bytes, b"before-ready".to_vec());
-            }
-            other => panic!("expected output before bootstrap is ready, got {other:?}"),
-        }
+        let frame = try_recv_web_binary(&mut web_rx);
+        assert_session_output_frame(&frame, "alpha", b"before-ready");
 
         service.set_session_bootstrap_provider(Some(Arc::new(|session_id| {
             Some(RemoteSessionBootstrap {
@@ -5446,26 +7439,13 @@ mod tests {
         let mut last_bootstrap_retry_at = HashMap::new();
         deliver_pending_bootstraps(&service.inner, &mut last_bootstrap_retry_at);
 
-        match std_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(ServerMessage::SessionStream {
-                event: RemoteSessionStreamEvent::Bootstrap { bootstrap },
-            }) => assert_eq!(bootstrap.session_id, "alpha"),
-            other => panic!("expected late bootstrap event, got {other:?}"),
-        }
+        let bootstrap = try_recv_web_json(&mut web_rx);
+        assert_eq!(bootstrap["type"], "sessionBootstrap");
+        assert_eq!(bootstrap["sessionId"], "alpha");
 
         service.push_session_output("alpha", b"after-ready".to_vec());
 
-        match std_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(ServerMessage::SessionStream {
-                event:
-                    RemoteSessionStreamEvent::Output {
-                        session_id, bytes, ..
-                    },
-            }) => {
-                assert_eq!(session_id, "alpha");
-                assert_eq!(bytes, b"after-ready".to_vec());
-            }
-            other => panic!("expected output after late bootstrap, got {other:?}"),
-        }
+        let frame = try_recv_web_binary(&mut web_rx);
+        assert_session_output_frame(&frame, "alpha", b"after-ready");
     }
 }

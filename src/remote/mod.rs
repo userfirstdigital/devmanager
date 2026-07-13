@@ -12,8 +12,8 @@ use presentation::{
     SemanticEvent, SemanticEventDraft, SemanticJournalStore, SemanticReplay,
     SemanticSessionMetadata, StableSessionKey,
 };
+use web::bridge::{BrowserOutboundSender, WebConnectionTombstone};
 use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
-use web::wire::{SemanticBootstrap, WsOutbound};
 
 use crate::git::git_service::{
     AiCommitMessage, DeviceCodeResponse, GitBranch, GitDiffResult, GitLogEntry, GitStatusResult,
@@ -41,7 +41,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc as tokio_mpsc;
 
 pub const PROTOCOL_VERSION: u32 = 5;
 const REMOTE_FILE_NAME: &str = "remote.json";
@@ -1023,10 +1022,11 @@ impl Drop for SemanticPublicationEpoch<'_> {
 #[derive(Clone)]
 struct ConnectedRemoteClient {
     client_id: String,
-    sender: mpsc::Sender<ServerMessage>,
+    sender: Option<mpsc::Sender<ServerMessage>>,
     /// Present only for browser clients. Browser-only semantic/control frames
     /// must never enter the native MessagePack `ServerMessage` protocol.
-    web_sender: Option<tokio_mpsc::Sender<WsOutbound>>,
+    web_sender: Option<BrowserOutboundSender>,
+    web_tombstone: Option<Arc<WebConnectionTombstone>>,
     semantic_cursors: HashMap<StableSessionKey, u64>,
     subscribed_session_ids: HashSet<String>,
     bootstrapped_session_ids: HashSet<String>,
@@ -1038,6 +1038,66 @@ struct ConnectedRemoteClient {
     last_controller_client_id: Option<String>,
     last_you_have_control: bool,
     last_snapshot_revision: u64,
+}
+
+#[derive(Clone)]
+enum ClientDeliveryTarget {
+    Native(mpsc::Sender<ServerMessage>),
+    Browser {
+        sender: BrowserOutboundSender,
+        client_id: String,
+        tombstone: Arc<WebConnectionTombstone>,
+    },
+}
+
+fn client_delivery_target(client: &ConnectedRemoteClient) -> Option<ClientDeliveryTarget> {
+    if let (Some(sender), Some(tombstone)) =
+        (client.web_sender.clone(), client.web_tombstone.clone())
+    {
+        return Some(ClientDeliveryTarget::Browser {
+            sender,
+            client_id: client.client_id.clone(),
+            tombstone,
+        });
+    }
+    client.sender.clone().map(ClientDeliveryTarget::Native)
+}
+
+fn deliver_server_message(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    target: &ClientDeliveryTarget,
+    message: ServerMessage,
+) -> bool {
+    match target {
+        ClientDeliveryTarget::Native(sender) => sender.send(message).is_ok(),
+        ClientDeliveryTarget::Browser {
+            sender, client_id, ..
+        } => sender
+            .try_send_server_message(&message, inner, connection_id, client_id)
+            .is_ok(),
+    }
+}
+
+fn revoke_failed_delivery(
+    inner: &Arc<RemoteHostInner>,
+    connection_id: u64,
+    target: ClientDeliveryTarget,
+) {
+    match target {
+        ClientDeliveryTarget::Browser {
+            client_id,
+            tombstone,
+            ..
+        } => {
+            web::bridge::revoke_web_connection(inner, connection_id, &client_id, &tombstone, None);
+        }
+        ClientDeliveryTarget::Native(_) => {
+            if let Ok(mut clients) = inner.clients.lock() {
+                clients.remove(&connection_id);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1362,14 +1422,26 @@ impl RemoteHostService {
             runtime_changed || mode_changed || output_changed
         });
         self.mark_subscribed_clients_bootstrap_pending(session_id);
-        let Ok(mut clients) = self.inner.clients.lock() else {
-            return;
-        };
-        let mut dead_connections = Vec::new();
-        for (connection_id, client) in clients.iter_mut() {
-            if !client.subscribed_session_ids.contains(session_id) {
-                continue;
-            }
+        let targets = self
+            .inner
+            .clients
+            .lock()
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter_map(|(connection_id, client)| {
+                        client
+                            .subscribed_session_ids
+                            .contains(session_id)
+                            .then(|| (*connection_id, client_delivery_target(client)))
+                    })
+                    .filter_map(|(connection_id, target)| {
+                        target.map(|target| (connection_id, target))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (connection_id, target) in targets {
             let message = ServerMessage::SessionStream {
                 event: RemoteSessionStreamEvent::Output {
                     session_id: session_id.to_string(),
@@ -1381,13 +1453,10 @@ impl RemoteHostService {
                     bytes: bytes.clone(),
                 },
             };
-            if client.sender.send(message).is_err() {
-                dead_connections.push(*connection_id);
+            if !deliver_server_message(&self.inner, connection_id, &target, message) {
+                revoke_failed_delivery(&self.inner, connection_id, target);
             }
         }
-        let removed = remove_client_records(&mut clients, dead_connections);
-        drop(clients);
-        release_removed_web_connections(&self.inner, removed);
     }
 
     pub fn push_session_runtime(&self, session_id: &str, runtime: SessionRuntimeState) {
@@ -1401,18 +1470,27 @@ impl RemoteHostService {
             journals.observe_runtime(&runtime, &tabs, now_epoch_ms())
         });
         self.mark_subscribed_clients_bootstrap_pending(session_id);
-        let Ok(mut clients) = self.inner.clients.lock() else {
-            return;
-        };
-        let mut dead_connections = Vec::new();
-        for (connection_id, client) in clients.iter_mut() {
-            if !client.subscribed_session_ids.contains(session_id) {
-                continue;
-            }
-            if !runtime.status.is_live() {
-                client.bootstrapped_session_ids.remove(session_id);
-                client.bootstrap_pending_session_ids.remove(session_id);
-            }
+        let targets = self
+            .inner
+            .clients
+            .lock()
+            .map(|mut clients| {
+                clients
+                    .iter_mut()
+                    .filter_map(|(connection_id, client)| {
+                        if !client.subscribed_session_ids.contains(session_id) {
+                            return None;
+                        }
+                        if !runtime.status.is_live() {
+                            client.bootstrapped_session_ids.remove(session_id);
+                            client.bootstrap_pending_session_ids.remove(session_id);
+                        }
+                        client_delivery_target(client).map(|target| (*connection_id, target))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (connection_id, target) in targets {
             let event = if runtime.status.is_live() {
                 RemoteSessionStreamEvent::RuntimePatch {
                     session_id: session_id.to_string(),
@@ -1424,17 +1502,15 @@ impl RemoteHostService {
                     runtime: runtime.clone(),
                 }
             };
-            if client
-                .sender
-                .send(ServerMessage::SessionStream { event })
-                .is_err()
-            {
-                dead_connections.push(*connection_id);
+            if !deliver_server_message(
+                &self.inner,
+                connection_id,
+                &target,
+                ServerMessage::SessionStream { event },
+            ) {
+                revoke_failed_delivery(&self.inner, connection_id, target);
             }
         }
-        let removed = remove_client_records(&mut clients, dead_connections);
-        drop(clients);
-        release_removed_web_connections(&self.inner, removed);
     }
 
     fn publish_semantic_change(
@@ -1519,31 +1595,38 @@ impl RemoteHostService {
     }
 
     pub fn push_session_removed(&self, session_id: &str) {
-        let Ok(mut clients) = self.inner.clients.lock() else {
-            return;
-        };
-        let mut dead_connections = Vec::new();
-        for (connection_id, client) in clients.iter_mut() {
-            if !client.subscribed_session_ids.contains(session_id) {
-                continue;
-            }
-            client.bootstrapped_session_ids.remove(session_id);
-            client.bootstrap_pending_session_ids.remove(session_id);
-            if client
-                .sender
-                .send(ServerMessage::SessionStream {
+        let targets = self
+            .inner
+            .clients
+            .lock()
+            .map(|mut clients| {
+                clients
+                    .iter_mut()
+                    .filter_map(|(connection_id, client)| {
+                        if !client.subscribed_session_ids.contains(session_id) {
+                            return None;
+                        }
+                        client.bootstrapped_session_ids.remove(session_id);
+                        client.bootstrap_pending_session_ids.remove(session_id);
+                        client_delivery_target(client).map(|target| (*connection_id, target))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (connection_id, target) in targets {
+            if !deliver_server_message(
+                &self.inner,
+                connection_id,
+                &target,
+                ServerMessage::SessionStream {
                     event: RemoteSessionStreamEvent::Removed {
                         session_id: session_id.to_string(),
                     },
-                })
-                .is_err()
-            {
-                dead_connections.push(*connection_id);
+                },
+            ) {
+                revoke_failed_delivery(&self.inner, connection_id, target);
             }
         }
-        let removed = remove_client_records(&mut clients, dead_connections);
-        drop(clients);
-        release_removed_web_connections(&self.inner, removed);
     }
 
     pub fn drain_requests(&self) -> Vec<PendingRemoteRequest> {
@@ -1671,9 +1754,11 @@ impl RemoteHostService {
                 .collect();
             for connection_id in connection_ids {
                 if let Some(client) = clients.remove(&connection_id) {
-                    let _ = client.sender.send(ServerMessage::Disconnected {
-                        message: "This host revoked the saved client token.".to_string(),
-                    });
+                    if let Some(sender) = client.sender.as_ref() {
+                        let _ = sender.send(ServerMessage::Disconnected {
+                            message: "This host revoked the saved client token.".to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -1688,6 +1773,11 @@ impl RemoteHostService {
     }
 
     pub fn revoke_paired_web_client(&self, client_id: &str) -> bool {
+        let _operation = self
+            .inner
+            .web_control_operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let removed = match mutate_host_config(&self.inner, |config| {
             let before = config.web.paired_clients.len();
             config
@@ -1703,40 +1793,47 @@ impl RemoteHostService {
             Err(_) => return false,
         };
 
-        let removed_connections = if let Ok(mut clients) = self.inner.clients.lock() {
-            let connection_ids: Vec<u64> = clients
-                .iter()
-                .filter_map(|(connection_id, client)| {
-                    (client.client_id == client_id).then_some(*connection_id)
-                })
-                .collect();
-            connection_ids
-                .into_iter()
-                .filter_map(|connection_id| {
-                    clients.remove(&connection_id).map(|client| {
-                        let _ = client.sender.send(ServerMessage::Disconnected {
-                            message: "This browser invite was revoked. Pair again to reconnect."
-                                .to_string(),
-                        });
-                        (connection_id, client.client_id)
+        let connections = self
+            .inner
+            .clients
+            .lock()
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter_map(|(connection_id, client)| {
+                        (client.client_id == client_id).then(|| {
+                            Some((
+                                *connection_id,
+                                client.client_id.clone(),
+                                client.web_tombstone.clone()?,
+                            ))
+                        })?
                     })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        release_removed_web_connections(&self.inner, removed_connections);
-
-        if let Ok(mut controller) = self.inner.controller_client_id.write() {
-            if controller.as_deref() == Some(client_id) {
-                *controller = None;
-            }
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (connection_id, registered_client_id, tombstone) in connections {
+            web::bridge::revoke_web_connection_locked(
+                &self.inner,
+                connection_id,
+                &registered_client_id,
+                &tombstone,
+                Some("This browser invite was revoked. Pair again to reconnect.".to_string()),
+            );
+        }
+        if removed {
+            web::bridge::broadcast_writer_lease_state_locked(&self.inner, now_epoch_ms());
         }
 
         removed
     }
 
     pub fn reset_browser_access(&self) -> bool {
+        let _operation = self
+            .inner
+            .web_control_operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let removed_client_ids = match mutate_host_config(&self.inner, |config| {
             let removed_ids = config
                 .web
@@ -1756,42 +1853,37 @@ impl RemoteHostService {
             Err(_) => return false,
         };
         let removed_client_ids: HashSet<String> = removed_client_ids.into_iter().collect();
-
-        let removed_connections = if let Ok(mut clients) = self.inner.clients.lock() {
-            let connection_ids: Vec<u64> = clients
-                .iter()
-                .filter_map(|(connection_id, client)| {
-                    (client.client_id.starts_with("web-")
-                        || removed_client_ids.contains(client.client_id.as_str()))
-                    .then_some(*connection_id)
-                })
-                .collect();
-            connection_ids
-                .into_iter()
-                .filter_map(|connection_id| {
-                    clients.remove(&connection_id).map(|client| {
-                        let _ = client.sender.send(ServerMessage::Disconnected {
-                            message: "Browser access was reset. Pair again to reconnect."
-                                .to_string(),
-                        });
-                        (connection_id, client.client_id)
+        let connections = self
+            .inner
+            .clients
+            .lock()
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter_map(|(connection_id, client)| {
+                        (client.client_id.starts_with("web-")
+                            || removed_client_ids.contains(client.client_id.as_str()))
+                        .then(|| {
+                            Some((
+                                *connection_id,
+                                client.client_id.clone(),
+                                client.web_tombstone.clone()?,
+                            ))
+                        })?
                     })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        release_removed_web_connections(&self.inner, removed_connections);
-
-        if let Ok(mut controller) = self.inner.controller_client_id.write() {
-            if controller
-                .as_deref()
-                .map(|client_id| client_id.starts_with("web-"))
-                .unwrap_or(false)
-            {
-                *controller = None;
-            }
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (connection_id, registered_client_id, tombstone) in connections {
+            web::bridge::revoke_web_connection_locked(
+                &self.inner,
+                connection_id,
+                &registered_client_id,
+                &tombstone,
+                Some("Browser access was reset. Pair again to reconnect.".to_string()),
+            );
         }
+        web::bridge::broadcast_writer_lease_state_locked(&self.inner, now_epoch_ms());
 
         true
     }
@@ -2718,7 +2810,7 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
             thread::sleep(SNAPSHOT_BROADCAST_INTERVAL);
             continue;
         };
-        let mut dead_connections = Vec::new();
+        let mut deliveries = Vec::new();
 
         for (connection_id, client) in clients.iter_mut() {
             let you_have_control =
@@ -2748,22 +2840,22 @@ fn run_broadcaster(inner: Arc<RemoteHostInner>) {
                 you_have_control,
             };
 
-            if client.sender.send(ServerMessage::Delta { delta }).is_err() {
-                dead_connections.push(*connection_id);
-                continue;
-            }
-
             client.last_app_hash = app_hash;
             client.last_runtime_hash = runtime_hash;
             client.last_port_hash = port_hash;
             client.last_controller_client_id = controller_client_id.clone();
             client.last_you_have_control = you_have_control;
             client.last_snapshot_revision = snapshot_revision;
+            if let Some(target) = client_delivery_target(client) {
+                deliveries.push((*connection_id, target, ServerMessage::Delta { delta }));
+            }
         }
-
-        let removed = remove_client_records(&mut clients, dead_connections);
         drop(clients);
-        release_removed_web_connections(&inner, removed);
+        for (connection_id, target, message) in deliveries {
+            if !deliver_server_message(&inner, connection_id, &target, message) {
+                revoke_failed_delivery(&inner, connection_id, target);
+            }
+        }
 
         last_snapshot_revision = snapshot_revision;
         last_controller_client_id = controller_client_id;
@@ -2846,7 +2938,7 @@ pub(crate) fn deliver_pending_bootstraps(
     let Ok(mut clients) = inner.clients.lock() else {
         return;
     };
-    let mut dead_connections = Vec::new();
+    let mut deliveries = Vec::new();
     for (connection_id, client) in clients.iter_mut() {
         let pending_for_client: Vec<String> = client
             .bootstrap_pending_session_ids
@@ -2866,26 +2958,33 @@ pub(crate) fn deliver_pending_bootstraps(
             let Some(bootstrap) = bootstraps.get(&session_id) else {
                 continue;
             };
-            if client
-                .sender
-                .send(ServerMessage::SessionStream {
-                    event: RemoteSessionStreamEvent::Bootstrap {
-                        bootstrap: bootstrap.clone(),
+            if let Some(target) = client_delivery_target(client) {
+                deliveries.push((
+                    *connection_id,
+                    target,
+                    session_id,
+                    ServerMessage::SessionStream {
+                        event: RemoteSessionStreamEvent::Bootstrap {
+                            bootstrap: bootstrap.clone(),
+                        },
                     },
-                })
-                .is_ok()
-            {
-                client.bootstrap_pending_session_ids.remove(&session_id);
-                client.bootstrapped_session_ids.insert(session_id);
-            } else {
-                dead_connections.push(*connection_id);
-                break;
+                ));
             }
         }
     }
-    let removed = remove_client_records(&mut clients, dead_connections);
     drop(clients);
-    release_removed_web_connections(inner, removed);
+    for (connection_id, target, session_id, message) in deliveries {
+        if deliver_server_message(inner, connection_id, &target, message) {
+            if let Ok(mut clients) = inner.clients.lock() {
+                if let Some(client) = clients.get_mut(&connection_id) {
+                    client.bootstrap_pending_session_ids.remove(&session_id);
+                    client.bootstrapped_session_ids.insert(session_id);
+                }
+            }
+        } else {
+            revoke_failed_delivery(inner, connection_id, target);
+        }
+    }
 }
 
 fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, stream: TcpStream) {
@@ -2977,8 +3076,9 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
             connection_id,
             ConnectedRemoteClient {
                 client_id: client_id.clone(),
-                sender: tx.clone(),
+                sender: Some(tx.clone()),
                 web_sender: None,
+                web_tombstone: None,
                 semantic_cursors: HashMap::new(),
                 subscribed_session_ids: HashSet::new(),
                 bootstrapped_session_ids: HashSet::new(),
@@ -3451,7 +3551,7 @@ pub(crate) fn publish_semantic_event(
 /// and `try_send` never waits. Saturated clients are disconnected and recover
 /// by replaying from their last acknowledged cursor after reconnect.
 fn deliver_live_semantic_events(inner: &Arc<RemoteHostInner>) -> bool {
-    let _delivery = inner
+    let delivery = inner
         .semantic_delivery_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3466,12 +3566,6 @@ fn deliver_live_semantic_events(inner: &Arc<RemoteHostInner>) -> bool {
             hook();
         }
     }
-    let generation_before = inner
-        .semantic_publication_generation
-        .load(Ordering::Acquire);
-    if generation_before % 2 != 0 {
-        return false;
-    }
     let subscriptions = inner
         .clients
         .lock()
@@ -3479,12 +3573,22 @@ fn deliver_live_semantic_events(inner: &Arc<RemoteHostInner>) -> bool {
             clients
                 .iter()
                 .filter_map(|(connection_id, client)| {
-                    client.web_sender.as_ref()?;
+                    let sender = client.web_sender.clone()?;
+                    let tombstone = client.web_tombstone.clone()?;
                     Some(
                         client
                             .semantic_cursors
                             .iter()
-                            .map(|(key, cursor)| (*connection_id, key.clone(), *cursor))
+                            .map(|(key, cursor)| {
+                                (
+                                    *connection_id,
+                                    client.client_id.clone(),
+                                    sender.clone(),
+                                    tombstone.clone(),
+                                    key.clone(),
+                                    *cursor,
+                                )
+                            })
                             .collect::<Vec<_>>(),
                     )
                 })
@@ -3494,74 +3598,47 @@ fn deliver_live_semantic_events(inner: &Arc<RemoteHostInner>) -> bool {
         .unwrap_or_default();
 
     let mut dead_connections = Vec::new();
-    for (connection_id, key, cursor) in subscriptions {
-        let replay = inner
+    for (connection_id, client_id, sender, tombstone, key, cursor) in subscriptions {
+        let capture = inner
             .semantic_journals
             .lock()
             .ok()
-            .and_then(|journals| journals.replay_after(&key, cursor));
-        let Some(replay) = replay else {
+            .and_then(|journals| journals.capture_replay_after(&key, cursor));
+        let Some(capture) = capture else {
             continue;
         };
-        if inner
-            .semantic_publication_generation
-            .load(Ordering::Acquire)
-            != generation_before
-        {
-            return false;
+        let replay = Arc::new(capture.into_replay());
+        let through_sequence = replay.through_sequence;
+        if through_sequence == cursor {
+            continue;
         }
-
-        let latest_sequence = replay.latest_sequence;
+        let send_result =
+            sender.try_send_live_replay(sender.next_replay_id(), key.clone(), cursor, replay);
+        if send_result.is_err() {
+            dead_connections.push((connection_id, client_id, tombstone));
+            continue;
+        }
         if let Ok(mut clients) = inner.clients.lock() {
-            if let Some(client) = clients.get_mut(&connection_id) {
-                if client.semantic_cursors.get(&key) != Some(&cursor) {
-                    continue;
-                }
-                let Some(sender) = client.web_sender.as_ref() else {
-                    continue;
-                };
-                let send_result = if replay.cursor_rolled_over {
-                    sender.try_send(WsOutbound::SemanticBootstrap {
-                        bootstrap: SemanticBootstrap {
-                            stable_session_key: key.clone(),
-                            oldest_sequence: replay.oldest_sequence,
-                            latest_sequence,
-                            cursor_rolled_over: true,
-                            events: replay.events,
-                        },
-                    })
-                } else {
-                    let mut result = Ok(());
-                    for event in replay.events {
-                        if let Err(error) = sender.try_send(WsOutbound::SemanticEvent { event }) {
-                            result = Err(error);
-                            break;
-                        }
-                    }
-                    result
-                };
-                if send_result.is_err() {
-                    dead_connections.push(connection_id);
-                } else {
-                    client.semantic_cursors.insert(key, latest_sequence);
-                }
-            }
+            let Some(client) = clients.get_mut(&connection_id).filter(|client| {
+                client.client_id == client_id
+                    && client.semantic_cursors.get(&key) == Some(&cursor)
+                    && client
+                        .web_tombstone
+                        .as_ref()
+                        .is_some_and(|registered| Arc::ptr_eq(registered, &tombstone))
+            }) else {
+                continue;
+            };
+            client.semantic_cursors.insert(key, through_sequence);
         }
     }
-    dead_connections.sort_unstable();
-    dead_connections.dedup();
-    if !dead_connections.is_empty() {
-        let removed = inner
-            .clients
-            .lock()
-            .map(|mut clients| remove_client_records(&mut clients, dead_connections))
-            .unwrap_or_default();
-        release_removed_web_connections(inner, removed);
+    drop(delivery);
+    dead_connections.sort_unstable_by_key(|(connection_id, _, _)| *connection_id);
+    dead_connections.dedup_by_key(|(connection_id, _, _)| *connection_id);
+    for (connection_id, client_id, tombstone) in dead_connections {
+        web::bridge::revoke_web_connection(inner, connection_id, &client_id, &tombstone, None);
     }
-    inner
-        .semantic_publication_generation
-        .load(Ordering::Acquire)
-        == generation_before
+    true
 }
 
 fn drain_web_clients_for_restart(inner: &Arc<RemoteHostInner>) {
@@ -3569,28 +3646,30 @@ fn drain_web_clients_for_restart(inner: &Arc<RemoteHostInner>) {
         .web_control_operation_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let removed = inner
+    let connections = inner
         .clients
         .lock()
-        .map(|mut clients| {
-            let web_connection_ids = clients
+        .map(|clients| {
+            clients
                 .iter()
                 .filter_map(|(connection_id, client)| {
-                    client.web_sender.as_ref().map(|_| *connection_id)
+                    Some((
+                        *connection_id,
+                        client.client_id.clone(),
+                        client.web_tombstone.clone()?,
+                    ))
                 })
-                .collect::<Vec<_>>();
-            web_connection_ids
-                .into_iter()
-                .filter_map(|connection_id| clients.remove(&connection_id))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for client in &removed {
-        if let Some(sender) = client.web_sender.as_ref() {
-            let _ = sender.try_send(WsOutbound::Disconnected {
-                message: "The browser listener is restarting.".to_string(),
-            });
-        }
+    for (connection_id, client_id, tombstone) in connections {
+        web::bridge::revoke_web_connection_locked(
+            inner,
+            connection_id,
+            &client_id,
+            &tombstone,
+            Some("The browser listener is restarting.".to_string()),
+        );
     }
 
     let controller_id = inner
@@ -3647,52 +3726,6 @@ pub(crate) fn set_native_controller(
         }
     }
     web::bridge::broadcast_writer_lease_state_locked(inner, now_epoch_ms());
-}
-
-pub(crate) fn release_web_writer_connection(
-    inner: &Arc<RemoteHostInner>,
-    connection_id: u64,
-    client_id: &str,
-) -> bool {
-    let _operation = inner
-        .web_control_operation_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Ok(mut control) = inner.web_control.lock() else {
-        return false;
-    };
-    let release = control.release_connection(connection_id, client_id);
-    let released_now = release.released_lease.is_some() || release.legacy_released;
-    drop(control);
-    if released_now {
-        if let Ok(mut controller) = inner.controller_client_id.write() {
-            if controller.as_deref() == Some(client_id) {
-                *controller = None;
-            }
-        }
-    }
-    web::bridge::broadcast_writer_lease_state_locked(inner, now_epoch_ms());
-    released_now || release.lease_release_deferred
-}
-
-fn remove_client_records(
-    clients: &mut HashMap<u64, ConnectedRemoteClient>,
-    connection_ids: Vec<u64>,
-) -> Vec<(u64, String)> {
-    connection_ids
-        .into_iter()
-        .filter_map(|connection_id| {
-            clients
-                .remove(&connection_id)
-                .map(|client| (connection_id, client.client_id))
-        })
-        .collect()
-}
-
-fn release_removed_web_connections(inner: &Arc<RemoteHostInner>, removed: Vec<(u64, String)>) {
-    for (connection_id, client_id) in removed {
-        release_web_writer_connection(inner, connection_id, &client_id);
-    }
 }
 
 pub(crate) fn current_controller_allows(inner: &Arc<RemoteHostInner>, client_id: &str) -> bool {
@@ -4276,6 +4309,7 @@ mod tests {
         SemanticEventKind, SemanticJournalStore, SemanticRetention, SemanticSource,
         StableSessionKey,
     };
+    use crate::remote::web::bridge::BrowserOutboundSender;
     use crate::remote::web::wire::WsOutbound;
     use crate::state::{
         AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
@@ -4523,15 +4557,17 @@ mod tests {
             device_class: Some("desktop".to_string()),
         });
         let service = RemoteHostService::new(config);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let web_sender = BrowserOutboundSender::detached_for_test(8, 1024 * 1024);
+        let tombstone = web_sender.tombstone();
 
         if let Ok(mut clients) = service.inner.clients.lock() {
             clients.insert(
                 1,
                 ConnectedRemoteClient {
                     client_id: "web-client-1".to_string(),
-                    sender: tx,
-                    web_sender: Some(tokio::sync::mpsc::channel(1).0),
+                    sender: None,
+                    web_sender: Some(web_sender),
+                    web_tombstone: Some(tombstone.clone()),
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
@@ -4553,12 +4589,7 @@ mod tests {
         assert!(service.revoke_paired_web_client("web-client-1"));
         assert!(service.config().web.paired_clients.is_empty());
         assert!(service.status().controller_client_id.is_none());
-        match rx.recv().expect("disconnect message") {
-            ServerMessage::Disconnected { message } => {
-                assert!(message.contains("revoked"));
-            }
-            other => panic!("expected disconnected message, got {other:?}"),
-        }
+        assert!(!tombstone.is_active());
     }
 
     #[test]
@@ -4605,16 +4636,18 @@ mod tests {
             device_class: Some("desktop".to_string()),
         });
         let service = RemoteHostService::new(config);
-        let (web_tx, web_rx) = std::sync::mpsc::channel();
         let (native_tx, _native_rx) = std::sync::mpsc::channel();
+        let web_sender = BrowserOutboundSender::detached_for_test(8, 1024 * 1024);
+        let web_tombstone = web_sender.tombstone();
 
         if let Ok(mut clients) = service.inner.clients.lock() {
             clients.insert(
                 1,
                 ConnectedRemoteClient {
                     client_id: "web-client-1".to_string(),
-                    sender: web_tx,
-                    web_sender: Some(tokio::sync::mpsc::channel(1).0),
+                    sender: None,
+                    web_sender: Some(web_sender),
+                    web_tombstone: Some(web_tombstone.clone()),
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
@@ -4632,8 +4665,9 @@ mod tests {
                 2,
                 ConnectedRemoteClient {
                     client_id: "client-native-1".to_string(),
-                    sender: native_tx,
+                    sender: Some(native_tx),
                     web_sender: None,
+                    web_tombstone: None,
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
@@ -4663,12 +4697,7 @@ mod tests {
         assert_ne!(saved.web.cookie_secret_hex, original_cookie_secret);
         assert!(service.status().controller_client_id.is_none());
 
-        match web_rx.recv().expect("disconnect message") {
-            ServerMessage::Disconnected { message } => {
-                assert!(message.contains("reset"));
-            }
-            other => panic!("expected disconnected message, got {other:?}"),
-        }
+        assert!(!web_tombstone.is_active());
         assert_eq!(service.status().connected_web_clients, 0);
         assert_eq!(service.status().connected_native_clients, 1);
     }
@@ -4677,15 +4706,17 @@ mod tests {
     fn host_status_splits_live_native_and_web_clients() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let (native_tx, _native_rx) = mpsc::channel();
-        let (web_tx, _web_rx) = mpsc::channel();
+        let web_sender = BrowserOutboundSender::detached_for_test(8, 1024 * 1024);
+        let web_tombstone = web_sender.tombstone();
 
         if let Ok(mut clients) = service.inner.clients.lock() {
             clients.insert(
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: native_tx,
+                    sender: Some(native_tx),
                     web_sender: None,
+                    web_tombstone: None,
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
@@ -4703,8 +4734,9 @@ mod tests {
                 2,
                 ConnectedRemoteClient {
                     client_id: "web-client-1".to_string(),
-                    sender: web_tx,
-                    web_sender: Some(tokio::sync::mpsc::channel(1).0),
+                    sender: None,
+                    web_sender: Some(web_sender),
+                    web_tombstone: Some(web_tombstone),
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::new(),
                     bootstrapped_session_ids: HashSet::new(),
@@ -4803,8 +4835,9 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: subscribed_tx,
+                    sender: Some(subscribed_tx),
                     web_sender: None,
+                    web_tombstone: None,
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
@@ -4822,8 +4855,9 @@ mod tests {
                 2,
                 ConnectedRemoteClient {
                     client_id: "client-2".to_string(),
-                    sender: idle_tx,
+                    sender: Some(idle_tx),
                     web_sender: None,
+                    web_tombstone: None,
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["beta".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
@@ -5063,8 +5097,9 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: tx,
+                    sender: Some(tx),
                     web_sender: None,
+                    web_tombstone: None,
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
@@ -5110,8 +5145,9 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: tx,
+                    sender: Some(tx),
                     web_sender: None,
+                    web_tombstone: None,
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
@@ -5216,8 +5252,9 @@ mod tests {
             1,
             ConnectedRemoteClient {
                 client_id: "client-1".to_string(),
-                sender: tx,
+                sender: Some(tx),
                 web_sender: None,
+                web_tombstone: None,
                 semantic_cursors: HashMap::new(),
                 subscribed_session_ids: HashSet::from(["pty-runtime".to_string()]),
                 bootstrapped_session_ids: HashSet::new(),
@@ -5268,8 +5305,9 @@ mod tests {
                 1,
                 ConnectedRemoteClient {
                     client_id: "client-1".to_string(),
-                    sender: tx,
+                    sender: Some(tx),
                     web_sender: None,
+                    web_tombstone: None,
                     semantic_cursors: HashMap::new(),
                     subscribed_session_ids: HashSet::from(["alpha".to_string()]),
                     bootstrapped_session_ids: HashSet::new(),
@@ -5908,7 +5946,8 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let key = StableSessionKey::from_tab("semantic-tab");
         let (native_tx, native_rx) = mpsc::channel();
-        let (web_tx, mut web_rx) = tokio::sync::mpsc::channel(8);
+        let web_tx = BrowserOutboundSender::detached_for_test(8, 4 * 1024 * 1024);
+        let observed_web = web_tx.clone();
         let mut client = test_connected_client("browser", native_tx, Some(web_tx));
         client.semantic_cursors.insert(key.clone(), 0);
         service
@@ -5923,20 +5962,28 @@ mod tests {
             semantic_status_draft(key.clone(), "ready", 1),
         );
         assert!(deliver_live_semantic_events(&service.inner));
-        match web_rx.try_recv().expect("live browser event") {
-            WsOutbound::SemanticEvent { event } => assert_eq!(event, published),
-            other => panic!("unexpected browser frame: {other:?}"),
-        }
+        let queued_after_first = observed_web.queued_bytes();
+        assert!(queued_after_first > 0, "live browser event was queued");
         assert!(
             native_rx.try_recv().is_err(),
             "browser-only frames must not enter ServerMessage"
         );
 
         assert!(deliver_live_semantic_events(&service.inner));
-        assert!(
-            web_rx.try_recv().is_err(),
+        assert_eq!(
+            observed_web.queued_bytes(),
+            queued_after_first,
             "a committed semantic cursor must not be delivered twice"
         );
+        let cursor = service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .get(&1)
+            .and_then(|client| client.semantic_cursors.get(&key))
+            .copied();
+        assert_eq!(cursor, Some(published.sequence));
     }
 
     #[test]
@@ -5954,7 +6001,8 @@ mod tests {
         });
         let key = StableSessionKey::from_tab("rollover-tab");
         let (native_tx, _native_rx) = mpsc::channel();
-        let (web_tx, mut web_rx) = tokio::sync::mpsc::channel(8);
+        let web_tx = BrowserOutboundSender::detached_for_test(8, 4 * 1024 * 1024);
+        let observed_web = web_tx.clone();
         let mut client = test_connected_client("browser", native_tx, Some(web_tx));
         client.semantic_cursors.insert(key.clone(), 0);
         service
@@ -5983,19 +6031,19 @@ mod tests {
         );
 
         assert!(deliver_live_semantic_events(&service.inner));
-        match web_rx.try_recv().expect("rollover bootstrap") {
-            WsOutbound::SemanticBootstrap { bootstrap } => {
-                assert!(bootstrap.cursor_rolled_over);
-                assert_eq!(bootstrap.latest_sequence, second.sequence);
-                assert_eq!(bootstrap.events, vec![second]);
-            }
-            other => panic!("unexpected rollover frame: {other:?}"),
-        }
+        let queued_after_rollover = observed_web.queued_bytes();
+        assert!(queued_after_rollover > 0, "rollover replay was queued");
+        let cursor = service
+            .inner
+            .clients
+            .lock()
+            .expect("clients lock")
+            .get(&1)
+            .and_then(|client| client.semantic_cursors.get(&key))
+            .copied();
+        assert_eq!(cursor, Some(second.sequence));
         assert!(deliver_live_semantic_events(&service.inner));
-        assert!(
-            web_rx.try_recv().is_err(),
-            "rollover bootstrap must be exact once"
-        );
+        assert_eq!(observed_web.queued_bytes(), queued_after_rollover);
     }
 
     #[test]
@@ -6003,7 +6051,7 @@ mod tests {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let key = StableSessionKey::from_tab("slow-tab");
         let (native_tx, _native_rx) = mpsc::channel();
-        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(1);
+        let web_tx = BrowserOutboundSender::detached_for_test(1, 4 * 1024 * 1024);
         web_tx
             .try_send(WsOutbound::Pong)
             .expect("prefill bounded channel");
@@ -6056,7 +6104,7 @@ mod tests {
 
         let key = StableSessionKey::from_tab("semantic-tab");
         let (native_tx, _native_rx) = mpsc::channel();
-        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let web_tx = BrowserOutboundSender::detached_for_test(8, 4 * 1024 * 1024);
         let mut client = test_connected_client("browser", native_tx, Some(web_tx));
         client.semantic_cursors.insert(key, 0);
         service
@@ -6105,7 +6153,8 @@ mod tests {
     fn semantic_only_revision_still_wakes_the_browser_snapshot_path() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let (native_tx, native_rx) = mpsc::channel();
-        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let web_tx = BrowserOutboundSender::detached_for_test(8, 4 * 1024 * 1024);
+        let observed_web = web_tx.clone();
         let client = test_connected_client("browser", native_tx, Some(web_tx));
         service
             .inner
@@ -6121,12 +6170,17 @@ mod tests {
         service.inner.stop_flag.store(false, Ordering::SeqCst);
         let broadcaster_inner = service.inner.clone();
         let broadcaster = thread::spawn(move || run_broadcaster(broadcaster_inner));
-        let message = native_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("semantic-only browser delta");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while observed_web.queued_bytes() == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
         service.inner.stop_flag.store(true, Ordering::SeqCst);
         broadcaster.join().expect("broadcaster thread");
-        assert!(matches!(message, ServerMessage::Delta { .. }));
+        assert!(observed_web.queued_bytes() > 0, "browser delta was queued");
+        assert!(
+            native_rx.try_recv().is_err(),
+            "browser delta must not use the native MessagePack lane"
+        );
     }
 
     #[test]
@@ -6143,7 +6197,7 @@ mod tests {
     fn restart_drain_removes_web_state_but_preserves_native_client() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let (web_native_tx, _web_native_rx) = mpsc::channel();
-        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let web_tx = BrowserOutboundSender::detached_for_test(8, 4 * 1024 * 1024);
         let (native_tx, _native_rx) = mpsc::channel();
         let web_client = test_connected_client("browser", web_native_tx, Some(web_tx));
         let native_client = test_connected_client("native", native_tx, None);
@@ -6195,7 +6249,7 @@ mod tests {
     fn restart_drain_never_clears_the_real_native_controller() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let (web_native_tx, _web_native_rx) = mpsc::channel();
-        let (web_tx, _web_rx) = tokio::sync::mpsc::channel(8);
+        let web_tx = BrowserOutboundSender::detached_for_test(8, 4 * 1024 * 1024);
         let (native_tx, _native_rx) = mpsc::channel();
         {
             let mut clients = service.inner.clients.lock().expect("clients lock");
@@ -6251,12 +6305,15 @@ mod tests {
     fn test_connected_client(
         client_id: &str,
         sender: mpsc::Sender<ServerMessage>,
-        web_sender: Option<tokio::sync::mpsc::Sender<WsOutbound>>,
+        web_sender: Option<BrowserOutboundSender>,
     ) -> ConnectedRemoteClient {
+        let web_tombstone = web_sender.as_ref().map(BrowserOutboundSender::tombstone);
+        let sender = web_sender.is_none().then_some(sender);
         ConnectedRemoteClient {
             client_id: client_id.to_string(),
             sender,
             web_sender,
+            web_tombstone,
             semantic_cursors: HashMap::new(),
             subscribed_session_ids: HashSet::new(),
             bootstrapped_session_ids: HashSet::new(),

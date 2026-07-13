@@ -5,11 +5,13 @@ use alacritty_terminal::vte::{Parser, Perform};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 const DEFAULT_CANONICAL_EVENTS: usize = 50_000;
 const DEFAULT_CANONICAL_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_VERBOSE_EVENTS: usize = 5_000;
 const DEFAULT_VERBOSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SEMANTIC_EVENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -199,7 +201,7 @@ impl Default for JournalLimits {
 
 #[derive(Debug, Clone)]
 struct StoredSemanticEvent {
-    event: SemanticEvent,
+    event: Arc<SemanticEvent>,
     encoded_bytes: usize,
     deduplication_key: Option<String>,
 }
@@ -207,9 +209,35 @@ struct StoredSemanticEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticReplay {
     pub oldest_sequence: u64,
-    pub latest_sequence: u64,
+    pub through_sequence: u64,
     pub cursor_rolled_over: bool,
-    pub events: Vec<SemanticEvent>,
+    pub events: Vec<Arc<SemanticEvent>>,
+}
+
+/// Pointer-only capture made while the journal mutex is held. Sorting and
+/// serialization happen after the caller releases that mutex.
+#[derive(Debug, Clone)]
+pub struct SemanticReplayCapture {
+    pub oldest_sequence: u64,
+    pub through_sequence: u64,
+    pub cursor_rolled_over: bool,
+    events: Vec<Arc<SemanticEvent>>,
+}
+
+impl SemanticReplayCapture {
+    pub fn events(&self) -> impl Iterator<Item = &Arc<SemanticEvent>> {
+        self.events.iter()
+    }
+
+    pub fn into_replay(mut self) -> SemanticReplay {
+        self.events.sort_unstable_by_key(|event| event.sequence);
+        SemanticReplay {
+            oldest_sequence: self.oldest_sequence,
+            through_sequence: self.through_sequence,
+            cursor_rolled_over: self.cursor_rolled_over,
+            events: self.events,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -285,30 +313,30 @@ impl SemanticJournal {
         }
     }
 
-    pub fn replay_after(&self, cursor: u64) -> SemanticReplay {
+    pub fn capture_replay_after(&self, cursor: u64) -> SemanticReplayCapture {
         #[cfg(test)]
         self.replay_invocations
             .set(self.replay_invocations.get().saturating_add(1));
-        let mut available = self
+        let events = self
             .canonical
             .iter()
             .chain(self.verbose.iter())
             .chain(self.verbose_truncation_marker.iter())
-            .map(|stored| stored.event.clone())
+            .filter(|stored| stored.event.sequence > cursor)
+            .map(|stored| Arc::clone(&stored.event))
             .collect::<Vec<_>>();
-        available.sort_by_key(|event| event.sequence);
         let cursor_metadata = self.cursor_metadata();
         let cursor_rolled_over = cursor != 0 && cursor <= self.highest_evicted_sequence;
-        let events = available
-            .into_iter()
-            .filter(|event| event.sequence > cursor)
-            .collect();
-        SemanticReplay {
+        SemanticReplayCapture {
             oldest_sequence: cursor_metadata.oldest_sequence,
-            latest_sequence: cursor_metadata.latest_sequence,
+            through_sequence: cursor_metadata.latest_sequence,
             cursor_rolled_over,
             events,
         }
+    }
+
+    pub fn replay_after(&self, cursor: u64) -> SemanticReplay {
+        self.capture_replay_after(cursor).into_replay()
     }
 
     #[cfg(test)]
@@ -325,16 +353,27 @@ impl SemanticJournal {
     }
 
     fn insert_draft(&mut self, draft: SemanticEventDraft, sequence: u64) -> SemanticEvent {
-        let event = SemanticEvent {
+        let mut event = SemanticEvent {
             stable_session_key: draft.stable_session_key,
             sequence,
             occurred_at_epoch_ms: draft.occurred_at_epoch_ms,
             source: draft.source,
             kind: draft.kind,
         };
+        let mut encoded_bytes = serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
+        if encoded_bytes > MAX_SEMANTIC_EVENT_BYTES {
+            event.kind = SemanticEventKind::Status {
+                state: "semanticEventTruncated".to_string(),
+                detail: Some(format!(
+                    "An oversized semantic event ({encoded_bytes} bytes) was omitted; use the raw terminal stream."
+                )),
+            };
+            encoded_bytes = serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
+        }
+        let event = Arc::new(event);
         let stored = StoredSemanticEvent {
-            encoded_bytes: serde_json::to_vec(&event).map_or(0, |encoded| encoded.len()),
-            event: event.clone(),
+            encoded_bytes,
+            event: Arc::clone(&event),
             deduplication_key: draft.deduplication_key.clone(),
         };
         if let Some(key) = draft.deduplication_key {
@@ -354,7 +393,7 @@ impl SemanticJournal {
                 }
             }
         }
-        event
+        (*event).clone()
     }
 
     fn remove_sequence(&mut self, sequence: u64) {
@@ -427,7 +466,7 @@ impl SemanticJournal {
         };
         self.verbose_truncation_marker = Some(StoredSemanticEvent {
             encoded_bytes: serde_json::to_vec(&event).map_or(0, |encoded| encoded.len()),
-            event,
+            event: Arc::new(event),
             deduplication_key: None,
         });
     }
@@ -684,6 +723,16 @@ impl SemanticJournalStore {
             .map(|session| session.journal.replay_after(cursor))
     }
 
+    pub fn capture_replay_after(
+        &self,
+        key: &StableSessionKey,
+        cursor: u64,
+    ) -> Option<SemanticReplayCapture> {
+        self.sessions
+            .get(key)
+            .map(|session| session.journal.capture_replay_after(cursor))
+    }
+
     pub fn stable_key_for_session(&self, session_id: &str) -> Option<StableSessionKey> {
         self.session_bindings
             .get(session_id)
@@ -935,6 +984,173 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
+    }
+
+    #[test]
+    fn replay_capture_uses_arc_refs_and_survives_later_retention_eviction() {
+        let key = StableSessionKey::from_server("cmd-arc-snapshot");
+        let mut journal = SemanticJournal::with_limits(JournalLimits {
+            canonical_events: 2,
+            canonical_bytes: 16 * 1024,
+            verbose_events: 1,
+            verbose_bytes: 16 * 1024,
+        });
+        let first = journal.push(output_draft(
+            key.clone(),
+            "first-retained-payload",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        journal.push(output_draft(
+            key.clone(),
+            "second",
+            SemanticRetention::Canonical,
+            None,
+        ));
+
+        let capture = journal.capture_replay_after(0);
+        let captured_first = capture
+            .events()
+            .find(|event| event.sequence == first.sequence)
+            .expect("first captured event")
+            .clone();
+        assert_eq!(capture.through_sequence, 2);
+
+        journal.push(output_draft(
+            key,
+            "third-evicts-first",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        let snapshot = capture.into_replay();
+
+        assert_eq!(snapshot.through_sequence, 2);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(std::sync::Arc::ptr_eq(&captured_first, &snapshot.events[0]));
+        assert!(matches!(
+            &snapshot.events[0].kind,
+            SemanticEventKind::Output { text, .. } if text == "first-retained-payload"
+        ));
+    }
+
+    #[test]
+    fn fifty_five_thousand_event_capture_is_pointer_only_and_snapshot_stable() {
+        const EVENT_COUNT: usize = 55_000;
+        let key = StableSessionKey::from_server("large-pointer-snapshot");
+        let mut journal = SemanticJournal::with_limits(JournalLimits {
+            canonical_events: EVENT_COUNT,
+            canonical_bytes: 32 * 1024 * 1024,
+            verbose_events: 1,
+            verbose_bytes: 1024,
+        });
+        for sequence in 0..EVENT_COUNT {
+            journal.push(output_draft(
+                key.clone(),
+                if sequence == 0 { "first" } else { "x" },
+                SemanticRetention::Canonical,
+                None,
+            ));
+        }
+        let stored_first = journal
+            .canonical
+            .front()
+            .expect("first retained event")
+            .event
+            .clone();
+
+        let capture = journal.capture_replay_after(0);
+
+        assert_eq!(capture.events().count(), EVENT_COUNT);
+        assert_eq!(capture.through_sequence, EVENT_COUNT as u64);
+        let replay = capture.into_replay();
+        assert_eq!(replay.events.len(), EVENT_COUNT);
+        assert!(Arc::ptr_eq(&stored_first, &replay.events[0]));
+    }
+
+    #[test]
+    fn replay_capture_orders_gapped_canonical_verbose_and_marker_sequences() {
+        let key = StableSessionKey::from_server("cmd-gapped-snapshot");
+        let mut journal = SemanticJournal::with_limits(JournalLimits {
+            canonical_events: 8,
+            canonical_bytes: 16 * 1024,
+            verbose_events: 1,
+            verbose_bytes: 16 * 1024,
+        });
+        journal.push(output_draft(
+            key.clone(),
+            "canonical-one",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        journal.push(output_draft(
+            key.clone(),
+            "verbose-evicted",
+            SemanticRetention::Verbose,
+            None,
+        ));
+        journal.push(output_draft(
+            key.clone(),
+            "canonical-three",
+            SemanticRetention::Canonical,
+            None,
+        ));
+        journal.push(output_draft(
+            key,
+            "verbose-retained",
+            SemanticRetention::Verbose,
+            None,
+        ));
+
+        let snapshot = journal.capture_replay_after(1).into_replay();
+
+        assert!(snapshot.cursor_rolled_over);
+        assert_eq!(snapshot.through_sequence, 5);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn oversized_event_is_replaced_before_journal_insertion() {
+        let key = StableSessionKey::from_server("cmd-oversized");
+        let mut journal = SemanticJournal::with_limits(JournalLimits {
+            canonical_events: 8,
+            canonical_bytes: MAX_SEMANTIC_EVENT_BYTES * 2,
+            verbose_events: 8,
+            verbose_bytes: MAX_SEMANTIC_EVENT_BYTES * 2,
+        });
+
+        let published = journal.push(output_draft(
+            key,
+            &"x".repeat(MAX_SEMANTIC_EVENT_BYTES * 2),
+            SemanticRetention::Canonical,
+            None,
+        ));
+        let snapshot = journal.capture_replay_after(0).into_replay();
+
+        assert!(matches!(
+            &published.kind,
+            SemanticEventKind::Status { state, detail: Some(detail) }
+                if state == "semanticEventTruncated" && detail.contains("raw terminal")
+        ));
+        assert!(serde_json::to_vec(&published).unwrap().len() <= MAX_SEMANTIC_EVENT_BYTES);
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(
+            &journal.canonical.front().expect("stored surrogate").event,
+            &snapshot.events[0]
+        ));
     }
 
     #[test]

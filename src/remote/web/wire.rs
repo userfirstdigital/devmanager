@@ -4,6 +4,7 @@
 //! snapshots, deltas, or `RemoteAction` values.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use super::action::{WebAction, WebActionResult};
 use super::dto::{WebWorkspaceDelta, WebWorkspaceSnapshot, WebWriterLeaseState};
@@ -32,18 +33,31 @@ pub struct ResumeState {
     pub route: String,
     pub desired_session_key: Option<StableSessionKey>,
     pub workspace: Option<WebWorkspaceSnapshot>,
-    pub semantic_bootstrap: Option<SemanticBootstrap>,
+    pub semantic_replay: Option<SemanticReplayDescriptor>,
     pub writer_lease: WebWriterLeaseState,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SemanticBootstrap {
+pub struct SemanticReplayDescriptor {
+    pub replay_id: u64,
     pub stable_session_key: StableSessionKey,
-    pub oldest_sequence: u64,
-    pub latest_sequence: u64,
-    pub cursor_rolled_over: bool,
-    pub events: Vec<SemanticEvent>,
+    pub from_sequence: u64,
+    pub through_sequence: u64,
+    pub rollover: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticReplayPage {
+    pub replay_id: u64,
+    pub stable_session_key: StableSessionKey,
+    pub from_sequence: u64,
+    pub through_sequence: u64,
+    pub next_sequence: u64,
+    pub rollover: bool,
+    pub complete: bool,
+    pub events: Vec<Arc<SemanticEvent>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -206,9 +220,9 @@ pub enum WsOutbound {
     WriterLeaseState {
         writer_lease: WebWriterLeaseState,
     },
-    SemanticBootstrap {
+    SemanticReplayPage {
         #[serde(flatten)]
-        bootstrap: SemanticBootstrap,
+        page: SemanticReplayPage,
     },
     SemanticEvent {
         event: SemanticEvent,
