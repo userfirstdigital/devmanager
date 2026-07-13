@@ -1643,13 +1643,8 @@ impl RemoteHostService {
             let deferred = drain_expired_claude_reconciliations(&mut state, Instant::now());
             state
                 .adapters_by_pty_session
-                .insert(identity.pty_session_id.clone(), identity.clone());
-            let mut invalidated = remove_pending_claude_prompts(&mut state, |pending| {
-                pending.identity.pty_session_id == identity.pty_session_id
-                    && pending.identity != identity
-            });
-            invalidated.extend(deferred);
-            invalidated
+                .insert(identity.pty_session_id.clone(), identity);
+            deferred
         };
         for draft in deferred {
             self.push_semantic_draft(draft);
@@ -1663,15 +1658,17 @@ impl RemoteHostService {
                 .claude_composer_reconciliation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let deferred = drain_expired_claude_reconciliations(&mut state, Instant::now());
             if state.adapters_by_pty_session.get(&identity.pty_session_id) == Some(identity) {
                 state
                     .adapters_by_pty_session
                     .remove(&identity.pty_session_id);
             }
-            state
-                .reconciled_provider_keys
-                .retain(|entry| entry.identity != *identity);
-            remove_pending_claude_prompts(&mut state, |pending| pending.identity == *identity)
+            // Adapter lifetime and composer-write lifetime can cross: the PTY
+            // callback may still accept a write after its exact adapter exits
+            // or is replaced. Keep generation-scoped reservations and retry
+            // keys until accept/cancel or their bounded TTL resolves them.
+            deferred
         };
         for draft in deferred {
             self.push_semantic_draft(draft);
@@ -1695,8 +1692,6 @@ impl RemoteHostService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let expired = drain_expired_claude_reconciliations(&mut state, Instant::now());
-            let is_current =
-                state.adapters_by_pty_session.get(&identity.pty_session_id) == Some(&identity);
             let provider_key_reconciled = draft.deduplication_key.as_ref().is_some_and(|key| {
                 state
                     .reconciled_provider_keys
@@ -1708,58 +1703,57 @@ impl RemoteHostService {
                 _ => None,
             };
             let mut decision = Decision::Publish;
-            if is_current && provider_key_reconciled {
+            if provider_key_reconciled {
                 decision = Decision::Reconciled;
-            } else if is_current {
-                if let Some(text) = text {
-                    if let Some(index) = state.pending.iter().position(|pending| {
+            } else if let Some(text) = text {
+                if let Some(index) = state.pending.iter().position(|pending| {
+                    pending.identity == identity
+                        && pending.text == text
+                        && matches!(
+                            pending.state,
+                            PendingClaudeComposerPromptState::Reserved {
+                                deferred_hook: None
+                            }
+                                | PendingClaudeComposerPromptState::Accepted
+                        )
+                }) {
+                    let accepted = matches!(
+                        state.pending[index].state,
+                        PendingClaudeComposerPromptState::Accepted
+                    );
+                    if accepted {
+                        let pending = state
+                            .pending
+                            .remove(index)
+                            .expect("matched Claude reconciliation exists");
+                        if let Some(key) = draft.deduplication_key.clone() {
+                            remember_reconciled_claude_provider_key(
+                                &mut state,
+                                pending.identity,
+                                key,
+                                Instant::now(),
+                            );
+                        }
+                    } else {
+                        state.pending[index].state =
+                            PendingClaudeComposerPromptState::Reserved {
+                                deferred_hook: Some(draft.clone()),
+                            };
+                    }
+                    decision = Decision::Reconciled;
+                } else if draft.deduplication_key.as_ref().is_some_and(|key| {
+                    state.pending.iter().any(|pending| {
                         pending.identity == identity
                             && pending.text == text
                             && matches!(
-                                pending.state,
+                                &pending.state,
                                 PendingClaudeComposerPromptState::Reserved {
-                                    deferred_hook: None
-                                } | PendingClaudeComposerPromptState::Accepted
+                                    deferred_hook: Some(deferred)
+                                } if deferred.deduplication_key.as_ref() == Some(key)
                             )
-                    }) {
-                        let accepted = matches!(
-                            state.pending[index].state,
-                            PendingClaudeComposerPromptState::Accepted
-                        );
-                        if accepted {
-                            let pending = state
-                                .pending
-                                .remove(index)
-                                .expect("matched Claude reconciliation exists");
-                            if let Some(key) = draft.deduplication_key.clone() {
-                                remember_reconciled_claude_provider_key(
-                                    &mut state,
-                                    pending.identity,
-                                    key,
-                                    Instant::now(),
-                                );
-                            }
-                        } else {
-                            state.pending[index].state =
-                                PendingClaudeComposerPromptState::Reserved {
-                                    deferred_hook: Some(draft.clone()),
-                                };
-                        }
-                        decision = Decision::Reconciled;
-                    } else if draft.deduplication_key.as_ref().is_some_and(|key| {
-                        state.pending.iter().any(|pending| {
-                            pending.identity == identity
-                                && pending.text == text
-                                && matches!(
-                                    &pending.state,
-                                    PendingClaudeComposerPromptState::Reserved {
-                                        deferred_hook: Some(deferred)
-                                    } if deferred.deduplication_key.as_ref() == Some(key)
-                                )
-                        })
-                    }) {
-                        decision = Decision::Reconciled;
-                    }
+                    })
+                }) {
+                    decision = Decision::Reconciled;
                 }
             }
             (expired, decision)

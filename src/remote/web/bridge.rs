@@ -6329,6 +6329,247 @@ mod tests {
     }
 
     #[test]
+    fn claude_adapter_removal_during_reserved_prompt_keeps_one_user_message() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let stable_key = StableSessionKey::from_tab("tab-a");
+        let identity = crate::remote::ClaudeSemanticIdentity {
+            pty_session_id: "session-a".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_claude_adapter_registered(identity.clone());
+        service.reserve_claude_composer_prompt(
+            "mutation-a",
+            &identity.pty_session_id,
+            &stable_key,
+            "inspect the race",
+        );
+
+        service.push_claude_semantic_draft(
+            identity.clone(),
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_001,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "inspect the race".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("provider-prompt-a".to_string()),
+            },
+        );
+        service.push_claude_adapter_removed(&identity);
+        service.push_semantic_draft(SemanticEventDraft {
+            stable_session_key: stable_key.clone(),
+            occurred_at_epoch_ms: 1_002,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "inspect the race".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("composer:mutation-a".to_string()),
+        });
+        service.accept_claude_composer_prompt("mutation-a");
+
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "inspect the race"
+                ))
+                .count(),
+            1,
+            "adapter removal must not flush a hook while its composer write can still succeed"
+        );
+    }
+
+    #[test]
+    fn claude_adapter_replacement_during_reserved_prompt_keeps_one_user_message() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let stable_key = StableSessionKey::from_tab("tab-a");
+        let identity = crate::remote::ClaudeSemanticIdentity {
+            pty_session_id: "session-a".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_claude_adapter_registered(identity.clone());
+        service.reserve_claude_composer_prompt(
+            "mutation-a",
+            &identity.pty_session_id,
+            &stable_key,
+            "inspect the race",
+        );
+
+        service.push_claude_semantic_draft(
+            identity.clone(),
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_001,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "inspect the race".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("provider-prompt-a".to_string()),
+            },
+        );
+        service.push_claude_adapter_registered(crate::remote::ClaudeSemanticIdentity {
+            registration_generation: identity.registration_generation + 1,
+            ..identity.clone()
+        });
+        service.push_semantic_draft(SemanticEventDraft {
+            stable_session_key: stable_key.clone(),
+            occurred_at_epoch_ms: 1_002,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "inspect the race".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("composer:mutation-a".to_string()),
+        });
+        service.accept_claude_composer_prompt("mutation-a");
+
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "inspect the race"
+                ))
+                .count(),
+            1,
+            "replacement must not flush an old-generation hook while its write can still succeed"
+        );
+    }
+
+    #[test]
+    fn accepted_claude_prompt_reconciles_late_hook_after_adapter_removal() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let stable_key = StableSessionKey::from_tab("tab-a");
+        let identity = crate::remote::ClaudeSemanticIdentity {
+            pty_session_id: "session-a".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_claude_adapter_registered(identity.clone());
+        service.reserve_claude_composer_prompt(
+            "mutation-a",
+            &identity.pty_session_id,
+            &stable_key,
+            "late provider hook",
+        );
+        service.push_semantic_draft(SemanticEventDraft {
+            stable_session_key: stable_key.clone(),
+            occurred_at_epoch_ms: 1_001,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "late provider hook".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some("composer:mutation-a".to_string()),
+        });
+        service.accept_claude_composer_prompt("mutation-a");
+        service.push_claude_adapter_removed(&identity);
+
+        for occurred_at_epoch_ms in [1_002, 1_003] {
+            service.push_claude_semantic_draft(
+                identity.clone(),
+                SemanticEventDraft {
+                    stable_session_key: stable_key.clone(),
+                    occurred_at_epoch_ms,
+                    source: SemanticSource::Claude,
+                    kind: SemanticEventKind::UserMessage {
+                        text: "late provider hook".to_string(),
+                    },
+                    retention: SemanticRetention::Canonical,
+                    deduplication_key: Some("provider-prompt-a".to_string()),
+                },
+            );
+        }
+
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text } if text == "late provider hook"
+                ))
+                .count(),
+            1,
+            "a late official hook and retry remain reconciled after exact adapter removal"
+        );
+    }
+
+    #[test]
+    fn cancelled_claude_prompt_after_adapter_removal_releases_provider_hook_once() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let stable_key = StableSessionKey::from_tab("tab-a");
+        let identity = crate::remote::ClaudeSemanticIdentity {
+            pty_session_id: "session-a".to_string(),
+            stable_session_key: stable_key.clone(),
+            registration_generation: 7,
+        };
+        service.push_claude_adapter_registered(identity.clone());
+        service.reserve_claude_composer_prompt(
+            "mutation-a",
+            &identity.pty_session_id,
+            &stable_key,
+            "provider saw rejected write",
+        );
+        service.push_claude_semantic_draft(
+            identity.clone(),
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_001,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "provider saw rejected write".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("provider-prompt-a".to_string()),
+            },
+        );
+        service.push_claude_adapter_removed(&identity);
+        service.cancel_claude_composer_prompt("mutation-a");
+
+        service.push_claude_semantic_draft(
+            identity,
+            SemanticEventDraft {
+                stable_session_key: stable_key.clone(),
+                occurred_at_epoch_ms: 1_002,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "provider saw rejected write".to_string(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("provider-prompt-a".to_string()),
+            },
+        );
+
+        let replay = service.semantic_replay(&stable_key, 0).unwrap();
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SemanticEventKind::UserMessage { text }
+                        if text == "provider saw rejected write"
+                ))
+                .count(),
+            1,
+            "write rejection must publish the deferred provider hook without duplicating retries"
+        );
+    }
+
+    #[test]
     fn rejected_pty_write_releases_a_deferred_claude_prompt_fail_open() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         ai_session(&service, "tab-a", "session-a");
