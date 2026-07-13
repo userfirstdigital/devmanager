@@ -30,6 +30,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use super::super::presentation::{SemanticSessionMetadata, StableSessionKey};
 use super::super::{
     current_controller_allows, now_epoch_ms, request_timeout_for_action, requires_control,
     stable_hash, ConnectedRemoteClient, PendingRemoteRequest, RemoteActionResult, RemoteHostInner,
@@ -614,23 +615,30 @@ fn translate_outbound(
 }
 
 fn capture_web_snapshot(inner: &Arc<RemoteHostInner>, client_id: &str) -> WebWorkspaceSnapshot {
-    let (snapshot, revision) = {
+    let (snapshot, revision, semantic_metadata) = {
         let _snapshot_guard = inner
             .snapshot_state_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let semantic_metadata = inner
+            .semantic_journals
+            .lock()
+            .map(|journals| journals.metadata_snapshot())
+            .unwrap_or_default();
         (
             light_snapshot(inner, client_id),
             inner.snapshot_revision.load(Ordering::Relaxed),
+            semantic_metadata,
         )
     };
-    project_web_snapshot(inner, &snapshot, revision)
+    project_web_snapshot(inner, &snapshot, revision, &semantic_metadata)
 }
 
 fn project_web_snapshot(
     inner: &Arc<RemoteHostInner>,
     snapshot: &RemoteWorkspaceSnapshot,
     revision: u64,
+    semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
 ) -> WebWorkspaceSnapshot {
     let lease = WebWriterLeaseState {
         owner_client_instance_id: snapshot.controller_client_id.clone(),
@@ -645,6 +653,7 @@ fn project_web_snapshot(
         &snapshot.runtime_state,
         &snapshot.port_statuses,
         &lease,
+        semantic_metadata,
     );
     projected.server_id = snapshot.server_id.clone();
     projected

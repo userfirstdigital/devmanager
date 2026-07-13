@@ -1,4 +1,7 @@
 use crate::models::{PortStatus, TabType};
+use crate::remote::presentation::{
+    SemanticAdapterHealth, SemanticAttention, SemanticSessionMetadata, StableSessionKey,
+};
 use crate::state::{
     AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
 };
@@ -130,24 +133,49 @@ impl From<SessionKind> for WebSessionKind {
 #[serde(rename_all = "camelCase")]
 pub struct WebSessionSummary {
     pub session_id: String,
+    pub stable_session_key: Option<StableSessionKey>,
     pub kind: WebSessionKind,
     pub status: SessionStatus,
     pub project_id: Option<String>,
     pub command_id: Option<String>,
     pub tab_id: Option<String>,
     pub dimensions: SessionDimensions,
+    pub last_activity_epoch_ms: Option<u64>,
+    pub attention: SemanticAttention,
+    pub attention_count: u64,
+    pub adapter_health: SemanticAdapterHealth,
+    pub raw_required: bool,
+    pub oldest_sequence: u64,
+    pub latest_sequence: u64,
 }
 
-impl From<&SessionRuntimeState> for WebSessionSummary {
-    fn from(session: &SessionRuntimeState) -> Self {
+impl WebSessionSummary {
+    fn from_host(
+        session: &SessionRuntimeState,
+        app: &AppState,
+        semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
+    ) -> Self {
+        let stable_session_key = StableSessionKey::resolve(session, &app.open_tabs);
+        let metadata = stable_session_key
+            .as_ref()
+            .and_then(|key| semantic_metadata.get(key).cloned())
+            .unwrap_or_default();
         Self {
             session_id: session.session_id.clone(),
+            stable_session_key,
             kind: session.session_kind.into(),
             status: session.status,
             project_id: session.project_id.clone(),
             command_id: session.command_id.clone(),
             tab_id: session.tab_id.clone(),
             dimensions: session.dimensions,
+            last_activity_epoch_ms: metadata.last_activity_epoch_ms,
+            attention: metadata.attention,
+            attention_count: metadata.attention_count,
+            adapter_health: metadata.adapter_health,
+            raw_required: metadata.raw_required,
+            oldest_sequence: metadata.oldest_sequence,
+            latest_sequence: metadata.latest_sequence,
         }
     }
 }
@@ -180,6 +208,7 @@ impl WebWorkspaceSnapshot {
         runtime: &RuntimeState,
         ports: &HashMap<u16, PortStatus>,
         lease: &WebWriterLeaseState,
+        semantic_metadata: &HashMap<StableSessionKey, SemanticSessionMetadata>,
     ) -> Self {
         let projects = app
             .config
@@ -254,7 +283,7 @@ impl WebWorkspaceSnapshot {
         let mut sessions = runtime
             .sessions
             .values()
-            .map(WebSessionSummary::from)
+            .map(|session| WebSessionSummary::from_host(session, app, semantic_metadata))
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
 
@@ -282,6 +311,9 @@ mod tests {
     use crate::models::{
         PortStatus, Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, TabType,
     };
+    use crate::remote::presentation::{
+        SemanticAdapterHealth, SemanticAttention, SemanticJournalStore, StableSessionKey,
+    };
     use crate::state::{
         AiLaunchSpec, AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState,
     };
@@ -294,6 +326,7 @@ mod tests {
         runtime: RuntimeState,
         ports: HashMap<u16, PortStatus>,
         lease: WebWriterLeaseState,
+        journals: SemanticJournalStore,
     }
 
     fn host_fixture_with_sentinels() -> HostFixture {
@@ -359,7 +392,11 @@ mod tests {
             shell_args: Vec::new(),
             startup_command: "STARTUP_SENTINEL".to_string(),
         });
-        runtime.sessions.insert("session-1".to_string(), session);
+        runtime
+            .sessions
+            .insert("session-1".to_string(), session.clone());
+        let mut journals = SemanticJournalStore::default();
+        journals.observe_runtime(&session, &app.open_tabs, 6);
 
         HostFixture {
             app,
@@ -374,6 +411,7 @@ mod tests {
                 },
             )]),
             lease: WebWriterLeaseState::default(),
+            journals,
         }
     }
 
@@ -387,6 +425,7 @@ mod tests {
             &fixture.runtime,
             &fixture.ports,
             &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
         ))
         .unwrap();
         for forbidden in [
@@ -411,6 +450,7 @@ mod tests {
             &fixture.runtime,
             &fixture.ports,
             &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
         );
 
         assert_eq!(snapshot.web_protocol_version, WEB_PROTOCOL_VERSION);
@@ -425,6 +465,19 @@ mod tests {
         assert_eq!(snapshot.ssh_connections[0].username, "dev");
         assert_eq!(snapshot.tabs[0].session_id.as_deref(), Some("session-1"));
         assert_eq!(snapshot.sessions[0].session_id, "session-1");
+        assert_eq!(
+            snapshot.sessions[0].stable_session_key.as_ref(),
+            Some(&StableSessionKey::from_tab("tab-1"))
+        );
+        assert_eq!(snapshot.sessions[0].last_activity_epoch_ms, Some(6));
+        assert_eq!(snapshot.sessions[0].attention, SemanticAttention::None);
+        assert_eq!(snapshot.sessions[0].attention_count, 0);
+        assert_eq!(
+            snapshot.sessions[0].adapter_health,
+            SemanticAdapterHealth::Degraded
+        );
+        assert_eq!(snapshot.sessions[0].oldest_sequence, 1);
+        assert_eq!(snapshot.sessions[0].latest_sequence, 1);
         assert_eq!(snapshot.port_statuses[0].port, 43872);
     }
 }
