@@ -105,6 +105,8 @@ pub enum RemoteSessionEvent {
 type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
 type CodexAdapterPreparer =
     Arc<dyn Fn(&str) -> Result<PreparedCodexAdapter, String> + Send + Sync>;
+#[cfg(test)]
+type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
 
 pub(crate) struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
@@ -122,6 +124,8 @@ pub(crate) struct ProcessManagerInner {
     claude_hook_registry: Arc<ClaudeHookRegistry>,
     claude_hook_listener: Mutex<Option<ClaudeHookRelayListener>>,
     claude_hook_sessions: Mutex<HashMap<String, ClaudeHookSession>>,
+    #[cfg(test)]
+    claude_semantic_publication_test_hook: RwLock<Option<ClaudeSemanticPublicationTestHook>>,
     claude_hook_temp_root: PathBuf,
     claude_overlay_owner: Mutex<Weak<ClaudeOverlayOwner>>,
     codex_adapter_preparer: RwLock<CodexAdapterPreparer>,
@@ -247,6 +251,51 @@ fn next_codex_adapter_generation(counter: &AtomicU64) -> Option<u64> {
         .ok()
 }
 
+fn fence_and_remove_claude_hook_session(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    expected: Option<&ClaudeHookRegistration>,
+) -> Option<ClaudeHookSession> {
+    let candidate = {
+        let sessions = inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions
+            .get(session_id)
+            .filter(|session| expected.is_none_or(|expected| session.registration == *expected))
+            .cloned()
+    }?;
+
+    // The registry's generation write gate waits for every already-validated
+    // publication to finish. Keep the registration-to-PTY correlation in the
+    // session map until that fence completes so those publications can still
+    // resolve their exact semantic identity instead of failing open generically.
+    inner
+        .claude_hook_registry
+        .unregister_registration(&candidate.registration);
+
+    let removed = {
+        let mut sessions = inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions
+            .get(session_id)
+            .is_some_and(|session| session.registration == candidate.registration)
+            .then(|| sessions.remove(session_id))
+            .flatten()
+    }?;
+    emit_remote_session_event(
+        inner,
+        RemoteSessionEvent::ClaudeAdapterRemoved {
+            identity: claude_semantic_identity(session_id, &removed),
+        },
+    );
+    let _ = std::fs::remove_file(&removed.settings_path);
+    Some(removed)
+}
+
 #[derive(Debug, Clone)]
 struct RestartBackoff {
     delay: Duration,
@@ -318,6 +367,8 @@ impl ProcessManager {
             claude_hook_registry: claude_hook_registry.clone(),
             claude_hook_listener: Mutex::new(None),
             claude_hook_sessions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            claude_semantic_publication_test_hook: RwLock::new(None),
             claude_hook_temp_root: claude_hook_temp_root.clone(),
             claude_overlay_owner: Mutex::new(Weak::new()),
             codex_adapter_preparer: RwLock::new(Arc::new(prepare_codex_adapter)),
@@ -344,6 +395,15 @@ impl ProcessManager {
                 ClaudeRegistryEvent::Semantic(draft) => {
                     let registry = inner.claude_hook_registry.clone();
                     registry.publish_if_current(&registration, || {
+                        #[cfg(test)]
+                        if let Some(hook) = inner
+                            .claude_semantic_publication_test_hook
+                            .read()
+                            .ok()
+                            .and_then(|hook| hook.clone())
+                        {
+                            hook();
+                        }
                         let identity =
                             claude_semantic_identity_for_registration(&inner, &registration);
                         if let Some(identity) = identity {
@@ -1073,23 +1133,21 @@ impl ProcessManager {
                 .claude_hook_sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(session_id)
+                .map(|session| session.registration.clone());
+            if let Some(previous) = previous {
+                fence_and_remove_claude_hook_session(&self.inner, session_id, Some(&previous));
+            }
+            self.inner
+                .claude_hook_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(session_id.to_string(), session);
             launch.startup_command = overlay.startup_command;
             emit_remote_session_event(
                 &self.inner,
                 RemoteSessionEvent::ClaudeAdapterRegistered { identity },
             );
-            if let Some(previous) = previous {
-                emit_remote_session_event(
-                    &self.inner,
-                    RemoteSessionEvent::ClaudeAdapterRemoved {
-                        identity: claude_semantic_identity(session_id, &previous),
-                    },
-                );
-                self.inner
-                    .claude_hook_registry
-                    .unregister_registration(&previous.registration);
-            }
         }
         emit_remote_session_event(
             &self.inner,
@@ -1101,24 +1159,7 @@ impl ProcessManager {
     }
 
     fn cleanup_claude_hook_session(&self, session_id: &str) {
-        let registration = self
-            .inner
-            .claude_hook_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(session_id);
-        if let Some(registration) = registration {
-            emit_remote_session_event(
-                &self.inner,
-                RemoteSessionEvent::ClaudeAdapterRemoved {
-                    identity: claude_semantic_identity(session_id, &registration),
-                },
-            );
-            self.inner
-                .claude_hook_registry
-                .unregister_registration(&registration.registration);
-            let _ = std::fs::remove_file(registration.settings_path);
-        }
+        fence_and_remove_claude_hook_session(&self.inner, session_id, None);
     }
 
     pub fn drain_claude_hook_adapter(&self) {
@@ -2994,23 +3035,17 @@ impl ProcessManager {
 
 fn drain_claude_hook_sessions_inner(inner: &ProcessManagerInner) {
     let sessions = {
-        let mut sessions = inner
+        let sessions = inner
             .claude_hook_sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *sessions)
+        sessions
+            .iter()
+            .map(|(session_id, session)| (session_id.clone(), session.registration.clone()))
+            .collect::<Vec<_>>()
     };
-    for (session_id, session) in sessions {
-        emit_remote_session_event(
-            inner,
-            RemoteSessionEvent::ClaudeAdapterRemoved {
-                identity: claude_semantic_identity(&session_id, &session),
-            },
-        );
-        inner
-            .claude_hook_registry
-            .unregister_registration(&session.registration);
-        let _ = std::fs::remove_file(session.settings_path);
+    for (session_id, registration) in sessions {
+        fence_and_remove_claude_hook_session(inner, &session_id, Some(&registration));
     }
 }
 
@@ -4405,32 +4440,7 @@ fn cleanup_claude_hook_session_if_matches(
     session_id: &str,
     expected: &ClaudeHookRegistration,
 ) -> bool {
-    let removed = {
-        let mut sessions = inner
-            .claude_hook_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let matches = sessions.get(session_id).is_some_and(|session| {
-            session.registration.nonce == expected.nonce
-                && session.registration.generation == expected.generation
-                && session.registration.stable_session_key == expected.stable_session_key
-        });
-        matches.then(|| sessions.remove(session_id)).flatten()
-    };
-    let Some(removed) = removed else {
-        return false;
-    };
-    emit_remote_session_event(
-        inner,
-        RemoteSessionEvent::ClaudeAdapterRemoved {
-            identity: claude_semantic_identity(session_id, &removed),
-        },
-    );
-    inner
-        .claude_hook_registry
-        .unregister_registration(&removed.registration);
-    let _ = std::fs::remove_file(removed.settings_path);
-    true
+    fence_and_remove_claude_hook_session(inner, session_id, Some(expected)).is_some()
 }
 
 fn emit_codex_semantic_if_current(
@@ -5393,6 +5403,7 @@ mod tests {
     };
     use crate::services::pid_file;
     use std::fs;
+    use std::sync::Condvar;
     use std::thread;
 
     #[test]
@@ -5831,6 +5842,215 @@ mod tests {
 
         assert_eq!(manager.inner.claude_hook_registry.registration_count(), 0);
         assert!(!settings_path.exists());
+    }
+
+    #[test]
+    fn claude_cleanup_fences_hook_publication_before_losing_identity_correlation() {
+        let temp = temp_test_dir("claude-hook-cleanup-publication-fence");
+        let manager = ProcessManager::new();
+        let mut launch = AiLaunchSpec {
+            tab_id: "claude-fence-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Claude,
+            cwd: temp.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        };
+        manager.prepare_claude_launch_for_session(&mut launch, "claude-fence-session", &temp);
+        let registration = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("claude-fence-session")
+            .expect("Claude hook session")
+            .registration
+            .clone();
+        let endpoint = manager.claude_hook_endpoint().unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let cleanup_gate = Arc::new((Mutex::new((false, false, false)), Condvar::new()));
+        let handler_gate = cleanup_gate.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            if matches!(
+                &event,
+                RemoteSessionEvent::Semantic { draft }
+                    if matches!(
+                        &draft.kind,
+                        crate::remote::presentation::SemanticEventKind::UserMessage { text }
+                            if text == "racing prompt"
+                    )
+            ) {
+                let (lock, condition) = &*handler_gate;
+                let mut state = lock.lock().unwrap();
+                state.2 = true;
+                condition.notify_all();
+            }
+            if matches!(event, RemoteSessionEvent::ClaudeAdapterRemoved { .. }) {
+                let (lock, condition) = &*handler_gate;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                condition.notify_all();
+                while !state.1 {
+                    state = condition.wait(state).unwrap();
+                }
+            }
+            observed.lock().unwrap().push(event);
+        })));
+
+        let cleanup_manager = manager.clone();
+        let cleanup = thread::spawn(move || {
+            cleanup_manager.cleanup_claude_hook_session("claude-fence-session");
+        });
+        {
+            let (lock, condition) = &*cleanup_gate;
+            let state = lock.lock().unwrap();
+            let (state, timeout) = condition
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.0)
+                .unwrap();
+            assert!(!timeout.timed_out(), "cleanup reached adapter removal");
+            drop(state);
+        }
+
+        let _ = ureq::post(&endpoint)
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"racing prompt"}"#);
+
+        let generic_escaped = {
+            let (lock, condition) = &*cleanup_gate;
+            let state = lock.lock().unwrap();
+            let (state, _) = condition
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.2)
+                .unwrap();
+            state.2
+        };
+
+        {
+            let (lock, condition) = &*cleanup_gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            condition.notify_all();
+        }
+        cleanup.join().unwrap();
+
+        assert!(
+            !generic_escaped,
+            "cleanup must not let a current hook bypass Claude identity reconciliation"
+        );
+    }
+
+    #[test]
+    fn claude_cleanup_preserves_identity_for_an_admitted_hook_until_publication_finishes() {
+        let temp = temp_test_dir("claude-hook-admitted-publication-fence");
+        let manager = ProcessManager::new();
+        let mut launch = AiLaunchSpec {
+            tab_id: "claude-admitted-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Claude,
+            cwd: temp.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        };
+        manager.prepare_claude_launch_for_session(&mut launch, "claude-admitted-session", &temp);
+        let registration = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("claude-admitted-session")
+            .expect("Claude hook session")
+            .registration
+            .clone();
+        let endpoint = manager.claude_hook_endpoint().unwrap();
+
+        let publication_gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let hook_gate = publication_gate.clone();
+        *manager
+            .inner
+            .claude_semantic_publication_test_hook
+            .write()
+            .unwrap() = Some(Arc::new(move || {
+            let (lock, condition) = &*hook_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            condition.notify_all();
+            while !state.1 {
+                state = condition.wait(state).unwrap();
+            }
+        }));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            if matches!(event, RemoteSessionEvent::ClaudeAdapterRemoved { .. }) {
+                let _ = removed_tx.send(());
+            }
+            observed.lock().unwrap().push(event);
+        })));
+
+        ureq::post(&endpoint)
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"admitted prompt"}"#)
+            .unwrap();
+        {
+            let (lock, condition) = &*publication_gate;
+            let state = lock.lock().unwrap();
+            let (state, timeout) = condition
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.0)
+                .unwrap();
+            assert!(!timeout.timed_out(), "hook reached validated publication");
+            drop(state);
+        }
+
+        let cleanup_manager = manager.clone();
+        let (cleanup_started_tx, cleanup_started_rx) = std::sync::mpsc::channel();
+        let cleanup = thread::spawn(move || {
+            cleanup_started_tx.send(()).unwrap();
+            cleanup_manager.cleanup_claude_hook_session("claude-admitted-session");
+        });
+        cleanup_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let removed_before_publication_finished =
+            removed_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+        {
+            let (lock, condition) = &*publication_gate;
+            let mut state = lock.lock().unwrap();
+            state.1 = true;
+            condition.notify_all();
+        }
+        cleanup.join().unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(
+            !removed_before_publication_finished,
+            "adapter removal must wait for admitted publication to finish"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::ClaudeSemantic { identity, draft }
+                if identity.pty_session_id == "claude-admitted-session"
+                    && identity.registration_generation == registration.generation
+                    && matches!(
+                        &draft.kind,
+                        crate::remote::presentation::SemanticEventKind::UserMessage { text }
+                            if text == "admitted prompt"
+                    )
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RemoteSessionEvent::Semantic { draft }
+                if matches!(
+                    &draft.kind,
+                    crate::remote::presentation::SemanticEventKind::UserMessage { text }
+                        if text == "admitted prompt"
+                )
+        )));
     }
 
     #[test]
