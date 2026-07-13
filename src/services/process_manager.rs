@@ -192,24 +192,32 @@ impl ProcessManager {
         });
 
         let registry_inner = Arc::downgrade(&inner);
-        claude_hook_registry.set_event_handler(Some(Arc::new(move |event| {
+        claude_hook_registry.set_event_handler(Some(Arc::new(move |registration, event| {
             let Some(inner) = registry_inner.upgrade() else {
                 return;
             };
             match event {
                 ClaudeRegistryEvent::Semantic(draft) => {
-                    emit_remote_session_event(&inner, RemoteSessionEvent::Semantic { draft });
+                    let registry = inner.claude_hook_registry.clone();
+                    registry.publish_if_current(&registration, || {
+                        emit_remote_session_event(&inner, RemoteSessionEvent::Semantic { draft });
+                    });
                 }
                 ClaudeRegistryEvent::AdapterHealth {
                     stable_session_key,
                     health,
-                } => emit_remote_session_event(
-                    &inner,
-                    RemoteSessionEvent::AdapterHealth {
-                        stable_session_key,
-                        health,
-                    },
-                ),
+                } => {
+                    let registry = inner.claude_hook_registry.clone();
+                    registry.publish_if_current(&registration, || {
+                        emit_remote_session_event(
+                            &inner,
+                            RemoteSessionEvent::AdapterHealth {
+                                stable_session_key,
+                                health,
+                            },
+                        );
+                    });
+                }
                 ClaudeRegistryEvent::RegistrationDropped {
                     stable_session_key,
                     nonce,
@@ -226,16 +234,19 @@ impl ProcessManager {
                                 || session.registration.generation != generation
                         });
                     }
-                    if was_latest
-                        && !inner
-                            .claude_hook_registry
-                            .has_newer_generation(&stable_session_key, generation)
-                    {
-                        emit_remote_session_event(
-                            &inner,
-                            RemoteSessionEvent::AdapterHealth {
-                                stable_session_key,
-                                health: SemanticAdapterHealth::Degraded,
+                    if was_latest {
+                        let checked_key = stable_session_key.clone();
+                        inner.claude_hook_registry.publish_if_not_superseded(
+                            &checked_key,
+                            generation,
+                            || {
+                                emit_remote_session_event(
+                                    &inner,
+                                    RemoteSessionEvent::AdapterHealth {
+                                        stable_session_key,
+                                        health: SemanticAdapterHealth::Degraded,
+                                    },
+                                );
                             },
                         );
                     }

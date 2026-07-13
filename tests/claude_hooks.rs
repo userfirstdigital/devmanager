@@ -43,7 +43,6 @@ fn reducer() -> ClaudeReducer {
         StableSessionKey::from_tab("claude-tab"),
         ClaudeReducerLimits {
             max_tool_records: 8,
-            max_deduplication_keys: 32,
             ..ClaudeReducerLimits::default()
         },
     )
@@ -175,6 +174,74 @@ fn known_lifecycle_fixtures_normalize_without_leaking_provider_metadata() {
     ] {
         assert!(!rendered.contains(forbidden), "leaked {forbidden}");
     }
+}
+
+#[test]
+fn identical_user_prompts_without_unique_event_ids_are_both_projected() {
+    let mut reducer = reducer();
+
+    let first = reducer.apply_json(fixture("prompt"), 10);
+    let repeated = reducer.apply_json(fixture("prompt"), 11);
+
+    for outcome in [&first, &repeated] {
+        assert_eq!(outcome.drafts.len(), 1);
+        assert!(matches!(
+            &outcome.drafts[0].kind,
+            SemanticEventKind::UserMessage { text } if text == "Please inspect the reducer"
+        ));
+        assert_eq!(outcome.drafts[0].deduplication_key, None);
+    }
+}
+
+#[test]
+fn identical_session_start_resume_events_without_unique_event_ids_are_both_projected() {
+    let mut reducer = reducer();
+    let resume =
+        br#"{"hook_event_name":"SessionStart","source":"resume","session_id":"session-1"}"#;
+
+    let first = reducer.apply_json(resume, 20);
+    let repeated = reducer.apply_json(resume, 21);
+
+    for outcome in [&first, &repeated] {
+        assert_eq!(outcome.drafts.len(), 1);
+        assert!(matches!(
+            &outcome.drafts[0].kind,
+            SemanticEventKind::Status { state, detail }
+                if state == "started" && detail.as_deref() == Some("resume")
+        ));
+        assert_eq!(outcome.drafts[0].deduplication_key, None);
+    }
+}
+
+#[test]
+fn official_message_batch_and_tool_ids_deduplicate_retries_with_different_envelopes() {
+    let mut reducer = reducer();
+    let message = |retry_attempt: u64| {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "MessageDisplay",
+            "turn_id": "turn-retry",
+            "message_id": "message-retry",
+            "index": 0,
+            "final": true,
+            "delta": "only once",
+            "retry_attempt": retry_attempt,
+        }))
+        .unwrap()
+    };
+    let tool = |retry_attempt: u64| {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_use_id": "tool-retry",
+            "tool_name": "Read",
+            "retry_attempt": retry_attempt,
+        }))
+        .unwrap()
+    };
+
+    assert_eq!(reducer.apply_json(&message(1), 30).drafts.len(), 1);
+    assert!(reducer.apply_json(&message(2), 31).drafts.is_empty());
+    assert_eq!(reducer.apply_json(&tool(1), 32).drafts.len(), 1);
+    assert!(reducer.apply_json(&tool(2), 33).drafts.is_empty());
 }
 
 #[test]
@@ -329,7 +396,6 @@ fn malformed_and_unknown_hooks_are_fail_open_and_bounded() {
         StableSessionKey::from_tab("claude-tab"),
         ClaudeReducerLimits {
             max_tool_records: 2,
-            max_deduplication_keys: 3,
             ..ClaudeReducerLimits::default()
         },
     );
@@ -348,7 +414,6 @@ fn malformed_and_unknown_hooks_are_fail_open_and_bounded() {
     assert!(unknown.drafts.is_empty());
     assert!(!unknown.degraded);
     assert!(reducer.tool_record_count() <= 2);
-    assert!(reducer.deduplication_key_count() <= 3);
 }
 
 #[test]
@@ -593,7 +658,7 @@ fn registry_capacity_eviction_removes_ephemeral_settings_and_reports_the_nonce()
     }));
     let events = Arc::new(Mutex::new(Vec::new()));
     let observed = events.clone();
-    registry.set_event_handler(Some(Arc::new(move |event| {
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
         observed.lock().unwrap().push(event);
     })));
     let overlay = prepare_claude_launch_overlay(
@@ -625,7 +690,7 @@ fn superseded_registration_is_acknowledged_but_cannot_publish_to_replacement_key
     let registry = Arc::new(ClaudeHookRegistry::default());
     let events = Arc::new(Mutex::new(Vec::new()));
     let observed = events.clone();
-    registry.set_event_handler(Some(Arc::new(move |event| {
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
         observed.lock().unwrap().push(event);
     })));
     let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
@@ -658,6 +723,93 @@ fn superseded_registration_is_acknowledged_but_cannot_publish_to_replacement_key
         event,
         ClaudeRegistryEvent::Semantic(draft)
             if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "old event")
+    )));
+}
+
+#[test]
+fn superseded_posts_do_not_consume_replacement_ingress_capacity() {
+    let registry = Arc::new(ClaudeHookRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let block_first = Arc::new(AtomicBool::new(true));
+    let observed = events.clone();
+    let callback_gate = gate.clone();
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
+        if block_first.swap(false, Ordering::SeqCst) {
+            let (lock, condition) = &*callback_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            condition.notify_all();
+            while !state.1 {
+                state = condition.wait(state).unwrap();
+            }
+        }
+        observed.lock().unwrap().push(event);
+    })));
+    let listener = ClaudeHookRelayListener::start_with_ingress_limits(
+        registry.clone(),
+        ClaudeIngressLimits {
+            max_critical_events: 1,
+            max_optional_events: 1,
+            max_critical_bytes: 4 * 1024,
+            max_optional_bytes: 4 * 1024,
+        },
+    )
+    .unwrap();
+    let stable_key = StableSessionKey::from_tab("shared-capacity-tab");
+    let old = registry
+        .register_at(stable_key.clone(), Instant::now())
+        .unwrap();
+    let replacement = registry.register_at(stable_key, Instant::now()).unwrap();
+
+    ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &replacement.nonce)
+        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"blocker"}"#)
+        .unwrap();
+    {
+        let (lock, condition) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while !state.0 {
+            state = condition.wait(state).unwrap();
+        }
+    }
+
+    let stale = ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &old.nonce)
+        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"stale queued"}"#)
+        .unwrap();
+    let current = ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &replacement.nonce)
+        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"current queued"}"#)
+        .unwrap();
+    assert_eq!(stale.status().as_u16(), 204);
+    assert_eq!(current.status().as_u16(), 204);
+
+    {
+        let (lock, condition) = &*gate;
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        condition.notify_all();
+    }
+    wait_for(Duration::from_secs(2), || {
+        events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ClaudeRegistryEvent::Semantic(draft)
+                if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "current queued")
+        ))
+    });
+    let events = events.lock().unwrap();
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ClaudeRegistryEvent::Semantic(draft)
+            if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "stale queued")
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ClaudeRegistryEvent::AdapterHealth {
+            health: SemanticAdapterHealth::Degraded,
+            ..
+        }
     )));
 }
 
@@ -818,7 +970,7 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
     let events = Arc::new(Mutex::new(Vec::<ClaudeRegistryEvent>::new()));
     let callback_registry = registry.clone();
     let callback_events = events.clone();
-    registry.set_event_handler(Some(Arc::new(move |event| {
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
         // This would deadlock if registry callbacks ran under the registry lock.
         let _ = callback_registry.registration_count();
         callback_events.lock().unwrap().push(event);
@@ -904,7 +1056,7 @@ fn saturated_ingress_sheds_message_display_before_critical_events() {
     let observed = events.clone();
     let callback_gate = gate.clone();
     let callback_block_first = block_first.clone();
-    registry.set_event_handler(Some(Arc::new(move |event| {
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
         if callback_block_first.swap(false, Ordering::SeqCst) {
             let (lock, condition) = &*callback_gate;
             let mut state = lock.lock().unwrap();
@@ -1016,7 +1168,7 @@ fn critical_ingress_overflow_is_fail_open_and_degrades_exact_adapter() {
     let block_first = Arc::new(AtomicBool::new(true));
     let observed = events.clone();
     let callback_gate = gate.clone();
-    registry.set_event_handler(Some(Arc::new(move |event| {
+    registry.set_event_handler(Some(Arc::new(move |_registration, event| {
         if block_first.swap(false, Ordering::SeqCst) {
             let (lock, condition) = &*callback_gate;
             let mut state = lock.lock().unwrap();
