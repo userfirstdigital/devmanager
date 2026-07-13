@@ -22,6 +22,8 @@ const DEFAULT_ACTIVE_ITEMS: usize = 64;
 const DEFAULT_ITEM_BYTES: usize = 64 * 1024;
 const DEFAULT_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 const CODEX_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const CODEX_PROBE_TREE_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const CODEX_PROBE_PIPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const BRIDGE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1912,44 +1914,50 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(|error| {
         format!(
             "Failed to probe Codex executable `{}`: {error}",
             executable.display()
         )
     })?;
+    let pid = child.id();
+    // On Windows, kill-on-close job ownership is the reliable backstop for a
+    // wrapper that exits before its descendants. Unix probes are placed in a
+    // dedicated process group above. Tree termination remains the portable
+    // first attempt on every completion path.
+    let managed_job =
+        crate::services::platform_service::attach_process_to_managed_job(pid)
+            .ok()
+            .flatten();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_reader = std::thread::spawn(move || capture_probe_pipe(stdout));
-    let stderr_reader = std::thread::spawn(move || capture_probe_pipe(stderr));
+    let stdout_reader = spawn_probe_pipe_reader(stdout);
+    let stderr_reader = spawn_probe_pipe_reader(stderr);
     let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) if started.elapsed() < CODEX_PROBE_TIMEOUT => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!(
+            Ok(None) => break Err(format!(
                     "Codex capability probe timed out after {} seconds",
                     CODEX_PROBE_TIMEOUT.as_secs()
-                ));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!("Codex capability probe failed: {error}"));
-            }
+                )),
+            Err(error) => break Err(format!("Codex capability probe failed: {error}")),
         }
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+
+    terminate_probe_tree(&mut child, pid, managed_job);
+    let pipe_deadline = std::time::Instant::now() + CODEX_PROBE_PIPE_DRAIN_TIMEOUT;
+    let stdout = receive_probe_pipe(&stdout_reader, pipe_deadline);
+    let stderr = receive_probe_pipe(&stderr_reader, pipe_deadline);
+    let status = status?;
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&stdout),
@@ -1962,6 +1970,50 @@ fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
         ));
     }
     Ok(output)
+}
+
+fn spawn_probe_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(capture_probe_pipe(pipe));
+    });
+    receiver
+}
+
+fn receive_probe_pipe(
+    receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Instant,
+) -> Vec<u8> {
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or_default()
+}
+
+fn terminate_probe_tree(
+    child: &mut std::process::Child,
+    pid: u32,
+    managed_job: Option<crate::services::platform_service::ManagedProcessJob>,
+) {
+    let (tree_kill_tx, tree_kill_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = crate::services::platform_service::kill_process_tree(pid);
+        let _ = tree_kill_tx.send(result);
+    });
+    let _ = tree_kill_rx.recv_timeout(CODEX_PROBE_TREE_KILL_TIMEOUT);
+
+    // Closing a Windows kill-on-close job terminates descendants even when the
+    // wrapper has already exited and can no longer be walked as a live root.
+    drop(managed_job);
+    let _ = child.kill();
+    let reap_deadline = std::time::Instant::now() + CODEX_PROBE_TREE_KILL_TIMEOUT;
+    while std::time::Instant::now() < reap_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
 }
 
 fn capture_probe_pipe<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
@@ -2100,6 +2152,108 @@ mod tests {
 
     fn reducer() -> CodexSemanticReducer {
         CodexSemanticReducer::new(StableSessionKey::from_tab("codex-tab"))
+    }
+
+    fn read_probe_child_pid(path: &Path, timeout: std::time::Duration) -> Option<u32> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            if let Ok(pid) = std::fs::read_to_string(path) {
+                if let Ok(pid) = pid.trim().parse() {
+                    return Some(pid);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn capability_probe_reaps_inherited_stdout_grandchild_without_blocking() {
+        let unique = format!(
+            "devmanager-codex-probe-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp).unwrap();
+        let pid_path = temp.join("grandchild.pid");
+
+        #[cfg(windows)]
+        let (executable, args) = {
+            let script_path = temp.join("probe-wrapper.ps1");
+            std::fs::write(
+                &script_path,
+                r#"param([string]$PidPath)
+$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru -NoNewWindow
+[IO.File]::WriteAllText($PidPath, [string]$child.Id)
+[Console]::Out.WriteLine('probe-complete')
+"#,
+            )
+            .unwrap();
+            (
+                resolve_executable("powershell.exe").unwrap(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-File".to_string(),
+                    script_path.to_string_lossy().into_owned(),
+                    pid_path.to_string_lossy().into_owned(),
+                ],
+            )
+        };
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            PathBuf::from("/bin/sh"),
+            vec![
+                "-c".to_string(),
+                "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; printf 'probe-complete\\n'"
+                    .to_string(),
+                "probe-wrapper".to_string(),
+                pid_path.to_string_lossy().into_owned(),
+            ],
+        );
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(run_probe(&executable, &args));
+        });
+        let result = match result_rx.recv_timeout(std::time::Duration::from_secs(4)) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(pid) = read_probe_child_pid(&pid_path, std::time::Duration::from_secs(1))
+                {
+                    let _ = crate::services::platform_service::kill_process_tree(pid);
+                }
+                let _ = result_rx.recv_timeout(std::time::Duration::from_secs(2));
+                let _ = std::fs::remove_dir_all(&temp);
+                panic!("probe remained blocked on inherited stdout: {error}");
+            }
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "probe completion must remain bounded"
+        );
+        assert!(result.unwrap().contains("probe-complete"));
+
+        let grandchild_pid = read_probe_child_pid(&pid_path, std::time::Duration::from_secs(1))
+            .expect("wrapper must record its inherited-stdout grandchild");
+        let reaped_at = std::time::Instant::now();
+        while crate::services::platform_service::is_pid_running(grandchild_pid)
+            && reaped_at.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let still_running =
+            crate::services::platform_service::is_pid_running(grandchild_pid);
+        if still_running {
+            let _ = crate::services::platform_service::kill_process_tree(grandchild_pid);
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+        assert!(!still_running, "probe must not leave its grandchild running");
     }
 
     #[test]
