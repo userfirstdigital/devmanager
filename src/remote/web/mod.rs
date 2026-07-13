@@ -801,7 +801,14 @@ async fn me_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> R
 #[serde(rename_all = "camelCase")]
 struct PushStatusResponse {
     public_key: String,
+    enabled: bool,
+    /// Compatibility alias for the first notification-capable web bundle.
     subscribed: bool,
+}
+
+#[derive(Serialize)]
+struct PushMutationResponse {
+    enabled: bool,
 }
 
 fn single_request_header<'a>(
@@ -910,14 +917,11 @@ async fn push_status_handler(State(state): State<Arc<WebState>>, headers: Header
     let Ok(config) = state.inner.config.read() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "config unavailable").into_response();
     };
+    let enabled = config.web.push.notifications_enabled(&client_id);
     let response = PushStatusResponse {
         public_key: config.web.push.vapid_public_key_base64.clone(),
-        subscribed: config
-            .web
-            .push
-            .subscriptions
-            .iter()
-            .any(|subscription| subscription.client_id == client_id),
+        enabled,
+        subscribed: enabled,
     };
     match serde_json::to_vec(&response) {
         Ok(body) => (
@@ -945,6 +949,7 @@ async fn push_subscribe_handler(
         Ok(request) => request,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid subscription").into_response(),
     };
+    let mode = request.mode;
     let validated = match push::validate_registration(request) {
         Ok(validated) => validated,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
@@ -956,13 +961,20 @@ async fn push_subscribe_handler(
             .iter()
             .any(|client| client.client_id == client_id)
         {
-            return false;
+            return None;
         }
-        config
-            .web
-            .push
-            .upsert_subscription(&client_id, validated, now_epoch_ms());
-        true
+        let enabled = match mode {
+            push::PushRegistrationMode::Enable => config
+                .web
+                .push
+                .enable_and_replace_subscription(&client_id, validated, now_epoch_ms())
+                .map(|()| true),
+            push::PushRegistrationMode::Reconcile => Ok(config
+                .web
+                .push
+                .reconcile_and_replace_subscription(&client_id, validated, now_epoch_ms())),
+        };
+        Some(enabled)
     }) {
         Ok(registered) => registered,
         Err(_) => {
@@ -973,10 +985,28 @@ async fn push_subscribe_handler(
                 .into_response()
         }
     };
-    if !registered {
+    let Some(enabled) = registered else {
         return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    };
+    let enabled = match enabled {
+        Ok(enabled) => enabled,
+        Err(push::PushEnableError::ClientLimitReached) => {
+            return (
+                StatusCode::CONFLICT,
+                "notification client limit reached",
+            )
+                .into_response()
+        }
+    };
+    match serde_json::to_vec(&PushMutationResponse { enabled }) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "encoding failed").into_response(),
     }
-    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn push_unsubscribe_handler(
@@ -994,14 +1024,29 @@ async fn push_unsubscribe_handler(
         Ok(request) => request,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid subscription").into_response(),
     };
-    if let Err(error) = push::validate_push_endpoint(&request.endpoint) {
-        return (StatusCode::BAD_REQUEST, error).into_response();
+    if !request.disable && request.endpoint.is_none() {
+        return (StatusCode::BAD_REQUEST, "missing subscription endpoint").into_response();
+    }
+    if let Some(endpoint) = request.endpoint.as_deref() {
+        if let Err(error) = push::validate_push_endpoint(endpoint) {
+            return (StatusCode::BAD_REQUEST, error).into_response();
+        }
     }
     match super::mutate_host_config(&state.inner, |config| {
-        config
-            .web
-            .push
-            .remove_subscription(&client_id, &request.endpoint)
+        let legacy_endpoint_matches = request.endpoint.as_deref().is_some_and(|endpoint| {
+            config
+                .web
+                .push
+                .subscriptions
+                .iter()
+                .any(|subscription| {
+                    subscription.client_id == client_id && subscription.endpoint == endpoint
+                })
+        });
+        if request.disable || legacy_endpoint_matches {
+            config.web.push.disable_client(&client_id);
+        }
+        true
     }) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => (
@@ -1177,6 +1222,17 @@ mod tests {
         .expect("push registration")
     }
 
+    fn push_registration_with_mode(
+        service: &RemoteHostService,
+        endpoint: &str,
+        mode: &str,
+    ) -> Vec<u8> {
+        let mut registration: serde_json::Value =
+            serde_json::from_slice(&valid_push_registration(service, endpoint)).unwrap();
+        registration["mode"] = serde_json::Value::String(mode.to_string());
+        serde_json::to_vec(&registration).unwrap()
+    }
+
     #[test]
     fn push_routes_require_pairing_and_never_expose_private_vapid_material() {
         let _profile = TestProfileGuard::new("web-push-auth");
@@ -1249,10 +1305,10 @@ mod tests {
                     axum::http::Method::POST,
                     "/api/push",
                     phone_headers.clone(),
-                    valid_push_registration(&service, endpoint),
+                    push_registration_with_mode(&service, endpoint, "enable"),
                 )
                 .await;
-                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(service.config().web.push.subscriptions.len(), 1);
 
                 let saved = load_remote_machine_state().expect("persisted push state");
@@ -1311,6 +1367,190 @@ mod tests {
                     assert_eq!(response.status(), StatusCode::NO_CONTENT);
                 }
                 assert!(service.config().web.push.subscriptions.is_empty());
+            });
+    }
+
+    #[test]
+    fn explicit_push_enable_sets_intent_and_registers_exact_endpoint() {
+        let _profile = TestProfileGuard::new("web-push-explicit-enable");
+        let service = test_service("host-push-explicit-enable");
+        let state = test_state(&service);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let headers =
+                    push_mutation_headers(pair_cookie_headers(state.clone(), "phone-enable").await);
+                let endpoint = "https://web.push.apple.com/QM-phone-enabled";
+
+                let response = route_request(
+                    state,
+                    axum::http::Method::POST,
+                    "/api/push",
+                    headers,
+                    push_registration_with_mode(&service, endpoint, "enable"),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["enabled"],
+                    true
+                );
+                let saved = service.config();
+                let client_id = &saved.web.paired_clients[0].client_id;
+                assert!(saved.web.push.notifications_enabled(client_id));
+                assert_eq!(saved.web.push.subscriptions.len(), 1);
+                assert_eq!(saved.web.push.subscriptions[0].endpoint, endpoint);
+            });
+    }
+
+    #[test]
+    fn explicit_push_disable_clears_intent_and_every_client_endpoint() {
+        let _profile = TestProfileGuard::new("web-push-explicit-disable");
+        let service = test_service("host-push-explicit-disable");
+        let state = test_state(&service);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let headers =
+                    push_mutation_headers(pair_cookie_headers(state.clone(), "phone-disable").await);
+                let endpoint = "https://web.push.apple.com/QM-phone-disabled";
+
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    headers.clone(),
+                    push_registration_with_mode(&service, endpoint, "enable"),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+
+                let response = route_request(
+                    state,
+                    axum::http::Method::POST,
+                    "/api/push/unsubscribe",
+                    headers,
+                    serde_json::to_vec(&serde_json::json!({ "disable": true })).unwrap(),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                let saved = service.config();
+                let client_id = &saved.web.paired_clients[0].client_id;
+                assert!(!saved.web.push.notifications_enabled(client_id));
+                assert!(saved
+                    .web
+                    .push
+                    .subscriptions
+                    .iter()
+                    .all(|subscription| subscription.client_id != *client_id));
+            });
+    }
+
+    #[test]
+    fn push_status_follows_enabled_intent_even_when_the_endpoint_is_missing() {
+        let _profile = TestProfileGuard::new("web-push-status-intent");
+        let service = test_service("host-push-status-intent");
+        let state = test_state(&service);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let paired = pair_cookie_headers(state.clone(), "phone-status-intent").await;
+                let mutation_headers = push_mutation_headers(paired.clone());
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    mutation_headers,
+                    push_registration_with_mode(
+                        &service,
+                        "https://web.push.apple.com/QM-phone-status",
+                        "enable",
+                    ),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                crate::remote::mutate_host_config(&service.inner, |config| {
+                    config.web.push.subscriptions.clear();
+                })
+                .unwrap();
+
+                let response = route_request(
+                    state,
+                    axum::http::Method::GET,
+                    "/api/push",
+                    paired,
+                    Vec::new(),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+                let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(status["enabled"], true);
+                assert_eq!(status["subscribed"], true);
+            });
+    }
+
+    #[test]
+    fn delayed_reconcile_after_disable_cannot_resurrect_notifications() {
+        let _profile = TestProfileGuard::new("web-push-disable-race");
+        let service = test_service("host-push-disable-race");
+        let state = test_state(&service);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let headers =
+                    push_mutation_headers(pair_cookie_headers(state.clone(), "phone-race").await);
+                let endpoint = "https://web.push.apple.com/QM-phone-race";
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push",
+                    headers.clone(),
+                    push_registration_with_mode(&service, endpoint, "enable"),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let response = route_request(
+                    state.clone(),
+                    axum::http::Method::POST,
+                    "/api/push/unsubscribe",
+                    headers.clone(),
+                    serde_json::to_vec(&serde_json::json!({ "disable": true })).unwrap(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+                let response = route_request(
+                    state,
+                    axum::http::Method::POST,
+                    "/api/push",
+                    headers,
+                    push_registration_with_mode(&service, endpoint, "reconcile"),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["enabled"],
+                    false
+                );
+                let saved = service.config();
+                let client_id = &saved.web.paired_clients[0].client_id;
+                assert!(!saved.web.push.notifications_enabled(client_id));
+                assert!(saved.web.push.subscriptions.is_empty());
             });
     }
 
@@ -1381,10 +1621,10 @@ mod tests {
                     axum::http::Method::POST,
                     "/api/push",
                     proxy_headers.clone(),
-                    valid_push_registration(&service, endpoint),
+                    push_registration_with_mode(&service, endpoint, "enable"),
                 )
                 .await;
-                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(service.config().web.push.subscriptions.len(), 1);
 
                 proxy_headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());

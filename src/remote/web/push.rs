@@ -14,7 +14,14 @@ use web_push_native::p256::elliptic_curve::sec1::ToEncodedPoint;
 use web_push_native::{Auth, WebPushBuilder};
 
 pub const MAX_PUSH_SUBSCRIPTIONS: usize = 32;
-pub const MAX_PUSH_SUBSCRIPTIONS_PER_CLIENT: usize = 2;
+#[cfg(test)]
+const MAX_PUSH_SUBSCRIPTIONS_PER_CLIENT: usize = 2;
+const PUSH_INTENT_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushEnableError {
+    ClientLimitReached,
+}
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_KEY_TEXT_BYTES: usize = 256;
 const PUSH_TTL: Duration = Duration::from_secs(5 * 60);
@@ -29,7 +36,14 @@ const DELIVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct WebPushConfig {
     pub vapid_private_key_base64: String,
     pub vapid_public_key_base64: String,
+    #[serde(default = "legacy_intent_schema_version")]
+    pub intent_schema_version: u8,
+    pub enabled_client_ids: Vec<String>,
     pub subscriptions: Vec<WebPushSubscription>,
+}
+
+fn legacy_intent_schema_version() -> u8 {
+    0
 }
 
 impl fmt::Debug for WebPushConfig {
@@ -38,6 +52,7 @@ impl fmt::Debug for WebPushConfig {
             .debug_struct("WebPushConfig")
             .field("vapid_private_key_base64", &"[REDACTED]")
             .field("vapid_public_key_base64", &self.vapid_public_key_base64)
+            .field("enabled_client_count", &self.enabled_client_ids.len())
             .field("subscription_count", &self.subscriptions.len())
             .finish()
     }
@@ -49,6 +64,8 @@ impl Default for WebPushConfig {
         Self {
             vapid_private_key_base64: private_key,
             vapid_public_key_base64: public_key,
+            intent_schema_version: PUSH_INTENT_SCHEMA_VERSION,
+            enabled_client_ids: Vec::new(),
             subscriptions: Vec::new(),
         }
     }
@@ -56,6 +73,7 @@ impl Default for WebPushConfig {
 
 impl WebPushConfig {
     pub fn ensure_keys(&mut self) {
+        self.normalize_subscription_intent();
         if self.keys_are_valid() {
             return;
         }
@@ -66,6 +84,97 @@ impl WebPushConfig {
         // server key. Keeping them after a key rotation can only create a
         // permanent failing delivery loop.
         self.subscriptions.clear();
+    }
+
+    fn normalize_subscription_intent(&mut self) {
+        if self.intent_schema_version == 0 {
+            for client_id in self
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.client_id.clone())
+            {
+                if !self.enabled_client_ids.contains(&client_id) {
+                    self.enabled_client_ids.push(client_id);
+                }
+            }
+            self.intent_schema_version = PUSH_INTENT_SCHEMA_VERSION;
+        } else {
+            self.subscriptions.retain(|subscription| {
+                self.enabled_client_ids
+                    .iter()
+                    .any(|enabled| enabled == &subscription.client_id)
+            });
+        }
+        let mut unique = Vec::new();
+        self.enabled_client_ids.retain(|client_id| {
+            if unique.contains(client_id) {
+                false
+            } else {
+                unique.push(client_id.clone());
+                true
+            }
+        });
+        self.enabled_client_ids.truncate(MAX_PUSH_SUBSCRIPTIONS);
+    }
+
+    pub fn notifications_enabled(&self, client_id: &str) -> bool {
+        self.enabled_client_ids
+            .iter()
+            .any(|enabled| enabled == client_id)
+    }
+
+    pub fn enable_and_replace_subscription(
+        &mut self,
+        client_id: &str,
+        validated: ValidatedPushSubscription,
+        created_at_epoch_ms: u64,
+    ) -> Result<(), PushEnableError> {
+        if !self.notifications_enabled(client_id) {
+            if self.enabled_client_ids.len() >= MAX_PUSH_SUBSCRIPTIONS {
+                return Err(PushEnableError::ClientLimitReached);
+            }
+            self.enabled_client_ids.push(client_id.to_string());
+        }
+        self.replace_client_subscription(client_id, validated, created_at_epoch_ms);
+        Ok(())
+    }
+
+    pub fn reconcile_and_replace_subscription(
+        &mut self,
+        client_id: &str,
+        validated: ValidatedPushSubscription,
+        created_at_epoch_ms: u64,
+    ) -> bool {
+        if !self.notifications_enabled(client_id) {
+            return false;
+        }
+        self.replace_client_subscription(client_id, validated, created_at_epoch_ms);
+        true
+    }
+
+    fn replace_client_subscription(
+        &mut self,
+        client_id: &str,
+        validated: ValidatedPushSubscription,
+        created_at_epoch_ms: u64,
+    ) {
+        self.subscriptions
+            .retain(|subscription| subscription.client_id != client_id);
+        while self.subscriptions.len() >= MAX_PUSH_SUBSCRIPTIONS {
+            let oldest = self
+                .subscriptions
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, subscription)| subscription.created_at_epoch_ms)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            self.subscriptions.remove(oldest);
+        }
+        self.subscriptions.push(WebPushSubscription::from_validated(
+            client_id,
+            validated,
+            created_at_epoch_ms,
+        ));
     }
 
     pub fn keys_are_valid(&self) -> bool {
@@ -86,7 +195,8 @@ impl WebPushConfig {
             && ES256KeyPair::from_bytes(&private_bytes).is_ok()
     }
 
-    pub fn upsert_subscription(
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_subscription_for_test(
         &mut self,
         client_id: &str,
         validated: ValidatedPushSubscription,
@@ -132,15 +242,18 @@ impl WebPushConfig {
         ));
     }
 
-    pub fn remove_subscription(&mut self, client_id: &str, endpoint: &str) -> bool {
-        let before = self.subscriptions.len();
-        self.subscriptions.retain(|subscription| {
-            subscription.client_id != client_id || subscription.endpoint != endpoint
-        });
-        self.subscriptions.len() != before
+    pub fn disable_client(&mut self, client_id: &str) -> bool {
+        let enabled_before = self.enabled_client_ids.len();
+        self.enabled_client_ids
+            .retain(|enabled| enabled != client_id);
+        let subscriptions_before = self.subscriptions.len();
+        self.subscriptions
+            .retain(|subscription| subscription.client_id != client_id);
+        self.enabled_client_ids.len() != enabled_before
+            || self.subscriptions.len() != subscriptions_before
     }
 
-    fn remove_subscription_if_matches(&mut self, expected: &WebPushSubscription) -> bool {
+    fn expire_subscription_if_matches(&mut self, expected: &WebPushSubscription) -> bool {
         let before = self.subscriptions.len();
         self.subscriptions
             .retain(|subscription| subscription != expected);
@@ -148,10 +261,7 @@ impl WebPushConfig {
     }
 
     pub fn remove_client(&mut self, client_id: &str) -> bool {
-        let before = self.subscriptions.len();
-        self.subscriptions
-            .retain(|subscription| subscription.client_id != client_id);
-        self.subscriptions.len() != before
+        self.disable_client(client_id)
     }
 }
 
@@ -194,6 +304,7 @@ impl WebPushSubscription {
 
     fn validated(&self) -> Result<ValidatedPushSubscription, String> {
         validate_registration(PushRegistrationRequest {
+            mode: PushRegistrationMode::Reconcile,
             endpoint: self.endpoint.clone(),
             keys: PushRegistrationKeys {
                 p256dh: self.p256dh.clone(),
@@ -401,7 +512,7 @@ fn push_worker_loop(
             config
                 .web
                 .push
-                .remove_subscription_if_matches(&current_subscription)
+                .expire_subscription_if_matches(&current_subscription)
         });
     }
 }
@@ -409,8 +520,18 @@ fn push_worker_loop(
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PushRegistrationRequest {
+    #[serde(default)]
+    pub mode: PushRegistrationMode,
     pub endpoint: String,
     pub keys: PushRegistrationKeys,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PushRegistrationMode {
+    Enable,
+    #[default]
+    Reconcile,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -423,7 +544,10 @@ pub struct PushRegistrationKeys {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PushUnsubscribeRequest {
-    pub endpoint: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub disable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,6 +800,7 @@ mod tests {
     fn valid_registration() -> PushRegistrationRequest {
         let application_key = WebPushConfig::default().vapid_public_key_base64;
         PushRegistrationRequest {
+            mode: PushRegistrationMode::Reconcile,
             endpoint: "https://web.push.apple.com/QM-valid-endpoint".to_string(),
             keys: PushRegistrationKeys {
                 p256dh: application_key,
@@ -729,6 +854,82 @@ mod tests {
     }
 
     #[test]
+    fn legacy_subscriptions_migrate_to_enabled_intent() {
+        let mut legacy = WebPushConfig::default();
+        legacy.subscriptions.push(WebPushSubscription {
+            client_id: "phone".to_string(),
+            endpoint: valid_registration().endpoint,
+            p256dh: valid_registration().keys.p256dh,
+            auth: valid_registration().keys.auth,
+            created_at_epoch_ms: 1,
+        });
+        let mut serialized = serde_json::to_value(legacy).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("enabledClientIds");
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("intentSchemaVersion");
+        let mut migrated: WebPushConfig = serde_json::from_value(serialized).unwrap();
+
+        migrated.ensure_keys();
+
+        assert!(migrated.notifications_enabled("phone"));
+        assert!(!migrated.notifications_enabled("tablet"));
+    }
+
+    #[test]
+    fn normalized_disabled_intent_drops_stale_endpoint_without_reenabling() {
+        let mut normalized = WebPushConfig::default();
+        normalized.subscriptions.push(WebPushSubscription {
+            client_id: "phone".to_string(),
+            endpoint: valid_registration().endpoint,
+            p256dh: valid_registration().keys.p256dh,
+            auth: valid_registration().keys.auth,
+            created_at_epoch_ms: 1,
+        });
+        normalized.enabled_client_ids.clear();
+        let mut serialized = serde_json::to_value(normalized).unwrap();
+        serialized["intentSchemaVersion"] = serde_json::Value::from(1);
+        let mut loaded: WebPushConfig = serde_json::from_value(serialized).unwrap();
+
+        loaded.ensure_keys();
+
+        assert!(!loaded.notifications_enabled("phone"));
+        assert!(loaded.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn key_rotation_drops_legacy_endpoint_but_preserves_migrated_intent() {
+        let mut legacy = WebPushConfig::default();
+        legacy.subscriptions.push(WebPushSubscription {
+            client_id: "phone".to_string(),
+            endpoint: valid_registration().endpoint,
+            p256dh: valid_registration().keys.p256dh,
+            auth: valid_registration().keys.auth,
+            created_at_epoch_ms: 1,
+        });
+        legacy.vapid_public_key_base64 = "invalid".to_string();
+        let mut serialized = serde_json::to_value(legacy).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("enabledClientIds");
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("intentSchemaVersion");
+        let mut migrated: WebPushConfig = serde_json::from_value(serialized).unwrap();
+
+        migrated.ensure_keys();
+
+        assert!(migrated.subscriptions.is_empty());
+        assert!(migrated.notifications_enabled("phone"));
+    }
+
+    #[test]
     fn invalid_or_changed_vapid_material_rotates_and_drops_bound_subscriptions() {
         let mut config = WebPushConfig::default();
         config.subscriptions.push(WebPushSubscription {
@@ -771,6 +972,188 @@ mod tests {
         assert!(validate_registration(bad_auth)
             .unwrap_err()
             .contains("auth"));
+    }
+
+    #[test]
+    fn explicit_enable_replaces_every_stale_endpoint_for_only_that_client() {
+        let mut config = WebPushConfig::default();
+        for (client_id, endpoint, created_at) in [
+            ("phone", "https://web.push.apple.com/QM-phone-old-a", 1),
+            ("phone", "https://web.push.apple.com/QM-phone-old-b", 2),
+            ("tablet", "https://web.push.apple.com/QM-tablet", 3),
+        ] {
+            config.insert_legacy_subscription_for_test(
+                client_id,
+                validate_registration(PushRegistrationRequest {
+                    endpoint: endpoint.to_string(),
+                    ..valid_registration()
+                })
+                .unwrap(),
+                created_at,
+            );
+        }
+        let replacement_endpoint = "https://web.push.apple.com/QM-phone-current";
+        let replacement = validate_registration(PushRegistrationRequest {
+            endpoint: replacement_endpoint.to_string(),
+            ..valid_registration()
+        })
+        .unwrap();
+
+        config
+            .enable_and_replace_subscription("phone", replacement, 4)
+            .unwrap();
+
+        assert!(config.notifications_enabled("phone"));
+        let phone = config
+            .subscriptions
+            .iter()
+            .filter(|subscription| subscription.client_id == "phone")
+            .collect::<Vec<_>>();
+        assert_eq!(phone.len(), 1);
+        assert_eq!(phone[0].endpoint, replacement_endpoint);
+        assert!(config
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.client_id == "tablet"));
+    }
+
+    #[test]
+    fn automatic_reconcile_cannot_register_while_host_intent_is_disabled() {
+        let mut config = WebPushConfig::default();
+        let subscription = validate_registration(valid_registration()).unwrap();
+
+        let enabled = config.reconcile_and_replace_subscription("phone", subscription, 1);
+
+        assert!(!enabled);
+        assert!(!config.notifications_enabled("phone"));
+        assert!(config.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn explicit_disable_clears_intent_and_every_endpoint_for_only_that_client() {
+        let mut config = WebPushConfig::default();
+        for (client_id, endpoint, created_at) in [
+            ("phone", "https://web.push.apple.com/QM-phone", 1),
+            ("tablet", "https://web.push.apple.com/QM-tablet", 2),
+        ] {
+            config
+                .enable_and_replace_subscription(
+                    client_id,
+                    validate_registration(PushRegistrationRequest {
+                        endpoint: endpoint.to_string(),
+                        ..valid_registration()
+                    })
+                    .unwrap(),
+                    created_at,
+                )
+                .unwrap();
+        }
+
+        assert!(config.disable_client("phone"));
+
+        assert!(!config.notifications_enabled("phone"));
+        assert!(config.notifications_enabled("tablet"));
+        assert!(config
+            .subscriptions
+            .iter()
+            .all(|subscription| subscription.client_id != "phone"));
+        assert!(config
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.client_id == "tablet"));
+    }
+
+    #[test]
+    fn explicit_enable_rejects_a_new_client_at_the_intent_cap_but_allows_rotation() {
+        let mut config = WebPushConfig::default();
+        for index in 0..MAX_PUSH_SUBSCRIPTIONS {
+            let registration = PushRegistrationRequest {
+                endpoint: format!("https://web.push.apple.com/QM-client-{index}"),
+                ..valid_registration()
+            };
+            config
+                .enable_and_replace_subscription(
+                    &format!("client-{index}"),
+                    validate_registration(registration).unwrap(),
+                    index as u64,
+                )
+                .expect("client below intent cap should be enabled");
+        }
+
+        let overflow = config.enable_and_replace_subscription(
+            "overflow",
+            validate_registration(PushRegistrationRequest {
+                endpoint: "https://web.push.apple.com/QM-overflow".to_string(),
+                ..valid_registration()
+            })
+            .unwrap(),
+            100,
+        );
+
+        assert_eq!(overflow, Err(PushEnableError::ClientLimitReached));
+        assert!(!config.notifications_enabled("overflow"));
+        assert!(config
+            .subscriptions
+            .iter()
+            .all(|subscription| subscription.client_id != "overflow"));
+
+        let rotated_endpoint = "https://web.push.apple.com/QM-client-0-rotated";
+        config
+            .enable_and_replace_subscription(
+                "client-0",
+                validate_registration(PushRegistrationRequest {
+                    endpoint: rotated_endpoint.to_string(),
+                    ..valid_registration()
+                })
+                .unwrap(),
+                101,
+            )
+            .expect("enabled client should rotate at the intent cap");
+        assert_eq!(config.enabled_client_ids.len(), MAX_PUSH_SUBSCRIPTIONS);
+        assert_eq!(
+            config
+                .subscriptions
+                .iter()
+                .find(|subscription| subscription.client_id == "client-0")
+                .unwrap()
+                .endpoint,
+            rotated_endpoint
+        );
+    }
+
+    #[test]
+    fn terminal_delivery_expiry_removes_endpoint_but_preserves_enabled_intent() {
+        let mut config = WebPushConfig::default();
+        config
+            .enable_and_replace_subscription(
+                "phone",
+                validate_registration(valid_registration()).unwrap(),
+                1,
+            )
+            .unwrap();
+        let expired = config.subscriptions[0].clone();
+
+        assert!(config.expire_subscription_if_matches(&expired));
+
+        assert!(config.subscriptions.is_empty());
+        assert!(config.notifications_enabled("phone"));
+    }
+
+    #[test]
+    fn client_revocation_removes_endpoint_and_enabled_intent() {
+        let mut config = WebPushConfig::default();
+        config
+            .enable_and_replace_subscription(
+                "phone",
+                validate_registration(valid_registration()).unwrap(),
+                1,
+            )
+            .unwrap();
+
+        assert!(config.remove_client("phone"));
+
+        assert!(config.subscriptions.is_empty());
+        assert!(!config.notifications_enabled("phone"));
     }
 
     #[test]
@@ -866,7 +1249,11 @@ mod tests {
         let _profile = TestProfileGuard::new("push-expiry-worker");
         let mut config = RemoteHostConfig::default();
         let validated = validate_registration(valid_registration()).unwrap();
-        config.web.push.upsert_subscription("phone", validated, 1);
+        config
+            .web
+            .push
+            .enable_and_replace_subscription("phone", validated, 1)
+            .unwrap();
         let service = RemoteHostService::new(config);
         let push = service.config().web.push;
         let subscription = push.subscriptions[0].clone();
@@ -899,7 +1286,11 @@ mod tests {
     fn dispatcher_reauthorizes_queued_work_after_subscription_revocation() {
         let mut config = RemoteHostConfig::default();
         let validated = validate_registration(valid_registration()).unwrap();
-        config.web.push.upsert_subscription("phone", validated, 1);
+        config
+            .web
+            .push
+            .enable_and_replace_subscription("phone", validated, 1)
+            .unwrap();
         let service = RemoteHostService::new(config);
         let push = service.config().web.push;
         let subscription = push.subscriptions[0].clone();
@@ -942,7 +1333,7 @@ mod tests {
             .unwrap()
             .web
             .push
-            .remove_subscription("phone", &subscription.endpoint);
+            .disable_client("phone");
         release.wait();
 
         assert!(
@@ -956,7 +1347,11 @@ mod tests {
     fn dispatcher_preserves_delivery_order_for_each_subscription() {
         let mut config = RemoteHostConfig::default();
         let validated = validate_registration(valid_registration()).unwrap();
-        config.web.push.upsert_subscription("phone", validated, 1);
+        config
+            .web
+            .push
+            .enable_and_replace_subscription("phone", validated, 1)
+            .unwrap();
         let service = RemoteHostService::new(config);
         let push = service.config().web.push;
         let subscription = push.subscriptions[0].clone();
@@ -1009,7 +1404,8 @@ mod tests {
         config
             .web
             .push
-            .upsert_subscription("phone", validated.clone(), 1);
+            .enable_and_replace_subscription("phone", validated.clone(), 1)
+            .unwrap();
         let service = RemoteHostService::new(config);
         let push = service.config().web.push;
         let old_subscription = push.subscriptions[0].clone();
@@ -1038,7 +1434,8 @@ mod tests {
             .unwrap()
             .web
             .push
-            .upsert_subscription("phone", validated, 2);
+            .enable_and_replace_subscription("phone", validated, 2)
+            .unwrap();
         release.wait();
         drop(dispatcher);
 
@@ -1051,7 +1448,11 @@ mod tests {
     fn dispatcher_queue_is_bounded_and_admission_never_blocks() {
         let mut config = RemoteHostConfig::default();
         let validated = validate_registration(valid_registration()).unwrap();
-        config.web.push.upsert_subscription("phone", validated, 1);
+        config
+            .web
+            .push
+            .enable_and_replace_subscription("phone", validated, 1)
+            .unwrap();
         let service = RemoteHostService::new(config);
         let push = service.config().web.push;
         let subscription = push.subscriptions[0].clone();

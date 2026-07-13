@@ -2796,6 +2796,7 @@ impl RemoteHostService {
                 .map(|client| client.client_id.clone())
                 .collect::<Vec<_>>();
             config.web.paired_clients.clear();
+            config.web.push.enabled_client_ids.clear();
             config.web.push.subscriptions.clear();
             config
                 .web
@@ -5425,7 +5426,7 @@ mod tests {
     use crate::remote::web::bridge::BrowserOutboundSender;
     use crate::remote::web::push::{
         validate_registration, PushAttentionKind, PushDelivery, PushRegistrationKeys,
-        PushRegistrationRequest, PushSender,
+        PushRegistrationMode, PushRegistrationRequest, PushSender,
     };
     use crate::remote::web::wire::WsOutbound;
     use crate::state::{
@@ -5758,6 +5759,7 @@ mod tests {
             device_class: Some("desktop".to_string()),
         });
         let subscription = validate_registration(PushRegistrationRequest {
+            mode: PushRegistrationMode::Reconcile,
             endpoint: "https://web.push.apple.com/QM-revoke".to_string(),
             keys: PushRegistrationKeys {
                 p256dh: config.web.push.vapid_public_key_base64.clone(),
@@ -5768,7 +5770,8 @@ mod tests {
         config
             .web
             .push
-            .upsert_subscription("web-client-1", subscription, 1);
+            .enable_and_replace_subscription("web-client-1", subscription, 1)
+            .unwrap();
         let service = RemoteHostService::new(config);
         let web_sender = BrowserOutboundSender::detached_for_test(8, 1024 * 1024);
         let tombstone = web_sender.tombstone();
@@ -5826,6 +5829,7 @@ mod tests {
             device_class: Some("desktop".to_string()),
         });
         let subscription = validate_registration(PushRegistrationRequest {
+            mode: PushRegistrationMode::Reconcile,
             endpoint: "https://web.push.apple.com/QM-reset".to_string(),
             keys: PushRegistrationKeys {
                 p256dh: config.web.push.vapid_public_key_base64.clone(),
@@ -5836,7 +5840,8 @@ mod tests {
         config
             .web
             .push
-            .upsert_subscription("web-client-1", subscription, 1);
+            .enable_and_replace_subscription("web-client-1", subscription, 1)
+            .unwrap();
         config.web.activity_log.push(RemoteAccessActivityEvent {
             client_id: "web-client-1".to_string(),
             source: RemoteAccessSource::Browser,
@@ -5916,6 +5921,7 @@ mod tests {
         let saved = service.config();
         assert!(saved.web.paired_clients.is_empty());
         assert!(saved.web.push.subscriptions.is_empty());
+        assert!(!saved.web.push.notifications_enabled("web-client-1"));
         assert_eq!(saved.web.activity_log.len(), 1);
         assert_eq!(
             saved.web.activity_log[0].source,
@@ -6320,6 +6326,7 @@ mod tests {
     ) -> (RemoteHostService, mpsc::Receiver<PushDelivery>) {
         let mut config = RemoteHostConfig::default();
         let subscription = validate_registration(PushRegistrationRequest {
+            mode: PushRegistrationMode::Reconcile,
             endpoint: format!("https://web.push.apple.com/QM-{client_id}"),
             keys: PushRegistrationKeys {
                 p256dh: config.web.push.vapid_public_key_base64.clone(),
@@ -6330,7 +6337,8 @@ mod tests {
         config
             .web
             .push
-            .upsert_subscription(client_id, subscription, 1);
+            .enable_and_replace_subscription(client_id, subscription, 1)
+            .unwrap();
         let service = RemoteHostService::new(config);
         let (sender, receiver) = mpsc::sync_channel(8);
         *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
@@ -6525,6 +6533,7 @@ mod tests {
             ),
         ] {
             let subscription = validate_registration(PushRegistrationRequest {
+                mode: PushRegistrationMode::Reconcile,
                 endpoint: endpoint.to_string(),
                 keys: PushRegistrationKeys {
                     p256dh: config.web.push.vapid_public_key_base64.clone(),
@@ -6535,7 +6544,8 @@ mod tests {
             config
                 .web
                 .push
-                .upsert_subscription(client_id, subscription, 1);
+                .enable_and_replace_subscription(client_id, subscription, 1)
+                .unwrap();
         }
         let service = RemoteHostService::new(config);
         let (sender, receiver) = mpsc::sync_channel(8);
