@@ -64,13 +64,14 @@ export function Composer({
   const [localValue, setLocalValue] = useState(value);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [readingAttachments, setReadingAttachments] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scopeRef = useRef(scopeKey);
   const scopeGenerationRef = useRef(0);
   const attachmentsRef = useRef<PendingAttachment[]>([]);
   const attachmentReadPendingRef = useRef(false);
-  const busy = pending || submitting;
+  const busy = pending || submitting || readingAttachments;
   const canSend = !disabled && !busy && (localValue.trim().length > 0 || attachments.length > 0);
 
   useLayoutEffect(() => {
@@ -82,6 +83,7 @@ export function Composer({
     setLocalValue(value);
     setAttachments([]);
     setSubmitting(false);
+    setReadingAttachments(false);
     setError(null);
   }, [scopeKey, value]);
 
@@ -136,6 +138,7 @@ export function Composer({
     const operationScope = scopeRef.current;
     const operationGeneration = scopeGenerationRef.current;
     attachmentReadPendingRef.current = true;
+    setReadingAttachments(true);
     try {
       const additions: PendingAttachment[] = [];
       for (const file of files) {
@@ -170,6 +173,7 @@ export function Composer({
         scopeGenerationRef.current === operationGeneration
       ) {
         attachmentReadPendingRef.current = false;
+        setReadingAttachments(false);
       }
     }
   };
