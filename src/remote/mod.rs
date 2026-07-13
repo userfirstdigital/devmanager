@@ -2397,8 +2397,7 @@ impl RemoteHostService {
             .read()
             .map(|config| config.web.push.clone())
             .unwrap_or_default();
-        let subscriptions =
-            web::push::eligible_subscriptions(&push_config.subscriptions, &focused_clients);
+        let subscriptions = web::push::eligible_subscriptions(&push_config, &focused_clients);
         if subscriptions.is_empty() {
             return;
         }

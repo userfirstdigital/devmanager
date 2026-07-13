@@ -98,23 +98,9 @@ impl WebPushConfig {
                 }
             }
             self.intent_schema_version = PUSH_INTENT_SCHEMA_VERSION;
-        } else {
-            self.subscriptions.retain(|subscription| {
-                self.enabled_client_ids
-                    .iter()
-                    .any(|enabled| enabled == &subscription.client_id)
-            });
         }
-        let mut unique = Vec::new();
-        self.enabled_client_ids.retain(|client_id| {
-            if unique.contains(client_id) {
-                false
-            } else {
-                unique.push(client_id.clone());
-                true
-            }
-        });
-        self.enabled_client_ids.truncate(MAX_PUSH_SUBSCRIPTIONS);
+        self.enabled_client_ids = canonical_enabled_client_ids(&self.enabled_client_ids);
+        self.subscriptions = canonical_subscriptions(&self.enabled_client_ids, &self.subscriptions);
     }
 
     pub fn notifications_enabled(&self, client_id: &str) -> bool {
@@ -478,6 +464,7 @@ fn push_worker_loop(
                 let current = &config.web.push;
                 if current.vapid_private_key_base64 != delivery.config.vapid_private_key_base64
                     || current.vapid_public_key_base64 != delivery.config.vapid_public_key_base64
+                    || !current.notifications_enabled(&delivery.subscription.client_id)
                 {
                     return None;
                 }
@@ -757,18 +744,52 @@ pub fn build_push_request(
         .map_err(|error| format!("Cannot encrypt push payload: {error}"))
 }
 
-pub fn eligible_subscriptions(
+fn canonical_enabled_client_ids(enabled_client_ids: &[String]) -> Vec<String> {
+    let mut unique = Vec::new();
+    for client_id in enabled_client_ids {
+        if !unique.contains(client_id) {
+            unique.push(client_id.clone());
+            if unique.len() == MAX_PUSH_SUBSCRIPTIONS {
+                break;
+            }
+        }
+    }
+    unique
+}
+
+fn canonical_subscriptions(
+    enabled_client_ids: &[String],
     subscriptions: &[WebPushSubscription],
+) -> Vec<WebPushSubscription> {
+    canonical_enabled_client_ids(enabled_client_ids)
+        .iter()
+        .filter_map(|client_id| {
+            subscriptions
+                .iter()
+                .filter(|subscription| subscription.client_id == *client_id)
+                .max_by(|left, right| {
+                    left.created_at_epoch_ms
+                        .cmp(&right.created_at_epoch_ms)
+                        .then_with(|| left.endpoint.cmp(&right.endpoint))
+                        .then_with(|| left.p256dh.cmp(&right.p256dh))
+                        .then_with(|| left.auth.cmp(&right.auth))
+                })
+                .cloned()
+        })
+        .collect()
+}
+
+pub fn eligible_subscriptions(
+    config: &WebPushConfig,
     visibly_focused_client_ids: &[String],
 ) -> Vec<WebPushSubscription> {
-    subscriptions
-        .iter()
+    canonical_subscriptions(&config.enabled_client_ids, &config.subscriptions)
+        .into_iter()
         .filter(|subscription| {
             !visibly_focused_client_ids
                 .iter()
                 .any(|client_id| client_id == &subscription.client_id)
         })
-        .cloned()
         .collect()
 }
 
@@ -878,6 +899,118 @@ mod tests {
 
         assert!(migrated.notifications_enabled("phone"));
         assert!(!migrated.notifications_enabled("tablet"));
+    }
+
+    #[test]
+    fn legacy_migration_keeps_only_the_newest_endpoint_for_each_client() {
+        let mut legacy = WebPushConfig::default();
+        for (endpoint, created_at_epoch_ms) in [
+            ("https://web.push.apple.com/QM-phone-old", 1),
+            ("https://web.push.apple.com/QM-phone-new", 2),
+        ] {
+            legacy.insert_legacy_subscription_for_test(
+                "phone",
+                validate_registration(PushRegistrationRequest {
+                    endpoint: endpoint.to_string(),
+                    ..valid_registration()
+                })
+                .unwrap(),
+                created_at_epoch_ms,
+            );
+        }
+        let mut serialized = serde_json::to_value(legacy).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("enabledClientIds");
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("intentSchemaVersion");
+        let mut migrated: WebPushConfig = serde_json::from_value(serialized).unwrap();
+
+        migrated.ensure_keys();
+
+        assert!(migrated.notifications_enabled("phone"));
+        assert_eq!(migrated.subscriptions.len(), 1);
+        assert_eq!(
+            migrated.subscriptions[0].endpoint,
+            "https://web.push.apple.com/QM-phone-new"
+        );
+    }
+
+    #[test]
+    fn normalization_refilters_subscriptions_after_truncating_enabled_intent() {
+        let mut config = WebPushConfig::default();
+        config.enabled_client_ids = (0..=MAX_PUSH_SUBSCRIPTIONS)
+            .map(|index| format!("client-{index}"))
+            .collect();
+        config.subscriptions = (0..=MAX_PUSH_SUBSCRIPTIONS)
+            .map(|index| {
+                WebPushSubscription::from_validated(
+                    format!("client-{index}"),
+                    validate_registration(PushRegistrationRequest {
+                        endpoint: format!("https://web.push.apple.com/QM-client-{index}"),
+                        ..valid_registration()
+                    })
+                    .unwrap(),
+                    index as u64,
+                )
+            })
+            .collect();
+
+        config.ensure_keys();
+
+        assert_eq!(config.enabled_client_ids.len(), MAX_PUSH_SUBSCRIPTIONS);
+        assert_eq!(config.subscriptions.len(), MAX_PUSH_SUBSCRIPTIONS);
+        assert!(!config.notifications_enabled(&format!("client-{}", MAX_PUSH_SUBSCRIPTIONS)));
+        assert!(config
+            .subscriptions
+            .iter()
+            .all(|subscription| { config.notifications_enabled(&subscription.client_id) }));
+    }
+
+    #[test]
+    fn normalization_resolves_equal_timestamps_independent_of_saved_order() {
+        let make_config = |endpoints: [&str; 2]| {
+            let mut config = WebPushConfig::default();
+            config.enabled_client_ids = vec!["phone".to_string()];
+            config.subscriptions = endpoints
+                .into_iter()
+                .map(|endpoint| {
+                    WebPushSubscription::from_validated(
+                        "phone",
+                        validate_registration(PushRegistrationRequest {
+                            endpoint: endpoint.to_string(),
+                            ..valid_registration()
+                        })
+                        .unwrap(),
+                        7,
+                    )
+                })
+                .collect();
+            config
+        };
+        let mut forward = make_config([
+            "https://web.push.apple.com/QM-phone-a",
+            "https://web.push.apple.com/QM-phone-z",
+        ]);
+        let mut reversed = make_config([
+            "https://web.push.apple.com/QM-phone-z",
+            "https://web.push.apple.com/QM-phone-a",
+        ]);
+
+        forward.ensure_keys();
+        reversed.ensure_keys();
+
+        assert_eq!(
+            forward.subscriptions[0].endpoint,
+            reversed.subscriptions[0].endpoint
+        );
+        assert_eq!(
+            forward.subscriptions[0].endpoint,
+            "https://web.push.apple.com/QM-phone-z"
+        );
     }
 
     #[test]
@@ -1212,7 +1345,9 @@ mod tests {
 
     #[test]
     fn visible_client_is_suppressed_without_suppressing_other_installs() {
-        let subscriptions = vec![
+        let mut config = WebPushConfig::default();
+        config.enabled_client_ids = vec!["phone".to_string(), "tablet".to_string()];
+        config.subscriptions = vec![
             WebPushSubscription::from_validated(
                 "phone",
                 validate_registration(valid_registration()).unwrap(),
@@ -1229,10 +1364,80 @@ mod tests {
             ),
         ];
 
-        let eligible = eligible_subscriptions(&subscriptions, &["phone".to_string()]);
+        let eligible = eligible_subscriptions(&config, &["phone".to_string()]);
 
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].client_id, "tablet");
+    }
+
+    #[test]
+    fn malformed_disabled_endpoint_is_never_eligible_for_delivery() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let subscription = WebPushSubscription::from_validated(
+            "phone",
+            validate_registration(valid_registration()).unwrap(),
+            1,
+        );
+        {
+            let mut config = service.inner.config.write().unwrap();
+            config.web.push.enabled_client_ids.clear();
+            config.web.push.subscriptions = vec![subscription];
+        }
+        let (sender, receiver) = mpsc::sync_channel(2);
+        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
+
+        service.enqueue_push_attention(
+            None,
+            &StableSessionKey::from_tab("tab-1"),
+            PushAttentionKind::Completed,
+        );
+
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn malformed_duplicate_endpoints_deliver_only_the_newest_registration() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let old = WebPushSubscription::from_validated(
+            "phone",
+            validate_registration(PushRegistrationRequest {
+                endpoint: "https://web.push.apple.com/QM-phone-old".to_string(),
+                ..valid_registration()
+            })
+            .unwrap(),
+            1,
+        );
+        let newest = WebPushSubscription::from_validated(
+            "phone",
+            validate_registration(PushRegistrationRequest {
+                endpoint: "https://web.push.apple.com/QM-phone-new".to_string(),
+                ..valid_registration()
+            })
+            .unwrap(),
+            2,
+        );
+        {
+            let mut config = service.inner.config.write().unwrap();
+            config.web.push.enabled_client_ids = vec!["phone".to_string()];
+            config.web.push.subscriptions = vec![old, newest];
+        }
+        let (sender, receiver) = mpsc::sync_channel(3);
+        *service.inner.web_push_sender.write().unwrap() = Some(PushSender::single(sender));
+
+        service.enqueue_push_attention(
+            None,
+            &StableSessionKey::from_tab("tab-1"),
+            PushAttentionKind::Completed,
+        );
+
+        let delivery = receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("newest subscription should remain eligible");
+        assert_eq!(
+            delivery.subscription.endpoint,
+            "https://web.push.apple.com/QM-phone-new"
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
     #[test]
@@ -1339,6 +1544,68 @@ mod tests {
         assert!(
             called_rx.recv_timeout(Duration::from_millis(250)).is_err(),
             "revoked queued work must never reach the network"
+        );
+        drop(dispatcher);
+    }
+
+    #[test]
+    fn dispatcher_reauthorizes_queued_work_against_current_enabled_intent() {
+        let mut config = RemoteHostConfig::default();
+        let validated = validate_registration(valid_registration()).unwrap();
+        config
+            .web
+            .push
+            .enable_and_replace_subscription("phone", validated, 1)
+            .unwrap();
+        let service = RemoteHostService::new(config);
+        let push = service.config().web.push;
+        let subscription = push.subscriptions[0].clone();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let (called_tx, called_rx) = mpsc::channel();
+        let transport: PushTransport = Arc::new(move |_| {
+            let call = worker_calls.fetch_add(1, Ordering::AcqRel);
+            let _ = called_tx.send(());
+            if call == 0 {
+                worker_entered.wait();
+                worker_release.wait();
+            }
+            Ok(201)
+        });
+        let dispatcher =
+            PushDispatcher::start_with_transport(Arc::downgrade(&service.inner), 2, 1, transport)
+                .unwrap();
+
+        dispatcher
+            .sender()
+            .send(delivery(&push, &subscription, "in-flight"))
+            .unwrap();
+        called_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first delivery reached transport");
+        entered.wait();
+        dispatcher
+            .sender()
+            .send(delivery(&push, &subscription, "queued"))
+            .unwrap();
+        service
+            .inner
+            .config
+            .write()
+            .unwrap()
+            .web
+            .push
+            .enabled_client_ids
+            .clear();
+        release.wait();
+
+        assert!(
+            called_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "queued work for disabled intent must never reach the network"
         );
         drop(dispatcher);
     }
