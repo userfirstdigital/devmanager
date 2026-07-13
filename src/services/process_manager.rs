@@ -114,6 +114,7 @@ pub(crate) struct ProcessManagerInner {
 #[derive(Debug, Clone)]
 struct ClaudeHookSession {
     registration: ClaudeHookRegistration,
+    settings_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -209,34 +210,35 @@ impl ProcessManager {
                         health,
                     },
                 ),
-                ClaudeRegistryEvent::SessionEnded {
-                    stable_session_key: _,
-                    nonce,
-                } => {
-                    let mut sessions = inner
-                        .claude_hook_sessions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    sessions.retain(|_, session| session.registration.nonce != nonce);
-                }
                 ClaudeRegistryEvent::RegistrationDropped {
                     stable_session_key,
                     nonce,
+                    generation,
+                    was_latest,
                 } => {
                     {
                         let mut sessions = inner
                             .claude_hook_sessions
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        sessions.retain(|_, session| session.registration.nonce != nonce);
+                        sessions.retain(|_, session| {
+                            session.registration.nonce != nonce
+                                || session.registration.generation != generation
+                        });
                     }
-                    emit_remote_session_event(
-                        &inner,
-                        RemoteSessionEvent::AdapterHealth {
-                            stable_session_key,
-                            health: SemanticAdapterHealth::Degraded,
-                        },
-                    );
+                    if was_latest
+                        && !inner
+                            .claude_hook_registry
+                            .has_newer_generation(&stable_session_key, generation)
+                    {
+                        emit_remote_session_event(
+                            &inner,
+                            RemoteSessionEvent::AdapterHealth {
+                                stable_session_key,
+                                health: SemanticAdapterHealth::Degraded,
+                            },
+                        );
+                    }
                 }
             }
         })));
@@ -867,7 +869,9 @@ impl ProcessManager {
             Instant::now(),
         );
         let health = overlay.health;
-        if let Some(registration) = overlay.registration {
+        if let (Some(registration), Some(settings_path)) =
+            (overlay.registration, overlay.settings_path)
+        {
             let previous = self
                 .inner
                 .claude_hook_sessions
@@ -875,13 +879,16 @@ impl ProcessManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(
                     session_id.to_string(),
-                    ClaudeHookSession { registration },
+                    ClaudeHookSession {
+                        registration,
+                        settings_path,
+                    },
                 );
             launch.startup_command = overlay.startup_command;
             if let Some(previous) = previous {
                 self.inner
                     .claude_hook_registry
-                    .unregister(&previous.registration.nonce);
+                    .unregister_registration(&previous.registration);
             }
         }
         emit_remote_session_event(
@@ -903,7 +910,8 @@ impl ProcessManager {
         if let Some(registration) = registration {
             self.inner
                 .claude_hook_registry
-                .unregister(&registration.registration.nonce);
+                .unregister_registration(&registration.registration);
+            let _ = std::fs::remove_file(registration.settings_path);
         }
     }
 
@@ -1476,7 +1484,6 @@ impl ProcessManager {
             state.exit = None;
         });
 
-        let cleanup_session_id = existing_session_id.clone();
         if let Err(error) = self.schedule_restart_ai(
             existing_session_id,
             launch,
@@ -1486,9 +1493,6 @@ impl ProcessManager {
         ) {
             self.cleanup_claude_hook_session(&session_id);
             return Err(error);
-        }
-        if let Some(cleanup_session_id) = cleanup_session_id {
-            self.cleanup_claude_hook_session(&cleanup_session_id);
         }
         if activate_tab {
             self.set_active_session(session_id.clone());
@@ -1512,7 +1516,6 @@ impl ProcessManager {
 
         app_state.remove_tab(tab_id);
         if let Some(session_id) = session_id {
-            self.cleanup_claude_hook_session(&session_id);
             self.schedule_close_ai(&session_id, response)?;
         }
         Ok(())
@@ -2292,10 +2295,10 @@ impl ProcessManager {
     }
 
     fn request_session_close(&self, session_id: &str, closed_by_user: bool) -> Result<(), String> {
-        self.cleanup_claude_hook_session(session_id);
         let result = match self.get_session(session_id) {
             Ok(session) => session.close(closed_by_user),
             Err(error) => {
+                self.cleanup_claude_hook_session(session_id);
                 self.note_missing_session_close_request(session_id, closed_by_user);
                 Err(error)
             }
@@ -3905,14 +3908,63 @@ fn emit_tracked_remote_runtime_snapshot(inner: &ProcessManagerInner, session_id:
     emit_remote_runtime_snapshot(inner, session_id);
 }
 
+fn cleanup_claude_hook_session_if_matches(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    expected: &ClaudeHookRegistration,
+) -> bool {
+    let removed = {
+        let mut sessions = inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = sessions.get(session_id).is_some_and(|session| {
+            session.registration.nonce == expected.nonce
+                && session.registration.generation == expected.generation
+                && session.registration.stable_session_key == expected.stable_session_key
+        });
+        matches.then(|| sessions.remove(session_id)).flatten()
+    };
+    let Some(removed) = removed else {
+        return false;
+    };
+    inner
+        .claude_hook_registry
+        .unregister_registration(&removed.registration);
+    let _ = std::fs::remove_file(removed.settings_path);
+    true
+}
+
 fn session_change_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
 ) -> Arc<dyn Fn() + Send + Sync> {
+    let claude_registration = inner
+        .claude_hook_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&session_id)
+        .map(|session| session.registration.clone());
     Arc::new(move || {
         if note_runtime_generation_change(&inner, &session_id) {
             mark_remote_session_dirty(&inner, &session_id);
             emit_remote_runtime_snapshot(&inner, &session_id);
+        }
+        let terminal_exited = inner
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| !session.status.is_live())
+            })
+            .unwrap_or(true);
+        if terminal_exited {
+            if let Some(registration) = claude_registration.as_ref() {
+                cleanup_claude_hook_session_if_matches(&inner, &session_id, registration);
+            }
         }
     })
 }
@@ -4801,20 +4853,20 @@ mod tests {
                 health: crate::remote::presentation::SemanticAdapterHealth::Healthy,
             } if stable_session_key == &crate::remote::presentation::StableSessionKey::from_tab("claude-tab")
         )));
-        let settings_path = manager
+        let (registration, settings_path) = manager
             .inner
             .claude_hook_sessions
             .lock()
             .unwrap()
             .get("claude-session")
-            .map(|session| {
-                temp.join(format!(
-                    "claude-hooks-{}.json",
-                    session.registration.nonce
-                ))
-            })
+            .map(|session| (session.registration.clone(), session.settings_path.clone()))
             .expect("Claude hook session");
         assert!(settings_path.is_file());
+        assert!(!settings_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&registration.nonce));
 
         manager.cleanup_claude_hook_session("claude-session");
 
@@ -4823,7 +4875,7 @@ mod tests {
     }
 
     #[test]
-    fn old_claude_session_end_cannot_remove_replacement_for_the_same_tab() {
+    fn logical_session_end_survives_until_exact_pty_generation_exit() {
         let temp = temp_test_dir("claude-hook-replacement");
         let manager = ProcessManager::new();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -4841,16 +4893,16 @@ mod tests {
             startup_command: "claude".to_string(),
         };
         manager.prepare_claude_launch_for_session(&mut old_launch, "old-session", &temp);
-        let (old_nonce, old_settings_path) = {
+        manager.ensure_runtime_entry("old-session", temp.clone(), SessionDimensions::default());
+        manager.update_session_state("old-session", |state| {
+            state.status = SessionStatus::Running;
+        });
+        let old_exit_notifier =
+            session_change_notifier(manager.inner.clone(), "old-session".to_string());
+        let (old_registration, old_settings_path) = {
             let sessions = manager.inner.claude_hook_sessions.lock().unwrap();
             let old = sessions.get("old-session").unwrap();
-            (
-                old.registration.nonce.clone(),
-                temp.join(format!(
-                    "claude-hooks-{}.json",
-                    old.registration.nonce
-                )),
-            )
+            (old.registration.clone(), old.settings_path.clone())
         };
         let mut replacement = old_launch.clone();
         replacement.startup_command = "claude".to_string();
@@ -4861,28 +4913,25 @@ mod tests {
             .lock()
             .unwrap()
             .get("new-session")
-            .map(|session| {
-                temp.join(format!(
-                    "claude-hooks-{}.json",
-                    session.registration.nonce
-                ))
-            })
+            .map(|session| session.settings_path.clone())
             .unwrap();
         events.lock().unwrap().clear();
 
         let endpoint = manager.claude_hook_endpoint().unwrap();
         let response = ureq::post(&endpoint)
-            .header("x-devmanager-claude-nonce", &old_nonce)
-            .send(br#"{"hook_event_name":"SessionEnd","reason":"replacement"}"#)
+            .header("x-devmanager-claude-nonce", &old_registration.nonce)
+            .send(br#"{"hook_event_name":"SessionEnd","reason":"clear"}"#)
             .unwrap();
 
         assert_eq!(response.status().as_u16(), 204);
-        let sessions = manager.inner.claude_hook_sessions.lock().unwrap();
-        assert!(!sessions.contains_key("old-session"));
-        assert!(sessions.contains_key("new-session"));
-        drop(sessions);
-        assert_eq!(manager.inner.claude_hook_registry.registration_count(), 1);
-        assert!(!old_settings_path.exists());
+        assert!(manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .contains_key("old-session"));
+        assert_eq!(manager.inner.claude_hook_registry.registration_count(), 2);
+        assert!(old_settings_path.exists());
         assert!(new_settings_path.exists());
         assert!(!events.lock().unwrap().iter().any(|event| matches!(
             event,
@@ -4891,7 +4940,137 @@ mod tests {
                 health: crate::remote::presentation::SemanticAdapterHealth::Degraded,
             } if stable_session_key == &crate::remote::presentation::StableSessionKey::from_tab("shared-tab")
         )));
+
+        manager.update_session_state("old-session", |state| {
+            state.status = SessionStatus::Exited;
+        });
+        old_exit_notifier();
+
+        assert!(!manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .contains_key("old-session"));
+        assert_eq!(manager.inner.claude_hook_registry.registration_count(), 1);
+        assert!(!old_settings_path.exists());
+        assert!(new_settings_path.exists());
         manager.cleanup_claude_hook_session("new-session");
+    }
+
+    #[test]
+    fn late_old_pty_exit_cannot_remove_replacement_for_reused_session_id() {
+        let temp = temp_test_dir("claude-hook-reused-session");
+        let manager = ProcessManager::new();
+        let mut launch = AiLaunchSpec {
+            tab_id: "shared-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Claude,
+            cwd: temp.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        };
+        manager.prepare_claude_launch_for_session(&mut launch, "shared-session", &temp);
+        manager.ensure_runtime_entry("shared-session", temp.clone(), SessionDimensions::default());
+        manager.update_session_state("shared-session", |state| {
+            state.status = SessionStatus::Running;
+        });
+        let old_exit_notifier =
+            session_change_notifier(manager.inner.clone(), "shared-session".to_string());
+        let old_generation = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("shared-session")
+            .unwrap()
+            .registration
+            .generation;
+
+        launch.startup_command = "claude".to_string();
+        manager.prepare_claude_launch_for_session(&mut launch, "shared-session", &temp);
+        let (replacement_generation, replacement_path) = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("shared-session")
+            .map(|session| {
+                (
+                    session.registration.generation,
+                    session.settings_path.clone(),
+                )
+            })
+            .unwrap();
+        assert!(replacement_generation > old_generation);
+
+        manager.update_session_state("shared-session", |state| {
+            state.status = SessionStatus::Exited;
+        });
+        old_exit_notifier();
+
+        let sessions = manager.inner.claude_hook_sessions.lock().unwrap();
+        assert_eq!(
+            sessions
+                .get("shared-session")
+                .unwrap()
+                .registration
+                .generation,
+            replacement_generation
+        );
+        drop(sessions);
+        assert!(replacement_path.exists());
+        manager.cleanup_claude_hook_session("shared-session");
+    }
+
+    #[test]
+    fn unexpected_pty_exit_without_session_end_cleans_registration() {
+        let temp = temp_test_dir("claude-hook-unexpected-exit");
+        let manager = ProcessManager::new();
+        let mut launch = AiLaunchSpec {
+            tab_id: "unexpected-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Claude,
+            cwd: temp.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        };
+        manager.prepare_claude_launch_for_session(&mut launch, "unexpected-session", &temp);
+        manager.ensure_runtime_entry(
+            "unexpected-session",
+            temp.clone(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state("unexpected-session", |state| {
+            state.status = SessionStatus::Running;
+        });
+        let exit_notifier =
+            session_change_notifier(manager.inner.clone(), "unexpected-session".to_string());
+        let settings_path = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("unexpected-session")
+            .unwrap()
+            .settings_path
+            .clone();
+
+        manager.update_session_state("unexpected-session", |state| {
+            state.status = SessionStatus::Crashed;
+        });
+        exit_notifier();
+
+        assert_eq!(manager.inner.claude_hook_registry.registration_count(), 0);
+        assert!(!manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .contains_key("unexpected-session"));
+        assert!(!settings_path.exists());
     }
 
     #[test]
@@ -4957,12 +5136,7 @@ mod tests {
             .lock()
             .unwrap()
             .get("failure-session")
-            .map(|session| {
-                temp.join(format!(
-                    "claude-hooks-{}.json",
-                    session.registration.nonce
-                ))
-            })
+            .map(|session| session.settings_path.clone())
             .unwrap();
         launch.shell_program = "definitely-missing-devmanager-shell".to_string();
 

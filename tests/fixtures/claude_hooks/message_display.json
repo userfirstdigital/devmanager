@@ -3,7 +3,10 @@
   "transcript_path": "SECRET_TRANSCRIPT_PATH_SENTINEL",
   "cwd": "SECRET_CWD_SENTINEL",
   "hook_event_name": "MessageDisplay",
+  "turn_id": "turn-1",
   "message_id": "message-1",
-  "message": "I am checking it now.",
+  "index": 0,
+  "final": false,
+  "delta": "I am checking it now.\n",
   "future_chunk_metadata": { "ignored": true }
 }

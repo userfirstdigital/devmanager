@@ -1,8 +1,8 @@
 use devmanager::ai::claude_hooks::{
     is_valid_loopback_relay_url, prepare_claude_launch_overlay, quote_shell_argument,
     run_hook_relay, run_hook_relay_subcommand, ClaudeHookRegistry, ClaudeHookRelayListener,
-    ClaudeReducer, ClaudeReducerLimits, ClaudeRegistryEvent, ClaudeRegistryLimits, ClaudeShellKind,
-    RelayIngestStatus, MAX_CLAUDE_HOOK_BODY_BYTES,
+    ClaudeIngressLimits, ClaudeReducer, ClaudeReducerLimits, ClaudeRegistryEvent,
+    ClaudeRegistryLimits, ClaudeShellKind, RelayIngestStatus, MAX_CLAUDE_HOOK_BODY_BYTES,
 };
 use devmanager::remote::presentation::{
     SemanticAdapterHealth, SemanticEventKind, SemanticRetention, SemanticToolState,
@@ -12,7 +12,8 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn fixture(name: &str) -> &'static [u8] {
@@ -43,6 +44,7 @@ fn reducer() -> ClaudeReducer {
         ClaudeReducerLimits {
             max_tool_records: 8,
             max_deduplication_keys: 32,
+            ..ClaudeReducerLimits::default()
         },
     )
 }
@@ -132,7 +134,7 @@ fn known_lifecycle_fixtures_normalize_without_leaking_provider_metadata() {
     assert!(drafts.iter().any(|draft| matches!(
         &draft.kind,
         SemanticEventKind::AssistantMessage { text, streaming: true, .. }
-            if text == "I am checking it now."
+            if text == "I am checking it now.\n"
     )));
     assert!(drafts.iter().any(|draft| {
         matches!(
@@ -141,7 +143,7 @@ fn known_lifecycle_fixtures_normalize_without_leaking_provider_metadata() {
                 streaming: true,
                 ..
             }
-        ) && draft.retention == SemanticRetention::Verbose
+        ) && draft.retention == SemanticRetention::Canonical
     }));
     assert!(drafts.iter().any(|draft| matches!(
         &draft.kind,
@@ -176,12 +178,159 @@ fn known_lifecycle_fixtures_normalize_without_leaking_provider_metadata() {
 }
 
 #[test]
+fn message_display_accumulates_by_index_and_finalizes_with_stable_identity() {
+    let mut reducer = reducer();
+    let event = |index: u64, final_chunk: bool, delta: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "MessageDisplay",
+            "turn_id": "turn-1",
+            "message_id": "message-1",
+            "index": index,
+            "final": final_chunk,
+            "delta": delta,
+        }))
+        .unwrap()
+    };
+
+    let first = reducer.apply_json(&event(0, false, "First line.\n"), 10);
+    let duplicate_index = reducer.apply_json(&event(0, false, "SECRET_REPLAY"), 11);
+    let final_before_gap = reducer.apply_json(&event(2, true, "Done."), 12);
+    let completed = reducer.apply_json(&event(1, false, "Second line.\n"), 13);
+
+    assert_eq!(first.drafts.len(), 1);
+    assert!(duplicate_index.drafts.is_empty());
+    assert!(final_before_gap.drafts.is_empty());
+    assert_eq!(completed.drafts.len(), 1);
+    let SemanticEventKind::AssistantMessage {
+        message_id: first_id,
+        text: first_text,
+        streaming: first_streaming,
+    } = &first.drafts[0].kind
+    else {
+        panic!("expected first assistant projection");
+    };
+    let SemanticEventKind::AssistantMessage {
+        message_id: completed_id,
+        text: completed_text,
+        streaming: completed_streaming,
+    } = &completed.drafts[0].kind
+    else {
+        panic!("expected completed assistant projection");
+    };
+    assert_eq!(first_id, "message-1");
+    assert_eq!(completed_id, first_id);
+    assert_eq!(first_text, "First line.\n");
+    assert_eq!(completed_text, "First line.\nSecond line.\nDone.");
+    assert!(*first_streaming);
+    assert!(!completed_streaming);
+    assert_eq!(
+        first.drafts[0].deduplication_key,
+        completed.drafts[0].deduplication_key
+    );
+    assert_eq!(completed.drafts[0].retention, SemanticRetention::Canonical);
+    assert!(!completed_text.contains("SECRET_REPLAY"));
+}
+
+#[test]
+fn message_display_empty_final_chunk_finalizes_without_duplicate_stop_message() {
+    let mut reducer = reducer();
+    let first = serde_json::json!({
+        "hook_event_name": "MessageDisplay",
+        "turn_id": "turn-1",
+        "message_id": "message-1",
+        "index": 0,
+        "final": false,
+        "delta": "Complete answer.",
+    });
+    let final_chunk = serde_json::json!({
+        "hook_event_name": "MessageDisplay",
+        "turn_id": "turn-1",
+        "message_id": "message-1",
+        "index": 1,
+        "final": true,
+        "delta": "",
+    });
+    reducer.apply_json(&serde_json::to_vec(&first).unwrap(), 20);
+    let finalized = reducer.apply_json(&serde_json::to_vec(&final_chunk).unwrap(), 21);
+    let stopped = reducer.apply_json(fixture("stop"), 22);
+
+    assert!(matches!(
+        &finalized.drafts[0].kind,
+        SemanticEventKind::AssistantMessage {
+            message_id,
+            text,
+            streaming: false,
+        } if message_id == "message-1" && text == "Complete answer."
+    ));
+    assert_eq!(stopped.drafts.len(), 1);
+    assert!(matches!(
+        &stopped.drafts[0].kind,
+        SemanticEventKind::Status { state, detail: None } if state == "ready"
+    ));
+}
+
+#[test]
+fn message_display_accumulator_is_bounded_by_records_batches_and_bytes() {
+    let mut reducer = ClaudeReducer::new(
+        StableSessionKey::from_tab("claude-tab"),
+        ClaudeReducerLimits {
+            max_message_records: 2,
+            max_message_batches_per_record: 2,
+            max_message_accumulated_bytes: 12,
+            ..ClaudeReducerLimits::default()
+        },
+    );
+    for message in 0..5 {
+        for index in 0..3 {
+            let body = serde_json::json!({
+                "hook_event_name": "MessageDisplay",
+                "turn_id": "turn-1",
+                "message_id": format!("message-{message}"),
+                "index": index,
+                "final": index == 2,
+                "delta": "1234567890",
+            });
+            reducer.apply_json(
+                &serde_json::to_vec(&body).unwrap(),
+                30 + message * 3 + index,
+            );
+        }
+    }
+
+    assert!(reducer.message_record_count() <= 2);
+    assert!(reducer.message_batch_count() <= 4);
+    assert!(reducer.message_accumulated_bytes() <= 24);
+}
+
+#[test]
+fn stop_failure_only_projects_documented_safe_error_categories() {
+    let mut reducer = reducer();
+    let body = serde_json::json!({
+        "hook_event_name": "StopFailure",
+        "error": "SECRET_RAW_FAILURE",
+        "error_details": "SECRET_ERROR_DETAILS",
+        "last_assistant_message": "SECRET_LAST_MESSAGE",
+    });
+
+    let outcome = reducer.apply_json(&serde_json::to_vec(&body).unwrap(), 40);
+
+    assert_eq!(outcome.drafts.len(), 1);
+    assert!(matches!(
+        &outcome.drafts[0].kind,
+        SemanticEventKind::Error { message } if message == "Claude turn failed: unknown"
+    ));
+    let rendered = format!("{:?}", outcome.drafts);
+    assert!(!rendered.contains("SECRET"));
+}
+
+#[test]
 fn malformed_and_unknown_hooks_are_fail_open_and_bounded() {
     let mut reducer = ClaudeReducer::new(
         StableSessionKey::from_tab("claude-tab"),
         ClaudeReducerLimits {
             max_tool_records: 2,
             max_deduplication_keys: 3,
+            ..ClaudeReducerLimits::default()
         },
     );
 
@@ -208,8 +357,11 @@ fn huge_unicode_provider_text_stays_below_the_semantic_event_limit() {
     let message = "🦀".repeat(20_000);
     let body = serde_json::json!({
         "hook_event_name": "MessageDisplay",
+        "turn_id": "large-turn",
         "message_id": "large-message",
-        "message": message,
+        "index": 0,
+        "final": true,
+        "delta": message,
     });
 
     let outcome = reducer.apply_json(&serde_json::to_vec(&body).unwrap(), 1);
@@ -229,8 +381,11 @@ fn heavily_escaped_provider_text_stays_below_the_semantic_event_limit() {
     let mut reducer = reducer();
     let body = serde_json::json!({
         "hook_event_name": "MessageDisplay",
+        "turn_id": "escaped-turn",
         "message_id": "escaped-message",
-        "message": "\0".repeat(20_000),
+        "index": 0,
+        "final": true,
+        "delta": "\0".repeat(20_000),
     });
 
     let outcome = reducer.apply_json(&serde_json::to_vec(&body).unwrap(), 1);
@@ -377,6 +532,12 @@ fn recognized_commands_generate_exec_form_hooks_and_cleanup_with_registration() 
     let settings_path = overlay.settings_path.as_ref().expect("settings path");
     assert!(settings_path.is_file());
     assert!(overlay.startup_command.contains("--settings '"));
+    assert!(!overlay.startup_command.contains(&registration.nonce));
+    assert!(!settings_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains(&registration.nonce));
 
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(settings_path).unwrap()).unwrap();
@@ -456,6 +617,47 @@ fn registry_capacity_eviction_removes_ephemeral_settings_and_reports_the_nonce()
     assert!(events.lock().unwrap().iter().any(|event| matches!(
         event,
         ClaudeRegistryEvent::RegistrationDropped { nonce, .. } if nonce == &first.nonce
+    )));
+}
+
+#[test]
+fn superseded_registration_is_acknowledged_but_cannot_publish_to_replacement_key() {
+    let registry = Arc::new(ClaudeHookRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    registry.set_event_handler(Some(Arc::new(move |event| {
+        observed.lock().unwrap().push(event);
+    })));
+    let listener = ClaudeHookRelayListener::start(registry.clone()).expect("listener");
+    let stable_key = StableSessionKey::from_tab("shared-tab");
+    let old = registry
+        .register_at(stable_key.clone(), Instant::now())
+        .unwrap();
+    let replacement = registry.register_at(stable_key, Instant::now()).unwrap();
+
+    assert!(replacement.generation > old.generation);
+    let old_response = ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &old.nonce)
+        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"old event"}"#)
+        .unwrap();
+    let replacement_response = ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &replacement.nonce)
+        .send(br#"{"hook_event_name":"UserPromptSubmit","prompt":"replacement event"}"#)
+        .unwrap();
+
+    assert_eq!(old_response.status().as_u16(), 204);
+    assert_eq!(replacement_response.status().as_u16(), 204);
+    wait_for(Duration::from_secs(2), || {
+        events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ClaudeRegistryEvent::Semantic(draft)
+                if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "replacement event")
+        ))
+    });
+    assert!(!events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        ClaudeRegistryEvent::Semantic(draft)
+            if matches!(&draft.kind, SemanticEventKind::UserMessage { text } if text == "old event")
     )));
 }
 
@@ -670,8 +872,231 @@ fn loopback_listener_authenticates_caps_and_dispatches_after_unlock() {
         .send(fixture("session_end"));
     assert_eq!(ended.unwrap().status().as_u16(), 204);
     wait_for(Duration::from_secs(2), || {
-        registry.registration_count() == 0
+        events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ClaudeRegistryEvent::Semantic(draft)
+                if matches!(&draft.kind, SemanticEventKind::Status { state, .. } if state == "ended")
+        ))
     });
+    assert_eq!(registry.registration_count(), 1);
+
+    let resumed = ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .send(br#"{"hook_event_name":"SessionStart","source":"clear"}"#);
+    assert_eq!(resumed.unwrap().status().as_u16(), 204);
+    wait_for(Duration::from_secs(2), || {
+        events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ClaudeRegistryEvent::Semantic(draft)
+                if matches!(&draft.kind, SemanticEventKind::Status { state, detail } if state == "started" && detail.as_deref() == Some("clear"))
+        ))
+    });
+    assert_eq!(registry.registration_count(), 1);
+    registry.unregister(&registration.nonce);
+}
+
+#[test]
+fn saturated_ingress_sheds_message_display_before_critical_events() {
+    let registry = Arc::new(ClaudeHookRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::<ClaudeRegistryEvent>::new()));
+    let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let block_first = Arc::new(AtomicBool::new(true));
+    let observed = events.clone();
+    let callback_gate = gate.clone();
+    let callback_block_first = block_first.clone();
+    registry.set_event_handler(Some(Arc::new(move |event| {
+        if callback_block_first.swap(false, Ordering::SeqCst) {
+            let (lock, condition) = &*callback_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            condition.notify_all();
+            while !state.1 {
+                state = condition.wait(state).unwrap();
+            }
+        }
+        observed.lock().unwrap().push(event);
+    })));
+    let listener = ClaudeHookRelayListener::start_with_ingress_limits(
+        registry.clone(),
+        ClaudeIngressLimits {
+            max_critical_events: 4,
+            max_optional_events: 2,
+            max_critical_bytes: 16 * 1024,
+            max_optional_bytes: 16 * 1024,
+            ..ClaudeIngressLimits::default()
+        },
+    )
+    .unwrap();
+    let registration = registry
+        .register_at(StableSessionKey::from_tab("priority-tab"), Instant::now())
+        .unwrap();
+
+    assert_eq!(
+        ureq::post(listener.endpoint())
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(fixture("prompt"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+    {
+        let (lock, condition) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while !state.0 {
+            state = condition.wait(state).unwrap();
+        }
+    }
+
+    for index in 0..8 {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "MessageDisplay",
+            "turn_id": "turn-1",
+            "message_id": format!("optional-{index}"),
+            "index": 0,
+            "final": true,
+            "delta": format!("optional {index}"),
+        }))
+        .unwrap();
+        assert_eq!(
+            ureq::post(listener.endpoint())
+                .header("x-devmanager-claude-nonce", &registration.nonce)
+                .send(body)
+                .unwrap()
+                .status()
+                .as_u16(),
+            204
+        );
+    }
+    assert_eq!(
+        ureq::post(listener.endpoint())
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(fixture("permission"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+
+    {
+        let (lock, condition) = &*gate;
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        condition.notify_all();
+    }
+    wait_for(Duration::from_secs(2), || {
+        let events = events.lock().unwrap();
+        let questions = events
+            .iter()
+            .filter(|event| matches!(event, ClaudeRegistryEvent::Semantic(draft) if matches!(draft.kind, SemanticEventKind::Question { .. })))
+            .count();
+        let assistants = events
+            .iter()
+            .filter(|event| matches!(event, ClaudeRegistryEvent::Semantic(draft) if matches!(draft.kind, SemanticEventKind::AssistantMessage { .. })))
+            .count();
+        questions == 1 && assistants == 2
+    });
+    let events = events.lock().unwrap();
+    let question_position = events
+        .iter()
+        .position(|event| matches!(event, ClaudeRegistryEvent::Semantic(draft) if matches!(draft.kind, SemanticEventKind::Question { .. })))
+        .unwrap();
+    let first_assistant_position = events
+        .iter()
+        .position(|event| matches!(event, ClaudeRegistryEvent::Semantic(draft) if matches!(draft.kind, SemanticEventKind::AssistantMessage { .. })))
+        .unwrap();
+    assert!(question_position < first_assistant_position);
+}
+
+#[test]
+fn critical_ingress_overflow_is_fail_open_and_degrades_exact_adapter() {
+    let registry = Arc::new(ClaudeHookRegistry::default());
+    let events = Arc::new(Mutex::new(Vec::<ClaudeRegistryEvent>::new()));
+    let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let block_first = Arc::new(AtomicBool::new(true));
+    let observed = events.clone();
+    let callback_gate = gate.clone();
+    registry.set_event_handler(Some(Arc::new(move |event| {
+        if block_first.swap(false, Ordering::SeqCst) {
+            let (lock, condition) = &*callback_gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            condition.notify_all();
+            while !state.1 {
+                state = condition.wait(state).unwrap();
+            }
+        }
+        observed.lock().unwrap().push(event);
+    })));
+    let listener = ClaudeHookRelayListener::start_with_ingress_limits(
+        registry.clone(),
+        ClaudeIngressLimits {
+            max_critical_events: 1,
+            max_optional_events: 1,
+            max_critical_bytes: 4 * 1024,
+            max_optional_bytes: 4 * 1024,
+            ..ClaudeIngressLimits::default()
+        },
+    )
+    .unwrap();
+    let stable_key = StableSessionKey::from_tab("overflow-tab");
+    let registration = registry
+        .register_at(stable_key.clone(), Instant::now())
+        .unwrap();
+
+    ureq::post(listener.endpoint())
+        .header("x-devmanager-claude-nonce", &registration.nonce)
+        .send(fixture("prompt"))
+        .unwrap();
+    {
+        let (lock, condition) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while !state.0 {
+            state = condition.wait(state).unwrap();
+        }
+    }
+    assert_eq!(
+        ureq::post(listener.endpoint())
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(fixture("permission"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+    assert_eq!(
+        ureq::post(listener.endpoint())
+            .header("x-devmanager-claude-nonce", &registration.nonce)
+            .send(fixture("notification"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204,
+        "critical overflow must remain fail-open"
+    );
+    {
+        let (lock, condition) = &*gate;
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        condition.notify_all();
+    }
+
+    wait_for(Duration::from_secs(2), || {
+        events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                ClaudeRegistryEvent::AdapterHealth {
+                    stable_session_key,
+                    health: SemanticAdapterHealth::Degraded,
+                } if stable_session_key == &stable_key
+            )
+        })
+    });
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        ClaudeRegistryEvent::Semantic(draft)
+            if matches!(draft.kind, SemanticEventKind::Question { .. })
+    )));
 }
 
 fn wait_for(timeout: Duration, predicate: impl Fn() -> bool) {

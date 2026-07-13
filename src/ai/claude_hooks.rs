@@ -8,14 +8,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,11 +23,15 @@ pub const MAX_CLAUDE_HOOK_BODY_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_TEXT_BYTES: usize = 48 * 1024;
 const MAX_CLAUDE_SETTINGS_BYTES: usize = 1024 * 1024;
 const CLAUDE_NONCE_BYTES: usize = 32;
+const CLAUDE_SETTINGS_TOKEN_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeReducerLimits {
     pub max_tool_records: usize,
     pub max_deduplication_keys: usize,
+    pub max_message_records: usize,
+    pub max_message_batches_per_record: usize,
+    pub max_message_accumulated_bytes: usize,
 }
 
 impl Default for ClaudeReducerLimits {
@@ -35,6 +39,9 @@ impl Default for ClaudeReducerLimits {
         Self {
             max_tool_records: 512,
             max_deduplication_keys: 2_048,
+            max_message_records: 128,
+            max_message_batches_per_record: 512,
+            max_message_accumulated_bytes: MAX_PROVIDER_TEXT_BYTES,
         }
     }
 }
@@ -49,6 +56,29 @@ pub struct ClaudeToolSnapshot {
 #[derive(Debug, Clone)]
 struct ToolRecord {
     snapshot: ClaudeToolSnapshot,
+    touched: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MessageKey {
+    turn_id: String,
+    message_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct MessageBatch {
+    delta: String,
+    final_chunk: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MessageRecord {
+    batches: BTreeMap<u64, MessageBatch>,
+    next_index: u64,
+    text: String,
+    finalized: bool,
+    truncated: bool,
+    accumulated_bytes: usize,
     touched: u64,
 }
 
@@ -79,6 +109,8 @@ pub struct ClaudeReducer {
     limits: ClaudeReducerLimits,
     tools: HashMap<String, ToolRecord>,
     tool_clock: u64,
+    messages: HashMap<MessageKey, MessageRecord>,
+    message_clock: u64,
     deduplication_keys: HashSet<u64>,
     deduplication_order: VecDeque<u64>,
 }
@@ -90,6 +122,8 @@ impl ClaudeReducer {
             limits,
             tools: HashMap::new(),
             tool_clock: 0,
+            messages: HashMap::new(),
+            message_clock: 0,
             deduplication_keys: HashSet::new(),
             deduplication_order: VecDeque::new(),
         }
@@ -107,6 +141,24 @@ impl ClaudeReducer {
 
     pub fn deduplication_key_count(&self) -> usize {
         self.deduplication_keys.len()
+    }
+
+    pub fn message_record_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn message_batch_count(&self) -> usize {
+        self.messages
+            .values()
+            .map(|record| record.batches.len())
+            .sum()
+    }
+
+    pub fn message_accumulated_bytes(&self) -> usize {
+        self.messages
+            .values()
+            .map(|record| record.accumulated_bytes)
+            .sum()
     }
 
     pub fn apply_json(&mut self, body: &[u8], occurred_at_epoch_ms: u64) -> ClaudeReduceOutcome {
@@ -137,27 +189,7 @@ impl ClaudeReducer {
                 SemanticRetention::Canonical,
                 None,
             ),
-            "MessageDisplay" => {
-                let text = value
-                    .get("message")
-                    .or_else(|| value.get("text"))
-                    .or_else(|| value.get("content"))
-                    .and_then(Value::as_str);
-                self.text_event(
-                    occurred_at_epoch_ms,
-                    text,
-                    |text| SemanticEventKind::AssistantMessage {
-                        message_id: public_id(&value, "message_id", "message", fingerprint),
-                        text,
-                        streaming: true,
-                    },
-                    SemanticRetention::Verbose,
-                    value
-                        .get("message_id")
-                        .and_then(Value::as_str)
-                        .map(|id| format!("claude-message:{id}")),
-                )
-            }
+            "MessageDisplay" => self.message_display(&value, occurred_at_epoch_ms),
             "PreToolUse" => self.tool_event(
                 &value,
                 occurred_at_epoch_ms,
@@ -351,6 +383,119 @@ impl ClaudeReducer {
         }
     }
 
+    fn message_display(&mut self, value: &Value, occurred_at_epoch_ms: u64) -> ClaudeReduceOutcome {
+        let Some(turn_id) = value
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(bounded_identifier)
+            .filter(|id| !id.is_empty())
+        else {
+            return ClaudeReduceOutcome::malformed();
+        };
+        let Some(message_id) = value
+            .get("message_id")
+            .and_then(Value::as_str)
+            .map(bounded_identifier)
+            .filter(|id| !id.is_empty())
+        else {
+            return ClaudeReduceOutcome::malformed();
+        };
+        let Some(index) = value.get("index").and_then(Value::as_u64) else {
+            return ClaudeReduceOutcome::malformed();
+        };
+        let Some(final_chunk) = value.get("final").and_then(Value::as_bool) else {
+            return ClaudeReduceOutcome::malformed();
+        };
+        let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            return ClaudeReduceOutcome::malformed();
+        };
+        if self.limits.max_message_records == 0 || self.limits.max_message_batches_per_record == 0 {
+            return ClaudeReduceOutcome::ignored();
+        }
+
+        let key = MessageKey {
+            turn_id,
+            message_id,
+        };
+        self.message_clock = self.message_clock.wrapping_add(1);
+        if !self.messages.contains_key(&key) {
+            self.evict_oldest_message_if_full();
+            self.messages.insert(
+                key.clone(),
+                MessageRecord {
+                    batches: BTreeMap::new(),
+                    next_index: 0,
+                    text: String::new(),
+                    finalized: false,
+                    truncated: false,
+                    accumulated_bytes: 0,
+                    touched: self.message_clock,
+                },
+            );
+        }
+
+        let record = self.messages.get_mut(&key).expect("message inserted");
+        record.touched = self.message_clock;
+        if record.finalized
+            || record.batches.contains_key(&index)
+            || record.batches.len() >= self.limits.max_message_batches_per_record
+        {
+            return ClaudeReduceOutcome::ignored();
+        }
+
+        let remaining = self
+            .limits
+            .max_message_accumulated_bytes
+            .saturating_sub(record.accumulated_bytes);
+        let bounded_delta = utf8_prefix_by_bytes(delta, remaining);
+        if bounded_delta.len() < delta.len() {
+            record.truncated = true;
+        }
+        record.accumulated_bytes = record.accumulated_bytes.saturating_add(bounded_delta.len());
+        record.batches.insert(
+            index,
+            MessageBatch {
+                delta: bounded_delta.to_string(),
+                final_chunk,
+            },
+        );
+
+        let mut advanced = false;
+        while let Some(batch) = record.batches.get_mut(&record.next_index) {
+            let delta = std::mem::take(&mut batch.delta);
+            record.text.push_str(&delta);
+            advanced = true;
+            record.next_index = record.next_index.saturating_add(1);
+            if batch.final_chunk {
+                record.finalized = true;
+                break;
+            }
+        }
+        if !advanced || record.text.is_empty() {
+            return ClaudeReduceOutcome::ignored();
+        }
+
+        let text = if record.truncated {
+            format!("{}\n[truncated by DevManager]", record.text)
+        } else {
+            record.text.clone()
+        };
+        let streaming = !record.finalized;
+        ClaudeReduceOutcome {
+            drafts: vec![self.draft(
+                occurred_at_epoch_ms,
+                SemanticEventKind::AssistantMessage {
+                    message_id: key.message_id.clone(),
+                    text: bounded_text(&text),
+                    streaming,
+                },
+                SemanticRetention::Canonical,
+                Some(format!("claude-message:{}:{}", key.turn_id, key.message_id)),
+            )],
+            degraded: false,
+        }
+    }
+
     fn permission_question(
         &self,
         value: &Value,
@@ -465,38 +610,20 @@ impl ClaudeReducer {
 
     fn stop(
         &self,
-        value: &Value,
+        _value: &Value,
         occurred_at_epoch_ms: u64,
         fingerprint: u64,
     ) -> ClaudeReduceOutcome {
-        let mut drafts = Vec::new();
-        if let Some(message) = value
-            .get("last_assistant_message")
-            .and_then(Value::as_str)
-            .filter(|message| !message.is_empty())
-        {
-            drafts.push(self.draft(
+        ClaudeReduceOutcome {
+            drafts: vec![self.draft(
                 occurred_at_epoch_ms,
-                SemanticEventKind::AssistantMessage {
-                    message_id: format!("stop-{fingerprint:x}"),
-                    text: bounded_text(message),
-                    streaming: false,
+                SemanticEventKind::Status {
+                    state: "ready".to_string(),
+                    detail: None,
                 },
                 SemanticRetention::Canonical,
-                Some(format!("claude-stop-message:{fingerprint}")),
-            ));
-        }
-        drafts.push(self.draft(
-            occurred_at_epoch_ms,
-            SemanticEventKind::Status {
-                state: "ready".to_string(),
-                detail: None,
-            },
-            SemanticRetention::Canonical,
-            Some(format!("claude-stop:{fingerprint}")),
-        ));
-        ClaudeReduceOutcome {
-            drafts,
+                Some(format!("claude-stop:{fingerprint}")),
+            )],
             degraded: false,
         }
     }
@@ -505,11 +632,12 @@ impl ClaudeReducer {
         let Some(error) = value.get("error").and_then(Value::as_str) else {
             return ClaudeReduceOutcome::malformed();
         };
+        let error = safe_stop_failure_category(error);
         ClaudeReduceOutcome {
             drafts: vec![self.draft(
                 occurred_at_epoch_ms,
                 SemanticEventKind::Error {
-                    message: format!("Claude turn failed: {}", bounded_identifier(error)),
+                    message: format!("Claude turn failed: {error}"),
                 },
                 SemanticRetention::Canonical,
                 None,
@@ -567,6 +695,20 @@ impl ClaudeReducer {
         }
     }
 
+    fn evict_oldest_message_if_full(&mut self) {
+        while self.messages.len() >= self.limits.max_message_records {
+            let Some(oldest) = self
+                .messages
+                .iter()
+                .min_by_key(|(_, record)| record.touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.messages.remove(&oldest);
+        }
+    }
+
     fn remember_fingerprint(&mut self, fingerprint: u64) {
         let limit = self.limits.max_deduplication_keys;
         if limit == 0 {
@@ -581,6 +723,33 @@ impl ClaudeReducer {
             }
         }
     }
+}
+
+fn safe_stop_failure_category(error: &str) -> &'static str {
+    match error {
+        "rate_limit" => "rate_limit",
+        "overloaded" => "overloaded",
+        "authentication_failed" => "authentication_failed",
+        "oauth_org_not_allowed" => "oauth_org_not_allowed",
+        "billing_error" => "billing_error",
+        "invalid_request" => "invalid_request",
+        "model_not_found" => "model_not_found",
+        "server_error" => "server_error",
+        "max_output_tokens" => "max_output_tokens",
+        "unknown" => "unknown",
+        _ => "unknown",
+    }
+}
+
+fn utf8_prefix_by_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn should_advance_tool_state(current: SemanticToolState, requested: SemanticToolState) -> bool {
@@ -660,18 +829,23 @@ impl Default for ClaudeRegistryLimits {
 pub struct ClaudeHookRegistration {
     pub nonce: String,
     pub stable_session_key: StableSessionKey,
+    pub generation: u64,
 }
 
 struct RegisteredClaudeSession {
     stable_session_key: StableSessionKey,
+    generation: u64,
     expires_at: Instant,
     reducer: ClaudeReducer,
+    ingress_degraded: bool,
     cleanup_paths: Vec<PathBuf>,
 }
 
 struct ClaudeRegistryState {
     registrations: HashMap<String, RegisteredClaudeSession>,
     order: VecDeque<String>,
+    next_generation: u64,
+    latest_generation_by_key: HashMap<StableSessionKey, u64>,
 }
 
 pub struct ClaudeHookRegistry {
@@ -689,19 +863,19 @@ pub enum ClaudeRegistryEvent {
         stable_session_key: StableSessionKey,
         health: SemanticAdapterHealth,
     },
-    SessionEnded {
-        stable_session_key: StableSessionKey,
-        nonce: String,
-    },
     RegistrationDropped {
         stable_session_key: StableSessionKey,
         nonce: String,
+        generation: u64,
+        was_latest: bool,
     },
 }
 
 struct RemovedClaudeRegistration {
     nonce: String,
     stable_session_key: StableSessionKey,
+    generation: u64,
+    was_latest: bool,
     cleanup_paths: Vec<PathBuf>,
 }
 
@@ -718,6 +892,8 @@ impl ClaudeHookRegistry {
             state: Mutex::new(ClaudeRegistryState {
                 registrations: HashMap::new(),
                 order: VecDeque::new(),
+                next_generation: 0,
+                latest_generation_by_key: HashMap::new(),
             }),
             event_handler: RwLock::new(None),
         }
@@ -737,8 +913,8 @@ impl ClaudeHookRegistry {
             let Some(oldest) = state.order.pop_front() else {
                 break;
             };
-            if let Some(registration) = state.registrations.remove(&oldest) {
-                removed.push(removed_registration(oldest, registration));
+            if let Some(registration) = remove_registration(&mut state, &oldest) {
+                removed.push(registration);
             }
         }
 
@@ -755,19 +931,31 @@ impl ClaudeHookRegistry {
                 break candidate;
             }
         };
+        let Some(generation) = state.next_generation.checked_add(1) else {
+            drop(state);
+            self.finish_dropped_registrations(removed);
+            return Err("Claude hook registration generation exhausted".to_string());
+        };
+        state.next_generation = generation;
+        state
+            .latest_generation_by_key
+            .insert(stable_session_key.clone(), generation);
         state.order.push_back(nonce.clone());
         state.registrations.insert(
             nonce.clone(),
             RegisteredClaudeSession {
                 stable_session_key: stable_session_key.clone(),
+                generation,
                 expires_at: now + self.limits.registration_ttl,
                 reducer: ClaudeReducer::new(stable_session_key.clone(), self.limits.reducer),
+                ingress_degraded: false,
                 cleanup_paths: Vec::new(),
             },
         );
         let registration = ClaudeHookRegistration {
             nonce,
             stable_session_key,
+            generation,
         };
         drop(state);
         self.finish_dropped_registrations(removed);
@@ -794,14 +982,28 @@ impl ClaudeHookRegistry {
         now: Instant,
         occurred_at_epoch_ms: u64,
     ) -> CapturedClaudeIngest {
+        let context = match self.admit_at(peer, nonce, body.len(), now) {
+            Ok(context) => context,
+            Err(status) => return CapturedClaudeIngest::without_session(status),
+        };
+        self.reduce_admitted(context, body, occurred_at_epoch_ms)
+    }
+
+    fn admit_at(
+        &self,
+        peer: SocketAddr,
+        nonce: &str,
+        body_len: usize,
+        now: Instant,
+    ) -> Result<ClaudeRegistrationContext, RelayIngestStatus> {
         if !peer.ip().is_loopback() {
-            return CapturedClaudeIngest::without_session(RelayIngestStatus::Rejected);
+            return Err(RelayIngestStatus::Rejected);
         }
-        if body.len() > self.limits.max_body_bytes {
-            return CapturedClaudeIngest::without_session(RelayIngestStatus::BodyTooLarge);
+        if body_len > self.limits.max_body_bytes {
+            return Err(RelayIngestStatus::BodyTooLarge);
         }
         let Ok(mut state) = self.state.lock() else {
-            return CapturedClaudeIngest::without_session(RelayIngestStatus::Rejected);
+            return Err(RelayIngestStatus::Rejected);
         };
         if state
             .registrations
@@ -809,49 +1011,92 @@ impl ClaudeHookRegistry {
             .is_some_and(|registration| now > registration.expires_at)
         {
             state.order.retain(|candidate| candidate != nonce);
-            let mut removed = state
-                .registrations
-                .remove(nonce)
-                .map(|registration| vec![removed_registration(nonce.to_string(), registration)])
+            let mut removed = remove_registration(&mut state, nonce)
+                .map(|registration| vec![registration])
                 .unwrap_or_default();
             removed.extend(remove_expired(&mut state, now));
             drop(state);
             self.finish_dropped_registrations(removed);
-            return CapturedClaudeIngest::without_session(RelayIngestStatus::Expired);
+            return Err(RelayIngestStatus::Expired);
         }
-        let Some(_) = state.registrations.get(nonce) else {
+        let Some(registration) = state.registrations.get(nonce) else {
             let removed = remove_expired(&mut state, now);
             drop(state);
             self.finish_dropped_registrations(removed);
-            return CapturedClaudeIngest::without_session(RelayIngestStatus::Rejected);
+            return Err(RelayIngestStatus::Rejected);
+        };
+        let context = ClaudeRegistrationContext {
+            stable_session_key: registration.stable_session_key.clone(),
+            nonce: nonce.to_string(),
+            generation: registration.generation,
         };
         let registration = state
             .registrations
             .get_mut(nonce)
             .expect("registration checked above");
-        let stable_session_key = registration.stable_session_key.clone();
         registration.expires_at = now + self.limits.registration_ttl;
-        let outcome = registration.reducer.apply_json(body, occurred_at_epoch_ms);
-        let session_ended = outcome.drafts.iter().any(|draft| {
-            matches!(&draft.kind, SemanticEventKind::Status { state, .. } if state == "ended")
-        });
-        let cleanup_paths = if session_ended {
-            state.order.retain(|candidate| candidate != nonce);
-            state
-                .registrations
-                .remove(nonce)
-                .map(|registration| registration.cleanup_paths)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        Ok(context)
+    }
+
+    fn admit_ingress_at(
+        &self,
+        peer: SocketAddr,
+        nonce: &str,
+        body_len: usize,
+        now: Instant,
+    ) -> Result<ClaudeRegistrationContext, RelayIngestStatus> {
+        if !peer.ip().is_loopback() {
+            return Err(RelayIngestStatus::Rejected);
+        }
+        if body_len > self.limits.max_body_bytes {
+            return Err(RelayIngestStatus::BodyTooLarge);
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return Err(RelayIngestStatus::Rejected);
         };
-        drop(state);
-        remove_cleanup_paths(cleanup_paths);
+        let Some(registration) = state.registrations.get(nonce) else {
+            return Err(RelayIngestStatus::Rejected);
+        };
+        if now > registration.expires_at {
+            return Err(RelayIngestStatus::Expired);
+        }
+        let context = ClaudeRegistrationContext {
+            stable_session_key: registration.stable_session_key.clone(),
+            nonce: nonce.to_string(),
+            generation: registration.generation,
+        };
+        state
+            .registrations
+            .get_mut(nonce)
+            .expect("registration checked above")
+            .expires_at = now + self.limits.registration_ttl;
+        Ok(context)
+    }
+
+    fn reduce_admitted(
+        &self,
+        context: ClaudeRegistrationContext,
+        body: &[u8],
+        occurred_at_epoch_ms: u64,
+    ) -> CapturedClaudeIngest {
+        let Ok(mut state) = self.state.lock() else {
+            return CapturedClaudeIngest::without_session(RelayIngestStatus::Rejected);
+        };
+        if !context_is_current(&state, &context) {
+            return CapturedClaudeIngest {
+                status: RelayIngestStatus::Accepted(ClaudeReduceOutcome::ignored()),
+                context: Some(context),
+            };
+        }
+        let outcome = state
+            .registrations
+            .get_mut(&context.nonce)
+            .expect("current registration exists")
+            .reducer
+            .apply_json(body, occurred_at_epoch_ms);
         CapturedClaudeIngest {
             status: RelayIngestStatus::Accepted(outcome),
-            stable_session_key: Some(stable_session_key),
-            session_ended,
-            nonce: Some(nonce.to_string()),
+            context: Some(context),
         }
     }
 
@@ -873,31 +1118,17 @@ impl ClaudeHookRegistry {
             .is_some()
     }
 
-    fn ingest_and_dispatch_at(
-        &self,
-        peer: SocketAddr,
-        nonce: &str,
-        body: &[u8],
-        now: Instant,
-        occurred_at_epoch_ms: u64,
-    ) -> RelayIngestStatus {
-        let captured = self.ingest_captured_at(peer, nonce, body, now, occurred_at_epoch_ms);
-        self.dispatch_captured(captured)
-    }
-
     fn dispatch_captured(&self, captured: CapturedClaudeIngest) -> RelayIngestStatus {
-        let CapturedClaudeIngest {
-            status,
-            stable_session_key,
-            session_ended,
-            nonce,
-        } = captured;
+        let CapturedClaudeIngest { status, context } = captured;
         let RelayIngestStatus::Accepted(outcome) = &status else {
             return status;
         };
-        let Some(stable_session_key) = stable_session_key else {
+        let Some(context) = context else {
             return status;
         };
+        if !self.is_current_registration(&context) {
+            return status;
+        }
         let handler = self
             .event_handler
             .read()
@@ -911,19 +1142,8 @@ impl ClaudeHookRegistry {
                 invoke_registry_handler(
                     handler,
                     ClaudeRegistryEvent::AdapterHealth {
-                        stable_session_key: stable_session_key.clone(),
+                        stable_session_key: context.stable_session_key.clone(),
                         health: SemanticAdapterHealth::Degraded,
-                    },
-                );
-            }
-        }
-        if session_ended {
-            if let Some(handler) = handler {
-                invoke_registry_handler(
-                    &handler,
-                    ClaudeRegistryEvent::SessionEnded {
-                        stable_session_key,
-                        nonce: nonce.unwrap_or_default(),
                     },
                 );
             }
@@ -935,12 +1155,117 @@ impl ClaudeHookRegistry {
         let Ok(mut state) = self.state.lock() else {
             return None;
         };
-        state.order.retain(|candidate| candidate != nonce);
-        let registration = state.registrations.remove(nonce);
+        let registration = remove_registration(&mut state, nonce);
         drop(state);
         registration.map(|registration| {
             remove_cleanup_paths(registration.cleanup_paths);
             registration.stable_session_key
+        })
+    }
+
+    pub(crate) fn unregister_registration(
+        &self,
+        expected: &ClaudeHookRegistration,
+    ) -> Option<StableSessionKey> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        let matches = state
+            .registrations
+            .get(&expected.nonce)
+            .is_some_and(|registered| {
+                registered.generation == expected.generation
+                    && registered.stable_session_key == expected.stable_session_key
+            });
+        let registration = matches
+            .then(|| remove_registration(&mut state, &expected.nonce))
+            .flatten();
+        drop(state);
+        registration.map(|registration| {
+            remove_cleanup_paths(registration.cleanup_paths);
+            registration.stable_session_key
+        })
+    }
+
+    fn is_current_registration(&self, context: &ClaudeRegistrationContext) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| context_is_current(&state, context))
+    }
+
+    fn dispatch_degraded_if_current(&self, context: &ClaudeRegistrationContext) {
+        if !self.is_current_registration(context) {
+            return;
+        }
+        let handler = self
+            .event_handler
+            .read()
+            .ok()
+            .and_then(|handler| handler.clone());
+        if let Some(handler) = handler {
+            invoke_registry_handler(
+                &handler,
+                ClaudeRegistryEvent::AdapterHealth {
+                    stable_session_key: context.stable_session_key.clone(),
+                    health: SemanticAdapterHealth::Degraded,
+                },
+            );
+        }
+    }
+
+    fn mark_ingress_degraded(&self, context: &ClaudeRegistrationContext) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !context_is_current(&state, context) {
+            return false;
+        }
+        state
+            .registrations
+            .get_mut(&context.nonce)
+            .map(|registration| registration.ingress_degraded = true)
+            .is_some()
+    }
+
+    fn dispatch_pending_ingress_degradations(&self) {
+        let contexts = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let latest = state.latest_generation_by_key.clone();
+            state
+                .registrations
+                .iter_mut()
+                .filter_map(|(nonce, registration)| {
+                    if !registration.ingress_degraded {
+                        return None;
+                    }
+                    registration.ingress_degraded = false;
+                    (latest.get(&registration.stable_session_key).copied()
+                        == Some(registration.generation))
+                    .then(|| ClaudeRegistrationContext {
+                        stable_session_key: registration.stable_session_key.clone(),
+                        nonce: nonce.clone(),
+                        generation: registration.generation,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for context in contexts {
+            self.dispatch_degraded_if_current(&context);
+        }
+    }
+
+    pub(crate) fn has_newer_generation(
+        &self,
+        stable_session_key: &StableSessionKey,
+        generation: u64,
+    ) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .latest_generation_by_key
+                .get(stable_session_key)
+                .is_some_and(|latest| *latest > generation)
         })
     }
 
@@ -984,6 +1309,8 @@ impl ClaudeHookRegistry {
                     ClaudeRegistryEvent::RegistrationDropped {
                         stable_session_key: registration.stable_session_key,
                         nonce: registration.nonce,
+                        generation: registration.generation,
+                        was_latest: registration.was_latest,
                     },
                 );
             }
@@ -1019,20 +1346,38 @@ impl Eq for RelayIngestStatus {}
 
 struct CapturedClaudeIngest {
     status: RelayIngestStatus,
-    stable_session_key: Option<StableSessionKey>,
-    session_ended: bool,
-    nonce: Option<String>,
+    context: Option<ClaudeRegistrationContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClaudeRegistrationContext {
+    stable_session_key: StableSessionKey,
+    nonce: String,
+    generation: u64,
 }
 
 impl CapturedClaudeIngest {
     fn without_session(status: RelayIngestStatus) -> Self {
         Self {
             status,
-            stable_session_key: None,
-            session_ended: false,
-            nonce: None,
+            context: None,
         }
     }
+}
+
+fn context_is_current(state: &ClaudeRegistryState, context: &ClaudeRegistrationContext) -> bool {
+    state
+        .registrations
+        .get(&context.nonce)
+        .is_some_and(|registration| {
+            registration.generation == context.generation
+                && registration.stable_session_key == context.stable_session_key
+        })
+        && state
+            .latest_generation_by_key
+            .get(&context.stable_session_key)
+            .copied()
+            == Some(context.generation)
 }
 
 fn remove_expired(state: &mut ClaudeRegistryState, now: Instant) -> Vec<RemovedClaudeRegistration> {
@@ -1044,8 +1389,8 @@ fn remove_expired(state: &mut ClaudeRegistryState, now: Instant) -> Vec<RemovedC
         .collect::<Vec<_>>();
     let mut removed = Vec::new();
     for nonce in expired {
-        if let Some(registration) = state.registrations.remove(&nonce) {
-            removed.push(removed_registration(nonce, registration));
+        if let Some(registration) = remove_registration(state, &nonce) {
+            removed.push(registration);
         }
     }
     state
@@ -1054,15 +1399,33 @@ fn remove_expired(state: &mut ClaudeRegistryState, now: Instant) -> Vec<RemovedC
     removed
 }
 
-fn removed_registration(
-    nonce: String,
-    registration: RegisteredClaudeSession,
-) -> RemovedClaudeRegistration {
-    RemovedClaudeRegistration {
-        nonce,
-        stable_session_key: registration.stable_session_key,
-        cleanup_paths: registration.cleanup_paths,
+fn remove_registration(
+    state: &mut ClaudeRegistryState,
+    nonce: &str,
+) -> Option<RemovedClaudeRegistration> {
+    state.order.retain(|candidate| candidate != nonce);
+    let registration = state.registrations.remove(nonce)?;
+    let was_latest = state
+        .latest_generation_by_key
+        .get(&registration.stable_session_key)
+        .copied()
+        == Some(registration.generation);
+    if !state
+        .registrations
+        .values()
+        .any(|candidate| candidate.stable_session_key == registration.stable_session_key)
+    {
+        state
+            .latest_generation_by_key
+            .remove(&registration.stable_session_key);
     }
+    Some(RemovedClaudeRegistration {
+        nonce: nonce.to_string(),
+        stable_session_key: registration.stable_session_key,
+        generation: registration.generation,
+        was_latest,
+        cleanup_paths: registration.cleanup_paths,
+    })
 }
 
 fn remove_cleanup_paths(paths: Vec<PathBuf>) {
@@ -1071,14 +1434,161 @@ fn remove_cleanup_paths(paths: Vec<PathBuf>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaudeIngressLimits {
+    pub max_critical_events: usize,
+    pub max_optional_events: usize,
+    pub max_critical_bytes: usize,
+    pub max_optional_bytes: usize,
+}
+
+impl Default for ClaudeIngressLimits {
+    fn default() -> Self {
+        Self {
+            max_critical_events: 256,
+            max_optional_events: 64,
+            max_critical_bytes: 4 * 1024 * 1024,
+            max_optional_bytes: 1024 * 1024,
+        }
+    }
+}
+
+struct AdmittedClaudeHook {
+    context: ClaudeRegistrationContext,
+    body: Vec<u8>,
+    occurred_at_epoch_ms: u64,
+}
+
+#[derive(Default)]
+struct ClaudeIngressQueueState {
+    critical: VecDeque<AdmittedClaudeHook>,
+    optional: VecDeque<AdmittedClaudeHook>,
+    critical_bytes: usize,
+    optional_bytes: usize,
+    degradation_pending: bool,
+    shutdown: bool,
+}
+
+#[derive(Default)]
+struct ClaudeIngressQueue {
+    state: Mutex<ClaudeIngressQueueState>,
+    ready: Condvar,
+}
+
+enum ClaudeIngressWork {
+    Event(AdmittedClaudeHook),
+    Degraded,
+    Shutdown,
+}
+
+impl ClaudeIngressQueue {
+    fn enqueue(
+        &self,
+        event: AdmittedClaudeHook,
+        optional: bool,
+        limits: ClaudeIngressLimits,
+        registry: &ClaudeHookRegistry,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.shutdown {
+            return;
+        }
+        let body_bytes = event.body.len();
+        if optional {
+            let full = state.optional.len() >= limits.max_optional_events
+                || body_bytes
+                    > limits
+                        .max_optional_bytes
+                        .saturating_sub(state.optional_bytes);
+            if full {
+                return;
+            }
+            state.optional_bytes = state.optional_bytes.saturating_add(body_bytes);
+            state.optional.push_back(event);
+        } else {
+            let full = state.critical.len() >= limits.max_critical_events
+                || body_bytes
+                    > limits
+                        .max_critical_bytes
+                        .saturating_sub(state.critical_bytes);
+            if full {
+                let context = event.context;
+                if registry.mark_ingress_degraded(&context) {
+                    state.degradation_pending = true;
+                    self.ready.notify_one();
+                }
+                return;
+            }
+            state.critical_bytes = state.critical_bytes.saturating_add(body_bytes);
+            state.critical.push_back(event);
+        }
+        self.ready.notify_one();
+    }
+
+    fn next(&self) -> ClaudeIngressWork {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.shutdown {
+                return ClaudeIngressWork::Shutdown;
+            }
+            if state.degradation_pending {
+                state.degradation_pending = false;
+                return ClaudeIngressWork::Degraded;
+            }
+            if let Some(event) = state.critical.pop_front() {
+                state.critical_bytes = state.critical_bytes.saturating_sub(event.body.len());
+                return ClaudeIngressWork::Event(event);
+            }
+            if let Some(event) = state.optional.pop_front() {
+                state.optional_bytes = state.optional_bytes.saturating_sub(event.body.len());
+                return ClaudeIngressWork::Event(event);
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.shutdown = true;
+        self.ready.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct ClaudeIngressState {
+    registry: Arc<ClaudeHookRegistry>,
+    queue: Arc<ClaudeIngressQueue>,
+    limits: ClaudeIngressLimits,
+}
+
 pub struct ClaudeHookRelayListener {
     endpoint: String,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<thread::JoinHandle<()>>,
+    server_thread: Option<thread::JoinHandle<()>>,
+    queue: Arc<ClaudeIngressQueue>,
+    consumer_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl ClaudeHookRelayListener {
     pub fn start(registry: Arc<ClaudeHookRegistry>) -> Result<Self, String> {
+        Self::start_with_ingress_limits(registry, ClaudeIngressLimits::default())
+    }
+
+    pub fn start_with_ingress_limits(
+        registry: Arc<ClaudeHookRegistry>,
+        limits: ClaudeIngressLimits,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("bind Claude hook relay: {error}"))?;
         listener
@@ -1095,7 +1605,34 @@ impl ClaudeHookRelayListener {
         let body_limit = registry.max_body_bytes();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let cleanup_registry = registry.clone();
-        let thread = thread::Builder::new()
+        let queue = Arc::new(ClaudeIngressQueue::default());
+        let consumer_queue = queue.clone();
+        let consumer_registry = registry.clone();
+        let consumer_thread = thread::Builder::new()
+            .name("claude-hook-reducer".to_string())
+            .spawn(move || loop {
+                match consumer_queue.next() {
+                    ClaudeIngressWork::Event(event) => {
+                        let captured = consumer_registry.reduce_admitted(
+                            event.context,
+                            &event.body,
+                            event.occurred_at_epoch_ms,
+                        );
+                        consumer_registry.dispatch_captured(captured);
+                    }
+                    ClaudeIngressWork::Degraded => {
+                        consumer_registry.dispatch_pending_ingress_degradations();
+                    }
+                    ClaudeIngressWork::Shutdown => break,
+                }
+            })
+            .map_err(|error| format!("spawn Claude hook reducer: {error}"))?;
+        let ingress_state = ClaudeIngressState {
+            registry,
+            queue: queue.clone(),
+            limits,
+        };
+        let server_thread_result = thread::Builder::new()
             .name("claude-hook-relay".to_string())
             .spawn(move || {
                 runtime.block_on(async move {
@@ -1105,7 +1642,7 @@ impl ClaudeHookRelayListener {
                     let app = Router::new()
                         .route("/internal/claude-hook", post(handle_claude_hook))
                         .layer(DefaultBodyLimit::max(body_limit))
-                        .with_state(registry);
+                        .with_state(ingress_state);
                     let shutdown = async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(60));
                         loop {
@@ -1124,12 +1661,21 @@ impl ClaudeHookRelayListener {
                     .with_graceful_shutdown(shutdown)
                     .await;
                 });
-            })
-            .map_err(|error| format!("spawn Claude hook relay: {error}"))?;
+            });
+        let server_thread = match server_thread_result {
+            Ok(thread) => thread,
+            Err(error) => {
+                queue.shutdown();
+                let _ = consumer_thread.join();
+                return Err(format!("spawn Claude hook relay: {error}"));
+            }
+        };
         Ok(Self {
             endpoint,
             shutdown_tx: Some(shutdown_tx),
-            thread: Some(thread),
+            server_thread: Some(server_thread),
+            queue,
+            consumer_thread: Some(consumer_thread),
         })
     }
 
@@ -1143,14 +1689,18 @@ impl Drop for ClaudeHookRelayListener {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.server_thread.take() {
+            let _ = thread.join();
+        }
+        self.queue.shutdown();
+        if let Some(thread) = self.consumer_thread.take() {
             let _ = thread.join();
         }
     }
 }
 
 async fn handle_claude_hook(
-    State(registry): State<Arc<ClaudeHookRegistry>>,
+    State(ingress): State<ClaudeIngressState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
@@ -1161,12 +1711,41 @@ async fn handle_claude_hook(
     else {
         return StatusCode::UNAUTHORIZED;
     };
-    match registry.ingest_and_dispatch_at(peer, nonce, &body, Instant::now(), unix_epoch_ms()) {
-        RelayIngestStatus::Accepted(_) => StatusCode::NO_CONTENT,
-        RelayIngestStatus::Rejected => StatusCode::UNAUTHORIZED,
-        RelayIngestStatus::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-        RelayIngestStatus::Expired => StatusCode::GONE,
+    match ingress
+        .registry
+        .admit_ingress_at(peer, nonce, body.len(), Instant::now())
+    {
+        Ok(context) => {
+            let optional = is_optional_claude_hook(&body);
+            ingress.queue.enqueue(
+                AdmittedClaudeHook {
+                    context,
+                    body: body.to_vec(),
+                    occurred_at_epoch_ms: unix_epoch_ms(),
+                },
+                optional,
+                ingress.limits,
+                &ingress.registry,
+            );
+            StatusCode::NO_CONTENT
+        }
+        Err(RelayIngestStatus::Rejected) => StatusCode::UNAUTHORIZED,
+        Err(RelayIngestStatus::BodyTooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
+        Err(RelayIngestStatus::Expired) => StatusCode::GONE,
+        Err(RelayIngestStatus::Accepted(_)) => StatusCode::NO_CONTENT,
     }
+}
+
+fn is_optional_claude_hook(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("hook_event_name")
+                .and_then(Value::as_str)
+                .map(|event| event == "MessageDisplay")
+        })
+        .unwrap_or(false)
 }
 
 fn unix_epoch_ms() -> u64 {
@@ -1178,8 +1757,16 @@ fn unix_epoch_ms() -> u64 {
 }
 
 fn random_nonce() -> Result<String, String> {
-    let mut bytes = [0_u8; CLAUDE_NONCE_BYTES];
-    getrandom::fill(&mut bytes).map_err(|error| format!("generate Claude hook nonce: {error}"))?;
+    random_hex_token::<CLAUDE_NONCE_BYTES>("Claude hook nonce")
+}
+
+fn random_settings_token() -> Result<String, String> {
+    random_hex_token::<CLAUDE_SETTINGS_TOKEN_BYTES>("Claude settings filename")
+}
+
+fn random_hex_token<const N: usize>(label: &str) -> Result<String, String> {
+    let mut bytes = [0_u8; N];
+    getrandom::fill(&mut bytes).map_err(|error| format!("generate {label}: {error}"))?;
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;
@@ -1414,7 +2001,14 @@ pub fn prepare_claude_launch_overlay(
             );
         }
     }
-    let settings_path = temp_root.join(format!("claude-hooks-{}.json", registration.nonce));
+    let settings_token = match random_settings_token() {
+        Ok(token) => token,
+        Err(error) => {
+            registry.unregister(&registration.nonce);
+            return ClaudeLaunchOverlay::degraded(startup_command, endpoint, error);
+        }
+    };
+    let settings_path = temp_root.join(format!("claude-hooks-{settings_token}.json"));
     let encoded = match serde_json::to_vec_pretty(&settings) {
         Ok(encoded) => encoded,
         Err(error) => {
@@ -1767,7 +2361,7 @@ mod registry_race_tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
-    fn accepted_ingest_keeps_dispatch_context_after_concurrent_unregister() {
+    fn accepted_old_ingest_cannot_dispatch_after_replacement_registration() {
         let registry = ClaudeHookRegistry::default();
         let registration = registry
             .register_at(StableSessionKey::from_tab("race-tab"), Instant::now())
@@ -1785,13 +2379,16 @@ mod registry_race_tests {
             1_800_000_000_000,
         );
 
-        // Models an unregister winning between relay ingestion and callback
-        // dispatch. The accepted event owns all routing context it needs.
-        registry.unregister(&registration.nonce);
+        // Models a replacement winning between relay admission and reducer
+        // dispatch. The accepted old event must not update the shared key.
+        let replacement = registry
+            .register_at(StableSessionKey::from_tab("race-tab"), Instant::now())
+            .unwrap();
+        assert!(replacement.generation > registration.generation);
         let status = registry.dispatch_captured(captured);
 
         assert!(matches!(status, RelayIngestStatus::Accepted(_)));
-        assert!(events.lock().unwrap().iter().any(|event| matches!(
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(
             event,
             ClaudeRegistryEvent::Semantic(SemanticEventDraft {
                 stable_session_key,
