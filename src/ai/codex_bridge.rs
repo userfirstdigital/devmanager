@@ -30,7 +30,7 @@ const CODEX_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const CODEX_PROBE_TREE_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const CODEX_PROBE_PIPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(not(windows))]
-const CODEX_PROBE_TERM_GRACE: std::time::Duration =
+const CODEX_PROCESS_GROUP_TERM_GRACE: std::time::Duration =
     std::time::Duration::from_millis(250);
 const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -1459,6 +1459,8 @@ impl CodexBridgeHandle {
                         .kill_on_drop(true);
                     #[cfg(windows)]
                     command.creation_flags(0x0800_0000);
+                    #[cfg(unix)]
+                    command.process_group(0);
 
                     let mut child = match command.spawn() {
                         Ok(child) => child,
@@ -1468,7 +1470,35 @@ impl CodexBridgeHandle {
                             return;
                         }
                     };
+                    let Some(pid) = child.id() else {
+                        let _ = ready_tx.send(Err(
+                            "Codex app-server did not expose its process ID".to_string()
+                        ));
+                        let _ = child.kill().await;
+                        return;
+                    };
+                    let managed_job =
+                        match crate::services::platform_service::attach_process_to_managed_job(pid)
+                        {
+                            Ok(managed_job) => managed_job,
+                            Err(error) => {
+                                terminate_sidecar(
+                                    &mut child,
+                                    SidecarOwnership {
+                                        pid,
+                                        managed_job: None,
+                                    },
+                                )
+                                .await;
+                                let _ = ready_tx.send(Err(format!(
+                                    "Cannot own Codex app-server process tree: {error}"
+                                )));
+                                return;
+                            }
+                        };
+                    let ownership = SidecarOwnership { pid, managed_job };
                     if let Ok(Some(status)) = child.try_wait() {
+                        terminate_sidecar(&mut child, ownership).await;
                         let _ = ready_tx.send(Err(format!(
                             "Codex app-server exited during startup with {status}"
                         )));
@@ -1477,13 +1507,13 @@ impl CodexBridgeHandle {
                     let Some(stdin) = child.stdin.take() else {
                         let _ =
                             ready_tx.send(Err("Codex app-server did not expose stdin".to_string()));
-                        terminate_sidecar(&mut child).await;
+                        terminate_sidecar(&mut child, ownership).await;
                         return;
                     };
                     let Some(stdout) = child.stdout.take() else {
                         let _ = ready_tx
                             .send(Err("Codex app-server did not expose stdout".to_string()));
-                        terminate_sidecar(&mut child).await;
+                        terminate_sidecar(&mut child, ownership).await;
                         return;
                     };
                     let stderr_task = child.stderr.take().map(|stderr| {
@@ -1530,7 +1560,7 @@ impl CodexBridgeHandle {
                         },
                     };
                     runtime_alive.store(false, Ordering::Release);
-                    terminate_sidecar(&mut child).await;
+                    terminate_sidecar(&mut child, ownership).await;
                     if let Some(task) = stderr_task {
                         task.abort();
                         let _ = task.await;
@@ -1650,13 +1680,45 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for JoinedStdio<R, W> {
     }
 }
 
-async fn terminate_sidecar(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let _ = tokio::task::spawn_blocking(move || {
-            crate::services::platform_service::kill_process_tree(pid)
+fn terminate_owned_sidecar_with<Job, Terminate>(
+    pid: u32,
+    managed_job: Option<Job>,
+    terminate: Terminate,
+) -> Result<(), String>
+where
+    Terminate: FnOnce(u32) -> Result<(), String>,
+{
+    let result = terminate(pid);
+    drop(managed_job);
+    result
+}
+
+struct SidecarOwnership {
+    pid: u32,
+    managed_job: Option<crate::services::platform_service::ManagedProcessJob>,
+}
+
+async fn terminate_sidecar(
+    child: &mut tokio::process::Child,
+    ownership: SidecarOwnership,
+) {
+    let SidecarOwnership { pid, managed_job } = ownership;
+    let _ = tokio::task::spawn_blocking(move || {
+        terminate_owned_sidecar_with(pid, managed_job, |pid| {
+            #[cfg(windows)]
+            {
+                crate::services::platform_service::kill_process_tree(pid)
+            }
+            #[cfg(not(windows))]
+            {
+                crate::services::platform_service::terminate_owned_process_group(
+                    pid,
+                    CODEX_PROCESS_GROUP_TERM_GRACE,
+                )
+            }
         })
-        .await;
-    }
+    })
+    .await;
     let _ = child.kill().await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
 }
@@ -2168,7 +2230,7 @@ fn terminate_probe_tree(
         #[cfg(not(windows))]
         let result = crate::services::platform_service::terminate_owned_process_group(
             pid,
-            CODEX_PROBE_TERM_GRACE,
+            CODEX_PROCESS_GROUP_TERM_GRACE,
         );
         let _ = tree_kill_tx.send(result);
     });
@@ -3266,6 +3328,117 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
         .await
         .unwrap();
         bridge.handle_mut().shutdown();
+    }
+
+    #[test]
+    fn sidecar_cleanup_policy_uses_retained_pid_and_always_releases_job() {
+        struct DropMarker(std::sync::Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let observed_pid = std::sync::Arc::new(AtomicUsize::new(0));
+        let captured_pid = observed_pid.clone();
+        let result = terminate_owned_sidecar_with(
+            42,
+            Some(DropMarker(released.clone())),
+            move |pid| {
+                captured_pid.store(pid as usize, Ordering::Release);
+                Err("wrapper root already exited".to_string())
+            },
+        );
+
+        assert_eq!(observed_pid.load(Ordering::Acquire), 42);
+        assert!(released.load(Ordering::Acquire));
+        assert_eq!(result.unwrap_err(), "wrapper root already exited");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_job_reaps_descendant_after_wrapper_root_exits() {
+        let unique = format!(
+            "devmanager-codex-sidecar-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp).unwrap();
+        let pid_path = temp.join("descendant.pid");
+        let child_script = temp.join("descendant.ps1");
+        let wrapper_script = temp.join("wrapper.ps1");
+        std::fs::write(
+            &child_script,
+            "while ($true) { Start-Sleep -Seconds 60 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &wrapper_script,
+            r#"param(
+    [string]$PidPath,
+    [string]$ChildScript,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Ignored
+)
+$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $ChildScript) -WindowStyle Hidden -PassThru
+[IO.File]::WriteAllText($PidPath, [string]$child.Id)
+Start-Sleep -Milliseconds 500
+"#,
+        )
+        .unwrap();
+        let prepared = PreparedCodexAdapter {
+            executable: resolve_executable("powershell.exe").unwrap(),
+            sidecar_prefix_args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-File".to_string(),
+                wrapper_script.to_string_lossy().into_owned(),
+                "-PidPath".to_string(),
+                pid_path.to_string_lossy().into_owned(),
+                "-ChildScript".to_string(),
+                child_script.to_string_lossy().into_owned(),
+            ],
+            tui_args: Vec::new(),
+            version: "test".to_string(),
+        };
+
+        let mut bridge = CodexBridgeHandle::start(
+            prepared,
+            std::env::current_dir().unwrap(),
+            StableSessionKey::from_tab("codex-sidecar-tree"),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let descendant_pid = read_probe_child_pid(&pid_path, std::time::Duration::from_secs(2))
+            .expect("wrapper must record its descendant");
+        let root_exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while bridge.handle.is_running() && std::time::Instant::now() < root_exit_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        bridge.handle_mut().shutdown();
+
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while crate::services::platform_service::is_pid_running(descendant_pid)
+            && std::time::Instant::now() < cleanup_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let survived = crate::services::platform_service::is_pid_running(descendant_pid);
+        if survived {
+            let _ = crate::services::platform_service::kill_process_tree(descendant_pid);
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+        assert!(
+            !survived,
+            "managed sidecar teardown must reap descendants after the wrapper root exits"
+        );
     }
 
     #[tokio::test]
