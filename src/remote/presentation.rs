@@ -11,6 +11,8 @@ const DEFAULT_CANONICAL_EVENTS: usize = 50_000;
 const DEFAULT_CANONICAL_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_VERBOSE_EVENTS: usize = 5_000;
 const DEFAULT_VERBOSE_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_STORE_SESSIONS: usize = 256;
+const DEFAULT_STORE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_SEMANTIC_EVENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,6 +160,8 @@ pub enum SemanticEventKind {
 pub struct SemanticEvent {
     pub stable_session_key: StableSessionKey,
     pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_sequence: Option<u64>,
     pub occurred_at_epoch_ms: u64,
     pub source: SemanticSource,
     #[serde(flatten)]
@@ -291,10 +295,10 @@ impl SemanticJournal {
             .and_then(|key| self.deduplication_sequences.get(key))
             .copied();
         let sequence = self.allocate_sequence();
-        if let Some(sequence) = replaced_sequence {
-            self.remove_sequence(sequence);
+        if let Some(replaced_sequence) = replaced_sequence {
+            self.remove_sequence(replaced_sequence);
         }
-        self.insert_draft(draft, sequence)
+        self.insert_draft(draft, sequence, replaced_sequence)
     }
 
     pub fn cursor_metadata(&self) -> JournalCursorMetadata {
@@ -352,10 +356,16 @@ impl SemanticJournal {
         sequence
     }
 
-    fn insert_draft(&mut self, draft: SemanticEventDraft, sequence: u64) -> SemanticEvent {
+    fn insert_draft(
+        &mut self,
+        draft: SemanticEventDraft,
+        sequence: u64,
+        replaces_sequence: Option<u64>,
+    ) -> SemanticEvent {
         let mut event = SemanticEvent {
             stable_session_key: draft.stable_session_key,
             sequence,
+            replaces_sequence,
             occurred_at_epoch_ms: draft.occurred_at_epoch_ms,
             source: draft.source,
             kind: draft.kind,
@@ -420,6 +430,62 @@ impl SemanticJournal {
         }
     }
 
+    fn retained_bytes(&self) -> usize {
+        self.canonical_bytes
+            .saturating_add(self.verbose_bytes)
+            .saturating_add(
+                self.verbose_truncation_marker
+                    .as_ref()
+                    .map_or(0, |stored| stored.encoded_bytes),
+            )
+    }
+
+    fn trim_oldest_event(&mut self) -> bool {
+        enum Queue {
+            Canonical,
+            Verbose,
+            Marker,
+        }
+
+        let oldest = [
+            self.canonical
+                .front()
+                .map(|stored| (stored.event.sequence, Queue::Canonical)),
+            self.verbose
+                .front()
+                .map(|stored| (stored.event.sequence, Queue::Verbose)),
+            self.verbose_truncation_marker
+                .as_ref()
+                .map(|stored| (stored.event.sequence, Queue::Marker)),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(sequence, _)| *sequence);
+
+        let Some((_, queue)) = oldest else {
+            return false;
+        };
+        let stored = match queue {
+            Queue::Canonical => self.canonical.pop_front().map(|stored| {
+                self.canonical_bytes = self.canonical_bytes.saturating_sub(stored.encoded_bytes);
+                stored
+            }),
+            Queue::Verbose => self.verbose.pop_front().map(|stored| {
+                self.verbose_bytes = self.verbose_bytes.saturating_sub(stored.encoded_bytes);
+                stored
+            }),
+            Queue::Marker => self.verbose_truncation_marker.take(),
+        };
+        if let Some(stored) = stored {
+            self.highest_evicted_sequence =
+                self.highest_evicted_sequence.max(stored.event.sequence);
+            self.remove_deduplication_for(&stored);
+            true
+        } else {
+            false
+        }
+    }
+
     fn enforce_canonical_limits(&mut self) {
         while self.canonical.len() > self.limits.canonical_events
             || self.canonical_bytes > self.limits.canonical_bytes
@@ -455,6 +521,7 @@ impl SemanticJournal {
         let event = SemanticEvent {
             stable_session_key: key.clone(),
             sequence: self.allocate_sequence(),
+            replaces_sequence: None,
             occurred_at_epoch_ms: 0,
             source: SemanticSource::System,
             kind: SemanticEventKind::Status {
@@ -516,16 +583,20 @@ struct SessionBinding {
     source: SemanticSource,
     status: Option<SessionStatus>,
     raw_required: Option<bool>,
+    evicted_through_sequence: u64,
 }
 
 #[derive(Debug)]
 struct StoredSessionJournal {
     journal: SemanticJournal,
     metadata: SemanticSessionMetadata,
+    active: bool,
 }
 
 pub struct SemanticJournalStore {
     limits: JournalLimits,
+    max_sessions: usize,
+    max_total_bytes: usize,
     sessions: HashMap<StableSessionKey, StoredSessionJournal>,
     session_bindings: HashMap<String, SessionBinding>,
     projectors: HashMap<String, PlainTextProjector>,
@@ -539,8 +610,18 @@ impl Default for SemanticJournalStore {
 
 impl SemanticJournalStore {
     pub fn with_limits(limits: JournalLimits) -> Self {
+        Self::with_store_limits(limits, DEFAULT_STORE_SESSIONS, DEFAULT_STORE_BYTES)
+    }
+
+    pub fn with_store_limits(
+        limits: JournalLimits,
+        max_sessions: usize,
+        max_total_bytes: usize,
+    ) -> Self {
         Self {
             limits,
+            max_sessions: max_sessions.max(1),
+            max_total_bytes: max_total_bytes.max(1),
             sessions: HashMap::new(),
             session_bindings: HashMap::new(),
             projectors: HashMap::new(),
@@ -558,19 +639,26 @@ impl SemanticJournalStore {
         };
         let source = semantic_source(runtime.session_kind);
         let previous_binding = self.session_bindings.get(&runtime.session_id).cloned();
-        let previous_status = previous_binding.as_ref().and_then(|binding| binding.status);
+        let previous_for_key = previous_binding
+            .as_ref()
+            .filter(|binding| binding.key == key);
+        let previous_status = previous_for_key.and_then(|binding| binding.status);
         self.session_bindings.insert(
             runtime.session_id.clone(),
             SessionBinding {
                 key: key.clone(),
                 source,
                 status: Some(runtime.status),
-                raw_required: previous_binding.and_then(|binding| binding.raw_required),
+                raw_required: previous_for_key.and_then(|binding| binding.raw_required),
+                evicted_through_sequence: previous_for_key
+                    .map(|binding| binding.evicted_through_sequence)
+                    .unwrap_or(0),
             },
         );
 
         let is_new = !self.sessions.contains_key(&key);
         let session = self.ensure_session(&key, runtime.session_kind.is_ai());
+        session.active = runtime.status.is_live();
         let attention = semantic_attention(runtime);
         let attention_count = if attention == SemanticAttention::None {
             0
@@ -585,7 +673,7 @@ impl SemanticJournalStore {
         let status_changed = previous_status != Some(runtime.status);
         if status_changed {
             let event = SemanticEventDraft {
-                stable_session_key: key,
+                stable_session_key: key.clone(),
                 occurred_at_epoch_ms,
                 source: SemanticSource::System,
                 kind: SemanticEventKind::Status {
@@ -598,17 +686,13 @@ impl SemanticJournalStore {
             self.record(event);
         }
         if is_new || status_changed || metadata_changed {
-            if let Some(session) = self.sessions.get_mut(
-                &self
-                    .session_bindings
-                    .get(&runtime.session_id)
-                    .expect("binding was inserted")
-                    .key,
-            ) {
+            if let Some(session) = self.sessions.get_mut(&key) {
                 session.metadata.last_activity_epoch_ms = Some(occurred_at_epoch_ms);
             }
+            self.enforce_store_limits();
             true
         } else {
+            self.enforce_store_limits();
             false
         }
     }
@@ -695,12 +779,16 @@ impl SemanticJournalStore {
     pub fn record(&mut self, draft: SemanticEventDraft) -> SemanticEvent {
         let key = draft.stable_session_key.clone();
         let occurred_at_epoch_ms = draft.occurred_at_epoch_ms;
-        let session = self.ensure_session(&key, false);
-        let event = session.journal.push(draft);
-        let cursor = session.journal.cursor_metadata();
-        session.metadata.last_activity_epoch_ms = Some(occurred_at_epoch_ms);
-        session.metadata.oldest_sequence = cursor.oldest_sequence;
-        session.metadata.latest_sequence = cursor.latest_sequence;
+        let event = {
+            let session = self.ensure_session(&key, false);
+            let event = session.journal.push(draft);
+            let cursor = session.journal.cursor_metadata();
+            session.metadata.last_activity_epoch_ms = Some(occurred_at_epoch_ms);
+            session.metadata.oldest_sequence = cursor.oldest_sequence;
+            session.metadata.latest_sequence = cursor.latest_sequence;
+            event
+        };
+        self.enforce_store_limits();
         event
     }
 
@@ -765,6 +853,7 @@ impl SemanticJournalStore {
         }
         session.metadata.attention = attention;
         session.metadata.attention_count = count;
+        self.enforce_store_limits();
         true
     }
 
@@ -778,14 +867,35 @@ impl SemanticJournalStore {
             return false;
         }
         session.metadata.adapter_health = health;
+        self.enforce_store_limits();
         true
     }
 
     pub fn remove_session_binding(&mut self, session_id: &str) -> Option<StableSessionKey> {
         self.projectors.remove(session_id);
-        self.session_bindings
+        let key = self
+            .session_bindings
             .remove(session_id)
-            .map(|binding| binding.key)
+            .map(|binding| binding.key)?;
+        let still_active = self.session_bindings.values().any(|binding| {
+            binding.key == key && binding.status.is_some_and(SessionStatus::is_live)
+        });
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.active = still_active;
+        }
+        self.enforce_store_limits();
+        Some(key)
+    }
+
+    pub fn retained_session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|session| session.journal.retained_bytes())
+            .sum()
     }
 
     fn ensure_session(
@@ -793,19 +903,121 @@ impl SemanticJournalStore {
         key: &StableSessionKey,
         degraded_adapter: bool,
     ) -> &mut StoredSessionJournal {
-        self.sessions
-            .entry(key.clone())
-            .or_insert_with(|| StoredSessionJournal {
-                journal: SemanticJournal::with_limits(self.limits),
+        let matching_bindings = self
+            .session_bindings
+            .values()
+            .filter(|binding| binding.key == *key);
+        let (active, raw_required, evicted_through_sequence) = matching_bindings.fold(
+            (false, false, 0_u64),
+            |(active, raw_required, evicted_through_sequence), binding| {
+                (
+                    active || binding.status.is_some_and(SessionStatus::is_live),
+                    raw_required || binding.raw_required.unwrap_or(false),
+                    evicted_through_sequence.max(binding.evicted_through_sequence),
+                )
+            },
+        );
+        let limits = self.limits;
+        self.sessions.entry(key.clone()).or_insert_with(|| {
+            let mut journal = SemanticJournal::with_limits(limits);
+            journal.next_sequence = evicted_through_sequence.saturating_add(1);
+            journal.highest_evicted_sequence = evicted_through_sequence;
+            StoredSessionJournal {
+                journal,
                 metadata: SemanticSessionMetadata {
                     adapter_health: if degraded_adapter {
                         SemanticAdapterHealth::Degraded
                     } else {
                         SemanticAdapterHealth::Healthy
                     },
+                    raw_required,
+                    latest_sequence: evicted_through_sequence,
                     ..SemanticSessionMetadata::default()
                 },
-            })
+                active,
+            }
+        })
+    }
+
+    fn enforce_store_limits(&mut self) {
+        loop {
+            let over_sessions = self.sessions.len() > self.max_sessions;
+            let over_bytes = self.retained_bytes() > self.max_total_bytes;
+            if !over_sessions && !over_bytes {
+                break;
+            }
+
+            let oldest_inactive = self
+                .sessions
+                .iter()
+                .filter(|(_, session)| !session.active)
+                .min_by_key(|(_, session)| session.metadata.last_activity_epoch_ms.unwrap_or(0))
+                .map(|(key, _)| key.clone());
+            if let Some(key) = oldest_inactive {
+                self.remove_stored_session(&key);
+                continue;
+            }
+
+            if over_sessions {
+                let oldest_active = self
+                    .sessions
+                    .iter()
+                    .min_by_key(|(_, session)| session.metadata.last_activity_epoch_ms.unwrap_or(0))
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = oldest_active {
+                    self.remove_stored_session(&key);
+                    continue;
+                }
+            }
+
+            let oldest_active = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, session)| session.metadata.last_activity_epoch_ms.unwrap_or(0))
+                .map(|(key, _)| key.clone());
+            let Some(key) = oldest_active else {
+                break;
+            };
+            let trimmed = self
+                .sessions
+                .get_mut(&key)
+                .is_some_and(|session| session.journal.trim_oldest_event());
+            if !trimmed {
+                self.remove_stored_session(&key);
+            } else if let Some(session) = self.sessions.get_mut(&key) {
+                let cursor = session.journal.cursor_metadata();
+                session.metadata.oldest_sequence = cursor.oldest_sequence;
+                session.metadata.latest_sequence = cursor.latest_sequence;
+            }
+        }
+    }
+
+    fn remove_stored_session(&mut self, key: &StableSessionKey) {
+        let Some(removed) = self.sessions.remove(key) else {
+            return;
+        };
+        if removed.active {
+            let latest_sequence = removed.journal.cursor_metadata().latest_sequence;
+            for binding in self
+                .session_bindings
+                .values_mut()
+                .filter(|binding| &binding.key == key)
+            {
+                binding.evicted_through_sequence =
+                    binding.evicted_through_sequence.max(latest_sequence);
+            }
+            return;
+        }
+        let removed_session_ids = self
+            .session_bindings
+            .iter()
+            .filter(|(_, binding)| &binding.key == key)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in removed_session_ids {
+            self.session_bindings.remove(&session_id);
+            self.projectors.remove(&session_id);
+        }
     }
 }
 
@@ -1341,6 +1553,35 @@ mod tests {
     }
 
     #[test]
+    fn incremental_replay_identifies_the_sequence_replaced_by_deduplication() {
+        let key = StableSessionKey::from_tab("tab-incremental");
+        let mut journal = SemanticJournal::default();
+        let partial = journal.push(output_draft(
+            key.clone(),
+            "partial response",
+            SemanticRetention::Canonical,
+            Some("assistant-message-1"),
+        ));
+
+        let replacement = journal.push(output_draft(
+            key,
+            "complete response",
+            SemanticRetention::Canonical,
+            Some("assistant-message-1"),
+        ));
+        let incremental = journal.replay_after(partial.sequence);
+
+        assert_eq!(incremental.events.len(), 1);
+        assert_eq!(incremental.events[0].sequence, replacement.sequence);
+        assert_eq!(
+            incremental.events[0].replaces_sequence,
+            Some(partial.sequence)
+        );
+        let json = serde_json::to_value(incremental.events[0].as_ref()).unwrap();
+        assert_eq!(json["replacesSequence"], partial.sequence);
+    }
+
+    #[test]
     fn cursor_metadata_tracks_retained_bounds_without_replaying_payloads() {
         let key = StableSessionKey::from_server("cmd-1");
         let mut journal = SemanticJournal::with_limits(JournalLimits {
@@ -1499,6 +1740,153 @@ mod tests {
             &event.kind,
             SemanticEventKind::Output { text, .. } if text == "hello"
         )));
+    }
+
+    #[test]
+    fn removed_session_journals_and_projectors_obey_global_store_caps() {
+        let mut store = SemanticJournalStore::with_store_limits(
+            JournalLimits {
+                canonical_events: 64,
+                canonical_bytes: 64 * 1024,
+                verbose_events: 64,
+                verbose_bytes: 64 * 1024,
+            },
+            3,
+            2 * 1024,
+        );
+
+        for index in 0..24 {
+            let session_id = format!("pty-{index}");
+            let command_id = format!("command-{index}");
+            let mut runtime = SessionRuntimeState::new(
+                session_id.clone(),
+                PathBuf::new(),
+                Default::default(),
+                TerminalBackend::default(),
+            );
+            runtime.session_kind = SessionKind::Server;
+            runtime.command_id = Some(command_id);
+            runtime.status = SessionStatus::Running;
+            assert!(store.observe_runtime(&runtime, &[], index * 10));
+            assert!(store.observe_output(
+                &session_id,
+                format!("payload-{index}-{}", "x".repeat(256)).as_bytes(),
+                index * 10 + 1,
+            ));
+            assert_eq!(
+                store.remove_session_binding(&session_id),
+                Some(StableSessionKey::from_server(format!("command-{index}")))
+            );
+        }
+
+        assert!(store.retained_session_count() <= 3);
+        assert!(store.retained_bytes() <= 2 * 1024);
+        assert!(store.session_bindings.is_empty());
+        assert!(store.projectors.is_empty());
+        assert!(store
+            .metadata(&StableSessionKey::from_server("command-23"))
+            .is_some());
+    }
+
+    #[test]
+    fn active_history_is_trimmed_with_rollover_instead_of_growing_past_global_bytes() {
+        let mut store = SemanticJournalStore::with_store_limits(
+            JournalLimits {
+                canonical_events: 128,
+                canonical_bytes: 128 * 1024,
+                verbose_events: 128,
+                verbose_bytes: 128 * 1024,
+            },
+            8,
+            1024,
+        );
+        let session_id = "active-pty";
+        let key = StableSessionKey::from_server("active-command");
+        let mut runtime = SessionRuntimeState::new(
+            session_id,
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Server;
+        runtime.command_id = Some("active-command".to_string());
+        runtime.status = SessionStatus::Running;
+        assert!(store.observe_runtime(&runtime, &[], 1));
+
+        let first = store.record(output_draft(
+            key.clone(),
+            &format!("first-{}", "x".repeat(300)),
+            SemanticRetention::Canonical,
+            None,
+        ));
+        for index in 0..20 {
+            store.record(output_draft(
+                key.clone(),
+                &format!("event-{index}-{}", "x".repeat(300)),
+                SemanticRetention::Canonical,
+                None,
+            ));
+        }
+
+        assert_eq!(store.retained_session_count(), 1);
+        assert!(store.retained_bytes() <= 1024);
+        assert!(store.session_bindings.contains_key(session_id));
+        let replay = store
+            .capture_replay_after(&key, first.sequence)
+            .expect("active journal retained")
+            .into_replay();
+        assert!(replay.cursor_rolled_over);
+        assert!(replay.through_sequence > first.sequence);
+    }
+
+    #[test]
+    fn active_session_cap_eviction_preserves_binding_and_sequence_rollover() {
+        let mut store =
+            SemanticJournalStore::with_store_limits(JournalLimits::default(), 1, 1024 * 1024);
+        let key_a = StableSessionKey::from_server("command-a");
+        let key_b = StableSessionKey::from_server("command-b");
+
+        let mut runtime_a = SessionRuntimeState::new(
+            "pty-a",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime_a.session_kind = SessionKind::Server;
+        runtime_a.command_id = Some("command-a".to_string());
+        runtime_a.status = SessionStatus::Running;
+        assert!(store.observe_runtime(&runtime_a, &[], 10));
+        let previous_latest = store
+            .metadata(&key_a)
+            .expect("first active journal")
+            .latest_sequence;
+
+        let mut runtime_b = SessionRuntimeState::new(
+            "pty-b",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime_b.session_kind = SessionKind::Server;
+        runtime_b.command_id = Some("command-b".to_string());
+        runtime_b.status = SessionStatus::Running;
+        assert!(store.observe_runtime(&runtime_b, &[], 20));
+
+        assert_eq!(store.retained_session_count(), 1);
+        assert_eq!(store.stable_key_for_session("pty-a"), Some(key_a.clone()));
+        assert_eq!(store.stable_key_for_session("pty-b"), Some(key_b));
+        assert!(store.observe_output("pty-a", b"after eviction\n", 30));
+
+        let replay = store
+            .capture_replay_after(&key_a, previous_latest)
+            .expect("active journal recreated")
+            .into_replay();
+        assert!(replay.cursor_rolled_over);
+        assert!(replay.through_sequence > previous_latest);
+        assert!(replay
+            .events
+            .iter()
+            .all(|event| event.sequence > previous_latest));
     }
 
     #[test]

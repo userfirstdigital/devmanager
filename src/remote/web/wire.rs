@@ -515,6 +515,7 @@ mod tests {
         let event = SemanticEvent {
             stable_session_key: StableSessionKey::from_tab("tab-a"),
             sequence: 13,
+            replaces_sequence: None,
             occurred_at_epoch_ms: 1_234,
             source: SemanticSource::Claude,
             kind: SemanticEventKind::AssistantMessage {

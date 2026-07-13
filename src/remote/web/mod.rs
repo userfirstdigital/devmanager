@@ -4,6 +4,7 @@ pub mod auth;
 pub mod bridge;
 pub mod dto;
 pub mod image_paste;
+pub(crate) mod input_executor;
 pub mod lease;
 pub mod wire;
 

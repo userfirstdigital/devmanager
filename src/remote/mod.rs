@@ -13,6 +13,7 @@ use presentation::{
     SemanticSessionMetadata, StableSessionKey,
 };
 use web::bridge::{BrowserOutboundSender, WebConnectionTombstone};
+use web::input_executor::WebInputExecutor;
 use web::lease::{ControllerRequest, ControllerTarget, WebControlState};
 
 use crate::git::git_service::{
@@ -347,6 +348,11 @@ pub enum RemoteTerminalInput {
     Image {
         session_id: String,
         attachment: RemoteImageAttachment,
+    },
+    ComposerBatch {
+        session_id: String,
+        text: String,
+        attachments: Vec<RemoteImageAttachment>,
     },
 }
 
@@ -969,6 +975,7 @@ pub(crate) struct RemoteHostInner {
     /// part of the authority state.
     web_control: Mutex<WebControlState>,
     web_composer_mutations: Mutex<HashMap<String, WebComposerMutationRecord>>,
+    web_input_executor: WebInputExecutor,
     pending_requests: Mutex<Vec<PendingRemoteRequest>>,
     clients: Mutex<HashMap<u64, ConnectedRemoteClient>>,
     controller_client_id: RwLock<Option<String>>,
@@ -1182,6 +1189,7 @@ impl RemoteHostService {
                 web_control_operation_lock: Mutex::new(()),
                 web_control: Mutex::new(WebControlState::new(Duration::from_secs(8))),
                 web_composer_mutations: Mutex::new(HashMap::new()),
+                web_input_executor: WebInputExecutor::default(),
                 pending_requests: Mutex::new(Vec::new()),
                 clients: Mutex::new(HashMap::new()),
                 controller_client_id: RwLock::new(None),
@@ -1595,6 +1603,9 @@ impl RemoteHostService {
     }
 
     pub fn push_session_removed(&self, session_id: &str) {
+        self.publish_semantic_change(|journals| {
+            journals.remove_session_binding(session_id).is_some()
+        });
         let targets = self
             .inner
             .clients
@@ -3607,15 +3618,23 @@ fn deliver_live_semantic_events(inner: &Arc<RemoteHostInner>) -> bool {
         let Some(capture) = capture else {
             continue;
         };
-        let replay = Arc::new(capture.into_replay());
+        let replay = capture.into_replay();
         let through_sequence = replay.through_sequence;
         if through_sequence == cursor {
             continue;
         }
-        let send_result =
-            sender.try_send_live_replay(sender.next_replay_id(), key.clone(), cursor, replay);
+        if replay.cursor_rolled_over {
+            dead_connections.push((
+                connection_id,
+                client_id,
+                tombstone,
+                Some("Semantic history rolled over. Reconnecting for a clean resume.".to_string()),
+            ));
+            continue;
+        }
+        let send_result = sender.try_send_live_events(&replay.events);
         if send_result.is_err() {
-            dead_connections.push((connection_id, client_id, tombstone));
+            dead_connections.push((connection_id, client_id, tombstone, None));
             continue;
         }
         if let Ok(mut clients) = inner.clients.lock() {
@@ -3633,10 +3652,27 @@ fn deliver_live_semantic_events(inner: &Arc<RemoteHostInner>) -> bool {
         }
     }
     drop(delivery);
-    dead_connections.sort_unstable_by_key(|(connection_id, _, _)| *connection_id);
-    dead_connections.dedup_by_key(|(connection_id, _, _)| *connection_id);
-    for (connection_id, client_id, tombstone) in dead_connections {
-        web::bridge::revoke_web_connection(inner, connection_id, &client_id, &tombstone, None);
+    dead_connections.sort_unstable_by_key(|(connection_id, _, _, _)| *connection_id);
+    let mut deduplicated: Vec<(
+        u64,
+        String,
+        Arc<web::bridge::WebConnectionTombstone>,
+        Option<String>,
+    )> = Vec::new();
+    for dead in dead_connections {
+        if let Some(previous) = deduplicated
+            .last_mut()
+            .filter(|(connection_id, _, _, _)| *connection_id == dead.0)
+        {
+            if previous.3.is_none() {
+                previous.3 = dead.3;
+            }
+        } else {
+            deduplicated.push(dead);
+        }
+    }
+    for (connection_id, client_id, tombstone, reason) in deduplicated {
+        web::bridge::revoke_web_connection(inner, connection_id, &client_id, &tombstone, reason);
     }
     true
 }
@@ -5987,7 +6023,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_cursor_rollover_is_one_bootstrap_frame() {
+    fn semantic_cursor_rollover_disconnects_for_a_clean_resume() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         *service
             .inner
@@ -6032,16 +6068,18 @@ mod tests {
 
         assert!(deliver_live_semantic_events(&service.inner));
         let queued_after_rollover = observed_web.queued_bytes();
-        assert!(queued_after_rollover > 0, "rollover replay was queued");
-        let cursor = service
+        assert!(queued_after_rollover > 0, "disconnect frame was queued");
+        assert!(
+            !observed_web.is_active(),
+            "rolled-over browser stays fenced"
+        );
+        assert!(!service
             .inner
             .clients
             .lock()
             .expect("clients lock")
-            .get(&1)
-            .and_then(|client| client.semantic_cursors.get(&key))
-            .copied();
-        assert_eq!(cursor, Some(second.sequence));
+            .contains_key(&1));
+        assert!(second.sequence > first.sequence);
         assert!(deliver_live_semantic_events(&service.inner));
         assert_eq!(observed_web.queued_bytes(), queued_after_rollover);
     }

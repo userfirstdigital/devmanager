@@ -662,6 +662,16 @@ impl NativeShell {
                         &session_id,
                         &attachment,
                     ),
+                    RemoteTerminalInput::ComposerBatch {
+                        session_id,
+                        text,
+                        attachments,
+                    } => crate::remote::web::image_paste::handle_web_composer_batch(
+                        &input_manager,
+                        &session_id,
+                        &attachments,
+                        &text,
+                    ),
                 };
                 if result.is_ok() {
                     input_host_service.record_input_write_latency(enqueued_at_epoch_ms);
