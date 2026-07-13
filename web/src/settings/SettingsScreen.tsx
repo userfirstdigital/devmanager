@@ -8,9 +8,17 @@ import {
   Smartphone,
   SquareTerminal,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import type { WsStatus } from "../api/ws";
 import { isStandaloneDisplayMode } from "../app/restore";
+import {
+  currentNotificationAvailability,
+  disablePushNotifications,
+  enablePushNotifications,
+  readPushRegistrationState,
+  type NotificationAvailability,
+} from "../pwa/notifications";
 import { useDensityPreference } from "./densityPreference";
 import {
   useReturnBehavior,
@@ -28,12 +36,95 @@ function statusLabel(status: WsStatus): string {
   return "Starting";
 }
 
+type NotificationSetupState =
+  | "checking"
+  | "disabled"
+  | "enabled"
+  | "enabling"
+  | "disabling"
+  | "denied"
+  | "error";
+
+function unavailableNotificationLabel(
+  availability: NotificationAvailability,
+): string {
+  if (availability.supported) return "Available after setup";
+  if (availability.reason === "insecure") {
+    return "Requires a secure HTTPS address";
+  }
+  if (availability.reason === "notInstalled") {
+    return "Add to Home Screen to enable";
+  }
+  return "Unavailable in this browser";
+}
+
+function notificationSetupLabel(state: NotificationSetupState): string {
+  switch (state) {
+    case "checking":
+      return "Checking notification status…";
+    case "disabled":
+      return "Notify me when work needs attention";
+    case "enabled":
+      return "Notifications are enabled";
+    case "enabling":
+      return "Enabling notifications…";
+    case "disabling":
+      return "Disabling notifications…";
+    case "denied":
+      return "Permission is off in iPhone Settings";
+    case "error":
+      return "Notification setup could not be completed";
+  }
+}
+
 export function SettingsScreen({ status }: SettingsScreenProps) {
-  const secure = globalThis.isSecureContext === true;
   const installed = isStandaloneDisplayMode();
+  const notificationSupport = currentNotificationAvailability();
+  const [notificationSetup, setNotificationSetup] =
+    useState<NotificationSetupState>("checking");
   const [density, setDensity] = useDensityPreference();
   const [returnBehavior, setReturnBehavior] = useReturnBehavior();
   const [terminalPreference, setTerminalPreference] = useTerminalPreference();
+
+  useEffect(() => {
+    if (!notificationSupport.supported) return;
+    let current = true;
+    void readPushRegistrationState()
+      .then((pushStatus) => {
+        if (!current) return;
+        setNotificationSetup(
+          pushStatus.subscribed && Notification.permission === "granted"
+            ? "enabled"
+            : Notification.permission === "denied"
+              ? "denied"
+              : "disabled",
+        );
+      })
+      .catch(() => {
+        if (current) setNotificationSetup("error");
+      });
+    return () => {
+      current = false;
+    };
+  }, [notificationSupport.reason, notificationSupport.supported]);
+
+  const toggleNotifications = async () => {
+    const disabling = notificationSetup === "enabled";
+    setNotificationSetup(disabling ? "disabling" : "enabling");
+    try {
+      if (disabling) {
+        await disablePushNotifications();
+        setNotificationSetup("disabled");
+      } else {
+        await enablePushNotifications();
+        setNotificationSetup("enabled");
+      }
+    } catch {
+      setNotificationSetup(
+        Notification.permission === "denied" ? "denied" : "error",
+      );
+    }
+  };
 
   return (
     <section className="dm-screen" aria-labelledby="settings-title">
@@ -117,9 +208,34 @@ export function SettingsScreen({ status }: SettingsScreenProps) {
               <span className="dm-setting-icon dm-icon-blue" aria-hidden="true"><Smartphone size={18} /></span>
               <span className="dm-row-copy"><strong>Home Screen app</strong><small>{installed ? "Installed" : "Open Share, then Add to Home Screen"}</small></span>
             </div>
-            <div className="dm-setting-row">
+            <div className="dm-setting-row dm-notification-row">
               <span className="dm-setting-icon dm-icon-red" aria-hidden="true"><Bell size={18} /></span>
-              <span className="dm-row-copy"><strong>Notifications</strong><small>{secure ? "Available after setup" : "Requires a secure HTTPS address"}</small></span>
+              <span className="dm-row-copy dm-notification-copy">
+                <strong>Notifications</strong>
+                <small id="notification-status" aria-live="polite">
+                  {notificationSupport.supported
+                    ? notificationSetupLabel(notificationSetup)
+                    : unavailableNotificationLabel(notificationSupport)}
+                </small>
+              </span>
+              {notificationSupport.supported ? (
+                <button
+                  type="button"
+                  className="dm-setting-action"
+                  aria-describedby="notification-status"
+                  disabled={
+                    notificationSetup === "checking" ||
+                    notificationSetup === "enabling" ||
+                    notificationSetup === "disabling"
+                  }
+                  onClick={() => void toggleNotifications()}
+                >
+                  {notificationSetup === "enabled" ||
+                  notificationSetup === "disabling"
+                    ? "Disable notifications"
+                    : "Enable notifications"}
+                </button>
+              ) : null}
             </div>
           </div>
         </section>

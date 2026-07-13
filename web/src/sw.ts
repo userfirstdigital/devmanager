@@ -9,6 +9,11 @@ import {
 import { NavigationRoute, registerRoute } from "workbox-routing";
 import { NetworkOnly } from "workbox-strategies";
 import { isNetworkOnlyPath } from "./pwa/cachePolicy";
+import {
+  applyAppBadge,
+  describePushNotification,
+  type AppBadgeApi,
+} from "./pwa/notifications";
 import { safeRoute } from "./pwa/notificationRoute";
 import { parsePushPayload, type PushPayload } from "./pwa/pushPayload";
 import {
@@ -97,17 +102,26 @@ function readPushPayload(event: PushEvent): PushPayload {
 
 self.addEventListener("push", (event) => {
   const payload = readPushPayload(event);
-  // Task 10 will add the authenticated actionable payload schema. Task 7 keeps
-  // this listener deliberately generic and stores no push or API response.
-  const route = safeRoute(payload.route, self.location.origin);
-  event.waitUntil(
-    self.registration.showNotification(payload.title ?? "DevManager", {
-      body: payload.body ?? "DevManager needs your attention.",
+  const notification = describePushNotification(payload, self.location.origin);
+  const tasks: Promise<unknown>[] = [
+    self.registration.showNotification(notification.title, {
+      body: notification.body,
       icon: "/icons/devmanager-192.png",
       badge: "/icons/devmanager-192.png",
-      tag: payload.tag,
-      data: { route },
+      tag: notification.tag,
+      data: notification.data,
     }),
+  ];
+  if (notification.badge !== undefined) {
+    tasks.push(
+      applyAppBadge(
+        notification.badge,
+        self.navigator as WorkerNavigator & AppBadgeApi,
+      ),
+    );
+  }
+  event.waitUntil(
+    Promise.all(tasks).then(() => undefined),
   );
 });
 

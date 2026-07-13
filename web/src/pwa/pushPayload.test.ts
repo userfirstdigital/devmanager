@@ -16,6 +16,12 @@ describe("parsePushPayload", () => {
         body: "Ready for review",
         route: "/sessions?filter=attention",
         tag: "session-alert",
+        eventId: "event-12",
+        runtimeInstanceId: "runtime-3",
+        action: "needsInput",
+        badge: 2,
+        prompt: "PROMPT_SENTINEL",
+        code: "OUTPUT_SENTINEL",
         ignored: "not copied",
       }),
     ).toEqual({
@@ -23,7 +29,18 @@ describe("parsePushPayload", () => {
       body: "Ready for review",
       route: "/sessions?filter=attention",
       tag: "session-alert",
+      eventId: "event-12",
+      runtimeInstanceId: "runtime-3",
+      action: "needsInput",
+      badge: 2,
     });
-    expect(parsePushPayload({ title: 7, route: [] })).toEqual({});
+    expect(
+      parsePushPayload({
+        title: 7,
+        route: [],
+        badge: -1,
+        action: "arbitrary",
+      }),
+    ).toEqual({});
   });
 });

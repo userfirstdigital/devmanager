@@ -87,6 +87,7 @@ import {
   type BoundedSemanticJournalState,
   MAX_SEMANTIC_BYTES_PER_SESSION,
   MAX_SEMANTIC_EVENTS_PER_SESSION,
+  selectAggregateBadgeCount,
   useStore,
 } from "./index";
 
@@ -257,6 +258,39 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", storageMock());
   vi.stubGlobal("crypto", { randomUUID: vi.fn(() => "mutation-uuid") });
   resetStore();
+});
+
+describe("aggregate app badge", () => {
+  it("counts sessions requiring action without counting ordinary unread output", () => {
+    const ordinary = makeSnapshot().sessions[0]!;
+    const needsInput = {
+      ...ordinary,
+      stableSessionKey: "tab:input",
+      attention: "needsInput" as const,
+    };
+    const failed = {
+      ...ordinary,
+      stableSessionKey: "server:failed",
+      attention: "failed" as const,
+    };
+
+    expect(
+      selectAggregateBadgeCount({
+        runtimeInstanceId: "runtime-1",
+        sessions: {
+          "tab:a": ordinary,
+          "tab:input": needsInput,
+          "server:failed": failed,
+        },
+      }),
+    ).toBe(2);
+  });
+
+  it("does not clear a service-worker badge before host state is authoritative", () => {
+    expect(
+      selectAggregateBadgeCount({ runtimeInstanceId: null, sessions: {} }),
+    ).toBeNull();
+  });
 });
 
 describe("host runtime reconciliation", () => {

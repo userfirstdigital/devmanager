@@ -719,6 +719,30 @@ button:disabled {
   color: var(--dm-green);
 }
 
+.dm-setting-action {
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding: 0 11px;
+  border-radius: 10px;
+  color: var(--dm-accent);
+  background: var(--dm-accent-soft);
+  font-size: 0.78rem;
+  font-weight: 640;
+  line-height: 1.18;
+}
+
+.dm-setting-action:active:not(:disabled) {
+  background: color-mix(in srgb, var(--dm-accent) 20%, transparent);
+}
+
+.dm-setting-action:disabled {
+  opacity: 0.52;
+}
+
+.dm-notification-copy small {
+  white-space: normal;
+}
+
 .dm-section-footnote {
   margin: 7px 16px 0;
   color: var(--dm-secondary);

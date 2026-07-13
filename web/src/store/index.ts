@@ -163,6 +163,16 @@ export interface StoreState {
   closeActiveTab(): void;
 }
 
+export function selectAggregateBadgeCount(
+  state: Pick<StoreState, "runtimeInstanceId" | "sessions">,
+): number | null {
+  if (state.runtimeInstanceId === null) return null;
+  return Object.values(state.sessions).filter(
+    (session) =>
+      session.attention === "needsInput" || session.attention === "failed",
+  ).length;
+}
+
 function emptyRawTerminal(): RawTerminalSlice {
   return {
     activeStreamSessionId: null,
