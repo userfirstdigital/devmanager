@@ -52,7 +52,7 @@ use super::wire::{
     ComposerAccepted, ComposerAttachment, ComposerRejectCode, ComposerRejected, ResumeRequest,
     ResumeState, SemanticReplayDescriptor, SemanticReplayPage, WsInbound, WsOutbound,
 };
-use super::{authenticate_request, record_browser_connection, WebState};
+use super::{authenticate_request, record_browser_connection, request_is_same_origin, WebState};
 use crate::ai::codex_bridge::canonical_codex_composer_prompt;
 use crate::state::{SessionDimensions, SessionKind};
 
@@ -88,6 +88,13 @@ pub(crate) struct WsConnectQuery {
     browser_install_id: Option<String>,
 }
 
+fn authorize_ws_request(state: &WebState, headers: &HeaderMap) -> Result<String, StatusCode> {
+    if !request_is_same_origin(headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    authenticate_request(state, headers).ok_or(StatusCode::UNAUTHORIZED)
+}
+
 pub(crate) async fn ws_handler(
     State(state): State<Arc<WebState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -95,12 +102,18 @@ pub(crate) async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
-    let Some(client_id) = authenticate_request(&state, &headers) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "missing or invalid web auth cookie",
-        )
-            .into_response();
+    let client_id = match authorize_ws_request(&state, &headers) {
+        Ok(client_id) => client_id,
+        Err(StatusCode::FORBIDDEN) => {
+            return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid web auth cookie",
+            )
+                .into_response();
+        }
     };
     let inner = state.inner.clone();
     if let Err(error) = record_browser_connection(
@@ -4440,6 +4453,48 @@ mod tests {
 
     fn test_web_channel() -> (BrowserOutboundSender, BrowserOutboundReceiver) {
         BrowserOutboundSender::channel(4096, WEB_OUTBOUND_MAX_BYTES * 4)
+    }
+
+    #[test]
+    fn valid_cookie_cannot_authorize_a_cross_origin_websocket() {
+        let mut config = RemoteHostConfig::default();
+        config.server_id = "ws-origin-host".to_string();
+        config.web.enabled = true;
+        let service = RemoteHostService::new(config);
+        pair_web_client(&service, "paired-browser");
+        let state = WebState {
+            inner: service.inner.clone(),
+            pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
+        };
+        let config = service.config();
+        let signed = super::super::sign_cookie(&config.web.cookie_secret_hex, "paired-browser")
+            .expect("signed browser cookie");
+        assert_eq!(
+            super::super::verify_cookie(&config.web.cookie_secret_hex, &signed).as_deref(),
+            Some("paired-browser"),
+            "the fixture must carry a genuinely valid auth cookie"
+        );
+        let cookie_name = super::super::cookie_name_for_server_id(&config.server_id);
+        drop(config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "devmanager.test:43872".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://attacker.example".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("{cookie_name}={signed}").parse().unwrap(),
+        );
+
+        assert_eq!(
+            authorize_ws_request(&state, &headers),
+            Err(StatusCode::FORBIDDEN)
+        );
     }
 
     fn try_recv_web_text(receiver: &mut BrowserOutboundReceiver) -> String {

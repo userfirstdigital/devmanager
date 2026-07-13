@@ -5,16 +5,13 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-
-use super::super::now_epoch_ms;
 
 pub const WEB_COOKIE_NAME: &str = "dm_web";
 const WEB_COOKIE_NAME_PREFIX: &str = "dm_web_";
 const PAIRING_BACKOFF_STEPS_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const PAIRING_LOCKOUT_SECS: u64 = 60;
-static COOKIE_SECRET_COUNTER: AtomicU64 = AtomicU64::new(1);
+const PAIRING_TOKEN_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 pub fn cookie_name_for_server_id(server_id: &str) -> String {
     if server_id.trim().is_empty() {
@@ -62,43 +59,38 @@ impl Default for PairedWebClient {
 }
 
 pub fn generate_web_pairing_token() -> String {
-    // 8-char uppercase alphanumeric, derived from epoch millis + process id +
-    // a SHA-256 digest. Cheap and collision-resistant enough for a host-local
-    // secret that rotates on demand.
-    let seed = format!("web-{}-{}", now_epoch_ms(), std::process::id());
-    let digest = {
-        use sha2::Digest;
-        let mut hasher = Sha256::new();
-        hasher.update(seed.as_bytes());
-        hasher.finalize()
-    };
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut out = String::with_capacity(8);
-    for byte in digest.iter().take(8) {
-        out.push(ALPHABET[(*byte as usize) % ALPHABET.len()] as char);
-    }
-    out
+    pairing_token_from_random_bytes(os_random_bytes("web pairing token"))
 }
 
 pub fn generate_cookie_secret_hex() -> String {
-    // Derive 32 bytes by chaining SHA-256 over epoch, pid, and a small
-    // monotonic counter. Not as strong as /dev/urandom but good enough for an
-    // MVP cookie signing secret that the user can rotate any time.
-    let mut bytes = [0u8; 32];
-    let counter = COOKIE_SECRET_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let seed = format!(
-        "cookie-{}-{}-{:?}-{}",
-        now_epoch_ms(),
-        std::process::id(),
-        std::thread::current().id(),
-        counter
-    );
-    use sha2::Digest;
-    let mut hasher = Sha256::new();
-    hasher.update(seed.as_bytes());
-    let first = hasher.finalize();
-    bytes[..32].copy_from_slice(&first[..32]);
+    cookie_secret_from_random_bytes(os_random_bytes("web cookie signing key"))
+}
+
+pub(crate) fn generate_web_client_id() -> String {
+    web_client_id_from_random_bytes(os_random_bytes("web client identity"))
+}
+
+fn os_random_bytes<const N: usize>(label: &str) -> [u8; N] {
+    let mut bytes = [0_u8; N];
+    getrandom::fill(&mut bytes).unwrap_or_else(|error| {
+        panic!("Cannot generate {label} from the operating system RNG: {error}")
+    });
+    bytes
+}
+
+fn pairing_token_from_random_bytes(bytes: [u8; 8]) -> String {
+    bytes
+        .into_iter()
+        .map(|byte| PAIRING_TOKEN_ALPHABET[(byte as usize) % PAIRING_TOKEN_ALPHABET.len()] as char)
+        .collect()
+}
+
+fn cookie_secret_from_random_bytes(bytes: [u8; 32]) -> String {
     hex_encode(&bytes)
+}
+
+fn web_client_id_from_random_bytes(bytes: [u8; 16]) -> String {
+    format!("web-{}", hex_encode(&bytes))
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -283,6 +275,32 @@ mod tests {
     #[test]
     fn pairing_token_is_eight_chars() {
         assert_eq!(generate_web_pairing_token().len(), 8);
+    }
+
+    #[test]
+    fn web_credentials_are_formatted_only_from_supplied_entropy() {
+        assert_eq!(
+            pairing_token_from_random_bytes([0, 1, 2, 3, 28, 29, 30, 31]),
+            "ABCD6789"
+        );
+        assert_eq!(cookie_secret_from_random_bytes([0xab; 32]), "ab".repeat(32));
+        assert_eq!(
+            web_client_id_from_random_bytes([0xcd; 16]),
+            format!("web-{}", "cd".repeat(16))
+        );
+    }
+
+    #[test]
+    fn generated_web_client_ids_are_unique_and_128_bit() {
+        let ids = (0..32)
+            .map(|_| generate_web_client_id())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 32);
+        assert!(ids.iter().all(|id| {
+            id.len() == 4 + 32
+                && id.starts_with("web-")
+                && id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        }));
     }
 
     #[test]

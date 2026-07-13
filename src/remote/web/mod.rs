@@ -10,7 +10,7 @@ pub mod push;
 pub(crate) mod request_executor;
 pub mod wire;
 
-use self::auth::{PairingAttemptTracker, PairingThrottleStatus};
+use self::auth::{generate_web_client_id, PairingAttemptTracker, PairingThrottleStatus};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Instant;
@@ -631,7 +631,7 @@ async fn pair_handler(
                 }
                 existing.client_id.clone()
             } else {
-                let client_id = format!("web-{}", now_epoch_ms());
+                let client_id = generate_web_client_id();
                 config.web.paired_clients.push(PairedWebClient {
                     client_id: client_id.clone(),
                     browser_install_id: browser_install_id.to_string(),
@@ -649,7 +649,7 @@ async fn pair_handler(
                 client_id
             }
         } else {
-            let client_id = format!("web-{}", now_epoch_ms());
+            let client_id = generate_web_client_id();
             config.web.paired_clients.push(PairedWebClient {
                 client_id: client_id.clone(),
                 browser_install_id: client_id.clone(),
@@ -835,7 +835,7 @@ fn single_request_header<'a>(
     Ok(Some(value))
 }
 
-fn push_mutation_is_same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn request_is_same_origin(headers: &HeaderMap) -> bool {
     let Ok(Some(origin)) = single_request_header(headers, "origin") else {
         return false;
     };
@@ -910,7 +910,7 @@ fn validate_push_mutation_request(headers: &HeaderMap) -> Result<(), StatusCode>
     if !media_type.eq_ignore_ascii_case("application/json") {
         return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
-    if !push_mutation_is_same_origin(headers) {
+    if !request_is_same_origin(headers) {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(())
@@ -1640,6 +1640,65 @@ mod tests {
     }
 
     #[test]
+    fn same_origin_request_validation_is_exact_and_fail_closed() {
+        let mut direct = HeaderMap::new();
+        direct.insert(header::HOST, "devmanager.test:43872".parse().unwrap());
+        direct.insert(
+            header::ORIGIN,
+            "http://devmanager.test:43872".parse().unwrap(),
+        );
+        assert!(request_is_same_origin(&direct));
+
+        let mut forwarded_https = HeaderMap::new();
+        forwarded_https.insert(header::HOST, "127.0.0.1:43872".parse().unwrap());
+        forwarded_https.insert(
+            "x-forwarded-host",
+            "mobile.example.test:443".parse().unwrap(),
+        );
+        forwarded_https.insert("x-forwarded-proto", "https".parse().unwrap());
+        forwarded_https.insert(
+            header::ORIGIN,
+            "https://mobile.example.test".parse().unwrap(),
+        );
+        assert!(request_is_same_origin(&forwarded_https));
+
+        let mut wrong_port = direct.clone();
+        wrong_port.insert(
+            header::ORIGIN,
+            "http://devmanager.test:43873".parse().unwrap(),
+        );
+        assert!(!request_is_same_origin(&wrong_port));
+
+        let mut missing_origin = direct.clone();
+        missing_origin.remove(header::ORIGIN);
+        assert!(!request_is_same_origin(&missing_origin));
+
+        let mut malformed_origin = direct.clone();
+        malformed_origin.insert(header::ORIGIN, "not-an-origin".parse().unwrap());
+        assert!(!request_is_same_origin(&malformed_origin));
+
+        let mut comma_joined_origin = direct.clone();
+        comma_joined_origin.insert(
+            header::ORIGIN,
+            "http://devmanager.test:43872, http://evil.test"
+                .parse()
+                .unwrap(),
+        );
+        assert!(!request_is_same_origin(&comma_joined_origin));
+
+        let mut duplicate_origin = direct.clone();
+        duplicate_origin.append(
+            header::ORIGIN,
+            "http://devmanager.test:43872".parse().unwrap(),
+        );
+        assert!(!request_is_same_origin(&duplicate_origin));
+
+        let mut duplicate_forwarding = forwarded_https;
+        duplicate_forwarding.append("x-forwarded-proto", "https".parse().unwrap());
+        assert!(!request_is_same_origin(&duplicate_forwarding));
+    }
+
+    #[test]
     fn dynamic_routes_are_no_store_on_success_errors_and_redirects() {
         let _profile = TestProfileGuard::new("web-dynamic-no-store");
         let service = test_service("host-no-store");
@@ -2120,6 +2179,50 @@ mod tests {
             Some("127.0.0.2")
         );
         assert_eq!(config.web.activity_log.len(), 2);
+    }
+
+    #[test]
+    fn pair_handler_mints_distinct_random_identity_for_each_browser_install() {
+        let _profile = TestProfileGuard::new("web-random-client-ids");
+        let service = test_service("host-a");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        for browser_install_id in ["phone-install", "desktop-install"] {
+            let response = runtime.block_on(async {
+                pair_handler(
+                    State(state.clone()),
+                    ConnectInfo(test_addr()),
+                    test_headers(None),
+                    Query(PairQuery {
+                        t: Some("PAIR1234".to_string()),
+                        label: None,
+                        browser_install_id: Some(browser_install_id.to_string()),
+                    }),
+                )
+                .await
+            });
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        }
+        drop(runtime);
+
+        let config = service.config();
+        assert_eq!(config.web.paired_clients.len(), 2);
+        let client_ids = config
+            .web
+            .paired_clients
+            .iter()
+            .map(|client| client.client_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(client_ids.len(), 2);
+        assert!(client_ids.iter().all(|client_id| {
+            client_id.len() == 36
+                && client_id.starts_with("web-")
+                && client_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        }));
     }
 
     #[test]
