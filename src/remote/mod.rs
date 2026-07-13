@@ -995,7 +995,6 @@ pub(crate) struct RemoteHostInner {
 pub(crate) struct WebComposerMutationRecord {
     pub(crate) fingerprint: u64,
     pub(crate) status: WebComposerMutationStatus,
-    pub(crate) updated_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone)]

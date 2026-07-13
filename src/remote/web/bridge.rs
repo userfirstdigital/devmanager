@@ -43,7 +43,7 @@ use super::super::{
 };
 use super::action::WebActionResult;
 use super::dto::{WebWorkspaceSnapshot, WebWriterLeaseState};
-use super::lease::{LeaseError, WriterLease};
+use super::lease::{LeaseError, MutationBegin, WriterLease};
 use super::wire::{
     ComposerAccepted, ComposerAttachment, ComposerRejectCode, ComposerRejected, ResumeRequest,
     ResumeState, SemanticBootstrap, WsInbound, WsOutbound,
@@ -56,7 +56,10 @@ const BINARY_FRAME_SESSION_OUTPUT: u8 = 0x01;
 const WEB_PUSH_CHANNEL_CAPACITY: usize = 256;
 const MAX_COMPOSER_MUTATION_ID_BYTES: usize = 128;
 const MAX_COMPOSER_ERROR_BYTES: usize = 1024;
-const MAX_COMPOSER_MUTATION_RECORDS: usize = 4096;
+// At the mutation-ID limit, new prompts fail closed until this host runtime
+// restarts. 16,384 entries supports one unique phone submission roughly every
+// five seconds for a full day without ever forgetting an at-most-once result.
+const MAX_COMPOSER_MUTATION_RECORDS: usize = 16_384;
 const MAX_COMPOSER_TEXT_BYTES: usize = 256 * 1024;
 const MAX_COMPOSER_ATTACHMENTS: usize = 4;
 const MAX_COMPOSER_ATTACHMENT_TOTAL_BYTES: usize = 10 * 1024 * 1024;
@@ -1868,56 +1871,69 @@ fn process_composer_submit(
                 ComposerRejectCode::LeaseBusy,
                 "The writer lease changed before the prompt was accepted.",
             ),
-            Ok(lease) => {
+            Ok(_) => {
                 let controller_matches = inner
                     .controller_client_id
                     .read()
                     .map(|controller| controller.as_deref() == Some(client_id))
                     .unwrap_or(false);
-                // Drop the registry guard before the start branch may insert a
-                // new record. A temporary guard in the `else if let` condition
-                // otherwise lives through the entire conditional expression
-                // and self-deadlocks on `insert_composer_mutation`.
-                let existing = {
-                    let mutations = composer_mutations(inner);
-                    mutations.get(&mutation_id).cloned()
-                };
                 if !controller_matches {
                     ComposerStart::Rejected(
                         ComposerRejectCode::NativeControllerActive,
                         "A native desktop controller is active.",
                     )
-                } else if let Some(existing) = existing {
-                    ComposerStart::Existing(existing)
                 } else {
-                    let began = inner.web_control.lock().ok().and_then(|mut control| {
-                        control
-                            .writer_leases_mut()
-                            .begin_mutation(
+                    // Keep the registry guard through the capacity check,
+                    // busy-marker transition, and insertion. The operation
+                    // lock serializes reservations, and completion paths drop
+                    // this registry lock before taking that operation lock.
+                    let mut mutations = composer_mutations(inner);
+                    if let Some(existing) = mutations.get(&mutation_id).cloned() {
+                        ComposerStart::Existing(existing)
+                    } else if mutations.len() >= MAX_COMPOSER_MUTATION_RECORDS {
+                        ComposerStart::Rejected(
+                            ComposerRejectCode::CapacityExceeded,
+                            "Composer mutation history is full for this host runtime. Restart the host before submitting a new prompt.",
+                        )
+                    } else {
+                        let begin = {
+                            let mut control = match inner.web_control.lock() {
+                                Ok(control) => control,
+                                Err(poisoned) => {
+                                    let control = poisoned.into_inner();
+                                    inner.web_control.clear_poison();
+                                    control
+                                }
+                            };
+                            control.writer_leases_mut().begin_mutation(
                                 connection_id,
                                 client_id,
                                 expected_lease_generation,
                                 &mutation_id,
                                 now_epoch_ms,
                             )
-                            .ok()
-                    });
-                    if began.is_none() {
-                        ComposerStart::Rejected(
-                            ComposerRejectCode::LeaseBusy,
-                            "Another prompt is still being accepted by the PTY.",
-                        )
-                    } else {
-                        insert_composer_mutation(
-                            inner,
-                            mutation_id.clone(),
-                            WebComposerMutationRecord {
-                                fingerprint,
-                                status: WebComposerMutationStatus::InFlight,
-                                updated_at_epoch_ms: now_epoch_ms,
-                            },
-                        );
-                        ComposerStart::Started(lease.generation)
+                        };
+                        match begin {
+                            Ok(MutationBegin::Started(lease)) => {
+                                let previous = mutations.insert(
+                                    mutation_id.clone(),
+                                    WebComposerMutationRecord {
+                                        fingerprint,
+                                        status: WebComposerMutationStatus::InFlight,
+                                    },
+                                );
+                                debug_assert!(previous.is_none());
+                                ComposerStart::Started(lease.generation)
+                            }
+                            Ok(MutationBegin::AlreadyInFlight(_)) => ComposerStart::Rejected(
+                                ComposerRejectCode::MutationInFlight,
+                                "This mutation is still being accepted by the PTY.",
+                            ),
+                            Err(_) => ComposerStart::Rejected(
+                                ComposerRejectCode::LeaseBusy,
+                                "Another prompt is still being accepted by the PTY.",
+                            ),
+                        }
                     }
                 }
             }
@@ -2071,7 +2087,7 @@ fn process_composer_submit(
         accepted_sequence,
         lease_generation,
     };
-    insert_composer_mutation(
+    store_composer_mutation_outcome(
         inner,
         mutation_id,
         WebComposerMutationRecord {
@@ -2081,7 +2097,6 @@ fn process_composer_submit(
                 accepted_sequence,
                 lease_generation,
             },
-            updated_at_epoch_ms: now_epoch_ms,
         },
     );
     finish_composer_mutation(
@@ -2224,36 +2239,23 @@ fn bounded_composer_error(message: &str) -> String {
     message[..boundary].to_string()
 }
 
-fn insert_composer_mutation(
+fn store_composer_mutation_outcome(
     inner: &Arc<RemoteHostInner>,
     mutation_id: String,
     record: WebComposerMutationRecord,
 ) {
     let mut mutations = composer_mutations(inner);
-    if !mutations.contains_key(&mutation_id) {
-        while mutations.len() >= MAX_COMPOSER_MUTATION_RECORDS {
-            let evict = mutations
-                .iter()
-                .filter(|(_, record)| !matches!(record.status, WebComposerMutationStatus::InFlight))
-                .min_by_key(|(_, record)| record.updated_at_epoch_ms)
-                .or_else(|| {
-                    // At most one in-flight record can be real because the
-                    // writer lease carries one active mutation ID. If a
-                    // poisoned/restored registry contains only InFlight
-                    // records, all pre-existing entries are stale; evict the
-                    // oldest instead of allowing unbounded growth.
-                    mutations
-                        .iter()
-                        .min_by_key(|(_, record)| record.updated_at_epoch_ms)
-                })
-                .map(|(mutation_id, _)| mutation_id.clone());
-            let Some(evict) = evict else {
-                break;
-            };
-            mutations.remove(&evict);
+    // A PTY callback can only run after its InFlight record was reserved.
+    // If that invariant is ever violated, preserving the terminal outcome is
+    // still safer than forgetting the ID after a possible PTY side effect.
+    match mutations.entry(mutation_id) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(record);
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(record);
         }
     }
-    mutations.insert(mutation_id, record);
 }
 
 fn store_pty_rejection(
@@ -2262,22 +2264,16 @@ fn store_pty_rejection(
     fingerprint: u64,
     message: &str,
 ) {
-    let mut mutations = composer_mutations(inner);
-    if mutations.get(mutation_id).is_some_and(|record| {
-        record.fingerprint == fingerprint
-            && matches!(record.status, WebComposerMutationStatus::InFlight)
-    }) {
-        mutations.insert(
-            mutation_id.to_string(),
-            WebComposerMutationRecord {
-                fingerprint,
-                status: WebComposerMutationStatus::PtyRejected {
-                    message: message.to_string(),
-                },
-                updated_at_epoch_ms: now_epoch_ms(),
+    store_composer_mutation_outcome(
+        inner,
+        mutation_id.to_string(),
+        WebComposerMutationRecord {
+            fingerprint,
+            status: WebComposerMutationStatus::PtyRejected {
+                message: message.to_string(),
             },
-        );
-    }
+        },
+    );
 }
 
 fn finish_composer_mutation(
@@ -3454,61 +3450,357 @@ mod tests {
     }
 
     #[test]
-    fn composer_registry_and_terminal_errors_remain_bounded() {
+    fn full_composer_registry_preserves_oldest_terminal_outcomes() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
         let key = StableSessionKey::from_tab("tab-a");
-        for index in 0..(MAX_COMPOSER_MUTATION_RECORDS + 100) {
-            insert_composer_mutation(
-                &service.inner,
-                format!("mutation-{index}"),
-                WebComposerMutationRecord {
-                    fingerprint: index as u64,
-                    status: WebComposerMutationStatus::Accepted {
-                        stable_session_key: key.clone(),
-                        accepted_sequence: index as u64,
-                        lease_generation: 1,
-                    },
-                    updated_at_epoch_ms: index as u64,
-                },
-            );
-        }
-        assert_eq!(
-            composer_mutations(&service.inner).len(),
-            MAX_COMPOSER_MUTATION_RECORDS
-        );
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(None, Some(key.clone()), "tab-a"),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let accepted_text = "remember accepted";
+        let rejected_text = "remember rejected";
+        let accepted_fingerprint = stable_hash(&(
+            key.as_str(),
+            accepted_text,
+            &Vec::<ComposerAttachment>::new(),
+        ));
+        let rejected_fingerprint = stable_hash(&(
+            key.as_str(),
+            rejected_text,
+            &Vec::<ComposerAttachment>::new(),
+        ));
+        let expected_accepted = ComposerAccepted {
+            mutation_id: "oldest-accepted".to_string(),
+            stable_session_key: key.clone(),
+            accepted_sequence: 41,
+            lease_generation: generation,
+        };
         {
             let mut records = composer_mutations(&service.inner);
-            records.clear();
-            for index in 0..MAX_COMPOSER_MUTATION_RECORDS {
+            records.insert(
+                "oldest-accepted".to_string(),
+                WebComposerMutationRecord {
+                    fingerprint: accepted_fingerprint,
+                    status: WebComposerMutationStatus::Accepted {
+                        stable_session_key: key.clone(),
+                        accepted_sequence: expected_accepted.accepted_sequence,
+                        lease_generation: generation,
+                    },
+                },
+            );
+            records.insert(
+                "oldest-rejected".to_string(),
+                WebComposerMutationRecord {
+                    fingerprint: rejected_fingerprint,
+                    status: WebComposerMutationStatus::PtyRejected {
+                        message: "remembered PTY rejection".to_string(),
+                    },
+                },
+            );
+            for index in 2..MAX_COMPOSER_MUTATION_RECORDS {
                 records.insert(
-                    format!("stale-in-flight-{index}"),
+                    format!("terminal-{index}"),
                     WebComposerMutationRecord {
                         fingerprint: index as u64,
-                        status: WebComposerMutationStatus::InFlight,
-                        updated_at_epoch_ms: index as u64,
+                        status: WebComposerMutationStatus::Accepted {
+                            stable_session_key: key.clone(),
+                            accepted_sequence: index as u64,
+                            lease_generation: generation,
+                        },
                     },
                 );
             }
         }
-        insert_composer_mutation(
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_writes = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            callback_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+
+        for mutation_id in ["new-at-capacity-a", "new-at-capacity-b"] {
+            let capacity = process_composer_submit(
+                &service.inner,
+                1,
+                "web-client",
+                mutation_id.to_string(),
+                key.clone(),
+                "must not write".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+            .expect_err("a new mutation must be rejected at capacity");
+            assert_eq!(
+                serde_json::to_value(capacity.code).expect("serialize rejection code"),
+                serde_json::json!("capacityExceeded")
+            );
+        }
+        assert!(!service
+            .inner
+            .web_control
+            .lock()
+            .expect("web control lock")
+            .writer_leases()
+            .is_busy());
+
+        let accepted_first = process_composer_submit(
             &service.inner,
-            "new-terminal-record".to_string(),
-            WebComposerMutationRecord {
-                fingerprint: u64::MAX,
-                status: WebComposerMutationStatus::Accepted {
-                    stable_session_key: key.clone(),
-                    accepted_sequence: 1,
-                    lease_generation: 1,
-                },
-                updated_at_epoch_ms: u64::MAX,
-            },
-        );
+            1,
+            "web-client",
+            "oldest-accepted".to_string(),
+            key.clone(),
+            accepted_text.to_string(),
+            Vec::new(),
+            generation,
+            1_101,
+        )
+        .expect("oldest accepted result is retained");
+        let accepted_retry = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "oldest-accepted".to_string(),
+            key.clone(),
+            accepted_text.to_string(),
+            Vec::new(),
+            generation,
+            1_102,
+        )
+        .expect("oldest accepted retry is retained");
+        assert_eq!(accepted_first, expected_accepted);
+        assert_eq!(accepted_retry, expected_accepted);
+
+        let rejected_first = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "oldest-rejected".to_string(),
+            key.clone(),
+            rejected_text.to_string(),
+            Vec::new(),
+            generation,
+            1_103,
+        )
+        .expect_err("oldest rejection is retained");
+        let rejected_retry = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "oldest-rejected".to_string(),
+            key,
+            rejected_text.to_string(),
+            Vec::new(),
+            generation,
+            1_104,
+        )
+        .expect_err("oldest rejected retry is retained");
+        assert_eq!(rejected_first.code, ComposerRejectCode::PtyRejected);
+        assert_eq!(rejected_retry.code, rejected_first.code);
+        assert_eq!(rejected_first.message, "remembered PTY rejection");
+        assert_eq!(rejected_retry.message, rejected_first.message);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
         let records = composer_mutations(&service.inner);
         assert_eq!(records.len(), MAX_COMPOSER_MUTATION_RECORDS);
-        assert!(records.contains_key("new-terminal-record"));
-        drop(records);
+        assert!(records.contains_key("oldest-accepted"));
+        assert!(records.contains_key("oldest-rejected"));
+        assert!(!records.contains_key("new-at-capacity-a"));
+        assert!(!records.contains_key("new-at-capacity-b"));
+    }
 
+    #[test]
+    fn full_composer_registry_never_evicts_in_flight_records() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
         ai_session(&service, "tab-a", "session-a");
+        let key = StableSessionKey::from_tab("tab-a");
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(None, Some(key.clone()), "tab-a"),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        {
+            let mut records = composer_mutations(&service.inner);
+            for index in 0..MAX_COMPOSER_MUTATION_RECORDS {
+                records.insert(
+                    format!("in-flight-{index}"),
+                    WebComposerMutationRecord {
+                        fingerprint: index as u64,
+                        status: WebComposerMutationStatus::InFlight,
+                    },
+                );
+            }
+        }
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_writes = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            callback_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+
+        let capacity = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "new-terminal-record".to_string(),
+            key,
+            "must not write".to_string(),
+            Vec::new(),
+            generation,
+            1_100,
+        )
+        .expect_err("a full in-flight registry rejects new IDs");
+        assert_eq!(
+            serde_json::to_value(capacity.code).expect("serialize rejection code"),
+            serde_json::json!("capacityExceeded")
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(!service
+            .inner
+            .web_control
+            .lock()
+            .expect("web control lock")
+            .writer_leases()
+            .is_busy());
+        let records = composer_mutations(&service.inner);
+        assert_eq!(records.len(), MAX_COMPOSER_MUTATION_RECORDS);
+        assert!(records.contains_key("in-flight-0"));
+        assert!(!records.contains_key("new-terminal-record"));
+    }
+
+    #[test]
+    fn busy_marker_without_registry_record_cannot_execute_the_same_mutation() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let key = StableSessionKey::from_tab("tab-a");
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(None, Some(key.clone()), "tab-a"),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let started = service
+            .inner
+            .web_control
+            .lock()
+            .expect("web control lock")
+            .writer_leases_mut()
+            .begin_mutation(1, "web-client", generation, "busy-gap", 1_050)
+            .expect("synthetic in-flight marker");
+        assert!(matches!(started, MutationBegin::Started(_)));
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_writes = writes.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            callback_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+
+        let duplicate = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "busy-gap".to_string(),
+            key,
+            "must not execute".to_string(),
+            Vec::new(),
+            generation,
+            1_100,
+        )
+        .expect_err("the lease's busy marker must fail closed");
+        assert_eq!(duplicate.code, ComposerRejectCode::MutationInFlight);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn concurrent_same_composer_mutation_writes_exactly_once() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let key = StableSessionKey::from_tab("tab-a");
+        let generation = build_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            resume_request(None, Some(key.clone()), "tab-a"),
+            1_000,
+        )
+        .writer_lease
+        .generation;
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_writes = writes.clone();
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let callback_release = release.clone();
+        service.set_terminal_input_handler(Some(Arc::new(move |_, _| {
+            let call = callback_writes.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                entered_tx.send(()).expect("first callback observer");
+                let (lock, cvar) = &*callback_release;
+                let mut released = lock.lock().expect("callback gate lock");
+                while !*released {
+                    released = cvar.wait(released).expect("callback gate wait");
+                }
+            }
+            Ok(())
+        })));
+        let first_inner = service.inner.clone();
+        let first_key = key.clone();
+        let first = std::thread::spawn(move || {
+            process_composer_submit(
+                &first_inner,
+                1,
+                "web-client",
+                "concurrent-id".to_string(),
+                first_key,
+                "write once".to_string(),
+                Vec::new(),
+                generation,
+                1_100,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first callback entered");
+
+        let duplicate = process_composer_submit(
+            &service.inner,
+            1,
+            "web-client",
+            "concurrent-id".to_string(),
+            key,
+            "write once".to_string(),
+            Vec::new(),
+            generation,
+            1_101,
+        );
+        let (lock, cvar) = &*release;
+        *lock.lock().expect("callback gate lock") = true;
+        cvar.notify_all();
+        first
+            .join()
+            .expect("first submit thread")
+            .expect("first submit accepted");
+        let duplicate = duplicate.expect_err("concurrent duplicate remains in flight");
+        assert_eq!(duplicate.code, ComposerRejectCode::MutationInFlight);
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn composer_terminal_errors_remain_bounded() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let key = StableSessionKey::from_tab("tab-a");
         let generation = build_resume_state(
             &service.inner,
             1,
@@ -3533,7 +3825,7 @@ mod tests {
         .expect_err("PTY failure");
         assert!(rejected.message.len() <= MAX_COMPOSER_ERROR_BYTES);
         assert!(rejected.message.is_char_boundary(rejected.message.len()));
-        assert!(composer_mutations(&service.inner).len() <= MAX_COMPOSER_MUTATION_RECORDS);
+        assert_eq!(composer_mutations(&service.inner).len(), 1);
     }
 
     #[test]

@@ -23,6 +23,13 @@ pub enum LeaseError {
     StaleGeneration { current_generation: u64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "the caller must distinguish a new mutation from an existing busy marker"]
+pub enum MutationBegin {
+    Started(WriterLease),
+    AlreadyInFlight(WriterLease),
+}
+
 #[derive(Debug)]
 pub struct WriterLeaseManager {
     lease_duration_ms: u64,
@@ -323,7 +330,7 @@ impl WriterLeaseManager {
         expected_generation: u64,
         mutation_id: &str,
         now_epoch_ms: u64,
-    ) -> Result<(WriterLease, bool), LeaseError> {
+    ) -> Result<MutationBegin, LeaseError> {
         if expected_generation != self.generation {
             return Err(LeaseError::StaleGeneration {
                 current_generation: self.generation,
@@ -338,7 +345,7 @@ impl WriterLeaseManager {
         }
         if let Some(active_mutation_id) = current.active_mutation_id.as_deref() {
             if active_mutation_id == mutation_id {
-                return Ok((current.clone(), false));
+                return Ok(MutationBegin::AlreadyInFlight(current.clone()));
             }
             return Err(LeaseError::ActiveOwner);
         }
@@ -347,7 +354,7 @@ impl WriterLeaseManager {
         current.last_input_at_epoch_ms = Some(now_epoch_ms);
         current.expires_at_epoch_ms = now_epoch_ms.saturating_add(self.lease_duration_ms);
         current.active_mutation_id = Some(mutation_id.to_string());
-        Ok((current.clone(), true))
+        Ok(MutationBegin::Started(current.clone()))
     }
 
     pub fn finish_mutation(
@@ -609,10 +616,10 @@ mod tests {
         let first = leases
             .acquire(1, "phone", "tab-a", 1_000)
             .expect("phone acquires");
-        let (_, started) = leases
+        let started = leases
             .begin_mutation(1, "phone", first.generation, "mutation-a", 1_100)
             .expect("mutation starts");
-        assert!(started);
+        assert!(matches!(started, MutationBegin::Started(_)));
 
         assert!(matches!(
             leases.acquire(2, "desktop", "tab-b", 5_000),
@@ -640,14 +647,15 @@ mod tests {
         let first = leases
             .acquire(1, "phone", "tab-a", 1_000)
             .expect("phone acquires");
-        leases
+        let started = leases
             .begin_mutation(1, "phone", first.generation, "mutation-a", 1_100)
             .expect("mutation starts");
+        assert!(matches!(started, MutationBegin::Started(_)));
 
-        let (_, newly_started) = leases
+        let retry = leases
             .begin_mutation(1, "phone", first.generation, "mutation-a", 1_101)
             .expect("identical retry observes in-flight marker");
-        assert!(!newly_started);
+        assert!(matches!(retry, MutationBegin::AlreadyInFlight(_)));
         assert!(matches!(
             leases.begin_mutation(1, "phone", first.generation, "mutation-b", 1_102),
             Err(LeaseError::ActiveOwner)
@@ -660,9 +668,10 @@ mod tests {
         let first = leases
             .acquire(1, "phone", "tab-a", 1_000)
             .expect("phone acquires");
-        leases
+        let started = leases
             .begin_mutation(1, "phone", first.generation, "mutation-a", 1_100)
             .expect("mutation starts");
+        assert!(matches!(started, MutationBegin::Started(_)));
 
         assert_eq!(
             leases.invalidate(),
@@ -710,10 +719,11 @@ mod tests {
             .writer_leases_mut()
             .acquire(1, "phone", "tab-a", 1_000)
             .expect("phone acquires");
-        control
+        let started = control
             .writer_leases_mut()
             .begin_mutation(1, "phone", lease.generation, "mutation-a", 1_100)
             .expect("mutation starts");
+        assert!(matches!(started, MutationBegin::Started(_)));
 
         assert!(matches!(
             control.request_controller(ControllerTarget::Native("desktop".to_string())),
@@ -747,10 +757,11 @@ mod tests {
             .writer_leases_mut()
             .acquire(1, "phone", "tab-a", 1_000)
             .expect("phone acquires");
-        control
+        let started = control
             .writer_leases_mut()
             .begin_mutation(1, "phone", lease.generation, "mutation-a", 1_100)
             .expect("mutation starts");
+        assert!(matches!(started, MutationBegin::Started(_)));
 
         assert_eq!(control.reset_web(true), ControllerRequest::Deferred);
         assert!(control.writer_leases().is_busy());
@@ -793,9 +804,10 @@ mod tests {
         let lease = leases
             .acquire(1, "phone", "tab-a", 1_000)
             .expect("phone acquires");
-        leases
+        let started = leases
             .begin_mutation(1, "phone", lease.generation, "mutation-a", 1_100)
             .expect("mutation starts");
+        assert!(matches!(started, MutationBegin::Started(_)));
 
         assert!(leases
             .authorize(1, "phone", lease.generation, 20_000)

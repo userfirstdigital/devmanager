@@ -74,6 +74,7 @@ pub enum ComposerRejectCode {
     StaleGeneration,
     MutationInFlight,
     MutationConflict,
+    CapacityExceeded,
     PtyRejected,
 }
 
