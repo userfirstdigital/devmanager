@@ -1021,6 +1021,9 @@ impl EditorPanel {
             (Self::Settings(draft), EditorField::Settings(SettingsField::RemotePort)) => {
                 Some(&draft.remote_port)
             }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteWebBindAddress)) => {
+                Some(&draft.remote_web_bind_address)
+            }
             (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteWebPort)) => {
                 Some(&draft.remote_web_port)
             }
@@ -1101,6 +1104,9 @@ impl EditorPanel {
             }
             (Self::Settings(draft), EditorField::Settings(SettingsField::RemotePort)) => {
                 Some(&mut draft.remote_port)
+            }
+            (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteWebBindAddress)) => {
+                Some(&mut draft.remote_web_bind_address)
             }
             (Self::Settings(draft), EditorField::Settings(SettingsField::RemoteWebPort)) => {
                 Some(&mut draft.remote_web_port)
@@ -1208,6 +1214,7 @@ pub struct SettingsDraft {
     pub remote_host_enabled: bool,
     pub remote_bind_address: String,
     pub remote_port: String,
+    pub remote_web_bind_address: String,
     pub remote_web_port: String,
     pub remote_pairing_token: String,
     pub remote_connect_address: String,
@@ -1362,6 +1369,7 @@ pub enum SettingsField {
     GitHubToken,
     RemoteBindAddress,
     RemotePort,
+    RemoteWebBindAddress,
     RemoteWebPort,
     RemoteConnectAddress,
     RemoteConnectPort,
@@ -1465,6 +1473,7 @@ pub enum EditorAction {
     ToggleRemoteHosting,
     RegenerateRemotePairingToken,
     ToggleRemoteWebHosting,
+    ApplyRemoteWebNetworkSettings,
     RegenerateRemoteWebPairingToken,
     ResetRemoteWebAccess,
     CopyRemoteWebPairingToken,
@@ -2649,6 +2658,20 @@ fn build_remote_browser_access_section(
 
     fields.push(FormField::custom(
         render_settings_text_input(
+            "Browser bind address",
+            "Use 127.0.0.1 for a proxy on this computer, or 0.0.0.0 for direct LAN access.",
+            draft.remote_web_bind_address.as_str(),
+            EditorField::Settings(SettingsField::RemoteWebBindAddress),
+            model,
+            actions,
+            Some(200.0),
+            "0.0.0.0",
+        )
+        .into_any_element(),
+    ));
+
+    fields.push(FormField::custom(
+        render_settings_text_input(
             "Browser port",
             "TCP port the browser listener binds to on your local network.",
             draft.remote_web_port.as_str(),
@@ -2659,6 +2682,16 @@ fn build_remote_browser_access_section(
             "43872",
         )
         .into_any_element(),
+    ));
+
+    fields.push(FormField::action(
+        FormAction::new(
+            "Save the browser bind address and port",
+            "Apply network settings",
+            (actions.on_action)(EditorAction::ApplyRemoteWebNetworkSettings),
+        )
+        .description("Save these values and restart browser access only when they changed.")
+        .style(SurfaceActionButtonStyle::Primary),
     ));
 
     fields.push(FormField::Info(
@@ -3776,6 +3809,7 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         remote_host_enabled: false,
         remote_bind_address: "0.0.0.0".to_string(),
         remote_port: "43871".to_string(),
+        remote_web_bind_address: "0.0.0.0".to_string(),
         remote_web_port: "43872".to_string(),
         remote_pairing_token: "ABC123".to_string(),
         remote_connect_address: "192.168.0.20".to_string(),
@@ -4166,6 +4200,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Copy token", "New token"]
         );
+    }
+
+    #[test]
+    fn browser_listener_bind_address_is_an_editable_setting() {
+        let mut panel = EditorPanel::Settings(sample_settings_draft(None));
+        let field = EditorField::Settings(SettingsField::RemoteWebBindAddress);
+
+        assert_eq!(panel.text_value(field).map(String::as_str), Some("0.0.0.0"));
+        *panel
+            .text_value_mut(field)
+            .expect("browser bind address should accept text") = "127.0.0.1".to_string();
+        assert_eq!(
+            panel.text_value(field).map(String::as_str),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn browser_listener_network_fields_have_an_explicit_apply_action() {
+        let draft = sample_settings_draft(None);
+        let model = settings_model(draft.clone());
+        let actions = dummy_editor_actions();
+        let sections = build_remote_tab_sections(&draft, RemoteTopTab::Host, &model, &actions);
+        let browser_section = section(&sections, "Browser Access");
+
+        assert!(browser_section.fields.iter().any(|field| match field {
+            FormField::Action(action) => action.value == "Apply network settings",
+            _ => false,
+        }));
     }
 
     #[test]

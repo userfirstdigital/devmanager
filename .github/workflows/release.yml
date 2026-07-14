@@ -7,12 +7,75 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
+env:
+  RUST_TOOLCHAIN: "1.94.0"
+  CARGO_PACKAGER_VERSION: "0.11.8"
+  NSIS_VERSION: "3.12.0"
+  WIX_VERSION: "3.14.1.20250415"
+  WIX_BINARY_VERSION: "3.14.1.8722"
+
+permissions:
+  contents: read
+
 jobs:
+  verify:
+    if: >-
+      github.ref == 'refs/heads/master' &&
+      (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Verify browser web UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix web ci --no-audit --no-fund
+          npm --prefix web audit --audit-level=high
+          npm --prefix web test
+          npm --prefix web run typecheck
+          rm -rf web/bundle
+          npm --prefix web run build
+          if [ -n "$(git status --porcelain -- web/bundle)" ]; then
+            git status --short -- web/bundle
+            git diff -- web/bundle
+            echo "Generated web/bundle differs from the tracked bundle." >&2
+            exit 1
+          fi
+
+      - name: Verify Rust source and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --locked --all-targets -- --test-threads=1
+
   prepare:
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]')
+    needs: verify
+    if: >-
+      github.ref == 'refs/heads/master' &&
+      (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -23,7 +86,7 @@ jobs:
       commit_sha: ${{ steps.commit.outputs.commit_sha }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
@@ -137,7 +200,7 @@ jobs:
         id: commit
         shell: bash
         env:
-          TARGET_BRANCH: ${{ github.ref_name }}
+          TARGET_BRANCH: master
           VERSION: ${{ steps.version.outputs.release_version }}
         run: |
           set -euo pipefail
@@ -171,7 +234,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.commit_sha }}
@@ -193,15 +256,17 @@ jobs:
           fi
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
@@ -222,38 +287,50 @@ jobs:
 
       - name: Install cargo-packager
         shell: bash
-        run: cargo install cargo-packager --locked
+        run: cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked
 
       - name: Install NSIS
         if: runner.os == 'Windows'
         shell: powershell
-        run: choco install nsis -y --no-progress
+        run: |
+          choco install nsis --version="$env:NSIS_VERSION" --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey failed to install NSIS $env:NSIS_VERSION."
+          }
+          $actual = (& makensis.exe /VERSION | Out-String).Trim()
+          if ($actual -ne "v3.12") {
+            throw "Unexpected NSIS version: $actual"
+          }
 
       - name: Ensure WiX Toolset
         if: runner.os == 'Windows' && matrix.platform == 'windows-x86_64'
         shell: powershell
         run: |
-          $requiredTools = @("candle.exe", "light.exe")
-          $missing = $requiredTools | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
-          if ($missing.Count -gt 0) {
-            choco install wixtoolset -y --no-progress
-            $wixRoot = Get-ChildItem "${env:ProgramFiles(x86)}" -Directory -Filter "WiX Toolset*" |
-              Sort-Object Name -Descending |
-              Select-Object -First 1
-            if ($wixRoot) {
-              $wixBin = Join-Path $wixRoot.FullName "bin"
-              if (Test-Path $wixBin) {
-                $env:Path = "$wixBin;$env:Path"
-                $wixBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-              }
-            }
+          choco install wixtoolset --version="$env:WIX_VERSION" --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey failed to install WiX $env:WIX_VERSION."
           }
 
-          foreach ($tool in $requiredTools) {
-            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+          $wixRoot = Get-ChildItem "${env:ProgramFiles(x86)}" -Directory -Filter "WiX Toolset*" |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          if (-not $wixRoot) {
+            throw "WiX installation directory was not found."
+          }
+          $wixBin = Join-Path $wixRoot.FullName "bin"
+          $candle = Join-Path $wixBin "candle.exe"
+          $light = Join-Path $wixBin "light.exe"
+          foreach ($tool in @($candle, $light)) {
+            if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) {
               throw "Missing WiX tool after setup: $tool"
             }
           }
+          $actual = (& $candle -? 2>&1 | Out-String)
+          if ($actual -notmatch [regex]::Escape($env:WIX_BINARY_VERSION)) {
+            throw "Unexpected WiX compiler version: $actual"
+          }
+          $env:Path = "$wixBin;$env:Path"
+          $wixBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Package app
         shell: bash
@@ -275,7 +352,7 @@ jobs:
           cp -R dist/packager/. "release-artifacts/${PLATFORM}/"
 
       - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.platform }}
           path: release-artifacts/${{ matrix.platform }}
@@ -288,12 +365,17 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: release-artifacts
 
-      - name: Generate latest.json manifest
+      - name: Validate and stage the release contract
         shell: bash
         env:
           REPO: ${{ github.repository }}
@@ -305,12 +387,36 @@ jobs:
           import json
           import os
           import pathlib
+          import shutil
 
           root = pathlib.Path("release-artifacts")
           repo = os.environ["REPO"]
           version = os.environ["VERSION"]
           tag_name = os.environ["TAG_NAME"]
-          required_platforms = {
+          publish_dir = pathlib.Path("publish-assets")
+          if publish_dir.exists():
+              shutil.rmtree(publish_dir)
+          publish_dir.mkdir()
+
+          required_assets = {
+              "windows-x86_64": [
+                  ("Windows x64 NSIS installer", "*_x64-setup.exe"),
+                  ("Windows x64 NSIS signature", "*_x64-setup.exe.sig"),
+                  ("Windows x64 WiX installer", "*.msi"),
+                  ("Windows x64 WiX signature", "*.msi.sig"),
+              ],
+              "windows-aarch64": [
+                  ("Windows ARM64 NSIS installer", "*_arm64-setup.exe"),
+                  ("Windows ARM64 NSIS signature", "*_arm64-setup.exe.sig"),
+              ],
+              "macos-aarch64": [
+                  ("macOS updater archive", "*.app.tar.gz"),
+                  ("macOS updater signature", "*.app.tar.gz.sig"),
+                  ("macOS disk image", "*.dmg"),
+                  ("macOS disk image signature", "*.dmg.sig"),
+              ],
+          }
+          updater_assets = {
               "windows-x86_64": {
                   "pattern": "*_x64-setup.exe",
                   "format": "nsis",
@@ -326,13 +432,16 @@ jobs:
           }
 
           def pick_single_asset(directory: pathlib.Path, pattern: str, label: str) -> pathlib.Path:
-              matches = sorted(directory.glob(pattern))
+              matches = sorted(path for path in directory.glob(pattern) if path.is_file())
               if len(matches) != 1:
                   raise SystemExit(
                       f"Expected exactly one {label} matching {pattern!r} in {directory}, "
                       f"found {len(matches)}."
                   )
-              return matches[0]
+              asset = matches[0]
+              if asset.stat().st_size <= 0:
+                  raise SystemExit(f"Required release asset is empty: {asset}")
+              return asset
 
           def read_signature(path: pathlib.Path) -> str:
               if not path.is_file():
@@ -342,8 +451,27 @@ jobs:
                   raise SystemExit(f"Updater signature is empty: {path}")
               return signature
 
+          selected = []
+          for platform, contract in required_assets.items():
+              directory = root / platform
+              if not directory.is_dir():
+                  raise SystemExit(f"Missing packaged artifacts for {platform}: {directory}")
+              for label, pattern in contract:
+                  asset = pick_single_asset(directory, pattern, label)
+                  selected.append(asset)
+                  if asset.suffix == ".sig":
+                      read_signature(asset)
+
+          names = [asset.name for asset in selected]
+          if len(selected) != 10 or len(names) != len(set(names)):
+              raise SystemExit(
+                  f"Release contract requires 10 uniquely named platform files, found {sorted(names)}"
+              )
+          for asset in selected:
+              shutil.copy2(asset, publish_dir / asset.name)
+
           platforms = {}
-          for platform, metadata in required_platforms.items():
+          for platform, metadata in updater_assets.items():
               directory = root / platform
               if not directory.is_dir():
                   raise SystemExit(f"Missing packaged artifacts for {platform}: {directory}")
@@ -361,22 +489,176 @@ jobs:
               "pub_date": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": platforms,
           }
-          pathlib.Path("latest.json").write_text(
+          manifest_path = publish_dir / "latest.json"
+          manifest_path.write_text(
               json.dumps(manifest, indent=2) + "\n",
               encoding="utf-8",
           )
+          if manifest_path.stat().st_size <= 0:
+              raise SystemExit("Generated latest.json is empty")
+          print(f"Validated and staged {len(selected) + 1} required release assets.")
           PY
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag_name }}
-          name: DevManager ${{ needs.prepare.outputs.release_version }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            release-artifacts/windows-x86_64/*
-            release-artifacts/windows-aarch64/*
-            release-artifacts/macos-aarch64/*
-            latest.json
+      - name: Create and validate release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.commit_sha }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+            ACTUAL_SHA="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+            if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+              echo "Release tag ${TAG_NAME} points to ${ACTUAL_SHA}, expected ${EXPECTED_SHA}." >&2
+              exit 1
+            fi
+          else
+            git tag "${TAG_NAME}" "${EXPECTED_SHA}"
+            git push origin "refs/tags/${TAG_NAME}"
+          fi
+          git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          ACTUAL_SHA="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "Release tag ${TAG_NAME} points to ${ACTUAL_SHA}, expected ${EXPECTED_SHA}." >&2
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          url = f"https://api.github.com/repos/{os.environ['REPO']}/releases/tags/{os.environ['TAG_NAME']}"
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "User-Agent": "devmanager-release-workflow",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  release = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  raise SystemExit(0)
+              raise SystemExit(f"Release lookup failed closed with HTTP {error.code}: {error.reason}")
+          except (urllib.error.URLError, TimeoutError) as error:
+              raise SystemExit(f"Release lookup failed closed: {error}")
+          raise SystemExit(
+              f"Release {release.get('tag_name')} already exists "
+              f"(draft={release.get('draft')}); refusing to mutate it."
+          )
+          PY
+
+      - name: Create draft release and upload assets
+        id: draft_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.commit_sha }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          VERSION: ${{ needs.prepare.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG_NAME}" publish-assets/* \
+            --repo "${REPO}" \
+            --draft \
+            --latest=false \
+            --verify-tag \
+            --target "${EXPECTED_SHA}" \
+            --title "DevManager ${VERSION}" \
+            --generate-notes
+          RELEASE_ID="$(gh api "repos/${REPO}/releases/tags/${TAG_NAME}" --jq .id)"
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "Draft release ${TAG_NAME} did not return an id." >&2
+            exit 1
+          fi
+          echo "id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify draft assets and publish atomically
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.commit_sha }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.id }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          ACTUAL_SHA="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "Draft tag ${TAG_NAME} points to ${ACTUAL_SHA}, expected ${EXPECTED_SHA}." >&2
+            exit 1
+          fi
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          expected_paths = sorted(
+              path for path in pathlib.Path("publish-assets").iterdir() if path.is_file()
+          )
+          expected = {
+              path.name: {
+                  "size": path.stat().st_size,
+                  "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+              for path in expected_paths
+          }
+          if len(expected) != 11 or any(metadata["size"] <= 0 for metadata in expected.values()):
+              raise SystemExit(
+                  f"Expected exactly 11 non-empty staged release assets, found {sorted(expected)}"
+              )
+          assets = json.loads(
+              subprocess.check_output(
+                  [
+                      "gh",
+                      "api",
+                      f"repos/{os.environ['REPO']}/releases/{os.environ['RELEASE_ID']}/assets",
+                  ],
+                  text=True,
+              )
+          )
+          actual = {asset["name"]: asset for asset in assets}
+          if sorted(actual) != sorted(expected):
+              raise SystemExit(
+                  "Draft asset mismatch. "
+                  f"Expected {sorted(expected)}, found {sorted(actual)}."
+              )
+          for name, metadata in expected.items():
+              asset = actual[name]
+              if asset.get("state") != "uploaded":
+                  raise SystemExit(f"Draft asset {name} is not fully uploaded: {asset.get('state')}")
+              if asset.get("size") != metadata["size"]:
+                  raise SystemExit(
+                      f"Draft asset {name} size mismatch: expected {metadata['size']}, "
+                      f"found {asset.get('size')}"
+                  )
+              if asset.get("digest") != metadata["digest"]:
+                  raise SystemExit(
+                      f"Draft asset {name} digest mismatch: expected {metadata['digest']}, "
+                      f"found {asset.get('digest')}"
+                  )
+          print(f"Verified names, sizes, and SHA-256 digests for {len(actual)} draft assets.")
+          PY
+          gh api \
+            --method PATCH \
+            "repos/${REPO}/releases/${RELEASE_ID}" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true \
+            >/dev/null
+          if [ "$(gh api "repos/${REPO}/releases/${RELEASE_ID}" --jq .draft)" != "false" ]; then
+            echo "Release ${TAG_NAME} did not leave draft state." >&2
+            exit 1
+          fi

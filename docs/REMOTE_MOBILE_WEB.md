@@ -30,9 +30,11 @@ AI presentation density defaults to **Calm**. Settings also offers **Minimal** a
 
 ## Pairing and addresses
 
-Enable **Settings → Browser Web UI** in the native app. The default listener binds to port `43872` and displays a one-time pairing URL. Opening that URL stores a signed, host-specific, `HttpOnly` cookie and redirects into the app. Revoking a paired browser in the native settings invalidates its access.
+Enable **Settings → Remote → Host → Browser Access** in the native app. The listener defaults to `0.0.0.0:43872` for direct LAN use. Set **Browser bind address** to `127.0.0.1` when the trusted HTTPS proxy runs on the same computer. A successful invite is atomically single-use: it pairs one browser, rotates the future-pairing token, stores a signed host-specific cookie, and redirects into the app. Existing paired browsers remain valid until **Reset access** or an individual revoke invalidates them.
 
 Plain LAN HTTP remains useful for diagnostics and control, but modern iPhone platform features require a secure context. Use a trusted HTTPS tunnel or reverse proxy for the installed experience. The proxy must preserve WebSocket upgrades and forward `/api/**`, `/pair`, the app shell, the manifest, and the service worker to the same DevManager listener.
+
+Pair through the public origin itself. Copy the invite, retain its `/pair?t=...` path and query, replace the displayed local scheme/authority with the final `https://<public-host>`, and open that URL once in Safari. Pairing over the local HTTP URL and then navigating to the public hostname does not work: browser cookies are scoped to the authority that issued them.
 
 The trusted proxy must remove any client-supplied forwarding headers and set exactly one value for each of these headers on every forwarded HTTP and WebSocket request:
 
@@ -45,10 +47,28 @@ X-Forwarded-Host: <the public host, including a non-default port>
 
 Do not expose port `43872` directly to the public internet. Keep DevManager's cookie and pairing boundaries intact; do not add a proxy cache in front of authenticated API routes.
 
+## Production proxy and network checklist
+
+Use one of these topologies:
+
+- **Same-host proxy (recommended):** set **Browser bind address** to `127.0.0.1`; expose only the proxy's TCP `443` listener. No firewall rule is needed for `43872`.
+- **Proxy on another trusted machine:** bind to the specific private interface where possible, allow TCP `43872` only from the proxy's private IP, and deny every other source. Do not use a broad public-network or UDP rule.
+
+Before pairing a phone, verify all of the following:
+
+- the public hostname has a trusted, current TLS certificate and redirects HTTP to HTTPS without putting the invite token into an intermediate host
+- the proxy removes client-supplied `Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and related forwarding headers, then supplies the single canonical values documented above
+- WebSocket upgrades and long-lived connections are enabled; idle timeouts are long enough that ordinary phone backgrounding is handled by DevManager's reconnect path rather than a rapid proxy reconnect loop
+- `/api/**`, `/pair`, and authenticated responses are never cached; the proxy does not rewrite the service worker, manifest, hashed assets, cookies, or CSP headers
+- access logs omit or redact the `/pair` query string because it contains the one-time invitation; application/error logs must not record cookies, authorization values, request bodies, prompt text, or attachment content
+- the origin is dedicated to this DevManager host; do not multiplex another app under the same authority and path space
+
+The native app's `remote.json` contains cookie, pairing, TLS, and push credentials. DevManager writes it with current-user-only file permissions. Backups and diagnostic bundles must preserve that confidentiality and must not publish the file.
+
 ## Install on iPhone
 
 1. Pair through the trusted HTTPS origin in Safari.
-2. Confirm the app loads and Settings reports a secure context.
+2. Confirm the app loads and Settings does not show **Requires a secure HTTPS address** in the notification row.
 3. Choose **Share → Add to Home Screen**.
 4. Launch the new DevManager icon rather than the original Safari tab.
 
@@ -86,6 +106,31 @@ The cached shell can open while the host is unreachable, but it intentionally sh
 ## Security boundary
 
 The browser protocol is separate from the native remote protocol and exposes allowlisted, redacted DTOs and actions. It does not serialize SSH passwords or private keys, provider tokens, environment values, startup commands, arbitrary native settings, or unrelated sessions. Mutation payloads, image attachments, replay journals, queues, and HTTP bodies have explicit limits. Push endpoints require the paired browser cookie and subscriptions are associated with that browser installation.
+
+## Go-live smoke test
+
+A push to `master` starts release packaging. The release stays private in draft state until its complete asset-name set and exact tag commit pass the final check. Confirm the GitHub Actions `verify` job, version preparation, all platform builds, and release job are green. Confirm the published release tag points to the exact prepared commit, `latest.json` has the same version and expected platform URLs, and each updater asset has a non-empty `.sig` file.
+
+Do not restart the workstation's active DevManager host merely to test the artifact. Install on a clean/secondary Windows profile first and check:
+
+1. `https://<public-host>/api/health` returns `{"ok":true}` without a cache hit.
+2. The HTTPS app shell and manifest load, while an unpaired `/api/me` returns `401`.
+3. One public-origin invitation succeeds, immediate reuse of that same invitation returns `401`, and the new invite shown by the host is different.
+4. The installed Home Screen app connects its WebSocket, lists the expected projects/sessions, and sends one real prompt.
+5. Lock/background the phone, change state from the desktop, and return. The phone reconnects to the same runtime and current state without a Resume or Reconnect action.
+6. Drop and restore the phone network. Pending acknowledged input is not duplicated and current output catches up automatically.
+7. Reset browser access. Existing browser connections close and the old invite/cookie no longer authorize access.
+8. On the secondary host only, restart DevManager. The phone accepts the new blank runtime without resurrecting the old transcript or draft.
+9. Confirm the native updater verifies and offers the release before scheduling the real host restart at a point where losing the current in-memory web runtime is acceptable.
+
+## Release rollback
+
+- **Failure before GitHub Release publication:** leave the running host untouched and fix forward. If the workflow created an unpublished draft and orphan tag, delete both before retrying only after confirming that version was never public.
+- **Bad public artifact before installation:** immediately remove the bad GitHub Release so `releases/latest` falls back to the last good manifest, but retain its tag so that version can never be reused. Fix forward and publish the next higher version. A subsequent successful authoritative check replaces or discards a downloaded-but-uninstalled recalled update; until that check completes, tell affected clients not to choose **Restart to update**. Keep a copy of the failed workflow/artifact evidence for diagnosis.
+- **Bad artifact already installed:** stop further distribution, preserve the user's profile, and fix forward. Do not install an older binary over a profile written by a newer version unless backward compatibility has been explicitly verified.
+- **Proxy-only failure:** remove public routing or close TCP `443`; do not stop DevManager or delete `remote.json`. Existing native sessions continue under the desktop host while the web surface is unavailable.
+
+Installing an update restarts the native host and therefore intentionally creates a new web runtime. Schedule that restart; pushing and publishing alone do not disturb the currently running process.
 
 ## Develop and verify the web app
 

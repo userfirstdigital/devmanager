@@ -3294,9 +3294,7 @@ fn dispatch_composer_submit_for_connection(
                         return;
                     }
                 };
-            let host_service = RemoteHostService {
-                inner: fence.inner.clone(),
-            };
+            let host_service = RemoteHostService::borrowed(fence.inner.clone());
             let reconciliation = match session_kind {
                 SessionKind::Claude => host_service.reserve_claude_composer_prompt(
                     &mutation_id,

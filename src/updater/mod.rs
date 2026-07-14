@@ -309,7 +309,7 @@ impl UpdaterService {
                         Self::spawn_download_thread(inner, update);
                     }
                     Ok(AutoDownloadAction::KeepReady) => {
-                        inner.finish_check_without_update(check_plan);
+                        inner.restore_ready_snapshot(None);
                     }
                     Err(error) => inner.finish_check_error(
                         check_plan,
@@ -319,7 +319,7 @@ impl UpdaterService {
                         ),
                     ),
                 },
-                Ok(None) => inner.finish_check_without_update(check_plan),
+                Ok(None) => inner.finish_check_without_update(),
                 Err(error) => inner.finish_check_error(
                     check_plan,
                     format!("Update check failed: {error}"),
@@ -423,11 +423,8 @@ impl UpdaterInner {
         Ok(CheckPlan::Fresh)
     }
 
-    fn finish_check_without_update(&self, plan: CheckPlan) {
-        match plan {
-            CheckPlan::Fresh => self.set_up_to_date(),
-            CheckPlan::PreserveReady => self.restore_ready_snapshot(None),
-        }
+    fn finish_check_without_update(&self) {
+        self.set_up_to_date();
     }
 
     fn finish_check_error(&self, plan: CheckPlan, message: String) {
@@ -464,8 +461,8 @@ impl UpdaterInner {
         }
         if let Some(ready_update) = state.ready_update.as_ref() {
             match compare_versions(&update.version, &ready_update.update.version)? {
-                Ordering::Greater => {}
-                Ordering::Equal | Ordering::Less => return Ok(AutoDownloadAction::KeepReady),
+                Ordering::Equal => return Ok(AutoDownloadAction::KeepReady),
+                Ordering::Greater | Ordering::Less => state.ready_update = None,
             }
         }
         state.pending_update = Some(update.clone());
@@ -841,7 +838,7 @@ mod tests {
                 .ready_update
                 .as_ref()
                 .map(|update| update.update.version.as_str()),
-            Some("0.2.1")
+            None
         );
     }
 
@@ -862,18 +859,91 @@ mod tests {
     }
 
     #[test]
-    fn failed_replacement_download_keeps_existing_ready_update() {
+    fn failed_authoritative_replacement_cannot_restore_superseded_ready_update() {
         let inner = test_inner();
         let ready_update = test_update("0.2.1", Some("old release"));
+        let replacement = test_update("0.2.2", Some("new release"));
 
         inner.set_ready_to_install(ready_update, vec![1, 2, 3]);
+        assert_eq!(
+            inner.prepare_auto_download(&replacement).unwrap(),
+            AutoDownloadAction::Start
+        );
         inner.restore_ready_after_failed_download("Download failed".to_string());
 
         let state = inner.state.read().unwrap();
-        assert_eq!(state.snapshot.stage, UpdaterStage::ReadyToInstall);
-        assert_eq!(state.snapshot.target_version.as_deref(), Some("0.2.1"));
-        assert_eq!(state.snapshot.release_notes.as_deref(), Some("old release"));
-        assert_eq!(state.snapshot.downloaded_bytes, 3);
+        assert_eq!(state.snapshot.stage, UpdaterStage::Error);
+        assert!(state.snapshot.target_version.is_none());
+        assert!(state.snapshot.release_notes.is_none());
+        assert_eq!(state.snapshot.downloaded_bytes, 0);
+        assert!(state.ready_update.is_none());
+    }
+
+    #[test]
+    fn authoritative_no_update_discards_ready_update_while_check_error_preserves_it() {
+        let error_inner = test_inner();
+        error_inner.set_ready_to_install(
+            test_update("0.2.1", Some("recalled release")),
+            vec![1, 2, 3],
+        );
+        let error_plan = error_inner.prepare_check().unwrap();
+        error_inner.finish_check_error(error_plan, "Update check failed".to_string());
+
+        {
+            let state = error_inner.state.read().unwrap();
+            assert_eq!(state.snapshot.stage, UpdaterStage::ReadyToInstall);
+            assert_eq!(state.snapshot.target_version.as_deref(), Some("0.2.1"));
+            assert_eq!(state.snapshot.downloaded_bytes, 3);
+            assert!(state.ready_update.is_some());
+        }
+
+        let no_update_inner = test_inner();
+        no_update_inner.set_ready_to_install(
+            test_update("0.2.1", Some("recalled release")),
+            vec![1, 2, 3],
+        );
+        no_update_inner.prepare_check().unwrap();
+        no_update_inner.finish_check_without_update();
+
+        let state = no_update_inner.state.read().unwrap();
+        assert_eq!(state.snapshot.stage, UpdaterStage::UpToDate);
+        assert!(state.snapshot.target_version.is_none());
+        assert!(state.snapshot.release_notes.is_none());
+        assert_eq!(state.snapshot.downloaded_bytes, 0);
+        assert!(state.snapshot.total_bytes.is_none());
+        assert!(state.ready_update.is_none());
+    }
+
+    #[test]
+    fn authoritative_lower_release_discards_recalled_ready_update_before_downloading() {
+        let inner = test_inner();
+        inner.set_ready_to_install(
+            test_update("0.3.0", Some("recalled release")),
+            vec![1, 2, 3],
+        );
+        assert_eq!(inner.prepare_check().unwrap(), CheckPlan::PreserveReady);
+
+        let authoritative_update = test_update("0.2.1", Some("fallback release"));
+        assert_eq!(
+            inner.prepare_auto_download(&authoritative_update).unwrap(),
+            AutoDownloadAction::Start
+        );
+
+        {
+            let state = inner.state.read().unwrap();
+            assert_eq!(state.snapshot.stage, UpdaterStage::Downloading);
+            assert_eq!(state.snapshot.target_version.as_deref(), Some("0.2.1"));
+            assert_eq!(state.snapshot.downloaded_bytes, 0);
+            assert!(state.ready_update.is_none());
+        }
+
+        inner.restore_ready_after_failed_download("Download failed".to_string());
+
+        let state = inner.state.read().unwrap();
+        assert_eq!(state.snapshot.stage, UpdaterStage::Error);
+        assert!(state.ready_update.is_none());
+        assert!(state.snapshot.target_version.is_none());
+        assert_eq!(state.snapshot.downloaded_bytes, 0);
     }
 
     #[test]

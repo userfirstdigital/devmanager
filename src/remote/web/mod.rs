@@ -75,7 +75,9 @@ impl WebConfig {
         if self.pairing_token.is_empty() {
             self.pairing_token = generate_web_pairing_token();
         }
-        if self.cookie_secret_hex.is_empty() {
+        let cookie_secret_is_valid =
+            auth::hex_decode(&self.cookie_secret_hex).is_some_and(|secret| secret.len() == 32);
+        if !cookie_secret_is_valid {
             self.cookie_secret_hex = generate_cookie_secret_hex();
         }
         if self.bind_address.is_empty() {
@@ -568,35 +570,6 @@ async fn pair_handler(
         }
     }
 
-    // Read current config snapshot.
-    let (expected_token, cookie_secret_hex, cookie_name) = {
-        let Ok(config) = state.inner.config.read() else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "config unavailable").into_response();
-        };
-        if !config.web.enabled {
-            return (StatusCode::FORBIDDEN, "web UI disabled").into_response();
-        }
-        (
-            config.web.pairing_token.clone(),
-            config.web.cookie_secret_hex.clone(),
-            cookie_name_for_server_id(&config.server_id),
-        )
-    };
-
-    if provided != expected_token {
-        let throttle = state
-            .pairing_attempts
-            .lock()
-            .ok()
-            .map(|mut pairing_attempts| pairing_attempts.record_failure(client_ip, Instant::now()))
-            .unwrap_or(PairingThrottleStatus::Allowed);
-        return pair_token_rejected_response(throttle);
-    }
-
-    if let Ok(mut pairing_attempts) = state.pairing_attempts.lock() {
-        pairing_attempts.record_success(client_ip);
-    }
-
     let nickname = query
         .label
         .filter(|l| !l.is_empty())
@@ -610,31 +583,53 @@ async fn pair_handler(
         .browser_install_id
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());
-    let client_id = match super::mutate_host_config(&state.inner, |config| {
-        let client_id = if let Some(browser_install_id) = browser_install_id.as_deref() {
-            if let Some(existing) = config
-                .web
-                .paired_clients
-                .iter_mut()
-                .find(|client| client.browser_install_id == browser_install_id)
-            {
-                existing.last_seen_epoch_ms = Some(now);
-                existing.last_seen_ip = Some(client_ip_string.clone());
-                existing.label = metadata.label.clone();
-                existing.user_agent = metadata.user_agent.clone();
-                existing.browser_family = metadata.browser_family.clone();
-                existing.browser_version = metadata.browser_version.clone();
-                existing.os_family = metadata.os_family.clone();
-                existing.device_class = metadata.device_class.clone();
-                if nickname.is_some() {
-                    existing.nickname = nickname.clone();
+    let paired = match super::mutate_host_config_if(
+        &state.inner,
+        |config| config.web.enabled && provided == config.web.pairing_token,
+        |config| {
+            config.web.pairing_token = generate_web_pairing_token();
+            let client_id = if let Some(browser_install_id) = browser_install_id.as_deref() {
+                if let Some(existing) = config
+                    .web
+                    .paired_clients
+                    .iter_mut()
+                    .find(|client| client.browser_install_id == browser_install_id)
+                {
+                    existing.last_seen_epoch_ms = Some(now);
+                    existing.last_seen_ip = Some(client_ip_string.clone());
+                    existing.label = metadata.label.clone();
+                    existing.user_agent = metadata.user_agent.clone();
+                    existing.browser_family = metadata.browser_family.clone();
+                    existing.browser_version = metadata.browser_version.clone();
+                    existing.os_family = metadata.os_family.clone();
+                    existing.device_class = metadata.device_class.clone();
+                    if nickname.is_some() {
+                        existing.nickname = nickname.clone();
+                    }
+                    existing.client_id.clone()
+                } else {
+                    let client_id = generate_web_client_id();
+                    config.web.paired_clients.push(PairedWebClient {
+                        client_id: client_id.clone(),
+                        browser_install_id: browser_install_id.to_string(),
+                        nickname: nickname.clone(),
+                        label: metadata.label.clone(),
+                        issued_at_epoch_ms: Some(now),
+                        last_seen_epoch_ms: Some(now),
+                        last_seen_ip: Some(client_ip_string.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                        browser_family: metadata.browser_family.clone(),
+                        browser_version: metadata.browser_version.clone(),
+                        os_family: metadata.os_family.clone(),
+                        device_class: metadata.device_class.clone(),
+                    });
+                    client_id
                 }
-                existing.client_id.clone()
             } else {
                 let client_id = generate_web_client_id();
                 config.web.paired_clients.push(PairedWebClient {
                     client_id: client_id.clone(),
-                    browser_install_id: browser_install_id.to_string(),
+                    browser_install_id: client_id.clone(),
                     nickname: nickname.clone(),
                     label: metadata.label.clone(),
                     issued_at_epoch_ms: Some(now),
@@ -647,50 +642,58 @@ async fn pair_handler(
                     device_class: metadata.device_class.clone(),
                 });
                 client_id
-            }
-        } else {
-            let client_id = generate_web_client_id();
-            config.web.paired_clients.push(PairedWebClient {
-                client_id: client_id.clone(),
-                browser_install_id: client_id.clone(),
-                nickname: nickname.clone(),
-                label: metadata.label.clone(),
-                issued_at_epoch_ms: Some(now),
-                last_seen_epoch_ms: Some(now),
-                last_seen_ip: Some(client_ip_string.clone()),
-                user_agent: metadata.user_agent.clone(),
-                browser_family: metadata.browser_family.clone(),
-                browser_version: metadata.browser_version.clone(),
-                os_family: metadata.os_family.clone(),
-                device_class: metadata.device_class.clone(),
-            });
-            client_id
-        };
+            };
 
-        super::append_remote_access_activity_event(
-            config,
-            RemoteAccessActivityEvent {
-                client_id: client_id.clone(),
-                source: RemoteAccessSource::Browser,
-                event_kind: RemoteAccessActivityKind::Paired,
-                label: config
-                    .web
-                    .paired_clients
-                    .iter()
-                    .find(|client| client.client_id == client_id)
-                    .map(browser_display_label)
-                    .unwrap_or_else(|| metadata.label.clone()),
-                ip_address: Some(client_ip_string.clone()),
-                event_at_epoch_ms: Some(now),
-                browser_family: metadata.browser_family.clone(),
-                browser_version: metadata.browser_version.clone(),
-                os_family: metadata.os_family.clone(),
-                device_class: metadata.device_class.clone(),
-            },
-        );
-        client_id
-    }) {
-        Ok(client_id) => client_id,
+            super::append_remote_access_activity_event(
+                config,
+                RemoteAccessActivityEvent {
+                    client_id: client_id.clone(),
+                    source: RemoteAccessSource::Browser,
+                    event_kind: RemoteAccessActivityKind::Paired,
+                    label: config
+                        .web
+                        .paired_clients
+                        .iter()
+                        .find(|client| client.client_id == client_id)
+                        .map(browser_display_label)
+                        .unwrap_or_else(|| metadata.label.clone()),
+                    ip_address: Some(client_ip_string.clone()),
+                    event_at_epoch_ms: Some(now),
+                    browser_family: metadata.browser_family.clone(),
+                    browser_version: metadata.browser_version.clone(),
+                    os_family: metadata.os_family.clone(),
+                    device_class: metadata.device_class.clone(),
+                },
+            );
+            (
+                client_id,
+                config.web.cookie_secret_hex.clone(),
+                cookie_name_for_server_id(&config.server_id),
+            )
+        },
+    ) {
+        Ok(Some(paired)) => paired,
+        Ok(None) => {
+            let web_enabled = match state.inner.config.read() {
+                Ok(config) => config.web.enabled,
+                Err(_) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "config unavailable")
+                        .into_response();
+                }
+            };
+            if !web_enabled {
+                return (StatusCode::FORBIDDEN, "web UI disabled").into_response();
+            }
+            let throttle = state
+                .pairing_attempts
+                .lock()
+                .ok()
+                .map(|mut pairing_attempts| {
+                    pairing_attempts.record_failure(client_ip, Instant::now())
+                })
+                .unwrap_or(PairingThrottleStatus::Allowed);
+            return pair_token_rejected_response(throttle);
+        }
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -699,6 +702,11 @@ async fn pair_handler(
                 .into_response();
         }
     };
+    let (client_id, cookie_secret_hex, cookie_name) = paired;
+
+    if let Ok(mut pairing_attempts) = state.pairing_attempts.lock() {
+        pairing_attempts.record_success(client_ip);
+    }
 
     let Some(signed) = sign_cookie(&cookie_secret_hex, &client_id) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "cookie signing failed").into_response();
@@ -1112,6 +1120,19 @@ mod tests {
         RemoteHostService::new(config)
     }
 
+    #[test]
+    fn web_config_repairs_malformed_cookie_signing_secret() {
+        let mut config = WebConfig::default();
+        config.cookie_secret_hex = "not-a-32-byte-hex-secret".to_string();
+
+        config.ensure_secrets();
+
+        let decoded = auth::hex_decode(&config.cookie_secret_hex)
+            .expect("repaired cookie secret should be hexadecimal");
+        assert_eq!(decoded.len(), 32);
+        assert!(sign_cookie(&config.cookie_secret_hex, "client").is_some());
+    }
+
     fn test_state(service: &RemoteHostService) -> Arc<WebState> {
         Arc::new(WebState {
             inner: service.inner.clone(),
@@ -1173,12 +1194,20 @@ mod tests {
     }
 
     async fn pair_cookie_headers(state: Arc<WebState>, install_id: &str) -> HeaderMap {
+        let pairing_token = state
+            .inner
+            .config
+            .read()
+            .expect("host config")
+            .web
+            .pairing_token
+            .clone();
         let response = pair_handler(
             State(state),
             ConnectInfo(test_addr()),
             test_headers(None),
             Query(PairQuery {
-                t: Some("PAIR1234".to_string()),
+                t: Some(pairing_token),
                 label: None,
                 browser_install_id: Some(install_id.to_string()),
             }),
@@ -2076,6 +2105,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let saved = load_remote_machine_state().expect("load persisted remote state");
         assert_eq!(saved.host.web.paired_clients.len(), 1);
+        assert_ne!(saved.host.web.pairing_token, "PAIR1234");
         assert_eq!(
             saved.host.web.paired_clients[0].nickname.as_deref(),
             Some("Phone")
@@ -2125,6 +2155,96 @@ mod tests {
     }
 
     #[test]
+    fn pair_handler_rejects_sequential_reuse_of_consumed_invitation() {
+        let _profile = TestProfileGuard::new("web-pair-single-use-sequential");
+        let service = test_service("host-a");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let first = runtime.block_on(pair_handler(
+            State(state.clone()),
+            ConnectInfo(test_addr()),
+            test_headers(None),
+            Query(PairQuery {
+                t: Some("PAIR1234".to_string()),
+                label: None,
+                browser_install_id: Some("phone-install".to_string()),
+            }),
+        ));
+        let reused = runtime.block_on(pair_handler(
+            State(state),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 2], 43872))),
+            test_headers(None),
+            Query(PairQuery {
+                t: Some("PAIR1234".to_string()),
+                label: None,
+                browser_install_id: Some("tablet-install".to_string()),
+            }),
+        ));
+        drop(runtime);
+
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+        assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+        let config = service.config();
+        assert_eq!(config.web.paired_clients.len(), 1);
+        assert_ne!(config.web.pairing_token, "PAIR1234");
+    }
+
+    #[test]
+    fn pair_handler_atomically_consumes_invitation_for_concurrent_requests() {
+        let _profile = TestProfileGuard::new("web-pair-single-use-concurrent");
+        let service = test_service("host-a");
+        let state = test_state(&service);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let mut statuses = runtime.block_on(async {
+            let start = Arc::new(tokio::sync::Barrier::new(2));
+            let mut requests = Vec::new();
+            for (index, browser_install_id) in
+                ["phone-install", "tablet-install"].into_iter().enumerate()
+            {
+                let state = state.clone();
+                let start = start.clone();
+                requests.push(tokio::spawn(async move {
+                    start.wait().await;
+                    pair_handler(
+                        State(state),
+                        ConnectInfo(SocketAddr::from(([127, 0, 0, (index + 1) as u8], 43872))),
+                        test_headers(None),
+                        Query(PairQuery {
+                            t: Some("PAIR1234".to_string()),
+                            label: None,
+                            browser_install_id: Some(browser_install_id.to_string()),
+                        }),
+                    )
+                    .await
+                    .status()
+                }));
+            }
+
+            let mut statuses = Vec::new();
+            for request in requests {
+                statuses.push(request.await.expect("pair request task"));
+            }
+            statuses
+        });
+        drop(runtime);
+
+        statuses.sort_unstable();
+        assert_eq!(statuses, [StatusCode::SEE_OTHER, StatusCode::UNAUTHORIZED]);
+        let config = service.config();
+        assert_eq!(config.web.paired_clients.len(), 1);
+        assert_ne!(config.web.pairing_token, "PAIR1234");
+    }
+
+    #[test]
     fn pair_handler_reuses_existing_browser_identity_for_same_install_id() {
         let _profile = TestProfileGuard::new("web-dedupe");
         let service = test_service("host-a");
@@ -2150,13 +2270,14 @@ mod tests {
             )
             .await
         });
+        let fresh_token = service.config().web.pairing_token;
         let second = runtime.block_on(async {
             pair_handler(
                 State(state),
                 ConnectInfo(SocketAddr::from(([127, 0, 0, 2], 43872))),
                 test_headers(Some(user_agent)),
                 Query(PairQuery {
-                    t: Some("PAIR1234".to_string()),
+                    t: Some(fresh_token),
                     label: None,
                     browser_install_id: Some("work-browser".to_string()),
                 }),
@@ -2192,13 +2313,14 @@ mod tests {
             .expect("test runtime");
 
         for browser_install_id in ["phone-install", "desktop-install"] {
+            let pairing_token = service.config().web.pairing_token;
             let response = runtime.block_on(async {
                 pair_handler(
                     State(state.clone()),
                     ConnectInfo(test_addr()),
                     test_headers(None),
                     Query(PairQuery {
-                        t: Some("PAIR1234".to_string()),
+                        t: Some(pairing_token),
                         label: None,
                         browser_install_id: Some(browser_install_id.to_string()),
                     }),

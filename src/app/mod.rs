@@ -40,6 +40,7 @@ use gpui::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1078,10 +1079,17 @@ impl NativeShell {
         }
     }
 
-    fn persist_remote_machine_state(&mut self) {
-        if let Err(error) = remote::save_remote_machine_state(&self.remote_machine_state) {
-            self.editor_notice = Some(format!("Failed to save remote settings: {error}"));
+    fn persist_known_remote_hosts(&mut self) {
+        if let Err(error) = remote::save_remote_known_hosts(&self.remote_machine_state.known_hosts)
+        {
+            self.editor_notice = Some(format!("Failed to save remote hosts: {error}"));
         }
+    }
+
+    fn refresh_remote_host_config_from_service(&mut self) {
+        self.remote_machine_state.host = self.remote_host_service.config();
+        self.last_remote_host_config_revision = self.remote_host_service.config_revision();
+        self.sync_settings_remote_draft();
     }
 
     fn sync_remote_host_config_from_service(&mut self) {
@@ -1089,13 +1097,7 @@ impl NativeShell {
         if latest_revision == self.last_remote_host_config_revision {
             return;
         }
-        let latest = self.remote_host_service.config();
-        if self.remote_machine_state.host != latest {
-            self.remote_machine_state.host = latest;
-            self.persist_remote_machine_state();
-            self.sync_settings_remote_draft();
-        }
-        self.last_remote_host_config_revision = latest_revision;
+        self.refresh_remote_host_config_from_service();
     }
 
     fn sync_remote_client_snapshot(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1699,11 +1701,17 @@ impl NativeShell {
         if !self.ensure_local_host_mutation_control() {
             return;
         }
-        self.remote_machine_state.host.enabled = !self.remote_machine_state.host.enabled;
-        self.remote_host_service
-            .apply_config(self.remote_machine_state.host.clone());
-        self.persist_remote_machine_state();
-        self.sync_settings_remote_draft();
+        let config = self.remote_host_service.config();
+        if let Err(error) = self.remote_host_service.update_native_listener_settings(
+            !config.enabled,
+            config.bind_address,
+            config.port,
+        ) {
+            let message = format!("Could not update desktop hosting: {error}");
+            self.editor_notice = Some(message.clone());
+            self.set_remote_status_notice(message, true);
+        }
+        self.refresh_remote_host_config_from_service();
         cx.notify();
     }
 
@@ -1711,13 +1719,60 @@ impl NativeShell {
         if !self.ensure_local_host_mutation_control() {
             return;
         }
-        self.remote_machine_state.host.web.enabled = !self.remote_machine_state.host.web.enabled;
-        self.remote_machine_state.host.web.ensure_secrets();
-        self.remote_host_service
-            .apply_config(self.remote_machine_state.host.clone());
-        self.persist_remote_machine_state();
-        self.sync_settings_remote_draft();
+        let config = self.remote_host_service.config();
+        if let Err(error) = self.remote_host_service.update_web_listener_settings(
+            !config.web.enabled,
+            config.web.bind_address,
+            config.web.port,
+        ) {
+            let message = format!("Could not update browser access: {error}");
+            self.editor_notice = Some(message.clone());
+            self.set_remote_status_notice(message, true);
+        }
+        self.refresh_remote_host_config_from_service();
         cx.notify();
+    }
+
+    fn apply_native_listener_draft(&mut self, toggle_enabled: bool) -> Result<(), String> {
+        let (enabled, bind_address, port) = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Settings(draft)) => (
+                if toggle_enabled {
+                    !draft.remote_host_enabled
+                } else {
+                    draft.remote_host_enabled
+                },
+                draft.remote_bind_address.clone(),
+                draft.remote_port.clone(),
+            ),
+            _ => return Err("Remote settings are not open".to_string()),
+        };
+        let bind_address = normalize_remote_bind_address(&bind_address)?;
+        let port = parse_required_remote_port(&port, "Desktop port")?;
+        self.remote_host_service
+            .update_native_listener_settings(enabled, bind_address, port)?;
+        self.refresh_remote_host_config_from_service();
+        Ok(())
+    }
+
+    fn apply_browser_listener_draft(&mut self, toggle_enabled: bool) -> Result<(), String> {
+        let (enabled, bind_address, port) = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Settings(draft)) => (
+                if toggle_enabled {
+                    !draft.remote_web_enabled
+                } else {
+                    draft.remote_web_enabled
+                },
+                draft.remote_web_bind_address.clone(),
+                draft.remote_web_port.clone(),
+            ),
+            _ => return Err("Remote settings are not open".to_string()),
+        };
+        let bind_address = normalize_remote_bind_address(&bind_address)?;
+        let port = parse_required_remote_port(&port, "Browser port")?;
+        self.remote_host_service
+            .update_web_listener_settings(enabled, bind_address, port)?;
+        self.refresh_remote_host_config_from_service();
+        Ok(())
     }
 
     fn copy_remote_pairing_token_action(&mut self, cx: &mut Context<Self>) {
@@ -1740,9 +1795,10 @@ impl NativeShell {
 
     fn copy_remote_web_invite_link_action(&mut self, cx: &mut Context<Self>) {
         let status = self.remote_host_service.status();
-        let url = self.remote_machine_state.host.web.display_url();
-        let token = self.remote_machine_state.host.web.pairing_token.clone();
-        if !self.remote_machine_state.host.web.enabled {
+        let web = self.remote_host_service.config().web;
+        let url = web.display_url();
+        let token = web.pairing_token.clone();
+        if !web.enabled {
             self.editor_notice =
                 Some("Enable browser access before copying an invite link.".to_string());
             self.set_remote_status_notice(
@@ -1919,7 +1975,7 @@ impl NativeShell {
             client_id,
             client_token,
         );
-        self.persist_remote_machine_state();
+        self.persist_known_remote_hosts();
         let port_forwards = LocalPortForwardManager::new(client.clone());
         self.remote_mode = Some(RemoteModeState {
             subscribed_session_ids: BTreeSet::new(),
@@ -4236,6 +4292,7 @@ impl NativeShell {
                 remote_host_enabled: self.remote_machine_state.host.enabled,
                 remote_bind_address: self.remote_machine_state.host.bind_address.clone(),
                 remote_port: self.remote_machine_state.host.port.to_string(),
+                remote_web_bind_address: self.remote_machine_state.host.web.bind_address.clone(),
                 remote_web_port: self.remote_machine_state.host.web.port.to_string(),
                 remote_pairing_token: remote_status.pairing_token,
                 remote_connect_address: preferred_known_host
@@ -6493,38 +6550,23 @@ impl NativeShell {
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
-                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-                    draft.remote_host_enabled = !draft.remote_host_enabled;
-                    self.remote_machine_state.host.enabled = draft.remote_host_enabled;
-                    self.remote_machine_state.host.bind_address =
-                        draft.remote_bind_address.trim().to_string();
-                    self.remote_machine_state.host.port = parse_optional_u16(&draft.remote_port)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(43871);
-                    self.remote_machine_state.host.pairing_token =
-                        draft.remote_pairing_token.clone();
-                    self.remote_host_service
-                        .apply_config(self.remote_machine_state.host.clone());
-                    self.persist_remote_machine_state();
-                    self.sync_settings_remote_draft();
-                    cx.notify();
+                if let Err(error) = self.apply_native_listener_draft(true) {
+                    self.editor_notice = Some(format!("Could not update desktop hosting: {error}"));
                 }
+                cx.notify();
             }
             EditorAction::RegenerateRemotePairingToken => {
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
-                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-                    let token = remote::generate_pairing_token();
-                    draft.remote_pairing_token = token.clone();
-                    self.remote_machine_state.host.pairing_token = token;
-                    self.remote_host_service
-                        .apply_config(self.remote_machine_state.host.clone());
-                    self.persist_remote_machine_state();
-                    self.sync_settings_remote_draft();
-                    cx.notify();
+                match self.remote_host_service.regenerate_native_pairing_token() {
+                    Ok(_) => self.refresh_remote_host_config_from_service(),
+                    Err(error) => {
+                        self.editor_notice =
+                            Some(format!("Could not generate desktop pairing token: {error}"));
+                    }
                 }
+                cx.notify();
             }
             EditorAction::CopyRemotePairingToken => {
                 self.copy_remote_pairing_token_action(cx);
@@ -6533,45 +6575,45 @@ impl NativeShell {
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
-                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-                    draft.remote_web_enabled = !draft.remote_web_enabled;
-                    self.remote_machine_state.host.web.enabled = draft.remote_web_enabled;
-                    self.remote_machine_state.host.web.port =
-                        parse_optional_u16(&draft.remote_web_port)
-                            .ok()
-                            .flatten()
-                            .unwrap_or(43872);
-                    self.remote_machine_state.host.web.ensure_secrets();
-                    self.remote_host_service
-                        .apply_config(self.remote_machine_state.host.clone());
-                    self.persist_remote_machine_state();
-                    self.sync_settings_remote_draft();
-                    cx.notify();
+                if let Err(error) = self.apply_browser_listener_draft(true) {
+                    self.editor_notice = Some(format!("Could not update browser access: {error}"));
                 }
+                cx.notify();
+            }
+            EditorAction::ApplyRemoteWebNetworkSettings => {
+                if !self.ensure_mutation_control(cx) {
+                    return;
+                }
+                match self.apply_browser_listener_draft(false) {
+                    Ok(()) => {
+                        self.editor_notice = Some("Applied browser network settings.".to_string())
+                    }
+                    Err(error) => {
+                        self.editor_notice =
+                            Some(format!("Could not apply browser network settings: {error}"));
+                    }
+                }
+                cx.notify();
             }
             EditorAction::RegenerateRemoteWebPairingToken => {
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
-                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-                    let token = remote::web::generate_web_pairing_token();
-                    draft.remote_web_pairing_token = token.clone();
-                    self.remote_machine_state.host.web.pairing_token = token;
-                    self.remote_host_service
-                        .apply_config(self.remote_machine_state.host.clone());
-                    self.persist_remote_machine_state();
-                    self.sync_settings_remote_draft();
-                    cx.notify();
+                match self.remote_host_service.regenerate_web_pairing_token() {
+                    Ok(_) => self.refresh_remote_host_config_from_service(),
+                    Err(error) => {
+                        self.editor_notice =
+                            Some(format!("Could not generate browser pairing token: {error}"));
+                    }
                 }
+                cx.notify();
             }
             EditorAction::ResetRemoteWebAccess => {
                 if !self.ensure_mutation_control(cx) {
                     return;
                 }
                 if self.remote_host_service.reset_browser_access() {
-                    self.remote_machine_state.host = self.remote_host_service.config();
-                    self.persist_remote_machine_state();
-                    self.sync_settings_remote_draft();
+                    self.refresh_remote_host_config_from_service();
                     self.editor_notice =
                         Some("Reset browser access. All browsers must pair again.".to_string());
                 } else {
@@ -6580,7 +6622,7 @@ impl NativeShell {
                 cx.notify();
             }
             EditorAction::CopyRemoteWebPairingToken => {
-                let token = self.remote_machine_state.host.web.pairing_token.clone();
+                let token = self.remote_host_service.config().web.pairing_token;
                 if token.trim().is_empty() {
                     self.editor_notice = Some(
                         "Enable browser access first to generate a browser pair token.".to_string(),
@@ -6714,22 +6756,18 @@ impl NativeShell {
                 self.remote_machine_state
                     .known_hosts
                     .retain(|host| host.server_id != server_id);
-                self.persist_remote_machine_state();
+                self.persist_known_remote_hosts();
                 self.sync_settings_remote_draft();
                 self.editor_notice = Some("Removed saved remote host.".to_string());
                 cx.notify();
             }
             EditorAction::RevokeRemoteClient(client_id) => {
-                self.remote_machine_state
-                    .host
-                    .paired_clients
-                    .retain(|client| client.client_id != client_id);
-                self.remote_host_service.revoke_paired_client(&client_id);
-                self.remote_host_service
-                    .apply_config(self.remote_machine_state.host.clone());
-                self.persist_remote_machine_state();
-                self.sync_settings_remote_draft();
-                self.editor_notice = Some("Revoked paired remote client.".to_string());
+                if self.remote_host_service.revoke_paired_client(&client_id) {
+                    self.refresh_remote_host_config_from_service();
+                    self.editor_notice = Some("Revoked paired remote client.".to_string());
+                } else {
+                    self.editor_notice = Some("Could not revoke paired remote client.".to_string());
+                }
                 cx.notify();
             }
             EditorAction::RevokeRemoteWebClient(client_id) => {
@@ -6737,9 +6775,7 @@ impl NativeShell {
                     .remote_host_service
                     .revoke_paired_web_client(&client_id)
                 {
-                    self.remote_machine_state.host = self.remote_host_service.config();
-                    self.persist_remote_machine_state();
-                    self.sync_settings_remote_draft();
+                    self.refresh_remote_host_config_from_service();
                     self.editor_notice = Some("Revoked paired browser.".to_string());
                 } else {
                     self.editor_notice = Some("Could not revoke paired browser.".to_string());
@@ -12490,6 +12526,29 @@ fn parse_optional_u16(value: &str) -> Result<Option<u16>, String> {
         .map_err(|_| format!("`{trimmed}` is not a valid number"))
 }
 
+fn normalize_remote_bind_address(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let value = if value.is_empty() { "127.0.0.1" } else { value };
+    value
+        .parse::<IpAddr>()
+        .map(|address| address.to_string())
+        .map_err(|_| format!("`{value}` is not a valid IP bind address"))
+}
+
+fn parse_required_remote_port(value: &str, label: &str) -> Result<u16, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("{label} must be a number between 1 and 65535"))?;
+    if port == 0 {
+        return Err(format!("{label} must be between 1 and 65535"));
+    }
+    Ok(port)
+}
+
 fn parse_optional_u32(value: &str) -> Result<Option<u32>, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -13597,6 +13656,21 @@ mod tests {
             Some("Quick connect")
         );
         assert_eq!(state.secondary_action, None);
+    }
+
+    #[test]
+    fn empty_remote_bind_normalizes_to_loopback_and_port_is_required() {
+        assert_eq!(
+            normalize_remote_bind_address("").expect("empty bind should normalize safely"),
+            "127.0.0.1"
+        );
+        assert!(parse_required_remote_port("", "Browser port").is_err());
+        assert!(parse_required_remote_port("0", "Browser port").is_err());
+        assert!(parse_required_remote_port("not-a-port", "Browser port").is_err());
+        assert_eq!(
+            parse_required_remote_port("43872", "Browser port").expect("valid browser port"),
+            43872
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
@@ -857,11 +857,31 @@ pub struct RemotePortForwardState {
     pub message: Option<String>,
 }
 
+// remote.json has several independent writers in one process (the host
+// service persisting config and the app shell persisting client-side known
+// hosts). Serialize savers in this single-owner process across the complete
+// read/modify/write transaction. This keeps host config and known-host updates
+// from replacing each other with a stale snapshot. Separate DevManager
+// processes are intentionally outside this runtime ownership model.
+static REMOTE_STATE_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static REMOTE_STATE_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceError> {
+    let _guard = REMOTE_STATE_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_remote_machine_state_locked()
+}
+
+fn load_remote_machine_state_locked() -> Result<RemoteMachineState, PersistenceError> {
     let path = remote_state_path()?;
     if !path.exists() {
         return Ok(RemoteMachineState::default());
     }
+    lock_remote_state_file_permissions(&path).map_err(|source| PersistenceError::Io {
+        path: path.clone(),
+        source,
+    })?;
     let contents = fs::read_to_string(&path).map_err(|source| PersistenceError::Io {
         path: path.clone(),
         source,
@@ -869,20 +889,355 @@ pub fn load_remote_machine_state() -> Result<RemoteMachineState, PersistenceErro
     serde_json::from_str(&contents).map_err(|source| PersistenceError::Parse { path, source })
 }
 
-// remote.json has several independent writers in one process (the host
-// service persisting config, the app shell persisting client-side known
-// hosts) plus potentially other app instances. Serialize in-process savers
-// and give every save its own temp file so concurrent write+rename pairs
-// can't consume each other's temp file (the rename loser used to fail with
-// NotFound and, via mutate_host_config's rollback, silently drop the
-// mutation that triggered the save).
-static REMOTE_STATE_SAVE_LOCK: Mutex<()> = Mutex::new(());
-static REMOTE_STATE_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+fn write_private_remote_state_temp(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    if let Err(error) = lock_new_remote_state_file_permissions(path) {
+        drop(file);
+        return Err(error);
+    }
+    file.write_all(contents)
+}
+
+#[cfg(unix)]
+fn lock_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    verify_remote_state_file_permissions(path)
+}
+
+#[cfg(windows)]
+fn windows_system_tool(name: &str) -> std::io::Result<PathBuf> {
+    let system_root = std::env::var_os("SystemRoot")
+        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "SystemRoot is unavailable"))?;
+    let path = PathBuf::from(system_root).join("System32").join(name);
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!("Windows system tool is unavailable: {}", path.display()),
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn run_windows_system_tool(name: &str, args: &[std::ffi::OsString]) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let tool = windows_system_tool(name)?;
+    let output = std::process::Command::new(&tool)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} failed: {}",
+                tool.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn current_windows_process_sid() -> std::io::Result<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    static PROCESS_TOKEN_SID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(sid) = PROCESS_TOKEN_SID.get() {
+        return Ok(sid.clone());
+    }
+
+    let whoami = windows_system_tool("whoami.exe")?;
+    let output = std::process::Command::new(&whoami)
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} failed: {}",
+                whoami.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "whoami.exe returned non-UTF-8 output",
+        )
+    })?;
+    let sid = stdout
+        .split(|character: char| character == ',' || character.is_whitespace() || character == '"')
+        .find(|field| field.starts_with("S-1-"))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "whoami.exe did not return a process token SID",
+            )
+        })?;
+    let components = sid.split('-').collect::<Vec<_>>();
+    if components.len() < 4
+        || components[0] != "S"
+        || components[1] != "1"
+        || components[2..].iter().any(|component| {
+            component.is_empty() || !component.chars().all(|ch| ch.is_ascii_digit())
+        })
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("whoami.exe returned an invalid process token SID: {sid}"),
+        ));
+    }
+    let _ = PROCESS_TOKEN_SID.set(sid.clone());
+    Ok(sid)
+}
+
+#[cfg(windows)]
+fn windows_acl_sddl(path: &Path) -> std::io::Result<String> {
+    let acl_path = path.with_extension(format!(
+        "acl-{}-{}",
+        std::process::id(),
+        REMOTE_STATE_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        run_windows_system_tool(
+            "icacls.exe",
+            &[
+                path.as_os_str().to_os_string(),
+                "/save".into(),
+                acl_path.as_os_str().to_os_string(),
+            ],
+        )?;
+        let bytes = fs::read(&acl_path)?;
+        if bytes.len() % 2 != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "icacls.exe wrote a malformed ACL export",
+            ));
+        }
+        let words = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&words).map_err(|_| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "icacls.exe wrote an invalid UTF-16 ACL export",
+            )
+        })
+    })();
+    let _ = fs::remove_file(&acl_path);
+    result
+}
+
+#[cfg(windows)]
+fn windows_dacl_entries(sddl_export: &str) -> std::io::Result<Vec<(String, String, String)>> {
+    let dacl_start = sddl_export.find("D:").ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "ACL export is missing a DACL")
+    })?;
+    let dacl = &sddl_export[dacl_start + 2..];
+    let dacl = dacl.split("S:").next().unwrap_or(dacl);
+    let mut entries = Vec::new();
+    let mut remaining = dacl;
+    while let Some(start) = remaining.find('(') {
+        let after_start = &remaining[start + 1..];
+        let Some(end) = after_start.find(')') else {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "ACL export contains an unterminated access rule",
+            ));
+        };
+        let fields = after_start[..end].split(';').collect::<Vec<_>>();
+        if fields.len() < 6 || fields[5].trim().is_empty() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "ACL export contains a malformed access rule",
+            ));
+        }
+        entries.push((
+            fields[0].trim().to_string(),
+            fields[2].trim().to_string(),
+            fields[5].trim().to_string(),
+        ));
+        remaining = &after_start[end + 1..];
+    }
+    Ok(entries)
+}
+
+#[cfg(windows)]
+fn windows_trustee_sid(trustee: &str) -> Option<&str> {
+    match trustee {
+        "WD" => Some("S-1-1-0"),
+        "AU" => Some("S-1-5-11"),
+        "BU" => Some("S-1-5-32-545"),
+        "BA" => Some("S-1-5-32-544"),
+        "SY" => Some("S-1-5-18"),
+        trustee if trustee.starts_with("S-1-") => Some(trustee),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn lock_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    if verify_remote_state_file_permissions(path).is_ok() {
+        return Ok(());
+    }
+    let current_sid = current_windows_process_sid()?;
+    run_windows_system_tool(
+        "icacls.exe",
+        &[path.as_os_str().to_os_string(), "/inheritance:r".into()],
+    )?;
+
+    let initial_acl = windows_acl_sddl(path)?;
+    for (_, _, trustee) in windows_dacl_entries(&initial_acl)? {
+        let trustee_sid = windows_trustee_sid(&trustee).ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!("cannot safely identify ACL trustee {trustee}"),
+            )
+        })?;
+        if trustee_sid.eq_ignore_ascii_case(&current_sid) {
+            continue;
+        }
+        for removal in ["/remove:g", "/remove:d"] {
+            run_windows_system_tool(
+                "icacls.exe",
+                &[
+                    path.as_os_str().to_os_string(),
+                    removal.into(),
+                    format!("*{trustee_sid}").into(),
+                ],
+            )?;
+        }
+    }
+
+    // A legacy deny for the current user must not survive the upgrade.
+    run_windows_system_tool(
+        "icacls.exe",
+        &[
+            path.as_os_str().to_os_string(),
+            "/remove:d".into(),
+            format!("*{current_sid}").into(),
+        ],
+    )?;
+    run_windows_system_tool(
+        "icacls.exe",
+        &[
+            path.as_os_str().to_os_string(),
+            "/grant:r".into(),
+            format!("*{current_sid}:(F)").into(),
+        ],
+    )?;
+    verify_remote_state_file_permissions(path)
+}
+
+#[cfg(unix)]
+fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    lock_remote_state_file_permissions(path)
+}
+
+#[cfg(windows)]
+fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    let current_sid = current_windows_process_sid()?;
+    run_windows_system_tool(
+        "icacls.exe",
+        &[
+            path.as_os_str().to_os_string(),
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+            format!("*{current_sid}:(F)").into(),
+        ],
+    )?;
+    verify_remote_state_file_permissions(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    lock_remote_state_file_permissions(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lock_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        format!(
+            "secure remote state permissions are unsupported for {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode == 0o600 {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("remote state permissions are {mode:o}, expected 600"),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    let current_sid = current_windows_process_sid()?;
+    let entries = windows_dacl_entries(&windows_acl_sddl(path)?)?;
+    if entries.len() == 1
+        && entries[0].0 == "A"
+        && entries[0].1 == "FA"
+        && windows_trustee_sid(&entries[0].2)
+            .is_some_and(|sid| sid.eq_ignore_ascii_case(&current_sid))
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("remote state ACL is not current-user only: {entries:?}"),
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        format!(
+            "secure remote state permissions are unsupported for {}",
+            path.display()
+        ),
+    ))
+}
 
 pub fn save_remote_machine_state(state: &RemoteMachineState) -> Result<(), PersistenceError> {
     let _guard = REMOTE_STATE_SAVE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    save_remote_machine_state_locked(state)
+}
+
+fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), PersistenceError> {
     let path = remote_state_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| PersistenceError::Io {
@@ -899,21 +1254,75 @@ pub fn save_remote_machine_state(state: &RemoteMachineState) -> Result<(), Persi
         std::process::id(),
         REMOTE_STATE_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&temp_path, json).map_err(|source| PersistenceError::Io {
-        path: temp_path.clone(),
-        source,
-    })?;
+    if let Err(source) = write_private_remote_state_temp(&temp_path, json.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(PersistenceError::Io {
+            path: temp_path,
+            source,
+        });
+    }
     if let Err(source) = fs::rename(&temp_path, &path) {
         let _ = fs::remove_file(&temp_path);
         return Err(PersistenceError::Io { path, source });
     }
+    verify_remote_state_file_permissions(&path).map_err(|source| PersistenceError::Io {
+        path: path.clone(),
+        source,
+    })?;
     Ok(())
 }
 
 fn persist_host_config_snapshot(config: &RemoteHostConfig) -> Result<(), PersistenceError> {
-    let mut state = load_remote_machine_state()?;
+    let _guard = REMOTE_STATE_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = load_remote_machine_state_locked()?;
     state.host = config.clone();
-    save_remote_machine_state(&state)
+    save_remote_machine_state_locked(&state)
+}
+
+pub fn save_remote_known_hosts(known_hosts: &[KnownRemoteHost]) -> Result<(), PersistenceError> {
+    let _guard = REMOTE_STATE_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = load_remote_machine_state_locked()?;
+    state.known_hosts = known_hosts.to_vec();
+    save_remote_machine_state_locked(&state)
+}
+
+pub(crate) fn mutate_host_config_if<T>(
+    inner: &Arc<RemoteHostInner>,
+    condition: impl FnOnce(&RemoteHostConfig) -> bool,
+    mutate: impl FnOnce(&mut RemoteHostConfig) -> T,
+) -> Result<Option<T>, String> {
+    let _update_guard = inner
+        .config_update_lock
+        .lock()
+        .map_err(|_| "host config update unavailable".to_string())?;
+    let Some((result, snapshot, previous)) = ({
+        let Ok(mut config) = inner.config.write() else {
+            return Err("host config unavailable".to_string());
+        };
+        if !condition(&config) {
+            None
+        } else {
+            let previous = config.clone();
+            let result = mutate(&mut config);
+            Some((result, config.clone(), previous))
+        }
+    }) else {
+        return Ok(None);
+    };
+
+    if let Err(error) = persist_host_config_snapshot(&snapshot) {
+        if let Ok(mut config) = inner.config.write() {
+            *config = previous;
+        }
+        return Err(error.to_string());
+    }
+
+    bump_host_config_revision(inner);
+    Ok(Some(result))
 }
 
 pub(crate) fn mutate_host_config<T>(
@@ -964,7 +1373,7 @@ pub fn remote_state_path() -> Result<PathBuf, PersistenceError> {
 }
 
 pub fn generate_pairing_token() -> String {
-    generate_secret("pair").chars().rev().take(6).collect()
+    web::auth::generate_web_pairing_token()
 }
 
 pub fn upsert_known_host(
@@ -1012,8 +1421,15 @@ fn now_epoch_ms() -> u64 {
 }
 
 fn generate_secret(prefix: &str) -> String {
-    let millis = now_epoch_ms();
-    format!("{prefix}-{millis:x}-{:x}", std::process::id())
+    let mut bytes = [0_u8; 24];
+    getrandom::fill(&mut bytes).unwrap_or_else(|error| {
+        panic!("Cannot generate native remote credential from the operating system RNG: {error}")
+    });
+    let random_hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}-{random_hex}")
 }
 
 fn session_ids_for_open_tabs(state: &AppState) -> HashSet<String> {
@@ -1030,9 +1446,100 @@ fn session_ids_for_open_tabs(state: &AppState) -> HashSet<String> {
         .collect()
 }
 
-#[derive(Clone)]
 pub struct RemoteHostService {
     inner: Arc<RemoteHostInner>,
+    _lifetime_owner: Option<RemoteHostServiceOwner>,
+}
+
+struct RemoteHostServiceOwner {
+    inner: Arc<RemoteHostInner>,
+}
+
+impl Drop for RemoteHostServiceOwner {
+    fn drop(&mut self) {
+        self.inner
+            .native_runtime_generation
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner.stop_flag.store(true, Ordering::SeqCst);
+
+        let session_bootstrap_provider = self
+            .inner
+            .session_bootstrap_provider
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let terminal_input_handler = self
+            .inner
+            .terminal_input_handler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let terminal_resize_handler = self
+            .inner
+            .terminal_resize_handler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let focused_session_handler = self
+            .inner
+            .focused_session_handler
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let web_listener = self
+            .inner
+            .web_listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let listener_thread = self
+            .inner
+            .listener_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let broadcaster_thread = self
+            .inner
+            .broadcaster_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        // Drop callbacks outside their locks. The app callbacks can retain
+        // non-owning service clones (and the process manager), so running their
+        // destructors while a callback lock is held could deadlock teardown.
+        drop((
+            session_bootstrap_provider,
+            terminal_input_handler,
+            terminal_resize_handler,
+            focused_session_handler,
+        ));
+
+        // Revoke browser authority while the runtime can still deliver the
+        // disconnect, then drain once more after shutdown to close the narrow
+        // registration race between the first drain and listener teardown.
+        drain_web_clients_for_restart(&self.inner);
+        if let Some(listener) = web_listener {
+            listener.shutdown();
+        }
+        drain_web_clients_for_restart(&self.inner);
+
+        if let Some(thread) = listener_thread {
+            let _ = thread.join();
+        }
+        if let Some(thread) = broadcaster_thread {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Clone for RemoteHostService {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _lifetime_owner: None,
+        }
+    }
 }
 
 /// Exact identity of one Claude hook projection attached to one PTY launch.
@@ -1174,6 +1681,7 @@ pub(crate) struct RemoteHostInner {
     next_connection_id: AtomicU64,
     next_output_chunk_seq: AtomicU64,
     next_push_event_id: AtomicU64,
+    native_runtime_generation: AtomicU64,
     stop_flag: AtomicBool,
     listener_thread: Mutex<Option<thread::JoinHandle<()>>>,
     broadcaster_thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -1352,62 +1860,70 @@ impl RemoteHostService {
         let mut config = config;
         config.web.ensure_secrets();
         let _ = transport::ensure_host_tls_material(&mut config);
+        let inner = Arc::new(RemoteHostInner {
+            config: RwLock::new(config.clone()),
+            config_update_lock: Mutex::new(()),
+            config_revision: AtomicU64::new(1),
+            snapshot_state_lock: Mutex::new(()),
+            snapshot_revision: AtomicU64::new(1),
+            runtime_instance_id: generate_secret("runtime"),
+            shared_state: RwLock::new(AppState::default()),
+            runtime_state: RwLock::new(RuntimeState::default()),
+            port_statuses: RwLock::new(HashMap::new()),
+            semantic_journals: Mutex::new(SemanticJournalStore::default()),
+            semantic_publication_lock: Mutex::new(()),
+            semantic_publication_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            semantic_publication_test_hook: RwLock::new(None),
+            semantic_delivery_lock: Mutex::new(()),
+            #[cfg(test)]
+            semantic_delivery_test_hook: RwLock::new(None),
+            web_push_sender: RwLock::new(None),
+            session_bootstrap_provider: RwLock::new(None),
+            terminal_input_handler: RwLock::new(None),
+            terminal_resize_handler: RwLock::new(None),
+            focused_session_handler: RwLock::new(None),
+            web_control_operation_lock: Mutex::new(()),
+            web_control: Mutex::new(WebControlState::new(Duration::from_secs(8))),
+            web_composer_mutations: Mutex::new(HashMap::new()),
+            web_input_executor: WebInputExecutor::default(),
+            web_request_executor: WebRequestExecutor::default(),
+            host_work_limiter: RemoteHostWorkLimiter::new(MAX_CONCURRENT_REMOTE_HOST_WORK),
+            claude_composer_reconciliation: Mutex::new(ClaudeComposerReconciliationState::default()),
+            codex_composer_reconciliation: Mutex::new(CodexComposerReconciliationState::default()),
+            pending_requests: Mutex::new(Vec::new()),
+            clients: Mutex::new(HashMap::new()),
+            controller_client_id: RwLock::new(None),
+            listener_running: AtomicBool::new(false),
+            listener_error: RwLock::new(None),
+            last_connection_note: RwLock::new(None),
+            last_connection_is_error: AtomicBool::new(false),
+            latency: RwLock::new(RemoteLatencyStats::default()),
+            next_connection_id: AtomicU64::new(1),
+            next_output_chunk_seq: AtomicU64::new(1),
+            next_push_event_id: AtomicU64::new(1),
+            native_runtime_generation: AtomicU64::new(1),
+            stop_flag: AtomicBool::new(false),
+            listener_thread: Mutex::new(None),
+            broadcaster_thread: Mutex::new(None),
+            web_listener: Mutex::new(None),
+            web_listener_error: RwLock::new(None),
+        });
         let service = Self {
-            inner: Arc::new(RemoteHostInner {
-                config: RwLock::new(config.clone()),
-                config_update_lock: Mutex::new(()),
-                config_revision: AtomicU64::new(1),
-                snapshot_state_lock: Mutex::new(()),
-                snapshot_revision: AtomicU64::new(1),
-                runtime_instance_id: generate_secret("runtime"),
-                shared_state: RwLock::new(AppState::default()),
-                runtime_state: RwLock::new(RuntimeState::default()),
-                port_statuses: RwLock::new(HashMap::new()),
-                semantic_journals: Mutex::new(SemanticJournalStore::default()),
-                semantic_publication_lock: Mutex::new(()),
-                semantic_publication_generation: AtomicU64::new(0),
-                #[cfg(test)]
-                semantic_publication_test_hook: RwLock::new(None),
-                semantic_delivery_lock: Mutex::new(()),
-                #[cfg(test)]
-                semantic_delivery_test_hook: RwLock::new(None),
-                web_push_sender: RwLock::new(None),
-                session_bootstrap_provider: RwLock::new(None),
-                terminal_input_handler: RwLock::new(None),
-                terminal_resize_handler: RwLock::new(None),
-                focused_session_handler: RwLock::new(None),
-                web_control_operation_lock: Mutex::new(()),
-                web_control: Mutex::new(WebControlState::new(Duration::from_secs(8))),
-                web_composer_mutations: Mutex::new(HashMap::new()),
-                web_input_executor: WebInputExecutor::default(),
-                web_request_executor: WebRequestExecutor::default(),
-                host_work_limiter: RemoteHostWorkLimiter::new(MAX_CONCURRENT_REMOTE_HOST_WORK),
-                claude_composer_reconciliation: Mutex::new(
-                    ClaudeComposerReconciliationState::default(),
-                ),
-                codex_composer_reconciliation: Mutex::new(
-                    CodexComposerReconciliationState::default(),
-                ),
-                pending_requests: Mutex::new(Vec::new()),
-                clients: Mutex::new(HashMap::new()),
-                controller_client_id: RwLock::new(None),
-                listener_running: AtomicBool::new(false),
-                listener_error: RwLock::new(None),
-                last_connection_note: RwLock::new(None),
-                last_connection_is_error: AtomicBool::new(false),
-                latency: RwLock::new(RemoteLatencyStats::default()),
-                next_connection_id: AtomicU64::new(1),
-                next_output_chunk_seq: AtomicU64::new(1),
-                next_push_event_id: AtomicU64::new(1),
-                stop_flag: AtomicBool::new(false),
-                listener_thread: Mutex::new(None),
-                broadcaster_thread: Mutex::new(None),
-                web_listener: Mutex::new(None),
-                web_listener_error: RwLock::new(None),
+            _lifetime_owner: Some(RemoteHostServiceOwner {
+                inner: inner.clone(),
             }),
+            inner,
         };
         service.apply_config(config);
         service
+    }
+
+    pub(crate) fn borrowed(inner: Arc<RemoteHostInner>) -> Self {
+        Self {
+            inner,
+            _lifetime_owner: None,
+        }
     }
 
     pub(crate) fn web_mutation_authority_is_current(
@@ -1433,6 +1949,89 @@ impl RemoteHostService {
         }
         self.bump_config_revision();
         self.restart_threads();
+    }
+
+    pub fn update_native_listener_settings(
+        &self,
+        enabled: bool,
+        bind_address: String,
+        port: u16,
+    ) -> Result<(), String> {
+        let bind_address = bind_address.trim().to_string();
+        if bind_address.is_empty() {
+            return Err("Native bind address is required".to_string());
+        }
+        if port == 0 {
+            return Err("Native port must be between 1 and 65535".to_string());
+        }
+        let changed = mutate_host_config_if(
+            &self.inner,
+            |config| {
+                config.enabled != enabled
+                    || config.bind_address != bind_address
+                    || config.port != port
+            },
+            |config| {
+                config.enabled = enabled;
+                config.bind_address = bind_address.clone();
+                config.port = port;
+            },
+        )?
+        .is_some();
+        if changed {
+            self.restart_threads();
+        }
+        Ok(())
+    }
+
+    pub fn update_web_listener_settings(
+        &self,
+        enabled: bool,
+        bind_address: String,
+        port: u16,
+    ) -> Result<(), String> {
+        let bind_address = bind_address.trim().to_string();
+        if bind_address.is_empty() {
+            return Err("Browser bind address is required".to_string());
+        }
+        if port == 0 {
+            return Err("Browser port must be between 1 and 65535".to_string());
+        }
+        let changed = mutate_host_config_if(
+            &self.inner,
+            |config| {
+                config.web.enabled != enabled
+                    || config.web.bind_address != bind_address
+                    || config.web.port != port
+            },
+            |config| {
+                config.web.enabled = enabled;
+                config.web.bind_address = bind_address.clone();
+                config.web.port = port;
+                config.web.ensure_secrets();
+            },
+        )?
+        .is_some();
+        if changed {
+            self.restart_threads();
+        }
+        Ok(())
+    }
+
+    pub fn regenerate_native_pairing_token(&self) -> Result<String, String> {
+        let token = generate_pairing_token();
+        mutate_host_config(&self.inner, |config| {
+            config.pairing_token = token.clone();
+        })?;
+        Ok(token)
+    }
+
+    pub fn regenerate_web_pairing_token(&self) -> Result<String, String> {
+        let token = web::generate_web_pairing_token();
+        mutate_host_config(&self.inner, |config| {
+            config.web.pairing_token = token.clone();
+        })?;
+        Ok(token)
     }
 
     pub fn update_snapshot(
@@ -2703,42 +3302,49 @@ impl RemoteHostService {
     }
 
     pub fn revoke_paired_client(&self, client_id: &str) -> bool {
-        let mut removed = false;
-        let Ok(_update_guard) = self.inner.config_update_lock.lock() else {
-            return false;
+        let removed = match mutate_host_config_if(
+            &self.inner,
+            |config| {
+                config
+                    .paired_clients
+                    .iter()
+                    .any(|client| client.client_id == client_id)
+            },
+            |config| {
+                config
+                    .paired_clients
+                    .retain(|client| client.client_id != client_id);
+            },
+        ) {
+            Ok(Some(())) => true,
+            Ok(None) | Err(_) => false,
         };
-        if let Ok(mut config) = self.inner.config.write() {
-            let before = config.paired_clients.len();
-            config
-                .paired_clients
-                .retain(|client| client.client_id != client_id);
-            removed = config.paired_clients.len() != before;
-        }
-        if removed {
-            self.bump_config_revision();
-        }
 
-        if let Ok(mut clients) = self.inner.clients.lock() {
-            let connection_ids: Vec<u64> = clients
-                .iter()
-                .filter_map(|(connection_id, client)| {
-                    (client.client_id == client_id).then_some(*connection_id)
-                })
-                .collect();
-            for connection_id in connection_ids {
-                if let Some(client) = clients.remove(&connection_id) {
-                    if let Some(sender) = client.sender.as_ref() {
-                        let _ = sender.send(ServerMessage::Disconnected {
-                            message: "This host revoked the saved client token.".to_string(),
-                        });
+        if removed {
+            if let Ok(mut clients) = self.inner.clients.lock() {
+                let connection_ids: Vec<u64> = clients
+                    .iter()
+                    .filter_map(|(connection_id, client)| {
+                        (client.client_id == client_id).then_some(*connection_id)
+                    })
+                    .collect();
+                for connection_id in connection_ids {
+                    if let Some(client) = clients.remove(&connection_id) {
+                        if let Some(sender) = client.sender.as_ref() {
+                            let _ = sender.send(ServerMessage::Disconnected {
+                                message: "This host revoked the saved client token.".to_string(),
+                            });
+                        }
                     }
                 }
             }
         }
 
-        if let Ok(mut controller) = self.inner.controller_client_id.write() {
-            if controller.as_deref() == Some(client_id) {
-                *controller = None;
+        if removed {
+            if let Ok(mut controller) = self.inner.controller_client_id.write() {
+                if controller.as_deref() == Some(client_id) {
+                    *controller = None;
+                }
             }
         }
 
@@ -2822,6 +3428,7 @@ impl RemoteHostService {
                 .web
                 .activity_log
                 .retain(|event| event.source != RemoteAccessSource::Browser);
+            config.web.pairing_token = web::generate_web_pairing_token();
             config.web.cookie_secret_hex = web::generate_cookie_secret_hex();
             removed_ids
         }) {
@@ -2881,6 +3488,9 @@ impl RemoteHostService {
     }
 
     fn restart_threads(&self) {
+        self.inner
+            .native_runtime_generation
+            .fetch_add(1, Ordering::SeqCst);
         self.inner.stop_flag.store(true, Ordering::SeqCst);
         self.inner.listener_running.store(false, Ordering::Relaxed);
         if let Ok(mut error) = self.inner.listener_error.write() {
@@ -2928,7 +3538,10 @@ impl RemoteHostService {
 
         if config.enabled {
             let listener_inner = self.inner.clone();
-            let listener_thread = thread::spawn(move || run_listener(listener_inner));
+            let native_runtime_generation =
+                self.inner.native_runtime_generation.load(Ordering::SeqCst);
+            let listener_thread =
+                thread::spawn(move || run_listener(listener_inner, native_runtime_generation));
             if let Ok(mut handle) = self.inner.listener_thread.lock() {
                 *handle = Some(listener_thread);
             }
@@ -2970,16 +3583,7 @@ pub(crate) fn acknowledge_browser_attention(
     inner: &Arc<RemoteHostInner>,
     stable_session_key: &StableSessionKey,
 ) {
-    RemoteHostService {
-        inner: inner.clone(),
-    }
-    .acknowledge_semantic_attention(stable_session_key);
-}
-
-impl Drop for RemoteHostService {
-    fn drop(&mut self) {
-        self.inner.stop_flag.store(true, Ordering::SeqCst);
-    }
+    RemoteHostService::borrowed(inner.clone()).acknowledge_semantic_attention(stable_session_key);
 }
 
 impl RemoteClientHandle {
@@ -3571,8 +4175,15 @@ fn run_local_port_forward_listener(
             Ok((socket, _)) => {
                 let connection_inner = inner.clone();
                 let client = inner.client.clone();
+                let connection_stop_flag = stop_flag.clone();
                 thread::spawn(move || {
-                    handle_local_port_forward_connection(connection_inner, client, port, socket)
+                    handle_local_port_forward_connection(
+                        connection_inner,
+                        client,
+                        port,
+                        socket,
+                        connection_stop_flag,
+                    )
                 });
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -3599,6 +4210,7 @@ fn handle_local_port_forward_connection(
     client: RemoteClientHandle,
     port: u16,
     mut local_socket: TcpStream,
+    stop_flag: Arc<AtomicBool>,
 ) {
     let _ = local_socket.set_nodelay(true);
     let _ = local_socket.set_read_timeout(Some(Duration::from_millis(40)));
@@ -3623,7 +4235,9 @@ fn handle_local_port_forward_connection(
         .sock
         .set_read_timeout(Some(Duration::from_millis(40)));
 
-    if let Err(error) = copy_bidirectional(&mut local_socket, &mut remote_stream) {
+    if let Err(error) = copy_bidirectional(&mut local_socket, &mut remote_stream, || {
+        stop_flag.load(Ordering::Acquire)
+    }) {
         set_port_forward_state(
             &inner,
             RemotePortForwardState {
@@ -3641,14 +4255,21 @@ fn handle_local_port_forward_connection(
 fn copy_bidirectional<L: Read + Write, R: Read + Write>(
     left: &mut L,
     right: &mut R,
+    mut should_stop: impl FnMut() -> bool,
 ) -> Result<(), String> {
     let mut left_buf = [0_u8; 16 * 1024];
     let mut right_buf = [0_u8; 16 * 1024];
     loop {
+        if should_stop() {
+            break;
+        }
         let mut made_progress = false;
         match left.read(&mut left_buf) {
             Ok(0) => break,
             Ok(read) => {
+                if should_stop() {
+                    break;
+                }
                 right
                     .write_all(&left_buf[..read])
                     .map_err(|error| format!("Write failed: {error}"))?;
@@ -3665,9 +4286,15 @@ fn copy_bidirectional<L: Read + Write, R: Read + Write>(
             Err(error) => return Err(format!("Read failed: {error}")),
         }
 
+        if should_stop() {
+            break;
+        }
         match right.read(&mut right_buf) {
             Ok(0) => break,
             Ok(read) => {
+                if should_stop() {
+                    break;
+                }
                 left.write_all(&right_buf[..read])
                     .map_err(|error| format!("Write failed: {error}"))?;
                 left.flush()
@@ -3689,7 +4316,12 @@ fn copy_bidirectional<L: Read + Write, R: Read + Write>(
     Ok(())
 }
 
-fn run_listener(inner: Arc<RemoteHostInner>) {
+fn native_connection_should_stop(inner: &RemoteHostInner, native_runtime_generation: u64) -> bool {
+    inner.stop_flag.load(Ordering::Acquire)
+        || inner.native_runtime_generation.load(Ordering::Acquire) != native_runtime_generation
+}
+
+fn run_listener(inner: Arc<RemoteHostInner>, native_runtime_generation: u64) {
     let config = inner
         .config
         .read()
@@ -3718,13 +4350,18 @@ fn run_listener(inner: Arc<RemoteHostInner>) {
     }
     let _ = listener.set_nonblocking(true);
 
-    while !inner.stop_flag.load(Ordering::Relaxed) {
+    while !native_connection_should_stop(&inner, native_runtime_generation) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let connection_id = inner.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 let thread_inner = inner.clone();
                 thread::spawn(move || {
-                    handle_client_connection(thread_inner, connection_id, stream)
+                    handle_client_connection(
+                        thread_inner,
+                        connection_id,
+                        stream,
+                        native_runtime_generation,
+                    )
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3973,7 +4610,12 @@ pub(crate) fn deliver_pending_bootstraps(
     }
 }
 
-fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, stream: TcpStream) {
+fn handle_client_connection(
+    inner: Arc<RemoteHostInner>,
+    connection_id: u64,
+    stream: TcpStream,
+    native_runtime_generation: u64,
+) {
     let peer_addr = stream.peer_addr().ok();
     let peer_label = peer_addr
         .map(|addr| addr.to_string())
@@ -3984,9 +4626,14 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
         .read()
         .map(|slot| slot.clone())
         .unwrap_or_default();
-    let mut stream = match transport::accept_tls(stream, &config) {
+    let mut stream = match transport::accept_tls(stream, &config, || {
+        native_connection_should_stop(&inner, native_runtime_generation)
+    }) {
         Ok(stream) => stream,
         Err(error) => {
+            if native_connection_should_stop(&inner, native_runtime_generation) {
+                return;
+            }
             set_last_connection_note(
                 &inner,
                 format!("TLS handshake from {peer_label} failed: {error}"),
@@ -3998,9 +4645,14 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
     };
     let mut read_buffer = Vec::new();
 
-    let hello = match read_message::<ClientMessage, _>(&mut stream) {
+    let hello = match read_message_until_cancelled::<ClientMessage, _, _>(&mut stream, || {
+        native_connection_should_stop(&inner, native_runtime_generation)
+    }) {
         Ok(message) => message,
         Err(error) => {
+            if native_connection_should_stop(&inner, native_runtime_generation) {
+                return;
+            }
             set_last_connection_note(
                 &inner,
                 format!(
@@ -4016,9 +4668,13 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
     };
 
     if matches!(hello, ClientMessage::PortForwardHello { .. }) {
-        if let Err(message) =
-            handle_port_forward_connection(&inner, &peer_label, &mut stream, hello, &config)
-        {
+        if let Err(message) = handle_port_forward_connection(
+            &inner,
+            &peer_label,
+            &mut stream,
+            hello,
+            native_runtime_generation,
+        ) {
             set_last_connection_note(
                 &inner,
                 format!("Rejected port forward from {peer_label}: {message}"),
@@ -4145,7 +4801,7 @@ fn handle_client_connection(inner: Arc<RemoteHostInner>, connection_id: u64, str
         false,
     );
 
-    while !inner.stop_flag.load(Ordering::Relaxed) {
+    while !native_connection_should_stop(&inner, native_runtime_generation) {
         let mut should_break = false;
         for _ in 0..MAX_OUTBOUND_MESSAGES_PER_TICK {
             match rx.try_recv() {
@@ -4360,50 +5016,52 @@ fn authenticate_client(
         client_label
     };
 
-    let _update_guard = inner
-        .config_update_lock
-        .lock()
-        .map_err(|_| "Host config update unavailable.".to_string())?;
-    let mut config = inner
-        .config
-        .write()
-        .map_err(|_| "Host config is unavailable.".to_string())?;
     match auth {
         ClientAuth::PairToken { token } => {
-            if token.trim() != config.pairing_token.trim() {
-                return Err("Pairing token did not match the host.".to_string());
-            }
             let client_id = generate_secret("client");
             let client_token = generate_secret("auth");
-            config.paired_clients.push(PairedRemoteClient {
-                client_id: client_id.clone(),
-                label: client_label.clone(),
-                auth_token: client_token.clone(),
-                last_seen_epoch_ms: Some(now_epoch_ms()),
-            });
-            bump_host_config_revision(inner);
-            Ok((client_id, client_token, client_label))
+            mutate_host_config_if(
+                inner,
+                |config| token.trim() == config.pairing_token.trim(),
+                |config| {
+                    config.paired_clients.push(PairedRemoteClient {
+                        client_id: client_id.clone(),
+                        label: client_label.clone(),
+                        auth_token: client_token.clone(),
+                        last_seen_epoch_ms: Some(now_epoch_ms()),
+                    });
+                    (client_id, client_token, client_label)
+                },
+            )?
+            .ok_or_else(|| "Pairing token did not match the host.".to_string())
         }
         ClientAuth::ClientToken {
             client_id,
             auth_token,
-        } => {
-            let Some(client) = config
-                .paired_clients
-                .iter_mut()
-                .find(|client| client.client_id == client_id && client.auth_token == auth_token)
-            else {
-                return Err("Saved remote credentials are no longer valid.".to_string());
-            };
-            client.label = client_label.clone();
-            client.last_seen_epoch_ms = Some(now_epoch_ms());
-            bump_host_config_revision(inner);
-            Ok((
-                client.client_id.clone(),
-                client.auth_token.clone(),
-                client.label.clone(),
-            ))
-        }
+        } => mutate_host_config_if(
+            inner,
+            |config| {
+                config
+                    .paired_clients
+                    .iter()
+                    .any(|client| client.client_id == client_id && client.auth_token == auth_token)
+            },
+            |config| {
+                let client = config
+                    .paired_clients
+                    .iter_mut()
+                    .find(|client| client.client_id == client_id && client.auth_token == auth_token)
+                    .expect("serialized native client condition must remain true");
+                client.label = client_label;
+                client.last_seen_epoch_ms = Some(now_epoch_ms());
+                (
+                    client.client_id.clone(),
+                    client.auth_token.clone(),
+                    client.label.clone(),
+                )
+            },
+        )?
+        .ok_or_else(|| "Saved remote credentials are no longer valid.".to_string()),
     }
 }
 
@@ -4412,9 +5070,9 @@ fn handle_port_forward_connection(
     peer_label: &str,
     stream: &mut transport::ServerTlsStream,
     hello: ClientMessage,
-    config: &RemoteHostConfig,
+    native_runtime_generation: u64,
 ) -> Result<(), String> {
-    let (client_id, requested_port) = authenticate_port_forward(inner, hello, config)?;
+    let (client_id, auth_token, requested_port) = authenticate_port_forward(inner, hello)?;
     let mut upstream = TcpStream::connect(("127.0.0.1", requested_port))
         .or_else(|_| TcpStream::connect(("::1", requested_port)))
         .map_err(|error| {
@@ -4425,7 +5083,10 @@ fn handle_port_forward_connection(
     let _ = upstream.set_write_timeout(Some(Duration::from_secs(5)));
     write_message(stream, &ServerMessage::PortForwardOk)
         .map_err(|error| format!("Could not start port forward: {error}"))?;
-    if let Err(error) = copy_bidirectional(&mut upstream, stream) {
+    if let Err(error) = copy_bidirectional(&mut upstream, stream, || {
+        native_connection_should_stop(inner, native_runtime_generation)
+            || !native_client_credentials_are_current(inner, &client_id, &auth_token)
+    }) {
         eprintln!(
             "[remote] port forward {requested_port} for {client_id} from {peer_label} ended with error: {error}"
         );
@@ -4438,8 +5099,7 @@ fn handle_port_forward_connection(
 fn authenticate_port_forward(
     inner: &Arc<RemoteHostInner>,
     hello: ClientMessage,
-    config: &RemoteHostConfig,
-) -> Result<(String, u16), String> {
+) -> Result<(String, String, u16), String> {
     let ClientMessage::PortForwardHello {
         protocol_version,
         server_id,
@@ -4457,22 +5117,41 @@ fn authenticate_port_forward(
             PROTOCOL_VERSION
         ));
     }
-    if server_id != config.server_id {
-        return Err("This client targeted a different host identity.".to_string());
-    }
-    if !config
-        .paired_clients
-        .iter()
-        .any(|client| client.client_id == client_id && client.auth_token == auth_token)
     {
-        return Err("Saved remote credentials are no longer valid.".to_string());
+        let config = inner
+            .config
+            .read()
+            .map_err(|_| "Remote host credentials are temporarily unavailable.".to_string())?;
+        if server_id != config.server_id {
+            return Err("This client targeted a different host identity.".to_string());
+        }
+        if !config
+            .paired_clients
+            .iter()
+            .any(|client| client.client_id == client_id && client.auth_token == auth_token)
+        {
+            return Err("Saved remote credentials are no longer valid.".to_string());
+        }
     }
     if !host_can_forward_port(inner, requested_port) {
         return Err(format!(
             "Port {requested_port} is not a live DevManager server port on this host."
         ));
     }
-    Ok((client_id, requested_port))
+    Ok((client_id, auth_token, requested_port))
+}
+
+fn native_client_credentials_are_current(
+    inner: &RemoteHostInner,
+    client_id: &str,
+    auth_token: &str,
+) -> bool {
+    inner.config.read().is_ok_and(|config| {
+        config
+            .paired_clients
+            .iter()
+            .any(|client| client.client_id == client_id && client.auth_token == auth_token)
+    })
 }
 
 fn host_can_forward_port(inner: &Arc<RemoteHostInner>, requested_port: u16) -> bool {
@@ -4530,9 +5209,7 @@ pub(crate) fn publish_semantic_event(
     inner: &Arc<RemoteHostInner>,
     draft: SemanticEventDraft,
 ) -> SemanticEvent {
-    let service = RemoteHostService {
-        inner: inner.clone(),
-    };
+    let service = RemoteHostService::borrowed(inner.clone());
     let mut published = None;
     service.publish_semantic_change(|journals| {
         published = Some(journals.record(draft));
@@ -5191,8 +5868,18 @@ fn write_message<T: Serialize, W: Write>(stream: &mut W, message: &T) -> Result<
 }
 
 fn read_message<T: for<'de> Deserialize<'de>, R: Read>(stream: &mut R) -> Result<T, String> {
+    read_message_until_cancelled(stream, || false)
+}
+
+fn read_message_until_cancelled<T: for<'de> Deserialize<'de>, R: Read, C: FnMut() -> bool>(
+    stream: &mut R,
+    mut is_cancelled: C,
+) -> Result<T, String> {
     let mut buffer = Vec::new();
     loop {
+        if is_cancelled() {
+            return Err("Read cancelled because the remote host stopped.".to_string());
+        }
         if let Some(message) = try_read_message(stream, &mut buffer)? {
             return Ok(message);
         }
@@ -5428,14 +6115,16 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::TestProfileGuard;
     use super::{
-        apply_remote_session_output, apply_workspace_delta, current_controller_allows,
-        current_snapshot, deliver_live_semantic_events, deliver_pending_bootstraps,
-        drain_web_clients_for_restart, format_handshake_stage_error, generate_pairing_token,
-        light_snapshot, load_remote_machine_state, now_epoch_ms, publish_semantic_event,
-        request_timeout_for_action, requires_control, run_broadcaster, save_remote_machine_state,
-        set_last_connection_note, try_enqueue_pending_request, upsert_known_host, ClientAuth,
-        ConnectedRemoteClient, KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient,
-        PairedWebClient, PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
+        apply_remote_session_output, apply_workspace_delta, authenticate_client,
+        current_controller_allows, current_snapshot, deliver_live_semantic_events,
+        deliver_pending_bootstraps, drain_web_clients_for_restart, format_handshake_stage_error,
+        generate_pairing_token, light_snapshot, load_remote_machine_state,
+        native_connection_should_stop, now_epoch_ms, publish_semantic_event, read_message,
+        request_timeout_for_action, requires_control, run_broadcaster, save_remote_known_hosts,
+        save_remote_machine_state, set_last_connection_note, try_enqueue_pending_request,
+        upsert_known_host, write_message, ClientAuth, ClientMessage, ConnectedRemoteClient,
+        KnownRemoteHost, LocalPortForwardManager, PairedRemoteClient, PairedWebClient,
+        PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
         RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
         RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteWorkspaceDelta,
@@ -5462,7 +6151,7 @@ mod tests {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -5470,10 +6159,25 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn pairing_token_is_short_and_non_empty() {
+    fn pairing_token_uses_eight_unambiguous_characters() {
         let token = generate_pairing_token();
-        assert!(!token.is_empty());
-        assert!(token.len() >= 4);
+        assert_eq!(token.len(), 8);
+        assert!(
+            token
+                .bytes()
+                .all(|byte| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&byte)),
+            "pairing token contained an ambiguous or unsafe character: {token}"
+        );
+    }
+
+    #[test]
+    fn native_secret_uses_full_width_random_hex() {
+        let secret = super::generate_secret("auth");
+        let random_hex = secret
+            .strip_prefix("auth-")
+            .expect("secret should retain its namespace");
+        assert_eq!(random_hex.len(), 48);
+        assert!(random_hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -5491,6 +6195,221 @@ mod tests {
         assert!(!config.certificate_pem.is_empty());
         assert!(!config.private_key_pem.is_empty());
         assert!(!config.certificate_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn dropping_nonfinal_service_clone_keeps_shared_runtime_alive() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+
+        drop(service.clone());
+
+        assert!(!service.inner.stop_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_root_service_stops_runtime_with_clone_backed_handler_alive() {
+        let root = RemoteHostService::new(RemoteHostConfig::default());
+        let ordinary_clone = root.clone();
+        let handler_clone = root.clone();
+        let internal_reference = root.inner.clone();
+        root.set_terminal_input_handler(Some(Arc::new(move |_input, _enqueued_at_epoch_ms| {
+            let _ = handler_clone.status();
+            Ok(())
+        })));
+        assert!(internal_reference
+            .terminal_input_handler
+            .read()
+            .expect("terminal input handler lock")
+            .is_some());
+
+        drop(root);
+
+        assert!(internal_reference.stop_flag.load(Ordering::SeqCst));
+        assert!(internal_reference
+            .terminal_input_handler
+            .read()
+            .expect("terminal input handler lock")
+            .is_none());
+        drop(ordinary_clone);
+    }
+
+    #[test]
+    fn dropping_root_service_closes_web_listener_with_clone_backed_handler_alive() {
+        let port = reserve_free_tcp_port();
+        let mut config = RemoteHostConfig::default();
+        config.web.enabled = true;
+        config.web.bind_address = "127.0.0.1".to_string();
+        config.web.port = port;
+        let root = RemoteHostService::new(config);
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "web listener did not reserve its configured port"
+        );
+        let ordinary_clone = root.clone();
+        let handler_clone = root.clone();
+        root.set_terminal_input_handler(Some(Arc::new(move |_input, _enqueued_at_epoch_ms| {
+            let _ = handler_clone.status();
+            Ok(())
+        })));
+
+        drop(root);
+
+        wait_for(
+            || TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            Duration::from_secs(3),
+            "root service drop left the browser listener port bound",
+        );
+        ordinary_clone.set_terminal_input_handler(None);
+    }
+
+    #[test]
+    fn dropping_root_service_revokes_registered_browser_authority() {
+        let root = RemoteHostService::new(RemoteHostConfig::default());
+        let internal_reference = root.inner.clone();
+        let (native_tx, _native_rx) = mpsc::channel();
+        let web_sender = BrowserOutboundSender::detached_for_test(8, 1024 * 1024);
+        let tombstone = web_sender.tombstone();
+        internal_reference
+            .clients
+            .lock()
+            .expect("clients lock")
+            .insert(
+                1,
+                test_connected_client("browser", native_tx, Some(web_sender)),
+            );
+        internal_reference
+            .web_control
+            .lock()
+            .expect("web control lock")
+            .writer_leases_mut()
+            .acquire(1, "browser", "tab", now_epoch_ms())
+            .expect("browser lease");
+        *internal_reference
+            .controller_client_id
+            .write()
+            .expect("controller lock") = Some("browser".to_string());
+
+        drop(root);
+
+        assert!(
+            !tombstone.is_active(),
+            "root drop left a browser mutation tombstone authoritative"
+        );
+        assert!(
+            internal_reference
+                .clients
+                .lock()
+                .expect("clients lock")
+                .is_empty(),
+            "root drop retained a registered browser"
+        );
+        assert!(
+            internal_reference
+                .web_control
+                .lock()
+                .expect("web control lock")
+                .writer_leases()
+                .peek()
+                .is_none(),
+            "root drop retained the browser writer lease"
+        );
+        assert!(
+            internal_reference
+                .controller_client_id
+                .read()
+                .expect("controller lock")
+                .is_none(),
+            "root drop retained the browser controller"
+        );
+    }
+
+    #[test]
+    fn dropping_root_service_releases_a_stalled_native_tls_worker() {
+        let port = reserve_free_tcp_port();
+        let config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let root = RemoteHostService::new(config);
+        wait_for(
+            || root.status().listening,
+            Duration::from_secs(3),
+            "native listener never started",
+        );
+        let baseline_references = Arc::strong_count(&root.inner);
+        let stalled_client =
+            TcpStream::connect(("127.0.0.1", port)).expect("stalled native client should connect");
+        wait_for(
+            || Arc::strong_count(&root.inner) > baseline_references,
+            Duration::from_secs(3),
+            "native listener never admitted the stalled TLS worker",
+        );
+        let inner = Arc::downgrade(&root.inner);
+
+        drop(root);
+
+        wait_for(
+            || inner.upgrade().is_none(),
+            Duration::from_secs(2),
+            "stalled native TLS worker retained the stopped host runtime",
+        );
+        drop(stalled_client);
+    }
+
+    #[test]
+    fn dropping_root_service_releases_a_tls_client_that_withholds_hello() {
+        let port = reserve_free_tcp_port();
+        let config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port,
+            ..RemoteHostConfig::default()
+        };
+        let root = RemoteHostService::new(config);
+        wait_for(
+            || root.status().listening,
+            Duration::from_secs(3),
+            "native listener never started",
+        );
+        let stalled_client = super::transport::connect_tls("127.0.0.1", port, None)
+            .expect("TLS-only native client should complete transport handshake")
+            .stream;
+        let inner = Arc::downgrade(&root.inner);
+
+        drop(root);
+
+        wait_for(
+            || inner.upgrade().is_none(),
+            Duration::from_secs(2),
+            "TLS client that withheld hello retained the stopped host runtime",
+        );
+        drop(stalled_client);
+    }
+
+    #[test]
+    fn stale_native_runtime_generation_stays_stopped_after_flag_reset() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let admitted_generation = service
+            .inner
+            .native_runtime_generation
+            .load(Ordering::SeqCst);
+        assert!(!native_connection_should_stop(
+            &service.inner,
+            admitted_generation
+        ));
+
+        service
+            .inner
+            .native_runtime_generation
+            .fetch_add(1, Ordering::SeqCst);
+        service.inner.stop_flag.store(false, Ordering::SeqCst);
+
+        assert!(native_connection_should_stop(
+            &service.inner,
+            admitted_generation
+        ));
     }
 
     #[test]
@@ -5723,6 +6642,72 @@ mod tests {
     }
 
     #[test]
+    fn persisted_remote_machine_state_is_private_to_current_user() {
+        let _profile = TestProfileGuard::new("private-remote-state");
+        save_remote_machine_state(&RemoteMachineState::default())
+            .expect("save remote machine state");
+        let path = super::remote_state_path().expect("remote state path");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path)
+                .expect("remote state metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "unexpected mode for {path:?}");
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let output = std::process::Command::new("icacls")
+                .arg(&path)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .expect("inspect remote state ACL");
+            assert!(
+                output.status.success(),
+                "icacls failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let acl = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            assert!(
+                !acl.contains("(i)"),
+                "remote state retained inherited ACL entries:\n{acl}"
+            );
+            for broad_principal in [
+                "codexsandboxusers",
+                "builtin\\users",
+                "builtin\\administrators",
+                "nt authority\\system",
+                "authenticated users",
+                "everyone",
+            ] {
+                assert!(
+                    !acl.contains(broad_principal),
+                    "remote state grants {broad_principal}:\n{acl}"
+                );
+            }
+            let username = std::env::var("USERNAME").expect("USERNAME");
+            let identity = std::env::var("USERDOMAIN")
+                .ok()
+                .filter(|domain| !domain.trim().is_empty())
+                .map(|domain| format!("{domain}\\{username}"))
+                .unwrap_or(username)
+                .to_lowercase();
+            assert!(
+                acl.contains(&format!("{identity}:(f)")),
+                "remote state does not grant the current user {identity} full control:\n{acl}"
+            );
+        }
+    }
+
+    #[test]
     fn concurrent_remote_state_saves_do_not_race_on_temp_file() {
         let _profile = TestProfileGuard::new("concurrent-remote-save");
 
@@ -5746,7 +6731,243 @@ mod tests {
     }
 
     #[test]
+    fn native_listener_update_preserves_concurrently_rotated_browser_pairing_state() {
+        let _profile = TestProfileGuard::new("listener-preserves-web-pairing");
+        let mut config = RemoteHostConfig::default();
+        config.web.pairing_token = "browser-token-before".to_string();
+        save_remote_machine_state(&RemoteMachineState {
+            host: config.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed remote state");
+        let service = RemoteHostService::new(config);
+        let listener_port = reserve_free_tcp_port();
+        let pairing_service = service.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let pairing_barrier = barrier.clone();
+        let pairing_thread = thread::spawn(move || {
+            pairing_barrier.wait();
+            super::mutate_host_config(&pairing_service.inner, |config| {
+                config.web.pairing_token = "browser-token-after".to_string();
+                config.web.paired_clients.push(PairedWebClient {
+                    client_id: "web-client-race".to_string(),
+                    browser_install_id: "browser-install-race".to_string(),
+                    nickname: None,
+                    label: "Phone".to_string(),
+                    issued_at_epoch_ms: Some(10),
+                    last_seen_epoch_ms: Some(20),
+                    last_seen_ip: Some("127.0.0.1".to_string()),
+                    user_agent: Some("Safari".to_string()),
+                    browser_family: Some("Safari".to_string()),
+                    browser_version: Some("17.4".to_string()),
+                    os_family: Some("iOS".to_string()),
+                    device_class: Some("phone".to_string()),
+                });
+            })
+            .expect("persist paired browser");
+        });
+
+        let listener_service = service.clone();
+        let listener_barrier = barrier.clone();
+        let listener_thread = thread::spawn(move || {
+            listener_barrier.wait();
+            listener_service
+                .update_native_listener_settings(true, "127.0.0.1".to_string(), listener_port)
+                .expect("update native listener");
+        });
+
+        barrier.wait();
+        pairing_thread.join().expect("pairing thread");
+        listener_thread.join().expect("listener thread");
+
+        let saved = load_remote_machine_state().expect("reload remote state");
+        assert!(saved.host.enabled);
+        assert_eq!(saved.host.bind_address, "127.0.0.1");
+        assert_eq!(saved.host.port, listener_port);
+        assert_eq!(saved.host.web.pairing_token, "browser-token-after");
+        assert_eq!(saved.host.web.paired_clients.len(), 1);
+        assert_eq!(
+            saved.host.web.paired_clients[0].client_id,
+            "web-client-race"
+        );
+    }
+
+    #[test]
+    fn concurrent_host_and_known_host_saves_preserve_both_fields() {
+        let _profile = TestProfileGuard::new("known-host-preserves-host");
+        let mut disk_state = RemoteMachineState::default();
+        disk_state.host.pairing_token = "rotated-host-token".to_string();
+        save_remote_machine_state(&disk_state).expect("seed remote state");
+
+        let mut cached_state = disk_state.clone();
+        cached_state.host.pairing_token = "stale-cached-token".to_string();
+        cached_state.known_hosts.push(KnownRemoteHost {
+            label: "Studio".to_string(),
+            address: "10.0.0.5".to_string(),
+            port: 43871,
+            server_id: "studio-host".to_string(),
+            certificate_fingerprint: "fp-studio".to_string(),
+            client_id: "client-studio".to_string(),
+            auth_token: "auth-studio".to_string(),
+            last_connected_epoch_ms: Some(42),
+        });
+
+        let service = RemoteHostService::new(disk_state.host.clone());
+        let token_service = service.clone();
+        let known_hosts = cached_state.known_hosts.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let token_barrier = barrier.clone();
+        let token_thread = thread::spawn(move || {
+            token_barrier.wait();
+            token_service
+                .regenerate_native_pairing_token()
+                .expect("rotate host token")
+        });
+        let hosts_barrier = barrier.clone();
+        let hosts_thread = thread::spawn(move || {
+            hosts_barrier.wait();
+            save_remote_known_hosts(&known_hosts).expect("save known hosts only");
+        });
+        barrier.wait();
+        let rotated_token = token_thread.join().expect("token thread");
+        hosts_thread.join().expect("known-host thread");
+
+        let saved = load_remote_machine_state().expect("reload remote state");
+        assert_eq!(saved.host.pairing_token, rotated_token);
+        assert_eq!(saved.known_hosts.len(), 1);
+        assert_eq!(saved.known_hosts[0].server_id, "studio-host");
+    }
+
+    #[test]
+    fn unchanged_browser_listener_settings_do_not_restart_or_revise_service() {
+        let _profile = TestProfileGuard::new("unchanged-browser-listener");
+        let mut config = RemoteHostConfig::default();
+        config.web.bind_address = "127.0.0.1".to_string();
+        config.web.port = 43872;
+        save_remote_machine_state(&RemoteMachineState {
+            host: config.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed remote state");
+        let service = RemoteHostService::new(config);
+        let revision = service.config_revision();
+
+        service
+            .update_web_listener_settings(false, "127.0.0.1".to_string(), 43872)
+            .expect("apply unchanged settings");
+
+        assert_eq!(service.config_revision(), revision);
+    }
+
+    #[test]
+    fn changed_browser_listener_settings_persist_and_move_the_bound_port() {
+        let _profile = TestProfileGuard::new("changed-browser-listener");
+        let old_port = reserve_free_tcp_port();
+        let mut new_port = reserve_free_tcp_port();
+        while new_port == old_port {
+            new_port = reserve_free_tcp_port();
+        }
+        let mut config = RemoteHostConfig::default();
+        config.web.enabled = true;
+        config.web.bind_address = "127.0.0.1".to_string();
+        config.web.port = old_port;
+        save_remote_machine_state(&RemoteMachineState {
+            host: config.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed remote state");
+        let service = RemoteHostService::new(config);
+        assert!(
+            TcpListener::bind(("127.0.0.1", old_port)).is_err(),
+            "browser listener did not bind its original port"
+        );
+
+        service
+            .update_web_listener_settings(true, "127.0.0.1".to_string(), new_port)
+            .expect("apply changed browser listener settings");
+
+        wait_for(
+            || TcpListener::bind(("127.0.0.1", old_port)).is_ok(),
+            Duration::from_secs(3),
+            "browser listener did not release its original port",
+        );
+        assert!(
+            TcpListener::bind(("127.0.0.1", new_port)).is_err(),
+            "browser listener did not bind its new port"
+        );
+        let saved = load_remote_machine_state().expect("reload remote state");
+        assert_eq!(saved.host.web.bind_address, "127.0.0.1");
+        assert_eq!(saved.host.web.port, new_port);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loading_legacy_remote_state_upgrades_acl_before_returning_secrets() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let _profile = TestProfileGuard::new("legacy-remote-acl-upgrade");
+        let mut state = RemoteMachineState::default();
+        state.host.private_key_pem = "legacy-private-secret".to_string();
+        save_remote_machine_state(&state).expect("seed remote state");
+        let path = super::remote_state_path().expect("remote state path");
+        let icacls = super::windows_system_tool("icacls.exe").expect("absolute icacls path");
+        let output = std::process::Command::new(icacls)
+            .arg(&path)
+            .arg("/grant")
+            .arg("*S-1-1-0:(R)")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("weaken legacy ACL");
+        assert!(
+            output.status.success(),
+            "could not create legacy ACL: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let loaded = load_remote_machine_state().expect("legacy ACL should be upgraded");
+
+        assert_eq!(loaded.host.private_key_pem, "legacy-private-secret");
+        super::verify_remote_state_file_permissions(&path)
+            .expect("upgraded remote state ACL should be current-user only");
+    }
+
+    #[test]
+    fn native_pairing_persists_issued_credentials_for_restart() {
+        let _profile = TestProfileGuard::new("native-pairing-persists");
+        let mut config = RemoteHostConfig::default();
+        config.pairing_token = "NATIVE-PAIR".to_string();
+        save_remote_machine_state(&RemoteMachineState {
+            host: config.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed remote state");
+        let service = RemoteHostService::new(config);
+
+        let (client_id, auth_token, _) = authenticate_client(
+            &service.inner,
+            ClientMessage::Hello {
+                protocol_version: super::PROTOCOL_VERSION,
+                client_label: "Desktop test".to_string(),
+                auth: ClientAuth::PairToken {
+                    token: "NATIVE-PAIR".to_string(),
+                },
+            },
+        )
+        .expect("native pairing should succeed");
+
+        let reloaded = load_remote_machine_state().expect("reload paired native client");
+        assert!(reloaded
+            .host
+            .paired_clients
+            .iter()
+            .any(|client| { client.client_id == client_id && client.auth_token == auth_token }));
+    }
+
+    #[test]
     fn revoke_paired_client_removes_saved_token_and_control() {
+        let _profile = TestProfileGuard::new("revoke-native-client");
         let mut config = RemoteHostConfig::default();
         config.paired_clients.push(PairedRemoteClient {
             client_id: "client-1".to_string(),
@@ -5754,6 +6975,11 @@ mod tests {
             auth_token: "secret".to_string(),
             last_seen_epoch_ms: Some(1),
         });
+        save_remote_machine_state(&RemoteMachineState {
+            host: config.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed remote state");
         let service = RemoteHostService::new(config);
         if let Ok(mut controller) = service.inner.controller_client_id.write() {
             *controller = Some("client-1".to_string());
@@ -5762,6 +6988,14 @@ mod tests {
         assert!(service.revoke_paired_client("client-1"));
         assert!(service.config().paired_clients.is_empty());
         assert!(service.status().controller_client_id.is_none());
+        assert!(
+            load_remote_machine_state()
+                .expect("reload remote state")
+                .host
+                .paired_clients
+                .is_empty(),
+            "revoked native token was not removed from disk"
+        );
     }
 
     #[test]
@@ -5838,6 +7072,7 @@ mod tests {
         let _profile = TestProfileGuard::new("reset-web-access");
         let mut config = RemoteHostConfig::default();
         let original_cookie_secret = config.web.cookie_secret_hex.clone();
+        let original_pairing_token = config.web.pairing_token.clone();
         config.web.paired_clients.push(PairedWebClient {
             client_id: "web-client-1".to_string(),
             browser_install_id: "browser-install-1".to_string(),
@@ -5952,6 +7187,7 @@ mod tests {
             RemoteAccessSource::NativeApp
         );
         assert_ne!(saved.web.cookie_secret_hex, original_cookie_secret);
+        assert_ne!(saved.web.pairing_token, original_pairing_token);
         assert!(service.status().controller_client_id.is_none());
 
         assert!(!web_tombstone.is_active());
@@ -7530,6 +8766,185 @@ mod tests {
     }
 
     #[test]
+    fn revoked_native_client_cannot_forward_after_tls_accept_before_hello() {
+        let _profile = TestProfileGuard::new("revoke-native-port-forward-before-hello");
+        let host_port = reserve_free_tcp_port();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("upstream server should bind");
+        let server_port = upstream
+            .local_addr()
+            .expect("upstream address should be available")
+            .port();
+        let mut config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port: host_port,
+            ..RemoteHostConfig::default()
+        };
+        let server_id = config.server_id.clone();
+        config.paired_clients.push(PairedRemoteClient {
+            client_id: "revoked-client".to_string(),
+            label: "Revoked laptop".to_string(),
+            auth_token: "revoked-secret".to_string(),
+            last_seen_epoch_ms: Some(1),
+        });
+        save_remote_machine_state(&RemoteMachineState {
+            host: config.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed remote state");
+        let service = RemoteHostService::new(config);
+        service.update_snapshot(
+            managed_server_state(server_port),
+            managed_server_runtime("command-web", 4242),
+            HashMap::from([(
+                server_port,
+                PortStatus {
+                    port: server_port,
+                    in_use: true,
+                    pid: Some(4242),
+                    process_name: Some("node".to_string()),
+                },
+            )]),
+        );
+
+        wait_for(
+            || service.status().listening,
+            Duration::from_secs(3),
+            "remote host never started listening",
+        );
+        let mut stream = super::transport::connect_tls("127.0.0.1", host_port, None)
+            .expect("TLS-only native client should complete transport handshake")
+            .stream;
+
+        assert!(service.revoke_paired_client("revoked-client"));
+        write_message(
+            &mut stream,
+            &ClientMessage::PortForwardHello {
+                protocol_version: super::PROTOCOL_VERSION,
+                server_id,
+                client_id: "revoked-client".to_string(),
+                auth_token: "revoked-secret".to_string(),
+                requested_port: server_port,
+            },
+        )
+        .expect("withheld port-forward hello should write");
+
+        match read_message::<ServerMessage, _>(&mut stream)
+            .expect("host should answer the revoked port-forward hello")
+        {
+            ServerMessage::HelloErr { message } => {
+                assert!(message.contains("no longer valid"), "{message}");
+            }
+            other => panic!("revoked client unexpectedly opened a port forward: {other:?}"),
+        }
+        drop(upstream);
+    }
+
+    #[test]
+    fn revoking_native_client_stops_an_active_port_forward() {
+        let _profile = TestProfileGuard::new("revoke-active-native-port-forward");
+        let host_port = reserve_free_tcp_port();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).expect("upstream server should bind");
+        let server_port = upstream
+            .local_addr()
+            .expect("upstream address should be available")
+            .port();
+        let (payload_tx, payload_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let upstream_thread = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().expect("upstream should accept tunnel");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("upstream read timeout should apply");
+            let mut payload = [0_u8; 4];
+            socket
+                .read_exact(&mut payload)
+                .expect("upstream should receive tunneled payload");
+            payload_tx
+                .send(payload)
+                .expect("payload signal should send");
+            let mut byte = [0_u8; 1];
+            let closed = matches!(socket.read(&mut byte), Ok(0));
+            closed_tx.send(closed).expect("closed signal should send");
+        });
+
+        let mut config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port: host_port,
+            ..RemoteHostConfig::default()
+        };
+        let server_id = config.server_id.clone();
+        config.paired_clients.push(PairedRemoteClient {
+            client_id: "active-client".to_string(),
+            label: "Active laptop".to_string(),
+            auth_token: "active-secret".to_string(),
+            last_seen_epoch_ms: Some(1),
+        });
+        save_remote_machine_state(&RemoteMachineState {
+            host: config.clone(),
+            known_hosts: Vec::new(),
+        })
+        .expect("seed remote state");
+        let service = RemoteHostService::new(config);
+        service.update_snapshot(
+            managed_server_state(server_port),
+            managed_server_runtime("command-web", 4242),
+            HashMap::from([(
+                server_port,
+                PortStatus {
+                    port: server_port,
+                    in_use: true,
+                    pid: Some(4242),
+                    process_name: Some("node".to_string()),
+                },
+            )]),
+        );
+
+        wait_for(
+            || service.status().listening,
+            Duration::from_secs(3),
+            "remote host never started listening",
+        );
+        let mut stream = super::transport::connect_tls("127.0.0.1", host_port, None)
+            .expect("native port-forward TLS should connect")
+            .stream;
+        write_message(
+            &mut stream,
+            &ClientMessage::PortForwardHello {
+                protocol_version: super::PROTOCOL_VERSION,
+                server_id,
+                client_id: "active-client".to_string(),
+                auth_token: "active-secret".to_string(),
+                requested_port: server_port,
+            },
+        )
+        .expect("port-forward hello should write");
+        assert!(matches!(
+            read_message::<ServerMessage, _>(&mut stream).expect("host should answer hello"),
+            ServerMessage::PortForwardOk
+        ));
+        stream
+            .write_all(b"ping")
+            .expect("active tunnel should accept payload");
+        assert_eq!(
+            payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("upstream did not receive tunneled payload"),
+            *b"ping"
+        );
+
+        assert!(service.revoke_paired_client("active-client"));
+        assert!(
+            closed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("active tunnel did not close after revocation"),
+            "upstream did not observe EOF after client revocation"
+        );
+        upstream_thread.join().expect("upstream thread should exit");
+    }
+
+    #[test]
     fn port_forward_tunnels_bytes_to_a_live_managed_server_port() {
         let host_port = reserve_free_tcp_port();
         let server_port = reserve_free_tcp_port();
@@ -7608,6 +9023,94 @@ mod tests {
         client.client.disconnect();
         config.enabled = false;
         service.apply_config(config);
+    }
+
+    #[test]
+    fn dropping_root_service_stops_an_active_native_port_forward() {
+        let host_port = reserve_free_tcp_port();
+        let server_port = reserve_free_tcp_port();
+        let server_ready = Arc::new(AtomicBool::new(false));
+        let server_ready_signal = server_ready.clone();
+        let server_thread = thread::spawn(move || {
+            let listener =
+                TcpListener::bind(("127.0.0.1", server_port)).expect("server should bind");
+            server_ready_signal.store(true, Ordering::SeqCst);
+            let (mut socket, _) = listener.accept().expect("server should accept forward");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(40)))
+                .expect("server read timeout");
+            let mut buffer = [0_u8; 64];
+            loop {
+                match socket.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        wait_for(
+            || server_ready.load(Ordering::Relaxed),
+            Duration::from_secs(3),
+            "managed server never started",
+        );
+
+        let config = RemoteHostConfig {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port: host_port,
+            ..RemoteHostConfig::default()
+        };
+        let pair_token = config.pairing_token.clone();
+        let root = RemoteHostService::new(config);
+        root.update_snapshot(
+            managed_server_state(server_port),
+            managed_server_runtime("command-web", 4242),
+            HashMap::from([(
+                server_port,
+                PortStatus {
+                    port: server_port,
+                    in_use: true,
+                    pid: Some(4242),
+                    process_name: Some("node".to_string()),
+                },
+            )]),
+        );
+        wait_for(
+            || root.status().listening,
+            Duration::from_secs(3),
+            "remote host never started listening",
+        );
+        let client = RemoteClientHandle::connect(
+            "127.0.0.1",
+            host_port,
+            "Test Client",
+            ClientAuth::PairToken { token: pair_token },
+            None,
+        )
+        .expect("remote client should connect");
+        let forwarded = client
+            .client
+            .open_port_forward(server_port)
+            .expect("port forward should open");
+        let inner = Arc::downgrade(&root.inner);
+
+        drop(root);
+
+        wait_for(
+            || inner.upgrade().is_none(),
+            Duration::from_secs(2),
+            "active native port forward retained the stopped host runtime",
+        );
+        drop(forwarded);
+        client.client.disconnect();
+        server_thread.join().expect("managed server thread");
     }
 
     #[test]

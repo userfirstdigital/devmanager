@@ -12,12 +12,13 @@ use std::io::{BufReader, Cursor, ErrorKind};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub type ClientTlsStream = StreamOwned<ClientConnection, TcpStream>;
 pub type ServerTlsStream = StreamOwned<ServerConnection, TcpStream>;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(40);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_TLS_NAME: &str = "devmanager.remote";
@@ -66,7 +67,11 @@ pub fn ensure_host_tls_material(config: &mut RemoteHostConfig) -> Result<(), Str
     Ok(())
 }
 
-pub fn accept_tls(stream: TcpStream, config: &RemoteHostConfig) -> Result<ServerTlsStream, String> {
+pub fn accept_tls(
+    stream: TcpStream,
+    config: &RemoteHostConfig,
+    mut should_stop: impl FnMut() -> bool,
+) -> Result<ServerTlsStream, String> {
     let mut socket = stream;
     socket
         .set_nonblocking(false)
@@ -75,7 +80,7 @@ pub fn accept_tls(stream: TcpStream, config: &RemoteHostConfig) -> Result<Server
         .set_nodelay(true)
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
     socket
-        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL))
         .map_err(|error| format!("Failed to configure remote socket: {error}"))?;
     socket
         .set_write_timeout(Some(WRITE_TIMEOUT))
@@ -83,7 +88,14 @@ pub fn accept_tls(stream: TcpStream, config: &RemoteHostConfig) -> Result<Server
 
     let mut connection = ServerConnection::new(server_config(config)?)
         .map_err(|error| format!("Remote TLS setup failed: {error}"))?;
+    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     while connection.is_handshaking() {
+        if should_stop() {
+            return Err("Remote host stopped during the TLS handshake.".to_string());
+        }
+        if Instant::now() >= handshake_deadline {
+            return Err("Remote TLS handshake timed out.".to_string());
+        }
         match connection.complete_io(&mut socket) {
             Ok(_) => {}
             Err(error)

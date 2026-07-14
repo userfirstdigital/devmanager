@@ -13,17 +13,28 @@ on:
 permissions:
   contents: read
 
+env:
+  RUST_TOOLCHAIN: "1.94.0"
+
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: web/package-lock.json
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install browser dependencies
         run: npm --prefix web ci --no-audit --no-fund
@@ -43,4 +54,4 @@ jobs:
           fi
 
       - name: Validate embedded browser assets
-        run: cargo test remote::web::assets --lib -j 1
+        run: cargo test --locked remote::web::assets --lib -j 1

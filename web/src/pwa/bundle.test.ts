@@ -147,7 +147,7 @@ describe("tracked bundle determinism", () => {
     expect(workflow).toContain("npm --prefix web test");
     expect(workflow).toContain("npm --prefix web run typecheck");
     expect(workflow).toContain("npm --prefix web run build");
-    expect(workflow).toContain("cargo test remote::web::assets --lib");
+    expect(workflow).toContain("cargo test --locked remote::web::assets --lib");
     expect(workflow).toContain("git status --porcelain -- web/bundle");
   });
 });
