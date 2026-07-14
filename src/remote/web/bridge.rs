@@ -3937,6 +3937,17 @@ impl BrowserOutboundSender {
     ) -> Result<(), BrowserEnqueueError> {
         if matches!(
             message,
+            ServerMessage::SessionStream {
+                event: RemoteSessionStreamEvent::RuntimePatch { .. }
+            }
+        ) {
+            // Browser snapshots already carry runtime state. This variant is
+            // intentionally omitted from the web wire and must not be treated
+            // as a serialization failure that revokes the connection.
+            return Ok(());
+        }
+        if matches!(
+            message,
             ServerMessage::Snapshot { .. } | ServerMessage::Delta { .. }
         ) {
             let _operation = inner
@@ -4376,6 +4387,12 @@ fn encode_session_stream(event: &RemoteSessionStreamEvent) -> Option<EncodedFram
         RemoteSessionStreamEvent::Bootstrap { bootstrap } => {
             use base64::engine::general_purpose::STANDARD;
             use base64::Engine;
+            let mut screen = bootstrap.screen.clone();
+            // The browser renderer consumes `lines`; `cells` is the desktop
+            // renderer's indexed duplicate of the same visible grid. Keeping
+            // both can push an ordinary large terminal over the browser
+            // connection's bounded outbound queue and revoke the socket.
+            screen.cells.clear();
             let replay_base64 = if bootstrap.screen.rows > 0 && bootstrap.screen.cols > 0 {
                 String::new()
             } else {
@@ -4384,7 +4401,7 @@ fn encode_session_stream(event: &RemoteSessionStreamEvent) -> Option<EncodedFram
             serialize_text(&WsOutbound::SessionBootstrap {
                 session_id: bootstrap.session_id.clone(),
                 replay_base64,
-                screen: bootstrap.screen.clone(),
+                screen,
             })
         }
         RemoteSessionStreamEvent::Closed { session_id, .. } => {
@@ -5355,6 +5372,35 @@ mod tests {
         assert_eq!(try_recv_web_json(&mut receiver)["type"], "semanticEvent");
         let raw = try_recv_web_binary(&mut receiver);
         assert_session_output_frame(&raw, "raw", b"raw");
+    }
+
+    #[test]
+    fn browser_runtime_patch_is_an_intentional_noop() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let (sender, mut receiver) = test_web_channel();
+        let runtime = SessionRuntimeState::new(
+            "raw".to_string(),
+            PathBuf::from("C:\\Code"),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+
+        sender
+            .try_send_server_message(
+                &ServerMessage::SessionStream {
+                    event: RemoteSessionStreamEvent::RuntimePatch {
+                        session_id: "raw".to_string(),
+                        runtime,
+                    },
+                },
+                &service.inner,
+                1,
+                "web-client",
+            )
+            .expect("runtime patches are covered by the periodic web snapshot");
+
+        assert!(receiver.rx.try_recv().is_err());
+        assert!(sender.is_active());
     }
 
     #[test]
@@ -8829,6 +8875,21 @@ mod tests {
 
     #[test]
     fn encode_outbound_bootstrap_carries_screen_snapshot() {
+        let cell = crate::terminal::session::TerminalCellSnapshot {
+            character: 'A',
+            zero_width: Vec::new(),
+            foreground: 0xffffff,
+            background: 0,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+        };
         let message = ServerMessage::SessionStream {
             event: RemoteSessionStreamEvent::Bootstrap {
                 bootstrap: RemoteSessionBootstrap {
@@ -8840,21 +8901,12 @@ mod tests {
                         TerminalBackend::default(),
                     ),
                     screen: TerminalScreenSnapshot {
-                        lines: vec![vec![crate::terminal::session::TerminalCellSnapshot {
-                            character: 'A',
-                            zero_width: Vec::new(),
-                            foreground: 0xffffff,
-                            background: 0,
-                            bold: false,
-                            dim: false,
-                            italic: false,
-                            underline: false,
-                            undercurl: false,
-                            strike: false,
-                            hidden: false,
-                            has_hyperlink: false,
-                            default_background: true,
-                        }]],
+                        cells: vec![crate::terminal::session::TerminalIndexedCellSnapshot {
+                            row: 0,
+                            column: 0,
+                            cell: cell.clone(),
+                        }],
+                        lines: vec![vec![cell]],
                         rows: 1,
                         cols: 1,
                         ..TerminalScreenSnapshot::default()
@@ -8870,6 +8922,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(value["type"], "sessionBootstrap");
         assert_eq!(value["screen"]["lines"][0][0]["character"], "A");
+        assert_eq!(value["screen"]["cells"], serde_json::json!([]));
         assert_eq!(value["replayBase64"], "");
     }
 
