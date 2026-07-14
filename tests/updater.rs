@@ -155,6 +155,11 @@ fn release_draft_id_is_resolved_from_the_authenticated_release_list() {
     assert!(draft_step.contains("repos/${REPO}/releases?per_page=100"));
     assert!(draft_step.contains(".draft == true"));
     assert!(
+        draft_step.contains("for attempt in $(seq 1 12)"),
+        "GitHub can briefly omit a newly created draft from the authenticated release list"
+    );
+    assert!(draft_step.contains("sleep 5"));
+    assert!(
         !draft_step.contains("releases/tags/${TAG_NAME}"),
         "GitHub's release-by-tag endpoint does not expose an unpublished draft"
     );
