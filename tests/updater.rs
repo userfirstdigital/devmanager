@@ -144,6 +144,23 @@ fn release_windows_build_exports_the_installed_nsis_directory() {
 }
 
 #[test]
+fn release_draft_id_is_resolved_from_the_authenticated_release_list() {
+    let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
+    let draft_step = workflow
+        .split("- name: Create draft release and upload assets")
+        .nth(1)
+        .and_then(|tail| tail.split("\n      - name:").next())
+        .expect("release job should create a draft release");
+
+    assert!(draft_step.contains("repos/${REPO}/releases?per_page=100"));
+    assert!(draft_step.contains(".draft == true"));
+    assert!(
+        !draft_step.contains("releases/tags/${TAG_NAME}"),
+        "GitHub's release-by-tag endpoint does not expose an unpublished draft"
+    );
+}
+
+#[test]
 fn manifest_fixture_parses_expected_platform_assets() {
     let manifest_text = fs::read_to_string(fixture_path("latest.json")).expect("manifest fixture");
     let manifest = parse_release_manifest(&manifest_text).expect("parse manifest fixture");

@@ -564,11 +564,15 @@ jobs:
             --target "${EXPECTED_SHA}" \
             --title "DevManager ${VERSION}" \
             --generate-notes
-          RELEASE_ID="$(gh api "repos/${REPO}/releases/tags/${TAG_NAME}" --jq .id)"
-          if [ -z "${RELEASE_ID}" ]; then
-            echo "Draft release ${TAG_NAME} did not return an id." >&2
+          mapfile -t RELEASE_IDS < <(
+            gh api --paginate "repos/${REPO}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${TAG_NAME}\" and .draft == true) | .id"
+          )
+          if [ "${#RELEASE_IDS[@]}" -ne 1 ]; then
+            echo "Expected one draft release for ${TAG_NAME}, found ${#RELEASE_IDS[@]}." >&2
             exit 1
           fi
+          RELEASE_ID="${RELEASE_IDS[0]}"
           echo "id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify draft assets and publish atomically
