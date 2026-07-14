@@ -2150,7 +2150,10 @@ fn send_resume_state_with_lane(
             .desired_session_key
             .as_ref()
             .is_none_or(valid_stable_session_key)
-        && request.raw_session_id.as_deref().is_none_or(valid_session_id);
+        && request
+            .raw_session_id
+            .as_deref()
+            .is_none_or(valid_session_id);
     if !valid {
         let _ = web_tx.send(WsOutbound::Error {
             message: "Resume request identifiers are too long or empty.".to_string(),
@@ -8626,7 +8629,10 @@ mod tests {
             EncodedFrame::Text(text) => {
                 let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
                 assert_eq!(value["type"], "snapshot");
-                assert_eq!(value["workspace"]["webProtocolVersion"], 2);
+                assert_eq!(
+                    value["workspace"]["webProtocolVersion"],
+                    serde_json::json!(WEB_PROTOCOL_VERSION)
+                );
                 assert_eq!(value["workspace"]["serverId"], "host-1");
                 assert!(value["workspace"]["runtimeInstanceId"]
                     .as_str()

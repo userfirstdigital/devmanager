@@ -8,6 +8,7 @@ import type {
   WebActionResult,
   WebWorkspaceSnapshot,
 } from "../api/types";
+import { WEB_PROTOCOL_VERSION } from "../api/types";
 
 const { wsClientState, MockWsClient } = vi.hoisted(() => {
   const state: { instance: MockWsClient | null } = { instance: null };
@@ -104,7 +105,7 @@ function makeSnapshot(
   overrides: Partial<WebWorkspaceSnapshot> = {},
 ): WebWorkspaceSnapshot {
   return {
-    webProtocolVersion: 2,
+    webProtocolVersion: WEB_PROTOCOL_VERSION,
     runtimeInstanceId: "runtime-1",
     revision: 1,
     serverId: "server-1",
@@ -342,7 +343,7 @@ describe("aggregate app badge", () => {
         runtimeInstanceId: null,
         status: { kind: "closed", reason: "incompatible web protocol" },
         compatibilityDiagnostic: {
-          expectedProtocolVersion: 2,
+          expectedProtocolVersion: WEB_PROTOCOL_VERSION,
           receivedProtocolVersion: 1,
         },
         sessions: {},
@@ -494,7 +495,7 @@ describe("host runtime reconciliation", () => {
 
     const state = useStore.getState();
     expect(state.compatibilityDiagnostic).toEqual({
-      expectedProtocolVersion: 2,
+      expectedProtocolVersion: WEB_PROTOCOL_VERSION,
       receivedProtocolVersion: 99,
     });
     expect(state.status).toMatchObject({ kind: "closed" });

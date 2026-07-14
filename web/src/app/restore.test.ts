@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { WebWorkspaceSnapshot } from "../api/types";
+import { WEB_PROTOCOL_VERSION } from "../api/types";
 import { resolveColdStart, type SavedRoute } from "./restore";
 import type { AppRoute } from "./router";
 
@@ -9,7 +10,7 @@ function snapshot(
   stableSessionKey: string | null = "tab:tab-a",
 ): WebWorkspaceSnapshot {
   return {
-    webProtocolVersion: 2,
+    webProtocolVersion: WEB_PROTOCOL_VERSION,
     runtimeInstanceId,
     revision: 1,
     serverId: "server",

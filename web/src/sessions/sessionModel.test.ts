@@ -4,6 +4,7 @@ import type {
   WebSessionSummary,
   WebWorkspaceSnapshot,
 } from "../api/types";
+import { WEB_PROTOCOL_VERSION } from "../api/types";
 import { describeSession, groupSessions } from "./sessionModel";
 
 function session(
@@ -36,7 +37,7 @@ function session(
 
 function workspace(sessions: WebSessionSummary[]): WebWorkspaceSnapshot {
   return {
-    webProtocolVersion: 2,
+    webProtocolVersion: WEB_PROTOCOL_VERSION,
     runtimeInstanceId: "runtime",
     revision: 1,
     serverId: "server",
