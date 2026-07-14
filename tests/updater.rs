@@ -12,6 +12,13 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn release_workflow_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".github")
+        .join("workflows")
+        .join("release.yml")
+}
+
 #[test]
 fn updater_config_requires_endpoint_and_pubkey_together() {
     assert!(resolve_updater_config(
@@ -75,6 +82,26 @@ fn github_release_endpoint_matches_workflow_location() {
     assert_eq!(
         github_release_manifest_endpoint("example/devmanager"),
         "https://github.com/example/devmanager/releases/latest/download/latest.json"
+    );
+}
+
+#[test]
+fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
+    let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
+    let verify_job = workflow
+        .split("\n  prepare:")
+        .next()
+        .expect("verify job should precede prepare");
+    let rust_install = verify_job
+        .split("- name: Install Rust stable")
+        .nth(1)
+        .and_then(|tail| tail.split("\n      - name:").next())
+        .expect("verify job should install Rust");
+
+    assert!(verify_job.contains("cargo fmt --all -- --check"));
+    assert!(
+        rust_install.contains("components: rustfmt"),
+        "the minimal Rust toolchain must install cargo-fmt before verification"
     );
 }
 
