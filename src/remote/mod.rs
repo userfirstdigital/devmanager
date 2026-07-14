@@ -1096,6 +1096,12 @@ fn windows_trustee_sid(trustee: &str) -> Option<&str> {
 }
 
 #[cfg(windows)]
+fn windows_trustee_matches_sid(trustee: &str, sid: &str) -> bool {
+    windows_trustee_sid(trustee).is_some_and(|trustee_sid| trustee_sid.eq_ignore_ascii_case(sid))
+        || (trustee == "LA" && sid.rsplit('-').next() == Some("500"))
+}
+
+#[cfg(windows)]
 fn lock_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     if verify_remote_state_file_permissions(path).is_ok() {
         return Ok(());
@@ -1108,15 +1114,15 @@ fn lock_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
 
     let initial_acl = windows_acl_sddl(path)?;
     for (_, _, trustee) in windows_dacl_entries(&initial_acl)? {
+        if windows_trustee_matches_sid(&trustee, &current_sid) {
+            continue;
+        }
         let trustee_sid = windows_trustee_sid(&trustee).ok_or_else(|| {
             std::io::Error::new(
                 ErrorKind::PermissionDenied,
                 format!("cannot safely identify ACL trustee {trustee}"),
             )
         })?;
-        if trustee_sid.eq_ignore_ascii_case(&current_sid) {
-            continue;
-        }
         for removal in ["/remove:g", "/remove:d"] {
             run_windows_system_tool(
                 "icacls.exe",
@@ -1156,17 +1162,7 @@ fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
-    let current_sid = current_windows_process_sid()?;
-    run_windows_system_tool(
-        "icacls.exe",
-        &[
-            path.as_os_str().to_os_string(),
-            "/inheritance:r".into(),
-            "/grant:r".into(),
-            format!("*{current_sid}:(F)").into(),
-        ],
-    )?;
-    verify_remote_state_file_permissions(path)
+    lock_remote_state_file_permissions(path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1207,8 +1203,7 @@ fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     if entries.len() == 1
         && entries[0].0 == "A"
         && entries[0].1 == "FA"
-        && windows_trustee_sid(&entries[0].2)
-            .is_some_and(|sid| sid.eq_ignore_ascii_case(&current_sid))
+        && windows_trustee_matches_sid(&entries[0].2, &current_sid)
     {
         Ok(())
     } else {
@@ -6705,6 +6700,61 @@ mod tests {
                 "remote state does not grant the current user {identity} full control:\n{acl}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_administrator_sddl_alias_matches_only_rid_500() {
+        assert!(super::windows_trustee_matches_sid(
+            "LA",
+            "S-1-5-21-111-222-333-500"
+        ));
+        assert!(!super::windows_trustee_matches_sid(
+            "LA",
+            "S-1-5-21-111-222-333-1001"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_remote_state_acl_removes_explicit_non_user_grants() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let _profile = TestProfileGuard::new("explicit-new-remote-acl");
+        let path = super::remote_state_path().expect("remote state path");
+        std::fs::create_dir_all(path.parent().expect("remote state directory"))
+            .expect("create remote state directory");
+        std::fs::write(&path, b"{}").expect("seed remote state file");
+
+        let current_sid = super::current_windows_process_sid().expect("current process SID");
+        let icacls = super::windows_system_tool("icacls.exe").expect("absolute icacls path");
+        let output = std::process::Command::new(icacls)
+            .arg(&path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("*{current_sid}:(F)"))
+            .arg("/grant")
+            .arg("*S-1-5-18:(F)")
+            .arg("/grant")
+            .arg("*S-1-5-32-544:(F)")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("seed explicit remote state ACL");
+        assert!(
+            output.status.success(),
+            "could not seed explicit remote state ACL: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            super::verify_remote_state_file_permissions(&path).is_err(),
+            "test fixture unexpectedly started current-user only"
+        );
+
+        super::lock_new_remote_state_file_permissions(&path)
+            .expect("new remote state ACL should remove explicit non-user grants");
+        super::verify_remote_state_file_permissions(&path)
+            .expect("new remote state ACL should be current-user only");
     }
 
     #[test]
