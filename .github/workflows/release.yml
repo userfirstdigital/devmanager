@@ -280,10 +280,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Chocolatey failed to install NSIS $env:NSIS_VERSION."
           }
-          $actual = (& makensis.exe /VERSION | Out-String).Trim()
+          $nsisBin = Join-Path ${env:ProgramFiles(x86)} "NSIS"
+          $makensis = Join-Path $nsisBin "makensis.exe"
+          if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) {
+            throw "NSIS executable was not found at $makensis."
+          }
+          $actual = (& $makensis /VERSION | Out-String).Trim()
           if ($actual -ne "v3.12") {
             throw "Unexpected NSIS version: $actual"
           }
+          $nsisBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Ensure WiX Toolset
         if: runner.os == 'Windows' && matrix.platform == 'windows-x86_64'

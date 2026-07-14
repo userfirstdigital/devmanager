@@ -122,6 +122,28 @@ fn release_build_reuses_the_cross_platform_verified_web_bundle() {
 }
 
 #[test]
+fn release_windows_build_exports_the_installed_nsis_directory() {
+    let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
+    let build_job = workflow
+        .split("\n  build:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  release:").next())
+        .expect("build job should precede release");
+    let nsis_install = build_job
+        .split("- name: Install NSIS")
+        .nth(1)
+        .and_then(|tail| tail.split("\n      - name:").next())
+        .expect("Windows build should install NSIS");
+
+    assert!(nsis_install.contains("Join-Path ${env:ProgramFiles(x86)} \"NSIS\""));
+    assert!(nsis_install.contains("& $makensis /VERSION"));
+    assert!(
+        nsis_install.contains("$env:GITHUB_PATH"),
+        "the package step needs the newly installed NSIS directory on PATH"
+    );
+}
+
+#[test]
 fn manifest_fixture_parses_expected_platform_assets() {
     let manifest_text = fs::read_to_string(fixture_path("latest.json")).expect("manifest fixture");
     let manifest = parse_release_manifest(&manifest_text).expect("parse manifest fixture");
