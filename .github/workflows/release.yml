@@ -264,27 +264,9 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24"
-          cache: "npm"
-          cache-dependency-path: web/package-lock.json
-
-      - name: Rebuild and verify browser web UI bundle
+      - name: Verify embedded browser web UI bundle
         shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf web/bundle
-          npm --prefix web ci --no-audit --no-fund
-          npm --prefix web run build
-          if [ -n "$(git status --porcelain -- web/bundle)" ]; then
-            git status --short -- web/bundle
-            git diff -- web/bundle
-            echo "Generated web/bundle differs from the tracked bundle." >&2
-            exit 1
-          fi
-          cargo test remote::web::assets --lib
+        run: cargo test remote::web::assets --lib
 
       - name: Install cargo-packager
         shell: bash

@@ -106,6 +106,22 @@ fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
 }
 
 #[test]
+fn release_build_reuses_the_cross_platform_verified_web_bundle() {
+    let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
+    let build_job = workflow
+        .split("\n  build:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  release:").next())
+        .expect("build job should precede release");
+
+    assert!(build_job.contains("cargo test remote::web::assets --lib"));
+    assert!(
+        !build_job.contains("npm --prefix web") && !build_job.contains("rm -rf web/bundle"),
+        "platform packaging must reuse the bundle already verified by the verify job"
+    );
+}
+
+#[test]
 fn manifest_fixture_parses_expected_platform_assets() {
     let manifest_text = fs::read_to_string(fixture_path("latest.json")).expect("manifest fixture");
     let manifest = parse_release_manifest(&manifest_text).expect("parse manifest fixture");
