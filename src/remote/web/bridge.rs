@@ -2149,7 +2149,8 @@ fn send_resume_state_with_lane(
         && request
             .desired_session_key
             .as_ref()
-            .is_none_or(valid_stable_session_key);
+            .is_none_or(valid_stable_session_key)
+        && request.raw_session_id.as_deref().is_none_or(valid_session_id);
     if !valid {
         let _ = web_tx.send(WsOutbound::Error {
             message: "Resume request identifiers are too long or empty.".to_string(),
@@ -2204,6 +2205,7 @@ fn send_resume_state_with_lane(
             .ok()
             .map(|(session_id, _)| session_id)
     });
+    let raw_session_id = request.raw_session_id.clone();
     let delivered = if web_tx.is_test_lane() {
         web_tx.send(WsOutbound::ResumeState { state }).is_ok()
     } else {
@@ -2249,7 +2251,7 @@ fn send_resume_state_with_lane(
             .visible
             .then(|| desired_session_id.clone())
             .flatten();
-        if let Some(session_id) = desired_session_id.as_ref() {
+        if let Some(session_id) = raw_session_id.as_ref() {
             client.subscribed_session_ids.insert(session_id.clone());
             client
                 .bootstrap_pending_session_ids
@@ -5862,6 +5864,7 @@ mod tests {
                 .map(|key| format!("/session/{}", key.as_str().replace(':', "/")))
                 .unwrap_or_else(|| "/sessions".to_string()),
             desired_session_key,
+            raw_session_id: None,
             semantic_after_sequence: Some(0),
             client_instance_id: client_instance_id.to_string(),
             visible: true,
@@ -6023,7 +6026,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_marks_raw_bootstrap_pending_without_calling_the_provider() {
+    fn semantic_resume_does_not_subscribe_to_raw_terminal_or_call_provider() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         pair_web_client(&service, "web-client");
         ai_session(&service, "tab-a", "session-a");
@@ -6065,8 +6068,45 @@ mod tests {
         assert!(!provider_called.load(Ordering::SeqCst));
         let clients = service.inner.clients.lock().expect("clients lock");
         let client = clients.get(&1).expect("resume connection");
-        assert!(client.subscribed_session_ids.contains("session-a"));
-        assert!(client.bootstrap_pending_session_ids.contains("session-a"));
+        assert!(client.subscribed_session_ids.is_empty());
+        assert!(client.bootstrap_pending_session_ids.is_empty());
+    }
+
+    #[test]
+    fn raw_resume_marks_only_requested_terminal_bootstrap_pending() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        pair_web_client(&service, "web-client");
+        ai_session(&service, "tab-a", "session-a");
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(&service.inner, 1, "web-client", std_tx, test_web_sender());
+
+        let current_runtime = service.inner.runtime_instance_id.clone();
+        let mut request = resume_request(
+            Some(current_runtime),
+            Some(StableSessionKey::from_tab("tab-a")),
+            "tab-a",
+        );
+        request.raw_session_id = Some("session-a".to_string());
+        let (response_tx, _response_rx) = tokio_mpsc::unbounded_channel();
+        send_resume_state(
+            &service.inner,
+            1,
+            "web-client",
+            request,
+            1_000,
+            &response_tx,
+        );
+
+        let clients = service.inner.clients.lock().expect("clients lock");
+        let client = clients.get(&1).expect("resume connection");
+        assert_eq!(
+            client.subscribed_session_ids,
+            HashSet::from(["session-a".to_string()])
+        );
+        assert_eq!(
+            client.bootstrap_pending_session_ids,
+            HashSet::from(["session-a".to_string()])
+        );
     }
 
     #[test]

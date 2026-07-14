@@ -18,6 +18,8 @@ pub struct ResumeRequest {
     pub seen_revision: Option<u64>,
     pub route: String,
     pub desired_session_key: Option<StableSessionKey>,
+    #[serde(default)]
+    pub raw_session_id: Option<String>,
     pub semantic_after_sequence: Option<u64>,
     pub client_instance_id: String,
     pub visible: bool,
@@ -401,6 +403,7 @@ mod tests {
             "seenRevision": 41,
             "route": "/session/tab/tab-a",
             "desiredSessionKey": "tab:tab-a",
+            "rawSessionId": "pty-tab-a",
             "semanticAfterSequence": 12,
             "clientInstanceId": "tab-instance-a",
             "visible": true,
@@ -424,6 +427,7 @@ mod tests {
                 .map(StableSessionKey::as_str),
             Some("tab:tab-a")
         );
+        assert_eq!(request.raw_session_id.as_deref(), Some("pty-tab-a"));
         assert_eq!(request.semantic_after_sequence, Some(12));
         assert_eq!(request.client_instance_id, "tab-instance-a");
         assert!(request.visible);

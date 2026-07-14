@@ -1,12 +1,20 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 
 import { MobileKeyRow } from "../../components/MobileKeyRow";
+import { useStore } from "../../store";
 
 const LazyTerminal = lazy(() =>
   import("../../components/Terminal").then((module) => ({ default: module.TerminalView })),
 );
 
 export function RawTerminalView({ sessionId }: { sessionId: string }) {
+  const setRawTerminalSession = useStore((state) => state.setRawTerminalSession);
+
+  useEffect(() => {
+    setRawTerminalSession(sessionId);
+    return () => setRawTerminalSession(null);
+  }, [sessionId, setRawTerminalSession]);
+
   return (
     <div className="dm-raw-terminal" aria-label="Raw terminal view">
       <Suspense fallback={<div className="dm-terminal-loading" role="status">Opening terminal…</div>}>

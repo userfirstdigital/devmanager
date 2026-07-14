@@ -277,6 +277,7 @@ export interface ResumeContext {
   seenRevision: number | null;
   route: string;
   desiredSessionKey: StableSessionKey | null;
+  rawSessionId: string | null;
   semanticAfterSequence: number | null;
   visible: boolean;
   wantsWriterLease: boolean;

@@ -1372,12 +1372,13 @@ describe("resume ownership and stable session identity", () => {
 
     const client = wsClientState.instance;
     expect(useStore.getState().activeSessionKey).toBe("tab:a");
-    expect(useStore.getState().rawTerminal.activeStreamSessionId).toBe("pty-a");
+    expect(useStore.getState().rawTerminal.activeStreamSessionId).toBeNull();
     expect(client?.callbacks.getResumeContext?.()).toMatchObject({
       seenRuntimeInstanceId: "runtime-1",
       seenRevision: 1,
       route: "/session/tab/a",
       desiredSessionKey: "tab:a",
+      rawSessionId: null,
       semanticAfterSequence: 12,
       wantsWriterLease: true,
     });
@@ -1387,6 +1388,30 @@ describe("resume ownership and stable session identity", () => {
         type: expect.stringMatching(/focus|subscribe|takeControl|claimControl/i),
       }),
     );
+  });
+
+  it("puts raw terminal ownership into atomic Resume only while mounted", () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    useStore.getState().setActiveSession("pty-a");
+    const client = wsClientState.instance;
+    client?.wake.mockClear();
+
+    useStore.getState().setRawTerminalSession("pty-a");
+
+    expect(client?.callbacks.getResumeContext?.()).toMatchObject({
+      desiredSessionKey: "tab:a",
+      rawSessionId: "pty-a",
+    });
+    expect(client?.wake).toHaveBeenCalledTimes(1);
+
+    useStore.getState().setRawTerminalSession(null);
+
+    expect(client?.callbacks.getResumeContext?.()).toMatchObject({
+      desiredSessionKey: "tab:a",
+      rawSessionId: null,
+    });
+    expect(client?.wake).toHaveBeenCalledTimes(2);
   });
 
   it("foreground recovery never lies about visibility or emits legacy control frames", () => {

@@ -58,7 +58,7 @@ Expected: compilation or assertion failure because `raw_session_id` does not exi
 pub raw_session_id: Option<String>,
 ```
 
-Validate it with `valid_session_id`, then set `subscribed_session_ids`, `bootstrap_pending_session_ids`, and `focused_session_id` only from `raw_session_id`. Continue using `desired_session_key` for semantic replay and browser attention acknowledgement.
+Validate it with `valid_session_id`, then set `subscribed_session_ids` and `bootstrap_pending_session_ids` only from `raw_session_id`. Continue using `desired_session_key` for semantic replay, visible-session notification suppression, and browser attention acknowledgement.
 
 - [ ] **Step 4: Add a failing TypeScript Resume serialization test**
 

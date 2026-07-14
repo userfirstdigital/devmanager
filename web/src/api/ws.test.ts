@@ -10,6 +10,7 @@ const resumeContext = {
   seenRevision: 7,
   route: "/session/tab/tab-1",
   desiredSessionKey: "tab:tab-1",
+  rawSessionId: "pty-tab-1",
   semanticAfterSequence: 12,
   visible: true,
   wantsWriterLease: true,
@@ -383,6 +384,26 @@ describe("WsClient request handling", () => {
         ...resumeContext,
         clientInstanceId: "browser-install-uuid",
       },
+    ]);
+  });
+
+  it("defaults atomic resume to no raw terminal subscription", async () => {
+    const client = new WsClient({
+      onStatus: vi.fn(),
+      onMessage: vi.fn(),
+      onSessionOutput: vi.fn(),
+    });
+
+    await client.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.emitOpen();
+
+    expect(jsonFrames(socket)).toEqual([
+      expect.objectContaining({
+        type: "resume",
+        desiredSessionKey: null,
+        rawSessionId: null,
+      }),
     ]);
   });
 

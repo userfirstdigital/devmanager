@@ -175,6 +175,7 @@ function defaultResumeContext(): ResumeContext {
     seenRevision: null,
     route: currentRoute(),
     desiredSessionKey: null,
+    rawSessionId: null,
     semanticAfterSequence: null,
     visible,
     wantsWriterLease: visible,

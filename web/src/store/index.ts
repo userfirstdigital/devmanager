@@ -133,6 +133,7 @@ export interface StoreState {
   clearLastError(): void;
   setActiveProject(projectId: string | null): void;
   setActiveSession(sessionIdentifier: string | null): void;
+  setRawTerminalSession(sessionId: string | null): void;
   setConnectionVisibility(visible: boolean): void;
   foregroundConnection(): void;
   toggleProjectCollapsed(projectId: string): void;
@@ -393,18 +394,6 @@ function resolveStableSessionKey(
     ),
   );
   return commandExists ? `server:${identifier}` : null;
-}
-
-function streamIdForKey(
-  rawTerminal: RawTerminalSlice,
-  stableSessionKey: StableSessionKey | null,
-): string | null {
-  if (!stableSessionKey) return null;
-  const mapped = rawTerminal.streamSessionIdByStableKey[stableSessionKey];
-  if (mapped) return mapped;
-  return stableSessionKey.startsWith("server:")
-    ? stableSessionKey.slice("server:".length)
-    : null;
 }
 
 function mutationId(): string {
@@ -765,13 +754,11 @@ export const useStore = create<StoreState>((set, get) => {
         }
       : {
           ...current.rawTerminal,
-          activeStreamSessionId: streamIdForKey(
-            {
-              ...current.rawTerminal,
-              streamSessionIdByStableKey: nextStreamIds,
-            },
-            activeSessionKey,
-          ),
+          activeStreamSessionId:
+            current.rawTerminal.activeStreamSessionId &&
+            validStreamSessionIds.has(current.rawTerminal.activeStreamSessionId)
+              ? current.rawTerminal.activeStreamSessionId
+              : null,
           streamSessionIdByStableKey: nextStreamIds,
           terminalSubscribers: filterSessionMap(
             current.rawTerminal.terminalSubscribers,
@@ -892,17 +879,10 @@ export const useStore = create<StoreState>((set, get) => {
         resumeState.desiredSessionKey && get().sessions[resumeState.desiredSessionKey]
           ? resumeState.desiredSessionKey
           : null;
-      set((state) => ({
+      set({
         activeSessionKey: desiredSessionKey,
         pendingRoute: resumeState.route,
-        rawTerminal: {
-          ...state.rawTerminal,
-          activeStreamSessionId: streamIdForKey(
-            state.rawTerminal,
-            desiredSessionKey,
-          ),
-        },
-      }));
+      });
     }
     updateLease(resumeState.writerLease);
     if (
@@ -1183,7 +1163,6 @@ export const useStore = create<StoreState>((set, get) => {
         pendingRoute: routeForStableKey(stableSessionKey),
         rawTerminal: {
           ...state.rawTerminal,
-          activeStreamSessionId: payload.sessionId,
           streamSessionIdByStableKey: {
             ...state.rawTerminal.streamSessionIdByStableKey,
             [stableSessionKey]: payload.sessionId,
@@ -1309,6 +1288,7 @@ export const useStore = create<StoreState>((set, get) => {
               state.pendingRoute ??
               (stableSessionKey ? routeForStableKey(stableSessionKey) : "/sessions"),
             desiredSessionKey: stableSessionKey,
+            rawSessionId: state.rawTerminal.activeStreamSessionId,
             semanticAfterSequence: stableSessionKey
               ? state.journals[stableSessionKey]?.latestSequence ?? null
               : null,
@@ -1674,17 +1654,21 @@ export const useStore = create<StoreState>((set, get) => {
       const stableSessionKey = sessionIdentifier
         ? resolveStableSessionKey(state, sessionIdentifier)
         : null;
-      set((current) => ({
+      set({
         activeSessionKey: stableSessionKey,
         pendingRoute: stableSessionKey
           ? routeForStableKey(stableSessionKey)
           : "/sessions",
+      });
+      get().client?.wake();
+    },
+
+    setRawTerminalSession(sessionId) {
+      if (get().rawTerminal.activeStreamSessionId === sessionId) return;
+      set((state) => ({
         rawTerminal: {
-          ...current.rawTerminal,
-          activeStreamSessionId: streamIdForKey(
-            current.rawTerminal,
-            stableSessionKey,
-          ),
+          ...state.rawTerminal,
+          activeStreamSessionId: sessionId,
         },
       }));
       get().client?.wake();

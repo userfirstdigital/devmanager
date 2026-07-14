@@ -19,7 +19,7 @@ Claude and Codex have a second problem: their full-screen TUIs enable mouse repo
 
 `desiredSessionKey` remains the single authority for route restoration, semantic replay, attention acknowledgement, and native focus. A new optional `rawSessionId` in the atomic `Resume` request becomes the single authority for raw PTY subscription. The server clears and rebuilds its raw subscription set from `rawSessionId` on every resume, so reconnect remains automatic and does not require legacy subscribe/focus frames.
 
-The web store keeps `activeSessionKey` independent from `rawTerminal.activeStreamSessionId`. Selecting a session updates only semantic focus. Mounting `RawTerminalView` sets the raw stream ID and wakes the client; unmounting it clears the raw stream ID and wakes the client. This means switching back to native mode immediately stops raw output fanout.
+The web store keeps `activeSessionKey` independent from `rawTerminal.activeStreamSessionId`. Selecting a session updates semantic focus and the visible-session marker used for attention and notification suppression. Mounting `RawTerminalView` additionally sets the raw stream ID and wakes the client; unmounting it clears the raw stream ID and wakes the client. This means switching back to native mode immediately stops raw output fanout without losing semantic focus.
 
 For raw attachment, `TerminalView` already renders `screenSnapshotToAnsi(screen)` whenever the snapshot has non-zero dimensions and ignores `bootstrap.bytes`. The host will therefore encode an empty `replayBase64` when a valid screen snapshot exists. Replay bytes remain a fallback only when no usable screen snapshot exists.
 
