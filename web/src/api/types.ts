@@ -3,7 +3,7 @@
 // browser state is an allowlisted, flat projection and cannot represent host
 // configuration, secrets, environment values, or startup commands.
 
-export const WEB_PROTOCOL_VERSION = 2;
+export const WEB_PROTOCOL_VERSION = 3;
 
 export type StableSessionKey = string;
 

@@ -86,6 +86,10 @@ class FakeWebSocket {
 }
 
 describe("WsClient request handling", () => {
+  it("uses the raw-stream Resume protocol version", () => {
+    expect(WEB_PROTOCOL_VERSION).toBe(3);
+  });
+
   beforeEach(() => {
     FakeWebSocket.instances = [];
     vi.stubGlobal("window", globalThis);

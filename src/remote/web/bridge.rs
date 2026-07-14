@@ -4373,9 +4373,14 @@ fn encode_session_stream(event: &RemoteSessionStreamEvent) -> Option<EncodedFram
         RemoteSessionStreamEvent::Bootstrap { bootstrap } => {
             use base64::engine::general_purpose::STANDARD;
             use base64::Engine;
+            let replay_base64 = if bootstrap.screen.rows > 0 && bootstrap.screen.cols > 0 {
+                String::new()
+            } else {
+                STANDARD.encode(&bootstrap.replay_bytes)
+            };
             serialize_text(&WsOutbound::SessionBootstrap {
                 session_id: bootstrap.session_id.clone(),
-                replay_base64: STANDARD.encode(&bootstrap.replay_bytes),
+                replay_base64,
                 screen: bootstrap.screen.clone(),
             })
         }
@@ -8859,6 +8864,32 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
         assert_eq!(value["type"], "sessionBootstrap");
         assert_eq!(value["screen"]["lines"][0][0]["character"], "A");
+        assert_eq!(value["replayBase64"], "");
+    }
+
+    #[test]
+    fn encode_outbound_bootstrap_keeps_replay_as_screenless_fallback() {
+        let message = ServerMessage::SessionStream {
+            event: RemoteSessionStreamEvent::Bootstrap {
+                bootstrap: RemoteSessionBootstrap {
+                    session_id: "alpha".to_string(),
+                    runtime: SessionRuntimeState::new(
+                        "alpha".to_string(),
+                        PathBuf::from("C:\\Code"),
+                        SessionDimensions::default(),
+                        TerminalBackend::default(),
+                    ),
+                    screen: TerminalScreenSnapshot::default(),
+                    replay_bytes: b"boot".to_vec(),
+                },
+            },
+        };
+        let frame = encode_outbound(&message).expect("bootstrap text");
+        let EncodedFrame::Text(text) = frame else {
+            panic!("bootstrap should be text");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["replayBase64"], "Ym9vdA==");
     }
 
     #[test]

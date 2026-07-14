@@ -818,7 +818,7 @@ impl SemanticJournalStore {
             return false;
         };
         let raw_required = if matches!(source, SemanticSource::Claude | SemanticSource::Codex) {
-            mode.mouse_reporting()
+            false
         } else {
             mode.alternate_screen || mode.mouse_reporting()
         };
@@ -2148,7 +2148,7 @@ mod tests {
                 .raw_required
         );
 
-        assert!(store.observe_native_terminal_mode(
+        assert!(!store.observe_native_terminal_mode(
             "ai-runtime",
             TerminalModeSnapshot {
                 mouse_report_click: true,
@@ -2157,9 +2157,29 @@ mod tests {
             102,
         ));
         assert!(
-            store
+            !store
                 .metadata(&StableSessionKey::from_tab("ai-tab"))
                 .expect("AI metadata")
+                .raw_required
+        );
+
+        assert!(store.observe_native_terminal_mode(
+            "shell-runtime",
+            TerminalModeSnapshot::default(),
+            102,
+        ));
+        assert!(store.observe_native_terminal_mode(
+            "shell-runtime",
+            TerminalModeSnapshot {
+                mouse_report_click: true,
+                ..TerminalModeSnapshot::default()
+            },
+            103,
+        ));
+        assert!(
+            store
+                .metadata(&StableSessionKey::from_server("shell-command"))
+                .expect("shell metadata")
                 .raw_required
         );
     }

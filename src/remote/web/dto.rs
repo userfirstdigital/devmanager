@@ -8,7 +8,7 @@ use crate::state::{
 use serde::Serialize;
 use std::collections::HashMap;
 
-pub const WEB_PROTOCOL_VERSION: u32 = 2;
+pub const WEB_PROTOCOL_VERSION: u32 = 3;
 pub const WEB_BUILD_ID: &str = env!("DEVMANAGER_WEB_BUILD_ID");
 
 #[derive(Debug, Clone, Serialize)]
@@ -445,6 +445,7 @@ mod tests {
 
     #[test]
     fn browser_snapshot_contains_only_renderer_metadata_and_live_state() {
+        assert_eq!(WEB_PROTOCOL_VERSION, 3);
         let fixture = host_fixture_with_sentinels();
         let snapshot = WebWorkspaceSnapshot::from_host(
             "runtime-1",
