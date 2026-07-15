@@ -46,6 +46,7 @@ export function AiSessionView({
       <Timeline
         events={events}
         density={density}
+        includeFallbackOutput={adapterHealth !== "healthy"}
         emptyTitle="Start the conversation"
         emptyDetail="Messages and coding activity will stay readable here while you multitask."
       />

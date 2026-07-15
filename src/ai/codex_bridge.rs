@@ -35,7 +35,10 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_CODEX_HANDSHAKES: usize = 16;
 const BRIDGE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const BRIDGE_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+// Cold `npx` starts and Codex MCP initialization can take longer than the
+// ordinary remote-action timeout. Keep the bridge alive while the native UI
+// remains in its visible Starting state instead of degrading a healthy launch.
+const BRIDGE_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const CODEX_BRIDGE_AUTH_TOKEN_ENV: &str = "DEVMANAGER_CODEX_BRIDGE_TOKEN";
 
 #[derive(Debug, Clone, Copy)]
@@ -1163,6 +1166,7 @@ where
                     let _ = websocket_write.send(Message::Close(None)).await;
                     return Ok(());
                 }
+                trace_codex_bridge_frame("server", &server_frame);
                 let observed_at = epoch_millis();
                 let frame = forward_server_frame(&server_frame, observed_at, &observer);
                 if let Some(expected_id) = initialize_id.as_deref() {
@@ -1191,6 +1195,7 @@ where
                     .map_err(|error| format!("Codex bridge WebSocket read failed: {error}"))?;
                 match incoming {
                     Message::Text(text) => {
+                        trace_codex_bridge_frame("tui", text.as_bytes());
                         if let Some(id) = initialize_request_id(text.as_bytes()) {
                             initialize_id = Some(id);
                         }
@@ -1201,6 +1206,7 @@ where
                         }).await?;
                     }
                     Message::Binary(bytes) => {
+                        trace_codex_bridge_frame("tui", &bytes);
                         if let Some(id) = initialize_request_id(&bytes) {
                             initialize_id = Some(id);
                         }
@@ -1225,6 +1231,29 @@ where
                 return Err("Codex bridge activation timed out waiting for initialize response".to_string());
             }
         }
+    }
+}
+
+fn trace_codex_bridge_frame(direction: &str, frame: &[u8]) {
+    if std::env::var_os("DEVMANAGER_CODEX_TRACE").is_none() {
+        return;
+    }
+    let Ok(message) = serde_json::from_slice::<Value>(frame) else {
+        eprintln!(
+            "Codex bridge {direction}: non-JSON frame ({} bytes)",
+            frame.len()
+        );
+        return;
+    };
+    if let Some(method) = message.get("method").and_then(Value::as_str) {
+        eprintln!("Codex bridge {direction}: {method}");
+    } else if message.get("id").is_some() {
+        let outcome = if message.get("error").is_some() {
+            "error"
+        } else {
+            "result"
+        };
+        eprintln!("Codex bridge {direction}: response {outcome}");
     }
 }
 
@@ -2081,23 +2110,8 @@ fn resolve_executable(program: &str) -> Result<PathBuf, String> {
 
     let path = std::env::var_os("PATH")
         .ok_or_else(|| "PATH is unavailable while resolving Codex".to_string())?;
-    let mut names = vec![program.to_string()];
-    if cfg!(windows) && Path::new(program).extension().is_none() {
-        let extensions =
-            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        names.extend(
-            extensions
-                .split(';')
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| format!("{program}{}", extension.to_ascii_lowercase())),
-        );
-        names.extend(
-            extensions
-                .split(';')
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| format!("{program}{}", extension.to_ascii_uppercase())),
-        );
-    }
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let names = executable_candidate_names(program, cfg!(windows), &extensions);
 
     for directory in std::env::split_paths(&path) {
         for name in &names {
@@ -2112,6 +2126,26 @@ fn resolve_executable(program: &str) -> Result<PathBuf, String> {
     Err(format!(
         "Codex executable `{program}` was not found on PATH"
     ))
+}
+
+fn executable_candidate_names(program: &str, windows: bool, path_ext: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if windows && Path::new(program).extension().is_none() {
+        names.extend(
+            path_ext
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| format!("{program}{}", extension.to_ascii_lowercase())),
+        );
+        names.extend(
+            path_ext
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| format!("{program}{}", extension.to_ascii_uppercase())),
+        );
+    }
+    names.push(program.to_string());
+    names
 }
 
 fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
@@ -3202,6 +3236,15 @@ $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentL
             "--remote-auth-token-environment",
             "--remote-auth-token-env"
         ));
+    }
+
+    #[test]
+    fn windows_executable_resolution_prefers_pathext_wrappers_over_shell_shims() {
+        let candidates = executable_candidate_names("npx", true, ".EXE;.CMD");
+
+        assert_eq!(candidates.first().map(String::as_str), Some("npx.exe"));
+        assert_eq!(candidates.get(1).map(String::as_str), Some("npx.cmd"));
+        assert_eq!(candidates.last().map(String::as_str), Some("npx"));
     }
 
     #[test]

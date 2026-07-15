@@ -95,6 +95,7 @@ describe("session presentation", () => {
       label: "Native mobile UI",
       projectName: "DevManager",
       kindLabel: "Claude",
+      stateLabel: "Open",
       route: { name: "session", kind: "tab", id: "claude-a" },
     });
 

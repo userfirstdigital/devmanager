@@ -46,7 +46,7 @@ function statePresentation(session: WebSessionSummary): Pick<
   }
   if (session.kind === "claude" || session.kind === "codex") {
     if (session.status === "Starting") return { stateLabel: "Starting", statusTone: "active" };
-    if (session.status === "Running") return { stateLabel: "Working", statusTone: "active" };
+    if (session.status === "Running") return { stateLabel: "Open", statusTone: "active" };
     if (session.status === "Stopping") return { stateLabel: "Stopping", statusTone: "active" };
     return { stateLabel: "Ready to reopen", statusTone: "neutral" };
   }

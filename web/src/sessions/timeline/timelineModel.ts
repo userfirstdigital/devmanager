@@ -114,6 +114,7 @@ function boundFallbackOutput(text: string): string {
 export function buildConversationItems(
   events: SemanticEvent[],
   density: InterfaceDensity,
+  includeFallbackOutput = true,
 ): ConversationItem[] {
   const items: ConversationItem[] = [];
   const assistantIndexes = new Map<string, number>();
@@ -209,7 +210,7 @@ export function buildConversationItems(
       continue;
     }
 
-    if (event.kind === "output" && density !== "minimal") {
+    if (event.kind === "output" && density !== "minimal" && includeFallbackOutput) {
       const previous = items[items.length - 1];
       if (previous?.kind === "fallbackOutput" && previous.stream === event.stream) {
         previous.text = boundFallbackOutput(`${previous.text}${event.text}`);

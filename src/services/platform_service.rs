@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 #[cfg(not(windows))]
 use std::thread;
+#[cfg(any(not(windows), test))]
 use std::time::Duration;
 #[cfg(not(windows))]
 use std::time::Instant;
@@ -1030,6 +1031,7 @@ pub(crate) fn terminate_owned_process_group(pid: u32, term_grace: Duration) -> R
     )
 }
 
+#[cfg(any(not(windows), test))]
 fn terminate_owned_process_group_with<Signal, Exists, Sleep>(
     group_target: &str,
     term_grace: Duration,

@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::remote::RemoteImageAttachment;
 use crate::services::ProcessManager;
-use crate::state::SessionRuntimeState;
+use crate::state::{SessionKind, SessionRuntimeState};
 
 pub(crate) const WEB_PASTE_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 pub(crate) const WEB_COMPOSER_AUTHORITY_CHANGED: &str =
@@ -48,9 +48,23 @@ pub(crate) fn handle_web_composer_batch(
         .get(session_id)
         .cloned()
         .ok_or_else(|| format!("Unknown terminal session: {session_id}"))?;
-    execute_web_composer_batch(&session, attachments, text, authorize, |prompt| {
+    let recover_initial_codex_submit = session.session_kind == SessionKind::Codex
+        && process_manager.claim_codex_initial_composer_escape(session_id);
+    let result = execute_web_composer_batch(&session, attachments, text, authorize, |prompt| {
         process_manager.write_to_session(session_id, prompt)
-    })
+    });
+    if result.is_ok() && recover_initial_codex_submit {
+        std::thread::sleep(Duration::from_secs(1));
+        if !process_manager.codex_provider_turn_observed(session_id) {
+            if std::env::var_os("DEVMANAGER_CODEX_TRACE").is_some() {
+                eprintln!("Codex composer: recovering an ignored initial submit");
+            }
+            process_manager.write_to_session(session_id, "\u{1b}")?;
+            std::thread::sleep(Duration::from_millis(120));
+            process_manager.write_to_session(session_id, "\r")?;
+        }
+    }
+    result
 }
 
 fn execute_web_composer_batch(
@@ -58,7 +72,7 @@ fn execute_web_composer_batch(
     attachments: &[RemoteImageAttachment],
     text: &str,
     authorize: impl FnOnce() -> bool,
-    write: impl FnOnce(&str) -> Result<(), String>,
+    mut write: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut staged = Vec::with_capacity(attachments.len());
     for attachment in attachments {
@@ -75,6 +89,10 @@ fn execute_web_composer_batch(
         .map(|attachment| attachment.prompt_reference.as_str())
         .collect::<Vec<_>>()
         .join(" ");
+    let (text, submit) = match text.strip_suffix('\r') {
+        Some(text) => (text, Some("\r")),
+        None => (text, None),
+    };
     let prompt = if references.is_empty() {
         text.to_string()
     } else {
@@ -84,13 +102,18 @@ fn execute_web_composer_batch(
         rollback_staged_images(&staged);
         return Err(WEB_COMPOSER_AUTHORITY_CHANGED.to_string());
     }
-    match write(&prompt) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            rollback_staged_images(&staged);
-            Err(error)
-        }
+    if let Err(error) = write(&prompt) {
+        rollback_staged_images(&staged);
+        return Err(error);
     }
+    if let Some(submit) = submit {
+        // TUI input parsers treat an Enter key as a distinct event. Sending it
+        // in the same PTY write as pasted text can leave the prompt visibly
+        // filled but never submitted (observed with Codex on Windows ConPTY).
+        std::thread::sleep(Duration::from_millis(50));
+        write(submit)?;
+    }
+    Ok(())
 }
 
 fn rollback_staged_images(staged: &[StagedImageAttachment]) {
@@ -312,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_batch_stages_distinct_files_and_writes_the_pty_once() {
+    fn composer_batch_stages_distinct_files_then_submits_with_a_separate_enter() {
         let cwd = temp_test_dir("web-composer-batch-success");
         let mut session = SessionRuntimeState::new(
             "claude-batch",
@@ -333,8 +356,7 @@ mod tests {
                 bytes: vec![4, 5, 6],
             },
         ];
-        let writes = std::sync::atomic::AtomicUsize::new(0);
-        let observed_prompt = std::sync::Mutex::new(None);
+        let observed_writes = std::sync::Mutex::new(Vec::new());
 
         execute_web_composer_batch(
             &session,
@@ -342,15 +364,17 @@ mod tests {
             "hello\r",
             || true,
             |prompt| {
-                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                *observed_prompt.lock().unwrap() = Some(prompt.to_string());
+                observed_writes.lock().unwrap().push(prompt.to_string());
                 Ok(())
             },
         )
         .expect("batch succeeds");
 
-        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let prompt = observed_prompt.lock().unwrap().clone().unwrap();
+        let observed_writes = observed_writes.lock().unwrap();
+        assert_eq!(observed_writes.len(), 2);
+        assert_eq!(observed_writes[1], "\r");
+        let prompt = &observed_writes[0];
+        assert!(!prompt.ends_with('\r'));
         let references = prompt
             .split_whitespace()
             .filter(|part| part.starts_with('@'))

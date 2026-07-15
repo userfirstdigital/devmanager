@@ -240,6 +240,8 @@ struct CodexAdapterLifecycle {
     activated: bool,
     remote_command_injected: bool,
     fallback_started: bool,
+    initial_composer_escape_claimed: bool,
+    provider_turn_observed: bool,
 }
 
 impl CodexAdapterLifecycle {
@@ -249,6 +251,8 @@ impl CodexAdapterLifecycle {
             activated: false,
             remote_command_injected: false,
             fallback_started: false,
+            initial_composer_escape_claimed: false,
+            provider_turn_observed: false,
         }
     }
 
@@ -266,6 +270,18 @@ impl CodexAdapterLifecycle {
         }
         self.fallback_started = true;
         Some(self.original_startup_command.clone())
+    }
+
+    fn claim_initial_composer_escape(&mut self) -> bool {
+        if self.initial_composer_escape_claimed {
+            return false;
+        }
+        self.initial_composer_escape_claimed = true;
+        true
+    }
+
+    fn mark_provider_turn_observed(&mut self) {
+        self.provider_turn_observed = true;
     }
 }
 
@@ -457,7 +473,7 @@ impl ProcessManager {
             claude_hook_temp_root: claude_hook_temp_root.clone(),
             claude_overlay_owner: Mutex::new(Weak::new()),
             codex_adapter_preparer: RwLock::new(Arc::new(prepare_codex_adapter)),
-            codex_adapter_activation_timeout: RwLock::new(std::time::Duration::from_secs(8)),
+            codex_adapter_activation_timeout: RwLock::new(std::time::Duration::from_secs(30)),
             codex_fallback_terminal_ops: RwLock::new(Arc::new(NativeCodexFallbackTerminalOps)),
             codex_adapter_generation: AtomicU64::new(1),
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
@@ -1338,7 +1354,8 @@ impl ProcessManager {
             .clone();
         let prepared = match preparer(&launch.startup_command) {
             Ok(prepared) => prepared,
-            Err(_) => {
+            Err(error) => {
+                eprintln!("Codex native adapter preparation failed for {session_id}: {error}");
                 mark_codex_adapter_degraded(&self.inner, session_id, &identity);
                 return HashMap::new();
             }
@@ -1381,7 +1398,8 @@ impl ProcessManager {
                     );
                 }
             },
-            move |_| {
+            move |error| {
+                eprintln!("Codex native adapter bridge exited for {exit_session_id}: {error}");
                 if let Some(inner) = exit_inner.upgrade() {
                     handle_codex_bridge_exit(inner, &exit_session_id, &exit_identity);
                 }
@@ -1389,13 +1407,15 @@ impl ProcessManager {
             activation_timeout,
         ) {
             Ok(handle) => handle,
-            Err(_) => {
+            Err(error) => {
+                eprintln!("Codex native adapter bridge failed for {session_id}: {error}");
                 mark_codex_adapter_degraded(&self.inner, session_id, &identity);
                 return HashMap::new();
             }
         };
         let (mut handle, terminal_env) = started.into_parts();
         if !handle.is_running() {
+            eprintln!("Codex native adapter bridge exited before launch for {session_id}");
             handle.shutdown();
             mark_codex_adapter_degraded(&self.inner, session_id, &identity);
             return HashMap::new();
@@ -1600,6 +1620,33 @@ impl ProcessManager {
     pub fn write_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
         let session = self.get_session(session_id)?;
         session.write_text(text)
+    }
+
+    pub(crate) fn claim_codex_initial_composer_escape(&self, session_id: &str) -> bool {
+        let mut registry = self
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match registry.sessions.get_mut(session_id) {
+            Some(CodexAdapterSession::Running { lifecycle, .. }) => {
+                lifecycle.claim_initial_composer_escape()
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn codex_provider_turn_observed(&self, session_id: &str) -> bool {
+        let registry = self
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        matches!(
+            registry.sessions.get(session_id),
+            Some(CodexAdapterSession::Running { lifecycle, .. })
+                if lifecycle.provider_turn_observed
+        )
     }
 
     pub fn write_bytes_to_session(&self, session_id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -4581,16 +4628,25 @@ fn emit_codex_semantic_if_current(
     identity: &CodexAdapterIdentity,
     draft: SemanticEventDraft,
 ) {
-    let registry = inner
+    let mut registry = inner
         .codex_adapter_registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if registry.is_current(identity)
-        && registry
-            .sessions
-            .get(session_id)
-            .is_some_and(|session| session.identity() == identity)
-    {
+    if !registry.is_current(identity) {
+        return;
+    }
+    let Some(session) = registry.sessions.get_mut(session_id) else {
+        return;
+    };
+    if session.identity() == identity {
+        if matches!(
+            &draft.kind,
+            crate::remote::presentation::SemanticEventKind::UserMessage { .. }
+        ) {
+            if let CodexAdapterSession::Running { lifecycle, .. } = session {
+                lifecycle.mark_provider_turn_observed();
+            }
+        }
         emit_remote_session_event(
             inner,
             RemoteSessionEvent::CodexSemantic {
@@ -4601,6 +4657,7 @@ fn emit_codex_semantic_if_current(
     }
 }
 
+#[cfg(test)]
 fn emit_codex_health_if_current(
     inner: &ProcessManagerInner,
     identity: &CodexAdapterIdentity,
@@ -6052,6 +6109,17 @@ mod tests {
         assert_eq!(activated.claim_preactivation_fallback(), None);
     }
 
+    #[test]
+    fn codex_lifecycle_claims_the_startup_escape_for_only_the_first_composer() {
+        let mut lifecycle = CodexAdapterLifecycle::new("codex".to_string());
+
+        assert!(!lifecycle.provider_turn_observed);
+        assert!(lifecycle.claim_initial_composer_escape());
+        assert!(!lifecycle.claim_initial_composer_escape());
+        lifecycle.mark_provider_turn_observed();
+        assert!(lifecycle.provider_turn_observed);
+    }
+
     #[tokio::test]
     async fn codex_preparation_activates_only_after_initialize_negotiation() {
         let manager = ProcessManager::new();
@@ -6134,8 +6202,7 @@ mod tests {
         let (mut tui, _) = connect_async(request).await.unwrap();
         tui.send(Message::Text(
             r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","version":"test"}}}"#
-                .to_string()
-                .into(),
+                .to_string(),
         ))
         .await
         .unwrap();
@@ -6286,7 +6353,7 @@ mod tests {
         );
         let (mut tui, _) = connect_async(request).await.unwrap();
         tui.send(Message::Text(
-            r#"{"id":1,"method":"initialize","params":{}}"#.to_string().into(),
+            r#"{"id":1,"method":"initialize","params":{}}"#.to_string(),
         ))
         .await
         .unwrap();

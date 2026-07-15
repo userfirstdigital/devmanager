@@ -44,11 +44,13 @@ function captureVisibleAnchor(element: HTMLDivElement): VisibleAnchor | null {
 export function Timeline({
   events,
   density,
+  includeFallbackOutput = true,
   emptyTitle = "Nothing here yet",
   emptyDetail = "New activity will appear here automatically.",
 }: {
   events: SemanticEvent[];
   density: InterfaceDensity;
+  includeFallbackOutput?: boolean;
   emptyTitle?: string;
   emptyDetail?: string;
 }) {
@@ -56,8 +58,8 @@ export function Timeline({
   const followRef = useRef(true);
   const visibleAnchorRef = useRef<VisibleAnchor | null>(null);
   const visibleItems = useMemo(
-    () => buildConversationItems(events, density),
-    [density, events],
+    () => buildConversationItems(events, density, includeFallbackOutput),
+    [density, events, includeFallbackOutput],
   );
 
   useLayoutEffect(() => {

@@ -53,6 +53,7 @@ const SNAPSHOT_BROADCAST_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_BROADCAST_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const AI_STARTUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const REMOTE_ACCESS_LOG_LIMIT: usize = 100;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -5584,6 +5585,9 @@ pub(crate) fn requires_control(action: &RemoteAction) -> bool {
 
 pub(crate) fn request_timeout_for_action(action: &RemoteAction) -> Duration {
     match action {
+        RemoteAction::LaunchAi { .. }
+        | RemoteAction::OpenAiTab { .. }
+        | RemoteAction::RestartAiTab { .. } => AI_STARTUP_REQUEST_TIMEOUT,
         RemoteAction::GitCommit { .. }
         | RemoteAction::GitPush { .. }
         | RemoteAction::GitPushSetUpstream { .. }
@@ -6417,6 +6421,28 @@ mod tests {
             request_timeout_for_action(&RemoteAction::StopAllServers),
             super::REQUEST_TIMEOUT
         );
+    }
+
+    #[test]
+    fn ai_lifecycle_actions_allow_slow_provider_startup() {
+        let dimensions = SessionDimensions::default();
+        for action in [
+            RemoteAction::LaunchAi {
+                project_id: "project".to_string(),
+                tab_type: TabType::Codex,
+                dimensions,
+            },
+            RemoteAction::OpenAiTab {
+                tab_id: "tab".to_string(),
+                dimensions,
+            },
+            RemoteAction::RestartAiTab {
+                tab_id: "tab".to_string(),
+                dimensions,
+            },
+        ] {
+            assert!(request_timeout_for_action(&action) > super::REQUEST_TIMEOUT);
+        }
     }
 
     #[test]

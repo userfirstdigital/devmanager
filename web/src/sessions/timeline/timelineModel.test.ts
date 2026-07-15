@@ -123,4 +123,18 @@ describe("native conversation presentation", () => {
     expect(items[0].text.length).toBeLessThanOrEqual(12_000);
     expect(items[0].text).toContain("final screen");
   });
+
+  it("omits terminal redraw output once the semantic adapter is healthy", () => {
+    const items = buildConversationItems([
+      event(1, "output", { stream: "stdout", text: "raw terminal redraw" }),
+      event(2, "userMessage", { text: "Hello" }),
+      event(3, "assistantMessage", {
+        message_id: "answer-1",
+        text: "Hi there.",
+        streaming: false,
+      }),
+    ], "calm", false);
+
+    expect(items.map((item) => item.kind)).toEqual(["message", "message"]);
+  });
 });
