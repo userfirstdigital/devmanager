@@ -48,23 +48,9 @@ pub(crate) fn handle_web_composer_batch(
         .get(session_id)
         .cloned()
         .ok_or_else(|| format!("Unknown terminal session: {session_id}"))?;
-    let recover_initial_codex_submit = session.session_kind == SessionKind::Codex
-        && process_manager.claim_codex_initial_composer_escape(session_id);
-    let result = execute_web_composer_batch(&session, attachments, text, authorize, |prompt| {
+    execute_web_composer_batch(&session, attachments, text, authorize, |prompt| {
         process_manager.write_to_session(session_id, prompt)
-    });
-    if result.is_ok() && recover_initial_codex_submit {
-        std::thread::sleep(Duration::from_secs(1));
-        if !process_manager.codex_provider_turn_observed(session_id) {
-            if std::env::var_os("DEVMANAGER_CODEX_TRACE").is_some() {
-                eprintln!("Codex composer: recovering an ignored initial submit");
-            }
-            process_manager.write_to_session(session_id, "\u{1b}")?;
-            std::thread::sleep(Duration::from_millis(120));
-            process_manager.write_to_session(session_id, "\r")?;
-        }
-    }
-    result
+    })
 }
 
 fn execute_web_composer_batch(
@@ -111,6 +97,13 @@ fn execute_web_composer_batch(
         // in the same PTY write as pasted text can leave the prompt visibly
         // filled but never submitted (observed with Codex on Windows ConPTY).
         std::thread::sleep(Duration::from_millis(50));
+        if session.session_kind == SessionKind::Codex {
+            // Codex keeps a pasted prompt in its multiline editor when it
+            // receives a raw carriage return. Escape exits that editor state;
+            // the following Enter submits the prompt as a distinct key event.
+            write("\u{1b}")?;
+            std::thread::sleep(Duration::from_millis(120));
+        }
         write(submit)?;
     }
     Ok(())
@@ -389,6 +382,72 @@ mod tests {
             fs::read(cwd.join(references[1].trim_start_matches('@'))).unwrap(),
             vec![4, 5, 6]
         );
+    }
+
+    #[test]
+    fn every_codex_composer_batch_exits_multiline_mode_before_submitting() {
+        let cwd = temp_test_dir("web-composer-codex-submit");
+        let mut session = SessionRuntimeState::new(
+            "codex-batch",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Codex;
+        let observed_writes = std::sync::Mutex::new(Vec::new());
+
+        for prompt in ["first prompt\r", "second prompt\r"] {
+            execute_web_composer_batch(
+                &session,
+                &[],
+                prompt,
+                || true,
+                |text| {
+                    observed_writes.lock().unwrap().push(text.to_string());
+                    Ok(())
+                },
+            )
+            .expect("Codex batch succeeds");
+        }
+
+        assert_eq!(
+            *observed_writes.lock().unwrap(),
+            [
+                "first prompt",
+                "\u{1b}",
+                "\r",
+                "second prompt",
+                "\u{1b}",
+                "\r",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_composer_draft_does_not_send_submit_keys() {
+        let cwd = temp_test_dir("web-composer-codex-draft");
+        let mut session = SessionRuntimeState::new(
+            "codex-draft",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Codex;
+        let observed_writes = std::sync::Mutex::new(Vec::new());
+
+        execute_web_composer_batch(
+            &session,
+            &[],
+            "unfinished",
+            || true,
+            |text| {
+                observed_writes.lock().unwrap().push(text.to_string());
+                Ok(())
+            },
+        )
+        .expect("draft write succeeds");
+
+        assert_eq!(*observed_writes.lock().unwrap(), ["unfinished"]);
     }
 
     #[test]

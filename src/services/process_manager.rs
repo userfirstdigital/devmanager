@@ -240,7 +240,6 @@ struct CodexAdapterLifecycle {
     activated: bool,
     remote_command_injected: bool,
     fallback_started: bool,
-    initial_composer_escape_claimed: bool,
     provider_turn_observed: bool,
 }
 
@@ -251,7 +250,6 @@ impl CodexAdapterLifecycle {
             activated: false,
             remote_command_injected: false,
             fallback_started: false,
-            initial_composer_escape_claimed: false,
             provider_turn_observed: false,
         }
     }
@@ -270,14 +268,6 @@ impl CodexAdapterLifecycle {
         }
         self.fallback_started = true;
         Some(self.original_startup_command.clone())
-    }
-
-    fn claim_initial_composer_escape(&mut self) -> bool {
-        if self.initial_composer_escape_claimed {
-            return false;
-        }
-        self.initial_composer_escape_claimed = true;
-        true
     }
 
     fn mark_provider_turn_observed(&mut self) {
@@ -1620,33 +1610,6 @@ impl ProcessManager {
     pub fn write_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
         let session = self.get_session(session_id)?;
         session.write_text(text)
-    }
-
-    pub(crate) fn claim_codex_initial_composer_escape(&self, session_id: &str) -> bool {
-        let mut registry = self
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match registry.sessions.get_mut(session_id) {
-            Some(CodexAdapterSession::Running { lifecycle, .. }) => {
-                lifecycle.claim_initial_composer_escape()
-            }
-            _ => false,
-        }
-    }
-
-    pub(crate) fn codex_provider_turn_observed(&self, session_id: &str) -> bool {
-        let registry = self
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        matches!(
-            registry.sessions.get(session_id),
-            Some(CodexAdapterSession::Running { lifecycle, .. })
-                if lifecycle.provider_turn_observed
-        )
     }
 
     pub fn write_bytes_to_session(&self, session_id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -6110,12 +6073,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_lifecycle_claims_the_startup_escape_for_only_the_first_composer() {
+    fn codex_lifecycle_records_provider_turn_observation() {
         let mut lifecycle = CodexAdapterLifecycle::new("codex".to_string());
 
         assert!(!lifecycle.provider_turn_observed);
-        assert!(lifecycle.claim_initial_composer_escape());
-        assert!(!lifecycle.claim_initial_composer_escape());
         lifecycle.mark_provider_turn_observed();
         assert!(lifecycle.provider_turn_observed);
     }
