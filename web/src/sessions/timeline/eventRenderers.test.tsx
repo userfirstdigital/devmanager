@@ -5,7 +5,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { SemanticEvent } from "../../api/types";
-import { EventRenderer, visibleEventsForDensity } from "./eventRenderers";
+import { ConversationItemRenderer } from "./eventRenderers";
+import { buildConversationItems } from "./timelineModel";
 
 function event(kind: SemanticEvent["kind"], detail: Record<string, unknown> = {}): SemanticEvent {
   return {
@@ -34,35 +35,47 @@ const question = event("question", {
 afterEach(cleanup);
 
 describe("native semantic event rendering", () => {
-  it("collapses successful tools but expands questions in calm density", () => {
-    const { rerender } = render(<EventRenderer density="calm" event={successfulTool} />);
-    expect(screen.getByRole("button", { name: /read/i }).getAttribute("aria-expanded")).toBe("false");
+  it("collapses grouped successful activity but keeps questions expanded", () => {
+    const activity = buildConversationItems([successfulTool], "calm")[0];
+    const questionItem = buildConversationItems([question], "calm")[0];
+    if (!activity || !questionItem) throw new Error("fixture item missing");
 
-    rerender(<EventRenderer density="calm" event={question} />);
+    const { rerender } = render(
+      <ConversationItemRenderer density="calm" item={activity} />,
+    );
+    expect(screen.getByRole("button", { name: /1 action/i }).getAttribute("aria-expanded")).toBe("false");
+
+    rerender(<ConversationItemRenderer density="calm" item={questionItem} />);
     expect(screen.getByText("Continue with the migration?").isConnected).toBe(true);
     expect(screen.getByText("Continue").isConnected).toBe(true);
   });
 
-  it("lets the user expand a compact tool without rendering HTML", async () => {
+  it("lets the user expand grouped activity without rendering HTML", async () => {
     const user = userEvent.setup();
-    render(<EventRenderer density="calm" event={successfulTool} />);
+    const activity = buildConversationItems([successfulTool], "calm")[0];
+    if (!activity) throw new Error("activity missing");
+    render(<ConversationItemRenderer density="calm" item={activity} />);
 
-    await user.click(screen.getByRole("button", { name: /read/i }));
+    await user.click(screen.getByRole("button", { name: /1 action/i }));
 
     expect(screen.getByText("Read package.json").isConnected).toBe(true);
   });
 
-  it("keeps prose in minimal mode and exposes all details in full mode", () => {
+  it("renders assistant Markdown directly and drops routine AI cards", () => {
     const prose = event("assistantMessage", {
       message_id: "message-1",
-      text: "The build is ready.",
+      text: "## Ready\n\nThe build is ready.",
       streaming: false,
     });
-    const output = event("output", { stream: "stdout", text: "compiled" });
+    const starting = event("status", { state: "Starting", detail: null });
+    const restored = event("terminalMode", { raw_required: false });
+    const items = buildConversationItems([starting, prose, restored], "calm");
+    expect(items).toHaveLength(1);
 
-    expect(visibleEventsForDensity([prose, output], "minimal")).toEqual([prose]);
-
-    const { container } = render(<EventRenderer density="full" event={output} />);
-    expect(container.textContent).toContain("compiled");
+    const { container } = render(
+      <ConversationItemRenderer density="calm" item={items[0]!} />,
+    );
+    expect(screen.getByRole("heading", { name: "Ready" }).isConnected).toBe(true);
+    expect(container.textContent).not.toMatch(/Starting|Native view restored|Output/);
   });
 });

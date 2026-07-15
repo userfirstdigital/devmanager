@@ -1017,6 +1017,7 @@ button:disabled {
 }
 
 .dm-message-user {
+  max-width: min(88%, 700px);
   align-self: flex-end;
   padding: 9px 13px;
   border-radius: 18px 18px 5px 18px;
@@ -1025,11 +1026,101 @@ button:disabled {
 }
 
 .dm-message-assistant {
+  width: min(100%, 760px);
+  max-width: 100%;
   align-self: flex-start;
-  padding: 11px 13px;
-  border-radius: 5px 18px 18px 18px;
-  background: var(--dm-surface);
-  box-shadow: var(--dm-shadow);
+  padding: 2px 1px;
+  color: var(--dm-label);
+}
+
+.dm-markdown-message > :first-child {
+  margin-top: 0;
+}
+
+.dm-markdown-message > :last-child {
+  margin-bottom: 0;
+}
+
+.dm-markdown-message p,
+.dm-markdown-message ul,
+.dm-markdown-message ol,
+.dm-markdown-message blockquote,
+.dm-markdown-message pre,
+.dm-markdown-table-scroll {
+  margin: 0 0 0.82em;
+}
+
+.dm-markdown-message h1,
+.dm-markdown-message h2,
+.dm-markdown-message h3,
+.dm-markdown-message h4 {
+  margin: 1.1em 0 0.42em;
+  color: var(--dm-label);
+  line-height: 1.25;
+}
+
+.dm-markdown-message h1 { font-size: 1.28rem; }
+.dm-markdown-message h2 { font-size: 1.13rem; }
+.dm-markdown-message h3,
+.dm-markdown-message h4 { font-size: 1rem; }
+
+.dm-markdown-message ul,
+.dm-markdown-message ol {
+  padding-left: 1.35rem;
+}
+
+.dm-markdown-message li + li {
+  margin-top: 0.22em;
+}
+
+.dm-markdown-message blockquote {
+  padding-left: 0.82rem;
+  border-left: 3px solid var(--dm-separator);
+  color: var(--dm-secondary);
+}
+
+.dm-markdown-message :not(pre) > code {
+  padding: 0.1em 0.32em;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--dm-separator) 48%, transparent);
+  font: 0.88em ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+.dm-markdown-message pre,
+.dm-fallback-output pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 11px 12px;
+  border: 1px solid var(--dm-separator);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--dm-surface) 86%, var(--dm-bg));
+  font: 0.78rem/1.5 ui-monospace, "SFMono-Regular", Menlo, monospace;
+  white-space: pre;
+}
+
+.dm-markdown-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.dm-markdown-message table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.dm-markdown-message th,
+.dm-markdown-message td {
+  padding: 7px 9px;
+  border: 1px solid var(--dm-separator);
+  text-align: left;
+}
+
+.dm-markdown-message a {
+  color: var(--dm-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .dm-streaming-dot {
@@ -1047,6 +1138,7 @@ button:disabled {
 }
 
 .dm-event-card,
+.dm-activity-group,
 .dm-question-card,
 .dm-error-card {
   width: min(100%, 700px);
@@ -1073,6 +1165,82 @@ button:disabled {
   font-weight: 620;
 }
 
+.dm-activity-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  padding: 7px 10px;
+  align-items: center;
+  gap: 8px;
+  color: var(--dm-secondary);
+  background: transparent;
+  text-align: left;
+  font-size: 0.76rem;
+  font-weight: 620;
+}
+
+.dm-activity-toggle > span {
+  flex: 1 1 auto;
+}
+
+.dm-activity-group[data-state="success"] .dm-activity-toggle > svg:first-child {
+  color: var(--dm-green);
+}
+
+.dm-activity-group[data-state="failure"] .dm-activity-toggle > svg:first-child {
+  color: var(--dm-red);
+}
+
+.dm-activity-rows {
+  padding: 0 10px 8px 34px;
+}
+
+.dm-activity-row {
+  padding: 7px 0;
+  color: var(--dm-secondary);
+  font-size: 0.76rem;
+}
+
+.dm-activity-row + .dm-activity-row {
+  border-top: 1px solid color-mix(in srgb, var(--dm-separator) 72%, transparent);
+}
+
+.dm-activity-row strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--dm-label);
+  font-size: 0.76rem;
+}
+
+.dm-activity-detail,
+.dm-activity-detail pre,
+.dm-activity-detail code {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.dm-fallback-output {
+  width: min(100%, 760px);
+  color: var(--dm-secondary);
+  font-size: 0.72rem;
+}
+
+.dm-fallback-output > span {
+  display: flex;
+  margin-bottom: 5px;
+  align-items: center;
+  gap: 5px;
+}
+
+.dm-fallback-output pre {
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+  color: var(--dm-label);
+  white-space: pre-wrap;
+}
+
 .dm-event-card-toggle > span {
   flex: 1 1 auto;
 }
@@ -1090,7 +1258,8 @@ button:disabled {
   transition: transform 0.18s ease;
 }
 
-.dm-event-card.is-expanded .dm-event-chevron {
+.dm-event-card.is-expanded .dm-event-chevron,
+.dm-activity-group.is-expanded .dm-event-chevron {
   transform: rotate(180deg);
 }
 

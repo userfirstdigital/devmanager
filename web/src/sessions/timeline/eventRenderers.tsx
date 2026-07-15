@@ -1,161 +1,180 @@
-import { ChevronDown, CircleAlert, CircleCheck, CircleEllipsis, Terminal } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import {
+  ChevronDown,
+  CircleAlert,
+  CircleCheck,
+  CircleEllipsis,
+  Terminal,
+} from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import type { SemanticEvent } from "../../api/types";
+import { MarkdownMessage } from "./MarkdownMessage";
+import type { ConversationItem } from "./timelineModel";
 
 export type InterfaceDensity = "minimal" | "calm" | "full";
 
-function isActionable(event: SemanticEvent): boolean {
-  return (
-    event.kind === "question" ||
-    event.kind === "error" ||
-    (event.kind === "tool" && event.state === "failed")
-  );
-}
-
-export function visibleEventsForDensity(
-  events: SemanticEvent[],
-  density: InterfaceDensity,
-): SemanticEvent[] {
-  if (density !== "minimal") return events;
-  return events.filter(
-    (event) =>
-      event.kind === "userMessage" ||
-      event.kind === "assistantMessage" ||
-      isActionable(event),
-  );
-}
-
-function CompactCard({
-  title,
-  detail,
-  state,
-  defaultExpanded,
-  forceExpanded,
-  mono = false,
-  sequence,
-}: {
-  title: string;
-  detail: ReactNode;
-  state?: "active" | "success" | "failure";
-  defaultExpanded: boolean;
-  forceExpanded: boolean;
-  mono?: boolean;
-  sequence: number;
-}) {
-  const [expanded, setExpanded] = useState(defaultExpanded || forceExpanded);
-  const shown = expanded;
-  const StatusIcon =
-    state === "failure" ? CircleAlert : state === "success" ? CircleCheck : CircleEllipsis;
-  return (
-    <article
-      className={`dm-event-card${shown ? " is-expanded" : ""}`}
-      data-state={state}
-      data-event-sequence={sequence}
-    >
-      <button
-        type="button"
-        className="dm-event-card-toggle"
-        aria-expanded={shown}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <StatusIcon size={17} aria-hidden="true" />
-        <span>{title}</span>
-        <ChevronDown className="dm-event-chevron" size={16} aria-hidden="true" />
-      </button>
-      {shown && <div className={mono ? "dm-event-detail dm-mono" : "dm-event-detail"}>{detail}</div>}
-    </article>
-  );
-}
-
-function cardForEvent(event: SemanticEvent, density: InterfaceDensity): ReactNode {
-  const full = density === "full";
+function activityDetail(event: SemanticEvent): ReactNode {
   switch (event.kind) {
     case "reasoning":
-      return <CompactCard sequence={event.sequence} title="Thinking" detail={event.summary} defaultExpanded={false} forceExpanded={full} />;
-    case "tool": {
-      const failed = event.state === "failed";
-      return (
-        <CompactCard
-          sequence={event.sequence}
-          title={`${event.name} · ${event.state}`}
-          detail={event.summary || "No additional detail"}
-          state={failed ? "failure" : event.state === "completed" ? "success" : "active"}
-          defaultExpanded={failed}
-          forceExpanded={full}
-        />
-      );
-    }
+      return event.summary;
+    case "tool":
+      return event.summary || `${event.name} ${event.state}`;
     case "diff":
-      return <CompactCard sequence={event.sequence} title="Code changes" detail={<pre>{event.unified_diff}</pre>} defaultExpanded={false} forceExpanded={full} mono />;
+      return <pre>{event.unified_diff}</pre>;
     case "command":
-      return (
-        <CompactCard
-          sequence={event.sequence}
-          title={event.exit_code === null ? "Command running" : `Command exited ${event.exit_code}`}
-          detail={<code>$ {event.text}</code>}
-          state={event.exit_code === null ? "active" : event.exit_code === 0 ? "success" : "failure"}
-          defaultExpanded={event.exit_code !== 0 && event.exit_code !== null}
-          forceExpanded={full}
-          mono
-        />
-      );
-    case "output":
-      return <CompactCard sequence={event.sequence} title={event.stream === "stderr" ? "Error output" : "Output"} detail={<pre>{event.text}</pre>} state={event.stream === "stderr" ? "failure" : undefined} defaultExpanded={event.stream === "stderr"} forceExpanded={full} mono />;
-    case "status":
-      return <CompactCard sequence={event.sequence} title={event.state} detail={event.detail ?? "Session status updated"} defaultExpanded={false} forceExpanded={full} />;
-    case "terminalMode":
-      return <CompactCard sequence={event.sequence} title={event.raw_required ? "Terminal view needed" : "Native view restored"} detail={event.raw_required ? "This interaction needs a terminal grid." : "This session can be read as native text again."} defaultExpanded={false} forceExpanded={full} />;
+      return <code>$ {event.text}</code>;
     default:
       return null;
   }
 }
 
-export function EventRenderer({
-  event,
+function activityTitle(event: SemanticEvent): string {
+  switch (event.kind) {
+    case "reasoning":
+      return "Thinking";
+    case "tool":
+      return `${event.name} · ${event.state}`;
+    case "diff":
+      return "Code changes";
+    case "command":
+      return event.exit_code === null
+        ? "Command running"
+        : `Command exited ${event.exit_code}`;
+    default:
+      return "Activity";
+  }
+}
+
+function ActivityGroup({
+  item,
   density,
 }: {
-  event: SemanticEvent;
+  item: Extract<ConversationItem, { kind: "activity" }>;
   density: InterfaceDensity;
 }) {
-  if (event.kind === "userMessage") {
-    return <article className="dm-message dm-message-user" data-event-sequence={event.sequence}><p>{event.text}</p></article>;
-  }
-  if (event.kind === "assistantMessage") {
-    return (
-      <article className="dm-message dm-message-assistant" data-event-sequence={event.sequence} aria-busy={event.streaming || undefined}>
-        <p>{event.text}</p>
-        {event.streaming && <span className="dm-streaming-dot" aria-label="Responding" />}
-      </article>
-    );
-  }
-  if (event.kind === "question") {
-    return (
-      <article className="dm-question-card" data-event-sequence={event.sequence}>
-        <CircleAlert size={19} aria-hidden="true" />
-        <div>
-          <strong>Input needed</strong>
-          <p>{event.prompt}</p>
-          {event.choices.length > 0 && (
-            <ul>{event.choices.map((choice) => <li key={choice}>{choice}</li>)}</ul>
-          )}
+  const forcedOpen = density === "full" || item.state !== "success";
+  const [expanded, setExpanded] = useState(forcedOpen);
+  useEffect(() => {
+    if (forcedOpen) setExpanded(true);
+  }, [forcedOpen]);
+  const StatusIcon =
+    item.state === "failure"
+      ? CircleAlert
+      : item.state === "success"
+        ? CircleCheck
+        : CircleEllipsis;
+
+  return (
+    <article
+      className={`dm-activity-group${expanded ? " is-expanded" : ""}`}
+      data-state={item.state}
+      data-event-sequence={item.sequence}
+    >
+      <button
+        type="button"
+        className="dm-activity-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <StatusIcon size={16} aria-hidden="true" />
+        <span>{item.summary}</span>
+        <ChevronDown className="dm-event-chevron" size={15} aria-hidden="true" />
+      </button>
+      {expanded ? (
+        <div className="dm-activity-rows">
+          {item.events.map((event) => (
+            <div className="dm-activity-row" key={`${event.kind}:${event.sequence}`}>
+              <strong>{activityTitle(event)}</strong>
+              <div className="dm-activity-detail">{activityDetail(event)}</div>
+            </div>
+          ))}
         </div>
-      </article>
-    );
-  }
-  if (event.kind === "error") {
+      ) : null}
+    </article>
+  );
+}
+
+export function ConversationItemRenderer({
+  item,
+  density,
+}: {
+  item: ConversationItem;
+  density: InterfaceDensity;
+}) {
+  if (item.kind === "message") {
+    if (item.role === "user") {
+      return (
+        <article
+          className="dm-message dm-message-user"
+          data-event-sequence={item.sequence}
+        >
+          <p>{item.text}</p>
+        </article>
+      );
+    }
     return (
-      <article className="dm-error-card" data-event-sequence={event.sequence} role="alert">
-        <CircleAlert size={19} aria-hidden="true" />
-        <div><strong>Something needs attention</strong><p>{event.message}</p></div>
+      <article
+        className="dm-message dm-message-assistant"
+        data-event-sequence={item.sequence}
+        aria-busy={item.streaming || undefined}
+      >
+        <MarkdownMessage text={item.text} />
+        {item.streaming ? (
+          <span className="dm-streaming-dot" aria-label="Responding" />
+        ) : null}
       </article>
     );
   }
 
-  const card = cardForEvent(event, density);
-  return card ? <>{card}</> : (
-    <article className="dm-event-card is-expanded" data-event-sequence={event.sequence}>
-      <div className="dm-event-card-toggle"><Terminal size={17} aria-hidden="true" /><span>Session activity</span></div>
+  if (item.kind === "activity") {
+    return <ActivityGroup item={item} density={density} />;
+  }
+
+  if (item.kind === "question") {
+    return (
+      <article className="dm-question-card" data-event-sequence={item.sequence}>
+        <CircleAlert size={19} aria-hidden="true" />
+        <div>
+          <strong>Input needed</strong>
+          <p>{item.event.prompt}</p>
+          {item.event.choices.length > 0 ? (
+            <ul>
+              {item.event.choices.map((choice) => (
+                <li key={choice}>{choice}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      </article>
+    );
+  }
+
+  if (item.kind === "error") {
+    return (
+      <article
+        className="dm-error-card"
+        data-event-sequence={item.sequence}
+        role="alert"
+      >
+        <CircleAlert size={19} aria-hidden="true" />
+        <div>
+          <strong>Something needs attention</strong>
+          <p>{item.event.message}</p>
+        </div>
+      </article>
+    );
+  }
+
+  return (
+    <article
+      className="dm-fallback-output"
+      data-stream={item.stream}
+      data-event-sequence={item.sequence}
+    >
+      <span>
+        <Terminal size={14} aria-hidden="true" /> Limited transcript detail
+      </span>
+      <pre>{item.text}</pre>
     </article>
   );
 }

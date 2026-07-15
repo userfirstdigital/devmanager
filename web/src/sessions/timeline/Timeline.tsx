@@ -2,10 +2,10 @@ import { useLayoutEffect, useMemo, useRef } from "react";
 
 import type { SemanticEvent } from "../../api/types";
 import {
-  EventRenderer,
-  visibleEventsForDensity,
+  ConversationItemRenderer,
   type InterfaceDensity,
 } from "./eventRenderers";
+import { buildConversationItems } from "./timelineModel";
 
 const FOLLOW_DISTANCE_PX = 96;
 
@@ -41,27 +41,6 @@ function captureVisibleAnchor(element: HTMLDivElement): VisibleAnchor | null {
   return null;
 }
 
-function coalesceOutput(events: SemanticEvent[]): SemanticEvent[] {
-  const result: SemanticEvent[] = [];
-  for (const event of events) {
-    const previous = result[result.length - 1];
-    if (
-      previous?.kind === "output" &&
-      event.kind === "output" &&
-      previous.source === event.source &&
-      previous.stream === event.stream
-    ) {
-      result[result.length - 1] = {
-        ...event,
-        text: `${previous.text}${event.text}`,
-      };
-    } else {
-      result.push(event);
-    }
-  }
-  return result;
-}
-
 export function Timeline({
   events,
   density,
@@ -76,8 +55,8 @@ export function Timeline({
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
   const visibleAnchorRef = useRef<VisibleAnchor | null>(null);
-  const visibleEvents = useMemo(
-    () => coalesceOutput(visibleEventsForDensity(events, density)),
+  const visibleItems = useMemo(
+    () => buildConversationItems(events, density),
     [density, events],
   );
 
@@ -107,7 +86,7 @@ export function Timeline({
         visibleAnchorRef.current = captureVisibleAnchor(element);
       }
     };
-  }, [visibleEvents]);
+  }, [visibleItems]);
 
   return (
     <div
@@ -123,9 +102,9 @@ export function Timeline({
       }}
     >
       <div className="dm-timeline">
-        {visibleEvents.length ? (
-          visibleEvents.map((event) => (
-            <EventRenderer key={`${event.stableSessionKey}:${event.sequence}`} event={event} density={density} />
+        {visibleItems.length ? (
+          visibleItems.map((item) => (
+            <ConversationItemRenderer key={item.key} item={item} density={density} />
           ))
         ) : (
           <div className="dm-timeline-empty">
