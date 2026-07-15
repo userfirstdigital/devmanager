@@ -88,6 +88,16 @@ fn execute_web_composer_batch(
         rollback_staged_images(&staged);
         return Err(WEB_COMPOSER_AUTHORITY_CHANGED.to_string());
     }
+    if submit.is_some() && session.session_kind.is_ai() {
+        // Native mode can be restored while the provider TUI still owns a
+        // model, status, or other full-screen interaction. Exit that screen
+        // before writing the next prompt so the provider cannot discard it.
+        if let Err(error) = write("\u{1b}") {
+            rollback_staged_images(&staged);
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
     if let Err(error) = write(&prompt) {
         rollback_staged_images(&staged);
         return Err(error);
@@ -365,10 +375,11 @@ mod tests {
         .expect("batch succeeds");
 
         let observed_writes = observed_writes.lock().unwrap();
-        assert_eq!(observed_writes.len(), 3);
-        assert_eq!(observed_writes[1], "\u{1b}");
-        assert_eq!(observed_writes[2], "\r");
-        let prompt = &observed_writes[0];
+        assert_eq!(observed_writes.len(), 4);
+        assert_eq!(observed_writes[0], "\u{1b}");
+        assert_eq!(observed_writes[2], "\u{1b}");
+        assert_eq!(observed_writes[3], "\r");
+        let prompt = &observed_writes[1];
         assert!(!prompt.ends_with('\r'));
         let references = prompt
             .split_whitespace()
@@ -415,9 +426,11 @@ mod tests {
         assert_eq!(
             *observed_writes.lock().unwrap(),
             [
+                "\u{1b}",
                 "first prompt",
                 "\u{1b}",
                 "\r",
+                "\u{1b}",
                 "second prompt",
                 "\u{1b}",
                 "\r",
