@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::remote::RemoteImageAttachment;
 use crate::services::ProcessManager;
-use crate::state::{SessionKind, SessionRuntimeState};
+use crate::state::SessionRuntimeState;
 
 pub(crate) const WEB_PASTE_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 pub(crate) const WEB_COMPOSER_AUTHORITY_CHANGED: &str =
@@ -97,10 +97,11 @@ fn execute_web_composer_batch(
         // in the same PTY write as pasted text can leave the prompt visibly
         // filled but never submitted (observed with Codex on Windows ConPTY).
         std::thread::sleep(Duration::from_millis(50));
-        if session.session_kind == SessionKind::Codex {
-            // Codex keeps a pasted prompt in its multiline editor when it
-            // receives a raw carriage return. Escape exits that editor state;
-            // the following Enter submits the prompt as a distinct key event.
+        if session.session_kind.is_ai() {
+            // Codex can keep pasted text in its multiline editor, while Claude
+            // can leave autocomplete or a provider-owned screen active.
+            // Escape returns either TUI to its composer before the following
+            // Enter submits the prompt as a distinct key event.
             write("\u{1b}")?;
             std::thread::sleep(Duration::from_millis(120));
         }
@@ -328,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_batch_stages_distinct_files_then_submits_with_a_separate_enter() {
+    fn claude_composer_batch_exits_provider_ui_before_submitting() {
         let cwd = temp_test_dir("web-composer-batch-success");
         let mut session = SessionRuntimeState::new(
             "claude-batch",
@@ -364,8 +365,9 @@ mod tests {
         .expect("batch succeeds");
 
         let observed_writes = observed_writes.lock().unwrap();
-        assert_eq!(observed_writes.len(), 2);
-        assert_eq!(observed_writes[1], "\r");
+        assert_eq!(observed_writes.len(), 3);
+        assert_eq!(observed_writes[1], "\u{1b}");
+        assert_eq!(observed_writes[2], "\r");
         let prompt = &observed_writes[0];
         assert!(!prompt.ends_with('\r'));
         let references = prompt
