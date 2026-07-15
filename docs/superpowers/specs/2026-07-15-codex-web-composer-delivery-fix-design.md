@@ -4,12 +4,13 @@
 
 The native web composer acknowledges a Codex submission and immediately publishes the user's native transcript bubble, but the prompt can remain in Codex's multiline terminal editor instead of reaching the model. The existing recovery runs only for the first composer submission, so one command can appear to work while every later prompt silently accumulates in the editor. Codex `/status` has a second visibility problem: it renders its result only inside the provider terminal, while the native interface currently keeps that command inline.
 
-Manual reproduction confirmed the boundary failure. Writing a prompt followed by a raw carriage return leaves it in the Codex editor. Writing Escape, waiting briefly, then writing carriage return submits it. The same sequence submits ordinary prompts and opens Codex's real `/model` and `/status` screens. Claude accepts the current prompt-then-carriage-return sequence and must not change.
+Manual reproduction confirmed the boundary failure. Writing a prompt followed by a raw carriage return leaves it in the Codex editor. Writing Escape, waiting briefly, then writing carriage return submits it. The same sequence submits ordinary prompts and opens Codex's real `/model` and `/status` screens. Hot-load acceptance then exposed the equivalent Claude state leak: returning from a provider screen changed only the web view, so the next command could be discarded by the still-open provider screen. Escape then carriage return safely submitted both ordinary Claude prompts and slash commands.
 
 ## Goals
 
 - Every Codex native-web submission reaches the provider, including consecutive submissions in one session.
-- Claude and non-Codex terminal behavior remains unchanged.
+- Claude and Codex submissions recover from provider-owned editor and full-screen states.
+- Server, SSH, and shell terminal behavior remains unchanged.
 - Exact Codex `/status` submissions automatically open the provider view so the terminal-only result is visible.
 - The native composer continues to acknowledge only successful PTY writes and needs no retry or resume button.
 - Automated and manual hot-reload tests cover the real provider behavior before merging.
@@ -20,11 +21,11 @@ Manual reproduction confirmed the boundary failure. Writing a prompt followed by
 
 `execute_web_composer_batch` already owns prompt construction, attachment staging, writer-lease revalidation, and the final PTY writes. It will also own the provider-specific submit sequence:
 
-- Claude and other sessions: write prompt, wait 50 ms, write carriage return.
-- Codex: write prompt, wait 50 ms, write Escape, wait 120 ms, write carriage return.
+- Claude and Codex: write prompt, wait 50 ms, write Escape, wait 120 ms, write carriage return.
+- Other sessions: write prompt, wait 50 ms, write carriage return.
 - Draft-only writes without a trailing carriage return still write text without submitting.
 
-Escape exits Codex's multiline editing state; the separate carriage return then triggers the TUI submit action. Applying the sequence to every Codex submission removes the incorrect assumption that only the initial submission needs recovery.
+Escape exits Codex's multiline editing state and dismisses Claude autocomplete or a lingering provider-owned screen; the separate carriage return then triggers the TUI submit action. Applying the sequence to every AI submission also makes returning to native mode safe without adding a visible resume or reset action.
 
 ### Remove obsolete lifecycle recovery
 
@@ -43,7 +44,7 @@ Attachment rollback and writer-lease validation remain unchanged. Any failed pro
 Automated tests will prove:
 
 - Codex submissions produce prompt, Escape, carriage return on every call.
-- Claude submissions retain prompt, carriage return.
+- Claude submissions produce prompt, Escape, carriage return.
 - Draft-only Codex writes do not submit.
 - Codex `/status` is a provider interaction and triggers handoff only after acknowledgement.
 - Existing attachment rollback and authority checks still pass.

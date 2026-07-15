@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every Codex native-web prompt and slash command reach the provider while preserving Claude behavior and showing terminal-only Codex status results.
+**Goal:** Make every AI native-web prompt and slash command reach the provider while showing terminal-only Codex status results.
 
 **Architecture:** Keep prompt construction and PTY delivery in `execute_web_composer_batch`, but select the final key sequence from `SessionKind`. Remove the obsolete one-shot lifecycle recovery so there is one deterministic delivery path, then reuse the existing acknowledged provider-command handoff for `/status`.
 
@@ -11,7 +11,8 @@
 ## Global Constraints
 
 - Apply Escape then carriage return to every submitted Codex batch.
-- Keep Claude and other submitted batches as prompt then carriage return.
+- Apply Escape then carriage return to submitted Claude and Codex batches.
+- Keep non-AI submitted batches as prompt then carriage return.
 - Do not add retries, resume controls, or direct provider-protocol submission.
 - Preserve attachment rollback, writer-lease validation, and acknowledgement ordering.
 - Manually test the hot-reload build at a phone-sized viewport before merging.
@@ -28,7 +29,7 @@
 
 **Interfaces:**
 - Consumes: `SessionRuntimeState.session_kind: SessionKind` and the existing `write(&str) -> Result<(), String>` callback.
-- Produces: each submitted Codex batch writes `[prompt, "\u{1b}", "\r"]`; other submitted batches write `[prompt, "\r"]`.
+- Produces: each submitted Claude or Codex batch writes `[prompt, "\u{1b}", "\r"]`; other submitted batches write `[prompt, "\r"]`.
 
 - [ ] **Step 1: Write the failing delivery tests**
 
@@ -42,7 +43,7 @@ Expected: the new Codex test fails because each current call writes only prompt 
 
 - [ ] **Step 3: Implement the minimal provider-specific sequence**
 
-After the prompt write, keep the 50 ms delay. For `SessionKind::Codex`, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
+After the prompt write, keep the 50 ms delay. For AI session kinds, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
 
 - [ ] **Step 4: Remove the obsolete one-shot recovery**
 
