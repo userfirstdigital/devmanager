@@ -24,6 +24,109 @@ function deferred<T>() {
 }
 
 describe("native session composer", () => {
+  it("opens the provider command list from a slash and accepts keyboard selection without submitting", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value=""
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        provider="claude"
+        catalogSessionKey="tab:claude-a"
+        onChange={onChange}
+        onSubmit={onSubmit}
+      />,
+    );
+    const textarea = screen.getByRole("textbox", { name: /message/i });
+    await user.type(textarea, "/mod");
+
+    expect(screen.getByRole("listbox", { name: /claude commands/i })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /^\/model/i })).toBeTruthy();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(onChange).toHaveBeenLastCalledWith("/model");
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("closes slash suggestions on Escape and never opens them for non-AI sessions", async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <Composer
+        scopeKey="runtime-a:tab:codex-a"
+        value="/"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        provider="codex"
+        catalogSessionKey="tab:codex-a"
+        onChange={() => {}}
+        onSubmit={async () => {}}
+      />,
+    );
+    expect(screen.getByRole("listbox", { name: /codex commands/i })).toBeTruthy();
+    fireEvent.keyDown(screen.getByRole("textbox", { name: /message/i }), {
+      key: "Escape",
+    });
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    rerender(
+      <Composer
+        scopeKey="runtime-a:server:shell-a"
+        value="/"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        onChange={() => {}}
+        onSubmit={async () => {}}
+      />,
+    );
+    await user.click(screen.getByRole("textbox", { name: /message/i }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("offers stable native argument suggestions and keeps the sheet visible while reconnecting", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value="/fast"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        provider="claude"
+        catalogSessionKey="tab:claude-a"
+        onChange={onChange}
+        onSubmit={async () => {}}
+      />,
+    );
+    await user.click(screen.getByRole("option", { name: /^\/fast/i }));
+    expect(screen.getByRole("button", { name: /use on/i })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /use on/i }));
+    expect(onChange).toHaveBeenLastCalledWith("/fast on");
+
+    rerender(
+      <Composer
+        scopeKey="runtime-a:tab:claude-b"
+        value="/comp"
+        disabled
+        pending={false}
+        supportsAttachments={false}
+        provider="claude"
+        catalogSessionKey="tab:claude-b"
+        onChange={() => {}}
+        onSubmit={async () => {}}
+      />,
+    );
+    expect(screen.getByDisplayValue("/comp")).toBeTruthy();
+    expect(screen.getByRole("listbox", { name: /claude commands/i })).toBeTruthy();
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+  });
   it("uses a native multiline textarea and sends without a resume step", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

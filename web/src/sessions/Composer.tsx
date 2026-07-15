@@ -2,6 +2,7 @@ import { ImagePlus, Send, X } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ClipboardEvent,
@@ -9,13 +10,20 @@ import {
   type KeyboardEvent,
 } from "react";
 
-import type { ComposerAttachment } from "../api/types";
+import type { ComposerAttachment, WebAiKind } from "../api/types";
 import type { ReturnBehavior } from "../settings/inputPreference";
 import {
   buildImagePastePayload,
   inspectClipboardImageItems,
   WEB_PASTE_IMAGE_MAX_BYTES,
 } from "../components/imagePaste";
+import {
+  filterCommandCatalog,
+  replaceLeadingSlashToken,
+} from "./commands/commandCatalog";
+import { SlashCommandSheet } from "./commands/SlashCommandSheet";
+import type { SlashCommand } from "./commands/types";
+import { useSlashCommandCatalog } from "./commands/useSlashCommandCatalog";
 
 const MAX_ATTACHMENTS = 4;
 // The socket keeps one shared 8 MiB encoded outbound budget. Base64 expands
@@ -36,6 +44,8 @@ export interface ComposerProps {
   disabled: boolean;
   pending: boolean;
   supportsAttachments: boolean;
+  provider?: WebAiKind;
+  catalogSessionKey?: string;
   returnBehavior?: ReturnBehavior;
   placeholder?: string;
   note?: string | null;
@@ -58,6 +68,8 @@ export function Composer({
   disabled,
   pending,
   supportsAttachments,
+  provider,
+  catalogSessionKey = "",
   returnBehavior = "newline",
   placeholder = "Message",
   note = null,
@@ -71,6 +83,9 @@ export function Composer({
   const [submitting, setSubmitting] = useState(false);
   const [readingAttachments, setReadingAttachments] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeCommandIndex, setActiveCommandIndex] = useState(0);
+  const [dismissedCommandDraft, setDismissedCommandDraft] = useState<string | null>(null);
+  const [selectedCommand, setSelectedCommand] = useState<SlashCommand | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scopeRef = useRef(scopeKey);
   const scopeGenerationRef = useRef(0);
@@ -80,6 +95,20 @@ export function Composer({
   onSafetyStateChangeRef.current = onSafetyStateChange;
   const busy = pending || submitting || readingAttachments;
   const canSend = !disabled && !busy && (localValue.trim().length > 0 || attachments.length > 0);
+  const slashEligible = Boolean(
+    provider && localValue.startsWith("/") && !/\s/.test(localValue),
+  );
+  const catalog = useSlashCommandCatalog({
+    scopeKey,
+    sessionKey: catalogSessionKey,
+    provider: provider ?? "claude",
+    enabled: slashEligible,
+  });
+  const commandMatches = useMemo(
+    () => (provider ? filterCommandCatalog(catalog.commands, localValue) : []),
+    [catalog.commands, localValue, provider],
+  );
+  const commandSheetOpen = slashEligible && dismissedCommandDraft !== localValue;
   const publishSafety = (
     nextAttachments = attachmentsRef.current,
     loading = attachmentReadPendingRef.current,
@@ -115,9 +144,18 @@ export function Composer({
     setSubmitting(false);
     setReadingAttachments(false);
     setError(null);
+    setActiveCommandIndex(0);
+    setDismissedCommandDraft(null);
+    setSelectedCommand(null);
   }, [scopeKey, value]);
 
   useEffect(() => setLocalValue(value), [value]);
+
+  useEffect(() => {
+    setActiveCommandIndex((current) =>
+      commandMatches.length === 0 ? 0 : Math.min(current, commandMatches.length - 1),
+    );
+  }, [commandMatches.length]);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -126,9 +164,29 @@ export function Composer({
     textarea.style.height = `${Math.min(textarea.scrollHeight, 132)}px`;
   }, [localValue]);
 
-  const updateValue = (next: string) => {
+  const updateValue = (next: string, keepSelectedCommand = false) => {
     setLocalValue(next);
+    if (!keepSelectedCommand) {
+      const token = next.split(/\s/, 1)[0];
+      if (selectedCommand?.name !== token) setSelectedCommand(null);
+    }
     onChange(next);
+  };
+
+  const acceptCommand = (command: SlashCommand) => {
+    const next = replaceLeadingSlashToken(localValue, command.name);
+    setSelectedCommand(command);
+    setDismissedCommandDraft(next);
+    setActiveCommandIndex(0);
+    updateValue(next, true);
+    textareaRef.current?.focus();
+  };
+
+  const applySuggestion = (command: SlashCommand, value: string) => {
+    const next = `${command.name} ${value}`;
+    setDismissedCommandDraft(next);
+    updateValue(next, true);
+    textareaRef.current?.focus();
   };
 
   const addFiles = async (files: File[]) => {
@@ -255,6 +313,37 @@ export function Composer({
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (commandSheetOpen) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        if (commandMatches.length > 0) {
+          const direction = event.key === "ArrowDown" ? 1 : -1;
+          setActiveCommandIndex((current) =>
+            (current + direction + commandMatches.length) % commandMatches.length,
+          );
+        }
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDismissedCommandDraft(localValue);
+        return;
+      }
+      if (
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.nativeEvent.isComposing
+      ) {
+        const match = commandMatches[activeCommandIndex];
+        if (match) {
+          event.preventDefault();
+          acceptCommand(match.command);
+          return;
+        }
+      }
+    }
     const shouldSend =
       event.key === "Enter" &&
       !event.shiftKey &&
@@ -304,6 +393,31 @@ export function Composer({
                 <X size={14} aria-hidden="true" />
               </button>
             </span>
+          ))}
+        </div>
+      )}
+      {commandSheetOpen && provider && (
+        <SlashCommandSheet
+          provider={provider}
+          matches={commandMatches}
+          activeIndex={activeCommandIndex}
+          loading={catalog.loading}
+          onActiveIndexChange={setActiveCommandIndex}
+          onSelect={acceptCommand}
+        />
+      )}
+      {selectedCommand && selectedCommand.suggestions.length > 0 && (
+        <div className="dm-slash-command-suggestions" aria-label={`${selectedCommand.name} options`}>
+          <span>{selectedCommand.argumentHint}</span>
+          {selectedCommand.suggestions.map((suggestion) => (
+            <button
+              key={suggestion.value}
+              type="button"
+              aria-label={`Use ${suggestion.label}`}
+              onClick={() => applySuggestion(selectedCommand, suggestion.value)}
+            >
+              {suggestion.label}
+            </button>
           ))}
         </div>
       )}
