@@ -102,6 +102,7 @@ export function SessionScreen({
   const [terminalPinned, setTerminalPinned] = useState(
     terminalPreference === "raw",
   );
+  const [providerInteractionLabel, setProviderInteractionLabel] = useState<string | null>(null);
   const latestDraft = useRef("");
   const loadedDraftKey = useRef<string | null>(null);
 
@@ -138,10 +139,10 @@ export function SessionScreen({
     return () => globalThis.removeEventListener?.("pagehide", onPageHide);
   }, [stableSessionKey, workspace.runtimeInstanceId]);
 
-  useEffect(
-    () => setTerminalPinned(terminalPreference === "raw"),
-    [stableSessionKey, terminalPreference, workspace.runtimeInstanceId],
-  );
+  useEffect(() => {
+    setTerminalPinned(terminalPreference === "raw");
+    setProviderInteractionLabel(null);
+  }, [stableSessionKey, terminalPreference, workspace.runtimeInstanceId]);
 
   if (!stableSessionKey || !summary || !item) {
     return <SessionUnavailable onNavigate={onNavigate} />;
@@ -150,16 +151,18 @@ export function SessionScreen({
   const connected = status.kind === "open";
   const live = isLiveStatus(summary.status);
   const ai = summary.kind === "claude" || summary.kind === "codex";
+  const provider = ai ? (summary.kind as "claude" | "codex") : null;
   const nativeView = resolveNativeSessionView(
     summary.kind,
     summary.interactiveShell === true,
   );
-  const viewMode = resolveViewMode({
+  const resolvedViewMode = resolveViewMode({
     adapterHealth: summary.adapterHealth,
     ai,
     gridInteractionRequired: summary.rawRequired,
     pinned: terminalPinned,
   });
+  const viewMode = providerInteractionLabel ? "terminal" : resolvedViewMode;
   const commandId = summary.commandId ??
     (stableSessionKey.startsWith("server:") ? stableSessionKey.slice("server:".length) : null);
   const command = commandForSession(workspace, commandId);
@@ -181,6 +184,8 @@ export function SessionScreen({
       disabled={!connected || !live}
       pending={mutationPending}
       supportsAttachments={ai}
+      provider={provider ?? undefined}
+      catalogSessionKey={stableSessionKey}
       returnBehavior={returnBehavior}
       placeholder={ai ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}` : "Enter a command"}
       note={controlNote}
@@ -196,12 +201,24 @@ export function SessionScreen({
         await submitComposer(stableSessionKey, text, attachments);
         removeDraft(workspace.runtimeInstanceId, stableSessionKey);
       }}
+      onProviderCommandSubmitted={(command) => {
+        if (!provider) return;
+        setProviderInteractionLabel(
+          `${provider === "claude" ? "Claude" : "Codex"} · ${command.name}`,
+        );
+        setTerminalPinned(true);
+      }}
     />
   );
 
   let content;
   if (viewMode === "terminal") {
-    content = <RawTerminalView sessionId={summary.sessionId} />;
+    content = (
+      <RawTerminalView
+        sessionId={summary.sessionId}
+        interactionLabel={providerInteractionLabel ?? undefined}
+      />
+    );
   } else if (nativeView === "ai") {
     content = (
       <AiSessionView
@@ -278,15 +295,17 @@ export function SessionScreen({
         <button
           type="button"
           className="dm-session-mode-button"
-          aria-label={summary.rawRequired ? "Terminal grid required" : viewMode === "terminal" ? "Use native text view" : "Use raw terminal"}
+          aria-label={summary.rawRequired ? "Terminal grid required" : providerInteractionLabel ? "Return to native conversation" : viewMode === "terminal" ? "Use native text view" : "Use raw terminal"}
           disabled={summary.rawRequired}
           onClick={() => {
             if (viewMode === "terminal") {
+              setProviderInteractionLabel(null);
               setTerminalPinned(false);
               // Resume from the latest semantic cursor so output produced
               // while xterm was visible is reconciled before native render.
               foregroundConnection();
             } else {
+              setProviderInteractionLabel(null);
               setTerminalPinned(true);
             }
           }}

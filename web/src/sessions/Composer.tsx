@@ -51,6 +51,7 @@ export interface ComposerProps {
   note?: string | null;
   onChange(value: string): void;
   onSubmit(text: string, attachments: ComposerAttachment[]): Promise<unknown>;
+  onProviderCommandSubmitted?(command: SlashCommand): void;
   onFocus?(): void;
   onSafetyStateChange?(state: {
     selectedAttachments: number;
@@ -75,6 +76,7 @@ export function Composer({
   note = null,
   onChange,
   onSubmit,
+  onProviderCommandSubmitted,
   onFocus,
   onSafetyStateChange,
 }: ComposerProps) {
@@ -273,6 +275,13 @@ export function Composer({
     if (!canSend) return;
     const operationScope = scopeRef.current;
     const operationGeneration = scopeGenerationRef.current;
+    const submittedText = localValue.trim();
+    const providerCommand =
+      submittedText.length > 0 && !/\s/.test(submittedText)
+        ? catalog.commands.find(
+            (command) => command.name.toLowerCase() === submittedText.toLowerCase(),
+          ) ?? null
+        : null;
     setSubmitting(true);
     setError(null);
     try {
@@ -285,6 +294,9 @@ export function Composer({
         scopeGenerationRef.current !== operationGeneration
       ) {
         return;
+      }
+      if (providerCommand?.interaction === "providerMenu") {
+        onProviderCommandSubmitted?.(providerCommand);
       }
       attachmentsRef.current = [];
       publishSafety([], false);

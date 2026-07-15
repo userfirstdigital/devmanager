@@ -24,6 +24,75 @@ function deferred<T>() {
 }
 
 describe("native session composer", () => {
+  it("notifies provider-menu fallback only after the matching command is acknowledged", async () => {
+    const user = userEvent.setup();
+    const accepted = deferred<void>();
+    const onProviderCommandSubmitted = vi.fn();
+    render(
+      <Composer
+        scopeKey="runtime-a:tab:codex-a"
+        value="/model"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        provider="codex"
+        catalogSessionKey="tab:codex-a"
+        onChange={() => {}}
+        onSubmit={() => accepted.promise}
+        onProviderCommandSubmitted={onProviderCommandSubmitted}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    expect(onProviderCommandSubmitted).not.toHaveBeenCalled();
+    await act(async () => {
+      accepted.resolve();
+      await accepted.promise;
+    });
+    await waitFor(() =>
+      expect(onProviderCommandSubmitted).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "/model", interaction: "providerMenu" }),
+      ),
+    );
+  });
+
+  it("does not open provider fallback for inline commands or commands with direct arguments", async () => {
+    const user = userEvent.setup();
+    const onProviderCommandSubmitted = vi.fn();
+    const { rerender } = render(
+      <Composer
+        scopeKey="runtime-a:tab:codex-a"
+        value="/compact"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        provider="codex"
+        catalogSessionKey="tab:codex-a"
+        onChange={() => {}}
+        onSubmit={async () => {}}
+        onProviderCommandSubmitted={onProviderCommandSubmitted}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    expect(onProviderCommandSubmitted).not.toHaveBeenCalled();
+
+    rerender(
+      <Composer
+        scopeKey="runtime-a:tab:codex-b"
+        value="/model gpt-5.5"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        provider="codex"
+        catalogSessionKey="tab:codex-b"
+        onChange={() => {}}
+        onSubmit={async () => {}}
+        onProviderCommandSubmitted={onProviderCommandSubmitted}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    expect(onProviderCommandSubmitted).not.toHaveBeenCalled();
+  });
   it("opens the provider command list from a slash and accepts keyboard selection without submitting", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

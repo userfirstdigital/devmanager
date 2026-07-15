@@ -29,4 +29,18 @@ describe("raw terminal stream ownership", () => {
     expect(setRawTerminalSession).toHaveBeenLastCalledWith(null);
     expect(setRawTerminalSession).toHaveBeenCalledTimes(2);
   });
+
+  it("labels a provider-owned interaction without adding another resume control", () => {
+    useStore.setState({ setRawTerminalSession: vi.fn() });
+    render(
+      <RawTerminalView
+        sessionId="pty-codex"
+        interactionLabel="Codex · /model"
+      />,
+    );
+
+    expect(document.body.textContent).toContain("Codex · /model");
+    expect(document.body.textContent).toContain("Provider interaction");
+    expect(document.body.textContent).not.toMatch(/resume|reconnect/i);
+  });
 });

@@ -1742,6 +1742,26 @@ button:disabled {
   scrollbar-width: none;
 }
 
+.dm-provider-interaction-bar {
+  display: flex;
+  min-height: 36px;
+  padding: 0 max(12px, var(--safe-right)) 0 max(12px, var(--safe-left));
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--dm-separator);
+  color: var(--dm-label);
+  background: var(--dm-surface);
+  font-size: 0.76rem;
+  font-weight: 650;
+}
+
+.dm-provider-interaction-bar small {
+  color: var(--dm-tertiary);
+  font-size: 0.63rem;
+  font-weight: 550;
+}
+
 .dm-attachment-chip {
   display: inline-flex;
   max-width: 220px;
