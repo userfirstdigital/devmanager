@@ -8,7 +8,7 @@ import {
   type WebSessionSummary,
 } from "../../api/types";
 import type { InterfaceDensity } from "../timeline/eventRenderers";
-import { Timeline } from "../timeline/Timeline";
+import { LogTimeline } from "../timeline/LogTimeline";
 
 export function ServerSessionView({
   session,
@@ -33,7 +33,7 @@ export function ServerSessionView({
 }) {
   const live = isLiveStatus(session.status);
   return (
-    <div className="dm-session-body">
+    <div className="dm-session-body" data-density={density}>
       <section className="dm-server-overview" aria-label="Server status">
         <div><span>Status</span><strong data-live={live || undefined}>{session.status}</strong></div>
         <div><span>Port</span><strong>{command?.port ?? "—"}</strong></div>
@@ -49,9 +49,8 @@ export function ServerSessionView({
           <button type="button" disabled={actionsDisabled} className="is-primary" onClick={onStart}><Play size={16} fill="currentColor" aria-hidden="true" />Start</button>
         )}
       </div>
-      <Timeline
+      <LogTimeline
         events={events}
-        density={density}
         emptyTitle="No server output yet"
         emptyDetail="Logs and lifecycle changes will appear here automatically."
       />

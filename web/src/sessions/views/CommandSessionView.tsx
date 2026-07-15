@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 
 import type { SemanticEvent } from "../../api/types";
 import type { InterfaceDensity } from "../timeline/eventRenderers";
-import { Timeline } from "../timeline/Timeline";
+import { LogTimeline } from "../timeline/LogTimeline";
 
 export function CommandSessionView({
   events,
@@ -27,7 +27,7 @@ export function CommandSessionView({
   disconnectLabel?: string;
 }) {
   return (
-    <div className="dm-session-body">
+    <div className="dm-session-body" data-density={density}>
       {!connected && onReconnect && (
         <div className="dm-session-action-strip">
           <button type="button" className="dm-primary-inline-button" disabled={actionsDisabled} onClick={onReconnect}>
@@ -62,9 +62,8 @@ export function CommandSessionView({
           </details>
         </div>
       )}
-      <Timeline
+      <LogTimeline
         events={events}
-        density={density}
         emptyTitle="Ready for a command"
         emptyDetail="Commands and their output will appear as a readable timeline."
       />
