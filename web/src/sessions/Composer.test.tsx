@@ -56,6 +56,38 @@ describe("native session composer", () => {
     );
   });
 
+  it("opens Codex status in the provider view only after acknowledgement", async () => {
+    const user = userEvent.setup();
+    const accepted = deferred<void>();
+    const onProviderCommandSubmitted = vi.fn();
+    render(
+      <Composer
+        scopeKey="runtime-a:tab:codex-status"
+        value="/status"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        provider="codex"
+        catalogSessionKey="tab:codex-status"
+        onChange={() => {}}
+        onSubmit={() => accepted.promise}
+        onProviderCommandSubmitted={onProviderCommandSubmitted}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    expect(onProviderCommandSubmitted).not.toHaveBeenCalled();
+    await act(async () => {
+      accepted.resolve();
+      await accepted.promise;
+    });
+    await waitFor(() =>
+      expect(onProviderCommandSubmitted).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "/status", interaction: "providerMenu" }),
+      ),
+    );
+  });
+
   it("does not open provider fallback for inline commands or commands with direct arguments", async () => {
     const user = userEvent.setup();
     const onProviderCommandSubmitted = vi.fn();

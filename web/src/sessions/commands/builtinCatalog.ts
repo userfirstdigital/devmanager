@@ -180,7 +180,7 @@ const CODEX_SEEDS: readonly Seed[] = [
   ["/new", "Start a new conversation in this CLI session.", { category: "session" }],
   ["/quit", "Exit the Codex CLI.", { category: "session", aliases: ["exit"] }],
   ["/review", "Review the current working tree.", { category: "workflow", interaction: "providerMenu" }],
-  ["/status", "Show model, permissions, usage, and context.", { category: "diagnostics" }],
+  ["/status", "Show model, permissions, usage, and context.", { category: "diagnostics", interaction: "providerMenu" }],
   ["/usage", "Show token usage and rate-limit timing.", { category: "diagnostics", interaction: "providerMenu" }],
   ["/debug-config", "Print layered configuration diagnostics.", { category: "diagnostics" }],
   ["/statusline", "Choose and order terminal footer fields.", { category: "configuration", interaction: "providerMenu" }],

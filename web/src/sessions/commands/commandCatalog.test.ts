@@ -44,6 +44,9 @@ describe("provider slash command catalog", () => {
     expect(codex.find((command) => command.name === "/model")?.interaction).toBe(
       "providerMenu",
     );
+    expect(codex.find((command) => command.name === "/status")?.interaction).toBe(
+      "providerMenu",
+    );
     expect(codex.find((command) => command.name === "/compact")?.interaction).toBe(
       "inline",
     );
