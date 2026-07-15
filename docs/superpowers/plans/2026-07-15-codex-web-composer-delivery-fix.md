@@ -10,8 +10,7 @@
 
 ## Global Constraints
 
-- Apply Escape then carriage return to every submitted Codex batch.
-- Apply Escape then carriage return to submitted Claude and Codex batches.
+- Apply a preflight Escape, then prompt, Escape, and carriage return to every submitted Claude and Codex batch.
 - Keep non-AI submitted batches as prompt then carriage return.
 - Do not add retries, resume controls, or direct provider-protocol submission.
 - Preserve attachment rollback, writer-lease validation, and acknowledgement ordering.
@@ -29,7 +28,7 @@
 
 **Interfaces:**
 - Consumes: `SessionRuntimeState.session_kind: SessionKind` and the existing `write(&str) -> Result<(), String>` callback.
-- Produces: each submitted Claude or Codex batch writes `[prompt, "\u{1b}", "\r"]`; other submitted batches write `[prompt, "\r"]`.
+- Produces: each submitted Claude or Codex batch writes `["\u{1b}", prompt, "\u{1b}", "\r"]`; other submitted batches write `[prompt, "\r"]`.
 
 - [ ] **Step 1: Write the failing delivery tests**
 
@@ -43,7 +42,7 @@ Expected: the new Codex test fails because each current call writes only prompt 
 
 - [ ] **Step 3: Implement the minimal provider-specific sequence**
 
-After the prompt write, keep the 50 ms delay. For AI session kinds, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
+For submitted AI batches, write a preflight `"\u{1b}"` and wait 120 ms before the prompt. After the prompt write, keep the 50 ms delay, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
 
 - [ ] **Step 4: Remove the obsolete one-shot recovery**
 

@@ -21,11 +21,11 @@ Manual reproduction confirmed the boundary failure. Writing a prompt followed by
 
 `execute_web_composer_batch` already owns prompt construction, attachment staging, writer-lease revalidation, and the final PTY writes. It will also own the provider-specific submit sequence:
 
-- Claude and Codex: write prompt, wait 50 ms, write Escape, wait 120 ms, write carriage return.
+- Claude and Codex: write Escape, wait 120 ms, write prompt, wait 50 ms, write Escape, wait 120 ms, write carriage return.
 - Other sessions: write prompt, wait 50 ms, write carriage return.
 - Draft-only writes without a trailing carriage return still write text without submitting.
 
-Escape exits Codex's multiline editing state and dismisses Claude autocomplete or a lingering provider-owned screen; the separate carriage return then triggers the TUI submit action. Applying the sequence to every AI submission also makes returning to native mode safe without adding a visible resume or reset action.
+The preflight Escape exits a lingering provider-owned screen before the new prompt is written. The second Escape exits Codex's multiline editing state or dismisses Claude autocomplete created by the new text; the separate carriage return then triggers the TUI submit action. Applying the sequence to every AI submission makes returning to native mode safe without adding a visible resume or reset action.
 
 ### Remove obsolete lifecycle recovery
 
@@ -43,8 +43,8 @@ Attachment rollback and writer-lease validation remain unchanged. Any failed pro
 
 Automated tests will prove:
 
-- Codex submissions produce prompt, Escape, carriage return on every call.
-- Claude submissions produce prompt, Escape, carriage return.
+- Codex submissions produce Escape, prompt, Escape, carriage return on every call.
+- Claude submissions produce Escape, prompt, Escape, carriage return.
 - Draft-only Codex writes do not submit.
 - Codex `/status` is a provider interaction and triggers handoff only after acknowledgement.
 - Existing attachment rollback and authority checks still pass.
