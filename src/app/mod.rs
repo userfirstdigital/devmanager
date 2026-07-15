@@ -11277,6 +11277,7 @@ impl Render for NativeShell {
             .children(self.process_monitor.as_ref().map(|monitor| {
                 process_monitor::render_process_monitor(
                     monitor,
+                    &self.state,
                     &runtime_snapshot,
                     process_monitor::ProcessMonitorActions {
                         on_action: &make_process_monitor_action_handler,
