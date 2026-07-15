@@ -14,6 +14,7 @@ import {
   type AppDestination,
   type AppRoute,
 } from "./router";
+import { useOfflineIndicator } from "./useOfflineIndicator";
 
 interface DestinationItem {
   id: AppDestination;
@@ -79,6 +80,7 @@ export function AppShell({
 }: AppShellProps) {
   const destination = destinationForRoute(route);
   const isSession = route.name === "session";
+  const showOfflineIndicator = useOfflineIndicator(status);
 
   return (
     <div className="dm-app-shell" data-session-detail={isSession || undefined}>
@@ -122,15 +124,12 @@ export function AppShell({
       </aside>
 
       <main className="dm-app-stage">
-        {status.kind !== "open" || lastError ? (
+        {showOfflineIndicator || lastError ? (
           <div className="dm-app-notices">
-            {status.kind !== "open" && status.kind !== "unauthorized" ? (
-              <div className="dm-connection-banner" role="status" aria-live="polite">
+            {showOfflineIndicator ? (
+              <div className="dm-offline-chip" role="status" aria-live="polite">
                 <WifiOff size={17} aria-hidden="true" />
-                <span>
-                  <strong>Reconnecting automatically</strong>
-                  <small>Your host sessions keep running.</small>
-                </span>
+                <span>Offline · reconnecting</span>
               </div>
             ) : null}
             {lastError ? (

@@ -2,15 +2,20 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AppShell } from "./AppShell";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("native app shell connection feedback", () => {
-  it("keeps a cached workspace readable while clearly showing automatic reconnect", () => {
-    render(
+  it("keeps cached content readable and shows only sustained offline state", () => {
+    vi.useFakeTimers();
+    const { rerender } = render(
       <AppShell
         route={{ name: "sessions" }}
         status={{ kind: "closed", reason: "network changed" }}
@@ -24,7 +29,26 @@ describe("native app shell connection feedback", () => {
     );
 
     expect(screen.getByText("Cached session list").isConnected).toBe(true);
-    expect(screen.getByRole("status").textContent).toMatch(/reconnecting automatically/i);
+    expect(screen.queryByRole("status")).toBeNull();
+    act(() => vi.advanceTimersByTime(6_999));
+    expect(screen.queryByRole("status")).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.getByRole("status").textContent).toMatch(/offline.*reconnecting/i);
+    expect(screen.queryByRole("button", { name: /resume|reconnect/i })).toBeNull();
+
+    rerender(
+      <AppShell
+        route={{ name: "sessions" }}
+        status={{ kind: "open" }}
+        attentionCount={0}
+        lastError={null}
+        onDismissError={() => {}}
+        onNavigate={() => {}}
+      >
+        <p>Cached session list</p>
+      </AppShell>,
+    );
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("surfaces and dismisses action failures", async () => {

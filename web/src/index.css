@@ -145,6 +145,29 @@ button:disabled {
   pointer-events: auto;
 }
 
+.dm-offline-chip {
+  display: inline-flex;
+  min-height: 32px;
+  margin-left: auto;
+  padding: 0 10px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--dm-orange) 32%, var(--dm-separator));
+  border-radius: 999px;
+  color: var(--dm-secondary);
+  background: color-mix(in srgb, var(--dm-surface) 92%, transparent);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  pointer-events: none;
+  font-size: 0.72rem;
+  font-weight: 620;
+}
+
+.dm-offline-chip svg {
+  color: var(--dm-orange);
+}
+
 .dm-connection-banner > span {
   display: flex;
   min-width: 0;
