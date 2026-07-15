@@ -84,6 +84,10 @@ fn execute_web_composer_batch(
     } else {
         format!("{references} {text}")
     };
+    let type_slash_command = submit.is_some()
+        && session.session_kind.is_ai()
+        && references.is_empty()
+        && text.trim_start().starts_with('/');
     if !authorize() {
         rollback_staged_images(&staged);
         return Err(WEB_COMPOSER_AUTHORITY_CHANGED.to_string());
@@ -98,7 +102,12 @@ fn execute_web_composer_batch(
         }
         std::thread::sleep(Duration::from_millis(120));
     }
-    if let Err(error) = write(&prompt) {
+    let prompt_result = if type_slash_command {
+        write_slash_command_prompt(&prompt, &mut write)
+    } else {
+        write(&prompt)
+    };
+    if let Err(error) = prompt_result {
         rollback_staged_images(&staged);
         return Err(error);
     }
@@ -125,10 +134,31 @@ fn execute_web_composer_batch(
 
 fn ai_prompt_settle_delay(text: &str) -> Duration {
     if text.trim_start().starts_with('/') {
-        Duration::from_millis(750)
+        Duration::from_millis(250)
     } else {
         Duration::from_millis(50)
     }
+}
+
+fn write_slash_command_prompt(
+    prompt: &str,
+    write: &mut impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let trimmed = prompt.trim_start();
+    let leading_len = prompt.len() - trimmed.len();
+    if leading_len > 0 {
+        write(&prompt[..leading_len])?;
+    }
+    let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    for character in trimmed[..token_end].chars() {
+        let mut encoded = [0_u8; 4];
+        write(character.encode_utf8(&mut encoded))?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if token_end < trimmed.len() {
+        write(&trimmed[token_end..])?;
+    }
+    Ok(())
 }
 
 fn rollback_staged_images(staged: &[StagedImageAttachment]) {
@@ -478,14 +508,44 @@ mod tests {
 
     #[test]
     fn slash_commands_get_a_cold_provider_autocomplete_settle_window() {
-        assert_eq!(ai_prompt_settle_delay("/model"), Duration::from_millis(750));
+        assert_eq!(ai_prompt_settle_delay("/model"), Duration::from_millis(250));
         assert_eq!(
             ai_prompt_settle_delay("  /status"),
-            Duration::from_millis(750)
+            Duration::from_millis(250)
         );
         assert_eq!(
             ai_prompt_settle_delay("ordinary prompt"),
             Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn codex_slash_command_token_is_typed_instead_of_pasted() {
+        let cwd = temp_test_dir("web-composer-codex-slash");
+        let mut session = SessionRuntimeState::new(
+            "codex-slash",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Codex;
+        let observed_writes = std::sync::Mutex::new(Vec::new());
+
+        execute_web_composer_batch(
+            &session,
+            &[],
+            "/model\r",
+            || true,
+            |text| {
+                observed_writes.lock().unwrap().push(text.to_string());
+                Ok(())
+            },
+        )
+        .expect("slash command succeeds");
+
+        assert_eq!(
+            *observed_writes.lock().unwrap(),
+            ["\u{1b}", "/", "m", "o", "d", "e", "l", "\u{1b}", "\r"]
         );
     }
 

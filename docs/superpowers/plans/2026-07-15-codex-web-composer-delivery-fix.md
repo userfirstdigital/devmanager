@@ -42,7 +42,7 @@ Expected: the new Codex test fails because each current call writes only prompt 
 
 - [ ] **Step 3: Implement the minimal provider-specific sequence**
 
-For submitted AI batches, write a preflight `"\u{1b}"` and wait 120 ms before the prompt. After the prompt write, wait 750 ms for slash-command autocomplete or 50 ms for an ordinary prompt, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
+For submitted AI batches, write a preflight `"\u{1b}"` and wait 120 ms before the prompt. Type the leading slash-command token at 20 ms per character and bulk-write any arguments; bulk-write ordinary prompts unchanged. Wait 250 ms for slash-command autocomplete or 50 ms for an ordinary prompt, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
 
 - [ ] **Step 4: Remove the obsolete one-shot recovery**
 
