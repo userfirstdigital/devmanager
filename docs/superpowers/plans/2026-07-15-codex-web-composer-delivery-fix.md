@@ -42,7 +42,7 @@ Expected: the new Codex test fails because each current call writes only prompt 
 
 - [ ] **Step 3: Implement the minimal provider-specific sequence**
 
-For submitted AI batches, write a preflight `"\u{1b}"` and wait 120 ms before the prompt. After the prompt write, keep the 50 ms delay, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
+For submitted AI batches, write a preflight `"\u{1b}"` and wait 120 ms before the prompt. After the prompt write, wait 250 ms for provider autocomplete, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
 
 - [ ] **Step 4: Remove the obsolete one-shot recovery**
 

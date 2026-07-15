@@ -106,7 +106,10 @@ fn execute_web_composer_batch(
         // TUI input parsers treat an Enter key as a distinct event. Sending it
         // in the same PTY write as pasted text can leave the prompt visibly
         // filled but never submitted (observed with Codex on Windows ConPTY).
-        std::thread::sleep(Duration::from_millis(50));
+        // Give provider autocomplete enough time to observe the pasted slash
+        // token before Escape dismisses it. Shorter delays race Codex startup
+        // and leave commands such as /model selected but not submitted.
+        std::thread::sleep(Duration::from_millis(250));
         if session.session_kind.is_ai() {
             // Codex can keep pasted text in its multiline editor, while Claude
             // can leave autocomplete or a provider-owned screen active.
