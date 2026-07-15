@@ -106,10 +106,10 @@ fn execute_web_composer_batch(
         // TUI input parsers treat an Enter key as a distinct event. Sending it
         // in the same PTY write as pasted text can leave the prompt visibly
         // filled but never submitted (observed with Codex on Windows ConPTY).
-        // Give provider autocomplete enough time to observe the pasted slash
-        // token before Escape dismisses it. Shorter delays race Codex startup
-        // and leave commands such as /model selected but not submitted.
-        std::thread::sleep(Duration::from_millis(250));
+        // Give cold provider autocomplete enough time to observe a pasted
+        // slash token before Escape dismisses it. Ordinary prompts can use the
+        // short PTY settle interval without adding visible latency.
+        std::thread::sleep(ai_prompt_settle_delay(text));
         if session.session_kind.is_ai() {
             // Codex can keep pasted text in its multiline editor, while Claude
             // can leave autocomplete or a provider-owned screen active.
@@ -121,6 +121,14 @@ fn execute_web_composer_batch(
         write(submit)?;
     }
     Ok(())
+}
+
+fn ai_prompt_settle_delay(text: &str) -> Duration {
+    if text.trim_start().starts_with('/') {
+        Duration::from_millis(750)
+    } else {
+        Duration::from_millis(50)
+    }
 }
 
 fn rollback_staged_images(staged: &[StagedImageAttachment]) {
@@ -466,6 +474,19 @@ mod tests {
         .expect("draft write succeeds");
 
         assert_eq!(*observed_writes.lock().unwrap(), ["unfinished"]);
+    }
+
+    #[test]
+    fn slash_commands_get_a_cold_provider_autocomplete_settle_window() {
+        assert_eq!(ai_prompt_settle_delay("/model"), Duration::from_millis(750));
+        assert_eq!(
+            ai_prompt_settle_delay("  /status"),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            ai_prompt_settle_delay("ordinary prompt"),
+            Duration::from_millis(50)
+        );
     }
 
     #[test]
