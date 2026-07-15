@@ -2,6 +2,7 @@ pub mod action;
 pub mod assets;
 pub mod auth;
 pub mod bridge;
+pub(crate) mod command_catalog;
 pub mod dto;
 pub mod image_paste;
 pub(crate) mod input_executor;
@@ -11,7 +12,11 @@ pub(crate) mod request_executor;
 pub mod wire;
 
 use self::auth::{generate_web_client_id, PairingAttemptTracker, PairingThrottleStatus};
+use self::command_catalog::{
+    discover_slash_commands, DiscoveredSlashCommand, DiscoveryLimits, SlashCommandProvider,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,6 +34,8 @@ use super::{
     now_epoch_ms, RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource,
     RemoteHostInner,
 };
+use crate::remote::presentation::StableSessionKey;
+use crate::state::SessionKind;
 
 pub use auth::{
     cookie_name_for_server_id, extract_cookie, generate_cookie_secret_hex,
@@ -484,6 +491,7 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/pair", get(pair_handler))
         .route("/api/health", get(health_handler))
         .route("/api/me", get(me_handler))
+        .route("/api/slash-commands", get(slash_commands_handler))
         .route(
             "/api/push",
             get(push_status_handler).post(push_subscribe_handler),
@@ -811,6 +819,96 @@ async fn me_handler(State(state): State<Arc<WebState>>, headers: HeaderMap) -> R
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SlashCommandQuery {
+    session_key: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SlashCommandResponse {
+    provider: SlashCommandProvider,
+    commands: Vec<DiscoveredSlashCommand>,
+}
+
+async fn slash_commands_handler(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Query(query): Query<SlashCommandQuery>,
+) -> Response {
+    if authenticate_request(&state, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "not paired").into_response();
+    }
+    let Some(session_key) = query
+        .session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+    else {
+        return (StatusCode::BAD_REQUEST, "invalid session key").into_response();
+    };
+
+    let resolved = {
+        let app = match state.inner.shared_state.read() {
+            Ok(app) => app,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "workspace unavailable").into_response()
+            }
+        };
+        let runtime = match state.inner.runtime_state.read() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "runtime unavailable").into_response()
+            }
+        };
+        let mut matches = runtime.sessions.values().filter(|session| {
+            StableSessionKey::resolve(session, &app.open_tabs)
+                .as_ref()
+                .is_some_and(|key| key.as_str() == session_key)
+        });
+        let Some(session) = matches.next() else {
+            return (StatusCode::NOT_FOUND, "AI session not found").into_response();
+        };
+        if matches.next().is_some() {
+            return (StatusCode::CONFLICT, "session key is ambiguous").into_response();
+        }
+        let provider = match session.session_kind {
+            SessionKind::Claude => SlashCommandProvider::Claude,
+            SessionKind::Codex => SlashCommandProvider::Codex,
+            _ => return (StatusCode::NOT_FOUND, "AI session not found").into_response(),
+        };
+        let project_root = session.project_id.as_deref().and_then(|project_id| {
+            app.config
+                .projects
+                .iter()
+                .find(|project| project.id == project_id)
+                .map(|project| PathBuf::from(&project.root_path))
+        });
+        (provider, project_root, session.cwd.clone())
+    };
+    let (provider, project_root, session_cwd) = resolved;
+    let commands = discover_slash_commands(
+        provider,
+        project_root.as_deref(),
+        &session_cwd,
+        dirs::home_dir().as_deref(),
+        DiscoveryLimits::default(),
+    );
+    let body = match serde_json::to_string(&SlashCommandResponse { provider, commands }) {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "catalog unavailable").into_response()
+        }
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PushStatusResponse {
@@ -1104,12 +1202,18 @@ pub(crate) fn authenticate_request(state: &WebState, headers: &HeaderMap) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{Project, SessionTab, TabType};
     use crate::remote::{
         load_remote_machine_state, save_remote_machine_state, test_support::TestProfileGuard,
         KnownRemoteHost, RemoteHostConfig, RemoteHostService, RemoteMachineState,
     };
+    use crate::state::{AppState, RuntimeState, SessionKind, SessionRuntimeState};
+    use crate::terminal::session::TerminalBackend;
     use axum::body::{to_bytes, Body};
     use base64::Engine as _;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
 
     fn test_service(server_id: &str) -> RemoteHostService {
@@ -1246,6 +1350,126 @@ mod tests {
             }
         }))
         .expect("push registration")
+    }
+
+    fn slash_command_fixture(service: &RemoteHostService, kind: SessionKind) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-slash-route-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join(".claude/skills/project-check"))
+            .expect("create command fixture");
+        fs::write(
+            root.join(".claude/skills/project-check/SKILL.md"),
+            "---\nname: project-check\ndescription: Check this project.\n---\nPRIVATE BODY\n",
+        )
+        .expect("write command fixture");
+
+        let mut app = AppState::default();
+        app.config.projects = vec![Project {
+            id: "project-1".to_string(),
+            name: "Project One".to_string(),
+            root_path: root.to_string_lossy().into_owned(),
+            ..Project::default()
+        }];
+        app.open_tabs = vec![SessionTab {
+            id: "ai-tab".to_string(),
+            tab_type: match kind {
+                SessionKind::Claude => TabType::Claude,
+                SessionKind::Codex => TabType::Codex,
+                _ => TabType::Server,
+            },
+            project_id: "project-1".to_string(),
+            pty_session_id: Some("ai-pty".to_string()),
+            ..SessionTab::default()
+        }];
+        let mut runtime = RuntimeState::default();
+        let mut session = SessionRuntimeState::new(
+            "ai-pty",
+            root.clone(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = kind;
+        session.project_id = Some("project-1".to_string());
+        session.tab_id = Some("ai-tab".to_string());
+        runtime.sessions.insert("ai-pty".to_string(), session);
+        service.update_snapshot(app, runtime, Default::default());
+        root
+    }
+
+    #[test]
+    fn slash_command_route_requires_pairing_and_returns_safe_live_provider_metadata() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = test_service("slash-route");
+        let fixture_root = slash_command_fixture(&service, SessionKind::Claude);
+        let state = test_state(&service);
+
+        let unauthorized = runtime.block_on(route_response(
+            state.clone(),
+            "/api/slash-commands?sessionKey=tab%3Aai-tab",
+        ));
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let headers = runtime.block_on(pair_cookie_headers(state.clone(), "slash-browser"));
+        let response = runtime.block_on(route_request(
+            state,
+            axum::http::Method::GET,
+            "/api/slash-commands?sessionKey=tab%3Aai-tab",
+            headers,
+            Vec::new(),
+        ));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = runtime
+            .block_on(to_bytes(response.into_body(), 128 * 1024))
+            .expect("catalog body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("catalog JSON");
+
+        assert_eq!(value["provider"], "claude");
+        let project_command = value["commands"]
+            .as_array()
+            .expect("command array")
+            .iter()
+            .find(|command| command["name"] == "/project-check")
+            .expect("project command");
+        assert_eq!(project_command["description"], "Check this project.");
+        assert_eq!(project_command["source"], "project");
+        let text = String::from_utf8(body.to_vec()).expect("UTF-8 body");
+        assert!(!text.contains(fixture_root.to_string_lossy().as_ref()));
+        assert!(!text.contains("PRIVATE BODY"));
+        let _ = fs::remove_dir_all(fixture_root);
+    }
+
+    #[test]
+    fn slash_command_route_rejects_unknown_and_non_ai_sessions() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = test_service("slash-invalid-route");
+        let fixture_root = slash_command_fixture(&service, SessionKind::Server);
+        let state = test_state(&service);
+        let headers = runtime.block_on(pair_cookie_headers(state.clone(), "slash-invalid-browser"));
+
+        let unknown = runtime.block_on(route_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/api/slash-commands?sessionKey=tab%3Amissing",
+            headers.clone(),
+            Vec::new(),
+        ));
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let non_ai = runtime.block_on(route_request(
+            state,
+            axum::http::Method::GET,
+            "/api/slash-commands?sessionKey=tab%3Aai-tab",
+            headers,
+            Vec::new(),
+        ));
+        assert_eq!(non_ai.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(fixture_root);
     }
 
     fn push_registration_with_mode(
