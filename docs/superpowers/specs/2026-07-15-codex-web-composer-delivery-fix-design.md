@@ -21,7 +21,7 @@ Manual reproduction confirmed the boundary failure. Writing a prompt followed by
 
 `execute_web_composer_batch` already owns prompt construction, attachment staging, writer-lease revalidation, and the final PTY writes. It will also own the provider-specific submit sequence:
 
-- Claude and Codex: write Escape, wait 120 ms, write ordinary prompts as one PTY write or type the leading slash-command token at 20 ms per character, wait 250 ms for slash autocomplete or 50 ms for ordinary prompts, write Escape, wait 120 ms, write carriage return.
+- Claude and Codex: write Escape, wait 120 ms, write ordinary prompts as one PTY write or type the leading slash-command token at 100 ms per character, wait 250 ms for slash autocomplete or 50 ms for ordinary prompts, write Escape, wait 120 ms, write carriage return.
 - Other sessions: write prompt, wait 50 ms, write carriage return.
 - Draft-only writes without a trailing carriage return still write text without submitting.
 

@@ -153,7 +153,9 @@ fn write_slash_command_prompt(
     for character in trimmed[..token_end].chars() {
         let mut encoded = [0_u8; 4];
         write(character.encode_utf8(&mut encoded))?;
-        std::thread::sleep(Duration::from_millis(20));
+        // Keep each command-token byte outside the PTY/channel coalescing
+        // window so provider TUIs treat it as typing rather than a paste.
+        std::thread::sleep(Duration::from_millis(100));
     }
     if token_end < trimmed.len() {
         write(&trimmed[token_end..])?;
