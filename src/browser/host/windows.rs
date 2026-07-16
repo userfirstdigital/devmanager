@@ -3,29 +3,40 @@ use super::{
     BrowserHostState, BrowserMemoryTarget,
 };
 use crate::browser::{
-    build_semantic_snapshot, effective_browser_risk, BrowserAction, BrowserActionResult,
-    BrowserApprovalPolicy, BrowserBounds, BrowserCommand, BrowserCommandRequest,
-    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserError, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor, BrowserNetworkEntry,
-    BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget, BrowserPageLoadState,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
-    BrowserResourceHandle, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
+    build_semantic_snapshot, effective_browser_risk, redact_browser_text, BrowserAction,
+    BrowserActionResult, BrowserApprovalPolicy, BrowserApprovalRequest, BrowserBounds,
+    BrowserCommand, BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation,
+    BrowserDiagnosticLevel, BrowserDownloadState, BrowserDownloadStore, BrowserError,
+    BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor,
+    BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue,
+    BrowserOperationTarget, BrowserPageLoadState, BrowserPerformanceOperation,
+    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserResourceHandle,
+    BrowserResourceId, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
     BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary,
     BrowserStorageLayout, BrowserUploadResult, BrowserUserInputKind, BrowserWaitResult,
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
+use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
-use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
-use windows::core::HSTRING;
+use webview2_com::Microsoft::Web::WebView2::Win32::{
+    COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+    COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE,
+    COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION, COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+    COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+    COREWEBVIEW2_PERMISSION_STATE_DENY,
+};
+use webview2_com::{
+    take_pwstr, CallDevToolsProtocolMethodCompletedHandler, PermissionRequestedEventHandler,
+};
+use windows::core::{BOOL, HSTRING, PWSTR};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{
     MemoryUsageLevel, NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder,
@@ -42,24 +53,50 @@ const WORKSPACE_OPERATION_TAB: &str = "__workspace__";
 const INLINE_RESULT_LIMIT: usize = 8 * 1024;
 
 enum BrowserAsyncPhase {
+    Approval {
+        risk: crate::browser::BrowserRisk,
+        resume: BrowserApprovalResume,
+    },
     Snapshot,
     Screenshot,
     Wait,
-    InspectActions { actions: Vec<BrowserAction> },
-    Act { mutating: bool },
+    InspectActions {
+        actions: Vec<BrowserAction>,
+    },
+    Act {
+        mutating: bool,
+    },
     Console,
     Network,
     Performance,
-    UploadMark { paths: Vec<PathBuf>, token: String },
-    UploadRuntime { paths: Vec<PathBuf>, token: String },
-    UploadDescribe { paths: Vec<PathBuf>, token: String },
-    UploadSet { paths: Vec<PathBuf>, token: String },
+    UploadMark {
+        paths: Vec<PathBuf>,
+        token: String,
+    },
+    UploadRuntime {
+        paths: Vec<PathBuf>,
+        token: String,
+    },
+    UploadDescribe {
+        paths: Vec<PathBuf>,
+        token: String,
+    },
+    UploadSet {
+        paths: Vec<PathBuf>,
+        token: String,
+    },
     Cdp,
+}
+
+enum BrowserApprovalResume {
+    Command,
+    Actions(Vec<BrowserAction>),
 }
 
 struct ActiveBrowserRequest {
     request: BrowserCommandRequest,
     phase: BrowserAsyncPhase,
+    approved_risk: Option<crate::browser::BrowserRisk>,
     _started_at: Instant,
 }
 
@@ -176,7 +213,7 @@ impl BrowserWebViewHost {
                 None => self.cancel_workspace_operations(&workspace_key),
             }
             let result = self.handle_command(window, &workspace_key, command);
-            request.respond(result);
+            self.respond_request(request, result);
             return;
         }
         match &command {
@@ -198,7 +235,7 @@ impl BrowserWebViewHost {
             )
         {
             let result = self.handle_command(window, &workspace_key, command);
-            request.respond(result);
+            self.respond_request(request, result);
             return;
         }
         let target = self.operation_target(&workspace_key, &command);
@@ -240,13 +277,14 @@ impl BrowserWebViewHost {
     ) {
         let operation_id = request.context().operation_id.clone();
         if browser_command_is_automation(request.command()) {
-            match self.begin_automation_request(window, &target, &request) {
+            match self.begin_automation_request(window, &target, &request, None) {
                 BrowserStartResult::Pending(phase) => {
                     self.active_requests.insert(
                         target,
                         ActiveBrowserRequest {
                             request,
                             phase,
+                            approved_risk: None,
                             _started_at: Instant::now(),
                         },
                     );
@@ -271,10 +309,69 @@ impl BrowserWebViewHost {
         request: BrowserCommandRequest,
         result: Result<BrowserResponse, BrowserError>,
     ) {
-        request.respond(result);
+        self.respond_request(request, result);
         if let Some(next) = self.operation_queue.complete(&target, &operation_id) {
             self.start_queued_request(window, target, next);
         }
+    }
+
+    fn respond_request(
+        &mut self,
+        request: BrowserCommandRequest,
+        result: Result<BrowserResponse, BrowserError>,
+    ) {
+        if request.context().actor == BrowserInvocationActor::Agent
+            && browser_command_is_journaled(request.command())
+        {
+            let workspace_key = request.workspace_key().clone();
+            let tab_id = request
+                .command()
+                .tab_id()
+                .map(ToOwned::to_owned)
+                .or_else(|| self.selected_tab_id(&workspace_key));
+            let url = tab_id
+                .as_deref()
+                .and_then(|tab_id| {
+                    self.state
+                        .workspace(&workspace_key)
+                        .and_then(|snapshot| snapshot.tabs.iter().find(|tab| tab.id == tab_id))
+                })
+                .map(|tab| tab.url.clone())
+                .unwrap_or_else(|| "about:blank".to_string());
+            let result_code = match &result {
+                Ok(_) => "ok",
+                Err(error) => browser_error_code(error),
+            };
+            let entry = BrowserJournalEntry {
+                id: request.context().operation_id.clone(),
+                actor: BrowserJournalActor::Agent,
+                intent: request.context().intent.clone(),
+                url,
+                started_at: request.started_at().to_string(),
+                duration_ms: request.elapsed_ms(),
+                result: result_code.to_string(),
+                resource_ids: result
+                    .as_ref()
+                    .ok()
+                    .map(browser_response_resource_ids)
+                    .unwrap_or_default(),
+            };
+            if self
+                .state
+                .append_journal_entry(&workspace_key, entry)
+                .is_ok()
+            {
+                if let Some(tab_id) = tab_id {
+                    let _ = self
+                        .event_sender
+                        .send(BrowserHostEvent::AutomationStateChanged {
+                            workspace_key,
+                            tab_id,
+                        });
+                }
+            }
+        }
+        request.respond(result);
     }
 
     fn cancel_tab_operations(&mut self, workspace_key: &BrowserWorkspaceKey, tab_id: &str) {
@@ -283,20 +380,20 @@ impl BrowserWebViewHost {
         };
         let cancellation = self.operation_queue.cancel_tab(&target);
         if let Some(active) = self.active_requests.remove(&target) {
-            active.request.respond(Err(BrowserError::Interrupted));
+            self.respond_request(active.request, Err(BrowserError::Interrupted));
         }
         for queued in cancellation.queued {
-            queued.respond(Err(BrowserError::Interrupted));
+            self.respond_request(queued, Err(BrowserError::Interrupted));
         }
     }
 
     fn cancel_workspace_operations(&mut self, workspace_key: &BrowserWorkspaceKey) {
         for (target, cancellation) in self.operation_queue.cancel_workspace(workspace_key) {
             if let Some(active) = self.active_requests.remove(&target) {
-                active.request.respond(Err(BrowserError::Interrupted));
+                self.respond_request(active.request, Err(BrowserError::Interrupted));
             }
             for queued in cancellation.queued {
-                queued.respond(Err(BrowserError::Interrupted));
+                self.respond_request(queued, Err(BrowserError::Interrupted));
             }
         }
     }
@@ -306,6 +403,7 @@ impl BrowserWebViewHost {
         window: &gpui::Window,
         target: &BrowserOperationTarget,
         request: &BrowserCommandRequest,
+        approved_risk: Option<crate::browser::BrowserRisk>,
     ) -> BrowserStartResult {
         let workspace_key = request.workspace_key();
         let command = request.command();
@@ -316,31 +414,37 @@ impl BrowserWebViewHost {
             return BrowserStartResult::Complete(Err(error));
         }
         let operation_id = request.context().operation_id.clone();
-        let blocked_declared_risk = || {
-            BrowserApprovalPolicy::trust_project()
-                .requires_confirmation(request.context().declared_risk)
-                .then(|| BrowserError::BlockedPermission {
-                    permission: format!("{:?}", request.context().declared_risk),
-                })
-        };
-        match command {
-            BrowserCommand::Snapshot { .. } => {
-                if let Some(error) = blocked_declared_risk() {
-                    return BrowserStartResult::Complete(Err(error));
-                }
-                start_result(
-                    self.start_script(
-                        target,
-                        &operation_id,
-                        "window.__devmanagerBrowser.snapshot()",
-                    ),
-                    BrowserAsyncPhase::Snapshot,
-                )
+        let path_risk = matches!(
+            command,
+            BrowserCommand::Downloads {
+                operation: crate::browser::BrowserDownloadOperation::Delete,
+                ..
             }
+        )
+        .then_some(crate::browser::BrowserRisk::Destructive);
+        let initial_risk = effective_browser_risk(request.context().declared_risk, None, path_risk);
+        if !matches!(command, BrowserCommand::Act { .. })
+            && BrowserApprovalPolicy::trust_project().requires_confirmation(initial_risk)
+            && approved_risk != Some(initial_risk)
+        {
+            return self.await_approval(
+                target,
+                request,
+                initial_risk,
+                browser_command_summary(command),
+                BrowserApprovalResume::Command,
+            );
+        }
+        match command {
+            BrowserCommand::Snapshot { .. } => start_result(
+                self.start_script(
+                    target,
+                    &operation_id,
+                    "window.__devmanagerBrowser.snapshot()",
+                ),
+                BrowserAsyncPhase::Snapshot,
+            ),
             BrowserCommand::Screenshot { mode, .. } => {
-                if let Some(error) = blocked_declared_risk() {
-                    return BrowserStartResult::Complete(Err(error));
-                }
                 let params = match mode {
                     BrowserScreenshotMode::Viewport => {
                         json!({"format": "png", "fromSurface": true})
@@ -361,9 +465,6 @@ impl BrowserWebViewHost {
                 timeout_ms,
                 ..
             } => {
-                if let Some(error) = blocked_declared_risk() {
-                    return BrowserStartResult::Complete(Err(error));
-                }
                 if let Err(error) = self.validate_wait_reference(workspace_key, condition) {
                     return BrowserStartResult::Complete(Err(error));
                 }
@@ -414,9 +515,6 @@ impl BrowserWebViewHost {
                 )
             }
             BrowserCommand::Console { operation, .. } => {
-                if let Some(error) = blocked_declared_risk() {
-                    return BrowserStartResult::Complete(Err(error));
-                }
                 let operation = match operation {
                     BrowserConsoleOperation::List => "list",
                     BrowserConsoleOperation::Clear => "clear",
@@ -435,9 +533,6 @@ impl BrowserWebViewHost {
                 request_id,
                 ..
             } => {
-                if let Some(error) = blocked_declared_risk() {
-                    return BrowserStartResult::Complete(Err(error));
-                }
                 let operation = match operation {
                     BrowserNetworkOperation::List => "list",
                     BrowserNetworkOperation::Clear => "clear",
@@ -455,9 +550,6 @@ impl BrowserWebViewHost {
                 )
             }
             BrowserCommand::Performance { operation, .. } => {
-                if let Some(error) = blocked_declared_risk() {
-                    return BrowserStartResult::Complete(Err(error));
-                }
                 let operation = match operation {
                     BrowserPerformanceOperation::Snapshot => "snapshot",
                     BrowserPerformanceOperation::TraceStart => "traceStart",
@@ -477,9 +569,10 @@ impl BrowserWebViewHost {
                 paths,
                 ..
             } => {
-                if let Err(error) = self.validate_upload_paths(paths) {
-                    return BrowserStartResult::Complete(Err(error));
-                }
+                let paths = match self.canonical_upload_paths(paths) {
+                    Ok(paths) => paths,
+                    Err(error) => return BrowserStartResult::Complete(Err(error)),
+                };
                 let target_json = match serde_json::to_string(action_target) {
                     Ok(target) => target,
                     Err(error) => {
@@ -502,19 +595,13 @@ impl BrowserWebViewHost {
                             "window.__devmanagerBrowser.markUpload({target_json}, {token_json})"
                         ),
                     ),
-                    BrowserAsyncPhase::UploadMark {
-                        paths: paths.clone(),
-                        token,
-                    },
+                    BrowserAsyncPhase::UploadMark { paths, token },
                 )
             }
             BrowserCommand::Downloads { .. } => {
                 BrowserStartResult::Complete(self.handle_download_command(request))
             }
             BrowserCommand::Cdp { method, params, .. } => {
-                if let Some(error) = blocked_declared_risk() {
-                    return BrowserStartResult::Complete(Err(error));
-                }
                 if method.trim().is_empty() || method.trim() != method || !params.is_object() {
                     return BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
                         field: "cdp".to_string(),
@@ -529,6 +616,44 @@ impl BrowserWebViewHost {
                 message: "unexpected browser automation command".to_string(),
             })),
         }
+    }
+
+    fn await_approval(
+        &mut self,
+        target: &BrowserOperationTarget,
+        request: &BrowserCommandRequest,
+        risk: crate::browser::BrowserRisk,
+        action_summary: String,
+        resume: BrowserApprovalResume,
+    ) -> BrowserStartResult {
+        let origin_url = self
+            .state
+            .workspace(request.workspace_key())
+            .and_then(|snapshot| {
+                snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == target.tab_id)
+                    .map(|tab| tab.url.clone())
+            })
+            .unwrap_or_else(|| "about:blank".to_string());
+        let approval = BrowserApprovalRequest {
+            operation_id: request.context().operation_id.clone(),
+            actor: request.context().actor,
+            intent: redact_browser_text(&request.context().intent),
+            effective_risk: risk,
+            action_summary: redact_browser_text(&action_summary),
+            origin_url: redact_browser_text(&origin_url),
+        };
+        if let Ok(view) = self.view(request.workspace_key(), &target.tab_id) {
+            let _ = view.set_visible(false);
+        }
+        let _ = self.event_sender.send(BrowserHostEvent::ApprovalRequested {
+            workspace_key: request.workspace_key().clone(),
+            tab_id: target.tab_id.clone(),
+            request: approval,
+        });
+        BrowserStartResult::Pending(BrowserAsyncPhase::Approval { risk, resume })
     }
 
     fn start_script(
@@ -663,52 +788,31 @@ impl BrowserWebViewHost {
                     .fold(active.request.context().declared_risk, |risk, runtime| {
                         effective_browser_risk(risk, Some(runtime), None)
                     });
-                if BrowserApprovalPolicy::trust_project().requires_confirmation(effective_risk) {
-                    self.finish_queued_request(
-                        window,
-                        completion.target,
-                        operation_id,
-                        active.request,
-                        Err(BrowserError::BlockedPermission {
-                            permission: format!("{effective_risk:?}"),
-                        }),
-                    );
+                if BrowserApprovalPolicy::trust_project().requires_confirmation(effective_risk)
+                    && active.approved_risk != Some(effective_risk)
+                {
+                    let summary = actions
+                        .iter()
+                        .map(BrowserAction::redacted_summary)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let BrowserStartResult::Pending(phase) = self.await_approval(
+                        &completion.target,
+                        &active.request,
+                        effective_risk,
+                        summary,
+                        BrowserApprovalResume::Actions(actions),
+                    ) else {
+                        unreachable!("approval requests always remain pending")
+                    };
+                    active.phase = phase;
+                    self.active_requests.insert(completion.target, active);
                     return;
                 }
-                let mutating = actions.iter().any(BrowserAction::is_mutating);
-                let encoded = match serde_json::to_string(&actions) {
-                    Ok(encoded) => encoded,
-                    Err(_) => {
-                        self.finish_queued_request(
-                            window,
-                            completion.target,
-                            operation_id,
-                            active.request,
-                            Err(BrowserError::CrashedView {
-                                message: "could not encode inspected browser actions".to_string(),
-                            }),
-                        );
-                        return;
-                    }
-                };
-                active.phase = BrowserAsyncPhase::Act { mutating };
-                if let Err(error) = self.start_script(
-                    &completion.target,
-                    &operation_id,
-                    &format!("window.__devmanagerBrowser.act({encoded})"),
-                ) {
-                    self.finish_queued_request(
-                        window,
-                        completion.target,
-                        operation_id,
-                        active.request,
-                        Err(error),
-                    );
-                } else {
-                    self.active_requests.insert(completion.target, active);
-                }
+                self.continue_actions(window, completion.target, operation_id, active, actions);
                 return;
             }
+            BrowserAsyncPhase::Approval { .. } => return,
             BrowserAsyncPhase::Act { mutating } => {
                 self.complete_action(&active.request, &raw, mutating)
             }
@@ -761,6 +865,103 @@ impl BrowserWebViewHost {
             active.request,
             result,
         );
+    }
+
+    pub fn resolve_approval(
+        &mut self,
+        window: &gpui::Window,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        operation_id: &str,
+        approved: bool,
+    ) -> Result<(), BrowserError> {
+        let target = BrowserOperationTarget::new(workspace_key.clone(), tab_id)?;
+        if self.operation_queue.active_operation_id(&target) != Some(operation_id) {
+            return Err(BrowserError::Interrupted);
+        }
+        let Some(mut active) = self.active_requests.remove(&target) else {
+            return Err(BrowserError::Interrupted);
+        };
+        let phase = std::mem::replace(&mut active.phase, BrowserAsyncPhase::Cdp);
+        let BrowserAsyncPhase::Approval { risk, resume } = phase else {
+            self.active_requests.insert(target, active);
+            return Err(BrowserError::InvalidInvocation {
+                field: "approvalOperationId".to_string(),
+            });
+        };
+        if !approved {
+            self.finish_queued_request(
+                window,
+                target,
+                operation_id.to_string(),
+                active.request,
+                Err(BrowserError::BlockedPermission {
+                    permission: format!("{risk:?}"),
+                }),
+            );
+            self.apply_visibility_plan()?;
+            return Ok(());
+        }
+
+        active.approved_risk = Some(risk);
+        match resume {
+            BrowserApprovalResume::Command => {
+                match self.begin_automation_request(window, &target, &active.request, Some(risk)) {
+                    BrowserStartResult::Pending(phase) => {
+                        active.phase = phase;
+                        self.active_requests.insert(target, active);
+                    }
+                    BrowserStartResult::Complete(result) => self.finish_queued_request(
+                        window,
+                        target,
+                        operation_id.to_string(),
+                        active.request,
+                        result,
+                    ),
+                }
+            }
+            BrowserApprovalResume::Actions(actions) => {
+                self.continue_actions(window, target, operation_id.to_string(), active, actions)
+            }
+        }
+        self.apply_visibility_plan()?;
+        Ok(())
+    }
+
+    fn continue_actions(
+        &mut self,
+        window: &gpui::Window,
+        target: BrowserOperationTarget,
+        operation_id: String,
+        mut active: ActiveBrowserRequest,
+        actions: Vec<BrowserAction>,
+    ) {
+        let mutating = actions.iter().any(BrowserAction::is_mutating);
+        let encoded = match serde_json::to_string(&actions) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                self.finish_queued_request(
+                    window,
+                    target,
+                    operation_id,
+                    active.request,
+                    Err(BrowserError::CrashedView {
+                        message: "could not encode inspected browser actions".to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+        active.phase = BrowserAsyncPhase::Act { mutating };
+        if let Err(error) = self.start_script(
+            &target,
+            &operation_id,
+            &format!("window.__devmanagerBrowser.act({encoded})"),
+        ) {
+            self.finish_queued_request(window, target, operation_id, active.request, Err(error));
+        } else {
+            self.active_requests.insert(target, active);
+        }
     }
 
     fn complete_snapshot(
@@ -1049,11 +1250,29 @@ impl BrowserWebViewHost {
                     serde_json::from_value(value).map_err(|_| BrowserError::CrashedView {
                         message: "browser performance callback returned invalid data".to_string(),
                     })?;
-                Ok(BrowserResponse::Performance {
-                    snapshot: Some(snapshot),
-                    resource: None,
-                    tracing: false,
-                })
+                let encoded =
+                    serde_json::to_vec(&snapshot).map_err(|error| BrowserError::CrashedView {
+                        message: format!("could not encode browser performance snapshot: {error}"),
+                    })?;
+                if encoded.len() > INLINE_RESULT_LIMIT {
+                    let resource = self.store_resource(
+                        request.workspace_key(),
+                        BrowserResourceKind::PerformanceTrace,
+                        "application/json",
+                        encoded,
+                    )?;
+                    Ok(BrowserResponse::Performance {
+                        snapshot: None,
+                        resource: Some(resource),
+                        tracing: false,
+                    })
+                } else {
+                    Ok(BrowserResponse::Performance {
+                        snapshot: Some(snapshot),
+                        resource: None,
+                        tracing: false,
+                    })
+                }
             }
         }
     }
@@ -1291,29 +1510,36 @@ impl BrowserWebViewHost {
         Ok(())
     }
 
-    fn validate_upload_paths(&self, paths: &[PathBuf]) -> Result<(), BrowserError> {
+    fn canonical_upload_paths(&self, paths: &[PathBuf]) -> Result<Vec<PathBuf>, BrowserError> {
         if paths.is_empty() || paths.len() > 16 {
             return Err(BrowserError::InvalidInvocation {
                 field: "paths".to_string(),
             });
         }
+        let mut canonical_paths = Vec::with_capacity(paths.len());
         for path in paths {
-            let metadata = std::fs::metadata(path).map_err(|error| {
+            let canonical = path.canonicalize().map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     BrowserError::MissingFile { path: path.clone() }
                 } else {
                     BrowserError::Io {
-                        operation: "inspect upload file".to_string(),
+                        operation: "canonicalize upload file".to_string(),
                         path: path.clone(),
                         message: error.to_string(),
                     }
                 }
             })?;
+            let metadata = std::fs::metadata(&canonical).map_err(|error| BrowserError::Io {
+                operation: "inspect upload file".to_string(),
+                path: canonical.clone(),
+                message: error.to_string(),
+            })?;
             if !metadata.is_file() {
-                return Err(BrowserError::MissingFile { path: path.clone() });
+                return Err(BrowserError::MissingFile { path: canonical });
             }
+            canonical_paths.push(canonical);
         }
-        Ok(())
+        Ok(canonical_paths)
     }
 
     fn handle_download_command(
@@ -1330,46 +1556,22 @@ impl BrowserWebViewHost {
         };
         let layout =
             BrowserStorageLayout::new(&self.app_config_dir, &request.workspace_key().project_id);
-        std::fs::create_dir_all(&layout.downloads_dir).map_err(|error| BrowserError::Io {
-            operation: "create browser download directory".to_string(),
-            path: layout.downloads_dir.clone(),
-            message: error.to_string(),
-        })?;
-        let downloads = verified_downloads(&layout.downloads_dir)?;
+        let downloads = BrowserDownloadStore::open(&layout.downloads_dir)?;
         match operation {
             crate::browser::BrowserDownloadOperation::List => Ok(BrowserResponse::Downloads {
-                downloads: downloads
-                    .iter()
-                    .map(
-                        |(id, path, metadata)| crate::browser::BrowserDownloadEntry {
-                            id: id.clone(),
-                            file_name: path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("download")
-                                .to_string(),
-                            byte_size: metadata.len(),
-                            completed: true,
-                        },
-                    )
-                    .collect(),
+                downloads: downloads.list()?,
             }),
             crate::browser::BrowserDownloadOperation::Reveal => {
                 let id = download_id.ok_or_else(|| BrowserError::InvalidInvocation {
                     field: "downloadId".to_string(),
                 })?;
-                let (_, path, _) = downloads
-                    .iter()
-                    .find(|(candidate, _, _)| candidate == id)
-                    .ok_or_else(|| BrowserError::MissingFile {
-                        path: layout.downloads_dir.join("download"),
-                    })?;
+                let path = downloads.resolve(id)?;
                 std::process::Command::new("explorer.exe")
                     .arg(format!("/select,{}", path.display()))
                     .spawn()
                     .map_err(|error| BrowserError::Io {
                         operation: "reveal browser download".to_string(),
-                        path: path.clone(),
+                        path,
                         message: error.to_string(),
                     })?;
                 Ok(BrowserResponse::Downloads {
@@ -1377,8 +1579,12 @@ impl BrowserWebViewHost {
                 })
             }
             crate::browser::BrowserDownloadOperation::Delete => {
-                Err(BrowserError::BlockedPermission {
-                    permission: "destructive download deletion".to_string(),
+                let id = download_id.ok_or_else(|| BrowserError::InvalidInvocation {
+                    field: "downloadId".to_string(),
+                })?;
+                downloads.delete(id)?;
+                Ok(BrowserResponse::Downloads {
+                    downloads: Vec::new(),
                 })
             }
         }
@@ -1442,6 +1648,7 @@ impl BrowserWebViewHost {
                     let _ = self.state.apply_dom_mutation(workspace_key, tab_id);
                 }
                 BrowserHostEvent::AutomationStateChanged { .. } => {}
+                BrowserHostEvent::ApprovalRequested { .. } => {}
                 BrowserHostEvent::PageLoad { .. }
                 | BrowserHostEvent::NewWindow { .. }
                 | BrowserHostEvent::Download { .. }
@@ -1739,6 +1946,12 @@ impl BrowserWebViewHost {
                 }
             }
         };
+        attach_permission_handler(
+            &webview,
+            self.event_sender.clone(),
+            workspace_key.clone(),
+            tab_id.to_string(),
+        )?;
         webview.set_visible(false).map_err(view_failure)?;
         webview
             .set_memory_usage_level(MemoryUsageLevel::Low)
@@ -1839,6 +2052,81 @@ impl BrowserWebViewHost {
     }
 }
 
+fn attach_permission_handler(
+    webview: &WebView,
+    event_sender: Sender<BrowserHostEvent>,
+    workspace_key: BrowserWorkspaceKey,
+    tab_id: String,
+) -> Result<(), BrowserError> {
+    let controller = webview.controller();
+    let core_webview = webview.webview();
+    let handler = PermissionRequestedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+        let mut uri = PWSTR::null();
+        unsafe {
+            args.PermissionKind(&mut kind)?;
+            args.Uri(&mut uri)?;
+        }
+        let origin = redact_browser_text(&take_pwstr(uri));
+        let permission = permission_name(kind);
+        let mut was_visible: BOOL = false.into();
+        unsafe {
+            let _ = controller.IsVisible(&mut was_visible);
+            let _ = controller.SetIsVisible(false);
+        }
+        let description = format!(
+            "Actor: User\nIntent: allow website permission\nRisk: OsPermission\nAction: allow {permission}\nOrigin: {origin}"
+        );
+        let approved = MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("Confirm Browser Permission")
+            .set_description(description)
+            .set_buttons(MessageButtons::YesNo)
+            .show()
+            == MessageDialogResult::Yes;
+        let state = if approved {
+            COREWEBVIEW2_PERMISSION_STATE_ALLOW
+        } else {
+            COREWEBVIEW2_PERMISSION_STATE_DENY
+        };
+        let result = unsafe { args.SetState(state) };
+        unsafe {
+            let _ = controller.SetIsVisible(was_visible.as_bool());
+        }
+        let _ = event_sender.send(BrowserHostEvent::Diagnostic {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.clone(),
+            level: BrowserDiagnosticLevel::Info,
+            message: format!(
+                "{} browser permission {permission}",
+                if approved { "Approved" } else { "Denied" }
+            ),
+        });
+        result
+    }));
+    let mut token = 0_i64;
+    unsafe {
+        core_webview
+            .add_PermissionRequested(&handler, &mut token)
+            .map_err(view_failure)
+    }
+}
+
+fn permission_name(kind: COREWEBVIEW2_PERMISSION_KIND) -> &'static str {
+    match kind {
+        COREWEBVIEW2_PERMISSION_KIND_CAMERA => "camera",
+        COREWEBVIEW2_PERMISSION_KIND_MICROPHONE => "microphone",
+        COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION => "geolocation",
+        COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS => "notifications",
+        COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ => "clipboard read",
+        COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE => "file read/write",
+        _ => "operating-system capability",
+    }
+}
+
 fn configured_builder<'a>(
     context: &'a mut WebContext,
     event_sender: Sender<BrowserHostEvent>,
@@ -1922,6 +2210,10 @@ fn configured_builder<'a>(
                     tab_id: ipc_tab.clone(),
                     kind,
                 },
+                Ok(BrowserInputMessage::DomMutation) => BrowserHostEvent::DomMutation {
+                    workspace_key: ipc_workspace.clone(),
+                    tab_id: ipc_tab.clone(),
+                },
                 Err(_) => BrowserHostEvent::Diagnostic {
                     workspace_key: ipc_workspace.clone(),
                     tab_id: ipc_tab.clone(),
@@ -1978,6 +2270,7 @@ fn configured_builder<'a>(
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 enum BrowserInputMessage {
     UserInput { kind: BrowserUserInputKind },
+    DomMutation,
 }
 
 fn view_key(workspace_key: &BrowserWorkspaceKey, tab_id: &str) -> BrowserViewKey {
@@ -2013,6 +2306,111 @@ fn browser_command_is_automation(command: &BrowserCommand) -> bool {
     )
 }
 
+fn browser_command_is_journaled(command: &BrowserCommand) -> bool {
+    !matches!(
+        command,
+        BrowserCommand::Ensure { .. }
+            | BrowserCommand::SetPaneOpen { .. }
+            | BrowserCommand::WorkspaceState
+    )
+}
+
+fn browser_error_code(error: &BrowserError) -> &'static str {
+    match error {
+        BrowserError::InvalidWorkspaceKey { .. } => "invalid_workspace_key",
+        BrowserError::InvalidInvocation { .. } => "invalid_request",
+        BrowserError::StaleReference { .. } => "stale_reference",
+        BrowserError::MissingFile { .. } => "missing_file",
+        BrowserError::MissingResource { .. } => "missing_resource",
+        BrowserError::ResourceTooLarge { .. } => "resource_too_large",
+        BrowserError::OutsideWorkspace { .. } => "outside_workspace_file",
+        BrowserError::InvalidRecipe { .. } | BrowserError::UnsupportedRecipeVersion { .. } => {
+            "invalid_recipe"
+        }
+        BrowserError::Interrupted => "user_interrupted",
+        BrowserError::Timeout { .. } => "timeout",
+        BrowserError::NavigationFailure { .. } => "navigation_failure",
+        BrowserError::CrashedView { .. } => "crashed_view",
+        BrowserError::BlockedPermission { .. } => "blocked_permission",
+        BrowserError::UnavailablePlatform { .. } => "unavailable_platform",
+        BrowserError::Io { .. } => "io_error",
+    }
+}
+
+fn browser_response_resource_ids(response: &BrowserResponse) -> Vec<BrowserResourceId> {
+    let handle = match response {
+        BrowserResponse::Snapshot { resource, .. } | BrowserResponse::Screenshot { resource } => {
+            Some(resource)
+        }
+        BrowserResponse::Console { resource, .. }
+        | BrowserResponse::Network { resource, .. }
+        | BrowserResponse::Performance { resource, .. }
+        | BrowserResponse::Cdp { resource, .. } => resource.as_ref(),
+        BrowserResponse::Status { .. }
+        | BrowserResponse::WorkspaceState { .. }
+        | BrowserResponse::Workspace { .. }
+        | BrowserResponse::Tabs { .. }
+        | BrowserResponse::DownloadDirectory { .. }
+        | BrowserResponse::Wait { .. }
+        | BrowserResponse::Action { .. }
+        | BrowserResponse::Upload { .. }
+        | BrowserResponse::Downloads { .. }
+        | BrowserResponse::Acknowledged => None,
+    };
+    handle
+        .map(|resource| vec![resource.id.clone()])
+        .unwrap_or_default()
+}
+
+fn browser_command_summary(command: &BrowserCommand) -> String {
+    match command {
+        BrowserCommand::Status => "inspect browser status".to_string(),
+        BrowserCommand::WorkspaceState => "inspect browser workspace".to_string(),
+        BrowserCommand::Ensure { .. } => "initialize browser workspace".to_string(),
+        BrowserCommand::SetPaneOpen { open } => format!("set browser pane open to {open}"),
+        BrowserCommand::ListTabs => "list browser tabs".to_string(),
+        BrowserCommand::CreateTab { .. } => "create browser tab".to_string(),
+        BrowserCommand::SelectTab { .. } => "select browser tab".to_string(),
+        BrowserCommand::CloseTab { .. } => "close browser tab".to_string(),
+        BrowserCommand::Navigate { url, .. } => {
+            format!("navigate to {}", redact_browser_text(url))
+        }
+        BrowserCommand::Back { .. } => "navigate back".to_string(),
+        BrowserCommand::Forward { .. } => "navigate forward".to_string(),
+        BrowserCommand::Reload { .. } => "reload browser tab".to_string(),
+        BrowserCommand::UpdateViewport { .. } => "update browser viewport".to_string(),
+        BrowserCommand::OpenDevTools { .. } => "open browser devtools".to_string(),
+        BrowserCommand::Stop { .. } => "stop browser activity".to_string(),
+        BrowserCommand::ResetWorkspace => "reset browser workspace".to_string(),
+        BrowserCommand::ClearProjectProfile => "clear browser profile".to_string(),
+        BrowserCommand::DownloadDirectory => "open browser downloads".to_string(),
+        BrowserCommand::Snapshot { .. } => "capture semantic snapshot".to_string(),
+        BrowserCommand::Screenshot { .. } => "capture page screenshot".to_string(),
+        BrowserCommand::Wait { .. } => "wait for page condition".to_string(),
+        BrowserCommand::Act { actions, .. } => actions
+            .iter()
+            .map(BrowserAction::redacted_summary)
+            .collect::<Vec<_>>()
+            .join(", "),
+        BrowserCommand::Console { operation, .. } => {
+            format!("browser console {operation:?}").to_ascii_lowercase()
+        }
+        BrowserCommand::Network { operation, .. } => {
+            format!("browser network {operation:?}").to_ascii_lowercase()
+        }
+        BrowserCommand::Performance { operation, .. } => {
+            format!("browser performance {operation:?}").to_ascii_lowercase()
+        }
+        BrowserCommand::Upload { paths, .. } => format!("upload {} file(s)", paths.len()),
+        BrowserCommand::Downloads { operation, .. } => {
+            format!("browser downloads {operation:?}").to_ascii_lowercase()
+        }
+        BrowserCommand::Cdp { method, .. } => {
+            format!("call browser CDP method {}", redact_browser_text(method))
+        }
+    }
+}
+
 fn start_result(result: Result<(), BrowserError>, phase: BrowserAsyncPhase) -> BrowserStartResult {
     match result {
         Ok(()) => BrowserStartResult::Pending(phase),
@@ -2036,54 +2434,6 @@ fn script_value(raw: &str) -> Result<Value, BrowserError> {
                 .unwrap_or_else(|| "automation_failed".to_string()),
         })
     }
-}
-
-fn verified_downloads(
-    downloads_dir: &Path,
-) -> Result<Vec<(String, PathBuf, std::fs::Metadata)>, BrowserError> {
-    let verified_root = downloads_dir
-        .canonicalize()
-        .map_err(|error| BrowserError::Io {
-            operation: "verify browser download directory".to_string(),
-            path: downloads_dir.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    let mut downloads = Vec::new();
-    for entry in std::fs::read_dir(&verified_root).map_err(|error| BrowserError::Io {
-        operation: "list browser downloads".to_string(),
-        path: verified_root.clone(),
-        message: error.to_string(),
-    })? {
-        let entry = entry.map_err(|error| BrowserError::Io {
-            operation: "read browser download entry".to_string(),
-            path: verified_root.clone(),
-            message: error.to_string(),
-        })?;
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path).map_err(|error| BrowserError::Io {
-            operation: "inspect browser download".to_string(),
-            path: path.clone(),
-            message: error.to_string(),
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            continue;
-        }
-        let canonical_path = path.canonicalize().map_err(|error| BrowserError::Io {
-            operation: "verify browser download".to_string(),
-            path: path.clone(),
-            message: error.to_string(),
-        })?;
-        if canonical_path.parent() != Some(verified_root.as_path()) {
-            continue;
-        }
-        let id = format!(
-            "{:x}",
-            Sha256::digest(canonical_path.as_os_str().to_string_lossy().as_bytes())
-        );
-        downloads.push((id, canonical_path, metadata));
-    }
-    downloads.sort_by(|left, right| left.1.file_name().cmp(&right.1.file_name()));
-    Ok(downloads)
 }
 
 fn wry_bounds(bounds: BrowserBounds) -> Rect {

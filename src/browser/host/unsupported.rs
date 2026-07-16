@@ -69,6 +69,19 @@ impl BrowserWebViewHost {
         request.respond(result);
     }
 
+    pub fn pump_async_completions(&mut self, _window: &gpui::Window) {}
+
+    pub fn resolve_approval(
+        &mut self,
+        _window: &gpui::Window,
+        _workspace_key: &super::super::BrowserWorkspaceKey,
+        _tab_id: &str,
+        _operation_id: &str,
+        _approved: bool,
+    ) -> Result<(), BrowserError> {
+        Err(unsupported_platform_error(std::env::consts::OS))
+    }
+
     pub fn set_active_workspace(
         &mut self,
         _workspace_key: Option<super::super::BrowserWorkspaceKey>,

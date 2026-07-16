@@ -4,11 +4,11 @@ use devmanager::browser::{
     BrowserActionTarget, BrowserCommand, BrowserCommandBridge, BrowserCommandRequest,
     BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadOperation,
     BrowserDownloadState, BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
-    BrowserInvocationActor, BrowserInvocationContext, BrowserMemoryTarget, BrowserNetworkOperation,
-    BrowserPageLoadState, BrowserPerformanceOperation, BrowserResponse, BrowserRisk,
-    BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind,
-    BrowserViewport, BrowserWaitCondition, BrowserWebViewHost, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
+    BrowserMemoryTarget, BrowserNetworkOperation, BrowserPageLoadState,
+    BrowserPerformanceOperation, BrowserResponse, BrowserRisk, BrowserScreenshotMode,
+    BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
+    BrowserWaitCondition, BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::path::{Path, PathBuf};
@@ -875,6 +875,39 @@ fn initialization_script_coalesces_dom_mutations_and_bounds_redacted_telemetry()
 }
 
 #[test]
+fn windows_ipc_routes_dom_mutations_and_all_trusted_input_kinds() {
+    let windows_host = include_str!("../src/browser/host/windows.rs");
+
+    assert!(windows_host.contains("BrowserInputMessage::DomMutation"));
+    assert!(windows_host.contains("BrowserHostEvent::DomMutation"));
+    assert!(serde_json::from_str::<BrowserUserInputKind>("\"pointer\"").is_ok());
+    assert!(serde_json::from_str::<BrowserUserInputKind>("\"keyboard\"").is_ok());
+    assert!(serde_json::from_str::<BrowserUserInputKind>("\"textInput\"").is_ok());
+}
+
+#[test]
+fn windows_host_promotes_large_performance_snapshots_to_resources() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let start = source.find("fn complete_performance").unwrap();
+    let end = source[start..].find("fn complete_cdp").unwrap() + start;
+    let completion = &source[start..end];
+
+    assert!(completion.contains("encoded.len() > INLINE_RESULT_LIMIT"));
+    assert!(completion.contains("BrowserResourceKind::PerformanceTrace"));
+}
+
+#[test]
+fn windows_permission_requests_use_devmanager_confirmation_and_never_default_grant() {
+    let source = include_str!("../src/browser/host/windows.rs");
+
+    assert!(source.contains("PermissionRequestedEventHandler"));
+    assert!(source.contains("Confirm Browser Permission"));
+    assert!(source.contains("COREWEBVIEW2_PERMISSION_STATE_ALLOW"));
+    assert!(source.contains("COREWEBVIEW2_PERMISSION_STATE_DENY"));
+    assert!(!source.contains("COREWEBVIEW2_PERMISSION_STATE_DEFAULT"));
+}
+
+#[test]
 fn download_paths_stay_in_project_directory_and_never_overwrite() {
     let temp = TestDir::new("download-paths");
     let downloads = temp.path().join("downloads");
@@ -964,6 +997,35 @@ fn host_tab_and_page_mutations_advance_the_existing_snapshot_revision() {
 
     host.reset_workspace(&key);
     assert!(host.workspace(&key).is_none());
+}
+
+#[test]
+fn host_journal_append_is_bounded_persistable_state() {
+    let temp = TestDir::new("host-journal");
+    let mut host = BrowserHostState::new(temp.path());
+    let key = workspace("project-a", "conversation-a");
+    let initial = host
+        .ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
+        .unwrap();
+    let mutation = host
+        .append_journal_entry(
+            &key,
+            BrowserJournalEntry {
+                id: "op-1".to_string(),
+                actor: BrowserJournalActor::Agent,
+                intent: "inspect page".to_string(),
+                url: "https://fixture.test".to_string(),
+                started_at: "2026-07-16T00:00:00Z".to_string(),
+                duration_ms: 4,
+                result: "ok".to_string(),
+                resource_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    assert!(mutation.revision > initial.revision);
+    assert_eq!(mutation.snapshot.journal_entries.len(), 1);
+    assert_eq!(mutation.snapshot.journal_entries[0].id, "op-1");
 }
 
 #[allow(dead_code)]

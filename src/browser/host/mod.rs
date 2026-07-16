@@ -294,6 +294,17 @@ impl BrowserHostState {
         self.apply_dom_mutation(workspace_key, tab_id)
     }
 
+    pub fn append_journal_entry(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        entry: super::BrowserJournalEntry,
+    ) -> Result<BrowserWorkspaceMutation, BrowserError> {
+        let snapshot = self.workspace_mut(workspace_key)?;
+        snapshot.append_journal_entry(entry);
+        snapshot.advance_revision();
+        Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
+    }
+
     pub fn apply_page_load(
         &mut self,
         workspace_key: &BrowserWorkspaceKey,

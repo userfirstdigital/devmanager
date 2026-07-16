@@ -1110,6 +1110,7 @@ impl NativeShell {
     }
 
     fn pump_browser_events(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.browser_host.pump_async_completions(window);
         let events = self.browser_host.drain_events();
         if events.is_empty() {
             return;
@@ -1169,6 +1170,50 @@ impl NativeShell {
                     message,
                 } => {
                     self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(message);
+                }
+                BrowserPaneEventPlan::ConfirmApproval {
+                    workspace_key,
+                    tab_id,
+                    request,
+                } => {
+                    let description = format!(
+                        "Actor: {:?}\nIntent: {}\nRisk: {:?}\nAction: {}\nOrigin: {}",
+                        request.actor,
+                        request.intent,
+                        request.effective_risk,
+                        request.action_summary,
+                        request.origin_url
+                    );
+                    let _dialog_pause = self.pause_for_native_dialog();
+                    let approved = MessageDialog::new()
+                        .set_level(MessageLevel::Warning)
+                        .set_title("Confirm Browser Action")
+                        .set_description(description)
+                        .set_buttons(MessageButtons::YesNo)
+                        .show()
+                        == MessageDialogResult::Yes;
+                    match self.browser_host.resolve_approval(
+                        window,
+                        &workspace_key,
+                        &tab_id,
+                        &request.operation_id,
+                        approved,
+                    ) {
+                        Ok(()) => {
+                            self.browser_ui
+                                .entry(workspace_key)
+                                .or_default()
+                                .action_status = Some(if approved {
+                                "Approved browser action".to_string()
+                            } else {
+                                "Denied browser action".to_string()
+                            });
+                        }
+                        Err(error) => {
+                            self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                                Some(error.to_string());
+                        }
+                    }
                 }
             }
         }

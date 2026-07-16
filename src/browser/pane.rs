@@ -1,7 +1,8 @@
 use super::{
-    validate_browser_url, BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserError,
-    BrowserHostEvent, BrowserPageLoadState, BrowserResponse, BrowserRevision, BrowserTabSnapshot,
-    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    validate_browser_url, BrowserApprovalRequest, BrowserBounds, BrowserCommand,
+    BrowserDownloadState, BrowserError, BrowserHostEvent, BrowserJournalEntry,
+    BrowserPageLoadState, BrowserResponse, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -126,6 +127,7 @@ pub struct BrowserPaneModel {
     pub loading: bool,
     pub diagnostic: Option<String>,
     pub action_status: Option<String>,
+    pub journal_entries: Vec<BrowserJournalEntry>,
     pub divider_dragging: bool,
 }
 
@@ -178,6 +180,11 @@ pub enum BrowserPaneEventPlan {
         workspace_key: BrowserWorkspaceKey,
         message: String,
     },
+    ConfirmApproval {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+        request: BrowserApprovalRequest,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +236,12 @@ impl BrowserPaneModel {
             loading: transient.loading,
             diagnostic: transient.diagnostic,
             action_status: transient.action_status,
+            journal_entries: snapshot
+                .journal_entries
+                .iter()
+                .skip(snapshot.journal_entries.len().saturating_sub(3))
+                .cloned()
+                .collect(),
             divider_dragging: transient.divider_dragging,
         }
     }
@@ -404,6 +417,7 @@ pub fn browser_event_plan(
         | BrowserHostEvent::UserInput { workspace_key, .. }
         | BrowserHostEvent::DomMutation { workspace_key, .. }
         | BrowserHostEvent::AutomationStateChanged { workspace_key, .. }
+        | BrowserHostEvent::ApprovalRequested { workspace_key, .. }
         | BrowserHostEvent::NewWindow { workspace_key, .. }
         | BrowserHostEvent::Download { workspace_key, .. }
         | BrowserHostEvent::Diagnostic { workspace_key, .. } => workspace_key,
@@ -445,6 +459,13 @@ pub fn browser_event_plan(
                 loading: None,
             })
         }
+        BrowserHostEvent::ApprovalRequested {
+            tab_id, request, ..
+        } => Some(BrowserPaneEventPlan::ConfirmApproval {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.clone(),
+            request: request.clone(),
+        }),
         BrowserHostEvent::NewWindow { url, .. } => Some(BrowserPaneEventPlan::OpenLogicalTab {
             workspace_key: workspace_key.clone(),
             url: url.clone(),
@@ -734,6 +755,24 @@ pub fn render_browser_pane(
         .clone()
         .or_else(|| model.action_status.clone())
         .or_else(|| model.loading.then(|| "Loading...".to_string()));
+    let journal_rows = model.journal_entries.iter().map(|entry| {
+        div()
+            .h(px(18.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px(px(6.0))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .bg(rgb(theme::TOPBAR_BG))
+            .text_xs()
+            .text_color(rgb(theme::TEXT_DIM))
+            .child(SharedString::from(format!(
+                "{:?} - {} - {}",
+                entry.actor, entry.result, entry.intent
+            )))
+            .into_any_element()
+    });
     let address_text = if model.address_draft.is_empty() {
         "Enter an address".to_string()
     } else if model.address_focused {
@@ -935,6 +974,7 @@ pub fn render_browser_pane(
                         .unwrap_or_else(|| "Browser ready".to_string())
                 }))),
         )
+        .child(div().flex_none().flex().flex_col().children(journal_rows))
         .child(
             div()
                 .flex_1()

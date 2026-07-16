@@ -1,5 +1,6 @@
 mod automation;
 mod commands;
+mod downloads;
 mod gateway;
 mod host;
 mod mcp;
@@ -13,21 +14,23 @@ mod resources;
 mod storage;
 
 pub use automation::{
-    build_semantic_snapshot, effective_browser_risk, runtime_target_risk, BrowserAction,
-    BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry, BrowserConsoleOperation,
-    BrowserDownloadEntry, BrowserDownloadOperation, BrowserLocatorStrategy, BrowserNetworkEntry,
-    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
+    build_semantic_snapshot, effective_browser_risk, redact_browser_text, runtime_target_risk,
+    BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry,
+    BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation,
+    BrowserLocatorStrategy, BrowserNetworkEntry, BrowserNetworkOperation,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
     BrowserRawSemanticElement, BrowserRedactedAction, BrowserRuntimeTarget, BrowserScreenshotMode,
     BrowserSemanticElement, BrowserSemanticSnapshot, BrowserSnapshotSummary,
     BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition, BrowserWaitResult,
     MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
 };
 pub use commands::{
-    browser_command_channel, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
-    BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
-    BrowserPageLoadState, BrowserResponse, BrowserUserInputKind,
+    browser_command_channel, BrowserApprovalRequest, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandInbox, BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel,
+    BrowserDownloadState, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserPageLoadState, BrowserResponse, BrowserUserInputKind,
 };
+pub use downloads::BrowserDownloadStore;
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub use host::{
     browser_user_input_initialization_script, unique_download_path, unsupported_host_status,

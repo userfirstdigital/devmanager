@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+static SECRET_ASSIGNMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)((?:authorization|cookie|password|passwd|token|secret|api[_-]?key)\s*[:=]\s*)([^\s,;&#]+)",
+    )
+    .expect("browser secret-assignment regex is valid")
+});
+static BEARER_SECRET: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+")
+        .expect("browser bearer-token regex is valid")
+});
 
 pub const MAX_BROWSER_ACTIONS: usize = 32;
 pub const MAX_BROWSER_JOURNAL_ENTRIES: usize = 100;
@@ -588,11 +600,20 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
+pub fn redact_browser_text(value: &str) -> String {
+    let redacted = SECRET_ASSIGNMENT.replace_all(value, format!("$1{REDACTED_VALUE}"));
+    BEARER_SECRET
+        .replace_all(&redacted, format!("Bearer {REDACTED_VALUE}"))
+        .chars()
+        .take(4_000)
+        .collect()
+}
+
 impl BrowserWorkspaceSnapshot {
     pub fn append_journal_entry(&mut self, mut entry: super::BrowserJournalEntry) {
-        entry.intent = truncate(entry.intent.trim(), 512);
-        entry.url = truncate(entry.url.trim(), 2_000);
-        entry.result = truncate(entry.result.trim(), 128);
+        entry.intent = truncate(&redact_browser_text(entry.intent.trim()), 512);
+        entry.url = truncate(&redact_browser_text(entry.url.trim()), 2_000);
+        entry.result = truncate(&redact_browser_text(entry.result.trim()), 128);
         while self.journal_entries.len() >= MAX_BROWSER_JOURNAL_ENTRIES {
             self.journal_entries.remove(0);
         }

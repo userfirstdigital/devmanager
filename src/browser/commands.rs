@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +102,17 @@ impl BrowserInvocationContext {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserApprovalRequest {
+    pub operation_id: String,
+    pub actor: BrowserInvocationActor,
+    pub intent: String,
+    pub effective_risk: BrowserRisk,
+    pub action_summary: String,
+    pub origin_url: String,
 }
 
 fn random_operation_id() -> Result<String, BrowserError> {
@@ -364,7 +377,7 @@ pub enum BrowserPageLoadState {
 pub enum BrowserUserInputKind {
     Pointer,
     Keyboard,
-    Input,
+    TextInput,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -421,6 +434,11 @@ pub enum BrowserHostEvent {
     AutomationStateChanged {
         workspace_key: BrowserWorkspaceKey,
         tab_id: String,
+    },
+    ApprovalRequested {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+        request: BrowserApprovalRequest,
     },
     NewWindow {
         workspace_key: BrowserWorkspaceKey,
@@ -637,6 +655,8 @@ pub struct BrowserCommandRequest {
     context: BrowserInvocationContext,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     _pending_work: PendingWorkGuard,
+    started_at: String,
+    started: Instant,
 }
 
 impl BrowserCommandRequest {
@@ -650,6 +670,14 @@ impl BrowserCommandRequest {
 
     pub fn context(&self) -> &BrowserInvocationContext {
         &self.context
+    }
+
+    pub(crate) fn started_at(&self) -> &str {
+        &self.started_at
+    }
+
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
 
     pub fn respond(self, result: Result<BrowserResponse, BrowserError>) {
@@ -672,6 +700,10 @@ impl From<BrowserCommandEnvelope> for BrowserCommandRequest {
             context,
             response,
             _pending_work: pending_work,
+            started_at: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            started: Instant::now(),
         }
     }
 }

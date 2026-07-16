@@ -1,10 +1,10 @@
 use devmanager::browser::{
     build_semantic_snapshot, effective_browser_risk, BrowserAction, BrowserActionTarget,
-    BrowserBounds, BrowserElementRef, BrowserError, BrowserJournalActor, BrowserJournalEntry,
-    BrowserLocator, BrowserLocatorStrategy, BrowserOperationQueue, BrowserOperationTarget,
-    BrowserRawSemanticElement, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
-    BrowserRevision, BrowserRisk, BrowserRuntimeTarget, BrowserTelemetryBuffer,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserBounds, BrowserDownloadStore, BrowserElementRef, BrowserError, BrowserJournalActor,
+    BrowserJournalEntry, BrowserLocator, BrowserLocatorStrategy, BrowserOperationQueue,
+    BrowserOperationTarget, BrowserRawSemanticElement, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserRevision, BrowserRisk, BrowserRuntimeTarget,
+    BrowserTelemetryBuffer, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use static_assertions::assert_impl_all;
 use std::path::{Path, PathBuf};
@@ -305,4 +305,42 @@ fn telemetry_and_workspace_journal_are_bounded_oldest_first() {
     assert_eq!(snapshot.journal_entries.len(), 100);
     assert_eq!(snapshot.journal_entries.first().unwrap().id, "entry-5");
     assert_eq!(snapshot.journal_entries.last().unwrap().id, "entry-104");
+
+    snapshot.append_journal_entry(BrowserJournalEntry {
+        id: "secret-entry".to_string(),
+        actor: BrowserJournalActor::Agent,
+        intent: "submit token=never-store-this Bearer also-secret".to_string(),
+        url: "https://fixture.test/?password=hidden".to_string(),
+        started_at: "2026-07-16T00:00:00Z".to_string(),
+        duration_ms: 1,
+        result: "blocked token=result-secret".to_string(),
+        resource_ids: Vec::new(),
+    });
+    let encoded = serde_json::to_string(snapshot.journal_entries.last().unwrap()).unwrap();
+    assert!(!encoded.contains("never-store-this"));
+    assert!(!encoded.contains("also-secret"));
+    assert!(!encoded.contains("hidden"));
+    assert!(!encoded.contains("result-secret"));
+}
+
+#[test]
+fn download_store_lists_and_deletes_only_verified_direct_regular_files() {
+    let temp = TestDir::new("download-store");
+    let root = temp.path().join("downloads");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::write(root.join("report.txt"), b"report").unwrap();
+    std::fs::write(root.join("nested").join("hidden.txt"), b"hidden").unwrap();
+
+    let store = BrowserDownloadStore::open(&root).unwrap();
+    let downloads = store.list().unwrap();
+    assert_eq!(downloads.len(), 1);
+    assert_eq!(downloads[0].file_name, "report.txt");
+    assert!(downloads[0].id.starts_with("download-"));
+    assert!(!downloads[0].id.contains("report"));
+
+    let verified = store.resolve(&downloads[0].id).unwrap();
+    assert_eq!(verified, root.join("report.txt").canonicalize().unwrap());
+    store.delete(&downloads[0].id).unwrap();
+    assert!(!root.join("report.txt").exists());
+    assert!(root.join("nested").join("hidden.txt").exists());
 }

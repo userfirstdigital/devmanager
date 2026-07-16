@@ -50,7 +50,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   };
   window.addEventListener("pointerdown", reportInput("pointer"), true);
   window.addEventListener("keydown", reportInput("keyboard"), true);
-  window.addEventListener("input", reportInput("input"), true);
+  window.addEventListener("input", reportInput("textInput"), true);
 
   let mutationTimer = null;
   const mutationObserver = new MutationObserver(() => {
