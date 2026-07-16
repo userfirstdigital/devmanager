@@ -2,6 +2,16 @@ mod chrome;
 mod process_monitor;
 
 use crate::assets::AppAssets;
+use crate::browser::{
+    browser_action_plan, browser_command_channel, browser_event_plan, browser_host_visibility,
+    browser_pane_open_fallback, browser_response_sync, browser_settings_plan,
+    calculate_browser_split, render_browser_pane, BrowserBounds, BrowserCommand,
+    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
+    BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions, BrowserPaneContext,
+    BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
+    BrowserResponse, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
+};
 use crate::git::git_service;
 use crate::models::{
     AppConfig, DependencyStatus, MacTerminalProfile, PortStatus, Project, ProjectFolder,
@@ -26,13 +36,13 @@ use crate::state::{
 use crate::terminal::{self, view};
 use crate::updater::UpdaterService;
 use crate::workspace::{
-    self, CommandDraft, EditorAction, EditorField, EditorPaneModel, EditorPanel, FolderDraft,
-    FolderField, ProjectDraft, RemotePortForwardDraft, RemoteTopTab, SettingsDraft, SshDraft,
-    UiPreviewDraft,
+    self, apply_browser_enabled_preference, CommandDraft, EditorAction, EditorField,
+    EditorPaneModel, EditorPanel, FolderDraft, FolderField, ProjectDraft, RemotePortForwardDraft,
+    RemoteTopTab, SettingsDraft, SshDraft, UiPreviewDraft,
 };
 use crate::{icons, theme};
 use gpui::{
-    div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
+    canvas, div, prelude::*, px, rgb, size, App, AppContext, Application, Bounds, ClipboardEntry,
     ClipboardItem, Context, FocusHandle, IntoElement, KeyDownEvent, Keystroke, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
     Render, RenderImage, ScrollWheelEvent, Styled, Subscription, TouchPhase, Window, WindowBounds,
@@ -74,6 +84,28 @@ fn should_minimize_window_on_close(
     _legacy_remote_keep_hosting_in_background: bool,
 ) -> bool {
     minimize_to_tray
+}
+
+fn browser_bounds_from_gpui(bounds: Bounds<Pixels>) -> Option<BrowserBounds> {
+    let x = f32::from(bounds.origin.x);
+    let y = f32::from(bounds.origin.y);
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return None;
+    }
+    Some(BrowserBounds {
+        x: x.round() as i32,
+        y: y.round() as i32,
+        width: width.round() as i32,
+        height: height.round() as i32,
+    })
 }
 
 pub fn run() {
@@ -143,6 +175,15 @@ struct NativeShell {
     state: AppState,
     session_manager: SessionManager,
     process_manager: ProcessManager,
+    browser_host: BrowserWebViewHost,
+    browser_bridge: BrowserCommandBridge,
+    browser_inbox: Option<BrowserCommandInbox>,
+    browser_tasks_started: bool,
+    browser_ui: HashMap<BrowserWorkspaceKey, BrowserWorkspaceUiState>,
+    browser_address_focus: FocusHandle,
+    browser_split_bounds: Option<BrowserBounds>,
+    browser_page_bounds: Option<BrowserBounds>,
+    browser_divider_drag: Option<BrowserDividerDrag>,
     updater: UpdaterService,
     startup_notice: Option<String>,
     terminal_notice: Option<String>,
@@ -199,6 +240,21 @@ struct NativeShell {
 
 struct NativeDialogPauseGuard {
     blockers: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BrowserWorkspaceUiState {
+    address_draft: Option<String>,
+    address_cursor: usize,
+    address_focused: bool,
+    loading: bool,
+    diagnostic: Option<String>,
+    action_status: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserDividerDrag {
+    workspace_key: BrowserWorkspaceKey,
 }
 
 struct PreparedRemoteConnect {
@@ -604,6 +660,10 @@ fn build_remote_status_bar_state(
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
+        let browser_app_config_dir =
+            crate::persistence::app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let browser_host = BrowserWebViewHost::new(browser_app_config_dir);
+        let (browser_bridge, browser_inbox) = browser_command_channel(64);
         let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
         let (mut state, startup_notice) = match session_manager.load_workspace() {
@@ -765,6 +825,15 @@ impl NativeShell {
             state,
             session_manager,
             process_manager,
+            browser_host,
+            browser_bridge,
+            browser_inbox: Some(browser_inbox),
+            browser_tasks_started: false,
+            browser_ui: HashMap::new(),
+            browser_address_focus: cx.focus_handle(),
+            browser_split_bounds: None,
+            browser_page_bounds: None,
+            browser_divider_drag: None,
             updater,
             startup_notice,
             terminal_notice,
@@ -822,6 +891,607 @@ impl NativeShell {
         Self::spawn_splash_image_fetch(shell.native_dialog_blockers.clone(), cx);
 
         shell
+    }
+
+    fn start_browser_tasks(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.browser_tasks_started {
+            return;
+        }
+        let Some(mut inbox) = self.browser_inbox.take() else {
+            return;
+        };
+        self.browser_tasks_started = true;
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, move |cx: &mut gpui::AsyncWindowContext| {
+                let mut async_cx = cx.clone();
+                async move {
+                    while let Some(request) = inbox.recv().await {
+                        let updated = this.update_in(&mut async_cx, |shell, window, cx| {
+                            shell.handle_browser_request(request, window, cx);
+                        });
+                        if updated.is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                if this
+                    .update_in(&mut *cx, |shell, window, cx| {
+                        shell.pump_browser_events(window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            })
+            .detach();
+    }
+
+    fn open_browser_workspace_keys(&self) -> Vec<BrowserWorkspaceKey> {
+        self.state
+            .ai_tabs()
+            .filter_map(|tab| BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok())
+            .collect()
+    }
+
+    fn browser_route_is_open(&self, workspace_key: &BrowserWorkspaceKey) -> bool {
+        self.state
+            .find_ai_tab(&workspace_key.ai_tab_id)
+            .is_some_and(|tab| tab.project_id == workspace_key.project_id)
+    }
+
+    fn dispatch_browser_command(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        command: BrowserCommand,
+        window: &Window,
+    ) -> Result<BrowserResponse, BrowserError> {
+        if !self.browser_route_is_open(workspace_key) {
+            return Err(BrowserError::CrashedView {
+                message: "browser command route does not match an open AI conversation".to_string(),
+            });
+        }
+        let result = self
+            .browser_host
+            .handle_command(window, workspace_key, command.clone());
+        match &result {
+            Ok(response) => self.synchronize_browser_response(workspace_key, &command, response),
+            Err(error) => {
+                self.browser_ui
+                    .entry(workspace_key.clone())
+                    .or_default()
+                    .diagnostic = Some(error.to_string());
+            }
+        }
+        result
+    }
+
+    fn synchronize_browser_response(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        command: &BrowserCommand,
+        response: &BrowserResponse,
+    ) {
+        let open_workspaces = self.open_browser_workspace_keys();
+        let mut persist = false;
+        if let Some(sync) = browser_response_sync(&open_workspaces, workspace_key, response) {
+            let snapshot = sync.snapshot;
+            persist = self.state.update_browser_workspace(
+                &sync.workspace_key.ai_tab_id,
+                move |current| {
+                    *current = snapshot;
+                },
+            );
+            let ui = self.browser_ui.entry(sync.workspace_key).or_default();
+            if !ui.address_focused {
+                ui.address_draft = None;
+            }
+            ui.diagnostic = None;
+        } else if matches!(response, BrowserResponse::Acknowledged) {
+            match command {
+                BrowserCommand::ResetWorkspace => {
+                    persist = self
+                        .state
+                        .update_browser_workspace(&workspace_key.ai_tab_id, |snapshot| {
+                            *snapshot = BrowserWorkspaceSnapshot::default()
+                        });
+                    self.browser_ui.remove(workspace_key);
+                }
+                BrowserCommand::ClearProjectProfile => {
+                    let project_id = workspace_key.project_id.clone();
+                    let tab_ids: Vec<_> = self
+                        .state
+                        .ai_tabs()
+                        .filter(|tab| tab.project_id == project_id)
+                        .map(|tab| tab.id.clone())
+                        .collect();
+                    for tab_id in tab_ids {
+                        persist = self.state.update_browser_workspace(&tab_id, |snapshot| {
+                            *snapshot = BrowserWorkspaceSnapshot::default();
+                        }) || persist;
+                    }
+                    self.browser_ui
+                        .retain(|key, _| key.project_id != project_id);
+                }
+                _ => {}
+            }
+        }
+        if let BrowserResponse::Status { status } = response {
+            self.browser_ui
+                .entry(workspace_key.clone())
+                .or_default()
+                .diagnostic = status.diagnostic.clone();
+        }
+        if persist {
+            self.save_session_state();
+        }
+    }
+
+    fn handle_browser_request(
+        &mut self,
+        request: BrowserCommandRequest,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_key = request.workspace_key().clone();
+        let command = request.command().clone();
+        let result = self.dispatch_browser_command(&workspace_key, command, window);
+        request.respond(result);
+        self.sync_browser_host_visibility();
+        cx.notify();
+    }
+
+    fn pump_browser_events(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let events = self.browser_host.drain_events();
+        if events.is_empty() {
+            return;
+        }
+        let open_workspaces = self.open_browser_workspace_keys();
+        let mut persist = false;
+        for event in events {
+            let Some(plan) = browser_event_plan(&open_workspaces, &event) else {
+                continue;
+            };
+            match plan {
+                BrowserPaneEventPlan::SyncSnapshot {
+                    workspace_key,
+                    interrupt_agent,
+                    loading,
+                    ..
+                } => {
+                    if interrupt_agent {
+                        self.browser_bridge.observe_host_event(&event);
+                    }
+                    if let Some(loading) = loading {
+                        self.browser_ui
+                            .entry(workspace_key.clone())
+                            .or_default()
+                            .loading = loading;
+                    }
+                    if let Some(snapshot) = self
+                        .browser_host
+                        .workspace_snapshot(&workspace_key)
+                        .cloned()
+                    {
+                        persist =
+                            self.state.update_browser_workspace(
+                                &workspace_key.ai_tab_id,
+                                move |current| *current = snapshot,
+                            ) || persist;
+                    }
+                }
+                BrowserPaneEventPlan::OpenLogicalTab { workspace_key, url } => {
+                    let _ = self.dispatch_browser_command(
+                        &workspace_key,
+                        BrowserCommand::CreateTab { url: Some(url) },
+                        window,
+                    );
+                }
+                BrowserPaneEventPlan::DownloadStatus {
+                    workspace_key,
+                    message,
+                } => {
+                    self.browser_ui
+                        .entry(workspace_key)
+                        .or_default()
+                        .action_status = Some(message);
+                }
+                BrowserPaneEventPlan::Diagnostic {
+                    workspace_key,
+                    message,
+                } => {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(message);
+                }
+            }
+        }
+        if persist {
+            self.save_session_state();
+        }
+        self.sync_browser_host_visibility();
+        cx.notify();
+    }
+
+    fn browser_pane_context(&self) -> BrowserPaneContext {
+        BrowserPaneContext {
+            browser_enabled: self.state.settings().browser_enabled,
+            platform_supported: self.browser_host.status().available,
+            active_surface: self.state.active_tab().map(|tab| match tab.tab_type {
+                TabType::Server => BrowserPaneSurface::Server,
+                TabType::Claude => BrowserPaneSurface::Claude,
+                TabType::Codex => BrowserPaneSurface::Codex,
+                TabType::Ssh => BrowserPaneSurface::Ssh,
+            }),
+            editor_open: self.editor_panel.is_some(),
+            modal_open: self.process_monitor.is_some() || self.add_project_wizard.is_some(),
+        }
+    }
+
+    fn sync_browser_host_visibility(&mut self) {
+        let context = self.browser_pane_context();
+        let visibility = self.state.active_tab().and_then(|tab| {
+            let key = BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()?;
+            let snapshot = tab.browser_workspace.as_ref()?;
+            Some(browser_host_visibility(
+                &context,
+                &key,
+                snapshot,
+                self.browser_divider_drag.is_some(),
+            ))
+        });
+        let active_workspace = match visibility {
+            Some(BrowserHostVisibility::Selected { workspace_key, .. }) => Some(workspace_key),
+            Some(BrowserHostVisibility::Hidden) | None => None,
+        };
+        let _ = self.browser_host.set_active_workspace(active_workspace);
+    }
+
+    fn active_browser_model(&self) -> Option<BrowserPaneModel> {
+        let tab = self.state.active_tab()?;
+        if !matches!(tab.tab_type, TabType::Claude | TabType::Codex) {
+            return None;
+        }
+        let workspace_key =
+            BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()?;
+        let snapshot = tab.browser_workspace.clone().unwrap_or_default();
+        let ui = self
+            .browser_ui
+            .get(&workspace_key)
+            .cloned()
+            .unwrap_or_default();
+        Some(BrowserPaneModel::new(
+            workspace_key,
+            &self.browser_pane_context(),
+            &snapshot,
+            BrowserPaneTransient {
+                address_draft: ui.address_draft,
+                address_cursor: ui.address_cursor,
+                address_focused: ui.address_focused,
+                loading: ui.loading,
+                diagnostic: ui.diagnostic,
+                action_status: ui.action_status,
+                divider_dragging: self.browser_divider_drag.is_some(),
+            },
+        ))
+    }
+
+    fn active_browser_workspace(&self) -> Option<(BrowserWorkspaceKey, BrowserWorkspaceSnapshot)> {
+        let tab = self.state.active_tab()?;
+        if !matches!(tab.tab_type, TabType::Claude | TabType::Codex) {
+            return None;
+        }
+        Some((
+            BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()?,
+            tab.browser_workspace.clone().unwrap_or_default(),
+        ))
+    }
+
+    fn capture_browser_split_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = browser_bounds_from_gpui(bounds) else {
+            return;
+        };
+        if self.browser_split_bounds != Some(bounds) {
+            self.browser_split_bounds = Some(bounds);
+            cx.notify();
+        }
+    }
+
+    fn capture_browser_page_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = browser_bounds_from_gpui(bounds) else {
+            return;
+        };
+        if self.browser_page_bounds == Some(bounds) {
+            return;
+        }
+        self.browser_page_bounds = Some(bounds);
+        if let Err(error) = self.browser_host.set_bounds(bounds) {
+            if let Some((workspace_key, _)) = self.active_browser_workspace() {
+                self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                    Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn apply_browser_pane_action(
+        &mut self,
+        action: BrowserPaneAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((workspace_key, snapshot)) = self.active_browser_workspace() else {
+            self.terminal_notice = Some("Select a Claude or Codex conversation first.".to_string());
+            cx.notify();
+            return;
+        };
+
+        match action {
+            BrowserPaneAction::DividerBegin { .. } => {
+                self.browser_divider_drag = Some(BrowserDividerDrag { workspace_key });
+                self.sync_browser_host_visibility();
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::DividerUpdate { pointer_x } => {
+                if let (Some(drag), Some(bounds)) = (
+                    self.browser_divider_drag.as_ref(),
+                    self.browser_split_bounds,
+                ) {
+                    let right = bounds.x.saturating_add(bounds.width);
+                    let pane_width = (right as f32 - pointer_x).clamp(0.0, bounds.width as f32);
+                    let percent = if bounds.width > 0 {
+                        ((pane_width / bounds.width as f32) * 100.0).round() as u8
+                    } else {
+                        50
+                    };
+                    let tab_id = drag.workspace_key.ai_tab_id.clone();
+                    self.state.update_browser_workspace(&tab_id, |snapshot| {
+                        snapshot.set_split_percent(percent);
+                    });
+                    cx.notify();
+                }
+                return;
+            }
+            BrowserPaneAction::DividerEnd => {
+                if self.browser_divider_drag.take().is_some() {
+                    self.save_session_state();
+                    self.sync_browser_host_visibility();
+                    cx.notify();
+                }
+                return;
+            }
+            BrowserPaneAction::FocusAddress => {
+                let selected_url = snapshot
+                    .selected_tab_id
+                    .as_deref()
+                    .and_then(|selected| snapshot.tabs.iter().find(|tab| tab.id == selected))
+                    .map(|tab| tab.url.clone())
+                    .unwrap_or_default();
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                let draft = ui.address_draft.get_or_insert(selected_url);
+                ui.address_cursor = draft.chars().count();
+                ui.address_focused = true;
+                window.focus(&self.browser_address_focus);
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::EditAddress(value) => {
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                ui.address_cursor = value.chars().count();
+                ui.address_draft = Some(value);
+                ui.address_focused = true;
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+
+        let address_draft = self
+            .browser_ui
+            .get(&workspace_key)
+            .and_then(|ui| ui.address_draft.clone())
+            .unwrap_or_default();
+        let plan = match browser_action_plan(
+            Some(&workspace_key),
+            Some(&snapshot),
+            &address_draft,
+            action.clone(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                    Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(diagnostic) = plan.diagnostic {
+            self.browser_ui
+                .entry(plan.workspace_key)
+                .or_default()
+                .diagnostic = Some(diagnostic);
+            cx.notify();
+            return;
+        }
+
+        let mut failed = None;
+        for command in plan.commands {
+            if let BrowserCommand::Stop { tab_id } = &command {
+                let controller = self
+                    .browser_bridge
+                    .bind(plan.workspace_key.clone(), Duration::from_secs(30));
+                if let Some(tab_id) = tab_id {
+                    controller.interrupt_tab(tab_id);
+                } else {
+                    controller.interrupt_workspace();
+                }
+            }
+            match self.dispatch_browser_command(&plan.workspace_key, command, window) {
+                Ok(BrowserResponse::DownloadDirectory { path }) => {
+                    if let Err(error) = platform_service::open_path(&path) {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    failed = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(message) = failed {
+            self.browser_ui
+                .entry(plan.workspace_key.clone())
+                .or_default()
+                .diagnostic = Some(message);
+            if let Some(pane_open) = browser_pane_open_fallback(&action) {
+                self.state
+                    .update_browser_workspace(&plan.workspace_key.ai_tab_id, |snapshot| {
+                        snapshot.pane_open = pane_open;
+                        snapshot.advance_revision();
+                    });
+                self.save_session_state();
+            }
+        } else {
+            let ui = self.browser_ui.entry(plan.workspace_key).or_default();
+            ui.action_status = Some(match action {
+                BrowserPaneAction::Stop => "Stopped browser activity".to_string(),
+                BrowserPaneAction::OpenDownloads => "Opened downloads".to_string(),
+                _ => "Browser updated".to_string(),
+            });
+            if matches!(action, BrowserPaneAction::SubmitAddress) {
+                ui.address_focused = false;
+                ui.address_draft = None;
+            }
+        }
+        self.sync_browser_host_visibility();
+        cx.notify();
+    }
+
+    fn handle_browser_address_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((workspace_key, _)) = self.active_browser_workspace() else {
+            return;
+        };
+        let key = event.keystroke.key.to_ascii_lowercase();
+        if key == "enter" {
+            self.apply_browser_pane_action(BrowserPaneAction::SubmitAddress, window, cx);
+            window.prevent_default();
+            return;
+        }
+        if key == "escape" {
+            if let Some(ui) = self.browser_ui.get_mut(&workspace_key) {
+                ui.address_focused = false;
+                ui.address_draft = None;
+            }
+            cx.notify();
+            window.prevent_default();
+            return;
+        }
+        let secondary = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        let paste_text = if secondary && key == "v" {
+            cx.read_from_clipboard().and_then(|item| item.text())
+        } else {
+            None
+        };
+        let ui = self.browser_ui.entry(workspace_key).or_default();
+        let draft = ui.address_draft.get_or_insert_default();
+        let mut selection = None;
+        if apply_text_key_to_string(
+            draft,
+            &mut ui.address_cursor,
+            &mut selection,
+            event,
+            paste_text.as_deref(),
+            false,
+            false,
+        ) {
+            ui.address_focused = true;
+            cx.notify();
+            window.prevent_default();
+        }
+    }
+
+    fn apply_browser_settings_action(
+        &mut self,
+        action: BrowserSettingsAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.state.settings().browser_enabled {
+            self.editor_notice = Some(
+                "Enable per-conversation Browser before using browser data actions.".to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let status = self.browser_host.status();
+        if !status.available {
+            self.editor_notice = Some(status.diagnostic.unwrap_or_else(|| {
+                "WebView2 is unavailable; browser data actions cannot run.".to_string()
+            }));
+            cx.notify();
+            return;
+        }
+        let Some((active_workspace, _)) = self.active_browser_workspace() else {
+            self.editor_notice =
+                Some("Select an active Claude or Codex conversation first.".to_string());
+            cx.notify();
+            return;
+        };
+        let open_workspaces = self.open_browser_workspace_keys();
+        let plan = match browser_settings_plan(
+            action.clone(),
+            Some(&active_workspace),
+            &open_workspaces,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.editor_notice = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        match self.dispatch_browser_command(&plan.route_key, plan.command, window) {
+            Ok(BrowserResponse::DownloadDirectory { path }) => {
+                self.editor_notice = Some(match platform_service::open_path(&path) {
+                    Ok(()) => "Opened active project browser downloads.".to_string(),
+                    Err(error) => format!("Could not reveal browser downloads: {error}"),
+                });
+            }
+            Ok(_) => {
+                self.editor_notice = Some(match action {
+                    BrowserSettingsAction::ClearActiveProjectProfile => {
+                        "Cleared the active project browser profile. Downloads and captured resources were retained."
+                            .to_string()
+                    }
+                    BrowserSettingsAction::ResetActiveConversation => {
+                        "Reset the active conversation browser workspace.".to_string()
+                    }
+                    BrowserSettingsAction::RevealActiveDownloads => {
+                        "Opened active project browser downloads.".to_string()
+                    }
+                });
+            }
+            Err(error) => {
+                self.editor_notice = Some(format!("Browser operation failed: {error}"));
+            }
+        }
+        self.sync_browser_host_visibility();
+        cx.notify();
     }
 
     fn register_focus_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4233,6 +4903,7 @@ impl NativeShell {
     fn open_settings_panel(&mut self, remote_focus_only: bool, cx: &mut Context<Self>) {
         let settings = self.state.settings().clone();
         let remote_status = self.remote_host_service.status();
+        let browser_status = self.browser_host.status();
         let preferred_known_host = self.preferred_known_remote_host();
         let remote_connected_label = self
             .remote_mode
@@ -4289,6 +4960,9 @@ impl NativeShell {
                 terminal_mouse_override: settings.terminal_mouse_override,
                 terminal_read_only: settings.terminal_read_only,
                 github_token: settings.github_token.unwrap_or_default(),
+                browser_enabled: settings.browser_enabled,
+                browser_available: browser_status.available,
+                browser_diagnostic: browser_status.diagnostic,
                 remote_host_enabled: self.remote_machine_state.host.enabled,
                 remote_bind_address: self.remote_machine_state.host.bind_address.clone(),
                 remote_port: self.remote_machine_state.host.port.to_string(),
@@ -5520,8 +6194,10 @@ impl NativeShell {
         settings.shell_integration_enabled = draft.shell_integration_enabled;
         settings.terminal_mouse_override = draft.terminal_mouse_override;
         settings.terminal_read_only = draft.terminal_read_only;
+        apply_browser_enabled_preference(&mut settings, draft.browser_enabled);
 
         self.state.update_settings(settings);
+        self.sync_browser_host_visibility();
         self.process_manager
             .set_log_buffer_size(self.state.settings().log_buffer_size as usize);
         self.save_config_state();
@@ -6540,6 +7216,41 @@ impl NativeShell {
                     self.apply_settings_draft(cx);
                 }
             }
+            EditorAction::ToggleBrowserEnabled => {
+                if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    draft.browser_enabled = !draft.browser_enabled;
+                    draft.open_picker = None;
+                    let enabled = draft.browser_enabled;
+                    self.apply_settings_draft(cx);
+                    if enabled {
+                        let status = self.browser_host.status();
+                        if !status.available {
+                            self.editor_notice = status.diagnostic.or_else(|| {
+                                Some(
+                                    "WebView2 is unavailable; the Browser companion pane cannot open."
+                                        .to_string(),
+                                )
+                            });
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+            EditorAction::ClearActiveBrowserProfile => self.apply_browser_settings_action(
+                BrowserSettingsAction::ClearActiveProjectProfile,
+                window,
+                cx,
+            ),
+            EditorAction::ResetActiveBrowserWorkspace => self.apply_browser_settings_action(
+                BrowserSettingsAction::ResetActiveConversation,
+                window,
+                cx,
+            ),
+            EditorAction::RevealActiveBrowserDownloads => self.apply_browser_settings_action(
+                BrowserSettingsAction::RevealActiveDownloads,
+                window,
+                cx,
+            ),
             EditorAction::SelectRemoteTopTab(tab) => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.remote_active_tab = tab;
@@ -10322,6 +11033,8 @@ fn remote_shared_app_state(state: &AppState) -> AppState {
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
+        self.start_browser_tasks(window, cx);
+        self.sync_browser_host_visibility();
         self.capture_window_bounds(window);
         self.sync_remote_host_config_from_service();
         if self.remote_mode.is_some() {
@@ -10376,6 +11089,7 @@ impl Render for NativeShell {
         } else {
             None
         };
+        let browser_model = self.active_browser_model();
 
         let make_open_settings_handler =
             || -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)> {
@@ -10958,6 +11672,21 @@ impl Render for NativeShell {
                 },
             )
         };
+        let make_browser_action_handler = {
+            let browser_entity = editor_entity.clone();
+            Arc::new(
+                move |action: BrowserPaneAction| -> Box<
+                    dyn Fn(&MouseDownEvent, &mut Window, &mut App),
+                > {
+                    let browser_entity = browser_entity.clone();
+                    Box::new(move |_, window, app| {
+                        let _ = browser_entity.update(app, |this, cx| {
+                            this.apply_browser_pane_action(action.clone(), window, cx);
+                        });
+                    })
+                },
+            )
+        };
         let make_editor_focus_handler = {
             let editor_entity = editor_entity.clone();
             Arc::new(
@@ -11025,6 +11754,10 @@ impl Render for NativeShell {
             let controls = model.runtime_controls.as_ref();
             let command_id = self.state.active_terminal_spec().session_id;
             view::TerminalPaneActions {
+                on_open_browser: browser_model
+                    .as_ref()
+                    .filter(|model| model.eligible && !model.pane_open)
+                    .map(|_| make_browser_action_handler(BrowserPaneAction::Open)),
                 on_start_server: controls
                     .filter(|controls| controls.can_start)
                     .map(|_| make_focused_start_handler(command_id.clone())),
@@ -11197,10 +11930,13 @@ impl Render for NativeShell {
                                     on_drag_to: make_editor_drag_handler.clone(),
                                 },
                             ))
+                            .into_any_element()
                     } else {
                         let model = terminal_model.as_ref().expect("terminal model");
-                        div()
+                        let terminal_surface = div()
                             .flex_1()
+                            .h_full()
+                            .overflow_hidden()
                             .track_focus(&self.terminal_focus)
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -11242,6 +11978,146 @@ impl Render for NativeShell {
                             .on_key_down(cx.listener(Self::handle_terminal_key))
                             .on_scroll_wheel(cx.listener(Self::handle_terminal_scroll))
                             .child(view::render_terminal_surface(model, terminal_actions))
+                            .into_any_element();
+
+                        if let Some(browser) = browser_model
+                            .clone()
+                            .filter(|model| model.eligible && model.pane_open)
+                        {
+                            let total_width = self
+                                .browser_split_bounds
+                                .map(|bounds| bounds.width as f32)
+                                .unwrap_or_else(|| {
+                                    let width: f32 = window.viewport_size().width.into();
+                                    width
+                                });
+                            let layout = calculate_browser_split(
+                                total_width,
+                                browser.split_percent,
+                                300.0,
+                                320.0,
+                                6.0,
+                            );
+                            let split_entity = cx.weak_entity();
+                            let page_entity = split_entity.clone();
+                            let browser_actions = BrowserPaneActions {
+                                on_action: make_browser_action_handler.clone(),
+                                on_address_key: Box::new(
+                                    cx.listener(Self::handle_browser_address_key),
+                                ),
+                                on_page_bounds: Arc::new(move |bounds, _window, app| {
+                                    let _ = page_entity.update(app, |this, cx| {
+                                        this.capture_browser_page_bounds(bounds, cx);
+                                    });
+                                }),
+                            };
+
+                            div()
+                                .flex_1()
+                                .h_full()
+                                .min_w(px(0.0))
+                                .relative()
+                                .flex()
+                                .flex_row()
+                                .overflow_hidden()
+                                .on_mouse_move(cx.listener(
+                                    |this, event: &MouseMoveEvent, window, cx| {
+                                        if this.browser_divider_drag.is_some() {
+                                            this.apply_browser_pane_action(
+                                                BrowserPaneAction::DividerUpdate {
+                                                    pointer_x: f32::from(event.position.x),
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                ))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                                        if this.browser_divider_drag.is_some() {
+                                            this.apply_browser_pane_action(
+                                                BrowserPaneAction::DividerEnd,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                                        if this.browser_divider_drag.is_some() {
+                                            this.apply_browser_pane_action(
+                                                BrowserPaneAction::DividerEnd,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                                )
+                                .child(
+                                    canvas(
+                                        move |bounds, _window, app| {
+                                            let _ = split_entity.update(app, |this, cx| {
+                                                this.capture_browser_split_bounds(bounds, cx);
+                                            });
+                                        },
+                                        |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .top(px(0.0))
+                                    .left(px(0.0))
+                                    .size_full(),
+                                )
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(px(layout.terminal_width))
+                                        .flex_none()
+                                        .overflow_hidden()
+                                        .child(terminal_surface),
+                                )
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(px(layout.divider_width))
+                                        .flex_none()
+                                        .cursor_col_resize()
+                                        .bg(rgb(theme::BORDER_PRIMARY))
+                                        .hover(|style| style.bg(rgb(theme::PRIMARY)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, event: &MouseDownEvent, window, cx| {
+                                                    this.apply_browser_pane_action(
+                                                        BrowserPaneAction::DividerBegin {
+                                                            pointer_x: f32::from(event.position.x),
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(px(layout.pane_width))
+                                        .flex_none()
+                                        .overflow_hidden()
+                                        .child(render_browser_pane(
+                                            browser,
+                                            self.browser_address_focus.clone(),
+                                            browser_actions,
+                                        )),
+                                )
+                                .into_any_element()
+                        } else {
+                            terminal_surface
+                        }
                     })
                     .child(chrome::render_status_bar(
                         &runtime_snapshot,

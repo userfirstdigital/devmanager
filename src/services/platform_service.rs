@@ -931,6 +931,25 @@ pub fn open_url(url: &str) -> Result<(), String> {
     }
 }
 
+pub fn open_path(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("Path does not exist: {}", path.display()));
+    }
+
+    #[cfg(windows)]
+    let mut command = Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+
+    command
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))
+}
+
 #[cfg(target_os = "macos")]
 fn applescript_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))

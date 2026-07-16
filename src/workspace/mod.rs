@@ -11,7 +11,7 @@ use self::editor_ui::{
 };
 use crate::models::{
     DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult, ScannedPort,
-    ScannedScript,
+    ScannedScript, Settings,
 };
 use crate::remote::{
     KnownRemoteHost, PairedRemoteClient, PairedWebClient, RemoteAccessActivityEvent,
@@ -1211,6 +1211,9 @@ pub struct SettingsDraft {
     pub terminal_mouse_override: bool,
     pub terminal_read_only: bool,
     pub github_token: String,
+    pub browser_enabled: bool,
+    pub browser_available: bool,
+    pub browser_diagnostic: Option<String>,
     pub remote_host_enabled: bool,
     pub remote_bind_address: String,
     pub remote_port: String,
@@ -1252,6 +1255,10 @@ pub struct SettingsDraft {
     pub remote_web_paired_clients_detail: Vec<PairedWebClient>,
     pub remote_access_activity_log: Vec<RemoteAccessActivityEvent>,
     pub open_picker: Option<SettingsPicker>,
+}
+
+pub fn apply_browser_enabled_preference(settings: &mut Settings, enabled: bool) {
+    settings.browser_enabled = enabled;
 }
 
 #[derive(Debug, Clone)]
@@ -1469,6 +1476,10 @@ pub enum EditorAction {
     ToggleShellIntegrationEnabled,
     ToggleTerminalMouseOverride,
     ToggleTerminalReadOnly,
+    ToggleBrowserEnabled,
+    ClearActiveBrowserProfile,
+    ResetActiveBrowserWorkspace,
+    RevealActiveBrowserDownloads,
     SelectRemoteTopTab(RemoteTopTab),
     ToggleRemoteHosting,
     RegenerateRemotePairingToken,
@@ -1913,47 +1924,93 @@ fn render_settings_panel(
     if !draft.remote_focus_only {
         sections.push(FormSection::new("Terminal").fields(terminal_fields));
 
-        sections.push(FormSection::new("AI").fields(vec![
-                FormField::custom(
-                    render_settings_text_input(
-                        "Claude command",
-                        "Command used for Claude terminals.",
-                        draft.claude_command.as_str(),
-                        EditorField::Settings(SettingsField::ClaudeCommand),
-                        model,
-                        actions,
-                        None,
-                        "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
+        let mut ai_fields = vec![
+            FormField::custom(
+                render_settings_text_input(
+                    "Claude command",
+                    "Command used for Claude terminals.",
+                    draft.claude_command.as_str(),
+                    EditorField::Settings(SettingsField::ClaudeCommand),
+                    model,
+                    actions,
+                    None,
+                    "npx -y @anthropic-ai/claude-code@latest --dangerously-skip-permissions",
+                )
+                .into_any_element(),
+            ),
+            FormField::custom(
+                render_settings_text_input(
+                    "Codex command",
+                    "Command used for Codex terminals.",
+                    draft.codex_command.as_str(),
+                    EditorField::Settings(SettingsField::CodexCommand),
+                    model,
+                    actions,
+                    None,
+                    "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+                )
+                .into_any_element(),
+            ),
+            FormField::custom(
+                render_settings_text_input(
+                    "GitHub token",
+                    "Personal access token for AI commit messages and GitHub API.",
+                    draft.github_token.as_str(),
+                    EditorField::Settings(SettingsField::GitHubToken),
+                    model,
+                    actions,
+                    None,
+                    "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                )
+                .into_any_element(),
+            ),
+            FormField::toggle(
+                "Enable per-conversation Browser",
+                draft.browser_enabled,
+                "Show a Windows WebView2 companion pane for Claude and Codex conversations.",
+                (actions.on_action)(EditorAction::ToggleBrowserEnabled),
+            ),
+            FormField::action_group(
+                FormActionGroup::new("Browser data")
+                    .action(
+                        FormAction::new(
+                            "Active project browser profile",
+                            "Clear",
+                            (actions.on_action)(EditorAction::ClearActiveBrowserProfile),
+                        )
+                        .description(
+                            "Clear cookies and site storage for the active AI tab's project; downloads and captured resources are retained.",
+                        ),
                     )
-                    .into_any_element(),
-                ),
-                FormField::custom(
-                    render_settings_text_input(
-                        "Codex command",
-                        "Command used for Codex terminals.",
-                        draft.codex_command.as_str(),
-                        EditorField::Settings(SettingsField::CodexCommand),
-                        model,
-                        actions,
-                        None,
-                        "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+                    .action(
+                        FormAction::new(
+                            "Active conversation browser workspace",
+                            "Reset",
+                            (actions.on_action)(EditorAction::ResetActiveBrowserWorkspace),
+                        )
+                        .description(
+                            "Drop only this conversation's child views and leave a fresh closed workspace.",
+                        ),
                     )
-                    .into_any_element(),
-                ),
-                FormField::custom(
-                    render_settings_text_input(
-                        "GitHub token",
-                        "Personal access token for AI commit messages and GitHub API.",
-                        draft.github_token.as_str(),
-                        EditorField::Settings(SettingsField::GitHubToken),
-                        model,
-                        actions,
-                        None,
-                        "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                    )
-                    .into_any_element(),
-                ),
-            ]));
+                    .action(
+                        FormAction::new(
+                            "Active browser downloads",
+                            "Reveal",
+                            (actions.on_action)(EditorAction::RevealActiveBrowserDownloads),
+                        )
+                        .description("Create and reveal the active project's browser downloads folder."),
+                    ),
+            ),
+        ];
+        if !draft.browser_available {
+            ai_fields.push(FormField::notice(
+                draft.browser_diagnostic.clone().unwrap_or_else(|| {
+                    "Per-conversation Browser is unavailable on this system.".to_string()
+                }),
+                SurfaceTone::Danger,
+            ));
+        }
+        sections.push(FormSection::new("AI").fields(ai_fields));
 
         sections.push(
             FormSection::new("Updates").field(FormField::custom(
@@ -3806,6 +3863,9 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         terminal_mouse_override: false,
         terminal_read_only: false,
         github_token: String::new(),
+        browser_enabled: true,
+        browser_available: true,
+        browser_diagnostic: None,
         remote_host_enabled: false,
         remote_bind_address: "0.0.0.0".to_string(),
         remote_port: "43871".to_string(),

@@ -61,6 +61,7 @@ pub struct TerminalActionableNotice {
 }
 
 pub struct TerminalPaneActions {
+    pub on_open_browser: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_start_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_stop_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_restart_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
@@ -160,6 +161,9 @@ pub fn render_terminal_surface(
     let scrollbar_actions = actions
         .as_ref()
         .and_then(|actions| actions.scrollbar.clone());
+    let open_browser_action = actions
+        .as_mut()
+        .and_then(|actions| actions.on_open_browser.take());
     // Hide the plain muted startup_notice when an actionable banner is taking over,
     // so we don't show the same text twice.
     let notice = if model.actionable_notice.is_some() {
@@ -339,6 +343,9 @@ pub fn render_terminal_surface(
                                 ))),
                         ),
                 )
+                .children(open_browser_action.map(|on_click| {
+                    runtime_action_button("Browser", theme::PRIMARY, on_click).into_any_element()
+                }))
                 .children(
                     actions
                         .zip(runtime_controls.clone())
@@ -1063,6 +1070,7 @@ fn render_runtime_actions(
     controls: TerminalRuntimeControlsModel,
 ) -> impl IntoElement {
     let TerminalPaneActions {
+        on_open_browser: _,
         on_start_server,
         on_stop_server,
         on_restart_server,
