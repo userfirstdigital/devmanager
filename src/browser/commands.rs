@@ -1,6 +1,11 @@
 use super::{
-    BrowserError, BrowserRisk, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
-    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry,
+    BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation, BrowserError,
+    BrowserNetworkEntry, BrowserNetworkOperation, BrowserPerformanceOperation,
+    BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserRisk, BrowserScreenshotMode,
+    BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
+    BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation,
+    BrowserWorkspaceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -161,6 +166,50 @@ pub enum BrowserCommand {
     ResetWorkspace,
     ClearProjectProfile,
     DownloadDirectory,
+    Snapshot {
+        tab_id: String,
+    },
+    Screenshot {
+        tab_id: String,
+        mode: BrowserScreenshotMode,
+    },
+    Wait {
+        tab_id: String,
+        condition: BrowserWaitCondition,
+        timeout_ms: u64,
+    },
+    Act {
+        tab_id: String,
+        actions: Vec<BrowserAction>,
+    },
+    Console {
+        tab_id: String,
+        operation: BrowserConsoleOperation,
+    },
+    Network {
+        tab_id: String,
+        operation: BrowserNetworkOperation,
+        request_id: Option<String>,
+    },
+    Performance {
+        tab_id: String,
+        operation: BrowserPerformanceOperation,
+    },
+    Upload {
+        tab_id: String,
+        target: BrowserActionTarget,
+        paths: Vec<PathBuf>,
+    },
+    Downloads {
+        tab_id: String,
+        operation: BrowserDownloadOperation,
+        download_id: Option<String>,
+    },
+    Cdp {
+        tab_id: String,
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 impl BrowserCommand {
@@ -184,6 +233,16 @@ impl BrowserCommand {
             Self::ResetWorkspace => "resetWorkspace",
             Self::ClearProjectProfile => "clearProjectProfile",
             Self::DownloadDirectory => "downloadDirectory",
+            Self::Snapshot { .. } => "snapshot",
+            Self::Screenshot { .. } => "screenshot",
+            Self::Wait { .. } => "wait",
+            Self::Act { .. } => "act",
+            Self::Console { .. } => "console",
+            Self::Network { .. } => "network",
+            Self::Performance { .. } => "performance",
+            Self::Upload { .. } => "upload",
+            Self::Downloads { .. } => "downloads",
+            Self::Cdp { .. } => "cdp",
         }
     }
 
@@ -196,7 +255,17 @@ impl BrowserCommand {
             | Self::Forward { tab_id }
             | Self::Reload { tab_id }
             | Self::UpdateViewport { tab_id, .. }
-            | Self::OpenDevTools { tab_id } => Some(tab_id),
+            | Self::OpenDevTools { tab_id }
+            | Self::Snapshot { tab_id }
+            | Self::Screenshot { tab_id, .. }
+            | Self::Wait { tab_id, .. }
+            | Self::Act { tab_id, .. }
+            | Self::Console { tab_id, .. }
+            | Self::Network { tab_id, .. }
+            | Self::Performance { tab_id, .. }
+            | Self::Upload { tab_id, .. }
+            | Self::Downloads { tab_id, .. }
+            | Self::Cdp { tab_id, .. } => Some(tab_id),
             Self::Stop { tab_id } => tab_id.as_deref(),
             Self::Status
             | Self::WorkspaceState
@@ -242,6 +311,43 @@ pub enum BrowserResponse {
     },
     DownloadDirectory {
         path: PathBuf,
+    },
+    Snapshot {
+        summary: BrowserSnapshotSummary,
+        resource: BrowserResourceHandle,
+    },
+    Screenshot {
+        resource: BrowserResourceHandle,
+    },
+    Wait {
+        result: BrowserWaitResult,
+    },
+    Action {
+        result: BrowserActionResult,
+    },
+    Console {
+        entries: Vec<BrowserConsoleEntry>,
+        resource: Option<BrowserResourceHandle>,
+    },
+    Network {
+        entries: Vec<BrowserNetworkEntry>,
+        resource: Option<BrowserResourceHandle>,
+        body_available: Option<bool>,
+    },
+    Performance {
+        snapshot: Option<BrowserPerformanceSnapshot>,
+        resource: Option<BrowserResourceHandle>,
+        tracing: bool,
+    },
+    Upload {
+        result: BrowserUploadResult,
+    },
+    Downloads {
+        downloads: Vec<BrowserDownloadEntry>,
+    },
+    Cdp {
+        inline_result: Option<serde_json::Value>,
+        resource: Option<BrowserResourceHandle>,
     },
     Acknowledged,
 }
@@ -307,6 +413,14 @@ pub enum BrowserHostEvent {
         workspace_key: BrowserWorkspaceKey,
         tab_id: String,
         kind: BrowserUserInputKind,
+    },
+    DomMutation {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+    },
+    AutomationStateChanged {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
     },
     NewWindow {
         workspace_key: BrowserWorkspaceKey,

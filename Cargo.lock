@@ -1952,6 +1952,8 @@ dependencies = [
  "tower-http",
  "ureq",
  "web-push-native",
+ "webview2-com",
+ "windows 0.61.3",
  "winresource",
  "wry",
 ]

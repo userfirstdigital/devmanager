@@ -1,6 +1,10 @@
 use devmanager::browser::{
-    BrowserError, BrowserOperationQueue, BrowserOperationTarget, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserWorkspaceKey,
+    build_semantic_snapshot, effective_browser_risk, BrowserAction, BrowserActionTarget,
+    BrowserBounds, BrowserElementRef, BrowserError, BrowserJournalActor, BrowserJournalEntry,
+    BrowserLocator, BrowserLocatorStrategy, BrowserOperationQueue, BrowserOperationTarget,
+    BrowserRawSemanticElement, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
+    BrowserRevision, BrowserRisk, BrowserRuntimeTarget, BrowserTelemetryBuffer,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use static_assertions::assert_impl_all;
 use std::path::{Path, PathBuf};
@@ -169,4 +173,136 @@ fn resource_store_ignores_corrupt_metadata_and_rejects_traversal_ids() {
         std::fs::read(temp.path().join("untracked.bin")).unwrap(),
         b"keep me"
     );
+}
+
+#[test]
+fn semantic_snapshot_is_revision_bound_prefers_semantics_and_redacts_passwords() {
+    let revision = BrowserRevision(42);
+    let snapshot = build_semantic_snapshot(
+        revision,
+        "https://fixture.test/form",
+        "Fixture form",
+        vec![
+            BrowserRawSemanticElement {
+                role: Some("button".to_string()),
+                name: Some("Save profile".to_string()),
+                label: None,
+                text: Some("Save".to_string()),
+                test_id: Some("save-profile".to_string()),
+                css_selectors: vec!["#save".to_string()],
+                bounds: BrowserBounds {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 30,
+                },
+                enabled: true,
+                checked: None,
+                value: None,
+                input_type: None,
+                interactive: true,
+            },
+            BrowserRawSemanticElement {
+                role: Some("textbox".to_string()),
+                name: Some("Password".to_string()),
+                label: Some("Password".to_string()),
+                text: None,
+                test_id: None,
+                css_selectors: vec!["#password".to_string()],
+                bounds: BrowserBounds {
+                    x: 10,
+                    y: 60,
+                    width: 200,
+                    height: 30,
+                },
+                enabled: true,
+                checked: None,
+                value: Some("top-secret-value".to_string()),
+                input_type: Some("password".to_string()),
+                interactive: true,
+            },
+        ],
+    );
+
+    assert_eq!(snapshot.revision, revision);
+    assert_eq!(snapshot.elements[0].element_ref.revision, revision);
+    assert_eq!(snapshot.elements[1].value.as_deref(), Some("[redacted]"));
+    assert!(!serde_json::to_string(&snapshot)
+        .unwrap()
+        .contains("top-secret-value"));
+    assert_eq!(
+        BrowserActionTarget::from_element_ref(snapshot.elements[0].element_ref.clone())
+            .resolution_order(),
+        vec![
+            BrowserLocatorStrategy::TestId("save-profile".to_string()),
+            BrowserLocatorStrategy::Accessibility {
+                role: "button".to_string(),
+                name: "Save profile".to_string(),
+            },
+            BrowserLocatorStrategy::Css("#save".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn action_diagnostics_are_secret_free_and_runtime_risk_cannot_be_lowered() {
+    let target = BrowserActionTarget::from_element_ref(BrowserElementRef {
+        revision: BrowserRevision(7),
+        locator: BrowserLocator {
+            accessibility_role: Some("textbox".to_string()),
+            accessibility_name: Some("Password".to_string()),
+            test_id: Some("password".to_string()),
+            css_selectors: vec!["#password".to_string()],
+        },
+        backend_node_id: None,
+    });
+    let action = BrowserAction::Type {
+        target,
+        text: "never-log-this-secret".to_string(),
+    };
+    assert_eq!(action.redacted_summary(), "type into password");
+    assert!(!format!("{:?}", action.redacted_for_diagnostics()).contains("never-log-this-secret"));
+
+    let destructive = BrowserRuntimeTarget {
+        origin_url: "https://fixture.test/settings".to_string(),
+        role: Some("button".to_string()),
+        name: Some("Delete account permanently".to_string()),
+        input_type: None,
+        form_action: None,
+        permission: None,
+    };
+    assert_eq!(
+        effective_browser_risk(BrowserRisk::Normal, Some(&destructive), None),
+        BrowserRisk::Destructive
+    );
+    assert_eq!(
+        effective_browser_risk(BrowserRisk::AccountSecurity, None, None),
+        BrowserRisk::AccountSecurity
+    );
+}
+
+#[test]
+fn telemetry_and_workspace_journal_are_bounded_oldest_first() {
+    let mut telemetry = BrowserTelemetryBuffer::new(2);
+    telemetry.push("first".to_string());
+    telemetry.push("second".to_string());
+    telemetry.push("third".to_string());
+    assert_eq!(telemetry.to_vec(), ["second", "third"]);
+
+    let mut snapshot = BrowserWorkspaceSnapshot::default();
+    for index in 0..105 {
+        snapshot.append_journal_entry(BrowserJournalEntry {
+            id: format!("entry-{index}"),
+            actor: BrowserJournalActor::Agent,
+            intent: format!("inspect item {index}"),
+            url: "https://fixture.test".to_string(),
+            started_at: "2026-07-16T00:00:00Z".to_string(),
+            duration_ms: 1,
+            result: "ok".to_string(),
+            resource_ids: Vec::new(),
+        });
+    }
+    assert_eq!(snapshot.journal_entries.len(), 100);
+    assert_eq!(snapshot.journal_entries.first().unwrap().id, "entry-5");
+    assert_eq!(snapshot.journal_entries.last().unwrap().id, "entry-104");
 }

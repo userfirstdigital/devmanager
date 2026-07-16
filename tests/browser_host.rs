@@ -1,11 +1,14 @@
 use devmanager::browser::{
     browser_command_channel, browser_user_input_initialization_script, unique_download_path,
-    unsupported_host_status, unsupported_platform_error, validate_browser_url, BrowserCommand,
-    BrowserCommandBridge, BrowserCommandRequest, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostStatus, BrowserInvocationActor,
-    BrowserInvocationContext, BrowserMemoryTarget, BrowserPageLoadState, BrowserResponse,
-    BrowserRisk, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
-    BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    unsupported_host_status, unsupported_platform_error, validate_browser_url, BrowserAction,
+    BrowserActionTarget, BrowserCommand, BrowserCommandBridge, BrowserCommandRequest,
+    BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadOperation,
+    BrowserDownloadState, BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
+    BrowserInvocationActor, BrowserInvocationContext, BrowserMemoryTarget, BrowserNetworkOperation,
+    BrowserPageLoadState, BrowserPerformanceOperation, BrowserResponse, BrowserRisk,
+    BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind,
+    BrowserViewport, BrowserWaitCondition, BrowserWebViewHost, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::path::{Path, PathBuf};
@@ -704,6 +707,99 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
 }
 
 #[test]
+fn automation_commands_are_typed_and_use_stable_group_names() {
+    let target = BrowserActionTarget::default();
+    let commands = vec![
+        (
+            BrowserCommand::Snapshot {
+                tab_id: "tab-a".into(),
+            },
+            "snapshot",
+        ),
+        (
+            BrowserCommand::Screenshot {
+                tab_id: "tab-a".into(),
+                mode: BrowserScreenshotMode::FullPage,
+            },
+            "screenshot",
+        ),
+        (
+            BrowserCommand::Wait {
+                tab_id: "tab-a".into(),
+                condition: BrowserWaitCondition::Load,
+                timeout_ms: 1_000,
+            },
+            "wait",
+        ),
+        (
+            BrowserCommand::Act {
+                tab_id: "tab-a".into(),
+                actions: vec![BrowserAction::Click {
+                    target: target.clone(),
+                }],
+            },
+            "act",
+        ),
+        (
+            BrowserCommand::Console {
+                tab_id: "tab-a".into(),
+                operation: BrowserConsoleOperation::List,
+            },
+            "console",
+        ),
+        (
+            BrowserCommand::Network {
+                tab_id: "tab-a".into(),
+                operation: BrowserNetworkOperation::Body,
+                request_id: Some("request-a".into()),
+            },
+            "network",
+        ),
+        (
+            BrowserCommand::Performance {
+                tab_id: "tab-a".into(),
+                operation: BrowserPerformanceOperation::Snapshot,
+            },
+            "performance",
+        ),
+        (
+            BrowserCommand::Upload {
+                tab_id: "tab-a".into(),
+                target,
+                paths: vec![PathBuf::from("fixture.txt")],
+            },
+            "upload",
+        ),
+        (
+            BrowserCommand::Downloads {
+                tab_id: "tab-a".into(),
+                operation: BrowserDownloadOperation::List,
+                download_id: None,
+            },
+            "downloads",
+        ),
+        (
+            BrowserCommand::Cdp {
+                tab_id: "tab-a".into(),
+                method: "Runtime.evaluate".into(),
+                params: serde_json::json!({"expression": "1 + 1"}),
+            },
+            "cdp",
+        ),
+    ];
+
+    for (command, expected_type) in commands {
+        let value = serde_json::to_value(&command).expect("serialize automation command");
+        assert_eq!(value["type"], expected_type);
+        assert_eq!(value["tabId"], "tab-a");
+        assert_eq!(
+            serde_json::from_value::<BrowserCommand>(value).unwrap(),
+            command
+        );
+    }
+}
+
+#[test]
 fn unsupported_adapter_helpers_return_the_typed_platform_error() {
     let status = unsupported_host_status("macos");
     assert_eq!(
@@ -759,6 +855,23 @@ fn initialization_script_reports_only_trusted_input_metadata() {
     assert!(!script.contains("target.value"));
     assert!(!script.contains("textContent"));
     assert!(!script.contains("innerHTML"));
+}
+
+#[test]
+fn initialization_script_coalesces_dom_mutations_and_bounds_redacted_telemetry() {
+    let script = browser_user_input_initialization_script();
+    assert!(script.contains("MutationObserver"));
+    assert!(script.contains("domMutation"));
+    assert!(script.contains("mutationTimer"));
+    assert!(script.contains("MAX_CONSOLE"));
+    assert!(script.contains("MAX_NETWORK"));
+    assert!(script.contains("PerformanceObserver"));
+    assert!(script.contains("XMLHttpRequest"));
+    assert!(script.contains("window.fetch"));
+    assert!(script.contains("[redacted]"));
+    assert!(script.contains("authorization"));
+    assert!(script.contains("cookie"));
+    assert!(!script.contains("postMessage(JSON.stringify({ type: \"telemetry\""));
 }
 
 #[test]

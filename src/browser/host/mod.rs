@@ -273,6 +273,27 @@ impl BrowserHostState {
         Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
     }
 
+    pub fn apply_dom_mutation(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+    ) -> Result<BrowserWorkspaceMutation, BrowserError> {
+        let snapshot = self.workspace_mut(workspace_key)?;
+        if !snapshot.tabs.iter().any(|tab| tab.id == tab_id) {
+            return Err(missing_tab(tab_id));
+        }
+        snapshot.advance_revision();
+        Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
+    }
+
+    pub fn apply_automation_mutation(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+    ) -> Result<BrowserWorkspaceMutation, BrowserError> {
+        self.apply_dom_mutation(workspace_key, tab_id)
+    }
+
     pub fn apply_page_load(
         &mut self,
         workspace_key: &BrowserWorkspaceKey,

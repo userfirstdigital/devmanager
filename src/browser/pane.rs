@@ -379,6 +379,16 @@ pub fn browser_response_sync(
         BrowserResponse::Status { .. }
         | BrowserResponse::Tabs { .. }
         | BrowserResponse::DownloadDirectory { .. }
+        | BrowserResponse::Snapshot { .. }
+        | BrowserResponse::Screenshot { .. }
+        | BrowserResponse::Wait { .. }
+        | BrowserResponse::Action { .. }
+        | BrowserResponse::Console { .. }
+        | BrowserResponse::Network { .. }
+        | BrowserResponse::Performance { .. }
+        | BrowserResponse::Upload { .. }
+        | BrowserResponse::Downloads { .. }
+        | BrowserResponse::Cdp { .. }
         | BrowserResponse::Acknowledged => None,
     }
 }
@@ -392,6 +402,8 @@ pub fn browser_event_plan(
         | BrowserHostEvent::TitleChanged { workspace_key, .. }
         | BrowserHostEvent::PageLoad { workspace_key, .. }
         | BrowserHostEvent::UserInput { workspace_key, .. }
+        | BrowserHostEvent::DomMutation { workspace_key, .. }
+        | BrowserHostEvent::AutomationStateChanged { workspace_key, .. }
         | BrowserHostEvent::NewWindow { workspace_key, .. }
         | BrowserHostEvent::Download { workspace_key, .. }
         | BrowserHostEvent::Diagnostic { workspace_key, .. } => workspace_key,
@@ -424,6 +436,15 @@ pub fn browser_event_plan(
             interrupt_agent: true,
             loading: None,
         }),
+        BrowserHostEvent::DomMutation { tab_id, .. }
+        | BrowserHostEvent::AutomationStateChanged { tab_id, .. } => {
+            Some(BrowserPaneEventPlan::SyncSnapshot {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                interrupt_agent: false,
+                loading: None,
+            })
+        }
         BrowserHostEvent::NewWindow { url, .. } => Some(BrowserPaneEventPlan::OpenLogicalTab {
             workspace_key: workspace_key.clone(),
             url: url.clone(),
