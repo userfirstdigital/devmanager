@@ -320,6 +320,21 @@ impl BrowserWebViewHost {
         request: BrowserCommandRequest,
         result: Result<BrowserResponse, BrowserError>,
     ) {
+        if matches!(&result, Ok(BrowserResponse::Workspace { .. })) {
+            if let Some(tab_id) = request
+                .command()
+                .tab_id()
+                .map(ToOwned::to_owned)
+                .or_else(|| self.selected_tab_id(request.workspace_key()))
+            {
+                let _ = self
+                    .event_sender
+                    .send(BrowserHostEvent::AutomationStateChanged {
+                        workspace_key: request.workspace_key().clone(),
+                        tab_id,
+                    });
+            }
+        }
         if request.context().actor == BrowserInvocationActor::Agent
             && browser_command_is_journaled(request.command())
         {

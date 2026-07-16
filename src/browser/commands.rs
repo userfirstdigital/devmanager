@@ -540,7 +540,7 @@ impl BrowserController {
         let mut workspace_cancellation = cancellations.workspace;
         let mut tab_cancellation = cancellations.tab;
         let (response, receiver) = oneshot::channel();
-        let timeout = tokio::time::sleep(self.timeout);
+        let timeout = tokio::time::sleep(command_transport_timeout(self.timeout, &command));
         tokio::pin!(timeout);
         let send = self.sender.send(BrowserCommandEnvelope {
             workspace_key: self.workspace_key.clone(),
@@ -620,6 +620,15 @@ impl BrowserController {
     }
 }
 
+fn command_transport_timeout(base: Duration, command: &BrowserCommand) -> Duration {
+    match command {
+        BrowserCommand::Wait { timeout_ms, .. } => {
+            base.saturating_add(Duration::from_millis(*timeout_ms))
+        }
+        _ => base,
+    }
+}
+
 pub struct BrowserCommandInbox {
     receiver: mpsc::Receiver<BrowserCommandEnvelope>,
     cancellations: Arc<CancellationEpochs>,
@@ -683,6 +692,22 @@ impl BrowserCommandRequest {
     pub fn respond(self, result: Result<BrowserResponse, BrowserError>) {
         let _ = self.response.send(result);
     }
+}
+
+pub fn route_browser_request(
+    route_is_open: bool,
+    request: BrowserCommandRequest,
+    dispatch_open: impl FnOnce(BrowserCommandRequest),
+) -> Result<(), BrowserError> {
+    if !route_is_open {
+        let error = BrowserError::CrashedView {
+            message: "browser command route does not match an open AI conversation".to_string(),
+        };
+        request.respond(Err(error.clone()));
+        return Err(error);
+    }
+    dispatch_open(request);
+    Ok(())
 }
 
 impl From<BrowserCommandEnvelope> for BrowserCommandRequest {

@@ -5,8 +5,8 @@ use crate::assets::AppAssets;
 use crate::browser::{
     browser_action_plan, browser_command_channel, browser_event_plan, browser_host_reconcile_plan,
     browser_pane_open_fallback, browser_response_sync, browser_settings_plan,
-    calculate_browser_split, render_browser_pane, BrowserBounds, BrowserCommand,
-    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
+    calculate_browser_split, render_browser_pane, route_browser_request, BrowserBounds,
+    BrowserCommand, BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
     BrowserGatewayHandle, BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions,
     BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface,
     BrowserPaneTransient, BrowserResponse, BrowserSettingsAction, BrowserWebViewHost,
@@ -1102,9 +1102,12 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         let workspace_key = request.workspace_key().clone();
-        let command = request.command().clone();
-        let result = self.dispatch_browser_command(&workspace_key, command, window);
-        request.respond(result);
+        let route_is_open = self.browser_route_is_open(&workspace_key);
+        if let Err(error) = route_browser_request(route_is_open, request, |request| {
+            self.browser_host.handle_request(window, request)
+        }) {
+            self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(error.to_string());
+        }
         self.sync_browser_host_visibility(Some(window));
         cx.notify();
     }

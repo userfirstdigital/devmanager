@@ -25,10 +25,11 @@ pub use automation::{
     MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
 };
 pub use commands::{
-    browser_command_channel, BrowserApprovalRequest, BrowserCommand, BrowserCommandBridge,
-    BrowserCommandInbox, BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel,
-    BrowserDownloadState, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
-    BrowserInvocationContext, BrowserPageLoadState, BrowserResponse, BrowserUserInputKind,
+    browser_command_channel, route_browser_request, BrowserApprovalRequest, BrowserCommand,
+    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserController,
+    BrowserDiagnosticLevel, BrowserDownloadState, BrowserHostEvent, BrowserHostStatus,
+    BrowserInvocationActor, BrowserInvocationContext, BrowserPageLoadState, BrowserResponse,
+    BrowserUserInputKind,
 };
 pub use downloads::BrowserDownloadStore;
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};

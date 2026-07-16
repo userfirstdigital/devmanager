@@ -1,14 +1,15 @@
 use devmanager::browser::{
-    browser_command_channel, browser_user_input_initialization_script, unique_download_path,
-    unsupported_host_status, unsupported_platform_error, validate_browser_url, BrowserAction,
-    BrowserActionTarget, BrowserCommand, BrowserCommandBridge, BrowserCommandRequest,
-    BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadOperation,
-    BrowserDownloadState, BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
-    BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
-    BrowserMemoryTarget, BrowserNetworkOperation, BrowserPageLoadState,
-    BrowserPerformanceOperation, BrowserResponse, BrowserRisk, BrowserScreenshotMode,
-    BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
-    BrowserWaitCondition, BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    browser_command_channel, browser_user_input_initialization_script, route_browser_request,
+    unique_download_path, unsupported_host_status, unsupported_platform_error,
+    validate_browser_url, BrowserAction, BrowserActionTarget, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserDownloadOperation, BrowserDownloadState, BrowserError, BrowserHostEvent,
+    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
+    BrowserJournalActor, BrowserJournalEntry, BrowserMemoryTarget, BrowserNetworkOperation,
+    BrowserPageLoadState, BrowserPerformanceOperation, BrowserResponse, BrowserRevision,
+    BrowserRisk, BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserUserInputKind, BrowserViewport, BrowserWaitCondition, BrowserWaitResult,
+    BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::path::{Path, PathBuf};
@@ -145,6 +146,94 @@ async fn controller_requests_return_a_typed_timeout() {
             operation: "status".to_string(),
         })
     );
+}
+
+#[tokio::test]
+async fn wait_timeout_extends_the_controller_transport_deadline() {
+    let key = workspace("project-a", "conversation-a");
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let controller = bridge.bind(key, Duration::from_millis(20));
+
+    let request_task = tokio::spawn(async move {
+        controller
+            .request(BrowserCommand::Wait {
+                tab_id: "tab-a".to_string(),
+                condition: BrowserWaitCondition::Duration { duration_ms: 1 },
+                timeout_ms: 200,
+            })
+            .await
+    });
+    let request = inbox.recv().await.expect("wait request");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let expected = BrowserResponse::Wait {
+        result: BrowserWaitResult {
+            matched: true,
+            elapsed_ms: 50,
+            revision: BrowserRevision(1),
+        },
+    };
+    request.respond(Ok(expected.clone()));
+
+    assert_eq!(request_task.await.expect("wait request task"), Ok(expected));
+}
+
+#[tokio::test]
+async fn production_request_router_dispatches_open_agent_automation_and_leaves_it_pending() {
+    let key = workspace("project-a", "conversation-a");
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let controller = bridge.bind(key, Duration::from_secs(1));
+    let context = BrowserInvocationContext::agent("capture fixture", BrowserRisk::Normal).unwrap();
+    let request_task = tokio::spawn(async move {
+        controller
+            .request_with_context(
+                BrowserCommand::Screenshot {
+                    tab_id: "tab-a".to_string(),
+                    mode: BrowserScreenshotMode::Viewport,
+                },
+                context,
+            )
+            .await
+    });
+    let request = inbox.recv().await.expect("automation request");
+    let mut dispatched = None;
+
+    route_browser_request(true, request, |request| dispatched = Some(request))
+        .expect("open route dispatches to the host");
+    tokio::task::yield_now().await;
+    assert!(!request_task.is_finished());
+    let request = dispatched.expect("host receives the original request");
+    assert!(matches!(
+        request.command(),
+        BrowserCommand::Screenshot {
+            mode: BrowserScreenshotMode::Viewport,
+            ..
+        }
+    ));
+    request.respond(Ok(BrowserResponse::Acknowledged));
+    assert_eq!(
+        request_task.await.expect("automation request task"),
+        Ok(BrowserResponse::Acknowledged)
+    );
+}
+
+#[tokio::test]
+async fn production_request_router_rejects_closed_routes_without_dispatching() {
+    let key = workspace("project-a", "conversation-a");
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let controller = bridge.bind(key, Duration::from_secs(1));
+    let request_task = tokio::spawn(async move {
+        controller
+            .request(BrowserCommand::Snapshot {
+                tab_id: "tab-a".to_string(),
+            })
+            .await
+    });
+    let request = inbox.recv().await.expect("closed-route request");
+
+    let error = route_browser_request(false, request, |_| panic!("closed route dispatched"))
+        .expect_err("closed route is rejected");
+    assert!(matches!(error, BrowserError::CrashedView { .. }));
+    assert_eq!(request_task.await.expect("closed-route task"), Err(error));
 }
 
 #[tokio::test]

@@ -140,6 +140,23 @@ fn native_shell_awaits_browser_commands_in_a_window_local_main_thread_task() {
 }
 
 #[test]
+fn native_shell_routes_mcp_requests_through_the_async_host_queue() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source
+        .find("fn handle_browser_request(")
+        .expect("browser request handler should exist");
+    let end = source[start..]
+        .find("fn pump_browser_events(")
+        .map(|offset| start + offset)
+        .expect("browser event pump should follow request handler");
+    let handler = &source[start..end];
+
+    assert!(handler.contains("route_browser_request("));
+    assert!(handler.contains("browser_host.handle_request(window, request)"));
+    assert!(!handler.contains("dispatch_browser_command"));
+}
+
+#[test]
 fn native_shell_pumps_async_browser_completions_before_host_events() {
     let source = include_str!("../src/app/mod.rs");
     let pump = source
