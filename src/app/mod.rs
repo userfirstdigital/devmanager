@@ -663,7 +663,7 @@ impl NativeShell {
         let session_manager = SessionManager::new();
         let browser_app_config_dir =
             crate::persistence::app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let browser_host = BrowserWebViewHost::new(browser_app_config_dir);
+        let browser_host = BrowserWebViewHost::new(&browser_app_config_dir);
         let (browser_bridge, browser_inbox) = browser_command_channel(64);
         let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
@@ -685,7 +685,10 @@ impl NativeShell {
         let browser_gateway = if state.config.settings.browser_enabled
             && browser_host.status().available
         {
-            match BrowserGatewayHandle::start(browser_bridge.clone()) {
+            match BrowserGatewayHandle::start_with_app_config_dir(
+                browser_bridge.clone(),
+                &browser_app_config_dir,
+            ) {
                 Ok(gateway) => {
                     process_manager.set_browser_gateway_registrar(Some(gateway.registrar()));
                     Some(gateway)
@@ -971,7 +974,12 @@ impl NativeShell {
         if self.browser_gateway.is_some() {
             return None;
         }
-        match BrowserGatewayHandle::start(self.browser_bridge.clone()) {
+        let browser_app_config_dir =
+            crate::persistence::app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match BrowserGatewayHandle::start_with_app_config_dir(
+            self.browser_bridge.clone(),
+            browser_app_config_dir,
+        ) {
             Ok(gateway) => {
                 self.process_manager
                     .set_browser_gateway_registrar(Some(gateway.registrar()));

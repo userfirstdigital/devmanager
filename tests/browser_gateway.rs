@@ -1,10 +1,11 @@
 use base64::Engine as _;
 use devmanager::browser::{
     browser_command_channel, BrowserCommand, BrowserCommandInbox, BrowserGatewayHandle,
-    BrowserHostState, BrowserHostStatus, BrowserResponse, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRisk,
+    BrowserStorageLayout, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
-use rmcp::model::{CallToolRequestParams, ClientInfo};
+use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
     streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
 };
@@ -15,6 +16,16 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+fn unique_gateway_config_dir(label: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    std::env::temp_dir().join(format!(
+        "devmanager-browser-gateway-{label}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
     BrowserWorkspaceKey::new(project, conversation).expect("valid browser workspace key")
@@ -370,6 +381,162 @@ async fn tokens_on_one_listener_route_to_their_exact_bound_workspaces() {
         }
     };
     let (_, ()) = tokio::join!(run_fake_host(inbox, commands), scenario);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_rmcp_resources_are_standard_and_token_owner_isolated() {
+    let config_dir = unique_gateway_config_dir("resources");
+    let layout = BrowserStorageLayout::new(&config_dir, "project-a");
+    let store = BrowserResourceStore::open(&layout.resources_dir, BrowserResourceLimits::default())
+        .expect("open project resource store");
+    let owner_a = workspace("project-a", "conversation-a");
+    let owner_b = workspace("project-a", "conversation-b");
+    let resource_a = store
+        .put(
+            &owner_a,
+            BrowserResourceKind::DomSnapshot,
+            "application/json",
+            br#"{"owner":"a"}"#,
+            false,
+        )
+        .expect("store owner-a resource");
+    let resource_b = store
+        .put(
+            &owner_b,
+            BrowserResourceKind::NetworkBody,
+            "text/plain",
+            b"owner-b-only",
+            false,
+        )
+        .expect("store owner-b resource");
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start_with_app_config_dir(bridge, &config_dir)
+        .expect("start resource-aware gateway");
+    let registration = gateway
+        .registrar()
+        .register(
+            "resource-client-a",
+            owner_a,
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register owner-a token");
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+            .auth_header(registration.access().bearer_token_for_launch()),
+    );
+    let client = ClientInfo::default()
+        .serve(transport)
+        .await
+        .expect("initialize owner-a resource client");
+
+    let listed = client
+        .peer()
+        .list_resources(None)
+        .await
+        .expect("list resources");
+    assert_eq!(listed.resources.len(), 1);
+    assert_eq!(listed.resources[0].uri, resource_a.uri);
+    assert_eq!(
+        listed.resources[0].mime_type.as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(listed.resources[0].size, Some(resource_a.byte_size));
+
+    let read = client
+        .peer()
+        .read_resource(ReadResourceRequestParams::new(resource_a.uri.clone()))
+        .await
+        .expect("read owned resource");
+    assert!(matches!(
+        read.contents.as_slice(),
+        [ResourceContents::TextResourceContents { text, .. }] if text == r#"{"owner":"a"}"#
+    ));
+    assert!(client
+        .peer()
+        .read_resource(ReadResourceRequestParams::new(resource_b.uri))
+        .await
+        .is_err());
+
+    client.cancel().await.expect("close resource client");
+    drop(gateway);
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task4_mcp_commands_retain_one_agent_invocation_context() {
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let key = workspace("project-context", "conversation-context");
+    let registration = gateway
+        .registrar()
+        .register(
+            "context-client",
+            key.clone(),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register context client");
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+            .auth_header(registration.access().bearer_token_for_launch()),
+    );
+    let scenario = async move {
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize context client");
+        let status = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_status").with_arguments(arguments(json!({
+                    "intent": "inspect the active financial form",
+                    "risk": "financial"
+                }))),
+            )
+            .await
+            .expect("call context-bearing status");
+        assert_eq!(status.is_error, Some(false));
+        client.cancel().await.expect("close context client");
+    };
+    let host = async move {
+        let mut state = BrowserHostState::new("context-fake-host");
+        let mut contexts: Vec<BrowserInvocationContext> = Vec::new();
+        for _ in 0..4 {
+            let request = inbox.recv().await.expect("context-routed request");
+            contexts.push(request.context().clone());
+            let command = request.command().clone();
+            let result = match command {
+                BrowserCommand::Ensure { snapshot } => state
+                    .ensure_workspace(key.clone(), snapshot)
+                    .map(|mutation| BrowserResponse::Workspace { mutation }),
+                BrowserCommand::SetPaneOpen { open } => state
+                    .set_pane_open(&key, open)
+                    .map(|mutation| BrowserResponse::Workspace { mutation }),
+                BrowserCommand::WorkspaceState => Ok(BrowserResponse::WorkspaceState {
+                    snapshot: state.workspace(&key).unwrap().clone(),
+                }),
+                BrowserCommand::Status => Ok(BrowserResponse::Status {
+                    status: BrowserHostStatus {
+                        available: true,
+                        platform: "windows".to_string(),
+                        version: Some("fixture".to_string()),
+                        diagnostic: None,
+                    },
+                }),
+                other => panic!("unexpected context command: {other:?}"),
+            };
+            request.respond(result);
+        }
+        assert!(contexts.iter().all(|context| {
+            context.actor == BrowserInvocationActor::Agent
+                && context.intent == "inspect the active financial form"
+                && context.declared_risk == BrowserRisk::Financial
+        }));
+        assert!(contexts
+            .windows(2)
+            .all(|pair| pair[0].operation_id == pair[1].operation_id));
+    };
+
+    tokio::join!(host, scenario);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

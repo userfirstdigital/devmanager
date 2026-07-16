@@ -1,9 +1,10 @@
 use super::{
-    BrowserError, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
+    BrowserError, BrowserRisk, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
     BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -11,6 +12,103 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserInvocationActor {
+    User,
+    Agent,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInvocationContext {
+    pub actor: BrowserInvocationActor,
+    pub intent: String,
+    pub declared_risk: BrowserRisk,
+    pub operation_id: String,
+}
+
+impl BrowserInvocationContext {
+    pub fn new(
+        actor: BrowserInvocationActor,
+        intent: impl Into<String>,
+        declared_risk: BrowserRisk,
+        operation_id: impl Into<String>,
+    ) -> Result<Self, BrowserError> {
+        let context = Self {
+            actor,
+            intent: intent.into(),
+            declared_risk,
+            operation_id: operation_id.into(),
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    pub fn agent(
+        intent: impl Into<String>,
+        declared_risk: BrowserRisk,
+    ) -> Result<Self, BrowserError> {
+        Self::new(
+            BrowserInvocationActor::Agent,
+            intent,
+            declared_risk,
+            random_operation_id()?,
+        )
+    }
+
+    pub fn user(
+        intent: impl Into<String>,
+        declared_risk: BrowserRisk,
+    ) -> Result<Self, BrowserError> {
+        Self::new(
+            BrowserInvocationActor::User,
+            intent,
+            declared_risk,
+            random_operation_id()?,
+        )
+    }
+
+    pub fn internal(operation: impl Into<String>) -> Self {
+        let operation = operation.into();
+        Self {
+            actor: BrowserInvocationActor::Internal,
+            intent: format!("internal lifecycle: {operation}"),
+            declared_risk: BrowserRisk::Normal,
+            operation_id: random_operation_id()
+                .unwrap_or_else(|_| "internal-operation".to_string()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        if self.intent.trim().is_empty() {
+            return Err(BrowserError::InvalidInvocation {
+                field: "intent".to_string(),
+            });
+        }
+        if self.operation_id.trim().is_empty() {
+            return Err(BrowserError::InvalidInvocation {
+                field: "operationId".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn random_operation_id() -> Result<String, BrowserError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| BrowserError::CrashedView {
+        message: format!("could not generate browser operation id: {error}"),
+    })?;
+    let mut id = String::with_capacity(35);
+    id.push_str("op-");
+    for byte in bytes {
+        let _ = write!(id, "{byte:02x}");
+    }
+    Ok(id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
@@ -233,6 +331,7 @@ pub enum BrowserHostEvent {
 struct BrowserCommandEnvelope {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
+    context: BrowserInvocationContext,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     pending_work: PendingWorkGuard,
 }
@@ -262,6 +361,14 @@ impl BrowserCommandBridge {
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
         self.cancellations.observe_host_event(event);
     }
+
+    pub fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
+        self.cancellations.interrupt_workspace(workspace_key);
+    }
+
+    pub fn interrupt_tab(&self, workspace_key: &BrowserWorkspaceKey, tab_id: &str) {
+        self.cancellations.interrupt_tab(workspace_key, tab_id);
+    }
 }
 
 #[derive(Clone)]
@@ -283,6 +390,16 @@ impl BrowserController {
     }
 
     pub async fn request(&self, command: BrowserCommand) -> Result<BrowserResponse, BrowserError> {
+        let context = BrowserInvocationContext::internal(command.operation_name());
+        self.request_with_context(command, context).await
+    }
+
+    pub async fn request_with_context(
+        &self,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+    ) -> Result<BrowserResponse, BrowserError> {
+        context.validate()?;
         self.interrupt_for_command(&command);
         let operation = command.operation_name().to_string();
         let cancellations = self
@@ -296,6 +413,7 @@ impl BrowserController {
         let send = self.sender.send(BrowserCommandEnvelope {
             workspace_key: self.workspace_key.clone(),
             command,
+            context,
             response,
             pending_work: self.pending_work.track(),
         });
@@ -323,6 +441,16 @@ impl BrowserController {
     }
 
     pub async fn notify(&self, command: BrowserCommand) -> Result<(), BrowserError> {
+        let context = BrowserInvocationContext::internal(command.operation_name());
+        self.notify_with_context(command, context).await
+    }
+
+    pub async fn notify_with_context(
+        &self,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+    ) -> Result<(), BrowserError> {
+        context.validate()?;
         self.interrupt_for_command(&command);
         let (response, receiver) = oneshot::channel();
         drop(receiver);
@@ -330,6 +458,7 @@ impl BrowserController {
             .send(BrowserCommandEnvelope {
                 workspace_key: self.workspace_key.clone(),
                 command,
+                context,
                 response,
                 pending_work: self.pending_work.track(),
             })
@@ -391,7 +520,9 @@ impl BrowserCommandInbox {
 pub struct BrowserCommandRequest {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
+    context: BrowserInvocationContext,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
+    _pending_work: PendingWorkGuard,
 }
 
 impl BrowserCommandRequest {
@@ -401,6 +532,10 @@ impl BrowserCommandRequest {
 
     pub fn command(&self) -> &BrowserCommand {
         &self.command
+    }
+
+    pub fn context(&self) -> &BrowserInvocationContext {
+        &self.context
     }
 
     pub fn respond(self, result: Result<BrowserResponse, BrowserError>) {
@@ -413,14 +548,16 @@ impl From<BrowserCommandEnvelope> for BrowserCommandRequest {
         let BrowserCommandEnvelope {
             workspace_key,
             command,
+            context,
             response,
             pending_work,
         } = envelope;
-        drop(pending_work);
         Self {
             workspace_key,
             command,
+            context,
             response,
+            _pending_work: pending_work,
         }
     }
 }

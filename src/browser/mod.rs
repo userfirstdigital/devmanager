@@ -3,17 +3,19 @@ mod gateway;
 mod host;
 mod mcp;
 mod model;
+mod operation_queue;
 mod pane;
 mod policy;
 mod provider;
 mod recipes;
+mod resources;
 mod storage;
 
 pub use commands::{
     browser_command_channel, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
     BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserHostEvent, BrowserHostStatus, BrowserPageLoadState, BrowserResponse,
-    BrowserUserInputKind,
+    BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
+    BrowserPageLoadState, BrowserResponse, BrowserUserInputKind,
 };
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub use host::{
@@ -26,6 +28,9 @@ pub use model::{
     BrowserAnnotation, BrowserBounds, BrowserElementRef, BrowserError, BrowserJournalActor,
     BrowserJournalEntry, BrowserLocator, BrowserResourceId, BrowserRevision, BrowserTabSnapshot,
     BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+};
+pub use operation_queue::{
+    BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,
 };
 pub use pane::{
     browser_action_plan, browser_content_bounds, browser_event_plan, browser_host_reconcile_plan,
@@ -45,5 +50,9 @@ pub use provider::{
 pub use recipes::{
     load_recipe, recipe_path, save_recipe, BrowserRecipeAction, BrowserRecipeInput,
     BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1, BROWSER_RECIPE_SCHEMA_VERSION,
+};
+pub use resources::{
+    resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceMetadata, BrowserResourceStore,
 };
 pub use storage::BrowserStorageLayout;

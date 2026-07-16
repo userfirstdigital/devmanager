@@ -2,10 +2,10 @@ use devmanager::browser::{
     browser_command_channel, browser_user_input_initialization_script, unique_download_path,
     unsupported_host_status, unsupported_platform_error, validate_browser_url, BrowserCommand,
     BrowserCommandBridge, BrowserCommandRequest, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostStatus, BrowserMemoryTarget,
-    BrowserPageLoadState, BrowserResponse, BrowserStorageLayout, BrowserTabSnapshot,
-    BrowserUserInputKind, BrowserViewport, BrowserWebViewHost, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserMemoryTarget, BrowserPageLoadState, BrowserResponse,
+    BrowserRisk, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
+    BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::path::{Path, PathBuf};
@@ -85,6 +85,44 @@ async fn command_requests_stay_bound_and_typed_results_round_trip() {
 }
 
 #[tokio::test]
+async fn command_requests_preserve_validated_invocation_context() {
+    let key = workspace("project-a", "conversation-a");
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let controller = bridge.bind(key, Duration::from_secs(1));
+    let context = BrowserInvocationContext::agent(
+        "Inspect the active page before submitting",
+        BrowserRisk::Financial,
+    )
+    .expect("valid agent invocation");
+
+    let response_task = tokio::spawn({
+        let controller = controller.clone();
+        let context = context.clone();
+        async move {
+            controller
+                .request_with_context(BrowserCommand::Status, context)
+                .await
+        }
+    });
+    let request = inbox.recv().await.expect("context-bearing request");
+
+    assert_eq!(request.context(), &context);
+    assert_eq!(request.context().actor, BrowserInvocationActor::Agent);
+    assert_eq!(request.context().declared_risk, BrowserRisk::Financial);
+    assert!(!request.context().operation_id.trim().is_empty());
+    request.respond(Ok(BrowserResponse::Acknowledged));
+    assert_eq!(
+        response_task.await.expect("context request task"),
+        Ok(BrowserResponse::Acknowledged)
+    );
+
+    assert!(matches!(
+        BrowserInvocationContext::agent("  ", BrowserRisk::Normal),
+        Err(BrowserError::InvalidInvocation { field }) if field == "intent"
+    ));
+}
+
+#[tokio::test]
 async fn controller_requests_return_a_typed_timeout() {
     let key = workspace("project-a", "conversation-a");
     let (bridge, mut inbox) = browser_command_channel(4);
@@ -131,7 +169,7 @@ async fn controller_timeout_also_bounds_a_saturated_inbox() {
 }
 
 #[tokio::test]
-async fn pending_work_is_observable_until_receive_without_cancel_or_timeout_leaks() {
+async fn pending_work_is_observable_until_response_without_cancel_or_timeout_leaks() {
     let key = workspace("project-a", "conversation-a");
     let (bridge, mut inbox) = browser_command_channel(1);
     let controller = bridge.bind(key.clone(), Duration::from_secs(1));
@@ -143,8 +181,8 @@ async fn pending_work_is_observable_until_receive_without_cancel_or_timeout_leak
     wait_for_pending_count(&bridge, 1).await;
     assert_eq!(inbox.pending_work_count(), 1);
     let request = inbox.recv().await.expect("pending status request");
-    assert_eq!(bridge.pending_work_count(), 0);
-    assert_eq!(inbox.pending_work_count(), 0);
+    assert_eq!(bridge.pending_work_count(), 1);
+    assert_eq!(inbox.pending_work_count(), 1);
     request.respond(Ok(BrowserResponse::Acknowledged));
     assert_eq!(
         response_task.await.expect("status request task"),
@@ -179,7 +217,10 @@ async fn pending_work_is_observable_until_receive_without_cancel_or_timeout_leak
     assert_eq!(bridge.pending_work_count(), 1);
 
     let _queued_request = inbox.recv().await.expect("queued notification");
-    assert_eq!(bridge.pending_work_count(), 0);
+    assert_eq!(bridge.pending_work_count(), 1);
+    assert_eq!(inbox.pending_work_count(), 1);
+    drop(_queued_request);
+    wait_for_pending_count(&bridge, 0).await;
     assert_eq!(inbox.pending_work_count(), 0);
 }
 

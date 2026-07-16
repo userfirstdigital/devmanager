@@ -1,6 +1,7 @@
 use super::mcp::BrowserMcpServer;
 use super::{
-    BrowserCommandBridge, BrowserProviderAccess, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserCommandBridge, BrowserProviderAccess, BrowserResourceLimits, BrowserResourceStore,
+    BrowserStorageLayout, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use axum::body::Body;
 use axum::extract::State;
@@ -15,6 +16,7 @@ use rmcp::transport::streamable_http_server::{
 use std::collections::HashMap;
 use std::fmt;
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -41,6 +43,7 @@ struct BrowserGatewayInner {
     port: u16,
     endpoint: String,
     bridge: BrowserCommandBridge,
+    app_config_dir: PathBuf,
     registrations: Mutex<RegistrationStore>,
     running: AtomicBool,
 }
@@ -100,11 +103,40 @@ pub struct BrowserGatewayHandle {
 
 impl BrowserGatewayHandle {
     pub fn start(bridge: BrowserCommandBridge) -> Result<Self, String> {
-        Self::start_with_runtime_builder(bridge, build_gateway_runtime)
+        let app_config_dir = std::env::temp_dir()
+            .join("devmanager-browser-gateway")
+            .join(std::process::id().to_string());
+        Self::start_with_app_config_dir(bridge, app_config_dir)
     }
 
+    pub fn start_with_app_config_dir(
+        bridge: BrowserCommandBridge,
+        app_config_dir: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        Self::start_with_runtime_builder_and_config(
+            bridge,
+            app_config_dir.as_ref().to_path_buf(),
+            build_gateway_runtime,
+        )
+    }
+
+    #[cfg(test)]
     fn start_with_runtime_builder<F>(
         bridge: BrowserCommandBridge,
+        build_runtime: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<tokio::runtime::Runtime, String> + Send + 'static,
+    {
+        let app_config_dir = std::env::temp_dir()
+            .join("devmanager-browser-gateway")
+            .join(std::process::id().to_string());
+        Self::start_with_runtime_builder_and_config(bridge, app_config_dir, build_runtime)
+    }
+
+    fn start_with_runtime_builder_and_config<F>(
+        bridge: BrowserCommandBridge,
+        app_config_dir: PathBuf,
         build_runtime: F,
     ) -> Result<Self, String>
     where
@@ -124,6 +156,7 @@ impl BrowserGatewayHandle {
             port,
             endpoint,
             bridge,
+            app_config_dir,
             registrations: Mutex::new(RegistrationStore::default()),
             running: AtomicBool::new(false),
         });
@@ -263,7 +296,13 @@ impl BrowserGatewayRegistrar {
             .inner
             .bridge
             .bind(workspace_key.clone(), Duration::from_secs(30));
-        let server = BrowserMcpServer::new(controller, initial_snapshot);
+        let resource_store = BrowserResourceStore::open(
+            BrowserStorageLayout::new(&self.inner.app_config_dir, &workspace_key.project_id)
+                .resources_dir,
+            BrowserResourceLimits::default(),
+        )
+        .map_err(|error| format!("open DevManager browser resource store: {error}"))?;
+        let server = BrowserMcpServer::new(controller, initial_snapshot, resource_store);
         let allowed_hosts = [
             format!("127.0.0.1:{}", self.inner.port),
             format!("localhost:{}", self.inner.port),
@@ -307,6 +346,9 @@ impl BrowserGatewayRegistrar {
         if !matches {
             return false;
         }
+        self.inner
+            .bridge
+            .interrupt_workspace(&registration.workspace_key);
         registrations.by_token.remove(token);
         if registrations
             .token_by_process
@@ -325,11 +367,20 @@ impl BrowserGatewayRegistrar {
         let Some(token) = registrations.token_by_process.remove(process_session_id) else {
             return false;
         };
-        registrations.by_token.remove(&token).is_some()
+        let removed = registrations.by_token.remove(&token);
+        if let Some(active) = &removed {
+            self.inner.bridge.interrupt_workspace(&active.workspace_key);
+        }
+        removed.is_some()
     }
 
     pub fn revoke_all(&self) {
         let mut registrations = lock(&self.inner.registrations);
+        for registration in registrations.by_token.values() {
+            self.inner
+                .bridge
+                .interrupt_workspace(&registration.workspace_key);
+        }
         registrations.by_token.clear();
         registrations.token_by_process.clear();
     }
@@ -346,6 +397,11 @@ impl BrowserGatewayRegistrar {
 fn stop_and_clear_registrations(inner: &BrowserGatewayInner) {
     let mut registrations = lock(&inner.registrations);
     inner.running.store(false, Ordering::Release);
+    for registration in registrations.by_token.values() {
+        inner
+            .bridge
+            .interrupt_workspace(&registration.workspace_key);
+    }
     registrations.by_token.clear();
     registrations.token_by_process.clear();
 }

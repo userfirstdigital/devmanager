@@ -1,11 +1,18 @@
 use super::{
-    BrowserCommand, BrowserController, BrowserError, BrowserResponse, BrowserRisk,
+    resource_id_from_uri, BrowserCommand, BrowserController, BrowserError,
+    BrowserInvocationContext, BrowserResourceStore, BrowserResponse, BrowserRisk,
     BrowserTabSnapshot, BrowserWorkspaceSnapshot,
 };
+use base64::Engine as _;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, Implementation, ListResourcesResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerInfo,
+};
 use rmcp::schemars;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -90,6 +97,7 @@ struct BrowserMcpContext {
     initial_snapshot: BrowserWorkspaceSnapshot,
     live_snapshot: Mutex<BrowserWorkspaceSnapshot>,
     first_use: Mutex<bool>,
+    resource_store: BrowserResourceStore,
 }
 
 #[derive(Clone)]
@@ -102,6 +110,7 @@ impl BrowserMcpServer {
     pub(crate) fn new(
         controller: BrowserController,
         initial_snapshot: BrowserWorkspaceSnapshot,
+        resource_store: BrowserResourceStore,
     ) -> Self {
         Self {
             context: Arc::new(BrowserMcpContext {
@@ -109,6 +118,7 @@ impl BrowserMcpServer {
                 live_snapshot: Mutex::new(initial_snapshot.clone()),
                 initial_snapshot,
                 first_use: Mutex::new(false),
+                resource_store,
             }),
             tool_router: Self::tool_router(),
         }
@@ -116,42 +126,43 @@ impl BrowserMcpServer {
 
     async fn validate_and_ensure(
         &self,
-        intent: &str,
-        risk: BrowserMcpRisk,
+        context: &BrowserInvocationContext,
     ) -> Result<BrowserWorkspaceSnapshot, ToolFailure> {
-        if intent.trim().is_empty() {
-            return Err(ToolFailure::invalid_request("intent cannot be blank"));
-        }
-        let _declared_risk: BrowserRisk = risk.into();
         let mut first_use = self.context.first_use.lock().await;
         if !*first_use {
             let ensured = self
                 .context
                 .controller
-                .request(BrowserCommand::Ensure {
-                    snapshot: self.context.initial_snapshot.clone(),
-                })
+                .request_with_context(
+                    BrowserCommand::Ensure {
+                        snapshot: self.context.initial_snapshot.clone(),
+                    },
+                    context.clone(),
+                )
                 .await
                 .map_err(ToolFailure::from)?;
             self.apply_workspace_response(ensured).await?;
             let opened = self
                 .context
                 .controller
-                .request(BrowserCommand::SetPaneOpen { open: true })
+                .request_with_context(BrowserCommand::SetPaneOpen { open: true }, context.clone())
                 .await
                 .map_err(ToolFailure::from)?;
             self.apply_workspace_response(opened).await?;
             *first_use = true;
         }
         drop(first_use);
-        self.refresh_workspace_state().await
+        self.refresh_workspace_state(context).await
     }
 
-    async fn refresh_workspace_state(&self) -> Result<BrowserWorkspaceSnapshot, ToolFailure> {
+    async fn refresh_workspace_state(
+        &self,
+        context: &BrowserInvocationContext,
+    ) -> Result<BrowserWorkspaceSnapshot, ToolFailure> {
         let response = self
             .context
             .controller
-            .request(BrowserCommand::WorkspaceState)
+            .request_with_context(BrowserCommand::WorkspaceState, context.clone())
             .await
             .map_err(ToolFailure::from)?;
         let BrowserResponse::WorkspaceState { snapshot } = response else {
@@ -178,16 +189,18 @@ impl BrowserMcpServer {
     }
 
     async fn run_tabs_operation(&self, request: BrowserTabsRequest) -> Result<Value, ToolFailure> {
-        let current = self
-            .validate_and_ensure(&request.intent, request.risk)
-            .await?;
+        let context = invocation_context(&request.intent, request.risk)?;
+        let current = self.validate_and_ensure(&context).await?;
         let snapshot = match request.operation {
             BrowserTabsOperation::List => current,
             BrowserTabsOperation::Create => {
                 let response = self
                     .context
                     .controller
-                    .request(BrowserCommand::CreateTab { url: request.url })
+                    .request_with_context(
+                        BrowserCommand::CreateTab { url: request.url },
+                        context.clone(),
+                    )
                     .await
                     .map_err(ToolFailure::from)?;
                 self.apply_workspace_response(response).await?
@@ -202,7 +215,7 @@ impl BrowserMcpServer {
                 let response = self
                     .context
                     .controller
-                    .request(command)
+                    .request_with_context(command, context.clone())
                     .await
                     .map_err(ToolFailure::from)?;
                 self.apply_workspace_response(response).await?
@@ -212,9 +225,8 @@ impl BrowserMcpServer {
     }
 
     async fn run_navigation(&self, request: BrowserNavigateRequest) -> Result<Value, ToolFailure> {
-        let mut snapshot = self
-            .validate_and_ensure(&request.intent, request.risk)
-            .await?;
+        let context = invocation_context(&request.intent, request.risk)?;
+        let mut snapshot = self.validate_and_ensure(&context).await?;
         let tab_id = request
             .tab_id
             .filter(|value| !value.trim().is_empty())
@@ -238,7 +250,7 @@ impl BrowserMcpServer {
         let response = self
             .context
             .controller
-            .request(command)
+            .request_with_context(command, context.clone())
             .await
             .map_err(ToolFailure::from)?;
         match response {
@@ -246,7 +258,7 @@ impl BrowserMcpServer {
                 snapshot = self.apply_workspace_response(workspace).await?;
             }
             BrowserResponse::Acknowledged => {
-                snapshot = self.refresh_workspace_state().await?;
+                snapshot = self.refresh_workspace_state(&context).await?;
             }
             _ => {
                 return Err(ToolFailure::invalid_response(
@@ -279,13 +291,12 @@ impl BrowserMcpServer {
         Parameters(request): Parameters<BrowserStatusRequest>,
     ) -> CallToolResult {
         let result = async {
-            let snapshot = self
-                .validate_and_ensure(&request.intent, request.risk)
-                .await?;
+            let context = invocation_context(&request.intent, request.risk)?;
+            let snapshot = self.validate_and_ensure(&context).await?;
             let response = self
                 .context
                 .controller
-                .request(BrowserCommand::Status)
+                .request_with_context(BrowserCommand::Status, context)
                 .await
                 .map_err(ToolFailure::from)?;
             let BrowserResponse::Status { status } = response else {
@@ -335,7 +346,12 @@ impl BrowserMcpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BrowserMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
             .with_server_info(
                 Implementation::new("devmanager-browser", "v1")
                     .with_title("devmanager-browser"),
@@ -344,6 +360,57 @@ impl ServerHandler for BrowserMcpServer {
                 "Tools operate only the caller's visible per-conversation companion pane. Semantic references are revision-bound and large results are returned as resources.",
             )
     }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let owner = self.context.controller.workspace_key();
+        let resources = self
+            .context
+            .resource_store
+            .list(owner)
+            .map_err(|_| ErrorData::resource_not_found("resource store unavailable", None))?
+            .into_iter()
+            .map(|handle| {
+                Resource::new(handle.uri, format!("browser-{:?}", handle.kind))
+                    .with_mime_type(handle.mime_type)
+                    .with_size(handle.byte_size)
+            })
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        let id = resource_id_from_uri(&request.uri)
+            .map_err(|_| ErrorData::resource_not_found("resource not found", None))?;
+        let resource = self
+            .context
+            .resource_store
+            .read(self.context.controller.workspace_key(), &id)
+            .map_err(|_| ErrorData::resource_not_found("resource not found", None))?;
+        let contents = if is_text_resource(&resource.metadata.mime_type) {
+            let text = String::from_utf8(resource.bytes)
+                .map_err(|_| ErrorData::resource_not_found("resource not found", None))?;
+            ResourceContents::text(text, request.uri).with_mime_type(resource.metadata.mime_type)
+        } else {
+            let blob = base64::engine::general_purpose::STANDARD.encode(resource.bytes);
+            ResourceContents::blob(blob, request.uri).with_mime_type(resource.metadata.mime_type)
+        };
+        Ok(ReadResourceResult::new(vec![contents]))
+    }
+}
+
+fn is_text_resource(mime_type: &str) -> bool {
+    mime_type.starts_with("text/")
+        || mime_type == "application/json"
+        || mime_type.ends_with("+json")
+        || mime_type == "application/javascript"
 }
 
 #[derive(Debug)]
@@ -372,8 +439,11 @@ impl From<BrowserError> for ToolFailure {
     fn from(error: BrowserError) -> Self {
         let code = match &error {
             BrowserError::InvalidWorkspaceKey { .. } => "invalid_workspace_key",
+            BrowserError::InvalidInvocation { .. } => "invalid_request",
             BrowserError::StaleReference { .. } => "stale_reference",
             BrowserError::MissingFile { .. } => "missing_file",
+            BrowserError::MissingResource { .. } => "missing_resource",
+            BrowserError::ResourceTooLarge { .. } => "resource_too_large",
             BrowserError::OutsideWorkspace { .. } => "outside_workspace_file",
             BrowserError::InvalidRecipe { .. } | BrowserError::UnsupportedRecipeVersion { .. } => {
                 "invalid_recipe"
@@ -410,6 +480,13 @@ fn required_nonblank(value: Option<String>, field: &str) -> Result<String, ToolF
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ToolFailure::invalid_request(format!("{field} is required")))
+}
+
+fn invocation_context(
+    intent: &str,
+    risk: BrowserMcpRisk,
+) -> Result<BrowserInvocationContext, ToolFailure> {
+    BrowserInvocationContext::agent(intent, BrowserRisk::from(risk)).map_err(ToolFailure::from)
 }
 
 fn compact_tab(tab: &BrowserTabSnapshot) -> Value {

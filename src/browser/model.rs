@@ -139,12 +139,22 @@ pub enum BrowserError {
     InvalidWorkspaceKey {
         field: String,
     },
+    InvalidInvocation {
+        field: String,
+    },
     StaleReference {
         expected: BrowserRevision,
         actual: BrowserRevision,
     },
     MissingFile {
         path: PathBuf,
+    },
+    MissingResource {
+        id: BrowserResourceId,
+    },
+    ResourceTooLarge {
+        byte_size: u64,
+        limit: u64,
     },
     OutsideWorkspace {
         path: PathBuf,
@@ -188,6 +198,12 @@ impl fmt::Display for BrowserError {
                     "browser workspace key field {field} cannot be blank"
                 )
             }
+            Self::InvalidInvocation { field } => {
+                write!(
+                    formatter,
+                    "browser invocation field {field} cannot be blank"
+                )
+            }
             Self::StaleReference { expected, actual } => write!(
                 formatter,
                 "stale browser element reference: expected revision {}, got {}",
@@ -196,6 +212,13 @@ impl fmt::Display for BrowserError {
             Self::MissingFile { path } => {
                 write!(formatter, "browser file does not exist: {}", path.display())
             }
+            Self::MissingResource { id } => {
+                write!(formatter, "browser resource does not exist: {}", id.0)
+            }
+            Self::ResourceTooLarge { byte_size, limit } => write!(
+                formatter,
+                "browser resource size {byte_size} exceeds limit {limit}"
+            ),
             Self::OutsideWorkspace { path } => write!(
                 formatter,
                 "browser file is outside the project workspace: {}",
