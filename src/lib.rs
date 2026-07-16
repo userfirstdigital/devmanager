@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod app;
 pub mod assets;
+pub mod browser;
 pub mod git;
 pub mod icons;
 pub mod models;

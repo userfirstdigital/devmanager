@@ -1614,6 +1614,7 @@ mod tests {
             pty_session_id: Some("session-1".to_string()),
             label: Some("Claude".to_string()),
             ssh_connection_id: None,
+            browser_workspace: None,
         }
     }
 

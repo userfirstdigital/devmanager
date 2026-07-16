@@ -1,3 +1,4 @@
+use crate::browser::BrowserWorkspaceSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -135,6 +136,7 @@ pub struct Settings {
     pub terminal_mouse_override: bool,
     pub terminal_read_only: bool,
     pub github_token: Option<String>,
+    pub browser_enabled: bool,
 }
 
 impl Default for Settings {
@@ -159,6 +161,7 @@ impl Default for Settings {
             terminal_mouse_override: false,
             terminal_read_only: false,
             github_token: None,
+            browser_enabled: cfg!(windows),
         }
     }
 }
@@ -216,6 +219,9 @@ impl SessionState {
             if matches!(tab.tab_type, TabType::Server) && tab.pty_session_id.is_none() {
                 tab.pty_session_id = tab.command_id.clone();
             }
+            if !matches!(tab.tab_type, TabType::Claude | TabType::Codex) {
+                tab.browser_workspace = None;
+            }
         }
 
         if self
@@ -241,6 +247,8 @@ pub struct SessionTab {
     pub pty_session_id: Option<String>,
     pub label: Option<String>,
     pub ssh_connection_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_workspace: Option<BrowserWorkspaceSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

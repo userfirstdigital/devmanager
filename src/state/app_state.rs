@@ -1,3 +1,4 @@
+use crate::browser::{BrowserWorkspaceKey, BrowserWorkspaceSnapshot};
 use crate::models::{
     AppConfig, Project, ProjectFolder, RunCommand, SSHConnection, SessionState, SessionTab,
     Settings, TabType, WindowBoundsState,
@@ -158,6 +159,36 @@ impl AppState {
             .filter(|tab| matches!(tab.tab_type, TabType::Claude | TabType::Codex))
     }
 
+    pub fn browser_workspace(&self, tab_id: &str) -> Option<&BrowserWorkspaceSnapshot> {
+        self.find_ai_tab(tab_id)
+            .and_then(|tab| tab.browser_workspace.as_ref())
+    }
+
+    pub fn browser_workspace_key(&self, tab_id: &str) -> Option<BrowserWorkspaceKey> {
+        let tab = self.find_ai_tab(tab_id)?;
+        BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()
+    }
+
+    pub fn update_browser_workspace(
+        &mut self,
+        tab_id: &str,
+        update: impl FnOnce(&mut BrowserWorkspaceSnapshot),
+    ) -> bool {
+        let Some(index) = self.open_tabs.iter().position(|tab| {
+            tab.id == tab_id && matches!(tab.tab_type, TabType::Claude | TabType::Codex)
+        }) else {
+            return false;
+        };
+
+        update(
+            self.open_tabs[index]
+                .browser_workspace
+                .get_or_insert_default(),
+        );
+        self.mark_dirty();
+        true
+    }
+
     pub fn find_ai_tab_by_session(&self, session_id: &str) -> Option<&SessionTab> {
         self.ai_tabs()
             .find(|tab| tab.pty_session_id.as_deref() == Some(session_id))
@@ -266,6 +297,7 @@ impl AppState {
             tab.pty_session_id = Some(command_id.to_string());
             tab.label = label;
             tab.ssh_connection_id = None;
+            tab.browser_workspace = None;
         } else {
             self.open_tabs.push(SessionTab {
                 id: tab_id.clone(),
@@ -275,6 +307,7 @@ impl AppState {
                 pty_session_id: Some(command_id.to_string()),
                 label,
                 ssh_connection_id: None,
+                browser_workspace: None,
             });
         }
         self.mark_dirty();
@@ -342,6 +375,7 @@ impl AppState {
                 pty_session_id: Some(pty_session_id),
                 label,
                 ssh_connection_id: None,
+                browser_workspace: None,
             });
         }
 
@@ -383,6 +417,7 @@ impl AppState {
             tab.command_id = None;
             tab.label = label.or_else(|| tab.label.clone());
             tab.ssh_connection_id = Some(connection_id.to_string());
+            tab.browser_workspace = None;
         } else {
             self.open_tabs.push(SessionTab {
                 id: tab_id.clone(),
@@ -392,6 +427,7 @@ impl AppState {
                 pty_session_id: None,
                 label,
                 ssh_connection_id: Some(connection_id.to_string()),
+                browser_workspace: None,
             });
         }
 
@@ -831,6 +867,7 @@ mod tests {
             pty_session_id: Some("claude-session".to_string()),
             label: Some("Claude".to_string()),
             ssh_connection_id: None,
+            browser_workspace: None,
         }
     }
 

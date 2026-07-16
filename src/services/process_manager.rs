@@ -2125,6 +2125,7 @@ impl ProcessManager {
                 pty_session_id: Some(session.session_id.clone()),
                 label: Some(label),
                 ssh_connection_id: None,
+                browser_workspace: None,
             });
         }
 
@@ -2439,6 +2440,7 @@ impl ProcessManager {
                 pty_session_id: Some(session.session_id.clone()),
                 label: Some(connection.label.clone()),
                 ssh_connection_id: Some(connection_id),
+                browser_workspace: None,
             });
         }
 
@@ -2755,6 +2757,7 @@ impl ProcessManager {
                     pty_session_id: Some(command_id.to_string()),
                     label: Some(lookup.command.label.clone()),
                     ssh_connection_id: None,
+                    browser_workspace: None,
                 });
             }
         }
@@ -7453,6 +7456,7 @@ mod tests {
             pty_session_id: Some("ssh-session".to_string()),
             label: Some("SSH".to_string()),
             ssh_connection_id: Some("ssh-1".to_string()),
+            browser_workspace: None,
         });
         manager.register_runtime_session(SessionRuntimeState::new(
             "ssh-session",

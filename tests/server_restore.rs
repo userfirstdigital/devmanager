@@ -47,6 +47,7 @@ fn merge_recovered_server_tabs_adds_missing() {
         pty_session_id: Some("cmd-dev".to_string()),
         label: Some("dev".to_string()),
         ssh_connection_id: None,
+        browser_workspace: None,
     };
 
     let added = state.merge_recovered_server_tabs(vec![recovered]);
