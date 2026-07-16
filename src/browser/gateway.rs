@@ -270,7 +270,30 @@ impl BrowserGatewayRegistrar {
         workspace_key: BrowserWorkspaceKey,
         initial_snapshot: BrowserWorkspaceSnapshot,
     ) -> Result<BrowserGatewayRegistration, String> {
-        self.register_with_before_store(process_session_id, workspace_key, initial_snapshot, || {})
+        self.register_with_project_root(
+            process_session_id,
+            workspace_key,
+            initial_snapshot,
+            std::env::current_dir().map_err(|error| {
+                format!("resolve browser gateway default project root: {error}")
+            })?,
+        )
+    }
+
+    pub fn register_with_project_root(
+        &self,
+        process_session_id: impl Into<String>,
+        workspace_key: BrowserWorkspaceKey,
+        initial_snapshot: BrowserWorkspaceSnapshot,
+        project_root: impl AsRef<Path>,
+    ) -> Result<BrowserGatewayRegistration, String> {
+        self.register_with_before_store(
+            process_session_id,
+            workspace_key,
+            initial_snapshot,
+            project_root.as_ref().to_path_buf(),
+            || {},
+        )
     }
 
     fn register_with_before_store<F>(
@@ -278,6 +301,7 @@ impl BrowserGatewayRegistrar {
         process_session_id: impl Into<String>,
         workspace_key: BrowserWorkspaceKey,
         initial_snapshot: BrowserWorkspaceSnapshot,
+        project_root: PathBuf,
         before_store: F,
     ) -> Result<BrowserGatewayRegistration, String>
     where
@@ -290,6 +314,9 @@ impl BrowserGatewayRegistrar {
         if process_session_id.trim().is_empty() {
             return Err("browser gateway process session id cannot be blank".to_string());
         }
+        let project_root = project_root
+            .canonicalize()
+            .map_err(|error| format!("canonicalize browser project root: {error}"))?;
         let token = generate_token()?;
         let access = BrowserProviderAccess::new(self.inner.endpoint.clone(), token.clone())?;
         let controller = self
@@ -302,7 +329,8 @@ impl BrowserGatewayRegistrar {
             BrowserResourceLimits::default(),
         )
         .map_err(|error| format!("open DevManager browser resource store: {error}"))?;
-        let server = BrowserMcpServer::new(controller, initial_snapshot, resource_store);
+        let server =
+            BrowserMcpServer::new(controller, initial_snapshot, resource_store, project_root);
         let allowed_hosts = [
             format!("127.0.0.1:{}", self.inner.port),
             format!("localhost:{}", self.inner.port),
@@ -531,6 +559,7 @@ mod tests {
             "racing-process",
             BrowserWorkspaceKey::new("project", "conversation").unwrap(),
             BrowserWorkspaceSnapshot::default(),
+            std::env::current_dir().unwrap(),
             move || {
                 shutdown.inner.running.store(false, Ordering::Release);
                 shutdown.revoke_all();

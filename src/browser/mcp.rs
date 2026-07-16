@@ -1,7 +1,9 @@
 use super::{
-    resource_id_from_uri, BrowserCommand, BrowserController, BrowserError,
-    BrowserInvocationContext, BrowserResourceStore, BrowserResponse, BrowserRisk,
-    BrowserTabSnapshot, BrowserWorkspaceSnapshot,
+    classify_upload_path, effective_browser_risk, resource_id_from_uri, BrowserAction,
+    BrowserActionTarget, BrowserCommand, BrowserConsoleOperation, BrowserController,
+    BrowserDownloadOperation, BrowserError, BrowserInvocationContext, BrowserNetworkOperation,
+    BrowserPerformanceOperation, BrowserResourceStore, BrowserResponse, BrowserRisk,
+    BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition, BrowserWorkspaceSnapshot,
 };
 use base64::Engine as _;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -15,6 +17,7 @@ use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -92,12 +95,107 @@ struct BrowserNavigateRequest {
     url: Option<String>,
 }
 
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserSnapshotRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserScreenshotRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    mode: BrowserScreenshotMode,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserWaitRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    condition: BrowserWaitCondition,
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserActRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    actions: Vec<BrowserAction>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserConsoleRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    operation: BrowserConsoleOperation,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserNetworkRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    operation: BrowserNetworkOperation,
+    request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPerformanceRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    operation: BrowserPerformanceOperation,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserUploadRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    target: BrowserActionTarget,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserDownloadsRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    operation: BrowserDownloadOperation,
+    download_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BrowserCdpRequest {
+    intent: String,
+    risk: BrowserMcpRisk,
+    tab_id: Option<String>,
+    method: String,
+    params: Value,
+}
+
 struct BrowserMcpContext {
     controller: BrowserController,
     initial_snapshot: BrowserWorkspaceSnapshot,
     live_snapshot: Mutex<BrowserWorkspaceSnapshot>,
     first_use: Mutex<bool>,
     resource_store: BrowserResourceStore,
+    project_root: PathBuf,
 }
 
 #[derive(Clone)]
@@ -111,6 +209,7 @@ impl BrowserMcpServer {
         controller: BrowserController,
         initial_snapshot: BrowserWorkspaceSnapshot,
         resource_store: BrowserResourceStore,
+        project_root: PathBuf,
     ) -> Self {
         Self {
             context: Arc::new(BrowserMcpContext {
@@ -119,6 +218,7 @@ impl BrowserMcpServer {
                 initial_snapshot,
                 first_use: Mutex::new(false),
                 resource_store,
+                project_root,
             }),
             tool_router: Self::tool_router(),
         }
@@ -278,6 +378,84 @@ impl BrowserMcpServer {
             "tab": compact_tab(selected),
         }))
     }
+
+    async fn prepare_automation(
+        &self,
+        intent: &str,
+        risk: BrowserMcpRisk,
+        tab_id: Option<String>,
+    ) -> Result<(BrowserInvocationContext, String), ToolFailure> {
+        let context = invocation_context(intent, risk)?;
+        let snapshot = self.validate_and_ensure(&context).await?;
+        let tab_id = tab_id
+            .filter(|value| !value.trim().is_empty())
+            .or(snapshot.selected_tab_id)
+            .ok_or_else(|| ToolFailure::invalid_request("no selected browser tab"))?;
+        if !snapshot.tabs.iter().any(|tab| tab.id == tab_id) {
+            return Err(ToolFailure::invalid_request("browser tab does not exist"));
+        }
+        Ok((context, tab_id))
+    }
+
+    async fn send_automation(
+        &self,
+        context: BrowserInvocationContext,
+        command: BrowserCommand,
+    ) -> Result<BrowserResponse, ToolFailure> {
+        self.context
+            .controller
+            .request_with_context(command, context)
+            .await
+            .map_err(ToolFailure::from)
+    }
+
+    async fn run_upload(&self, request: BrowserUploadRequest) -> Result<Value, ToolFailure> {
+        let mut effective_risk = BrowserRisk::from(request.risk);
+        let mut paths = Vec::with_capacity(request.paths.len());
+        for path in request.paths {
+            let candidate = if path.is_absolute() {
+                path
+            } else {
+                self.context.project_root.join(path)
+            };
+            let (path, path_risk) = classify_upload_path(&self.context.project_root, candidate)
+                .map_err(ToolFailure::from)?;
+            effective_risk = effective_browser_risk(effective_risk, None, Some(path_risk));
+            paths.push(path);
+        }
+        let context = BrowserInvocationContext::agent(&request.intent, effective_risk)
+            .map_err(ToolFailure::from)?;
+        let snapshot = self.validate_and_ensure(&context).await?;
+        let tab_id = request
+            .tab_id
+            .filter(|value| !value.trim().is_empty())
+            .or(snapshot.selected_tab_id)
+            .ok_or_else(|| ToolFailure::invalid_request("no selected browser tab"))?;
+        if !snapshot.tabs.iter().any(|tab| tab.id == tab_id) {
+            return Err(ToolFailure::invalid_request("browser tab does not exist"));
+        }
+        let response = self
+            .send_automation(
+                context,
+                BrowserCommand::Upload {
+                    tab_id,
+                    target: request.target,
+                    paths,
+                },
+            )
+            .await?;
+        match response {
+            BrowserResponse::Upload { result } => Ok(json!({
+                "ok": true,
+                "version": 1,
+                "uploadedCount": result.files.len(),
+                "revision": result.revision,
+            })),
+            _ => Err(ToolFailure::invalid_response(
+                "browser host returned the wrong upload response type",
+            )),
+        }
+    }
 }
 
 #[tool_router]
@@ -340,6 +518,292 @@ impl BrowserMcpServer {
         Parameters(request): Parameters<BrowserNavigateRequest>,
     ) -> CallToolResult {
         into_tool_result(self.run_navigation(request).await)
+    }
+
+    #[tool(
+        name = "browser_snapshot",
+        description = "Capture a revision-bound semantic page snapshot and return a compact summary plus resource handle."
+    )]
+    async fn browser_snapshot(
+        &self,
+        Parameters(request): Parameters<BrowserSnapshotRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(context, BrowserCommand::Snapshot { tab_id })
+                .await?;
+            require_response(response, "snapshot", |response| {
+                matches!(response, BrowserResponse::Snapshot { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_screenshot",
+        description = "Capture a viewport or full-page PNG and return an authenticated resource handle."
+    )]
+    async fn browser_screenshot(
+        &self,
+        Parameters(request): Parameters<BrowserScreenshotRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Screenshot {
+                        tab_id,
+                        mode: request.mode,
+                    },
+                )
+                .await?;
+            require_response(response, "screenshot", |response| {
+                matches!(response, BrowserResponse::Screenshot { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_wait",
+        description = "Wait asynchronously for a typed page condition with a bounded timeout."
+    )]
+    async fn browser_wait(
+        &self,
+        Parameters(request): Parameters<BrowserWaitRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            if !(1..=60_000).contains(&request.timeout_ms) {
+                return Err(ToolFailure::invalid_request(
+                    "timeoutMs must be between 1 and 60000",
+                ));
+            }
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Wait {
+                        tab_id,
+                        condition: request.condition,
+                        timeout_ms: request.timeout_ms,
+                    },
+                )
+                .await?;
+            require_response(response, "wait", |response| {
+                matches!(response, BrowserResponse::Wait { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_act",
+        description = "Run one bounded ordered list of semantic browser actions with runtime risk inspection."
+    )]
+    async fn browser_act(
+        &self,
+        Parameters(request): Parameters<BrowserActRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Act {
+                        tab_id,
+                        actions: request.actions,
+                    },
+                )
+                .await?;
+            require_response(response, "action", |response| {
+                matches!(response, BrowserResponse::Action { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_console",
+        description = "List or clear the bounded redacted console and runtime-error buffer."
+    )]
+    async fn browser_console(
+        &self,
+        Parameters(request): Parameters<BrowserConsoleRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Console {
+                        tab_id,
+                        operation: request.operation,
+                    },
+                )
+                .await?;
+            require_response(response, "console", |response| {
+                matches!(response, BrowserResponse::Console { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_network",
+        description = "List or clear bounded request metadata, or retrieve one explicit captured body."
+    )]
+    async fn browser_network(
+        &self,
+        Parameters(mut request): Parameters<BrowserNetworkRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            if request.operation == BrowserNetworkOperation::Body {
+                request.request_id = Some(required_nonblank(request.request_id, "requestId")?);
+            }
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Network {
+                        tab_id,
+                        operation: request.operation,
+                        request_id: request.request_id,
+                    },
+                )
+                .await?;
+            require_response(response, "network", |response| {
+                matches!(response, BrowserResponse::Network { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_performance",
+        description = "Capture bounded performance data or start and stop an in-page trace resource."
+    )]
+    async fn browser_performance(
+        &self,
+        Parameters(request): Parameters<BrowserPerformanceRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Performance {
+                        tab_id,
+                        operation: request.operation,
+                    },
+                )
+                .await?;
+            require_response(response, "performance", |response| {
+                matches!(response, BrowserResponse::Performance { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_upload",
+        description = "Set canonical project files on a semantic file input through WebView2 CDP."
+    )]
+    async fn browser_upload(
+        &self,
+        Parameters(request): Parameters<BrowserUploadRequest>,
+    ) -> CallToolResult {
+        into_tool_result(self.run_upload(request).await)
+    }
+
+    #[tool(
+        name = "browser_downloads",
+        description = "List, reveal, or confirm-delete verified files in this project's browser download directory."
+    )]
+    async fn browser_downloads(
+        &self,
+        Parameters(mut request): Parameters<BrowserDownloadsRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            if request.operation != BrowserDownloadOperation::List {
+                request.download_id = Some(required_nonblank(request.download_id, "downloadId")?);
+            }
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Downloads {
+                        tab_id,
+                        operation: request.operation,
+                        download_id: request.download_id,
+                    },
+                )
+                .await?;
+            require_response(response, "downloads", |response| {
+                matches!(response, BrowserResponse::Downloads { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_cdp",
+        description = "Call an enabled raw WebView2 DevTools Protocol method without opening a debugging port."
+    )]
+    async fn browser_cdp(
+        &self,
+        Parameters(request): Parameters<BrowserCdpRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            if request.method.trim().is_empty() || !request.params.is_object() {
+                return Err(ToolFailure::invalid_request(
+                    "method is required and params must be an object",
+                ));
+            }
+            let (context, tab_id) = self
+                .prepare_automation(&request.intent, request.risk, request.tab_id)
+                .await?;
+            let response = self
+                .send_automation(
+                    context,
+                    BrowserCommand::Cdp {
+                        tab_id,
+                        method: request.method,
+                        params: request.params,
+                    },
+                )
+                .await?;
+            require_response(response, "CDP", |response| {
+                matches!(response, BrowserResponse::Cdp { .. })
+            })
+        }
+        .await;
+        into_tool_result(result)
     }
 }
 
@@ -474,6 +938,23 @@ fn into_tool_result(result: Result<Value, ToolFailure>) -> CallToolResult {
             }
         })),
     }
+}
+
+fn require_response(
+    response: BrowserResponse,
+    operation: &str,
+    expected: impl FnOnce(&BrowserResponse) -> bool,
+) -> Result<Value, ToolFailure> {
+    if !expected(&response) {
+        return Err(ToolFailure::invalid_response(format!(
+            "browser host returned the wrong {operation} response type"
+        )));
+    }
+    Ok(json!({
+        "ok": true,
+        "version": 1,
+        "result": response,
+    }))
 }
 
 fn required_nonblank(value: Option<String>, field: &str) -> Result<String, ToolFailure> {

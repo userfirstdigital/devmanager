@@ -2,6 +2,7 @@ use super::{
     BrowserBounds, BrowserElementRef, BrowserLocator, BrowserRevision, BrowserRisk,
     BrowserWorkspaceSnapshot,
 };
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -23,14 +24,16 @@ pub const MAX_BROWSER_ACTIONS: usize = 32;
 pub const MAX_BROWSER_JOURNAL_ENTRIES: usize = 100;
 pub const REDACTED_VALUE: &str = "[redacted]";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserPoint {
     pub x: i32,
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq, Default,
+)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BrowserActionTarget {
     pub element_ref: Option<BrowserElementRef>,
@@ -106,7 +109,7 @@ pub enum BrowserLocatorStrategy {
     Coordinates(BrowserPoint),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(
     tag = "operation",
     rename_all = "camelCase",
@@ -148,14 +151,14 @@ pub enum BrowserAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BrowserScreenshotMode {
     Viewport,
     FullPage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -173,14 +176,14 @@ pub enum BrowserWaitCondition {
     JavaScript { predicate: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BrowserConsoleOperation {
     List,
     Clear,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BrowserNetworkOperation {
     List,
@@ -188,7 +191,7 @@ pub enum BrowserNetworkOperation {
     Body,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BrowserPerformanceOperation {
     Snapshot,
@@ -196,7 +199,7 @@ pub enum BrowserPerformanceOperation {
     TraceStop,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BrowserDownloadOperation {
     List,

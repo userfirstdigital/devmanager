@@ -1,3 +1,4 @@
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -11,7 +12,18 @@ pub struct BrowserWorkspaceKey {
 }
 
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    rmcp::schemars::JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
 )]
 #[serde(transparent)]
 pub struct BrowserRevision(pub u64);
@@ -20,7 +32,7 @@ pub struct BrowserRevision(pub u64);
 #[serde(transparent)]
 pub struct BrowserResourceId(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BrowserViewport {
     pub width: u32,
@@ -38,7 +50,9 @@ impl Default for BrowserViewport {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq, Default,
+)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BrowserLocator {
     pub accessibility_role: Option<String>,
@@ -47,7 +61,7 @@ pub struct BrowserLocator {
     pub css_selectors: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserElementRef {
     pub revision: BrowserRevision,
@@ -64,7 +78,7 @@ pub struct BrowserTabSnapshot {
     pub viewport: BrowserViewport,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserBounds {
     pub x: i32,

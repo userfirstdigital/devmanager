@@ -1226,7 +1226,12 @@ impl ProcessManager {
                     return;
                 }
             };
-        let registration = match registrar.register(session_id, workspace_key, initial_snapshot) {
+        let registration = match registrar.register_with_project_root(
+            session_id,
+            workspace_key,
+            initial_snapshot,
+            &launch.cwd,
+        ) {
             Ok(registration) => registration,
             Err(error) => {
                 self.set_browser_diagnostic(

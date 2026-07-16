@@ -1,9 +1,12 @@
 use base64::Engine as _;
 use devmanager::browser::{
-    browser_command_channel, BrowserCommand, BrowserCommandInbox, BrowserGatewayHandle,
-    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
-    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRisk,
-    BrowserStorageLayout, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    browser_command_channel, BrowserActionResult, BrowserCommand, BrowserCommandInbox,
+    BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostState,
+    BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext, BrowserNetworkEntry,
+    BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
+    BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult,
+    BrowserViewport, BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -90,6 +93,23 @@ fn arguments(value: Value) -> Map<String, Value> {
     serde_json::from_value(value).expect("tool arguments object")
 }
 
+fn fixture_resource(
+    id: &str,
+    kind: BrowserResourceKind,
+    mime_type: &str,
+    byte_size: u64,
+) -> BrowserResourceHandle {
+    BrowserResourceHandle {
+        id: BrowserResourceId(id.to_string()),
+        uri: format!("devmanager-browser://resource/{id}"),
+        mime_type: mime_type.to_string(),
+        kind,
+        byte_size,
+        created_at_epoch_ms: 1,
+        pinned: false,
+    }
+}
+
 async fn run_fake_host(
     inbox: BrowserCommandInbox,
     commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>>,
@@ -165,6 +185,99 @@ async fn run_fake_host_with_state(
             | BrowserCommand::Forward { .. }
             | BrowserCommand::Reload { .. }
             | BrowserCommand::Stop { .. } => Ok(BrowserResponse::Acknowledged),
+            BrowserCommand::Snapshot { tab_id } => Ok(BrowserResponse::Snapshot {
+                summary: BrowserSnapshotSummary {
+                    tab_id,
+                    url: "http://127.0.0.1:4173/".to_string(),
+                    revision: BrowserRevision(7),
+                    element_count: 12,
+                },
+                resource: fixture_resource(
+                    "res-00000000000000000000000000000001",
+                    BrowserResourceKind::DomSnapshot,
+                    "application/json",
+                    128,
+                ),
+            }),
+            BrowserCommand::Screenshot { .. } => Ok(BrowserResponse::Screenshot {
+                resource: fixture_resource(
+                    "res-00000000000000000000000000000002",
+                    BrowserResourceKind::Screenshot,
+                    "image/png",
+                    256,
+                ),
+            }),
+            BrowserCommand::Wait { timeout_ms, .. } if timeout_ms == 13 => {
+                Err(devmanager::browser::BrowserError::Timeout {
+                    operation: "fixture wait".to_string(),
+                })
+            }
+            BrowserCommand::Wait { .. } => Ok(BrowserResponse::Wait {
+                result: BrowserWaitResult {
+                    matched: true,
+                    elapsed_ms: 1,
+                    revision: BrowserRevision(7),
+                },
+            }),
+            BrowserCommand::Act { actions, .. } => Ok(BrowserResponse::Action {
+                result: BrowserActionResult {
+                    completed_actions: actions.len(),
+                    revision: BrowserRevision(8),
+                },
+            }),
+            BrowserCommand::Console { .. } => Ok(BrowserResponse::Console {
+                entries: vec![BrowserConsoleEntry {
+                    sequence: 1,
+                    level: "error".to_string(),
+                    message: "fixture runtime error".to_string(),
+                    timestamp_ms: 1,
+                }],
+                resource: None,
+            }),
+            BrowserCommand::Network { .. } => Ok(BrowserResponse::Network {
+                entries: vec![BrowserNetworkEntry {
+                    request_id: "fixture-request".to_string(),
+                    url: "http://127.0.0.1:4173/api/success".to_string(),
+                    method: "GET".to_string(),
+                    status: Some(200),
+                    failed: false,
+                    body_available: true,
+                    duration_ms: Some(2),
+                }],
+                resource: None,
+                body_available: Some(true),
+            }),
+            BrowserCommand::Performance { .. } => Ok(BrowserResponse::Performance {
+                snapshot: Some(BrowserPerformanceSnapshot {
+                    navigation: json!({"type":"navigate","duration":2}),
+                    entries: vec![json!({"name":"fixture","duration":1})],
+                }),
+                resource: None,
+                tracing: false,
+            }),
+            BrowserCommand::Upload { paths, .. } => Ok(BrowserResponse::Upload {
+                result: BrowserUploadResult {
+                    files: paths,
+                    revision: BrowserRevision(9),
+                },
+            }),
+            BrowserCommand::Downloads { .. } => Ok(BrowserResponse::Downloads {
+                downloads: vec![BrowserDownloadEntry {
+                    id: "download-fixture".to_string(),
+                    file_name: "fixture-download.txt".to_string(),
+                    byte_size: 16,
+                    completed: true,
+                }],
+            }),
+            BrowserCommand::Cdp { method, .. } if method == "Runtime.fail" => {
+                Err(devmanager::browser::BrowserError::CrashedView {
+                    message: "fixture CDP failure".to_string(),
+                })
+            }
+            BrowserCommand::Cdp { .. } => Ok(BrowserResponse::Cdp {
+                inline_result: Some(json!({"result":{"value":4}})),
+                resource: None,
+            }),
             other => panic!("unexpected fake-host command: {other:?}"),
         };
         drop(host);
@@ -540,7 +653,7 @@ async fn task4_mcp_commands_retain_one_agent_invocation_context() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_rmcp_client_lists_and_calls_only_the_three_v1_tools() {
+async fn real_rmcp_client_lists_the_task4_tools_and_all_ten_automation_groups() {
     let (bridge, inbox) = browser_command_channel(32);
     let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
         Arc::new(Mutex::new(Vec::new()));
@@ -583,7 +696,21 @@ async fn real_rmcp_client_lists_and_calls_only_the_three_v1_tools() {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["browser_navigate", "browser_status", "browser_tabs"]
+            vec![
+                "browser_act",
+                "browser_cdp",
+                "browser_console",
+                "browser_downloads",
+                "browser_navigate",
+                "browser_network",
+                "browser_performance",
+                "browser_screenshot",
+                "browser_snapshot",
+                "browser_status",
+                "browser_tabs",
+                "browser_upload",
+                "browser_wait",
+            ]
         );
         assert!(listed.tools.iter().all(|tool| {
             let required = tool
@@ -593,6 +720,13 @@ async fn real_rmcp_client_lists_and_calls_only_the_three_v1_tools() {
                 .cloned()
                 .unwrap_or_default();
             required.contains(&json!("intent")) && required.contains(&json!("risk"))
+        }));
+        assert!(listed.tools.iter().all(|tool| {
+            let properties = &tool.input_schema["properties"];
+            properties.get("projectId").is_none()
+                && properties.get("conversationId").is_none()
+                && properties.get("aiTabId").is_none()
+                && properties.get("workspaceKey").is_none()
         }));
         let status_tool = listed
             .tools
@@ -752,6 +886,216 @@ async fn real_rmcp_client_lists_and_calls_only_the_three_v1_tools() {
         let _ = client.cancel().await;
     };
     let (_, ()) = tokio::join!(run_fake_host(inbox, commands), scenario);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_rmcp_client_routes_all_ten_automation_groups_with_compact_results() {
+    let config_dir = unique_gateway_config_dir("automation-tools");
+    let project_root = config_dir.join("project-root");
+    std::fs::create_dir_all(&project_root).expect("create automation project root");
+    std::fs::write(project_root.join("fixture-upload.txt"), b"fixture upload")
+        .expect("write upload fixture");
+
+    let (bridge, inbox) = browser_command_channel(64);
+    let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let gateway = BrowserGatewayHandle::start_with_app_config_dir(bridge, &config_dir)
+        .expect("start automation gateway");
+    let scenario_project_root = project_root.clone();
+    let scenario = async move {
+        let key = workspace("project-tools", "conversation-tools");
+        let initial_snapshot = BrowserWorkspaceSnapshot {
+            tabs: vec![BrowserTabSnapshot {
+                id: "tab-main".to_string(),
+                title: "Loopback fixture".to_string(),
+                url: "http://127.0.0.1:4173/".to_string(),
+                viewport: BrowserViewport::default(),
+            }],
+            selected_tab_id: Some("tab-main".to_string()),
+            ..BrowserWorkspaceSnapshot::default()
+        };
+        let registration = gateway
+            .registrar()
+            .register_with_project_root(
+                "automation-client",
+                key,
+                initial_snapshot,
+                &scenario_project_root,
+            )
+            .expect("register automation client");
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize automation client");
+
+        let calls = [
+            (
+                "browser_snapshot",
+                json!({"intent":"inspect semantic page","risk":"normal"}),
+                "snapshot",
+            ),
+            (
+                "browser_screenshot",
+                json!({"intent":"capture viewport","risk":"normal","mode":"viewport"}),
+                "screenshot",
+            ),
+            (
+                "browser_wait",
+                json!({
+                    "intent":"wait for fixture mutation",
+                    "risk":"normal",
+                    "condition":{"type":"duration","durationMs":1},
+                    "timeoutMs":100
+                }),
+                "wait",
+            ),
+            (
+                "browser_act",
+                json!({
+                    "intent":"focus fixture target",
+                    "risk":"normal",
+                    "actions":[{
+                        "operation":"focus",
+                        "target":{"locator":{"testId":"fixture-target"}}
+                    }]
+                }),
+                "action",
+            ),
+            (
+                "browser_console",
+                json!({"intent":"inspect console","risk":"normal","operation":"list"}),
+                "console",
+            ),
+            (
+                "browser_network",
+                json!({"intent":"inspect requests","risk":"normal","operation":"list"}),
+                "network",
+            ),
+            (
+                "browser_performance",
+                json!({"intent":"inspect timings","risk":"normal","operation":"snapshot"}),
+                "performance",
+            ),
+            (
+                "browser_upload",
+                json!({
+                    "intent":"upload project fixture",
+                    "risk":"normal",
+                    "target":{"locator":{"testId":"fixture-upload"}},
+                    "paths":["fixture-upload.txt"]
+                }),
+                "upload",
+            ),
+            (
+                "browser_downloads",
+                json!({"intent":"list downloads","risk":"normal","operation":"list"}),
+                "downloads",
+            ),
+            (
+                "browser_cdp",
+                json!({
+                    "intent":"evaluate fixture expression",
+                    "risk":"normal",
+                    "method":"Runtime.evaluate",
+                    "params":{"expression":"2 + 2"}
+                }),
+                "cdp",
+            ),
+        ];
+
+        for (tool_name, tool_arguments, expected_type) in calls {
+            let result = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new(tool_name).with_arguments(arguments(tool_arguments)),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("call {tool_name}: {error}"));
+            assert_eq!(result.is_error, Some(false), "{tool_name}");
+            let structured = result
+                .structured_content
+                .unwrap_or_else(|| panic!("structured result for {tool_name}"));
+            assert_eq!(structured["ok"], true, "{tool_name}");
+            assert_eq!(structured["version"], 1, "{tool_name}");
+            if expected_type == "upload" {
+                assert_eq!(structured["uploadedCount"], 1);
+                assert!(structured.get("paths").is_none());
+            } else {
+                assert_eq!(structured["result"]["type"], expected_type, "{tool_name}");
+            }
+            if matches!(expected_type, "snapshot" | "screenshot") {
+                let resource = &structured["result"]["resource"];
+                assert!(resource["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.starts_with("devmanager-browser://resource/res-")));
+                assert!(resource["byteSize"].as_u64().is_some_and(|size| size > 0));
+            }
+        }
+
+        let typed_failure = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_wait").with_arguments(arguments(json!({
+                    "intent":"exercise bounded timeout validation",
+                    "risk":"normal",
+                    "condition":{"type":"duration","durationMs":1},
+                    "timeoutMs":0
+                }))),
+            )
+            .await
+            .expect("typed invalid wait result");
+        assert_eq!(typed_failure.is_error, Some(true));
+        assert_eq!(
+            typed_failure.structured_content.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+
+        let host_failure = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_wait").with_arguments(arguments(json!({
+                    "intent":"exercise typed host timeout",
+                    "risk":"normal",
+                    "condition":{"type":"duration","durationMs":50},
+                    "timeoutMs":13
+                }))),
+            )
+            .await
+            .expect("typed host timeout result");
+        assert_eq!(host_failure.is_error, Some(true));
+        assert_eq!(
+            host_failure.structured_content.unwrap()["error"]["code"],
+            "timeout"
+        );
+
+        let missing_upload_tab = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_upload").with_arguments(arguments(json!({
+                    "intent":"reject an upload to a nonexistent tab",
+                    "risk":"normal",
+                    "tabId":"missing-tab",
+                    "target":{"locator":{"testId":"fixture-upload"}},
+                    "paths":["fixture-upload.txt"]
+                }))),
+            )
+            .await
+            .expect("typed missing upload tab result");
+        assert_eq!(missing_upload_tab.is_error, Some(true));
+        assert_eq!(
+            missing_upload_tab.structured_content.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+
+        client.cancel().await.expect("close automation client");
+    };
+
+    let (_, ()) = tokio::join!(run_fake_host(inbox, commands), scenario);
+    let _ = std::fs::remove_dir_all(config_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

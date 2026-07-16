@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DevManager Browser Task 5A Fixture</title>
+    <style>
+      :root { color-scheme: light dark; font: 16px/1.45 system-ui, sans-serif; }
+      body { margin: 0 auto; max-width: 70rem; padding: 2rem; }
+      main { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); }
+      section { border: 1px solid #8888; border-radius: 0.5rem; padding: 1rem; }
+      label { display: grid; gap: 0.25rem; margin: 0.5rem 0; }
+      button, input, select, a { margin: 0.25rem; }
+      #drag-source, #drop-zone { border: 1px dashed currentColor; margin: 0.5rem; padding: 0.75rem; }
+      #drop-zone { min-height: 2rem; }
+    </style>
+  </head>
+  <body>
+    <h1>DevManager automation loopback fixture</h1>
+    <p id="fixture-status" role="status">Fixture ready</p>
+    <main>
+      <section aria-labelledby="semantic-heading">
+        <h2 id="semantic-heading">Semantic actions</h2>
+        <button
+          id="semantic-target"
+          data-testid="semantic-target"
+          aria-label="Semantic action target"
+        >Semantic target</button>
+        <button data-testid="purchase-target">Purchase subscription</button>
+        <button data-testid="delete-target">Delete saved record</button>
+        <button data-testid="account-security-target">Change account password</button>
+        <button data-testid="permission-target">Allow camera permission</button>
+        <label>
+          Fixture option
+          <select data-testid="fixture-select">
+            <option value="alpha">Alpha</option>
+            <option value="beta">Beta</option>
+          </select>
+        </label>
+        <div id="drag-source" data-testid="drag-source" draggable="true">Drag source</div>
+        <div id="drop-zone" data-testid="drop-zone">Drop destination</div>
+      </section>
+
+      <section aria-labelledby="form-heading">
+        <h2 id="form-heading">Form and password redaction</h2>
+        <form data-testid="fixture-form">
+          <label>
+            Display name
+            <input name="displayName" value="Fixture User" autocomplete="name" />
+          </label>
+          <label>
+            Password
+            <input
+              data-testid="password-input"
+              name="password"
+              type="password"
+              value="never-expose-this-value"
+              autocomplete="current-password"
+            />
+          </label>
+          <button type="submit" data-testid="submit-form">Submit fixture form</button>
+        </form>
+        <p data-testid="form-result">Not submitted</p>
+      </section>
+
+      <section aria-labelledby="mutation-heading">
+        <h2 id="mutation-heading">Mutation and waits</h2>
+        <p>The delayed target appears after page initialization.</p>
+        <button data-testid="never-appears-trigger">Start an intentionally failing wait</button>
+        <div data-testid="mutation-container"></div>
+      </section>
+
+      <section aria-labelledby="navigation-heading">
+        <h2 id="navigation-heading">Navigation and logical tabs</h2>
+        <a data-testid="redirect-link" href="./redirect.html">Follow redirect</a>
+        <a data-testid="new-tab-link" href="./destination.html" target="_blank" rel="opener">
+          Open a second logical tab
+        </a>
+        <button data-testid="popup-button">Open scripted popup</button>
+      </section>
+
+      <section aria-labelledby="diagnostics-heading">
+        <h2 id="diagnostics-heading">Console, network, and performance</h2>
+        <button data-testid="console-error-button">Emit console error</button>
+        <button data-testid="runtime-error-button">Emit runtime error</button>
+        <button data-testid="network-button">Repeat fetch and XHR traffic</button>
+      </section>
+
+      <section aria-labelledby="files-heading">
+        <h2 id="files-heading">Uploads and downloads</h2>
+        <label>
+          Project file
+          <input data-testid="fixture-upload" type="file" multiple />
+        </label>
+        <p data-testid="upload-result">No files selected</p>
+        <a
+          data-testid="fixture-download"
+          href="./download.txt"
+          download="fixture-download.txt"
+        >Download fixture file</a>
+      </section>
+    </main>
+
+    <script>
+      const status = document.querySelector("#fixture-status");
+
+      function issueNetworkTraffic() {
+        fetch("./api-success.json")
+          .then((response) => response.json())
+          .then((body) => { status.textContent = `Fetch success: ${body.source}`; });
+        fetch("./api-missing.json")
+          .then((response) => {
+            if (!response.ok) throw new Error(`Expected fetch failure: ${response.status}`);
+          })
+          .catch((error) => console.error("fixture fetch failure", error.message));
+
+        for (const route of ["./api-success.json", "./xhr-missing.json"]) {
+          const xhr = new XMLHttpRequest();
+          xhr.open("GET", route);
+          xhr.addEventListener("loadend", () => {
+            if (xhr.status >= 400 || xhr.status === 0) {
+              console.error("fixture XHR failure", route, xhr.status);
+            }
+          });
+          xhr.send();
+        }
+      }
+
+      document.querySelector('[data-testid="fixture-form"]').addEventListener("submit", (event) => {
+        event.preventDefault();
+        document.querySelector('[data-testid="form-result"]').textContent = "Form submitted";
+      });
+      document.querySelector('[data-testid="fixture-upload"]').addEventListener("change", (event) => {
+        document.querySelector('[data-testid="upload-result"]').textContent =
+          `${event.target.files.length} file(s) selected`;
+      });
+      document.querySelector('[data-testid="popup-button"]').addEventListener("click", () => {
+        window.open("./destination.html?source=popup", "devmanager-fixture-popup");
+      });
+      document.querySelector('[data-testid="console-error-button"]').addEventListener("click", () => {
+        console.error("fixture console error token=[redaction-check]");
+      });
+      document.querySelector('[data-testid="runtime-error-button"]').addEventListener("click", () => {
+        setTimeout(() => { throw new Error("fixture runtime error"); }, 0);
+      });
+      document.querySelector('[data-testid="network-button"]').addEventListener("click", issueNetworkTraffic);
+      document.querySelector('[data-testid="never-appears-trigger"]').addEventListener("click", () => {
+        status.textContent = "The never-appears target is intentionally absent";
+      });
+      document.querySelector('[data-testid="drop-zone"]').addEventListener("drop", (event) => {
+        event.preventDefault();
+        event.currentTarget.textContent = "Drop completed";
+      });
+      document.querySelector('[data-testid="drop-zone"]').addEventListener("dragover", (event) => {
+        event.preventDefault();
+      });
+
+      setTimeout(() => {
+        document.querySelector('[data-testid="mutation-container"]').insertAdjacentHTML(
+          "beforeend",
+          '<button data-testid="delayed-target" aria-label="Delayed fixture target">Delayed target</button>',
+        );
+      }, 150);
+
+      issueNetworkTraffic();
+    </script>
+  </body>
+</html>
