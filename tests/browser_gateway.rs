@@ -80,10 +80,24 @@ fn arguments(value: Value) -> Map<String, Value> {
 }
 
 async fn run_fake_host(
-    mut inbox: BrowserCommandInbox,
+    inbox: BrowserCommandInbox,
     commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>>,
 ) {
-    let mut host = BrowserHostState::new(PathBuf::from("gateway-fake-host"));
+    run_fake_host_with_state(
+        inbox,
+        commands,
+        Arc::new(Mutex::new(BrowserHostState::new(PathBuf::from(
+            "gateway-fake-host",
+        )))),
+    )
+    .await;
+}
+
+async fn run_fake_host_with_state(
+    mut inbox: BrowserCommandInbox,
+    commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>>,
+    host: Arc<Mutex<BrowserHostState>>,
+) {
     while let Some(request) = inbox.recv().await {
         let key = request.workspace_key().clone();
         let command = request.command().clone();
@@ -91,6 +105,7 @@ async fn run_fake_host(
             .lock()
             .unwrap()
             .push((key.clone(), command.clone()));
+        let mut host = host.lock().unwrap();
         let result = match command {
             BrowserCommand::Status => Ok(BrowserResponse::Status {
                 status: BrowserHostStatus {
@@ -100,6 +115,13 @@ async fn run_fake_host(
                     diagnostic: None,
                 },
             }),
+            BrowserCommand::WorkspaceState => host
+                .workspace(&key)
+                .cloned()
+                .map(|snapshot| BrowserResponse::WorkspaceState { snapshot })
+                .ok_or_else(|| devmanager::browser::BrowserError::CrashedView {
+                    message: "missing fake workspace".to_string(),
+                }),
             BrowserCommand::Ensure { snapshot } => host
                 .ensure_workspace(key, snapshot)
                 .map(|mutation| BrowserResponse::Workspace { mutation }),
@@ -134,6 +156,7 @@ async fn run_fake_host(
             | BrowserCommand::Stop { .. } => Ok(BrowserResponse::Acknowledged),
             other => panic!("unexpected fake-host command: {other:?}"),
         };
+        drop(host);
         request.respond(result);
     }
 }
@@ -338,11 +361,12 @@ async fn tokens_on_one_listener_route_to_their_exact_bound_workspaces() {
 
         let routed = observed_commands.lock().unwrap().clone();
         for (index, key) in expected.iter().enumerate() {
-            let commands = &routed[index * 3..index * 3 + 3];
+            let commands = &routed[index * 4..index * 4 + 4];
             assert!(commands.iter().all(|(routed_key, _)| routed_key == key));
             assert!(matches!(commands[0].1, BrowserCommand::Ensure { .. }));
             assert_eq!(commands[1].1, BrowserCommand::SetPaneOpen { open: true });
-            assert_eq!(commands[2].1, BrowserCommand::Status);
+            assert_eq!(commands[2].1, BrowserCommand::WorkspaceState);
+            assert_eq!(commands[3].1, BrowserCommand::Status);
         }
     };
     let (_, ()) = tokio::join!(run_fake_host(inbox, commands), scenario);
@@ -449,7 +473,8 @@ async fn real_rmcp_client_lists_and_calls_only_the_three_v1_tools() {
         let recorded = observed_commands.lock().unwrap().clone();
         assert!(matches!(recorded[0].1, BrowserCommand::Ensure { .. }));
         assert_eq!(recorded[1].1, BrowserCommand::SetPaneOpen { open: true });
-        assert_eq!(recorded[2].1, BrowserCommand::Status);
+        assert_eq!(recorded[2].1, BrowserCommand::WorkspaceState);
+        assert_eq!(recorded[3].1, BrowserCommand::Status);
 
         let blank_intent = client
             .peer()
@@ -563,8 +588,110 @@ async fn real_rmcp_client_lists_and_calls_only_the_three_v1_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_refreshes_user_changed_workspace_state_before_each_tool_operation() {
+    let (bridge, inbox) = browser_command_channel(32);
+    let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let host = Arc::new(Mutex::new(BrowserHostState::new(PathBuf::from(
+        "gateway-live-state-host",
+    ))));
+    let fake_host = run_fake_host_with_state(inbox, Arc::clone(&commands), Arc::clone(&host));
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let scenario = async move {
+        let key = workspace("project-live", "conversation-live");
+        let registration = gateway
+            .registrar()
+            .register(
+                "ai-process-live",
+                key.clone(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register live-state token");
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize live-state client");
+
+        client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_status").with_arguments(arguments(json!({
+                    "intent": "initialize my companion pane",
+                    "risk": "normal"
+                }))),
+            )
+            .await
+            .expect("initialize browser workspace");
+
+        let external = host
+            .lock()
+            .unwrap()
+            .create_tab(&key, "https://example.test/user-selected")
+            .expect("user creates and selects a tab outside MCP");
+        let external_tab_id = external
+            .snapshot
+            .selected_tab_id
+            .clone()
+            .expect("externally selected tab");
+        let external_revision = external.revision.0;
+
+        let status = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_status").with_arguments(arguments(json!({
+                    "intent": "read the current user-selected tab",
+                    "risk": "normal"
+                }))),
+            )
+            .await
+            .expect("read refreshed browser status")
+            .structured_content
+            .expect("structured refreshed status");
+        assert_eq!(status["selectedTabId"], external_tab_id);
+        assert_eq!(status["revision"], external_revision);
+
+        let navigated = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_navigate").with_arguments(arguments(json!({
+                    "intent": "navigate the currently selected tab",
+                    "risk": "normal",
+                    "operation": "goto",
+                    "url": "https://example.test/after-refresh"
+                }))),
+            )
+            .await
+            .expect("navigate refreshed selection")
+            .structured_content
+            .expect("structured navigation result");
+        assert_eq!(navigated["tab"]["id"], external_tab_id);
+        assert_eq!(
+            navigated["tab"]["url"],
+            "https://example.test/after-refresh"
+        );
+
+        let recorded = commands.lock().unwrap().clone();
+        let navigate_index = recorded
+            .iter()
+            .position(|(_, command)| matches!(command, BrowserCommand::Navigate { .. }))
+            .expect("navigate command recorded");
+        assert!(matches!(
+            recorded[navigate_index - 1].1,
+            BrowserCommand::WorkspaceState
+        ));
+        client.cancel().await.expect("close live-state client");
+    };
+
+    let (_, ()) = tokio::join!(fake_host, scenario);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_shutdown_is_bounded_with_a_live_rmcp_client() {
-    let (bridge, _inbox) = browser_command_channel(8);
+    let (bridge, mut inbox) = browser_command_channel(8);
     let gateway = BrowserGatewayHandle::start(bridge).unwrap();
     let registration = gateway
         .registrar()
@@ -583,10 +710,41 @@ async fn gateway_shutdown_is_bounded_with_a_live_rmcp_client() {
         .await
         .expect("initialize live client");
 
-    let dropping = tokio::task::spawn_blocking(move || drop(gateway));
-    tokio::time::timeout(Duration::from_millis(500), dropping)
-        .await
-        .expect("gateway drop must not wait for a live SSE connection")
-        .expect("gateway drop worker");
-    drop(client);
+    let (completed, mut dropping) = {
+        let peer = client.peer();
+        let call = peer.call_tool(CallToolRequestParams::new("browser_status").with_arguments(
+            arguments(json!({
+                "intent": "hold an active request during shutdown",
+                "risk": "normal"
+            })),
+        ));
+        tokio::pin!(call);
+        let pending_request = tokio::select! {
+            request = inbox.recv() => request.expect("active controller request"),
+            result = &mut call => panic!("tool call unexpectedly completed before host response: {result:?}"),
+        };
+        assert!(matches!(
+            pending_request.command(),
+            BrowserCommand::Ensure { .. }
+        ));
+
+        let mut dropping = tokio::task::spawn_blocking(move || drop(gateway));
+        let completed = tokio::time::timeout(Duration::from_millis(500), &mut dropping)
+            .await
+            .is_ok();
+        pending_request.respond(Err(devmanager::browser::BrowserError::Interrupted));
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut call).await;
+        (completed, dropping)
+    };
+    let _ = client.cancel().await;
+    if !completed {
+        tokio::time::timeout(Duration::from_secs(2), &mut dropping)
+            .await
+            .expect("gateway drop should finish after the active request is released")
+            .expect("gateway drop worker");
+    }
+    assert!(
+        completed,
+        "gateway drop must be bounded while an authenticated request is active"
+    );
 }

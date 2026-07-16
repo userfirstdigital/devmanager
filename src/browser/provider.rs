@@ -1,4 +1,6 @@
-use crate::ai::claude_hooks::{append_claude_cli_arguments, ClaudeShellKind};
+use crate::ai::claude_hooks::{
+    append_claude_cli_arguments, is_safe_cmd_settings_root, ClaudeShellKind,
+};
 use crate::ai::codex_bridge::CodexConfigOverride;
 use axum::http::Uri;
 use serde_json::json;
@@ -144,6 +146,9 @@ pub fn prepare_claude_browser_overlay(
 ) -> Result<ClaudeBrowserOverlay, String> {
     validate_process_session_id(process_session_id)?;
     let root = root.as_ref().to_path_buf();
+    if shell == ClaudeShellKind::Cmd && !is_safe_cmd_settings_root(&root) {
+        return Err("Claude browser overlay path cannot be quoted safely for cmd.exe".to_string());
+    }
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("create Claude browser overlay directory: {error}"))?;
 

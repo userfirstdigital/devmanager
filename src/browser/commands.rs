@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 )]
 pub enum BrowserCommand {
     Status,
+    WorkspaceState,
     Ensure {
         snapshot: BrowserWorkspaceSnapshot,
     },
@@ -68,6 +69,7 @@ impl BrowserCommand {
     fn operation_name(&self) -> &'static str {
         match self {
             Self::Status => "status",
+            Self::WorkspaceState => "workspaceState",
             Self::Ensure { .. } => "ensure",
             Self::SetPaneOpen { .. } => "setPaneOpen",
             Self::ListTabs => "listTabs",
@@ -99,6 +101,7 @@ impl BrowserCommand {
             | Self::OpenDevTools { tab_id } => Some(tab_id),
             Self::Stop { tab_id } => tab_id.as_deref(),
             Self::Status
+            | Self::WorkspaceState
             | Self::Ensure { .. }
             | Self::SetPaneOpen { .. }
             | Self::ListTabs
@@ -128,6 +131,9 @@ pub struct BrowserHostStatus {
 pub enum BrowserResponse {
     Status {
         status: BrowserHostStatus,
+    },
+    WorkspaceState {
+        snapshot: BrowserWorkspaceSnapshot,
     },
     Workspace {
         mutation: BrowserWorkspaceMutation,

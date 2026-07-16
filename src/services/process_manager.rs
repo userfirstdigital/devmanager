@@ -5237,6 +5237,30 @@ fn cleanup_codex_adapter_session_if_matches(
     was_removed
 }
 
+fn cleanup_browser_provider_session_if_matches(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+    expected: &BrowserGatewayRegistration,
+) -> bool {
+    let removed = {
+        let mut sessions = inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = sessions.get(session_id).is_some_and(|session| {
+            session.registration.process_session_id() == expected.process_session_id()
+                && session.registration.workspace_key() == expected.workspace_key()
+                && session.registration.access().bearer_token() == expected.access().bearer_token()
+        });
+        matches.then(|| sessions.remove(session_id)).flatten()
+    };
+    let Some(removed) = removed else {
+        return false;
+    };
+    removed.registrar.revoke(&removed.registration);
+    true
+}
+
 fn session_change_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
@@ -5254,6 +5278,12 @@ fn session_change_notifier(
         .sessions
         .get(&session_id)
         .map(|session| session.identity().clone());
+    let browser_registration = inner
+        .browser_provider_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&session_id)
+        .map(|session| session.registration.clone());
     Arc::new(move || {
         if note_runtime_generation_change(&inner, &session_id) {
             mark_remote_session_dirty(&inner, &session_id);
@@ -5276,6 +5306,9 @@ fn session_change_notifier(
             }
             if let Some(identity) = codex_identity.as_ref() {
                 cleanup_codex_adapter_session_if_matches(&inner, &session_id, identity);
+            }
+            if let Some(registration) = browser_registration.as_ref() {
+                cleanup_browser_provider_session_if_matches(&inner, &session_id, registration);
             }
         }
     })
@@ -5980,6 +6013,25 @@ fn spawn_ai_session_with_inner(
     session_id: &str,
     dimensions: SessionDimensions,
 ) -> Result<(), String> {
+    spawn_ai_session_with_writer(
+        inner,
+        launch,
+        session_id,
+        dimensions,
+        TerminalSession::write_text,
+    )
+}
+
+fn spawn_ai_session_with_writer<F>(
+    inner: &Arc<ProcessManagerInner>,
+    launch: &AiLaunchSpec,
+    session_id: &str,
+    dimensions: SessionDimensions,
+    write_startup_command: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&TerminalSession, &str) -> Result<(), String>,
+{
     let manager = process_manager_from_inner(inner.clone());
     if manager.session_exists(session_id) {
         return Ok(());
@@ -6044,7 +6096,33 @@ fn spawn_ai_session_with_inner(
         sessions.insert(session_id.to_string(), session.clone());
     }
     thread::sleep(Duration::from_millis(AI_COMMAND_INJECTION_DELAY_MS));
-    let _ = session.write_text(&(effective_launch.startup_command + "\r\n"));
+    let startup_command = effective_launch.startup_command + "\r\n";
+    if let Err(write_error) = write_startup_command(&session, &startup_command) {
+        let error = format!("inject AI startup command: {write_error}");
+        manager.cleanup_ai_adapters_for_session(session_id);
+        if let Ok(mut sessions) = inner.sessions.lock() {
+            let is_failed_session = sessions
+                .get(session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &session));
+            if is_failed_session {
+                sessions.remove(session_id);
+            }
+        }
+        let _ = session.close(false);
+        drop(session);
+        let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Failed;
+            state.exit = Some(SessionExitState {
+                code: None,
+                signal: None,
+                closed_by_user: false,
+                summary: error.clone(),
+            });
+            state.mark_dirty();
+        });
+        return Err(error);
+    }
     if let Some(identity) = codex_identity.as_ref() {
         mark_codex_remote_command_injected(inner, session_id, identity);
     }
@@ -6286,6 +6364,103 @@ mod tests {
         assert_eq!(gateway.registrar().active_registration_count(), 0);
     }
 
+    #[test]
+    fn terminal_exit_cleans_only_the_captured_browser_provider_registration() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        let session_id = "shared-browser-exit-session";
+        let mut launch = browser_test_launch(SessionKind::Claude, "claude --model sonnet");
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            session_id,
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+        manager.ensure_runtime_entry(
+            session_id,
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Running;
+        });
+        let old_exit_notifier =
+            session_change_notifier(manager.inner.clone(), session_id.to_string());
+        let old_overlay = manager
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .unwrap()
+            ._claude_overlay
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+
+        let mut replacement = browser_test_launch(SessionKind::Claude, "claude --model opus");
+        manager.prepare_browser_launch_for_session(
+            &mut replacement,
+            session_id,
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+        let (replacement_token, replacement_overlay) = {
+            let sessions = manager.inner.browser_provider_sessions.lock().unwrap();
+            let replacement = sessions.get(session_id).unwrap();
+            (
+                replacement
+                    .registration
+                    .access()
+                    .bearer_token_for_launch()
+                    .to_string(),
+                replacement
+                    ._claude_overlay
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .to_path_buf(),
+            )
+        };
+        assert!(!old_overlay.exists());
+        assert!(replacement_overlay.exists());
+
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Exited;
+        });
+        old_exit_notifier();
+
+        assert_eq!(gateway.registrar().active_registration_count(), 1);
+        assert_eq!(
+            manager
+                .inner
+                .browser_provider_sessions
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .unwrap()
+                .registration
+                .access()
+                .bearer_token_for_launch(),
+            replacement_token
+        );
+        assert!(replacement_overlay.exists());
+
+        let replacement_exit_notifier =
+            session_change_notifier(manager.inner.clone(), session_id.to_string());
+        replacement_exit_notifier();
+
+        assert!(!manager
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap()
+            .contains_key(session_id));
+        assert_eq!(gateway.registrar().active_registration_count(), 0);
+        assert!(!replacement_overlay.exists());
+    }
+
     #[tokio::test]
     async fn codex_browser_config_and_token_survive_native_adapter_fallback() {
         let (bridge, _inbox) = crate::browser::browser_command_channel(8);
@@ -6460,6 +6635,61 @@ mod tests {
 
         assert!(environment.is_empty());
         assert_eq!(gateway.registrar().active_registration_count(), 0);
+    }
+
+    #[test]
+    fn startup_command_write_failure_cleans_session_and_browser_credentials() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        let session_id = "startup-write-failure";
+        let mut launch = browser_test_launch(SessionKind::Claude, "claude --model sonnet");
+        if !cfg!(windows) {
+            launch.shell_program = "/bin/sh".to_string();
+        }
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            session_id,
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+        let overlay_path = manager
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .unwrap()
+            ._claude_overlay
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        manager.ensure_runtime_entry(session_id, launch.cwd.clone(), SessionDimensions::default());
+
+        let result = spawn_ai_session_with_writer(
+            &manager.inner,
+            &launch,
+            session_id,
+            SessionDimensions::default(),
+            |_session, _command| Err("fixture PTY write failed".to_string()),
+        );
+
+        let error = result.expect_err("startup command write failure must fail the spawn");
+        assert!(error.contains("fixture PTY write failed"));
+        assert!(!manager.session_exists(session_id));
+        assert!(!manager
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap()
+            .contains_key(session_id));
+        assert_eq!(gateway.registrar().active_registration_count(), 0);
+        assert!(!overlay_path.exists());
+        assert_eq!(
+            manager.runtime_state().sessions[session_id].status,
+            SessionStatus::Failed
+        );
     }
 
     impl CodexFallbackTerminalOps for RecordingCodexFallbackTerminalOps {

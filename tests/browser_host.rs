@@ -495,6 +495,7 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
     let viewport = BrowserViewport::default();
     let commands = vec![
         (BrowserCommand::Status, "status"),
+        (BrowserCommand::WorkspaceState, "workspaceState"),
         (
             BrowserCommand::Ensure {
                 snapshot: snapshot.clone(),
@@ -576,6 +577,16 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
         let round_trip: BrowserCommand = serde_json::from_value(value).expect("round-trip command");
         assert_eq!(round_trip, command);
     }
+
+    let response = BrowserResponse::WorkspaceState {
+        snapshot: snapshot.clone(),
+    };
+    let value = serde_json::to_value(&response).expect("serialize workspace state response");
+    assert_eq!(value["type"], "workspaceState");
+    assert_eq!(
+        serde_json::from_value::<BrowserResponse>(value).unwrap(),
+        response
+    );
 
     let response = BrowserResponse::DownloadDirectory {
         path: PathBuf::from("C:/downloads/project-a"),

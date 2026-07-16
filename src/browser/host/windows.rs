@@ -216,6 +216,14 @@ impl BrowserWebViewHost {
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
         match command {
+            BrowserCommand::WorkspaceState => {
+                let snapshot = self
+                    .state
+                    .workspace(workspace_key)
+                    .cloned()
+                    .ok_or_else(missing_workspace)?;
+                Ok(BrowserResponse::WorkspaceState { snapshot })
+            }
             BrowserCommand::Ensure { snapshot } => {
                 let mutation = self
                     .state

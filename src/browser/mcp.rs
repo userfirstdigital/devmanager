@@ -143,7 +143,24 @@ impl BrowserMcpServer {
             self.apply_workspace_response(opened).await?;
             *first_use = true;
         }
-        Ok(self.context.live_snapshot.lock().await.clone())
+        drop(first_use);
+        self.refresh_workspace_state().await
+    }
+
+    async fn refresh_workspace_state(&self) -> Result<BrowserWorkspaceSnapshot, ToolFailure> {
+        let response = self
+            .context
+            .controller
+            .request(BrowserCommand::WorkspaceState)
+            .await
+            .map_err(ToolFailure::from)?;
+        let BrowserResponse::WorkspaceState { snapshot } = response else {
+            return Err(ToolFailure::invalid_response(
+                "browser host returned the wrong workspace-state response type",
+            ));
+        };
+        *self.context.live_snapshot.lock().await = snapshot.clone();
+        Ok(snapshot)
     }
 
     async fn apply_workspace_response(
@@ -160,40 +177,12 @@ impl BrowserMcpServer {
         Ok(snapshot)
     }
 
-    async fn apply_tab_list(
-        &self,
-        response: BrowserResponse,
-    ) -> Result<BrowserWorkspaceSnapshot, ToolFailure> {
-        let BrowserResponse::Tabs {
-            tabs,
-            selected_tab_id,
-        } = response
-        else {
-            return Err(ToolFailure::invalid_response(
-                "browser host returned the wrong tab response type",
-            ));
-        };
-        let mut snapshot = self.context.live_snapshot.lock().await;
-        snapshot.tabs = tabs;
-        snapshot.selected_tab_id = selected_tab_id;
-        Ok(snapshot.clone())
-    }
-
-    async fn request_tabs(&self) -> Result<BrowserWorkspaceSnapshot, ToolFailure> {
-        let response = self
-            .context
-            .controller
-            .request(BrowserCommand::ListTabs)
-            .await
-            .map_err(ToolFailure::from)?;
-        self.apply_tab_list(response).await
-    }
-
     async fn run_tabs_operation(&self, request: BrowserTabsRequest) -> Result<Value, ToolFailure> {
-        self.validate_and_ensure(&request.intent, request.risk)
+        let current = self
+            .validate_and_ensure(&request.intent, request.risk)
             .await?;
         let snapshot = match request.operation {
-            BrowserTabsOperation::List => self.request_tabs().await?,
+            BrowserTabsOperation::List => current,
             BrowserTabsOperation::Create => {
                 let response = self
                     .context
@@ -252,12 +241,18 @@ impl BrowserMcpServer {
             .request(command)
             .await
             .map_err(ToolFailure::from)?;
-        if matches!(response, BrowserResponse::Workspace { .. }) {
-            snapshot = self.apply_workspace_response(response).await?;
-        } else if !matches!(response, BrowserResponse::Acknowledged) {
-            return Err(ToolFailure::invalid_response(
-                "browser host returned the wrong navigation response type",
-            ));
+        match response {
+            workspace @ BrowserResponse::Workspace { .. } => {
+                snapshot = self.apply_workspace_response(workspace).await?;
+            }
+            BrowserResponse::Acknowledged => {
+                snapshot = self.refresh_workspace_state().await?;
+            }
+            _ => {
+                return Err(ToolFailure::invalid_response(
+                    "browser host returned the wrong navigation response type",
+                ));
+            }
         }
         let selected = snapshot
             .tabs

@@ -18,8 +18,10 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower::Service;
+
+const GATEWAY_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 type RegistrationService = StreamableHttpService<BrowserMcpServer, LocalSessionManager>;
 
@@ -98,6 +100,16 @@ pub struct BrowserGatewayHandle {
 
 impl BrowserGatewayHandle {
     pub fn start(bridge: BrowserCommandBridge) -> Result<Self, String> {
+        Self::start_with_runtime_builder(bridge, build_gateway_runtime)
+    }
+
+    fn start_with_runtime_builder<F>(
+        bridge: BrowserCommandBridge,
+        build_runtime: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<tokio::runtime::Runtime, String> + Send + 'static,
+    {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("bind DevManager browser MCP gateway: {error}"))?;
         listener
@@ -113,22 +125,19 @@ impl BrowserGatewayHandle {
             endpoint,
             bridge,
             registrations: Mutex::new(RegistrationStore::default()),
-            running: AtomicBool::new(true),
+            running: AtomicBool::new(false),
         });
         let server_inner = Arc::clone(&inner);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("devmanager-browser-mcp".to_string())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                {
+                let runtime = match build_runtime() {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        server_inner.running.store(false, Ordering::Release);
-                        eprintln!("DevManager browser MCP runtime failed: {error}");
+                        stop_and_clear_registrations(&server_inner);
+                        let _ = ready_tx.send(Err(error));
                         return;
                     }
                 };
@@ -136,28 +145,48 @@ impl BrowserGatewayHandle {
                     let listener = match tokio::net::TcpListener::from_std(listener) {
                         Ok(listener) => listener,
                         Err(error) => {
-                            server_inner.running.store(false, Ordering::Release);
-                            eprintln!("DevManager browser MCP listener failed: {error}");
+                            stop_and_clear_registrations(&server_inner);
+                            let _ = ready_tx.send(Err(format!(
+                                "initialize DevManager browser MCP listener: {error}"
+                            )));
                             return;
                         }
                     };
                     let app = Router::new()
                         .route("/mcp", any(dispatch_mcp))
                         .with_state(Arc::clone(&server_inner));
+                    server_inner.running.store(true, Ordering::Release);
+                    if ready_tx.send(Ok(())).is_err() {
+                        stop_and_clear_registrations(&server_inner);
+                        return;
+                    }
                     let _ = axum::serve(listener, app)
                         .with_graceful_shutdown(async move {
                             let _ = shutdown_rx.await;
                         })
                         .await;
-                    server_inner.running.store(false, Ordering::Release);
+                    stop_and_clear_registrations(&server_inner);
                 });
             })
             .map_err(|error| format!("start DevManager browser MCP thread: {error}"))?;
-        Ok(Self {
+        let handle = Self {
             inner,
             shutdown: Mutex::new(Some(shutdown_tx)),
             thread: Mutex::new(Some(thread)),
-        })
+        };
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(handle),
+            Ok(Err(error)) => {
+                drop(handle);
+                Err(error)
+            }
+            Err(error) => {
+                drop(handle);
+                Err(format!(
+                    "DevManager browser MCP thread exited before readiness: {error}"
+                ))
+            }
+        }
     }
 
     pub fn registrar(&self) -> BrowserGatewayRegistrar {
@@ -175,15 +204,28 @@ impl BrowserGatewayHandle {
     }
 }
 
+fn build_gateway_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| format!("initialize DevManager browser MCP runtime: {error}"))
+}
+
 impl Drop for BrowserGatewayHandle {
     fn drop(&mut self) {
-        self.inner.running.store(false, Ordering::Release);
-        self.registrar().revoke_all();
+        stop_and_clear_registrations(&self.inner);
         if let Some(shutdown) = lock(&self.shutdown).take() {
             let _ = shutdown.send(());
         }
         if let Some(thread) = lock(&self.thread).take() {
-            let _ = thread.join();
+            let started = Instant::now();
+            while !thread.is_finished() && started.elapsed() < GATEWAY_THREAD_JOIN_TIMEOUT {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -195,6 +237,19 @@ impl BrowserGatewayRegistrar {
         workspace_key: BrowserWorkspaceKey,
         initial_snapshot: BrowserWorkspaceSnapshot,
     ) -> Result<BrowserGatewayRegistration, String> {
+        self.register_with_before_store(process_session_id, workspace_key, initial_snapshot, || {})
+    }
+
+    fn register_with_before_store<F>(
+        &self,
+        process_session_id: impl Into<String>,
+        workspace_key: BrowserWorkspaceKey,
+        initial_snapshot: BrowserWorkspaceSnapshot,
+        before_store: F,
+    ) -> Result<BrowserGatewayRegistration, String>
+    where
+        F: FnOnce(),
+    {
         if !self.inner.running.load(Ordering::Acquire) {
             return Err("DevManager browser MCP gateway is not running".to_string());
         }
@@ -223,7 +278,11 @@ impl BrowserGatewayRegistrar {
             workspace_key: workspace_key.clone(),
             service,
         };
+        before_store();
         let mut registrations = lock(&self.inner.registrations);
+        if !self.inner.running.load(Ordering::Acquire) {
+            return Err("DevManager browser MCP gateway is not running".to_string());
+        }
         if let Some(old_token) = registrations
             .token_by_process
             .insert(process_session_id.clone(), token.clone())
@@ -282,6 +341,13 @@ impl BrowserGatewayRegistrar {
     pub fn endpoint(&self) -> &str {
         &self.inner.endpoint
     }
+}
+
+fn stop_and_clear_registrations(inner: &BrowserGatewayInner) {
+    let mut registrations = lock(&inner.registrations);
+    inner.running.store(false, Ordering::Release);
+    registrations.by_token.clear();
+    registrations.token_by_process.clear();
 }
 
 async fn dispatch_mcp(
@@ -376,4 +442,48 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browser::browser_command_channel;
+
+    #[test]
+    fn start_waits_for_thread_runtime_failure_before_returning() {
+        let (bridge, _inbox) = browser_command_channel(1);
+
+        let result = BrowserGatewayHandle::start_with_runtime_builder(bridge, || {
+            Err("fixture runtime construction failed".to_string())
+        });
+
+        let error = match result {
+            Ok(_) => panic!("gateway startup must not publish a handle before runtime readiness"),
+            Err(error) => error,
+        };
+        assert!(error.contains("fixture runtime construction failed"));
+    }
+
+    #[test]
+    fn registration_cannot_publish_after_shutdown_wins_before_store_lock() {
+        let (bridge, _inbox) = browser_command_channel(1);
+        let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+        let registrar = gateway.registrar();
+        let shutdown = registrar.clone();
+
+        let result = registrar.register_with_before_store(
+            "racing-process",
+            BrowserWorkspaceKey::new("project", "conversation").unwrap(),
+            BrowserWorkspaceSnapshot::default(),
+            move || {
+                shutdown.inner.running.store(false, Ordering::Release);
+                shutdown.revoke_all();
+            },
+        );
+
+        assert!(result
+            .expect_err("shutdown must fence a registration that has not reached the store")
+            .contains("not running"));
+        assert_eq!(registrar.active_registration_count(), 0);
+    }
 }

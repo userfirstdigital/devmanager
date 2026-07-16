@@ -2627,7 +2627,7 @@ pub fn append_claude_cli_arguments(
     Ok(command)
 }
 
-fn is_safe_cmd_settings_root(path: &Path) -> bool {
+pub(crate) fn is_safe_cmd_settings_root(path: &Path) -> bool {
     path.to_str().is_some_and(|value| {
         !value
             .chars()

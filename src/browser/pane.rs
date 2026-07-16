@@ -371,6 +371,11 @@ pub fn browser_response_sync(
             revision: mutation.revision,
             snapshot: mutation.snapshot.clone(),
         }),
+        BrowserResponse::WorkspaceState { snapshot } => Some(BrowserSnapshotSync {
+            workspace_key: route.clone(),
+            revision: snapshot.revision,
+            snapshot: snapshot.clone(),
+        }),
         BrowserResponse::Status { .. }
         | BrowserResponse::Tabs { .. }
         | BrowserResponse::DownloadDirectory { .. }

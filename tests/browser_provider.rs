@@ -113,6 +113,26 @@ fn claude_overlay_failure_leaves_the_original_command_and_directory_untouched() 
 }
 
 #[test]
+fn claude_browser_overlay_rejects_cmd_roots_with_expansion_markers() {
+    let temp = TestDir::new("cmd-unsafe-root-parent");
+    let unsafe_root = temp.path().join("browser-%TEMP%-!");
+    let original = "claude --model opus";
+
+    let error = prepare_claude_browser_overlay(
+        &unsafe_root,
+        "claude-session",
+        original,
+        ClaudeShellKind::Cmd,
+        &access(),
+    )
+    .expect_err("cmd.exe expansion markers must be rejected before writing an overlay");
+
+    assert!(error.contains("cmd.exe"));
+    assert!(!unsafe_root.exists());
+    assert_eq!(original, "claude --model opus");
+}
+
+#[test]
 fn codex_browser_config_is_typed_exact_and_only_changes_tui_tokens() {
     let overrides = codex_browser_config_overrides(&access());
     assert_eq!(
