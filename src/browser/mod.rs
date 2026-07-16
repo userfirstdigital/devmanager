@@ -24,13 +24,14 @@ pub use model::{
     BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 pub use pane::{
-    browser_action_plan, browser_content_bounds, browser_event_plan, browser_host_visibility,
-    browser_pane_eligible, browser_pane_open_fallback, browser_response_sync,
-    browser_settings_plan, calculate_browser_split, normalize_browser_address, render_browser_pane,
-    selected_browser_tab_id, BrowserActionPlan, BrowserHostVisibility, BrowserPaneAction,
-    BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel,
-    BrowserPaneSurface, BrowserPaneTransient, BrowserSettingsAction, BrowserSettingsPlan,
-    BrowserSnapshotSync, BrowserSplitLayout, BrowserViewportPreset,
+    browser_action_plan, browser_content_bounds, browser_event_plan, browser_host_reconcile_plan,
+    browser_host_visibility, browser_pane_eligible, browser_pane_open_fallback,
+    browser_response_sync, browser_settings_plan, calculate_browser_split,
+    normalize_browser_address, render_browser_pane, selected_browser_tab_id, BrowserActionPlan,
+    BrowserHostReconcilePlan, BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions,
+    BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface,
+    BrowserPaneTransient, BrowserSettingsAction, BrowserSettingsPlan, BrowserSnapshotSync,
+    BrowserSplitLayout, BrowserViewportPreset,
 };
 pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserRisk};
 pub use recipes::{

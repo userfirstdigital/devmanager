@@ -1,12 +1,13 @@
 use devmanager::browser::{
-    browser_action_plan, browser_content_bounds, browser_event_plan, browser_host_visibility,
-    browser_pane_eligible, browser_pane_open_fallback, browser_response_sync,
-    browser_settings_plan, calculate_browser_split, normalize_browser_address, BrowserBounds,
-    BrowserCommand, BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostVisibility,
-    BrowserPaneAction, BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel,
-    BrowserPaneSurface, BrowserPaneTransient, BrowserResponse, BrowserSettingsAction,
-    BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport, BrowserViewportPreset,
-    BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    browser_action_plan, browser_content_bounds, browser_event_plan, browser_host_reconcile_plan,
+    browser_host_visibility, browser_pane_eligible, browser_pane_open_fallback,
+    browser_response_sync, browser_settings_plan, calculate_browser_split,
+    normalize_browser_address, BrowserBounds, BrowserCommand, BrowserError, BrowserHostEvent,
+    BrowserHostState, BrowserHostVisibility, BrowserPaneAction, BrowserPaneContext,
+    BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
+    BrowserResponse, BrowserSettingsAction, BrowserTabSnapshot, BrowserUserInputKind,
+    BrowserViewport, BrowserViewportPreset, BrowserWorkspaceKey, BrowserWorkspaceMutation,
+    BrowserWorkspaceSnapshot,
 };
 use std::path::PathBuf;
 
@@ -290,6 +291,51 @@ fn host_visibility_is_selected_only_for_an_open_eligible_pane() {
             tab_id: "tab-a".to_string(),
         }
     );
+}
+
+#[test]
+fn restored_open_workspace_is_ensured_once_without_overwriting_live_host_state() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let persisted = BrowserWorkspaceSnapshot {
+        pane_open: true,
+        tabs: vec![BrowserTabSnapshot {
+            id: "persisted-tab".to_string(),
+            title: "Persisted".to_string(),
+            url: "https://persisted.example".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("persisted-tab".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+
+    let restored = browser_host_reconcile_plan(
+        &context(BrowserPaneSurface::Claude),
+        &key,
+        &persisted,
+        false,
+        None,
+    );
+    assert_eq!(restored.ensure_snapshot, Some(persisted.clone()));
+    assert!(matches!(
+        restored.visibility,
+        BrowserHostVisibility::Selected { workspace_key, .. } if workspace_key == key
+    ));
+
+    let mut newer_live = persisted.clone();
+    newer_live.tabs[0].url = "https://newer-live.example".to_string();
+    newer_live.advance_revision();
+    let routine_sync = browser_host_reconcile_plan(
+        &context(BrowserPaneSurface::Claude),
+        &key,
+        &persisted,
+        false,
+        Some(&newer_live),
+    );
+    assert_eq!(routine_sync.ensure_snapshot, None);
+
+    let app_source = include_str!("../src/app/mod.rs");
+    assert!(app_source.contains("browser_host_reconcile_plan("));
+    assert!(app_source.contains("BrowserCommand::Ensure { snapshot }"));
 }
 
 #[test]

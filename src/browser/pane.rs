@@ -139,6 +139,12 @@ pub enum BrowserHostVisibility {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserHostReconcilePlan {
+    pub visibility: BrowserHostVisibility,
+    pub ensure_snapshot: Option<BrowserWorkspaceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserActionPlan {
     pub workspace_key: BrowserWorkspaceKey,
     pub commands: Vec<BrowserCommand>,
@@ -251,6 +257,25 @@ pub fn browser_host_visibility(
             tab_id: tab_id.to_string(),
         }
     })
+}
+
+pub fn browser_host_reconcile_plan(
+    context: &BrowserPaneContext,
+    workspace_key: &BrowserWorkspaceKey,
+    persisted_snapshot: &BrowserWorkspaceSnapshot,
+    divider_dragging: bool,
+    live_host_snapshot: Option<&BrowserWorkspaceSnapshot>,
+) -> BrowserHostReconcilePlan {
+    let visibility =
+        browser_host_visibility(context, workspace_key, persisted_snapshot, divider_dragging);
+    let ensure_snapshot = match (&visibility, live_host_snapshot) {
+        (BrowserHostVisibility::Selected { .. }, None) => Some(persisted_snapshot.clone()),
+        _ => None,
+    };
+    BrowserHostReconcilePlan {
+        visibility,
+        ensure_snapshot,
+    }
 }
 
 pub fn browser_action_plan(

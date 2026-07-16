@@ -3,7 +3,7 @@ mod process_monitor;
 
 use crate::assets::AppAssets;
 use crate::browser::{
-    browser_action_plan, browser_command_channel, browser_event_plan, browser_host_visibility,
+    browser_action_plan, browser_command_channel, browser_event_plan, browser_host_reconcile_plan,
     browser_pane_open_fallback, browser_response_sync, browser_settings_plan,
     calculate_browser_split, render_browser_pane, BrowserBounds, BrowserCommand,
     BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
@@ -1046,7 +1046,7 @@ impl NativeShell {
         let command = request.command().clone();
         let result = self.dispatch_browser_command(&workspace_key, command, window);
         request.respond(result);
-        self.sync_browser_host_visibility();
+        self.sync_browser_host_visibility(Some(window));
         cx.notify();
     }
 
@@ -1116,7 +1116,7 @@ impl NativeShell {
         if persist {
             self.save_session_state();
         }
-        self.sync_browser_host_visibility();
+        self.sync_browser_host_visibility(Some(window));
         cx.notify();
     }
 
@@ -1135,23 +1135,53 @@ impl NativeShell {
         }
     }
 
-    fn sync_browser_host_visibility(&mut self) {
+    fn sync_browser_host_visibility(&mut self, window: Option<&Window>) {
         let context = self.browser_pane_context();
-        let visibility = self.state.active_tab().and_then(|tab| {
+        let plan = self.state.active_tab().and_then(|tab| {
             let key = BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()?;
             let snapshot = tab.browser_workspace.as_ref()?;
-            Some(browser_host_visibility(
+            Some(browser_host_reconcile_plan(
                 &context,
                 &key,
                 snapshot,
                 self.browser_divider_drag.is_some(),
+                self.browser_host.workspace_snapshot(&key),
             ))
         });
-        let active_workspace = match visibility {
-            Some(BrowserHostVisibility::Selected { workspace_key, .. }) => Some(workspace_key),
+        let mut active_workspace = match plan.as_ref().map(|plan| &plan.visibility) {
+            Some(BrowserHostVisibility::Selected { workspace_key, .. }) => {
+                Some(workspace_key.clone())
+            }
             Some(BrowserHostVisibility::Hidden) | None => None,
         };
-        let _ = self.browser_host.set_active_workspace(active_workspace);
+        if let Some(snapshot) = plan.and_then(|plan| plan.ensure_snapshot) {
+            let Some(window) = window else {
+                let _ = self.browser_host.set_active_workspace(None);
+                return;
+            };
+            let Some(workspace_key) = active_workspace.as_ref() else {
+                return;
+            };
+            if self
+                .dispatch_browser_command(
+                    workspace_key,
+                    BrowserCommand::Ensure { snapshot },
+                    window,
+                )
+                .is_err()
+            {
+                active_workspace = None;
+            }
+        }
+        if let Err(error) = self
+            .browser_host
+            .set_active_workspace(active_workspace.clone())
+        {
+            if let Some(workspace_key) = active_workspace {
+                self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                    Some(error.to_string());
+            }
+        }
     }
 
     fn active_browser_model(&self) -> Option<BrowserPaneModel> {
@@ -1236,7 +1266,7 @@ impl NativeShell {
         match action {
             BrowserPaneAction::DividerBegin { .. } => {
                 self.browser_divider_drag = Some(BrowserDividerDrag { workspace_key });
-                self.sync_browser_host_visibility();
+                self.sync_browser_host_visibility(Some(window));
                 cx.notify();
                 return;
             }
@@ -1263,7 +1293,7 @@ impl NativeShell {
             BrowserPaneAction::DividerEnd => {
                 if self.browser_divider_drag.take().is_some() {
                     self.save_session_state();
-                    self.sync_browser_host_visibility();
+                    self.sync_browser_host_visibility(Some(window));
                     cx.notify();
                 }
                 return;
@@ -1373,7 +1403,7 @@ impl NativeShell {
                 ui.address_draft = None;
             }
         }
-        self.sync_browser_host_visibility();
+        self.sync_browser_host_visibility(Some(window));
         cx.notify();
     }
 
@@ -1490,7 +1520,7 @@ impl NativeShell {
                 self.editor_notice = Some(format!("Browser operation failed: {error}"));
             }
         }
-        self.sync_browser_host_visibility();
+        self.sync_browser_host_visibility(Some(window));
         cx.notify();
     }
 
@@ -6197,7 +6227,7 @@ impl NativeShell {
         apply_browser_enabled_preference(&mut settings, draft.browser_enabled);
 
         self.state.update_settings(settings);
-        self.sync_browser_host_visibility();
+        self.sync_browser_host_visibility(None);
         self.process_manager
             .set_log_buffer_size(self.state.settings().log_buffer_size as usize);
         self.save_config_state();
@@ -11034,7 +11064,7 @@ impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = Instant::now();
         self.start_browser_tasks(window, cx);
-        self.sync_browser_host_visibility();
+        self.sync_browser_host_visibility(Some(window));
         self.capture_window_bounds(window);
         self.sync_remote_host_config_from_service();
         if self.remote_mode.is_some() {
