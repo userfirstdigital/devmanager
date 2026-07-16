@@ -96,6 +96,7 @@ export function SessionScreen({
   const restartSsh = useStore((state) => state.restartSsh);
   const disconnectSsh = useStore((state) => state.disconnectSsh);
   const foregroundConnection = useStore((state) => state.foregroundConnection);
+  const sendInput = useStore((state) => state.sendInput);
   const [density] = useDensityPreference();
   const [returnBehavior] = useReturnBehavior();
   const [terminalPreference] = useTerminalPreference();
@@ -299,6 +300,12 @@ export function SessionScreen({
           disabled={summary.rawRequired}
           onClick={() => {
             if (viewMode === "terminal") {
+              if (provider === "claude" && providerInteractionLabel) {
+                // Claude keeps provider menus open after the web view returns
+                // to native mode. Close the known interaction at that exact
+                // boundary so the next native prompt starts in the composer.
+                sendInput(summary.sessionId, "\u{1b}");
+              }
               setProviderInteractionLabel(null);
               setTerminalPinned(false);
               // Resume from the latest semantic cursor so output produced

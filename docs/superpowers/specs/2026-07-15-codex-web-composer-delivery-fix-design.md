@@ -4,7 +4,7 @@
 
 The native web composer acknowledges a Codex submission and immediately publishes the user's native transcript bubble, but the prompt can remain in Codex's multiline terminal editor instead of reaching the model. The existing recovery runs only for the first composer submission, so one command can appear to work while every later prompt silently accumulates in the editor. Codex `/status` has a second visibility problem: it renders its result only inside the provider terminal, while the native interface currently keeps that command inline.
 
-Manual reproduction confirmed the boundary failure. Writing a prompt followed by a raw carriage return leaves it in the Codex editor. Writing Escape, waiting briefly, then writing carriage return submits it. The same sequence submits ordinary prompts and opens Codex's real `/model` and `/status` screens. Hot-load acceptance then exposed the equivalent Claude state leak: returning from a provider screen changed only the web view, so the next command could be discarded by the still-open provider screen. Escape then carriage return safely submitted both ordinary Claude prompts and slash commands.
+Manual reproduction confirmed the boundary failure. Writing a prompt followed by a raw carriage return leaves it in the Codex editor. Writing Escape, waiting briefly, then writing carriage return submits it. Hot-load acceptance then exposed two additional provider differences: Claude clears an ordinary composed prompt if Escape is sent after the text, and the providers handle slash autocomplete differently. Codex Tab accepts a command while Claude Tab can expand argument placeholders; Escape leaves ambiguous commands such as `/status` pending. In both TUIs, one harmless trailing space closes autocomplete and is ignored when Enter executes the command.
 
 ## Goals
 
@@ -21,11 +21,16 @@ Manual reproduction confirmed the boundary failure. Writing a prompt followed by
 
 `execute_web_composer_batch` already owns prompt construction, attachment staging, writer-lease revalidation, and the final PTY writes. It will also own the provider-specific submit sequence:
 
-- Claude and Codex: write Escape, wait 120 ms, write ordinary prompts as one PTY write or type the leading slash-command token at 100 ms per character, wait 250 ms for slash autocomplete or 50 ms for ordinary prompts, write Escape, wait 120 ms, write carriage return.
+- Codex: write one preflight Escape and wait 180 ms.
+- Claude: when the user returns from a known provider interaction, the web session screen sends one Escape at that boundary; ordinary composer delivery adds no speculative preflight key.
+- Then write ordinary prompts as one PTY write or type the leading slash-command token at 100 ms per character.
+- Claude and Codex slash commands: wait 250 ms for autocomplete, write one trailing space, wait 500 ms for the queued PTY write to reach the provider, then write carriage return. Exact Claude commands without arguments write a second carriage return because the first accepts the queued autocomplete entry; commands with arguments submit once.
+- Ordinary Codex prompts: wait 50 ms, write Escape, wait 120 ms, then write carriage return.
+- Ordinary Claude prompts: wait 50 ms, then write carriage return without a second Escape.
 - Other sessions: write prompt, wait 50 ms, write carriage return.
 - Draft-only writes without a trailing carriage return still write text without submitting.
 
-The preflight Escape exits a lingering provider-owned screen before the new prompt is written. The short slash-command token is typed character by character so provider paste debouncing cannot delay it; any arguments still use a normal bulk write. A 250 ms autocomplete interval follows slash tokens, while ordinary prompts retain the 50 ms interval. The second Escape exits Codex's multiline editing state or dismisses Claude autocomplete, and the separate carriage return triggers the TUI submit action. Applying the sequence to every AI submission makes returning to native mode safe without adding a visible resume or reset action.
+The Codex preflight Escape exits a lingering provider-owned screen before the new prompt is written. Claude is different: an extra Escape at a fresh composer opens its rewind UI, so the web screen closes a known provider interaction exactly when the user returns to native mode. Raw input and composer mutations share the ordered writer lane, ensuring that boundary Escape reaches the PTY before any immediately submitted prompt. The short slash-command token is typed character by character so provider paste debouncing cannot delay it; any arguments still use a normal bulk write. Both providers close autocomplete when a trailing separator arrives and ignore that whitespace when executing. A conservative 500 ms settle accounts for the in-process ConPTY queue before Enter. Claude's queued exact commands consume the first Enter to accept autocomplete, so a second Enter executes them; explicit arguments already dismiss autocomplete and receive one Enter. Codex retains its post-text Escape for multiline editing; Claude omits it so the prompt is not cleared.
 
 ### Remove obsolete lifecycle recovery
 
@@ -43,10 +48,12 @@ Attachment rollback and writer-lease validation remain unchanged. Any failed pro
 
 Automated tests will prove:
 
-- Codex submissions produce Escape, prompt, Escape, carriage return on every call.
-- Claude submissions produce Escape, prompt, Escape, carriage return.
+- Ordinary Codex submissions produce Escape, prompt, Escape, carriage return on every call.
+- Ordinary Claude submissions produce prompt and carriage return without clearing the prompt or opening rewind.
+- Returning from a known Claude provider interaction sends one Escape before native mode resumes.
+- Claude and Codex unique, prefix-colliding, and argument-bearing slash commands close autocomplete with a harmless trailing space before carriage return.
 - Draft-only Codex writes do not submit.
 - Codex `/status` is a provider interaction and triggers handoff only after acknowledgement.
 - Existing attachment rollback and authority checks still pass.
 
-Manual hot-reload acceptance will use a phone-sized browser and a real Codex session to submit two consecutive marker prompts, open `/model`, return to native, and open `/status`. A Claude prompt and `/model` interaction will confirm its unchanged path. Full Rust and web test/build gates will run before merging to `master`.
+Manual hot-reload acceptance will use a phone-sized browser and real Codex and Claude sessions. It will submit ordinary prompts, open `/model`, return to native while that provider screen remains open, and open `/status`. Full Rust and web test/build gates will run before merging to `master`.

@@ -92,7 +92,7 @@ fn execute_web_composer_batch(
         rollback_staged_images(&staged);
         return Err(WEB_COMPOSER_AUTHORITY_CHANGED.to_string());
     }
-    if submit.is_some() && session.session_kind.is_ai() {
+    if submit.is_some() && matches!(session.session_kind, crate::state::SessionKind::Codex) {
         // Native mode can be restored while the provider TUI still owns a
         // model, status, or other full-screen interaction. Exit that screen
         // before writing the next prompt so the provider cannot discard it.
@@ -100,7 +100,7 @@ fn execute_web_composer_batch(
             rollback_staged_images(&staged);
             return Err(error);
         }
-        std::thread::sleep(Duration::from_millis(120));
+        std::thread::sleep(Duration::from_millis(180));
     }
     let prompt_result = if type_slash_command {
         write_slash_command_prompt(&prompt, &mut write)
@@ -115,19 +115,37 @@ fn execute_web_composer_batch(
         // TUI input parsers treat an Enter key as a distinct event. Sending it
         // in the same PTY write as pasted text can leave the prompt visibly
         // filled but never submitted (observed with Codex on Windows ConPTY).
-        // Give cold provider autocomplete enough time to observe a pasted
-        // slash token before Escape dismisses it. Ordinary prompts can use the
-        // short PTY settle interval without adding visible latency.
+        // Give cold provider autocomplete enough time to observe a typed slash
+        // token. Ordinary prompts can use the short PTY settle interval without
+        // adding visible latency.
         std::thread::sleep(ai_prompt_settle_delay(text));
-        if session.session_kind.is_ai() {
-            // Codex can keep pasted text in its multiline editor, while Claude
-            // can leave autocomplete or a provider-owned screen active.
-            // Escape returns either TUI to its composer before the following
-            // Enter submits the prompt as a distinct key event.
+        if type_slash_command {
+            // A trailing separator closes autocomplete without choosing or
+            // expanding a suggestion. Both providers ignore the whitespace
+            // when executing, and the longer settle lets queued ConPTY writes
+            // reach the TUI before Enter is delivered.
+            write(" ")?;
+            std::thread::sleep(Duration::from_millis(500));
+        } else if matches!(session.session_kind, crate::state::SessionKind::Codex) {
+            // Codex can keep pasted text in its multiline editor. Escape
+            // returns it to the composer before Enter submits the prompt as a
+            // distinct key event. Claude instead clears a composed prompt when
+            // Escape is sent here, so it omits this post-text key entirely.
             write("\u{1b}")?;
             std::thread::sleep(Duration::from_millis(120));
         }
         write(submit)?;
+        if type_slash_command
+            && matches!(session.session_kind, crate::state::SessionKind::Claude)
+            && slash_command_has_no_arguments(text)
+        {
+            // Composer writes reach Claude as one queued PTY burst. The first
+            // Enter accepts its autocomplete entry; a second distinct Enter
+            // executes the now-complete exact command. Argument-bearing
+            // commands already dismissed autocomplete and must submit once.
+            std::thread::sleep(Duration::from_millis(180));
+            write(submit)?;
+        }
     }
     Ok(())
 }
@@ -138,6 +156,12 @@ fn ai_prompt_settle_delay(text: &str) -> Duration {
     } else {
         Duration::from_millis(50)
     }
+}
+
+fn slash_command_has_no_arguments(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    trimmed[token_end..].trim().is_empty()
 }
 
 fn write_slash_command_prompt(
@@ -382,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_composer_batch_exits_provider_ui_before_submitting() {
+    fn claude_composer_batch_exits_provider_ui_without_clearing_the_prompt() {
         let cwd = temp_test_dir("web-composer-batch-success");
         let mut session = SessionRuntimeState::new(
             "claude-batch",
@@ -418,11 +442,9 @@ mod tests {
         .expect("batch succeeds");
 
         let observed_writes = observed_writes.lock().unwrap();
-        assert_eq!(observed_writes.len(), 4);
-        assert_eq!(observed_writes[0], "\u{1b}");
-        assert_eq!(observed_writes[2], "\u{1b}");
-        assert_eq!(observed_writes[3], "\r");
-        let prompt = &observed_writes[1];
+        assert_eq!(observed_writes.len(), 2);
+        assert_eq!(observed_writes[1], "\r");
+        let prompt = &observed_writes[0];
         assert!(!prompt.ends_with('\r'));
         let references = prompt
             .split_whitespace()
@@ -522,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_slash_command_token_is_typed_instead_of_pasted() {
+    fn codex_slash_command_dismisses_autocomplete_with_trailing_space() {
         let cwd = temp_test_dir("web-composer-codex-slash");
         let mut session = SessionRuntimeState::new(
             "codex-slash",
@@ -547,7 +569,97 @@ mod tests {
 
         assert_eq!(
             *observed_writes.lock().unwrap(),
-            ["\u{1b}", "/", "m", "o", "d", "e", "l", "\u{1b}", "\r"]
+            ["\u{1b}", "/", "m", "o", "d", "e", "l", " ", "\r"]
+        );
+    }
+
+    #[test]
+    fn claude_unique_slash_command_dismisses_autocomplete_with_trailing_space() {
+        let cwd = temp_test_dir("web-composer-claude-slash");
+        let mut session = SessionRuntimeState::new(
+            "claude-slash",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        let observed_writes = std::sync::Mutex::new(Vec::new());
+
+        execute_web_composer_batch(
+            &session,
+            &[],
+            "/model\r",
+            || true,
+            |text| {
+                observed_writes.lock().unwrap().push(text.to_string());
+                Ok(())
+            },
+        )
+        .expect("slash command succeeds");
+
+        assert_eq!(
+            *observed_writes.lock().unwrap(),
+            ["/", "m", "o", "d", "e", "l", " ", "\r", "\r"]
+        );
+    }
+
+    #[test]
+    fn claude_prefix_colliding_slash_command_dismisses_autocomplete_with_trailing_space() {
+        let cwd = temp_test_dir("web-composer-claude-status");
+        let mut session = SessionRuntimeState::new(
+            "claude-status",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        let observed_writes = std::sync::Mutex::new(Vec::new());
+
+        execute_web_composer_batch(
+            &session,
+            &[],
+            "/status\r",
+            || true,
+            |text| {
+                observed_writes.lock().unwrap().push(text.to_string());
+                Ok(())
+            },
+        )
+        .expect("slash command succeeds");
+
+        assert_eq!(
+            *observed_writes.lock().unwrap(),
+            ["/", "s", "t", "a", "t", "u", "s", " ", "\r", "\r"]
+        );
+    }
+
+    #[test]
+    fn claude_slash_command_with_arguments_gets_a_trailing_separator() {
+        let cwd = temp_test_dir("web-composer-claude-arguments");
+        let mut session = SessionRuntimeState::new(
+            "claude-arguments",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        let observed_writes = std::sync::Mutex::new(Vec::new());
+
+        execute_web_composer_batch(
+            &session,
+            &[],
+            "/model opus\r",
+            || true,
+            |text| {
+                observed_writes.lock().unwrap().push(text.to_string());
+                Ok(())
+            },
+        )
+        .expect("slash command succeeds");
+
+        assert_eq!(
+            *observed_writes.lock().unwrap(),
+            ["/", "m", "o", "d", "e", "l", " opus", " ", "\r"]
         );
     }
 

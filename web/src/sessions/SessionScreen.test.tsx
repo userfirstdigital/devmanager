@@ -151,6 +151,37 @@ describe("session slash command integration", () => {
     );
   });
 
+  it("exits a Claude provider interaction when returning to native", async () => {
+    const user = userEvent.setup();
+    const submitComposer = vi.fn().mockResolvedValue({
+      mutationId: "mutation-claude",
+      stableSessionKey: "tab:ai-a",
+      acceptedSequence: 1,
+      leaseGeneration: 1,
+    });
+    const sendInput = vi.fn();
+    useStore.setState({
+      drafts: { "tab:ai-a": "/model" },
+      submitComposer,
+      sendInput,
+    });
+    render(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude")}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /send message/i }));
+    await screen.findByLabelText("Raw provider interaction");
+    await user.click(screen.getByRole("button", { name: /return to native conversation/i }));
+
+    expect(sendInput).toHaveBeenCalledWith("pty-ai-a", "\u{1b}");
+    expect(screen.getByLabelText("Native AI conversation")).toBeTruthy();
+  });
+
   it("keeps inline commands native and ignores an old acknowledgement after scope change", async () => {
     const user = userEvent.setup();
     const oldAccepted = deferred<ComposerAccepted>();

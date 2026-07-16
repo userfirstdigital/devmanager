@@ -4,13 +4,15 @@
 
 **Goal:** Make every AI native-web prompt and slash command reach the provider while showing terminal-only Codex status results.
 
-**Architecture:** Keep prompt construction and PTY delivery in `execute_web_composer_batch`, but select the final key sequence from `SessionKind`. Remove the obsolete one-shot lifecycle recovery so there is one deterministic delivery path, then reuse the existing acknowledged provider-command handoff for `/status`.
+**Architecture:** Keep prompt construction and PTY delivery in `execute_web_composer_batch`, using Codex's deterministic preflight and one neutral trailing-space slash-autocomplete dismissal. Close known Claude provider interactions at the web view's return-to-native boundary, where that state is authoritative. Remove the obsolete one-shot lifecycle recovery, then reuse the existing acknowledged provider-command handoff for `/status`.
 
 **Tech Stack:** Rust, Windows ConPTY, React, TypeScript, Vitest, Vite
 
 ## Global Constraints
 
-- Apply a preflight Escape, then prompt, Escape, and carriage return to every submitted Claude and Codex batch.
+- Apply one preflight Escape before every submitted Codex batch and retain a post-text Escape only for ordinary Codex prompts.
+- Close known Claude provider interactions when returning to native mode; do not send speculative Escape keys from a fresh Claude composer.
+- Close Claude and Codex slash autocomplete with one harmless trailing space and a 500 ms PTY settle before Enter; exact no-argument Claude commands use a second Enter to execute the accepted entry.
 - Keep non-AI submitted batches as prompt then carriage return.
 - Do not add retries, resume controls, or direct provider-protocol submission.
 - Preserve attachment rollback, writer-lease validation, and acknowledgement ordering.
@@ -28,7 +30,7 @@
 
 **Interfaces:**
 - Consumes: `SessionRuntimeState.session_kind: SessionKind` and the existing `write(&str) -> Result<(), String>` callback.
-- Produces: each submitted Claude or Codex batch writes `["\u{1b}", prompt, "\u{1b}", "\r"]`; other submitted batches write `[prompt, "\r"]`.
+- Produces: ordinary Codex batches write `["\u{1b}", prompt, "\u{1b}", "\r"]`; ordinary Claude batches write `[prompt, "\r"]`; AI slash batches append one trailing space before carriage return. Returning from a known Claude provider interaction writes Escape before the next composer mutation can be sent.
 
 - [ ] **Step 1: Write the failing delivery tests**
 
@@ -42,7 +44,7 @@ Expected: the new Codex test fails because each current call writes only prompt 
 
 - [ ] **Step 3: Implement the minimal provider-specific sequence**
 
-For submitted AI batches, write a preflight `"\u{1b}"` and wait 120 ms before the prompt. Type the leading slash-command token at 100 ms per character and bulk-write any arguments; bulk-write ordinary prompts unchanged. Wait 250 ms for slash-command autocomplete or 50 ms for an ordinary prompt, write `"\u{1b}"`, wait 120 ms, then write `"\r"`. For other session kinds, write `"\r"` directly. Leave non-submitted drafts unchanged.
+For submitted Codex batches, write one preflight `"\u{1b}"` and wait 180 ms. Type the leading slash-command token at 100 ms per character and bulk-write any arguments; bulk-write ordinary prompts unchanged. For Claude and Codex slash commands, wait 250 ms, write one trailing space, wait 500 ms for the ConPTY queue, then write `"\r"`. For exact Claude commands without arguments, wait 180 ms and write a second `"\r"`; argument-bearing commands submit once. For ordinary Codex prompts, wait 50 ms, write Escape, wait 120 ms, and write carriage return. For ordinary Claude prompts, wait 50 ms and write carriage return directly. When returning from a labeled Claude provider interaction, send Escape through the ordered raw-input lane before clearing the label. Leave non-submitted drafts unchanged.
 
 - [ ] **Step 4: Remove the obsolete one-shot recovery**
 
