@@ -316,6 +316,38 @@ fn host_state_creates_isolated_blank_tabs_and_restores_the_selected_tab() {
 }
 
 #[test]
+fn ensure_workspace_never_replaces_newer_live_state_with_a_launch_snapshot() {
+    let temp = TestDir::new("idempotent-ensure");
+    let mut host = BrowserHostState::new(temp.path());
+    let key = workspace("project-a", "conversation-a");
+    let launch_snapshot = BrowserWorkspaceSnapshot {
+        revision: devmanager::browser::BrowserRevision(3),
+        tabs: vec![BrowserTabSnapshot {
+            id: "launch-tab".to_string(),
+            title: "Launch".to_string(),
+            url: "https://example.test/launch".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("launch-tab".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    host.ensure_workspace(key.clone(), launch_snapshot.clone())
+        .expect("initial ensure");
+    let live = host
+        .create_tab(&key, "https://example.test/live")
+        .expect("mutate live workspace")
+        .snapshot;
+    assert!(live.revision > launch_snapshot.revision);
+
+    let ensured = host
+        .ensure_workspace(key.clone(), launch_snapshot)
+        .expect("repeat ensure");
+
+    assert_eq!(ensured.snapshot, live);
+    assert_eq!(host.workspace(&key), Some(&live));
+}
+
+#[test]
 fn project_context_planning_reuses_only_same_project_profiles() {
     let temp = TestDir::new("project-context");
     let host = BrowserHostState::new(temp.path());
@@ -755,6 +787,7 @@ fn host_tab_and_page_mutations_advance_the_existing_snapshot_revision() {
 
     let mut saturated = loaded.snapshot;
     saturated.revision = devmanager::browser::BrowserRevision(u64::MAX);
+    host.reset_workspace(&key);
     host.ensure_workspace(key.clone(), saturated).unwrap();
     assert_eq!(
         host.apply_page_load(&key, &replacement, "https://example.test/max")

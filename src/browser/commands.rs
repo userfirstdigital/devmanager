@@ -272,6 +272,10 @@ impl BrowserController {
         &self.workspace_key
     }
 
+    pub fn pending_work_count(&self) -> usize {
+        self.pending_work.count()
+    }
+
     pub async fn request(&self, command: BrowserCommand) -> Result<BrowserResponse, BrowserError> {
         self.interrupt_for_command(&command);
         let operation = command.operation_name().to_string();

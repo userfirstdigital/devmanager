@@ -7,10 +7,10 @@ use crate::browser::{
     browser_pane_open_fallback, browser_response_sync, browser_settings_plan,
     calculate_browser_split, render_browser_pane, BrowserBounds, BrowserCommand,
     BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
-    BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions, BrowserPaneContext,
-    BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
-    BrowserResponse, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserGatewayHandle, BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions,
+    BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface,
+    BrowserPaneTransient, BrowserResponse, BrowserSettingsAction, BrowserWebViewHost,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -175,6 +175,7 @@ struct NativeShell {
     state: AppState,
     session_manager: SessionManager,
     process_manager: ProcessManager,
+    browser_gateway: Option<BrowserGatewayHandle>,
     browser_host: BrowserWebViewHost,
     browser_bridge: BrowserCommandBridge,
     browser_inbox: Option<BrowserCommandInbox>,
@@ -666,7 +667,7 @@ impl NativeShell {
         let (browser_bridge, browser_inbox) = browser_command_channel(64);
         let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
-        let (mut state, startup_notice) = match session_manager.load_workspace() {
+        let (mut state, mut startup_notice) = match session_manager.load_workspace() {
             Ok(snapshot) => (AppState::from_workspace(snapshot), None),
             Err(error) => (
                 AppState::default(),
@@ -681,6 +682,28 @@ impl NativeShell {
         process_manager.set_settings(state.config.settings.clone());
         process_manager.set_notification_sound(state.config.settings.notification_sound.clone());
         process_manager.set_log_buffer_size(state.config.settings.log_buffer_size as usize);
+        let browser_gateway = if state.config.settings.browser_enabled
+            && browser_host.status().available
+        {
+            match BrowserGatewayHandle::start(browser_bridge.clone()) {
+                Ok(gateway) => {
+                    process_manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+                    Some(gateway)
+                }
+                Err(error) => {
+                    let diagnostic = format!(
+                        "Browser tools are unavailable; AI terminals will continue normally: {error}"
+                    );
+                    startup_notice = Some(match startup_notice {
+                        Some(existing) => format!("{existing}\n{diagnostic}"),
+                        None => diagnostic,
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let updater = UpdaterService::new();
         let remote_host_service = RemoteHostService::new(remote_machine_state.host.clone());
         let bootstrap_manager = process_manager.clone();
@@ -825,6 +848,7 @@ impl NativeShell {
             state,
             session_manager,
             process_manager,
+            browser_gateway,
             browser_host,
             browser_bridge,
             browser_inbox: Some(browser_inbox),
@@ -934,6 +958,33 @@ impl NativeShell {
                 }
             })
             .detach();
+    }
+
+    fn reconcile_browser_gateway(&mut self) -> Option<String> {
+        let should_run =
+            self.state.settings().browser_enabled && self.browser_host.status().available;
+        if !should_run {
+            self.process_manager.set_browser_gateway_registrar(None);
+            self.browser_gateway = None;
+            return None;
+        }
+        if self.browser_gateway.is_some() {
+            return None;
+        }
+        match BrowserGatewayHandle::start(self.browser_bridge.clone()) {
+            Ok(gateway) => {
+                self.process_manager
+                    .set_browser_gateway_registrar(Some(gateway.registrar()));
+                self.browser_gateway = Some(gateway);
+                None
+            }
+            Err(error) => {
+                self.process_manager.set_browser_gateway_registrar(None);
+                Some(format!(
+                    "Browser tools are unavailable; AI terminals will continue normally: {error}"
+                ))
+            }
+        }
     }
 
     fn open_browser_workspace_keys(&self) -> Vec<BrowserWorkspaceKey> {
@@ -1197,6 +1248,9 @@ impl NativeShell {
             .get(&workspace_key)
             .cloned()
             .unwrap_or_default();
+        let diagnostic = ui
+            .diagnostic
+            .or_else(|| self.process_manager.browser_diagnostic(&tab.id));
         Some(BrowserPaneModel::new(
             workspace_key,
             &self.browser_pane_context(),
@@ -1206,7 +1260,7 @@ impl NativeShell {
                 address_cursor: ui.address_cursor,
                 address_focused: ui.address_focused,
                 loading: ui.loading,
-                diagnostic: ui.diagnostic,
+                diagnostic,
                 action_status: ui.action_status,
                 divider_dragging: self.browser_divider_drag.is_some(),
             },
@@ -6227,12 +6281,14 @@ impl NativeShell {
         apply_browser_enabled_preference(&mut settings, draft.browser_enabled);
 
         self.state.update_settings(settings);
+        let browser_gateway_diagnostic = self.reconcile_browser_gateway();
         self.sync_browser_host_visibility(None);
         self.process_manager
             .set_log_buffer_size(self.state.settings().log_buffer_size as usize);
         self.save_config_state();
         self.last_dimensions = None;
-        self.editor_notice = Some("Settings saved".to_string());
+        self.editor_notice =
+            browser_gateway_diagnostic.or_else(|| Some("Settings saved".to_string()));
         cx.notify();
     }
 

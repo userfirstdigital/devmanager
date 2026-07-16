@@ -2583,6 +2583,50 @@ pub fn quote_shell_argument(value: &str, shell: ClaudeShellKind) -> String {
     }
 }
 
+/// Appends provider-owned Claude CLI arguments only after proving that the
+/// configured command is a single, directly recognized Claude invocation.
+pub fn append_claude_cli_arguments(
+    startup_command: &str,
+    shell: ClaudeShellKind,
+    arguments: &[String],
+) -> Result<String, String> {
+    let tokens = tokenize_shell_command(startup_command, shell)?;
+    if claude_argument_start(&tokens).is_none() {
+        return Err("startup command is not a directly recognized Claude Code command".to_string());
+    }
+    if arguments.is_empty() {
+        return Ok(startup_command.to_string());
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.is_empty() || argument.contains(['\r', '\n']))
+    {
+        return Err("Claude provider arguments must be nonblank single-line values".to_string());
+    }
+    let mut command = startup_command.to_string();
+    if !command.ends_with(char::is_whitespace) {
+        command.push(' ');
+    }
+    command.push_str(
+        &arguments
+            .iter()
+            .map(|argument| {
+                if argument.starts_with("--")
+                    && argument[2..]
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                {
+                    argument.clone()
+                } else {
+                    quote_shell_argument(argument, shell)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    Ok(command)
+}
+
 fn is_safe_cmd_settings_root(path: &Path) -> bool {
     path.to_str().is_some_and(|value| {
         !value

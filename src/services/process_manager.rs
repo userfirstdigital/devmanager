@@ -3,6 +3,11 @@ use crate::ai::claude_hooks::{
     ClaudeHookRelayListener, ClaudeRegistryEvent, ClaudeShellKind,
 };
 use crate::ai::codex_bridge::{prepare_codex_adapter, CodexBridgeHandle, PreparedCodexAdapter};
+use crate::browser::{
+    codex_browser_config_overrides, prepare_claude_browser_overlay, BrowserGatewayRegistrar,
+    BrowserGatewayRegistration, BrowserProviderAccess, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
+};
 use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
 };
@@ -127,6 +132,7 @@ trait CodexFallbackTerminalOps: Send + Sync {
         inner: &Arc<ProcessManagerInner>,
         session_id: &str,
         launch: &AiLaunchSpec,
+        environment: &HashMap<String, String>,
     ) -> Result<(), String>;
 }
 
@@ -152,6 +158,9 @@ pub(crate) struct ProcessManagerInner {
     claude_semantic_publication_test_hook: RwLock<Option<ClaudeSemanticPublicationTestHook>>,
     claude_hook_temp_root: PathBuf,
     claude_overlay_owner: Mutex<Weak<ClaudeOverlayOwner>>,
+    browser_gateway_registrar: RwLock<Option<BrowserGatewayRegistrar>>,
+    browser_provider_sessions: Mutex<HashMap<String, BrowserProviderSession>>,
+    browser_diagnostics: Mutex<HashMap<String, String>>,
     codex_adapter_preparer: RwLock<CodexAdapterPreparer>,
     codex_adapter_activation_timeout: RwLock<Duration>,
     codex_fallback_terminal_ops: RwLock<Arc<dyn CodexFallbackTerminalOps>>,
@@ -166,6 +175,12 @@ pub(crate) struct ProcessManagerInner {
 struct ClaudeHookSession {
     registration: ClaudeHookRegistration,
     settings_path: PathBuf,
+}
+
+struct BrowserProviderSession {
+    registrar: BrowserGatewayRegistrar,
+    registration: BrowserGatewayRegistration,
+    _claude_overlay: Option<ClaudeBrowserOverlay>,
 }
 
 struct ClaudeOverlayOwner {
@@ -231,6 +246,7 @@ enum CodexAdapterSession {
         _handle: CodexBridgeHandle,
         lifecycle: CodexAdapterLifecycle,
         original_launch: AiLaunchSpec,
+        fallback_environment: HashMap<String, String>,
     },
 }
 
@@ -462,6 +478,9 @@ impl ProcessManager {
             claude_semantic_publication_test_hook: RwLock::new(None),
             claude_hook_temp_root: claude_hook_temp_root.clone(),
             claude_overlay_owner: Mutex::new(Weak::new()),
+            browser_gateway_registrar: RwLock::new(None),
+            browser_provider_sessions: Mutex::new(HashMap::new()),
+            browser_diagnostics: Mutex::new(HashMap::new()),
             codex_adapter_preparer: RwLock::new(Arc::new(prepare_codex_adapter)),
             codex_adapter_activation_timeout: RwLock::new(std::time::Duration::from_secs(30)),
             codex_fallback_terminal_ops: RwLock::new(Arc::new(NativeCodexFallbackTerminalOps)),
@@ -1150,6 +1169,141 @@ impl ProcessManager {
         }
     }
 
+    pub fn set_browser_gateway_registrar(&self, registrar: Option<BrowserGatewayRegistrar>) {
+        drain_browser_provider_sessions_inner(&self.inner);
+        if let Ok(mut slot) = self.inner.browser_gateway_registrar.write() {
+            *slot = registrar;
+        }
+    }
+
+    pub fn browser_diagnostic(&self, ai_tab_id: &str) -> Option<String> {
+        self.inner
+            .browser_diagnostics
+            .lock()
+            .ok()
+            .and_then(|diagnostics| diagnostics.get(ai_tab_id).cloned())
+    }
+
+    fn set_browser_diagnostic(&self, ai_tab_id: &str, diagnostic: Option<String>) {
+        if let Ok(mut diagnostics) = self.inner.browser_diagnostics.lock() {
+            match diagnostic {
+                Some(diagnostic) => {
+                    diagnostics.insert(ai_tab_id.to_string(), diagnostic);
+                }
+                None => {
+                    diagnostics.remove(ai_tab_id);
+                }
+            }
+        }
+    }
+
+    fn prepare_browser_launch_for_session(
+        &self,
+        launch: &mut AiLaunchSpec,
+        session_id: &str,
+        initial_snapshot: BrowserWorkspaceSnapshot,
+    ) {
+        if !matches!(launch.tool, SessionKind::Claude | SessionKind::Codex) {
+            return;
+        }
+        let registrar = self
+            .inner
+            .browser_gateway_registrar
+            .read()
+            .ok()
+            .and_then(|registrar| registrar.clone());
+        let Some(registrar) = registrar else {
+            return;
+        };
+        let workspace_key =
+            match BrowserWorkspaceKey::new(launch.project_id.clone(), launch.tab_id.clone()) {
+                Ok(workspace_key) => workspace_key,
+                Err(error) => {
+                    self.set_browser_diagnostic(
+                        &launch.tab_id,
+                        Some(format!("Browser tools unavailable: {error}")),
+                    );
+                    return;
+                }
+            };
+        let registration = match registrar.register(session_id, workspace_key, initial_snapshot) {
+            Ok(registration) => registration,
+            Err(error) => {
+                self.set_browser_diagnostic(
+                    &launch.tab_id,
+                    Some(format!("Browser tools unavailable: {error}")),
+                );
+                return;
+            }
+        };
+        let claude_overlay = if launch.tool == SessionKind::Claude {
+            match prepare_claude_browser_overlay(
+                &self.inner.claude_hook_temp_root,
+                session_id,
+                &launch.startup_command,
+                claude_shell_kind(&launch.shell_program),
+                registration.access(),
+            ) {
+                Ok(overlay) => Some(overlay),
+                Err(error) => {
+                    registrar.revoke(&registration);
+                    self.set_browser_diagnostic(
+                        &launch.tab_id,
+                        Some(format!("Browser tools unavailable: {error}")),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(overlay) = claude_overlay.as_ref() {
+            launch.startup_command = overlay.startup_command().to_string();
+        }
+        let previous = self
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                session_id.to_string(),
+                BrowserProviderSession {
+                    registrar: registrar.clone(),
+                    registration,
+                    _claude_overlay: claude_overlay,
+                },
+            );
+        if let Some(previous) = previous {
+            previous.registrar.revoke(&previous.registration);
+        }
+        self.set_browser_diagnostic(&launch.tab_id, None);
+    }
+
+    fn browser_environment(&self, session_id: &str) -> HashMap<String, String> {
+        self.inner
+            .browser_provider_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .get(session_id)
+                    .map(|session| session.registration.access().environment())
+            })
+            .unwrap_or_default()
+    }
+
+    fn browser_access(&self, session_id: &str) -> Option<BrowserProviderAccess> {
+        self.inner
+            .browser_provider_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .get(session_id)
+                    .map(|session| session.registration.access().clone())
+            })
+    }
+
     fn claude_hook_endpoint(&self) -> Result<String, String> {
         let mut listener = self
             .inner
@@ -1261,6 +1415,10 @@ impl ProcessManager {
         remove_owned_claude_overlay_root(&self.inner.claude_hook_temp_root);
     }
 
+    pub fn drain_browser_provider_adapter(&self) {
+        drain_browser_provider_sessions_inner(&self.inner);
+    }
+
     #[cfg(test)]
     fn set_codex_adapter_preparer_for_test(&self, preparer: CodexAdapterPreparer) {
         *self
@@ -1296,6 +1454,11 @@ impl ProcessManager {
         if launch.tool != SessionKind::Codex {
             return HashMap::new();
         }
+        let browser_access = self.browser_access(session_id);
+        let browser_config = browser_access
+            .as_ref()
+            .map(codex_browser_config_overrides)
+            .unwrap_or_default();
         let stable_session_key = StableSessionKey::from_tab(&launch.tab_id);
         let Some(generation) = next_codex_adapter_generation(&self.inner.codex_adapter_generation)
         else {
@@ -1347,6 +1510,14 @@ impl ProcessManager {
             Err(error) => {
                 eprintln!("Codex native adapter preparation failed for {session_id}: {error}");
                 mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+                self.cleanup_browser_provider_session(session_id);
+                self.set_browser_diagnostic(
+                    &launch.tab_id,
+                    Some(
+                        "Browser tools unavailable because Codex launch preparation failed"
+                            .to_string(),
+                    ),
+                );
                 return HashMap::new();
             }
         };
@@ -1400,16 +1571,44 @@ impl ProcessManager {
             Err(error) => {
                 eprintln!("Codex native adapter bridge failed for {session_id}: {error}");
                 mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+                self.cleanup_browser_provider_session(session_id);
+                self.set_browser_diagnostic(
+                    &launch.tab_id,
+                    Some(
+                        "Browser tools unavailable because the Codex adapter did not start"
+                            .to_string(),
+                    ),
+                );
                 return HashMap::new();
             }
         };
-        let (mut handle, terminal_env) = started.into_parts();
+        let (mut handle, mut terminal_env) = started.into_parts();
         if !handle.is_running() {
             eprintln!("Codex native adapter bridge exited before launch for {session_id}");
             handle.shutdown();
             mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+            self.cleanup_browser_provider_session(session_id);
+            self.set_browser_diagnostic(
+                &launch.tab_id,
+                Some(
+                    "Browser tools unavailable because the Codex adapter exited early".to_string(),
+                ),
+            );
             return HashMap::new();
         }
+        if let Some(access) = browser_access.as_ref() {
+            terminal_env.extend(access.environment());
+        }
+
+        let mut fallback_launch = original_launch.clone();
+        if !browser_config.is_empty() {
+            fallback_launch.startup_command =
+                prepared.fallback_tui_command_with_config(&launch.shell_program, &browser_config);
+        }
+        let fallback_environment = browser_access
+            .as_ref()
+            .map(BrowserProviderAccess::environment)
+            .unwrap_or_default();
 
         let endpoint = handle.endpoint().to_string();
         let installed = {
@@ -1435,9 +1634,10 @@ impl ProcessManager {
                         identity: identity.clone(),
                         _handle: handle,
                         lifecycle: CodexAdapterLifecycle::new(
-                            original_launch.startup_command.clone(),
+                            fallback_launch.startup_command.clone(),
                         ),
-                        original_launch,
+                        original_launch: fallback_launch,
+                        fallback_environment,
                     },
                 );
                 true
@@ -1446,6 +1646,14 @@ impl ProcessManager {
             }
         };
         if !installed {
+            self.cleanup_browser_provider_session(session_id);
+            self.set_browser_diagnostic(
+                &launch.tab_id,
+                Some(
+                    "Browser tools unavailable because the Codex adapter was superseded"
+                        .to_string(),
+                ),
+            );
             return HashMap::new();
         }
         emit_remote_session_event(
@@ -1454,8 +1662,19 @@ impl ProcessManager {
                 identity: codex_semantic_identity(session_id, &identity),
             },
         );
-        launch.startup_command = prepared.tui_command(&endpoint, &launch.shell_program);
+        launch.startup_command =
+            prepared.tui_command_with_config(&endpoint, &launch.shell_program, &browser_config);
         terminal_env
+    }
+
+    fn prepare_ai_terminal_environment(
+        &self,
+        launch: &mut AiLaunchSpec,
+        session_id: &str,
+    ) -> HashMap<String, String> {
+        let mut terminal_environment = self.prepare_codex_launch_for_session(launch, session_id);
+        terminal_environment.extend(self.browser_environment(session_id));
+        terminal_environment
     }
 
     fn cleanup_codex_adapter_session(&self, session_id: &str) {
@@ -1477,9 +1696,22 @@ impl ProcessManager {
         }
     }
 
+    fn cleanup_browser_provider_session(&self, session_id: &str) {
+        let removed = self
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+        if let Some(removed) = removed {
+            removed.registrar.revoke(&removed.registration);
+        }
+    }
+
     fn cleanup_ai_adapters_for_session(&self, session_id: &str) {
         self.cleanup_claude_hook_session(session_id);
         self.cleanup_codex_adapter_session(session_id);
+        self.cleanup_browser_provider_session(session_id);
     }
 
     pub fn set_notification_sound(&self, sound_id: Option<String>) {
@@ -1942,6 +2174,11 @@ impl ProcessManager {
         let session_id = next_ai_session_id(&tab.tab_type);
         let mut launch =
             build_ai_launch_spec(&app_state.config.settings, &project, &tab, &session_id)?;
+        self.prepare_browser_launch_for_session(
+            &mut launch,
+            &session_id,
+            tab.browser_workspace.clone().unwrap_or_default(),
+        );
         self.prepare_claude_launch_for_session(
             &mut launch,
             &session_id,
@@ -2028,6 +2265,11 @@ impl ProcessManager {
         let session_id = next_ai_session_id(&tab.tab_type);
         let mut launch =
             build_ai_launch_spec(&app_state.config.settings, &project, &tab, &session_id)?;
+        self.prepare_browser_launch_for_session(
+            &mut launch,
+            &session_id,
+            tab.browser_workspace.clone().unwrap_or_default(),
+        );
         self.prepare_claude_launch_for_session(
             &mut launch,
             &session_id,
@@ -3194,6 +3436,19 @@ fn drain_claude_hook_sessions_inner(inner: &ProcessManagerInner) {
     }
 }
 
+fn drain_browser_provider_sessions_inner(inner: &ProcessManagerInner) {
+    let sessions = {
+        let mut sessions = inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *sessions)
+    };
+    for (_, session) in sessions {
+        session.registrar.revoke(&session.registration);
+    }
+}
+
 impl Drop for ProcessManagerInner {
     fn drop(&mut self) {
         self.background_stop.store(true, Ordering::SeqCst);
@@ -3213,6 +3468,7 @@ impl Drop for ProcessManagerInner {
             }
         }
         drain_claude_hook_sessions_inner(self);
+        drain_browser_provider_sessions_inner(self);
         remove_owned_claude_overlay_root(&self.claude_hook_temp_root);
     }
 }
@@ -4696,6 +4952,7 @@ fn handle_codex_bridge_exit(
                 identity: current,
                 lifecycle,
                 original_launch,
+                fallback_environment,
                 ..
             }) if current == identity => {
                 lifecycle
@@ -4703,7 +4960,7 @@ fn handle_codex_bridge_exit(
                     .map(|original_startup_command| {
                         let mut launch = original_launch.clone();
                         launch.startup_command = original_startup_command;
-                        launch
+                        (launch, fallback_environment.clone())
                     })
             }
             _ => None,
@@ -4717,8 +4974,14 @@ fn handle_codex_bridge_exit(
             health: SemanticAdapterHealth::Degraded,
         },
     );
-    if let Some(launch) = fallback_launch {
-        schedule_codex_original_fallback(inner, session_id.to_string(), identity.clone(), launch);
+    if let Some((launch, environment)) = fallback_launch {
+        schedule_codex_original_fallback(
+            inner,
+            session_id.to_string(),
+            identity.clone(),
+            launch,
+            environment,
+        );
     }
 }
 
@@ -4752,6 +5015,7 @@ fn schedule_codex_original_fallback(
     session_id: String,
     identity: CodexAdapterIdentity,
     launch: AiLaunchSpec,
+    environment: HashMap<String, String>,
 ) {
     let terminal_ops = inner
         .codex_fallback_terminal_ops
@@ -4816,9 +5080,17 @@ fn schedule_codex_original_fallback(
             },
         );
 
-        let _ = terminal_ops
+        let fallback_result = terminal_ops
             .terminate_and_reap(&inner, &session_id)
-            .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch));
+            .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch, &environment));
+        if fallback_result.is_err() {
+            let manager = process_manager_from_inner(inner.clone());
+            manager.cleanup_browser_provider_session(&session_id);
+            manager.set_browser_diagnostic(
+                &launch.tab_id,
+                Some("Browser tools unavailable because Codex fallback launch failed".to_string()),
+            );
+        }
     });
 }
 
@@ -4853,6 +5125,7 @@ impl CodexFallbackTerminalOps for NativeCodexFallbackTerminalOps {
         inner: &Arc<ProcessManagerInner>,
         session_id: &str,
         launch: &AiLaunchSpec,
+        environment: &HashMap<String, String>,
     ) -> Result<(), String> {
         let dimensions = inner
             .runtime_state
@@ -4871,7 +5144,7 @@ impl CodexFallbackTerminalOps for NativeCodexFallbackTerminalOps {
             dimensions,
             launch.shell_program.clone(),
             launch.shell_args.clone(),
-            HashMap::new(),
+            environment.clone(),
             inner
                 .scrollback_lines
                 .read()
@@ -5713,7 +5986,7 @@ fn spawn_ai_session_with_inner(
     }
     let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
     let mut effective_launch = launch.clone();
-    let terminal_env = manager.prepare_codex_launch_for_session(&mut effective_launch, session_id);
+    let terminal_env = manager.prepare_ai_terminal_environment(&mut effective_launch, session_id);
     let codex_identity = inner
         .codex_adapter_registry
         .lock()
@@ -5848,6 +6121,7 @@ fn shutdown_managed_processes_inner(
         pid_file::clear_all();
     }
     manager.drain_claude_hook_adapter();
+    manager.drain_browser_provider_adapter();
     report
 }
 
@@ -5870,6 +6144,322 @@ mod tests {
     #[derive(Default)]
     struct RecordingCodexFallbackTerminalOps {
         steps: Arc<Mutex<Vec<String>>>,
+        environments: Arc<Mutex<Vec<HashMap<String, String>>>>,
+        fail_spawn: AtomicBool,
+    }
+
+    fn browser_test_launch(tool: SessionKind, command: &str) -> AiLaunchSpec {
+        AiLaunchSpec {
+            tab_id: "browser-ai-tab".to_string(),
+            project_id: "browser-project".to_string(),
+            tool,
+            cwd: std::env::current_dir().unwrap(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn browser_provider_registration_injects_claude_ephemerally_and_cleans_up() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        let mut launch = browser_test_launch(
+            SessionKind::Claude,
+            "claude --model sonnet --dangerously-skip-permissions",
+        );
+        let original = launch.startup_command.clone();
+
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            "claude-browser-session",
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+        manager.prepare_claude_launch_for_session(
+            &mut launch,
+            "claude-browser-session",
+            &manager.inner.claude_hook_temp_root,
+        );
+
+        assert!(launch.startup_command.starts_with(&original));
+        assert!(launch.startup_command.contains("--mcp-config"));
+        assert!(launch.startup_command.contains("--settings"));
+        let sessions = manager.inner.browser_provider_sessions.lock().unwrap();
+        let provider = sessions.get("claude-browser-session").unwrap();
+        let token = provider
+            .registration
+            .access()
+            .bearer_token_for_launch()
+            .to_string();
+        let overlay_path = provider
+            ._claude_overlay
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let overlay = std::fs::read_to_string(&overlay_path).unwrap();
+        assert!(overlay.contains("${DEVMANAGER_BROWSER_TOKEN}"));
+        assert!(!overlay.contains(&token));
+        drop(sessions);
+        assert_eq!(
+            manager
+                .browser_environment("claude-browser-session")
+                .get(crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV),
+            Some(&token)
+        );
+        assert!(!serde_json::to_string(&manager.runtime_state())
+            .unwrap()
+            .contains(&token));
+
+        manager.cleanup_ai_adapters_for_session("claude-browser-session");
+        assert!(!overlay_path.exists());
+        assert_eq!(gateway.registrar().active_registration_count(), 0);
+    }
+
+    #[test]
+    fn browser_provider_failure_keeps_launch_and_environment_exact() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        let mut launch = browser_test_launch(SessionKind::Claude, "claude | Write-Output nope");
+        let original = launch.clone();
+
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            "claude-browser-failure",
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+
+        assert_eq!(launch.startup_command, original.startup_command);
+        assert!(manager
+            .browser_environment("claude-browser-failure")
+            .is_empty());
+        assert_eq!(gateway.registrar().active_registration_count(), 0);
+        let diagnostic = manager
+            .browser_diagnostic(&launch.tab_id)
+            .expect("matching browser diagnostic");
+        assert!(diagnostic
+            .to_ascii_lowercase()
+            .contains("browser tools unavailable"));
+        assert!(!diagnostic.contains("Bearer"));
+    }
+
+    #[test]
+    fn explicit_browser_provider_drain_revokes_all_sessions_and_owned_overlays() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        let mut launch = browser_test_launch(SessionKind::Claude, "claude --model sonnet");
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            "claude-browser-drain",
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+        let overlay_path = manager
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap()
+            .get("claude-browser-drain")
+            .unwrap()
+            ._claude_overlay
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        assert!(overlay_path.exists());
+        assert_eq!(gateway.registrar().active_registration_count(), 1);
+
+        manager.drain_browser_provider_adapter();
+
+        assert!(!overlay_path.exists());
+        assert!(manager
+            .inner
+            .browser_provider_sessions
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(gateway.registrar().active_registration_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_browser_config_and_token_survive_native_adapter_fallback() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
+        }));
+        manager.set_codex_adapter_activation_timeout_for_test(Duration::from_millis(100));
+        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
+        let steps = terminal_ops.steps.clone();
+        let fallback_environments = terminal_ops.environments.clone();
+        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            "codex-browser-fallback",
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+        let token = manager.browser_environment("codex-browser-fallback")
+            [crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV]
+            .clone();
+
+        let terminal_environment =
+            manager.prepare_codex_launch_for_session(&mut launch, "codex-browser-fallback");
+        assert_eq!(
+            terminal_environment.get(crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV),
+            Some(&token)
+        );
+        assert!(
+            terminal_environment.contains_key(crate::ai::codex_bridge::CODEX_BRIDGE_AUTH_TOKEN_ENV)
+        );
+        assert!(launch.startup_command.contains(
+            "mcp_servers.devmanager_browser.bearer_token_env_var=\"DEVMANAGER_BROWSER_TOKEN\""
+        ));
+        assert!(launch.startup_command.contains("--remote"));
+
+        let identity = manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .get("codex-browser-fallback")
+            .unwrap()
+            .identity()
+            .clone();
+        assert!(mark_codex_remote_command_injected(
+            &manager.inner,
+            "codex-browser-fallback",
+            &identity,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if steps.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native adapter fallback");
+        let steps = steps.lock().unwrap();
+        assert!(steps[1].contains("mcp_servers.devmanager_browser.url="));
+        assert!(!steps[1].contains("--remote"));
+        drop(steps);
+        assert_eq!(
+            fallback_environments.lock().unwrap()[0]
+                .get(crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV),
+            Some(&token)
+        );
+        assert!(!fallback_environments.lock().unwrap()[0]
+            .contains_key(crate::ai::codex_bridge::CODEX_BRIDGE_AUTH_TOKEN_ENV));
+    }
+
+    #[tokio::test]
+    async fn codex_fallback_spawn_failure_revokes_browser_registration() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
+        }));
+        manager.set_codex_adapter_activation_timeout_for_test(Duration::from_millis(100));
+        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
+        terminal_ops.fail_spawn.store(true, Ordering::Release);
+        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            "codex-browser-fallback-spawn-failure",
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+        let environment = manager
+            .prepare_ai_terminal_environment(&mut launch, "codex-browser-fallback-spawn-failure");
+        assert!(environment.contains_key(crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV));
+
+        let identity = manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .get("codex-browser-fallback-spawn-failure")
+            .unwrap()
+            .identity()
+            .clone();
+        assert!(mark_codex_remote_command_injected(
+            &manager.inner,
+            "codex-browser-fallback-spawn-failure",
+            &identity,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gateway.registrar().active_registration_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed fallback spawn must revoke browser access");
+    }
+
+    #[test]
+    fn codex_preparer_failure_revokes_browser_and_preserves_original_launch() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Err("fixture preparer failed".to_string())
+        }));
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        let original = launch.clone();
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            "codex-browser-preparer-failure",
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+
+        let environment =
+            manager.prepare_codex_launch_for_session(&mut launch, "codex-browser-preparer-failure");
+
+        assert!(environment.is_empty());
+        assert_eq!(launch.startup_command, original.startup_command);
+        assert_eq!(gateway.registrar().active_registration_count(), 0);
+        assert!(manager
+            .browser_diagnostic(&launch.tab_id)
+            .unwrap()
+            .contains("Codex launch preparation failed"));
+    }
+
+    #[test]
+    fn codex_preparer_failure_does_not_leak_revoked_browser_env_to_terminal_spawn() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Err("fixture preparer failed".to_string())
+        }));
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            "codex-browser-spawn-failure",
+            crate::browser::BrowserWorkspaceSnapshot::default(),
+        );
+
+        let environment =
+            manager.prepare_ai_terminal_environment(&mut launch, "codex-browser-spawn-failure");
+
+        assert!(environment.is_empty());
+        assert_eq!(gateway.registrar().active_registration_count(), 0);
     }
 
     impl CodexFallbackTerminalOps for RecordingCodexFallbackTerminalOps {
@@ -5890,11 +6480,16 @@ mod tests {
             _inner: &Arc<ProcessManagerInner>,
             session_id: &str,
             launch: &AiLaunchSpec,
+            environment: &HashMap<String, String>,
         ) -> Result<(), String> {
             self.steps.lock().unwrap().push(format!(
                 "spawn-original:{session_id}:{}",
                 launch.startup_command
             ));
+            self.environments.lock().unwrap().push(environment.clone());
+            if self.fail_spawn.load(Ordering::Acquire) {
+                return Err("fixture fallback spawn failed".to_string());
+            }
             Ok(())
         }
     }

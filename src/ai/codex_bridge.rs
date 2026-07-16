@@ -1342,6 +1342,42 @@ pub struct PreparedCodexAdapter {
     version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexConfigOverride {
+    key: String,
+    toml_value: String,
+}
+
+impl CodexConfigOverride {
+    pub fn new(key: impl Into<String>, toml_value: impl Into<String>) -> Result<Self, String> {
+        let key = key.into();
+        if key.is_empty()
+            || !key.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+            })
+        {
+            return Err("Codex config override key is invalid".to_string());
+        }
+        let toml_value = toml_value.into();
+        if toml_value.is_empty() || toml_value.contains(['\r', '\n']) {
+            return Err("Codex config override value must be nonblank and single-line".to_string());
+        }
+        Ok(Self { key, toml_value })
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn toml_value(&self) -> &str {
+        &self.toml_value
+    }
+
+    fn argument(&self) -> String {
+        format!("{}={}", self.key, self.toml_value)
+    }
+}
+
 #[derive(Debug)]
 pub struct CodexBridgeHandle {
     endpoint: String,
@@ -1803,13 +1839,41 @@ impl PreparedCodexAdapter {
     }
 
     pub fn tui_command(&self, endpoint: &str, shell_program: &str) -> String {
-        let mut tokens = Vec::with_capacity(self.tui_args.len() + 5);
+        self.tui_command_with_config(endpoint, shell_program, &[])
+    }
+
+    pub fn tui_command_with_config(
+        &self,
+        endpoint: &str,
+        shell_program: &str,
+        config: &[CodexConfigOverride],
+    ) -> String {
+        let mut tokens = Vec::with_capacity(self.tui_args.len() + config.len() * 2 + 5);
         tokens.push(self.executable.to_string_lossy().into_owned());
         tokens.extend(self.tui_args.iter().cloned());
+        for override_value in config {
+            tokens.push("--config".to_string());
+            tokens.push(override_value.argument());
+        }
         tokens.push("--remote".to_string());
         tokens.push(endpoint.to_string());
         tokens.push("--remote-auth-token-env".to_string());
         tokens.push(CODEX_BRIDGE_AUTH_TOKEN_ENV.to_string());
+        quote_command_for_shell(&tokens, shell_program)
+    }
+
+    pub fn fallback_tui_command_with_config(
+        &self,
+        shell_program: &str,
+        config: &[CodexConfigOverride],
+    ) -> String {
+        let mut tokens = Vec::with_capacity(self.tui_args.len() + config.len() * 2 + 1);
+        tokens.push(self.executable.to_string_lossy().into_owned());
+        tokens.extend(self.tui_args.iter().cloned());
+        for override_value in config {
+            tokens.push("--config".to_string());
+            tokens.push(override_value.argument());
+        }
         quote_command_for_shell(&tokens, shell_program)
     }
 }

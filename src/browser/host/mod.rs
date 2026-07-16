@@ -94,6 +94,9 @@ impl BrowserHostState {
         workspace_key: BrowserWorkspaceKey,
         mut snapshot: BrowserWorkspaceSnapshot,
     ) -> Result<BrowserWorkspaceMutation, BrowserError> {
+        if let Some(existing) = self.workspaces.get(&workspace_key) {
+            return Ok(BrowserWorkspaceMutation::new(existing.clone()));
+        }
         let mut changed = false;
         if snapshot.tabs.is_empty() {
             let tab_id = self.generate_tab_id()?;

@@ -1,8 +1,11 @@
 mod commands;
+mod gateway;
 mod host;
+mod mcp;
 mod model;
 mod pane;
 mod policy;
+mod provider;
 mod recipes;
 mod storage;
 
@@ -12,6 +15,7 @@ pub use commands::{
     BrowserHostEvent, BrowserHostStatus, BrowserPageLoadState, BrowserResponse,
     BrowserUserInputKind,
 };
+pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub use host::{
     browser_user_input_initialization_script, unique_download_path, unsupported_host_status,
     unsupported_platform_error, validate_browser_url, BrowserHostState, BrowserMemoryTarget,
@@ -34,6 +38,10 @@ pub use pane::{
     BrowserSplitLayout, BrowserViewportPreset,
 };
 pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserRisk};
+pub use provider::{
+    codex_browser_config_overrides, prepare_claude_browser_overlay, BrowserProviderAccess,
+    ClaudeBrowserOverlay, DEVMANAGER_BROWSER_TOKEN_ENV,
+};
 pub use recipes::{
     load_recipe, recipe_path, save_recipe, BrowserRecipeAction, BrowserRecipeInput,
     BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1, BROWSER_RECIPE_SCHEMA_VERSION,
