@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -227,12 +228,14 @@ struct BrowserCommandEnvelope {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
+    pending_work: PendingWorkGuard,
 }
 
 #[derive(Clone)]
 pub struct BrowserCommandBridge {
     sender: mpsc::Sender<BrowserCommandEnvelope>,
     cancellations: Arc<CancellationEpochs>,
+    pending_work: Arc<PendingWork>,
 }
 
 impl BrowserCommandBridge {
@@ -242,7 +245,16 @@ impl BrowserCommandBridge {
             sender: self.sender.clone(),
             timeout,
             cancellations: Arc::clone(&self.cancellations),
+            pending_work: Arc::clone(&self.pending_work),
         }
+    }
+
+    pub fn pending_work_count(&self) -> usize {
+        self.pending_work.count()
+    }
+
+    pub fn observe_host_event(&self, event: &BrowserHostEvent) {
+        self.cancellations.observe_host_event(event);
     }
 }
 
@@ -252,6 +264,7 @@ pub struct BrowserController {
     sender: mpsc::Sender<BrowserCommandEnvelope>,
     timeout: Duration,
     cancellations: Arc<CancellationEpochs>,
+    pending_work: Arc<PendingWork>,
 }
 
 impl BrowserController {
@@ -274,6 +287,7 @@ impl BrowserController {
             workspace_key: self.workspace_key.clone(),
             command,
             response,
+            pending_work: self.pending_work.track(),
         });
         tokio::pin!(send);
         tokio::select! {
@@ -307,6 +321,7 @@ impl BrowserController {
                 workspace_key: self.workspace_key.clone(),
                 command,
                 response,
+                pending_work: self.pending_work.track(),
             })
             .await
             .map_err(|_| BrowserError::CrashedView {
@@ -337,12 +352,17 @@ impl BrowserController {
 pub struct BrowserCommandInbox {
     receiver: mpsc::Receiver<BrowserCommandEnvelope>,
     cancellations: Arc<CancellationEpochs>,
+    pending_work: Arc<PendingWork>,
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
 impl BrowserCommandInbox {
     pub async fn recv(&mut self) -> Option<BrowserCommandRequest> {
         self.receiver.recv().await.map(BrowserCommandRequest::from)
+    }
+
+    pub fn pending_work_count(&self) -> usize {
+        self.pending_work.count()
     }
 
     pub fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
@@ -354,14 +374,7 @@ impl BrowserCommandInbox {
     }
 
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
-        if let BrowserHostEvent::UserInput {
-            workspace_key,
-            tab_id,
-            ..
-        } = event
-        {
-            self.interrupt_tab(workspace_key, tab_id);
-        }
+        self.cancellations.observe_host_event(event);
     }
 }
 
@@ -387,10 +400,17 @@ impl BrowserCommandRequest {
 
 impl From<BrowserCommandEnvelope> for BrowserCommandRequest {
     fn from(envelope: BrowserCommandEnvelope) -> Self {
+        let BrowserCommandEnvelope {
+            workspace_key,
+            command,
+            response,
+            pending_work,
+        } = envelope;
+        drop(pending_work);
         Self {
-            workspace_key: envelope.workspace_key,
-            command: envelope.command,
-            response: envelope.response,
+            workspace_key,
+            command,
+            response,
         }
     }
 }
@@ -398,17 +418,49 @@ impl From<BrowserCommandEnvelope> for BrowserCommandRequest {
 pub fn browser_command_channel(capacity: usize) -> (BrowserCommandBridge, BrowserCommandInbox) {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let cancellations = Arc::new(CancellationEpochs::default());
+    let pending_work = Arc::new(PendingWork::default());
     (
         BrowserCommandBridge {
             sender,
             cancellations: Arc::clone(&cancellations),
+            pending_work: Arc::clone(&pending_work),
         },
         BrowserCommandInbox {
             receiver,
             cancellations,
+            pending_work,
             _main_thread_only: PhantomData,
         },
     )
+}
+
+#[derive(Default)]
+struct PendingWork {
+    count: AtomicUsize,
+}
+
+impl PendingWork {
+    fn track(self: &Arc<Self>) -> PendingWorkGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        PendingWorkGuard {
+            pending_work: Arc::clone(self),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+}
+
+struct PendingWorkGuard {
+    pending_work: Arc<PendingWork>,
+}
+
+impl Drop for PendingWorkGuard {
+    fn drop(&mut self) {
+        let previous = self.pending_work.count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "browser pending work count underflow");
+    }
 }
 
 #[derive(Default)]
@@ -446,6 +498,17 @@ impl CancellationEpochs {
             &mut lock(&self.tabs),
             (workspace_key.clone(), tab_id.to_string()),
         ));
+    }
+
+    fn observe_host_event(&self, event: &BrowserHostEvent) {
+        if let BrowserHostEvent::UserInput {
+            workspace_key,
+            tab_id,
+            ..
+        } = event
+        {
+            self.interrupt_tab(workspace_key, tab_id);
+        }
     }
 }
 

@@ -1,8 +1,8 @@
 use devmanager::browser::{
     browser_command_channel, browser_user_input_initialization_script, unique_download_path,
     unsupported_host_status, unsupported_platform_error, validate_browser_url, BrowserCommand,
-    BrowserCommandRequest, BrowserDiagnosticLevel, BrowserDownloadState, BrowserError,
-    BrowserHostEvent, BrowserHostState, BrowserHostStatus, BrowserMemoryTarget,
+    BrowserCommandBridge, BrowserCommandRequest, BrowserDiagnosticLevel, BrowserDownloadState,
+    BrowserError, BrowserHostEvent, BrowserHostState, BrowserHostStatus, BrowserMemoryTarget,
     BrowserPageLoadState, BrowserResponse, BrowserStorageLayout, BrowserTabSnapshot,
     BrowserUserInputKind, BrowserViewport, BrowserWebViewHost, BrowserWorkspaceKey,
     BrowserWorkspaceSnapshot,
@@ -14,6 +14,16 @@ use std::time::Duration;
 
 fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
     BrowserWorkspaceKey::new(project, conversation).expect("valid browser workspace key")
+}
+
+async fn wait_for_pending_count(bridge: &BrowserCommandBridge, expected: usize) {
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while bridge.pending_work_count() != expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending work count should settle");
 }
 
 struct TestDir(PathBuf);
@@ -121,6 +131,59 @@ async fn controller_timeout_also_bounds_a_saturated_inbox() {
 }
 
 #[tokio::test]
+async fn pending_work_is_observable_until_receive_without_cancel_or_timeout_leaks() {
+    let key = workspace("project-a", "conversation-a");
+    let (bridge, mut inbox) = browser_command_channel(1);
+    let controller = bridge.bind(key.clone(), Duration::from_secs(1));
+
+    let response_task = tokio::spawn({
+        let controller = controller.clone();
+        async move { controller.request(BrowserCommand::Status).await }
+    });
+    wait_for_pending_count(&bridge, 1).await;
+    assert_eq!(inbox.pending_work_count(), 1);
+    let request = inbox.recv().await.expect("pending status request");
+    assert_eq!(bridge.pending_work_count(), 0);
+    assert_eq!(inbox.pending_work_count(), 0);
+    request.respond(Ok(BrowserResponse::Acknowledged));
+    assert_eq!(
+        response_task.await.expect("status request task"),
+        Ok(BrowserResponse::Acknowledged)
+    );
+
+    controller
+        .notify(BrowserCommand::Status)
+        .await
+        .expect("fill bounded inbox");
+    assert_eq!(bridge.pending_work_count(), 1);
+
+    let cancelled_task = tokio::spawn({
+        let controller = controller.clone();
+        async move { controller.request(BrowserCommand::Status).await }
+    });
+    wait_for_pending_count(&bridge, 2).await;
+    cancelled_task.abort();
+    assert!(cancelled_task
+        .await
+        .expect_err("request task should be cancelled")
+        .is_cancelled());
+    wait_for_pending_count(&bridge, 1).await;
+
+    let short_controller = bridge.bind(key, Duration::from_millis(10));
+    assert_eq!(
+        short_controller.request(BrowserCommand::Status).await,
+        Err(BrowserError::Timeout {
+            operation: "status".to_string(),
+        })
+    );
+    assert_eq!(bridge.pending_work_count(), 1);
+
+    let _queued_request = inbox.recv().await.expect("queued notification");
+    assert_eq!(bridge.pending_work_count(), 0);
+    assert_eq!(inbox.pending_work_count(), 0);
+}
+
+#[tokio::test]
 async fn stop_and_user_input_interrupt_outstanding_tab_operations() {
     let key = workspace("project-a", "conversation-a");
     let (bridge, mut inbox) = browser_command_channel(8);
@@ -183,7 +246,7 @@ async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     });
     let _request = inbox.recv().await.expect("reload request");
 
-    inbox.observe_host_event(&BrowserHostEvent::UserInput {
+    bridge.observe_host_event(&BrowserHostEvent::UserInput {
         workspace_key: key,
         tab_id: "tab-a".to_string(),
         kind: BrowserUserInputKind::Keyboard,
