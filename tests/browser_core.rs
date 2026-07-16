@@ -557,6 +557,22 @@ fn browser_recipe_validation_rejects_unsafe_or_secret_bearing_schema() {
 }
 
 #[test]
+fn browser_recipe_direct_serialization_rejects_secret_defaults() {
+    let mut recipe = sample_browser_recipe();
+    recipe
+        .inputs
+        .iter_mut()
+        .find(|input| input.kind == BrowserRecipeInputKind::Secret)
+        .expect("secret input")
+        .default_value = Some("must-not-be-serialized".to_string());
+
+    let error = serde_json::to_string(&recipe).expect_err("secret default must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("secret input default"));
+    assert!(!message.contains("must-not-be-serialized"));
+}
+
+#[test]
 fn browser_recipe_save_and_load_use_the_exact_pretty_repository_path() {
     let temp = TestDir::new("recipe-persistence");
     let project_root = temp.path().join("project");

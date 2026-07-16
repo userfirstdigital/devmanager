@@ -156,13 +156,45 @@ pub fn load_recipe(
     Ok(recipe)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserRecipeInput {
     pub name: String,
     pub kind: BrowserRecipeInputKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_value: Option<String>,
+}
+
+impl Serialize for BrowserRecipeInput {
+    fn serialize<Serializer>(
+        &self,
+        serializer: Serializer,
+    ) -> Result<Serializer::Ok, Serializer::Error>
+    where
+        Serializer: serde::Serializer,
+    {
+        if self.kind == BrowserRecipeInputKind::Secret && self.default_value.is_some() {
+            return Err(serde::ser::Error::custom(
+                "secret input default values cannot be serialized",
+            ));
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SerializableInput<'a> {
+            name: &'a str,
+            kind: BrowserRecipeInputKind,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            default_value: Option<&'a str>,
+        }
+
+        SerializableInput {
+            name: &self.name,
+            kind: self.kind,
+            default_value: self.default_value.as_deref(),
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
