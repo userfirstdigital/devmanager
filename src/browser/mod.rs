@@ -1,8 +1,22 @@
+mod commands;
+mod host;
 mod model;
 mod policy;
 mod recipes;
 mod storage;
 
+pub use commands::{
+    browser_command_channel, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
+    BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel, BrowserDownloadState,
+    BrowserHostEvent, BrowserHostStatus, BrowserPageLoadState, BrowserResponse,
+    BrowserUserInputKind,
+};
+pub use host::{
+    browser_user_input_initialization_script, unique_download_path, unsupported_host_status,
+    unsupported_platform_error, validate_browser_url, BrowserHostState, BrowserMemoryTarget,
+    BrowserProfileClearPlan, BrowserProjectContextKey, BrowserViewCreationPlan,
+    BrowserViewVisibilityPlan, BrowserWebViewHost, BrowserWorkspaceMutation,
+};
 pub use model::{
     BrowserAnnotation, BrowserBounds, BrowserElementRef, BrowserError, BrowserJournalActor,
     BrowserJournalEntry, BrowserLocator, BrowserResourceId, BrowserRevision, BrowserTabSnapshot,
