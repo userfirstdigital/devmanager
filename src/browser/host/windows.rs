@@ -2450,6 +2450,8 @@ fn browser_error_code(error: &BrowserError) -> &'static str {
     match error {
         BrowserError::InvalidWorkspaceKey { .. } => "invalid_workspace_key",
         BrowserError::InvalidInvocation { .. } => "invalid_request",
+        BrowserError::InvalidAnnotation { .. } => "invalid_annotation",
+        BrowserError::MissingAnnotation { .. } => "missing_annotation",
         BrowserError::StaleReference { .. } => "stale_reference",
         BrowserError::MissingFile { .. } => "missing_file",
         BrowserError::MissingResource { .. } => "missing_resource",

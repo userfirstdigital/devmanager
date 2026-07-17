@@ -87,10 +87,26 @@ pub struct BrowserBounds {
     pub height: i32,
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserAnnotationKind {
+    #[default]
+    Element,
+    Region,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserAnnotation {
     pub id: String,
+    #[serde(default)]
+    pub kind: BrowserAnnotationKind,
+    #[serde(default)]
+    pub tab_id: String,
+    #[serde(default)]
+    pub anchor_revision: BrowserRevision,
     pub comment: String,
     pub url: String,
     pub locator: BrowserLocator,
@@ -156,6 +172,13 @@ pub enum BrowserError {
     InvalidInvocation {
         field: String,
     },
+    InvalidAnnotation {
+        field: String,
+        message: String,
+    },
+    MissingAnnotation {
+        id: String,
+    },
     StaleReference {
         expected: BrowserRevision,
         actual: BrowserRevision,
@@ -217,6 +240,12 @@ impl fmt::Display for BrowserError {
                     formatter,
                     "browser invocation field {field} cannot be blank"
                 )
+            }
+            Self::InvalidAnnotation { field, message } => {
+                write!(formatter, "invalid browser annotation {field}: {message}")
+            }
+            Self::MissingAnnotation { id } => {
+                write!(formatter, "browser annotation does not exist: {id}")
             }
             Self::StaleReference { expected, actual } => write!(
                 formatter,
@@ -287,6 +316,7 @@ pub struct BrowserWorkspaceSnapshot {
     pub tabs: Vec<BrowserTabSnapshot>,
     pub selected_tab_id: Option<String>,
     pub annotations: Vec<BrowserAnnotation>,
+    pub pending_annotation_ids: Vec<String>,
     pub journal_entries: Vec<BrowserJournalEntry>,
 }
 
@@ -299,6 +329,7 @@ impl Default for BrowserWorkspaceSnapshot {
             tabs: Vec::new(),
             selected_tab_id: None,
             annotations: Vec::new(),
+            pending_annotation_ids: Vec::new(),
             journal_entries: Vec::new(),
         }
     }
@@ -323,5 +354,104 @@ impl BrowserWorkspaceSnapshot {
         }
 
         Ok(())
+    }
+
+    pub fn save_annotation(
+        &mut self,
+        mut annotation: BrowserAnnotation,
+    ) -> Result<(), BrowserError> {
+        annotation.id = annotation.id.trim().to_string();
+        if annotation.id.is_empty() {
+            return Err(BrowserError::InvalidAnnotation {
+                field: "id".to_string(),
+                message: "cannot be blank".to_string(),
+            });
+        }
+        annotation.comment = annotation.comment.trim().to_string();
+        if annotation.comment.is_empty() {
+            return Err(BrowserError::InvalidAnnotation {
+                field: "comment".to_string(),
+                message: "cannot be blank".to_string(),
+            });
+        }
+        if self
+            .annotations
+            .iter()
+            .any(|existing| existing.id == annotation.id)
+        {
+            return Err(BrowserError::InvalidAnnotation {
+                field: "id".to_string(),
+                message: format!("{} already exists", annotation.id),
+            });
+        }
+
+        let id = annotation.id.clone();
+        self.annotations.push(annotation);
+        if !self
+            .pending_annotation_ids
+            .iter()
+            .any(|pending| pending == &id)
+        {
+            self.pending_annotation_ids.push(id);
+        }
+        Ok(())
+    }
+
+    pub fn annotation(&self, id: &str) -> Result<&BrowserAnnotation, BrowserError> {
+        self.annotations
+            .iter()
+            .find(|annotation| annotation.id == id)
+            .ok_or_else(|| BrowserError::MissingAnnotation { id: id.to_string() })
+    }
+
+    pub fn set_annotation_resolved(
+        &mut self,
+        id: &str,
+        resolved: bool,
+    ) -> Result<bool, BrowserError> {
+        let annotation = self
+            .annotations
+            .iter_mut()
+            .find(|annotation| annotation.id == id)
+            .ok_or_else(|| BrowserError::MissingAnnotation { id: id.to_string() })?;
+        let changed = annotation.resolved != resolved;
+        annotation.resolved = resolved;
+        Ok(changed)
+    }
+
+    pub fn delete_annotation(&mut self, id: &str) -> Result<BrowserAnnotation, BrowserError> {
+        let index = self
+            .annotations
+            .iter()
+            .position(|annotation| annotation.id == id)
+            .ok_or_else(|| BrowserError::MissingAnnotation { id: id.to_string() })?;
+        self.remove_pending_annotation(id);
+        Ok(self.annotations.remove(index))
+    }
+
+    pub fn remove_pending_annotation(&mut self, id: &str) -> bool {
+        let previous_len = self.pending_annotation_ids.len();
+        self.pending_annotation_ids.retain(|pending| pending != id);
+        previous_len != self.pending_annotation_ids.len()
+    }
+
+    pub fn acknowledge_pending_annotations(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.pending_annotation_ids
+            .retain(|pending| !ids.iter().any(|acknowledged| acknowledged == pending));
+    }
+
+    pub fn annotation_anchor_is_stale(&self, id: &str) -> Result<bool, BrowserError> {
+        let annotation = self.annotation(id)?;
+        if annotation.tab_id.is_empty() || annotation.anchor_revision != self.revision {
+            return Ok(true);
+        }
+        Ok(self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == annotation.tab_id)
+            .is_none_or(|tab| tab.url != annotation.url))
     }
 }

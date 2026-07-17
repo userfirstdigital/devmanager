@@ -13545,7 +13545,10 @@ fn dedupe_adjacent_segments(segments: Vec<String>) -> Vec<String> {
 }
 
 fn is_startup_restorable_tab(tab: &SessionTab) -> bool {
-    matches!(tab.tab_type, TabType::Server | TabType::Ssh)
+    matches!(
+        tab.tab_type,
+        TabType::Server | TabType::Claude | TabType::Codex | TabType::Ssh
+    )
 }
 
 fn fetch_splash_image() -> Option<Arc<RenderImage>> {
@@ -13571,6 +13574,12 @@ fn retain_startup_restorable_tabs(
     active_tab_id: &mut Option<String>,
 ) {
     open_tabs.retain(is_startup_restorable_tab);
+    for tab in open_tabs.iter_mut() {
+        if matches!(tab.tab_type, TabType::Claude | TabType::Codex) {
+            tab.command_id = None;
+            tab.pty_session_id = None;
+        }
+    }
     if active_tab_id
         .as_ref()
         .is_none_or(|active| !open_tabs.iter().any(|tab| &tab.id == active))
@@ -13599,6 +13608,16 @@ fn restore_saved_tabs(
     retain_startup_restorable_tabs(&mut state.open_tabs, &mut state.active_tab_id);
     let recovered = process_manager.reconcile_saved_server_tabs(state);
     let ssh_restore = process_manager.restore_ssh_tabs(state);
+    if state
+        .active_tab()
+        .is_some_and(|tab| matches!(tab.tab_type, TabType::Claude | TabType::Codex))
+    {
+        state.active_tab_id = state
+            .open_tabs
+            .iter()
+            .find(|tab| matches!(tab.tab_type, TabType::Server | TabType::Ssh))
+            .map(|tab| tab.id.clone());
+    }
     let mut restore_notes = Vec::new();
     if recovered > 0 {
         restore_notes.push(format!("recovered {recovered} server tab(s)"));
@@ -14612,11 +14631,17 @@ mod tests {
             id: "tab-1".to_string(),
             tab_type: TabType::Claude,
             project_id: "project-1".to_string(),
-            command_id: None,
+            command_id: Some("stale-ai-command".to_string()),
             pty_session_id: Some("session-1".to_string()),
             label: Some("Claude 1".to_string()),
             ssh_connection_id: None,
-            browser_workspace: None,
+            browser_workspace: Some(
+                serde_json::from_value(serde_json::json!({
+                    "paneOpen": true,
+                    "pendingAnnotationIds": ["annotation-1"]
+                }))
+                .expect("browser workspace fixture"),
+            ),
         }
     }
 
@@ -15300,7 +15325,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_session_state_drops_ai_tabs_and_repairs_active_tab() {
+    fn persisted_session_state_keeps_ai_workspace_but_strips_runtime_identity() {
         let mut state = AppState::default();
         let mut settings = Settings::default();
         settings.restore_session_on_start = Some(true);
@@ -15319,9 +15344,19 @@ mod tests {
                 .iter()
                 .map(|tab| tab.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["server-tab", "ssh-tab"]
+            vec!["tab-1", "server-tab", "ssh-tab"]
         );
-        assert_eq!(session.active_tab_id.as_deref(), Some("server-tab"));
+        assert_eq!(session.active_tab_id.as_deref(), Some("tab-1"));
+        let ai_tab = &session.open_tabs[0];
+        assert_eq!(ai_tab.command_id, None);
+        assert_eq!(ai_tab.pty_session_id, None);
+        assert_eq!(ai_tab.project_id, "project-1");
+        let browser_json =
+            serde_json::to_value(ai_tab.browser_workspace.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            browser_json["pendingAnnotationIds"],
+            serde_json::json!(["annotation-1"])
+        );
         assert!(session.sidebar_collapsed);
     }
 
@@ -15357,7 +15392,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_saved_tabs_drops_ai_tabs_and_falls_back_to_fresh_shell() {
+    fn restore_saved_tabs_keeps_ai_tab_inactive_without_starting_provider() {
         let mut state = AppState::default();
         state.open_tabs.push(sample_ai_tab());
         state.active_tab_id = Some("tab-1".to_string());
@@ -15367,7 +15402,17 @@ mod tests {
 
         assert!(notice.is_none());
         assert!(manager.runtime_state().sessions.is_empty());
-        assert!(state.open_tabs.is_empty());
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.open_tabs[0].id, "tab-1");
+        assert_eq!(state.open_tabs[0].project_id, "project-1");
+        assert_eq!(state.open_tabs[0].command_id, None);
+        assert_eq!(state.open_tabs[0].pty_session_id, None);
+        let browser_json =
+            serde_json::to_value(state.open_tabs[0].browser_workspace.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            browser_json["pendingAnnotationIds"],
+            serde_json::json!(["annotation-1"])
+        );
         assert!(state.active_tab_id.is_none());
 
         let active_spec = state.active_terminal_spec();
@@ -15385,8 +15430,10 @@ mod tests {
         let notice = restore_saved_tabs(&manager, &mut state, SessionDimensions::default());
 
         assert!(notice.is_none());
-        assert_eq!(state.open_tabs.len(), 1);
-        assert_eq!(state.open_tabs[0].id, "server-tab");
+        assert_eq!(state.open_tabs.len(), 2);
+        assert_eq!(state.open_tabs[0].id, "tab-1");
+        assert_eq!(state.open_tabs[1].id, "server-tab");
+        assert_eq!(state.open_tabs[0].pty_session_id, None);
         assert_eq!(state.active_tab_id.as_deref(), Some("server-tab"));
     }
 

@@ -45,9 +45,9 @@ pub use host::{
     BrowserViewVisibilityPlan, BrowserWebViewHost, BrowserWorkspaceMutation,
 };
 pub use model::{
-    BrowserAnnotation, BrowserBounds, BrowserElementRef, BrowserError, BrowserJournalActor,
-    BrowserJournalEntry, BrowserLocator, BrowserResourceId, BrowserRevision, BrowserTabSnapshot,
-    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserAnnotation, BrowserAnnotationKind, BrowserBounds, BrowserElementRef, BrowserError,
+    BrowserJournalActor, BrowserJournalEntry, BrowserLocator, BrowserResourceId, BrowserRevision,
+    BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,

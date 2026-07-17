@@ -1,10 +1,10 @@
 use devmanager::browser::{
     classify_upload_path, load_recipe, recipe_path, save_recipe, BrowserAnnotation,
-    BrowserApprovalPolicy, BrowserBounds, BrowserElementRef, BrowserError, BrowserJournalActor,
-    BrowserJournalEntry, BrowserLocator, BrowserRecipeAction, BrowserRecipeInput,
-    BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1, BrowserResourceId, BrowserRevision,
-    BrowserRisk, BrowserStorageLayout, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
+    BrowserAnnotationKind, BrowserApprovalPolicy, BrowserBounds, BrowserElementRef, BrowserError,
+    BrowserJournalActor, BrowserJournalEntry, BrowserLocator, BrowserRecipeAction,
+    BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1,
+    BrowserResourceId, BrowserRevision, BrowserRisk, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use devmanager::models::{SessionState, SessionTab, Settings, TabType};
 use devmanager::state::AppState;
@@ -261,6 +261,9 @@ fn browser_persisted_model_payloads_are_camel_case_and_round_trip() {
     };
     let annotation = BrowserAnnotation {
         id: "annotation-1".to_string(),
+        kind: BrowserAnnotationKind::Element,
+        tab_id: "page-1".to_string(),
+        anchor_revision: BrowserRevision(0),
         comment: "Confirm before submitting".to_string(),
         url: "https://example.test/checkout".to_string(),
         locator: locator.clone(),

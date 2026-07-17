@@ -931,6 +931,8 @@ impl From<BrowserError> for ToolFailure {
         let code = match &error {
             BrowserError::InvalidWorkspaceKey { .. } => "invalid_workspace_key",
             BrowserError::InvalidInvocation { .. } => "invalid_request",
+            BrowserError::InvalidAnnotation { .. } => "invalid_annotation",
+            BrowserError::MissingAnnotation { .. } => "missing_annotation",
             BrowserError::StaleReference { .. } => "stale_reference",
             BrowserError::MissingFile { .. } => "missing_file",
             BrowserError::MissingResource { .. } => "missing_resource",
