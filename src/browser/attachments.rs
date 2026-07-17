@@ -285,6 +285,39 @@ impl BrowserAttachmentBroker {
         self.lock().bindings.get(session_id).cloned()
     }
 
+    pub fn renew_if_matches(
+        &self,
+        expected: &BrowserAttachmentSessionBinding,
+    ) -> Result<BrowserAttachmentSessionBinding, BrowserAttachmentError> {
+        let mut broker = self.lock();
+        if !broker
+            .bindings
+            .get(&expected.session_id)
+            .is_some_and(|current| current == expected)
+        {
+            return Err(BrowserAttachmentError::StaleBinding);
+        }
+
+        broker.next_generation = broker.next_generation.saturating_add(1);
+        let renewed = BrowserAttachmentSessionBinding {
+            session_id: expected.session_id.clone(),
+            workspace_key: expected.workspace_key.clone(),
+            generation: broker.next_generation,
+        };
+        if let Some(workspace) = broker.workspaces.get_mut(&expected.workspace_key) {
+            if workspace.active_reservation.as_ref().is_some_and(|active| {
+                active.session_id == expected.session_id
+                    && active.binding_generation == expected.generation
+            }) {
+                workspace.active_reservation = None;
+            }
+        }
+        broker
+            .bindings
+            .insert(expected.session_id.clone(), renewed.clone());
+        Ok(renewed)
+    }
+
     pub fn unbind_if_matches(&self, binding: &BrowserAttachmentSessionBinding) -> bool {
         let mut broker = self.lock();
         let matches = broker
@@ -977,6 +1010,34 @@ mod tests {
         assert!(broker
             .reserve_for_input("old-session", BrowserPromptInput::Text("prompt"))
             .is_none());
+    }
+
+    #[test]
+    fn compare_and_renew_cannot_steal_an_interleaved_replacement_binding() {
+        let broker = BrowserAttachmentBroker::default();
+        let workspace_key = key("project", "conversation");
+        let old = broker.bind_session("shared-session", workspace_key.clone());
+
+        // Deterministic race: fallback captured `old`, then a replacement won
+        // the workspace before fallback attempted its renewal.
+        let replacement = broker.bind_session("replacement-session", workspace_key);
+        assert_eq!(
+            broker.renew_if_matches(&old),
+            Err(BrowserAttachmentError::StaleBinding)
+        );
+        assert_eq!(
+            broker.binding("replacement-session"),
+            Some(replacement.clone())
+        );
+        assert!(broker.binding("shared-session").is_none());
+
+        let renewed = broker
+            .renew_if_matches(&replacement)
+            .expect("the current same-session binding renews atomically");
+        assert_eq!(renewed.session_id, replacement.session_id);
+        assert_eq!(renewed.workspace_key, replacement.workspace_key);
+        assert!(renewed.generation > replacement.generation);
+        assert_eq!(broker.binding("replacement-session"), Some(renewed));
     }
 
     #[test]

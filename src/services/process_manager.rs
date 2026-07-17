@@ -1066,13 +1066,16 @@ impl ProcessManager {
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
         let op_id = next_op_id();
-        self.op_queue
-            .submit(ProcessOp::CloseAi {
-                op_id,
-                session_id: session_id.to_string(),
-                response,
-            })
-            .map(|_| ())
+        let attachment_binding = self.inner.browser_attachment_broker.binding(session_id);
+        let result = self.op_queue.submit(ProcessOp::CloseAi {
+            op_id,
+            session_id: session_id.to_string(),
+            response,
+        });
+        if result.is_err() {
+            unbind_attachment_if_matches(&self.inner, attachment_binding.as_ref());
+        }
+        result.map(|_| ())
     }
 
     fn schedule_start_ssh(
@@ -3541,14 +3544,11 @@ fn unbind_attachment_if_matches(
 
 fn renew_attachment_binding_for_codex_fallback(
     inner: &ProcessManagerInner,
-    session_id: &str,
-) -> Option<BrowserAttachmentSessionBinding> {
-    let current = inner.browser_attachment_broker.binding(session_id)?;
-    Some(
-        inner
-            .browser_attachment_broker
-            .bind_session(session_id, current.workspace_key),
-    )
+    expected: Option<&BrowserAttachmentSessionBinding>,
+) -> Result<Option<BrowserAttachmentSessionBinding>, crate::browser::BrowserAttachmentError> {
+    expected
+        .map(|expected| inner.browser_attachment_broker.renew_if_matches(expected))
+        .transpose()
 }
 
 fn drain_claude_hook_sessions_inner(inner: &ProcessManagerInner) {
@@ -5148,6 +5148,7 @@ fn schedule_codex_original_fallback(
     launch: AiLaunchSpec,
     environment: HashMap<String, String>,
 ) {
+    let expected_attachment_binding = inner.browser_attachment_broker.binding(&session_id);
     let terminal_ops = inner
         .codex_fallback_terminal_ops
         .read()
@@ -5211,7 +5212,12 @@ fn schedule_codex_original_fallback(
             },
         );
 
-        let attachment_binding = renew_attachment_binding_for_codex_fallback(&inner, &session_id);
+        let Ok(attachment_binding) = renew_attachment_binding_for_codex_fallback(
+            &inner,
+            expected_attachment_binding.as_ref(),
+        ) else {
+            return;
+        };
         let fallback_result = terminal_ops
             .terminate_and_reap(&inner, &session_id)
             .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch, &environment));
@@ -6461,6 +6467,19 @@ mod tests {
         .expect("valid attachment snapshot")
     }
 
+    fn stop_background_tasks_for_test(manager: &ProcessManager) {
+        manager.inner.background_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = manager
+            .inner
+            .background_thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            handle.join().expect("background task stops cleanly");
+        }
+    }
+
     #[test]
     fn attachment_binding_precedes_gateway_and_survives_provider_setup_failure() {
         let manager = ProcessManager::new();
@@ -6540,9 +6559,13 @@ mod tests {
         );
         assert!(!manager.browser_attachment_broker().unbind_if_matches(&old));
 
-        let renewed =
-            renew_attachment_binding_for_codex_fallback(&manager.inner, "attachment-replacement")
-                .expect("same-ID fallback renews its binding");
+        let current = manager
+            .browser_attachment_broker()
+            .binding("attachment-replacement")
+            .expect("current attachment binding");
+        let renewed = renew_attachment_binding_for_codex_fallback(&manager.inner, Some(&current))
+            .expect("current binding renews")
+            .expect("same-ID fallback has an attachment binding");
         assert!(renewed.generation > old.generation);
         assert!(!manager.browser_attachment_broker().unbind_if_matches(&old));
         assert_eq!(
@@ -6580,6 +6603,33 @@ mod tests {
             .browser_attachment_broker()
             .binding("attachment-queue-failure")
             .is_none());
+        stop_background_tasks_for_test(&manager);
+    }
+
+    #[test]
+    fn close_queue_failure_unbinds_only_the_captured_attachment_generation() {
+        let manager = ProcessManager::new();
+        manager.op_queue.shutdown();
+        let mut launch = browser_test_launch(SessionKind::Claude, "claude --model sonnet");
+        let binding = manager
+            .prepare_browser_launch_for_session(
+                &mut launch,
+                "attachment-close-queue-failure",
+                browser_attachment_snapshot("ann-close-queue"),
+            )
+            .unwrap();
+
+        let result = manager.schedule_close_ai("attachment-close-queue-failure", None);
+
+        assert!(result.is_err());
+        assert!(!manager
+            .browser_attachment_broker()
+            .unbind_if_matches(&binding));
+        assert!(manager
+            .browser_attachment_broker()
+            .binding("attachment-close-queue-failure")
+            .is_none());
+        stop_background_tasks_for_test(&manager);
     }
 
     #[test]
