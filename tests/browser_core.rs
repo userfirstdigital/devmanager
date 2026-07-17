@@ -2,9 +2,10 @@ use devmanager::browser::{
     classify_upload_path, load_recipe, recipe_path, save_recipe, BrowserAnnotation,
     BrowserAnnotationKind, BrowserApprovalPolicy, BrowserBounds, BrowserElementRef, BrowserError,
     BrowserJournalActor, BrowserJournalEntry, BrowserLocator, BrowserRecipeAction,
-    BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserResourceId, BrowserRevision, BrowserRisk, BrowserStorageLayout, BrowserTabSnapshot,
-    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
+    BrowserRecipeAssertion, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
+    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeWait, BrowserResourceId,
+    BrowserRevision, BrowserRisk, BrowserStorageLayout, BrowserTabSnapshot, BrowserViewport,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use devmanager::models::{SessionState, SessionTab, Settings, TabType};
 use devmanager::state::AppState;
@@ -56,7 +57,7 @@ fn sample_browser_recipe() -> BrowserRecipeV1 {
         name: "Checkout review".to_string(),
         description: "Review checkout without submitting".to_string(),
         start_url: "https://example.test/checkout".to_string(),
-        viewport: BrowserViewport::default(),
+        viewport: BrowserViewport::default().into(),
         inputs: vec![
             BrowserRecipeInput {
                 name: "query".to_string(),
@@ -71,17 +72,32 @@ fn sample_browser_recipe() -> BrowserRecipeV1 {
         ],
         steps: vec![BrowserRecipeStep {
             id: "open-checkout".to_string(),
-            action: BrowserRecipeAction::Navigate,
-            locator: Some(BrowserLocator {
-                accessibility_role: Some("link".to_string()),
-                accessibility_name: Some("Checkout".to_string()),
-                test_id: None,
-                css_selectors: vec!["a.checkout".to_string()],
+            action: BrowserRecipeAction::Type {
+                locator: sample_recipe_locator(),
+                value: BrowserRecipeValue::Input {
+                    name: "query".to_string(),
+                },
+            },
+            wait: Some(BrowserRecipeWait::ElementVisible {
+                locator: sample_recipe_locator(),
+                timeout_ms: 5_000,
             }),
-            value_ref: Some("query".to_string()),
-            wait_condition: Some("networkIdle".to_string()),
-            assertions: vec!["urlContains:/checkout".to_string()],
+            assertions: vec![BrowserRecipeAssertion::Url {
+                value: BrowserRecipeValue::Literal {
+                    value: "https://example.test/checkout".to_string(),
+                },
+                exact: true,
+            }],
         }],
+    }
+}
+
+fn sample_recipe_locator() -> BrowserRecipeLocator {
+    BrowserRecipeLocator {
+        accessibility_role: Some("textbox".to_string()),
+        accessibility_name: Some("Search".to_string()),
+        test_id: Some("checkout-search".to_string()),
+        css_selectors: vec!["input[name='query']".to_string()],
     }
 }
 
@@ -476,26 +492,113 @@ fn browser_recipe_schema_v1_is_camel_case_and_round_trips() {
     assert!(value.get("schema_version").is_none());
     assert_eq!(value["inputs"][0]["defaultValue"], "books");
     assert!(value["inputs"][1].get("defaultValue").is_none());
-    assert_eq!(value["steps"][0]["valueRef"], "query");
-    assert_eq!(value["steps"][0]["waitCondition"], "networkIdle");
+    assert_eq!(value["steps"][0]["action"]["type"], "type");
+    assert_eq!(value["steps"][0]["action"]["value"]["name"], "query");
+    assert_eq!(value["steps"][0]["wait"]["type"], "elementVisible");
 
     let actions = [
-        (BrowserRecipeAction::Navigate, "navigate"),
-        (BrowserRecipeAction::Click, "click"),
-        (BrowserRecipeAction::Hover, "hover"),
-        (BrowserRecipeAction::Focus, "focus"),
-        (BrowserRecipeAction::Type, "type"),
-        (BrowserRecipeAction::Clear, "clear"),
-        (BrowserRecipeAction::Select, "select"),
-        (BrowserRecipeAction::Keypress, "keypress"),
-        (BrowserRecipeAction::Scroll, "scroll"),
-        (BrowserRecipeAction::DragDrop, "dragDrop"),
-        (BrowserRecipeAction::Wait, "wait"),
-        (BrowserRecipeAction::Screenshot, "screenshot"),
-        (BrowserRecipeAction::Cdp, "cdp"),
+        (
+            BrowserRecipeAction::Navigate {
+                url: BrowserRecipeValue::Literal {
+                    value: "https://example.test/".to_string(),
+                },
+            },
+            "navigate",
+        ),
+        (
+            BrowserRecipeAction::Click {
+                locator: sample_recipe_locator(),
+            },
+            "click",
+        ),
+        (
+            BrowserRecipeAction::Hover {
+                locator: sample_recipe_locator(),
+            },
+            "hover",
+        ),
+        (
+            BrowserRecipeAction::Focus {
+                locator: sample_recipe_locator(),
+            },
+            "focus",
+        ),
+        (
+            BrowserRecipeAction::Type {
+                locator: sample_recipe_locator(),
+                value: BrowserRecipeValue::Literal {
+                    value: "text".to_string(),
+                },
+            },
+            "type",
+        ),
+        (
+            BrowserRecipeAction::Clear {
+                locator: sample_recipe_locator(),
+            },
+            "clear",
+        ),
+        (
+            BrowserRecipeAction::Select {
+                locator: sample_recipe_locator(),
+                values: vec![BrowserRecipeValue::Literal {
+                    value: "choice".to_string(),
+                }],
+            },
+            "select",
+        ),
+        (
+            BrowserRecipeAction::Keypress {
+                locator: None,
+                key: BrowserRecipeValue::Literal {
+                    value: "Enter".to_string(),
+                },
+            },
+            "keypress",
+        ),
+        (
+            BrowserRecipeAction::Scroll {
+                locator: None,
+                delta_x: 0,
+                delta_y: 100,
+            },
+            "scroll",
+        ),
+        (
+            BrowserRecipeAction::DragDrop {
+                source: sample_recipe_locator(),
+                destination: sample_recipe_locator(),
+            },
+            "dragDrop",
+        ),
+        (
+            BrowserRecipeAction::Upload {
+                locator: sample_recipe_locator(),
+                file: BrowserRecipeValue::Input {
+                    name: "upload".to_string(),
+                },
+            },
+            "upload",
+        ),
+        (
+            BrowserRecipeAction::Download {
+                locator: sample_recipe_locator(),
+            },
+            "download",
+        ),
+        (
+            BrowserRecipeAction::Wait {
+                condition: BrowserRecipeWait::Load { timeout_ms: 5_000 },
+            },
+            "wait",
+        ),
+        (
+            BrowserRecipeAction::Screenshot { full_page: false },
+            "screenshot",
+        ),
     ];
     for (action, expected) in actions {
-        assert_eq!(serde_json::to_value(action).unwrap(), expected);
+        assert_eq!(serde_json::to_value(action).unwrap()["type"], expected);
     }
 
     let input_kinds = [

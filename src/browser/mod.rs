@@ -87,8 +87,10 @@ pub use provider::{
     ClaudeBrowserOverlay, DEVMANAGER_BROWSER_TOKEN_ENV,
 };
 pub use recipes::{
-    load_recipe, recipe_path, save_recipe, BrowserRecipeAction, BrowserRecipeInput,
-    BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1, BROWSER_RECIPE_SCHEMA_VERSION,
+    list_recipes, load_recipe, recipe_path, save_recipe, BrowserRecipeAction,
+    BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind,
+    BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
+    BrowserRecipeViewport, BrowserRecipeWait, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 pub use resources::{
     resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,
