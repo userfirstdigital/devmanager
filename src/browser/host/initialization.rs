@@ -80,8 +80,28 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   window.addEventListener("keydown", reportInput("keyboard"), true);
   window.addEventListener("input", reportInput("textInput"), true);
 
+  const annotationOwnedNodes = new WeakSet();
+  const annotationOwnedNode = (node) => {
+    if (!(node instanceof Element)) return false;
+    if (annotationOwnedNodes.has(node)) return true;
+    let ancestor = node.parentElement;
+    while (ancestor) {
+      if (annotationOwnedNodes.has(ancestor)) return true;
+      ancestor = ancestor.parentElement;
+    }
+    return false;
+  };
+  const annotationOwnedMutation = (record) => {
+    if (annotationOwnedNode(record.target)) return true;
+    const changedNodes = [
+      ...Array.from(record.addedNodes || []),
+      ...Array.from(record.removedNodes || []),
+    ];
+    return changedNodes.length > 0 && changedNodes.every(annotationOwnedNode);
+  };
   let mutationTimer = null;
-  const mutationObserver = new MutationObserver(() => {
+  const mutationObserver = new MutationObserver((records) => {
+    if (!records.some((record) => !annotationOwnedMutation(record))) return;
     if (mutationTimer !== null) return;
     mutationTimer = setTimeout(() => {
       mutationTimer = null;
@@ -298,11 +318,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     return Object.fromEntries(annotationStyleKeys.map((key) => [key, redact(computedStyle[key] || "").slice(0, 256)]));
   };
   let annotationSession = null;
-  const annotationOverlayMutation = (operation) => {
-    const result = operation();
-    mutationObserver.takeRecords();
-    return result;
-  };
+  const annotationOverlayMutation = (operation) => operation();
   const annotationCleanup = (notify) => {
     const session = annotationSession;
     if (!session) return;
@@ -338,6 +354,8 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     });
     const selection = document.createElement("div");
     selection.setAttribute("data-devmanager-annotation-selection", "true");
+    annotationOwnedNodes.add(overlay);
+    annotationOwnedNodes.add(selection);
     Object.assign(selection.style, {
       position: "fixed", display: "none", border: "2px solid #3b82f6",
       background: "rgba(59, 130, 246, 0.16)", pointerEvents: "none",

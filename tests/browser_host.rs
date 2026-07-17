@@ -1,22 +1,24 @@
 use devmanager::browser::{
     browser_command_channel, browser_lifecycle_control, browser_request_preempts_operation_queue,
     browser_user_input_initialization_script, crop_annotation_png,
-    parse_browser_annotation_ipc_message, prepare_verified_download_root,
-    prepare_verified_profile_root, remove_verified_profile, route_browser_request,
-    unique_download_path, unsupported_host_status, unsupported_platform_error,
-    validate_annotation_candidate_context, validate_browser_url, BrowserAction,
-    BrowserActionTarget, BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserAnnotationKind,
-    BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserBounds, BrowserCommand,
-    BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    parse_browser_annotation_ipc_message, parse_browser_page_ipc_message,
+    prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
+    route_browser_request, unique_download_path, unsupported_host_status,
+    unsupported_platform_error, validate_annotation_candidate_context, validate_browser_url,
+    BrowserAction, BrowserActionTarget, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
+    BrowserAnnotationDraft, BrowserAnnotationKind, BrowserAnnotationLifecycle,
+    BrowserAnnotationRoute, BrowserBounds, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
     BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
     BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserMemoryTarget, BrowserNetworkOperation, BrowserOperationQueue,
-    BrowserOperationTarget, BrowserPageLoadState, BrowserPerformanceOperation, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
-    BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind,
-    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserPerformanceOperation, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
+    BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
+    BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1524,7 +1526,9 @@ fn initialization_script_has_self_cleaning_element_and_region_annotation_overlay
     assert!(script.contains("kind: \"element\""));
     assert!(script.contains("kind: \"region\""));
     assert!(script.contains("removeEventListener"));
-    assert!(script.contains("mutationObserver.takeRecords()"));
+    assert!(script.contains("annotationOwnedMutation"));
+    assert!(script.contains("const annotationOwnedNodes = new WeakSet()"));
+    assert!(!script.contains("mutationObserver.takeRecords()"));
     assert!(script.contains("data-devmanager-annotation-overlay"));
     assert!(script.contains("computedStyle"));
     assert!(script.contains("fontSize"));
@@ -1580,6 +1584,7 @@ const body = new FakeElement("body");
 const documentElement = new FakeElement("html");
 const target = new FakeElement("button"); target.innerText = "Save"; target.setAttribute("role", "button"); target.setAttribute("data-testid", "");
 target.bounds = { x: -20, y: -5, width: 140, height: 70 };
+const spoofedPageNode = new FakeElement("section"); spoofedPageNode.setAttribute("data-devmanager-annotation-overlay", "true");
 globalThis.document = {
   body, documentElement,
   createElement: (tag) => new FakeElement(tag),
@@ -1597,9 +1602,13 @@ globalThis.window = {
 "#,
         browser_user_input_initialization_script(),
         r#"
+(async () => {
 const annotation = window.__devmanagerBrowser.annotation;
+documentElement.appendChild(spoofedPageNode);
 annotation.start({ url: "https://example.test/form", revision: 7 });
 activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.filter((message) => message.type === "domMutation").length !== 1) throw new Error("spoofed page marker mutation was suppressed");
 let overlay = body.children[0];
 overlay.dispatch("pointerdown", { clientX: 12, clientY: 14 });
 overlay.dispatch("pointerup", { clientX: 12, clientY: 14 });
@@ -1609,21 +1618,28 @@ if ((windowListeners.get("keydown") || []).length !== 1) throw new Error("base k
 annotation.start({ url: "https://example.test/form", revision: 7 });
 overlay = body.children[0];
 overlay.dispatch("pointerdown", { clientX: 4, clientY: 5 });
+activeObserver.record({ target, attributeName: "data-real-during-overlay" });
 overlay.dispatch("pointermove", { clientX: 44, clientY: 25 });
 overlay.dispatch("pointerup", { clientX: 44, clientY: 25 });
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.filter((message) => message.type === "domMutation").length !== 2) throw new Error("real mutation during overlay was suppressed or duplicated");
 if (body.children.length !== 0) throw new Error("region overlay leaked");
 
 annotation.start({ url: "https://example.test/form", revision: 7 });
 for (const handler of [...(windowListeners.get("keydown") || [])]) handler({ isTrusted: true, key: "Escape", preventDefault() {}, stopPropagation() {} });
 activeObserver.flush();
 if (body.children.length !== 0) throw new Error("escape overlay leaked");
-if (messages.some((message) => message.type === "domMutation")) throw new Error("overlay staled the page revision");
+await new Promise((resolve) => setTimeout(resolve, 75));
+const mutations = messages.filter((message) => message.type === "domMutation");
+if (mutations.length !== 2) throw new Error(`overlay-only mutation escaped filtering: ${mutations.length}`);
 const candidates = messages.filter((message) => message.type === "annotationCandidate").map((message) => message.candidate);
 if (candidates.length !== 2 || candidates[0].kind !== "element" || candidates[1].kind !== "region") throw new Error("candidate kinds missing");
 if (candidates[0].locator.testId !== null || candidates[0].locator.accessibilityName !== "Save" || candidates[0].computedStyles.fontSize !== "14px") throw new Error("semantic metadata normalization missing");
 if (JSON.stringify(candidates[0].bounds) !== JSON.stringify({ x: 0, y: 0, width: 100, height: 50 })) throw new Error("element bounds were not viewport-clamped");
 if (!messages.some((message) => message.type === "annotationCanceled")) throw new Error("escape cancellation missing");
 process.stdout.write(JSON.stringify({ candidates: candidates.length, children: body.children.length }));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 "#,
     ]
     .concat();
@@ -1698,6 +1714,27 @@ fn annotation_candidate_validation_is_strict_and_style_allowlisted() {
     let mut unknown = encoded.as_object().unwrap().clone();
     unknown.insert("pageHtml".to_string(), serde_json::json!("<secret>"));
     assert!(serde_json::from_value::<BrowserAnnotationCandidate>(unknown.into()).is_err());
+
+    for nested in ["locator", "bounds", "viewport"] {
+        let mut encoded = serde_json::to_value(annotation_candidate()).unwrap();
+        encoded[nested]
+            .as_object_mut()
+            .unwrap()
+            .insert("untrustedExtra".to_string(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<BrowserAnnotationCandidate>(encoded.clone()).is_err(),
+            "accepted unknown nested {nested} field"
+        );
+        let body = serde_json::json!({
+            "type": "annotationCandidate",
+            "candidate": encoded,
+        })
+        .to_string();
+        assert!(
+            parse_browser_annotation_ipc_message(&body).is_err(),
+            "IPC accepted unknown nested {nested} field"
+        );
+    }
 
     for bounds in [
         BrowserBounds {
@@ -1852,6 +1889,52 @@ fn annotation_lifecycle_is_route_owned_and_cancels_modes_and_drafts() {
 }
 
 #[test]
+fn annotation_cleanup_ledger_retries_failed_unpins_without_crossing_owners() {
+    let workspace_a = workspace("project-a", "conversation-a");
+    let workspace_b = workspace("project-a", "conversation-b");
+    let route_a = BrowserAnnotationRoute::new(workspace_a.clone(), "tab-a").unwrap();
+    let resource = BrowserResourceId(format!("res-{}", "a".repeat(32)));
+    let mut ledger = BrowserAnnotationCleanupLedger::default();
+    assert!(ledger.enqueue(route_a.clone(), resource.clone()));
+    assert!(!ledger.enqueue(route_a.clone(), resource.clone()));
+
+    let mut wrong_owner_attempts = 0;
+    assert!(ledger
+        .retry_workspace(&workspace_b, |_| {
+            wrong_owner_attempts += 1;
+            Ok(())
+        })
+        .is_empty());
+    assert_eq!(wrong_owner_attempts, 0);
+    assert_eq!(ledger.pending_for_workspace(&workspace_a).len(), 1);
+
+    let failures = ledger.retry_workspace(&workspace_a, |cleanup| {
+        assert_eq!(cleanup.route, route_a);
+        assert_eq!(cleanup.resource_id, resource);
+        Err(BrowserError::Io {
+            operation: "unpin annotation screenshot".to_string(),
+            path: PathBuf::from("locked-metadata.json"),
+            message: "sharing violation".to_string(),
+        })
+    });
+    assert_eq!(failures.len(), 1);
+    assert_eq!(ledger.pending_for_workspace(&workspace_a).len(), 1);
+
+    assert!(ledger.retry_workspace(&workspace_a, |_| Ok(())).is_empty());
+    assert!(ledger.pending_for_workspace(&workspace_a).is_empty());
+
+    assert!(ledger.enqueue(route_a, resource));
+    assert!(ledger
+        .retry_workspace(&workspace_a, |cleanup| {
+            Err(BrowserError::MissingResource {
+                id: cleanup.resource_id.clone(),
+            })
+        })
+        .is_empty());
+    assert!(ledger.pending_for_workspace(&workspace_a).is_empty());
+}
+
+#[test]
 fn annotation_save_and_cancel_transitions_are_failure_safe() {
     let source = include_str!("../src/browser/host/windows.rs");
     let commands = &source[source.find("fn handle_available_command(").unwrap()..];
@@ -1879,8 +1962,26 @@ fn annotation_save_and_cancel_transitions_are_failure_safe() {
         + completion_start;
     let completion = &source[completion_start..completion_end];
     assert!(completion.contains("let draft = match BrowserAnnotationDraft::new("));
-    assert!(completion.contains("set_resource_pinned("));
+    assert_eq!(completion.matches("queue_annotation_cleanup(").count(), 2);
     assert!(completion.contains("return Err(error);"));
+
+    for (start, end) in [
+        ("fn cancel_annotation_route(", "fn cancel_annotation_mode("),
+        (
+            "fn cancel_workspace_annotations(",
+            "fn cancel_project_annotations(",
+        ),
+        (
+            "fn cancel_project_annotations(",
+            "fn queue_annotation_cleanup(",
+        ),
+    ] {
+        let start = source.find(start).unwrap();
+        let end = source[start..].find(end).unwrap() + start;
+        let cancellation = &source[start..end];
+        assert!(cancellation.contains("annotation_cleanup"));
+        assert!(cancellation.contains("retry_annotation_cleanups"));
+    }
 }
 
 #[test]
@@ -2006,11 +2107,23 @@ fn initialization_script_inspects_active_keypress_and_both_drag_targets_before_a
 fn windows_ipc_routes_dom_mutations_and_all_trusted_input_kinds() {
     let windows_host = include_str!("../src/browser/host/windows.rs");
 
-    assert!(windows_host.contains("BrowserInputMessage::DomMutation"));
+    let handler = &windows_host[windows_host.find(".with_ipc_handler").unwrap()..];
+    assert!(handler.contains("parse_browser_page_ipc_message(body)"));
+    assert!(handler.contains("BrowserPageIpcMessage::DomMutation"));
     assert!(windows_host.contains("BrowserHostEvent::DomMutation"));
-    assert!(serde_json::from_str::<BrowserUserInputKind>("\"pointer\"").is_ok());
-    assert!(serde_json::from_str::<BrowserUserInputKind>("\"keyboard\"").is_ok());
-    assert!(serde_json::from_str::<BrowserUserInputKind>("\"textInput\"").is_ok());
+    for (encoded, expected) in [
+        ("pointer", BrowserUserInputKind::Pointer),
+        ("keyboard", BrowserUserInputKind::Keyboard),
+        ("textInput", BrowserUserInputKind::TextInput),
+    ] {
+        assert_eq!(
+            parse_browser_page_ipc_message(
+                &serde_json::json!({"type": "userInput", "kind": encoded}).to_string()
+            )
+            .unwrap(),
+            BrowserPageIpcMessage::UserInput { kind: expected }
+        );
+    }
 }
 
 #[test]
@@ -2450,6 +2563,7 @@ fn host_tab_and_page_mutations_advance_the_existing_snapshot_revision() {
         .update_viewport(&key, &first_tab, viewport.clone())
         .unwrap();
     assert_eq!(updated.snapshot.tabs[0].viewport, viewport);
+    assert_eq!(updated.revision.0, navigated.revision.0 + 1);
 
     let created = host.create_tab(&key, "https://example.test/two").unwrap();
     let second_tab = created.snapshot.selected_tab_id.clone().unwrap();
@@ -2492,6 +2606,35 @@ fn host_tab_and_page_mutations_advance_the_existing_snapshot_revision() {
 
     host.reset_workspace(&key);
     assert!(host.workspace(&key).is_none());
+}
+
+#[test]
+fn title_and_viewport_revision_causes_cancel_annotation_before_state_mutation() {
+    let source = include_str!("../src/browser/host/windows.rs");
+
+    let drain = &source[source.find("pub fn drain_events(").unwrap()..];
+    let title_start = drain.find("BrowserHostEvent::TitleChanged").unwrap();
+    let title_end = drain[title_start..]
+        .find("BrowserHostEvent::PageLoad")
+        .unwrap()
+        + title_start;
+    let title = &drain[title_start..title_end];
+    assert!(
+        title.find("cancel_annotation_mode").unwrap() < title.find("apply_title_change").unwrap()
+    );
+
+    let commands = &source[source.find("fn handle_available_command(").unwrap()..];
+    let viewport_start = commands.find("BrowserCommand::UpdateViewport").unwrap();
+    let viewport_end = commands[viewport_start..]
+        .find("BrowserCommand::OpenDevTools")
+        .unwrap()
+        + viewport_start;
+    let viewport = &commands[viewport_start..viewport_end];
+    assert!(viewport.contains("tab.viewport != viewport"));
+    assert!(
+        viewport.find("cancel_annotation_mode").unwrap()
+            < viewport.find("update_viewport").unwrap()
+    );
 }
 
 #[test]

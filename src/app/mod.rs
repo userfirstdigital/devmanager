@@ -1616,6 +1616,18 @@ impl NativeShell {
                 cx.notify();
                 return;
             }
+            BrowserPaneAction::FocusAnnotation => {
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                if ui.annotation_draft.is_some() {
+                    ui.annotation_cursor = ui
+                        .annotation_cursor
+                        .min(ui.annotation_comment.chars().count());
+                    ui.annotation_focused = true;
+                    window.focus(&self.browser_annotation_focus);
+                    cx.notify();
+                }
+                return;
+            }
             BrowserPaneAction::ToggleAnnotation => {
                 let enabled = !self
                     .browser_ui

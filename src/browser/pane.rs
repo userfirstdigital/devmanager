@@ -90,6 +90,7 @@ pub enum BrowserPaneAction {
     Forward,
     Reload,
     FocusAddress,
+    FocusAnnotation,
     EditAddress(String),
     SubmitAddress,
     SetViewport(BrowserViewportPreset),
@@ -394,6 +395,7 @@ pub fn browser_action_plan(
         | BrowserPaneAction::DividerUpdate { .. }
         | BrowserPaneAction::DividerEnd
         | BrowserPaneAction::FocusAddress
+        | BrowserPaneAction::FocusAnnotation
         | BrowserPaneAction::EditAddress(_) => Vec::new(),
     };
 
@@ -924,6 +926,10 @@ pub fn render_browser_pane(
                             theme::TEXT_PRIMARY
                         }))
                         .track_focus(&annotation_focus)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            action(BrowserPaneAction::FocusAnnotation),
+                        )
                         .on_key_down(actions.on_annotation_key)
                         .child(SharedString::from(comment)),
                 )

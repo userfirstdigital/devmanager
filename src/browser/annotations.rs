@@ -1,7 +1,7 @@
 use super::{
     redact_browser_text, validate_browser_url, BrowserAnnotation, BrowserAnnotationKind,
     BrowserBounds, BrowserError, BrowserLocator, BrowserResourceId, BrowserRevision,
-    BrowserViewport, BrowserWorkspaceKey,
+    BrowserUserInputKind, BrowserViewport, BrowserWorkspaceKey,
 };
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -31,8 +31,8 @@ const STYLE_ALLOWLIST: &[&str] = &[
     "visibility",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserAnnotationCandidate {
     pub kind: BrowserAnnotationKind,
     pub url: String,
@@ -41,6 +41,76 @@ pub struct BrowserAnnotationCandidate {
     pub bounds: BrowserBounds,
     pub viewport: BrowserViewport,
     pub computed_styles: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserAnnotationCandidateWire {
+    kind: BrowserAnnotationKind,
+    url: String,
+    revision: BrowserRevision,
+    locator: BrowserAnnotationLocatorWire,
+    bounds: BrowserAnnotationBoundsWire,
+    viewport: BrowserAnnotationViewportWire,
+    computed_styles: BTreeMap<String, String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserAnnotationLocatorWire {
+    accessibility_role: Option<String>,
+    accessibility_name: Option<String>,
+    test_id: Option<String>,
+    css_selectors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserAnnotationBoundsWire {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserAnnotationViewportWire {
+    width: u32,
+    height: u32,
+    scale_percent: u16,
+}
+
+impl<'de> Deserialize<'de> for BrowserAnnotationCandidate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = BrowserAnnotationCandidateWire::deserialize(deserializer)?;
+        Ok(Self {
+            kind: wire.kind,
+            url: wire.url,
+            revision: wire.revision,
+            locator: BrowserLocator {
+                accessibility_role: wire.locator.accessibility_role,
+                accessibility_name: wire.locator.accessibility_name,
+                test_id: wire.locator.test_id,
+                css_selectors: wire.locator.css_selectors,
+            },
+            bounds: BrowserBounds {
+                x: wire.bounds.x,
+                y: wire.bounds.y,
+                width: wire.bounds.width,
+                height: wire.bounds.height,
+            },
+            viewport: BrowserViewport {
+                width: wire.viewport.width,
+                height: wire.viewport.height,
+                scale_percent: wire.viewport.scale_percent,
+            },
+            computed_styles: wire.computed_styles,
+        })
+    }
 }
 
 impl BrowserAnnotationCandidate {
@@ -135,26 +205,37 @@ fn invalid<T>(field: &str, message: &str) -> Result<T, BrowserError> {
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
-enum AnnotationIpcMessage {
+pub enum BrowserPageIpcMessage {
+    UserInput {
+        kind: BrowserUserInputKind,
+    },
+    DomMutation,
     AnnotationCandidate {
         candidate: BrowserAnnotationCandidate,
     },
+    AnnotationCanceled,
+}
+
+pub fn parse_browser_page_ipc_message(body: &str) -> Result<BrowserPageIpcMessage, BrowserError> {
+    if body.len() > MAX_ANNOTATION_IPC_BYTES {
+        return invalid("ipcBody", "exceeds 32 KiB");
+    }
+    serde_json::from_str(body).map_err(|_| BrowserError::InvalidAnnotation {
+        field: "ipcBody".to_string(),
+        message: "is malformed".to_string(),
+    })
 }
 
 pub fn parse_browser_annotation_ipc_message(
     body: &str,
 ) -> Result<BrowserAnnotationCandidate, BrowserError> {
-    if body.len() > MAX_ANNOTATION_IPC_BYTES {
-        return invalid("ipcBody", "exceeds 32 KiB");
-    }
-    let message: AnnotationIpcMessage =
-        serde_json::from_str(body).map_err(|_| BrowserError::InvalidAnnotation {
-            field: "ipcBody".to_string(),
-            message: "is malformed".to_string(),
-        })?;
-    let AnnotationIpcMessage::AnnotationCandidate { candidate } = message;
+    let BrowserPageIpcMessage::AnnotationCandidate { candidate } =
+        parse_browser_page_ipc_message(body)?
+    else {
+        return invalid("ipcBody", "is not an annotation candidate");
+    };
     candidate.validate()?;
     Ok(candidate)
 }
@@ -284,6 +365,85 @@ fn random_id(prefix: &str) -> Result<String, BrowserError> {
 pub struct BrowserAnnotationRoute {
     pub workspace_key: BrowserWorkspaceKey,
     pub tab_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserAnnotationResourceCleanup {
+    pub route: BrowserAnnotationRoute,
+    pub resource_id: BrowserResourceId,
+}
+
+#[derive(Debug, Default)]
+pub struct BrowserAnnotationCleanupLedger {
+    pending: HashMap<(BrowserWorkspaceKey, BrowserResourceId), BrowserAnnotationRoute>,
+}
+
+impl BrowserAnnotationCleanupLedger {
+    pub fn enqueue(
+        &mut self,
+        route: BrowserAnnotationRoute,
+        resource_id: BrowserResourceId,
+    ) -> bool {
+        let key = (route.workspace_key.clone(), resource_id);
+        if self.pending.contains_key(&key) {
+            return false;
+        }
+        self.pending.insert(key, route);
+        true
+    }
+
+    pub fn pending_for_workspace(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Vec<BrowserAnnotationResourceCleanup> {
+        self.pending
+            .iter()
+            .filter(|((owner, _), _)| owner == workspace_key)
+            .map(
+                |((_, resource_id), route)| BrowserAnnotationResourceCleanup {
+                    route: route.clone(),
+                    resource_id: resource_id.clone(),
+                },
+            )
+            .collect()
+    }
+
+    pub fn pending_for_project(&self, project_id: &str) -> Vec<BrowserAnnotationResourceCleanup> {
+        self.pending
+            .iter()
+            .filter(|((owner, _), _)| owner.project_id == project_id)
+            .map(
+                |((_, resource_id), route)| BrowserAnnotationResourceCleanup {
+                    route: route.clone(),
+                    resource_id: resource_id.clone(),
+                },
+            )
+            .collect()
+    }
+
+    pub fn retry_workspace<F>(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        mut release: F,
+    ) -> Vec<(BrowserAnnotationResourceCleanup, BrowserError)>
+    where
+        F: FnMut(&BrowserAnnotationResourceCleanup) -> Result<(), BrowserError>,
+    {
+        let pending = self.pending_for_workspace(workspace_key);
+        let mut failures = Vec::new();
+        for cleanup in pending {
+            match release(&cleanup) {
+                Ok(()) | Err(BrowserError::MissingResource { .. }) => {
+                    self.pending.remove(&(
+                        cleanup.route.workspace_key.clone(),
+                        cleanup.resource_id.clone(),
+                    ));
+                }
+                Err(error) => failures.push((cleanup, error)),
+            }
+        }
+        failures
+    }
 }
 
 impl BrowserAnnotationRoute {

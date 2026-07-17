@@ -9,21 +9,21 @@ use crate::browser::downloads::{
 use crate::browser::{
     browser_lifecycle_control, browser_request_preempts_operation_queue, build_semantic_snapshot,
     crop_annotation_png, effective_browser_risk, effective_browser_risk_for_targets,
-    prepare_verified_download_root, redact_browser_resource_bytes, redact_browser_text,
-    remove_verified_profile, validate_annotation_candidate_context, BrowserAction,
-    BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationDraft,
-    BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
-    BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserCommandRequest,
-    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostStatus,
-    BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry,
-    BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget, BrowserPageLoadState,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
-    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
-    BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode,
-    BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult, BrowserUserInputKind,
-    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_ANNOTATION_IPC_BYTES,
-    MAX_BROWSER_ACTIONS,
+    parse_browser_page_ipc_message, prepare_verified_download_root, redact_browser_resource_bytes,
+    redact_browser_text, remove_verified_profile, validate_annotation_candidate_context,
+    BrowserAction, BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
+    BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationRoute,
+    BrowserApprovalPolicy, BrowserApprovalRequest, BrowserBounds, BrowserCommand,
+    BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
+    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
+    BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget,
+    BrowserPageIpcMessage, BrowserPageLoadState, BrowserPerformanceOperation,
+    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserResourceHandle,
+    BrowserResourceId, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
+    BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary,
+    BrowserStorageLayout, BrowserUploadResult, BrowserWaitResult, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -157,6 +157,7 @@ pub struct BrowserWebViewHost {
     async_sender: Sender<BrowserAsyncCompletion>,
     async_receiver: Receiver<BrowserAsyncCompletion>,
     annotation_lifecycle: BrowserAnnotationLifecycle,
+    annotation_cleanup: BrowserAnnotationCleanupLedger,
     accepted_annotation_candidates: HashMap<BrowserAnnotationRoute, BrowserAnnotationCandidate>,
     annotation_captures: HashMap<BrowserAnnotationRoute, PendingAnnotationCapture>,
     annotation_sender: Sender<BrowserAnnotationCompletion>,
@@ -242,6 +243,7 @@ impl BrowserWebViewHost {
             async_sender,
             async_receiver,
             annotation_lifecycle: BrowserAnnotationLifecycle::default(),
+            annotation_cleanup: BrowserAnnotationCleanupLedger::default(),
             accepted_annotation_candidates: HashMap::new(),
             annotation_captures: HashMap::new(),
             annotation_sender,
@@ -521,9 +523,10 @@ impl BrowserWebViewHost {
         let drafts = self.annotation_lifecycle.cancel_route(route);
         let canceled_draft = !drafts.is_empty();
         for draft in drafts {
-            let _ =
-                self.set_resource_pinned(&route.workspace_key, &draft.screenshot_resource, false);
+            self.annotation_cleanup
+                .enqueue(route.clone(), draft.screenshot_resource);
         }
+        self.retry_annotation_cleanups(&route.workspace_key);
         if canceled_draft {
             self.emit_annotation_canceled(route);
         }
@@ -576,9 +579,11 @@ impl BrowserWebViewHost {
         self.accepted_annotation_candidates
             .retain(|route, _| &route.workspace_key != workspace_key);
         for (route, draft) in self.annotation_lifecycle.cancel_workspace(workspace_key) {
-            let _ = self.set_resource_pinned(workspace_key, &draft.screenshot_resource, false);
+            self.annotation_cleanup
+                .enqueue(route.clone(), draft.screenshot_resource);
             self.emit_annotation_canceled(&route);
         }
+        self.retry_annotation_cleanups(workspace_key);
     }
 
     fn cancel_project_annotations(&mut self, project_id: &str) {
@@ -598,9 +603,50 @@ impl BrowserWebViewHost {
         self.accepted_annotation_candidates
             .retain(|route, _| route.workspace_key.project_id != project_id);
         for (route, draft) in self.annotation_lifecycle.cancel_project(project_id) {
-            let _ =
-                self.set_resource_pinned(&route.workspace_key, &draft.screenshot_resource, false);
+            self.annotation_cleanup
+                .enqueue(route.clone(), draft.screenshot_resource);
             self.emit_annotation_canceled(&route);
+            self.retry_annotation_cleanups(&route.workspace_key);
+        }
+        let retry_workspaces: Vec<_> = self
+            .annotation_cleanup
+            .pending_for_project(project_id)
+            .into_iter()
+            .map(|cleanup| cleanup.route.workspace_key)
+            .fold(Vec::new(), |mut workspaces, workspace_key| {
+                if !workspaces.contains(&workspace_key) {
+                    workspaces.push(workspace_key);
+                }
+                workspaces
+            });
+        for workspace_key in retry_workspaces {
+            self.retry_annotation_cleanups(&workspace_key);
+        }
+    }
+
+    fn queue_annotation_cleanup(
+        &mut self,
+        route: &BrowserAnnotationRoute,
+        resource_id: &BrowserResourceId,
+    ) {
+        self.annotation_cleanup
+            .enqueue(route.clone(), resource_id.clone());
+        self.retry_annotation_cleanups(&route.workspace_key);
+    }
+
+    fn retry_annotation_cleanups(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        let mut ledger = std::mem::take(&mut self.annotation_cleanup);
+        let failures = ledger.retry_workspace(workspace_key, |cleanup| {
+            self.set_resource_pinned(&cleanup.route.workspace_key, &cleanup.resource_id, false)
+                .map(|_| ())
+        });
+        self.annotation_cleanup = ledger;
+        for (cleanup, error) in failures {
+            self.emit_diagnostic(
+                &cleanup.route.workspace_key,
+                &cleanup.route.tab_id,
+                format!("annotation screenshot cleanup will retry: {error}"),
+            );
         }
     }
 
@@ -1032,11 +1078,7 @@ impl BrowserWebViewHost {
                 ) {
                     Ok(draft) => draft,
                     Err(error) => {
-                        let _ = self.set_resource_pinned(
-                            &completion.route.workspace_key,
-                            &resource.id,
-                            false,
-                        );
+                        self.queue_annotation_cleanup(&completion.route, &resource.id);
                         return Err(error);
                     }
                 };
@@ -1044,11 +1086,7 @@ impl BrowserWebViewHost {
                     .annotation_lifecycle
                     .store_draft(completion.route.clone(), draft.clone())
                 {
-                    let _ = self.set_resource_pinned(
-                        &completion.route.workspace_key,
-                        &resource.id,
-                        false,
-                    );
+                    self.queue_annotation_cleanup(&completion.route, &resource.id);
                     return Err(error);
                 }
                 Ok(draft)
@@ -2076,6 +2114,9 @@ impl BrowserWebViewHost {
                     tab_id,
                     title,
                 } => {
+                    if let Ok(route) = BrowserAnnotationRoute::new(workspace_key.clone(), tab_id) {
+                        self.cancel_annotation_mode(&route);
+                    }
                     let _ = self.state.apply_title_change(workspace_key, tab_id, title);
                 }
                 BrowserHostEvent::PageLoad {
@@ -2221,6 +2262,7 @@ impl BrowserWebViewHost {
                     .state
                     .ensure_workspace(workspace_key.clone(), snapshot)?;
                 self.reconcile_annotation_pins(workspace_key)?;
+                self.retry_annotation_cleanups(workspace_key);
                 self.ensure_selected_view(window, workspace_key)?;
                 self.apply_visibility_plan()?;
                 Ok(BrowserResponse::Workspace { mutation })
@@ -2392,6 +2434,15 @@ impl BrowserWebViewHost {
                 Ok(BrowserResponse::Acknowledged)
             }
             BrowserCommand::UpdateViewport { tab_id, viewport } => {
+                let changes_revision = self
+                    .state
+                    .workspace(workspace_key)
+                    .and_then(|snapshot| snapshot.tabs.iter().find(|tab| tab.id == tab_id))
+                    .is_some_and(|tab| tab.viewport != viewport);
+                if changes_revision {
+                    let route = BrowserAnnotationRoute::new(workspace_key.clone(), &tab_id)?;
+                    self.cancel_annotation_mode(&route);
+                }
                 let mutation = self
                     .state
                     .update_viewport(workspace_key, &tab_id, viewport)?;
@@ -2825,44 +2876,35 @@ fn configured_builder<'a>(
         })
         .with_ipc_handler(move |request| {
             let body = request.body();
-            let event = if body.len() > MAX_ANNOTATION_IPC_BYTES {
-                BrowserHostEvent::Diagnostic {
+            let event = match parse_browser_page_ipc_message(body) {
+                Ok(BrowserPageIpcMessage::UserInput { kind }) => BrowserHostEvent::UserInput {
+                    workspace_key: ipc_workspace.clone(),
+                    tab_id: ipc_tab.clone(),
+                    kind,
+                },
+                Ok(BrowserPageIpcMessage::DomMutation) => BrowserHostEvent::DomMutation {
+                    workspace_key: ipc_workspace.clone(),
+                    tab_id: ipc_tab.clone(),
+                },
+                Ok(BrowserPageIpcMessage::AnnotationCandidate { candidate }) => {
+                    BrowserHostEvent::AnnotationCandidate {
+                        workspace_key: ipc_workspace.clone(),
+                        tab_id: ipc_tab.clone(),
+                        candidate,
+                    }
+                }
+                Ok(BrowserPageIpcMessage::AnnotationCanceled) => {
+                    BrowserHostEvent::AnnotationCanceled {
+                        workspace_key: ipc_workspace.clone(),
+                        tab_id: ipc_tab.clone(),
+                    }
+                }
+                Err(_) => BrowserHostEvent::Diagnostic {
                     workspace_key: ipc_workspace.clone(),
                     tab_id: ipc_tab.clone(),
                     level: BrowserDiagnosticLevel::Warning,
-                    message: "ignored oversized browser input metadata".to_string(),
-                }
-            } else {
-                match serde_json::from_str::<BrowserInputMessage>(body) {
-                    Ok(BrowserInputMessage::UserInput { kind }) => BrowserHostEvent::UserInput {
-                        workspace_key: ipc_workspace.clone(),
-                        tab_id: ipc_tab.clone(),
-                        kind,
-                    },
-                    Ok(BrowserInputMessage::DomMutation) => BrowserHostEvent::DomMutation {
-                        workspace_key: ipc_workspace.clone(),
-                        tab_id: ipc_tab.clone(),
-                    },
-                    Ok(BrowserInputMessage::AnnotationCandidate { candidate }) => {
-                        BrowserHostEvent::AnnotationCandidate {
-                            workspace_key: ipc_workspace.clone(),
-                            tab_id: ipc_tab.clone(),
-                            candidate,
-                        }
-                    }
-                    Ok(BrowserInputMessage::AnnotationCanceled) => {
-                        BrowserHostEvent::AnnotationCanceled {
-                            workspace_key: ipc_workspace.clone(),
-                            tab_id: ipc_tab.clone(),
-                        }
-                    }
-                    Err(_) => BrowserHostEvent::Diagnostic {
-                        workspace_key: ipc_workspace.clone(),
-                        tab_id: ipc_tab.clone(),
-                        level: BrowserDiagnosticLevel::Warning,
-                        message: "ignored malformed browser input metadata".to_string(),
-                    },
-                }
+                    message: "ignored malformed or oversized browser input metadata".to_string(),
+                },
             };
             let _ = ipc_sender.send(event);
         })
@@ -2911,19 +2953,6 @@ fn configured_builder<'a>(
                 path: path.unwrap_or_else(|| completion_downloads_dir.clone()),
             });
         })
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
-enum BrowserInputMessage {
-    UserInput {
-        kind: BrowserUserInputKind,
-    },
-    DomMutation,
-    AnnotationCandidate {
-        candidate: BrowserAnnotationCandidate,
-    },
-    AnnotationCanceled,
 }
 
 fn view_key(workspace_key: &BrowserWorkspaceKey, tab_id: &str) -> BrowserViewKey {

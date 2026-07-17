@@ -15,9 +15,11 @@ mod resources;
 mod storage;
 
 pub use annotations::{
-    crop_annotation_png, parse_browser_annotation_ipc_message,
-    validate_annotation_candidate_context, BrowserAnnotationCandidate, BrowserAnnotationDraft,
-    BrowserAnnotationLifecycle, BrowserAnnotationRoute, MAX_ANNOTATION_IPC_BYTES,
+    crop_annotation_png, parse_browser_annotation_ipc_message, parse_browser_page_ipc_message,
+    validate_annotation_candidate_context, BrowserAnnotationCandidate,
+    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationLifecycle,
+    BrowserAnnotationResourceCleanup, BrowserAnnotationRoute, BrowserPageIpcMessage,
+    MAX_ANNOTATION_IPC_BYTES,
 };
 pub use automation::{
     build_semantic_snapshot, effective_browser_risk, effective_browser_risk_for_targets,

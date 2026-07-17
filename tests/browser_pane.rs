@@ -410,6 +410,7 @@ fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
         BrowserPaneAction::Forward,
         BrowserPaneAction::Reload,
         BrowserPaneAction::FocusAddress,
+        BrowserPaneAction::FocusAnnotation,
         BrowserPaneAction::SubmitAddress,
         BrowserPaneAction::SetViewport(BrowserViewportPreset::Desktop),
         BrowserPaneAction::ToggleAnnotation,
@@ -420,7 +421,7 @@ fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
         BrowserPaneAction::ResetWorkspace,
         BrowserPaneAction::ClearProjectProfile,
     ];
-    assert_eq!(actions.len(), 16);
+    assert_eq!(actions.len(), 17);
     assert_eq!(
         browser_pane_open_fallback(&BrowserPaneAction::Open),
         Some(true)
@@ -433,6 +434,49 @@ fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
         browser_pane_open_fallback(&BrowserPaneAction::CreateTab),
         None
     );
+}
+
+#[test]
+fn annotation_editor_has_an_explicit_native_focus_action() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let snapshot = BrowserWorkspaceSnapshot::default();
+    let plan = browser_action_plan(
+        Some(&key),
+        Some(&snapshot),
+        "",
+        BrowserPaneAction::FocusAnnotation,
+    )
+    .unwrap();
+    assert!(plan.commands.is_empty());
+
+    let model = BrowserPaneModel::new(
+        key.clone(),
+        &context(BrowserPaneSurface::Claude),
+        &snapshot,
+        BrowserPaneTransient {
+            annotation_focused: true,
+            ..BrowserPaneTransient::default()
+        },
+    );
+    assert!(model.annotation_focused);
+
+    let pane_source = include_str!("../src/browser/pane.rs");
+    let editor_start = pane_source.find("let annotation_editor").unwrap();
+    let editor_end = pane_source[editor_start..]
+        .find(".children(annotation_editor)")
+        .unwrap()
+        + editor_start;
+    let editor = &pane_source[editor_start..editor_end];
+    assert!(editor.contains(".on_mouse_down("));
+    assert!(editor.contains("action(BrowserPaneAction::FocusAnnotation)"));
+
+    let app_source = include_str!("../src/app/mod.rs");
+    let start = app_source
+        .find("BrowserPaneAction::FocusAnnotation =>")
+        .unwrap();
+    let body = &app_source[start..];
+    assert!(body.contains("ui.annotation_focused = true"));
+    assert!(body.contains("window.focus(&self.browser_annotation_focus)"));
 }
 
 #[test]
