@@ -17,6 +17,7 @@ mod recording_coordinator;
 mod recording_ipc;
 mod recording_mcp;
 mod replay;
+mod replay_executor;
 mod resources;
 mod storage;
 
@@ -141,6 +142,7 @@ pub use replay::{
     MAX_BROWSER_REPLAY_INPUTS, MAX_BROWSER_REPLAY_INPUT_NAME_BYTES, MAX_BROWSER_REPLAY_STEPS,
     MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
+pub use replay_executor::execute_browser_replay;
 pub use resources::{
     resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,
     BrowserResourceKind, BrowserResourceLimits, BrowserResourceMetadata, BrowserResourceStore,

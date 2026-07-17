@@ -72,6 +72,14 @@ impl BrowserInvocationContext {
         )
     }
 
+    pub fn for_actor(
+        actor: BrowserInvocationActor,
+        intent: impl Into<String>,
+        declared_risk: BrowserRisk,
+    ) -> Result<Self, BrowserError> {
+        Self::new(actor, intent, declared_risk, random_operation_id()?)
+    }
+
     pub fn user(
         intent: impl Into<String>,
         declared_risk: BrowserRisk,
