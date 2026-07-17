@@ -286,6 +286,16 @@ impl BrowserWorkflowRecorder {
         }
     }
 
+    pub(crate) fn active_instance(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Option<BrowserRecordingInstance> {
+        match self.workspaces.get(workspace_key) {
+            Some(WorkspaceRecordingState::Recording(active)) => Some(active.instance.clone()),
+            Some(WorkspaceRecordingState::Review(_)) | None => None,
+        }
+    }
+
     pub fn start(
         &mut self,
         workspace_key: BrowserWorkspaceKey,
@@ -422,6 +432,27 @@ impl BrowserWorkflowRecorder {
         let previous_next = active.next_to_drain;
         drain_ready(active);
         Ok(commit_result(previous_next, active.next_to_drain))
+    }
+
+    pub(crate) fn set_reservation_risk(
+        &mut self,
+        reservation: &BrowserRecordingReservation,
+        risk: BrowserRisk,
+    ) -> Result<(), BrowserRecordingError> {
+        let instance = BrowserRecordingInstance {
+            workspace_key: reservation.workspace_key.clone(),
+            id: reservation.instance_id,
+        };
+        let active = self.active_mut(&instance)?;
+        let slot = active
+            .reservations
+            .get_mut(&reservation.sequence)
+            .ok_or(BrowserRecordingError::StaleReservation)?;
+        if !matches!(slot.state, ReservationState::Pending) {
+            return Err(BrowserRecordingError::StaleReservation);
+        }
+        slot.context.risk = risk;
+        Ok(())
     }
 
     pub fn active_step_count(
@@ -1146,6 +1177,9 @@ fn action_value_and_kind(
     action: &BrowserRecipeAction,
 ) -> Option<(BrowserRecipeValue, BrowserRecipeInputKind)> {
     match action {
+        BrowserRecipeAction::CreateTab { url: Some(url), .. } => {
+            Some((url.clone(), BrowserRecipeInputKind::Url))
+        }
         BrowserRecipeAction::Navigate { url } => Some((url.clone(), BrowserRecipeInputKind::Url)),
         BrowserRecipeAction::Type { value, .. }
         | BrowserRecipeAction::Keypress { key: value, .. } => {
@@ -1160,6 +1194,7 @@ fn action_value_and_kind(
 
 fn action_value_mut(action: &mut BrowserRecipeAction) -> Option<&mut BrowserRecipeValue> {
     match action {
+        BrowserRecipeAction::CreateTab { url: Some(url), .. } => Some(url),
         BrowserRecipeAction::Navigate { url } => Some(url),
         BrowserRecipeAction::Type { value, .. } => Some(value),
         BrowserRecipeAction::Keypress { key, .. } => Some(key),
@@ -1199,6 +1234,7 @@ fn visit_action_values_mut(
     visitor: &mut impl FnMut(&mut BrowserRecipeValue),
 ) {
     match action {
+        BrowserRecipeAction::CreateTab { url: Some(url), .. } => visitor(url),
         BrowserRecipeAction::Navigate { url } => visitor(url),
         BrowserRecipeAction::Type { value, .. } => visitor(value),
         BrowserRecipeAction::Select { values, .. } => {
@@ -1210,6 +1246,14 @@ fn visit_action_values_mut(
         BrowserRecipeAction::Upload { file, .. } => visitor(file),
         BrowserRecipeAction::Wait { condition } => visit_wait_values_mut(condition, visitor),
         BrowserRecipeAction::Click { .. }
+        | BrowserRecipeAction::CreateTab { url: None, .. }
+        | BrowserRecipeAction::SelectTab { .. }
+        | BrowserRecipeAction::CloseTab { .. }
+        | BrowserRecipeAction::Back
+        | BrowserRecipeAction::Forward
+        | BrowserRecipeAction::Reload
+        | BrowserRecipeAction::SetViewport { .. }
+        | BrowserRecipeAction::CdpMarker { .. }
         | BrowserRecipeAction::Hover { .. }
         | BrowserRecipeAction::Focus { .. }
         | BrowserRecipeAction::Clear { .. }
@@ -1290,6 +1334,9 @@ fn finish_reference_mutation(review: &mut BrowserRecordingReview) -> BrowserReco
 
 fn action_references_input(action: &BrowserRecipeAction, input_name: &str) -> bool {
     match action {
+        BrowserRecipeAction::CreateTab { url, .. } => url
+            .as_ref()
+            .is_some_and(|value| value_references_input(value, input_name)),
         BrowserRecipeAction::Navigate { url } => value_references_input(url, input_name),
         BrowserRecipeAction::Type { value, .. } => value_references_input(value, input_name),
         BrowserRecipeAction::Select { values, .. } => values
@@ -1299,6 +1346,13 @@ fn action_references_input(action: &BrowserRecipeAction, input_name: &str) -> bo
         BrowserRecipeAction::Upload { file, .. } => value_references_input(file, input_name),
         BrowserRecipeAction::Wait { condition } => wait_references_input(condition, input_name),
         BrowserRecipeAction::Click { .. }
+        | BrowserRecipeAction::SelectTab { .. }
+        | BrowserRecipeAction::CloseTab { .. }
+        | BrowserRecipeAction::Back
+        | BrowserRecipeAction::Forward
+        | BrowserRecipeAction::Reload
+        | BrowserRecipeAction::SetViewport { .. }
+        | BrowserRecipeAction::CdpMarker { .. }
         | BrowserRecipeAction::Hover { .. }
         | BrowserRecipeAction::Focus { .. }
         | BrowserRecipeAction::Clear { .. }
@@ -1358,6 +1412,17 @@ fn sanitize_recipe_action(
         return Err(BrowserRecordingError::InvalidAction);
     }
     match action {
+        BrowserRecipeAction::CreateTab {
+            tab,
+            url: Some(BrowserRecipeValue::Literal { value }),
+        } => Ok(PendingRecordingAction::Recipe(
+            BrowserRecipeAction::CreateTab {
+                tab,
+                url: Some(BrowserRecipeValue::Literal {
+                    value: sanitize_recording_url(&value)?,
+                }),
+            },
+        )),
         BrowserRecipeAction::Navigate {
             url: BrowserRecipeValue::Literal { value },
         } => Ok(PendingRecordingAction::Recipe(
@@ -1399,6 +1464,9 @@ fn sanitize_recipe_action(
 
 fn action_has_input_reference(action: &BrowserRecipeAction) -> bool {
     match action {
+        BrowserRecipeAction::CreateTab { url, .. } => {
+            url.as_ref().is_some_and(value_has_input_reference)
+        }
         BrowserRecipeAction::Navigate { url } => value_has_input_reference(url),
         BrowserRecipeAction::Type { value, .. } => value_has_input_reference(value),
         BrowserRecipeAction::Select { values, .. } => values.iter().any(value_has_input_reference),
@@ -1406,6 +1474,13 @@ fn action_has_input_reference(action: &BrowserRecipeAction) -> bool {
         BrowserRecipeAction::Upload { file, .. } => value_has_input_reference(file),
         BrowserRecipeAction::Wait { condition } => wait_has_input_reference(condition),
         BrowserRecipeAction::Click { .. }
+        | BrowserRecipeAction::SelectTab { .. }
+        | BrowserRecipeAction::CloseTab { .. }
+        | BrowserRecipeAction::Back
+        | BrowserRecipeAction::Forward
+        | BrowserRecipeAction::Reload
+        | BrowserRecipeAction::SetViewport { .. }
+        | BrowserRecipeAction::CdpMarker { .. }
         | BrowserRecipeAction::Hover { .. }
         | BrowserRecipeAction::Focus { .. }
         | BrowserRecipeAction::Clear { .. }

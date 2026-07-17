@@ -889,12 +889,20 @@ fn windows_stop_fences_transport_then_drains_before_retiring_the_exact_recorder(
     let drain = stop
         .find("pump_page_recording_ipc")
         .expect("accepted-message drain");
-    let retire = stop
-        .find("recording_instances.remove")
-        .expect("authority retirement");
-    let recorder_stop = stop.find("workflow_recorder").expect("recorder Stop");
-    assert!(fence < drain && drain < retire && retire < recorder_stop);
-    assert!(windows.contains("self.pump_page_recording_ipc();\n        let instance"));
+    let retire_views = stop
+        .find("remove_workspace_recording_views")
+        .expect("view authority retirement");
+    let coordinator_stop = stop
+        .rfind(".stop(instance)")
+        .expect("shared coordinator Stop");
+    assert!(fence < drain && drain < retire_views && retire_views < coordinator_stop);
+    assert!(
+        stop.matches(".active_instance(instance.workspace_key())")
+            .count()
+            >= 2
+    );
+    assert!(!stop.contains("recording_instances"));
+    assert!(!stop.contains("workflow_recorder"));
     assert!(windows.contains("invalidate_page_recording_transport"));
     let invalidation_start = windows
         .find("fn invalidate_page_recording_transport(")

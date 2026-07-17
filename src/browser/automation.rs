@@ -469,6 +469,7 @@ pub struct BrowserRuntimeTarget {
     pub role: Option<String>,
     pub name: Option<String>,
     pub input_type: Option<String>,
+    pub autocomplete: Option<String>,
     pub form_action: Option<String>,
     pub permission: Option<String>,
 }
@@ -511,10 +512,11 @@ pub fn runtime_target_risk(target: &BrowserRuntimeTarget) -> BrowserRisk {
         return BrowserRisk::PermissionChange;
     }
     let combined = format!(
-        "{} {} {} {}",
+        "{} {} {} {} {}",
         target.role.as_deref().unwrap_or_default(),
         target.name.as_deref().unwrap_or_default(),
         target.input_type.as_deref().unwrap_or_default(),
+        target.autocomplete.as_deref().unwrap_or_default(),
         target.form_action.as_deref().unwrap_or_default()
     )
     .to_ascii_lowercase();

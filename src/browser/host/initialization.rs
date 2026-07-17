@@ -583,6 +583,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
         role: element ? roleOf(element) : null,
         name: element ? nameOf(element) : null,
         inputType: element?.getAttribute?.("type") || null,
+        autocomplete: element?.getAttribute?.("autocomplete") || null,
         formAction: form?.action ? safeUrl(form.action) : null,
         permission: null,
       };

@@ -652,6 +652,26 @@ impl BrowserRecipeStep {
     rename_all_fields = "camelCase"
 )]
 pub enum BrowserRecipeAction {
+    CreateTab {
+        tab: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<BrowserRecipeValue>,
+    },
+    SelectTab {
+        tab: String,
+    },
+    CloseTab {
+        tab: String,
+    },
+    Back,
+    Forward,
+    Reload,
+    SetViewport {
+        viewport: BrowserRecipeViewport,
+    },
+    CdpMarker {
+        method: String,
+    },
     Navigate {
         url: BrowserRecipeValue,
     },
@@ -713,6 +733,26 @@ pub enum BrowserRecipeAction {
     rename_all_fields = "camelCase"
 )]
 enum BrowserRecipeActionDocument {
+    CreateTab {
+        tab: String,
+        #[serde(default)]
+        url: Option<BrowserRecipeValue>,
+    },
+    SelectTab {
+        tab: String,
+    },
+    CloseTab {
+        tab: String,
+    },
+    Back,
+    Forward,
+    Reload,
+    SetViewport {
+        viewport: BrowserRecipeViewport,
+    },
+    CdpMarker {
+        method: String,
+    },
     Navigate {
         url: BrowserRecipeValue,
     },
@@ -769,6 +809,14 @@ enum BrowserRecipeActionDocument {
 impl From<BrowserRecipeActionDocument> for BrowserRecipeAction {
     fn from(document: BrowserRecipeActionDocument) -> Self {
         match document {
+            BrowserRecipeActionDocument::CreateTab { tab, url } => Self::CreateTab { tab, url },
+            BrowserRecipeActionDocument::SelectTab { tab } => Self::SelectTab { tab },
+            BrowserRecipeActionDocument::CloseTab { tab } => Self::CloseTab { tab },
+            BrowserRecipeActionDocument::Back => Self::Back,
+            BrowserRecipeActionDocument::Forward => Self::Forward,
+            BrowserRecipeActionDocument::Reload => Self::Reload,
+            BrowserRecipeActionDocument::SetViewport { viewport } => Self::SetViewport { viewport },
+            BrowserRecipeActionDocument::CdpMarker { method } => Self::CdpMarker { method },
             BrowserRecipeActionDocument::Navigate { url } => Self::Navigate { url },
             BrowserRecipeActionDocument::Click { locator } => Self::Click { locator },
             BrowserRecipeActionDocument::Hover { locator } => Self::Hover { locator },
@@ -822,6 +870,17 @@ impl<'de> Deserialize<'de> for BrowserRecipeAction {
 impl BrowserRecipeAction {
     fn validate_context_free(&self) -> Result<(), BrowserError> {
         match self {
+            Self::CreateTab { tab, url } => {
+                validate_recipe_tab_alias(tab)?;
+                if let Some(url) = url {
+                    validate_value_context_free(url, Some(LiteralKind::Url))?;
+                }
+                Ok(())
+            }
+            Self::SelectTab { tab } | Self::CloseTab { tab } => validate_recipe_tab_alias(tab),
+            Self::Back | Self::Forward | Self::Reload => Ok(()),
+            Self::SetViewport { viewport } => viewport.validate(),
+            Self::CdpMarker { method } => validate_cdp_marker_method(method),
             Self::Navigate { url } => validate_value_context_free(url, Some(LiteralKind::Url)),
             Self::Click { locator }
             | Self::Hover { locator }
@@ -895,6 +954,24 @@ impl BrowserRecipeAction {
     fn validate(&self, inputs: &HashMap<&str, BrowserRecipeInputKind>) -> Result<(), BrowserError> {
         self.validate_context_free()?;
         match self {
+            Self::CreateTab { url, .. } => {
+                if let Some(url) = url {
+                    validate_value(
+                        url,
+                        inputs,
+                        &[BrowserRecipeInputKind::Url],
+                        LiteralKind::Url,
+                    )?;
+                }
+                Ok(())
+            }
+            Self::SelectTab { .. }
+            | Self::CloseTab { .. }
+            | Self::Back
+            | Self::Forward
+            | Self::Reload
+            | Self::SetViewport { .. }
+            | Self::CdpMarker { .. } => Ok(()),
             Self::Navigate { url } => validate_value(
                 url,
                 inputs,
@@ -1455,6 +1532,26 @@ fn require_nonblank(value: &str, label: &str) -> Result<(), BrowserError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_recipe_tab_alias(tab: &str) -> Result<(), BrowserError> {
+    if !is_safe_recipe_id(tab) || tab.len() > 64 {
+        return Err(invalid_recipe("recipe tab alias is not a safe slug"));
+    }
+    Ok(())
+}
+
+fn validate_cdp_marker_method(method: &str) -> Result<(), BrowserError> {
+    if method.is_empty()
+        || method.len() > 128
+        || method.trim() != method
+        || !method
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+    {
+        return Err(invalid_recipe("recipe CDP marker method is invalid"));
+    }
+    Ok(())
 }
 
 fn reject_obvious_secret(value: &str, label: &str) -> Result<(), BrowserError> {

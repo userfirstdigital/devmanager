@@ -13,6 +13,7 @@ mod policy;
 mod provider;
 mod recipes;
 mod recording;
+mod recording_coordinator;
 mod recording_ipc;
 mod resources;
 mod storage;
@@ -101,6 +102,7 @@ pub use recording::{
     MAX_BROWSER_RECORDING_ASSERTIONS, MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION,
     MAX_BROWSER_RECORDING_INPUTS,
 };
+pub use recording_coordinator::BrowserWorkflowCoordinator;
 pub(crate) use recording_ipc::{
     browser_page_origin_from_url, BrowserPageRecordingIngress, BrowserPageRecordingSubmit,
     BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind,

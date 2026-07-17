@@ -2499,6 +2499,8 @@ fn initialization_script_inspects_active_keypress_and_both_drag_targets_before_a
     assert!(inspection.contains("document.activeElement"));
     assert!(inspection.contains("resolveTarget(action.source)"));
     assert!(inspection.contains("resolveTarget(action.destination)"));
+    assert!(inspection.contains("inputType: element?.getAttribute?.(\"type\")"));
+    assert!(inspection.contains("autocomplete: element?.getAttribute?.(\"autocomplete\")"));
 }
 
 #[test]

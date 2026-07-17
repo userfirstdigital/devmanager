@@ -401,6 +401,7 @@ fn action_diagnostics_are_secret_free_and_runtime_risk_cannot_be_lowered() {
         role: Some("button".to_string()),
         name: Some("Delete account permanently".to_string()),
         input_type: None,
+        autocomplete: None,
         form_action: None,
         permission: None,
     };
@@ -421,6 +422,7 @@ fn enter_form_and_drag_destination_runtime_targets_escalate_before_actions_run()
         role: Some("textbox".to_string()),
         name: Some("Confirmation".to_string()),
         input_type: Some("text".to_string()),
+        autocomplete: None,
         form_action: Some("https://fixture.test/delete-account-permanently".to_string()),
         permission: None,
     };

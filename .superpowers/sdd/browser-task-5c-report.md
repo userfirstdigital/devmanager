@@ -1,5 +1,67 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 4: Unified host capture
+
+### Status
+
+Checkpoint 4 started from the approved clean `master` head `5972652c5df5706ece58ba83b59fd3aa57b563a7`. It adds only unified in-memory capture for user chrome and queued agent/controller actions through the existing page/recording authority. The immutable final head, stable patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
+
+Checkpoints 5 through 12 are not implemented. This checkpoint adds no pane Record/review UI, MCP recording surface, recipe persistence call, replay compiler/executor, runtime secret prompt, or locator repair.
+
+### Contract decisions
+
+- `BrowserWorkflowCoordinator` is the single platform-neutral owner used by Windows host page IPC, user chrome, and agent capture. There is no host recorder mirror, agent recorder, or duplicate workspace-instance map.
+- Every producer uses the checkpoint-2 reserve/commit/cancel sequence. Accepted page messages drain before a user command or agent request reserves, agent work reserves before queue admission, and asynchronous completion timing cannot reorder source actions.
+- User chrome records only after an exact successful Workspace response. Create/select/close use deterministic per-instance logical aliases (`tab-1`, `tab-2`, and so on); runtime tab IDs are never emitted. Navigation uses the returned post-success URL and the existing credential-stripping boundary. Page click/type/select/upload/download remain page IPC only, so chrome capture cannot duplicate them.
+- Agent `Act` target metadata is runtime-inspected before any command text is copied into recorder-owned state. Password/security/credential targets and password/one-time-code autocomplete values create only an unset Secret input. Sensitive targets retain only these fixed non-text keys: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Home`, `End`, `PageUp`, and `PageDown`. Printable values, whitespace, modifiers, chords, and arbitrary key names are cancelled.
+- Upload capture accepts only the semantic locator and materializes an unset File input. CDP capture accepts only the typed method marker. Upload paths/files and CDP params, request bodies, response bodies, resource data, and inline results never enter coordinator state.
+- Inactive capture is an unconditional no-op. Stop/discard remove pending agent state for that exact instance; late completions are ignored. Direct user input, Stop/close/reset/profile clear, approval denial, callback/process failure, stale cancellation, and queue interruption converge on the same response finalization/cancellation path available at this checkpoint.
+
+### Implemented
+
+- Added a cloneable, mutex-protected coordinator over one `BrowserWorkflowRecorder`, including exact active-instance/project queries, shared page-recorder ingress, bounded logical tab aliases, and pending agent reservations keyed by workspace and operation.
+- Replaced the Windows host's separate recorder plus duplicate instance map with the coordinator. Start/Stop, reinjection, overflow invalidation, reset/profile clear, page IPC, user chrome, and agent queue/controller paths now consult the same authority.
+- Extended strict recipe v1 with typed create/select/close tab, back/forward/reload, viewport, and method-only CDP marker actions. Each variant participates in strict deserialize/validate/reference/redaction/review traversal; create-tab URLs pass the existing recording URL sanitizer.
+- Captured successful user tab create/select/close, navigate, back, forward, reload, and viewport changes. User `Act` remains ignored by chrome capture because semantic page actions arrive only through the private IPC.
+- Reserved every recordable agent command before enqueue, prepared `Act` actions only after runtime target inspection, upgraded reservation risk to effective runtime risk, and finalized before delivering the response. Only exact Workspace/Action/Wait/Screenshot/Upload/CDP response shapes can commit; every other result cancels.
+- Added safe conversions for semantic actions, waits, screenshots, uploads, and CDP method markers. Invalid or unsupported conversions cancel their reservation without blocking later source-order slots.
+
+### RED to GREEN evidence
+
+1. Shared authority and async ordering: the first focused test failed to compile because `BrowserWorkflowCoordinator` did not exist. GREEN interleaved page, chrome, agent success, and agent failure completions but emitted only successes in source order through one instance.
+2. Typed user chrome capture: RED had no coordinator API or typed tab/history/viewport variants. GREEN emitted deterministic strict actions only for exact success; failed navigation and user `Act` emitted nothing; credential query material and runtime tab IDs were absent.
+3. Agent inspection and completion: RED lacked reserve/inspect/complete, runtime `autocomplete`, and the CDP marker. GREEN buffered later navigation/upload/CDP behind inspected password typing, cancelled failure, and retained only unset Secret/File plus method-only CDP state.
+4. Host boundaries: RED found no capture at host ingress. GREEN reserves before enqueue, inspects before approval/execution, and finalizes before response delivery; interruption, denial, callback failure, and destructive lifecycle paths use the same finalizer.
+5. Hardening: RED showed inactive validation, printable password key retention, and Upload commitment from `Acknowledged`. GREEN makes inactive capture inert, uses the fixed key allowlist, and cancels mismatched response variants.
+6. Cross-producer order: RED found no page drain before user/agent reservations. GREEN synchronously drains already-accepted page events at both ingress paths.
+
+### Verification
+
+- `cargo test --locked --test browser_workflow_coordinator -- --test-threads=1` -> 11 passed, 0 failed.
+- Full browser integration targets covering annotations, attachment lifecycle, automation, core, fixture, gateway, host, pane, provider, recipes, recording, recording IPC, and coordinator -> 219 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 109 matching tests passed across all targets, 0 failed.
+- `cargo check --locked --all-targets` -> exit 0.
+- Native Windows `cargo build --locked` -> exit 0.
+- `cargo fmt --all -- --check` -> exit 0.
+- `git diff --check` -> exit 0.
+
+### Files
+
+- `src/browser/recording_coordinator.rs`
+- `src/browser/mod.rs`
+- `src/browser/recording.rs`
+- `src/browser/recipes.rs`
+- `src/browser/automation.rs`
+- `src/browser/host/initialization.rs`
+- `src/browser/host/windows.rs`
+- `tests/browser_workflow_coordinator.rs`
+- `tests/browser_automation.rs`
+- `tests/browser_host.rs`
+- `tests/browser_recording_ipc.rs`
+- `.superpowers/sdd/browser-task-5c-checkpoints.md`
+- `.superpowers/sdd/progress.md`
+- `.superpowers/sdd/browser-task-5c-report.md`
+
 ## Checkpoint 3: Semantic page recording IPC
 
 ### Status

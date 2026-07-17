@@ -29,7 +29,7 @@ use crate::browser::{
     BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
     BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget,
     BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
-    BrowserWaitResult, BrowserWorkflowRecorder, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
     MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
@@ -163,8 +163,7 @@ pub struct BrowserWebViewHost {
     event_receiver: Receiver<BrowserHostEvent>,
     recording_transport: BrowserPageRecordingTransport,
     recording_ingresses: HashMap<BrowserViewKey, BrowserPageRecordingIngress>,
-    workflow_recorder: BrowserWorkflowRecorder,
-    recording_instances: HashMap<BrowserWorkspaceKey, BrowserRecordingInstance>,
+    workflow_coordinator: BrowserWorkflowCoordinator,
     recording_views: HashMap<BrowserViewKey, BrowserPageRecordingIpc>,
     operation_queue: BrowserOperationQueue<BrowserCommandRequest>,
     active_requests: HashMap<BrowserOperationTarget, ActiveBrowserRequest>,
@@ -256,8 +255,7 @@ impl BrowserWebViewHost {
                 MAX_BROWSER_PAGE_RECORDING_QUEUE,
             ),
             recording_ingresses: HashMap::new(),
-            workflow_recorder: BrowserWorkflowRecorder::default(),
-            recording_instances: HashMap::new(),
+            workflow_coordinator: BrowserWorkflowCoordinator::default(),
             recording_views: HashMap::new(),
             operation_queue: BrowserOperationQueue::default(),
             active_requests: HashMap::new(),
@@ -285,7 +283,7 @@ impl BrowserWebViewHost {
         &self,
         workspace_key: &BrowserWorkspaceKey,
     ) -> BrowserRecordingStatus {
-        self.workflow_recorder.status(workspace_key)
+        self.workflow_coordinator.status(workspace_key)
     }
 
     pub fn start_page_recording(
@@ -305,11 +303,9 @@ impl BrowserWebViewHost {
             .collect::<Vec<_>>();
         self.pump_page_recording_ipc();
         let instance = self
-            .workflow_recorder
+            .workflow_coordinator
             .start(workspace_key.clone())
             .map_err(map_page_recording_error)?;
-        self.recording_instances
-            .insert(workspace_key.clone(), instance.clone());
         for tab_id in tab_ids {
             if self.views.contains_key(&view_key(workspace_key, &tab_id))
                 && self
@@ -317,9 +313,8 @@ impl BrowserWebViewHost {
                     .is_err()
             {
                 self.remove_workspace_recording_views(workspace_key);
-                self.recording_instances.remove(workspace_key);
-                if self.workflow_recorder.stop(&instance).is_ok() {
-                    let _ = self.workflow_recorder.discard(&instance);
+                if self.workflow_coordinator.stop(&instance).is_ok() {
+                    let _ = self.workflow_coordinator.discard(&instance);
                 }
                 return Err(BrowserPageRecordingIpcError::HostFailure);
             }
@@ -332,8 +327,8 @@ impl BrowserWebViewHost {
         instance: &BrowserRecordingInstance,
     ) -> Result<BrowserRecordingReview, BrowserPageRecordingIpcError> {
         if self
-            .recording_instances
-            .get(instance.workspace_key())
+            .workflow_coordinator
+            .active_instance(instance.workspace_key())
             .is_none_or(|active| active.id() != instance.id())
         {
             return Err(BrowserPageRecordingIpcError::Untrusted);
@@ -341,15 +336,14 @@ impl BrowserWebViewHost {
         self.fence_workspace_recording_views(instance.workspace_key());
         self.pump_page_recording_ipc();
         if self
-            .recording_instances
-            .get(instance.workspace_key())
+            .workflow_coordinator
+            .active_instance(instance.workspace_key())
             .is_none_or(|active| active.id() != instance.id())
         {
             return Err(BrowserPageRecordingIpcError::TransportInvalidated);
         }
         self.remove_workspace_recording_views(instance.workspace_key());
-        self.recording_instances.remove(instance.workspace_key());
-        self.workflow_recorder
+        self.workflow_coordinator
             .stop(instance)
             .map_err(map_page_recording_error)
     }
@@ -360,7 +354,19 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
+        self.pump_page_recording_ipc();
+        self.handle_command_with_user_capture(window, workspace_key, command, true)
+    }
+
+    fn handle_command_with_user_capture(
+        &mut self,
+        window: &gpui::Window,
+        workspace_key: &BrowserWorkspaceKey,
+        command: BrowserCommand,
+        capture_user_chrome: bool,
+    ) -> Result<BrowserResponse, BrowserError> {
         let annotation_command = matches!(&command, BrowserCommand::Annotations { .. });
+        let recording_command = capture_user_chrome.then(|| command.clone());
         if let Some(control) = browser_lifecycle_control(workspace_key, &command) {
             self.handle_control(control);
         }
@@ -384,6 +390,24 @@ impl BrowserWebViewHost {
                             format!("annotation resource pin reconciliation will retry: {error}"),
                         );
                     }
+                }
+            }
+        }
+        if let Some(command) = recording_command {
+            if let Err(error) = self.workflow_coordinator.record_user_chrome_result(
+                workspace_key,
+                &command,
+                &result,
+            ) {
+                if let Some(tab_id) = diagnostic_tab
+                    .clone()
+                    .or_else(|| self.selected_tab_id(workspace_key))
+                {
+                    self.emit_diagnostic(
+                        workspace_key,
+                        &tab_id,
+                        format!("browser recording could not capture chrome action: {error}"),
+                    );
                 }
             }
         }
@@ -422,12 +446,30 @@ impl BrowserWebViewHost {
             request.respond(Err(BrowserError::Interrupted));
             return;
         }
+        self.pump_page_recording_ipc();
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
+        if request.context().actor == BrowserInvocationActor::Agent {
+            if let Err(error) = self.workflow_coordinator.reserve_agent_command(
+                &workspace_key,
+                &request.context().operation_id,
+                &command,
+                request.context().declared_risk,
+            ) {
+                self.respond_request(request, Err(map_agent_recording_error(error)));
+                return;
+            }
+        }
         if request.context().actor != BrowserInvocationActor::Agent
             || browser_request_preempts_operation_queue(&command)
         {
-            let result = self.handle_command(window, &workspace_key, command);
+            let capture_user_chrome = request.context().actor == BrowserInvocationActor::User;
+            let result = self.handle_command_with_user_capture(
+                window,
+                &workspace_key,
+                command,
+                capture_user_chrome,
+            );
             self.respond_request(request, result);
             return;
         }
@@ -523,7 +565,7 @@ impl BrowserWebViewHost {
         }
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
-        let result = self.handle_command(window, &workspace_key, command);
+        let result = self.handle_command_with_user_capture(window, &workspace_key, command, false);
         self.finish_queued_request(window, target, operation_id, request, result);
     }
 
@@ -550,6 +592,26 @@ impl BrowserWebViewHost {
         let annotation_command = matches!(request.command(), BrowserCommand::Annotations { .. });
         let agent_journaled = request.context().actor == BrowserInvocationActor::Agent
             && browser_command_is_journaled(request.command());
+        if request.context().actor == BrowserInvocationActor::Agent {
+            if let Err(error) = self.workflow_coordinator.complete_agent_command(
+                &workspace_key,
+                &request.context().operation_id,
+                request.command(),
+                &result,
+            ) {
+                let tab_id = request
+                    .command()
+                    .tab_id()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| self.selected_tab_id(&workspace_key))
+                    .unwrap_or_else(|| WORKSPACE_OPERATION_TAB.to_string());
+                self.emit_diagnostic(
+                    &workspace_key,
+                    &tab_id,
+                    format!("browser workflow capture could not finalize: {error}"),
+                );
+            }
+        }
         if matches!(&result, Ok(BrowserResponse::Workspace { .. })) {
             if let Some(tab_id) = request
                 .command()
@@ -1383,6 +1445,22 @@ impl BrowserWebViewHost {
                     &runtime_targets,
                     None,
                 );
+                if let Err(error) = self.workflow_coordinator.inspect_agent_actions(
+                    active.request.workspace_key(),
+                    &operation_id,
+                    active.request.command(),
+                    &runtime_targets,
+                    effective_risk,
+                ) {
+                    self.finish_queued_request(
+                        window,
+                        completion.target,
+                        operation_id,
+                        active.request,
+                        Err(map_agent_recording_error(error)),
+                    );
+                    return;
+                }
                 if BrowserApprovalPolicy::trust_project().requires_confirmation(effective_risk)
                     && active.approved_risk != Some(effective_risk)
                 {
@@ -2378,7 +2456,10 @@ impl BrowserWebViewHost {
                     }
                     if *state == BrowserPageLoadState::Finished {
                         let _ = self.state.apply_page_load(workspace_key, tab_id, url);
-                        if self.recording_instances.contains_key(workspace_key)
+                        if self
+                            .workflow_coordinator
+                            .active_instance(workspace_key)
+                            .is_some()
                             && self
                                 .install_page_recording_view(workspace_key, tab_id)
                                 .is_err()
@@ -2469,8 +2550,8 @@ impl BrowserWebViewHost {
         let batch = self.recording_transport.drain();
         for failure in batch.failures {
             if self
-                .recording_instances
-                .get(&failure.workspace_key)
+                .workflow_coordinator
+                .active_instance(&failure.workspace_key)
                 .is_some_and(|active| active.id() == failure.instance_id)
             {
                 self.invalidate_page_recording_transport(
@@ -2482,8 +2563,8 @@ impl BrowserWebViewHost {
         }
         for message in batch.messages {
             if self
-                .recording_instances
-                .get(&message.workspace_key)
+                .workflow_coordinator
+                .active_instance(&message.workspace_key)
                 .is_none_or(|active| active.id() != message.instance_id)
             {
                 continue;
@@ -2492,11 +2573,9 @@ impl BrowserWebViewHost {
             let Some(ipc) = self.recording_views.get_mut(&key) else {
                 continue;
             };
-            let _ = ipc.ingest_from_origin(
-                &mut self.workflow_recorder,
-                &message.observed_origin,
-                &message.body,
-            );
+            let _ = self.workflow_coordinator.with_recorder(|recorder| {
+                ipc.ingest_from_origin(recorder, &message.observed_origin, &message.body)
+            });
         }
     }
 
@@ -2524,9 +2603,8 @@ impl BrowserWebViewHost {
         tab_id: &str,
     ) -> Result<(), BrowserPageRecordingIpcError> {
         let instance = self
-            .recording_instances
-            .get(workspace_key)
-            .cloned()
+            .workflow_coordinator
+            .active_instance(workspace_key)
             .ok_or(BrowserPageRecordingIpcError::Inactive)?;
         let snapshot = self
             .state
@@ -2629,20 +2707,20 @@ impl BrowserWebViewHost {
 
     fn discard_page_recording(&mut self, workspace_key: &BrowserWorkspaceKey) {
         self.remove_workspace_recording_views(workspace_key);
-        let Some(instance) = self.recording_instances.remove(workspace_key) else {
+        let Some(instance) = self.workflow_coordinator.active_instance(workspace_key) else {
             return;
         };
-        if self.workflow_recorder.stop(&instance).is_ok() {
-            let _ = self.workflow_recorder.discard(&instance);
+        if self.workflow_coordinator.stop(&instance).is_ok() {
+            let _ = self.workflow_coordinator.discard(&instance);
         }
     }
 
     fn discard_project_page_recordings(&mut self, project_id: &str) {
         let workspace_keys = self
-            .recording_instances
-            .keys()
-            .filter(|workspace_key| workspace_key.project_id == project_id)
-            .cloned()
+            .workflow_coordinator
+            .active_project_instances(project_id)
+            .into_iter()
+            .map(|instance| instance.workspace_key().clone())
             .collect::<Vec<_>>();
         for workspace_key in workspace_keys {
             self.discard_page_recording(&workspace_key);
@@ -3159,7 +3237,11 @@ impl BrowserWebViewHost {
         self.recording_ingresses
             .insert(key.clone(), recording_ingress);
         self.views.insert(key, webview);
-        if self.recording_instances.contains_key(workspace_key) {
+        if self
+            .workflow_coordinator
+            .active_instance(workspace_key)
+            .is_some()
+        {
             self.install_page_recording_view(workspace_key, tab_id)
                 .map_err(|_| BrowserError::CrashedView {
                     message: "browser recording instrumentation could not be installed".to_string(),
@@ -3278,6 +3360,12 @@ fn map_page_recording_error(error: BrowserRecordingError) -> BrowserPageRecordin
         BrowserRecordingError::CapacityExceeded
         | BrowserRecordingError::InvalidAction
         | BrowserRecordingError::InvalidMutation => BrowserPageRecordingIpcError::InvalidEvent,
+    }
+}
+
+fn map_agent_recording_error(error: BrowserRecordingError) -> BrowserError {
+    BrowserError::CrashedView {
+        message: format!("browser workflow capture failed: {error}"),
     }
 }
 
