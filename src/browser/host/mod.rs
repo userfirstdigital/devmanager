@@ -1,6 +1,6 @@
 use super::{
-    BrowserError, BrowserRevision, BrowserStorageLayout, BrowserTabSnapshot, BrowserViewport,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserAnnotation, BrowserError, BrowserRevision, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 mod initialization;
 mod unsupported;
@@ -145,6 +145,37 @@ impl BrowserHostState {
         snapshot.selected_tab_id = Some(tab_id);
         snapshot.advance_revision();
         Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
+    }
+
+    pub fn save_annotation(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        annotation: BrowserAnnotation,
+    ) -> Result<BrowserWorkspaceMutation, BrowserError> {
+        let snapshot = self.workspace_mut(workspace_key)?;
+        snapshot.save_annotation(annotation)?;
+        Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
+    }
+
+    pub fn set_annotation_resolved(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        annotation_id: &str,
+        resolved: bool,
+    ) -> Result<BrowserWorkspaceMutation, BrowserError> {
+        let snapshot = self.workspace_mut(workspace_key)?;
+        snapshot.set_annotation_resolved(annotation_id, resolved)?;
+        Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
+    }
+
+    pub fn delete_annotation(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        annotation_id: &str,
+    ) -> Result<(BrowserWorkspaceMutation, BrowserAnnotation), BrowserError> {
+        let snapshot = self.workspace_mut(workspace_key)?;
+        let annotation = snapshot.delete_annotation(annotation_id)?;
+        Ok((BrowserWorkspaceMutation::new(snapshot.clone()), annotation))
     }
 
     pub fn select_tab(
@@ -401,6 +432,10 @@ impl BrowserHostState {
 
     pub fn set_active_workspace(&mut self, workspace_key: Option<BrowserWorkspaceKey>) {
         self.active_workspace = workspace_key;
+    }
+
+    pub fn active_workspace(&self) -> Option<&BrowserWorkspaceKey> {
+        self.active_workspace.as_ref()
     }
 
     pub fn visibility_plan(&self) -> Vec<BrowserViewVisibilityPlan> {

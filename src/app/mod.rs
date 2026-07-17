@@ -183,6 +183,7 @@ struct NativeShell {
     browser_tasks_started: bool,
     browser_ui: HashMap<BrowserWorkspaceKey, BrowserWorkspaceUiState>,
     browser_address_focus: FocusHandle,
+    browser_annotation_focus: FocusHandle,
     browser_split_bounds: Option<BrowserBounds>,
     browser_page_bounds: Option<BrowserBounds>,
     browser_divider_drag: Option<BrowserDividerDrag>,
@@ -252,6 +253,11 @@ struct BrowserWorkspaceUiState {
     loading: bool,
     diagnostic: Option<String>,
     action_status: Option<String>,
+    annotation_mode: bool,
+    annotation_draft: Option<crate::browser::BrowserAnnotationDraft>,
+    annotation_comment: String,
+    annotation_cursor: usize,
+    annotation_focused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +895,7 @@ impl NativeShell {
             browser_tasks_started: false,
             browser_ui: HashMap::new(),
             browser_address_focus: cx.focus_handle(),
+            browser_annotation_focus: cx.focus_handle(),
             browser_split_bounds: None,
             browser_page_bounds: None,
             browser_divider_drag: None,
@@ -1174,7 +1181,7 @@ impl NativeShell {
         cx.notify();
     }
 
-    fn pump_browser_events(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn pump_browser_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let browser_bridge = self.browser_bridge.clone();
         let events = self.with_browser_host_control_barrier(window, |browser_host| {
             let mut events = browser_host.drain_events();
@@ -1246,6 +1253,56 @@ impl NativeShell {
                     message,
                 } => {
                     self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(message);
+                }
+                BrowserPaneEventPlan::CaptureAnnotation {
+                    workspace_key,
+                    tab_id,
+                    candidate,
+                } => {
+                    let result = self.dispatch_browser_command(
+                        &workspace_key,
+                        BrowserCommand::CaptureAnnotation { tab_id, candidate },
+                        window,
+                    );
+                    let ui = self.browser_ui.entry(workspace_key).or_default();
+                    ui.annotation_mode = false;
+                    match result {
+                        Ok(_) => {
+                            ui.action_status =
+                                Some("Capturing annotation screenshot...".to_string());
+                            ui.diagnostic = None;
+                        }
+                        Err(error) => ui.diagnostic = Some(error.to_string()),
+                    }
+                }
+                BrowserPaneEventPlan::ShowAnnotationDraft {
+                    workspace_key,
+                    draft,
+                } => {
+                    let ui = self.browser_ui.entry(workspace_key).or_default();
+                    ui.annotation_mode = false;
+                    ui.annotation_draft = Some(draft);
+                    ui.annotation_comment.clear();
+                    ui.annotation_cursor = 0;
+                    ui.annotation_focused = true;
+                    ui.action_status = Some("Annotation screenshot captured".to_string());
+                    ui.diagnostic = None;
+                    window.focus(&self.browser_annotation_focus);
+                }
+                BrowserPaneEventPlan::AnnotationModeChanged {
+                    workspace_key,
+                    enabled,
+                } => {
+                    let ui = self.browser_ui.entry(workspace_key).or_default();
+                    ui.annotation_mode = enabled;
+                }
+                BrowserPaneEventPlan::ClearAnnotation { workspace_key } => {
+                    let ui = self.browser_ui.entry(workspace_key).or_default();
+                    ui.annotation_mode = false;
+                    ui.annotation_draft = None;
+                    ui.annotation_comment.clear();
+                    ui.annotation_cursor = 0;
+                    ui.annotation_focused = false;
                 }
                 BrowserPaneEventPlan::ConfirmApproval {
                     workspace_key,
@@ -1442,6 +1499,11 @@ impl NativeShell {
                 diagnostic,
                 action_status: ui.action_status,
                 divider_dragging: self.browser_divider_drag.is_some(),
+                annotation_mode: ui.annotation_mode,
+                annotation_draft: ui.annotation_draft,
+                annotation_comment: ui.annotation_comment,
+                annotation_cursor: ui.annotation_cursor,
+                annotation_focused: ui.annotation_focused,
             },
         ))
     }
@@ -1551,6 +1613,112 @@ impl NativeShell {
                 ui.address_cursor = value.chars().count();
                 ui.address_draft = Some(value);
                 ui.address_focused = true;
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::ToggleAnnotation => {
+                let enabled = !self
+                    .browser_ui
+                    .get(&workspace_key)
+                    .is_some_and(|ui| ui.annotation_mode);
+                let Some(tab_id) = snapshot
+                    .selected_tab_id
+                    .clone()
+                    .or_else(|| snapshot.tabs.first().map(|tab| tab.id.clone()))
+                else {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                        Some("Browser workspace has no selected tab.".to_string());
+                    cx.notify();
+                    return;
+                };
+                match self.dispatch_browser_command(
+                    &workspace_key,
+                    BrowserCommand::SetAnnotationMode { tab_id, enabled },
+                    window,
+                ) {
+                    Ok(_) => {
+                        let ui = self.browser_ui.entry(workspace_key).or_default();
+                        ui.annotation_mode = enabled;
+                        if !enabled {
+                            ui.annotation_draft = None;
+                            ui.annotation_comment.clear();
+                            ui.annotation_cursor = 0;
+                            ui.annotation_focused = false;
+                        }
+                        ui.diagnostic = None;
+                    }
+                    Err(error) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some(error.to_string());
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::SaveAnnotation => {
+                let Some((draft_id, comment)) =
+                    self.browser_ui.get(&workspace_key).and_then(|ui| {
+                        ui.annotation_draft
+                            .as_ref()
+                            .map(|draft| (draft.id.clone(), ui.annotation_comment.clone()))
+                    })
+                else {
+                    return;
+                };
+                if comment.trim().is_empty() {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                        Some("Annotation comment cannot be blank.".to_string());
+                    cx.notify();
+                    return;
+                }
+                match self.dispatch_browser_command(
+                    &workspace_key,
+                    BrowserCommand::SaveAnnotationDraft { draft_id, comment },
+                    window,
+                ) {
+                    Ok(_) => {
+                        let ui = self.browser_ui.entry(workspace_key).or_default();
+                        ui.annotation_draft = None;
+                        ui.annotation_comment.clear();
+                        ui.annotation_cursor = 0;
+                        ui.annotation_focused = false;
+                        ui.action_status = Some("Saved browser annotation".to_string());
+                    }
+                    Err(error) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some(error.to_string());
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::CancelAnnotation => {
+                let Some(draft_id) = self
+                    .browser_ui
+                    .get(&workspace_key)
+                    .and_then(|ui| ui.annotation_draft.as_ref())
+                    .map(|draft| draft.id.clone())
+                else {
+                    return;
+                };
+                match self.dispatch_browser_command(
+                    &workspace_key,
+                    BrowserCommand::CancelAnnotationDraft { draft_id },
+                    window,
+                ) {
+                    Ok(_) => {
+                        let ui = self.browser_ui.entry(workspace_key).or_default();
+                        ui.annotation_draft = None;
+                        ui.annotation_comment.clear();
+                        ui.annotation_cursor = 0;
+                        ui.annotation_focused = false;
+                        ui.action_status = Some("Canceled browser annotation".to_string());
+                    }
+                    Err(error) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some(error.to_string());
+                    }
+                }
                 cx.notify();
                 return;
             }
@@ -1672,6 +1840,58 @@ impl NativeShell {
             false,
         ) {
             ui.address_focused = true;
+            cx.notify();
+            window.prevent_default();
+        }
+    }
+
+    fn handle_browser_annotation_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((workspace_key, _)) = self.active_browser_workspace() else {
+            return;
+        };
+        if self
+            .browser_ui
+            .get(&workspace_key)
+            .and_then(|ui| ui.annotation_draft.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        let key = event.keystroke.key.to_ascii_lowercase();
+        if key == "escape" {
+            self.apply_browser_pane_action(BrowserPaneAction::CancelAnnotation, window, cx);
+            window.prevent_default();
+            return;
+        }
+        let secondary = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        if secondary && key == "enter" {
+            self.apply_browser_pane_action(BrowserPaneAction::SaveAnnotation, window, cx);
+            window.prevent_default();
+            return;
+        }
+        let paste_text = if secondary && key == "v" {
+            cx.read_from_clipboard().and_then(|item| item.text())
+        } else {
+            None
+        };
+        let ui = self.browser_ui.entry(workspace_key).or_default();
+        let mut selection = None;
+        if apply_text_key_to_string(
+            &mut ui.annotation_comment,
+            &mut ui.annotation_cursor,
+            &mut selection,
+            event,
+            paste_text.as_deref(),
+            false,
+            true,
+        ) {
+            ui.annotation_focused = true;
+            ui.diagnostic = None;
             cx.notify();
             window.prevent_default();
         }
@@ -12259,6 +12479,9 @@ impl Render for NativeShell {
                                 on_address_key: Box::new(
                                     cx.listener(Self::handle_browser_address_key),
                                 ),
+                                on_annotation_key: Box::new(
+                                    cx.listener(Self::handle_browser_annotation_key),
+                                ),
                                 on_page_bounds: Arc::new(move |bounds, _window, app| {
                                     let _ = page_entity.update(app, |this, cx| {
                                         this.capture_browser_page_bounds(bounds, cx);
@@ -12365,6 +12588,7 @@ impl Render for NativeShell {
                                         .child(render_browser_pane(
                                             browser,
                                             self.browser_address_focus.clone(),
+                                            self.browser_annotation_focus.clone(),
                                             browser_actions,
                                         )),
                                 )
@@ -14782,6 +15006,50 @@ mod tests {
         assert_eq!(value, "3001");
         assert_eq!(cursor, 4);
         assert_eq!(selection_anchor, None);
+    }
+
+    #[test]
+    fn annotation_comment_editor_accepts_multiline_unicode_text() {
+        let mut value = "Review 👁".to_string();
+        let mut cursor = value.chars().count();
+        let mut selection_anchor = None;
+        let enter = KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers::default(),
+                key: "enter".to_string(),
+                key_char: None,
+            },
+            is_held: false,
+        };
+        assert!(apply_text_key_to_string(
+            &mut value,
+            &mut cursor,
+            &mut selection_anchor,
+            &enter,
+            None,
+            false,
+            true,
+        ));
+
+        let text = KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers::default(),
+                key: "n".to_string(),
+                key_char: Some("next".to_string()),
+            },
+            is_held: false,
+        };
+        assert!(apply_text_key_to_string(
+            &mut value,
+            &mut cursor,
+            &mut selection_anchor,
+            &text,
+            None,
+            false,
+            true,
+        ));
+        assert_eq!(value, "Review 👁\nnext");
+        assert_eq!(cursor, value.chars().count());
     }
 
     #[test]

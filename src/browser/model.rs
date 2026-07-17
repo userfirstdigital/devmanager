@@ -1,6 +1,6 @@
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -453,5 +453,23 @@ impl BrowserWorkspaceSnapshot {
             .iter()
             .find(|tab| tab.id == annotation.tab_id)
             .is_none_or(|tab| tab.url != annotation.url))
+    }
+
+    pub fn pinned_annotation_resource_ids(&self) -> BTreeSet<BrowserResourceId> {
+        let mut pinned = BTreeSet::new();
+        for annotation in &self.annotations {
+            if !annotation.resolved
+                || self
+                    .pending_annotation_ids
+                    .iter()
+                    .any(|pending| pending == &annotation.id)
+            {
+                pinned.insert(annotation.screenshot_resource.clone());
+            }
+        }
+        for entry in &self.journal_entries {
+            pinned.extend(entry.resource_ids.iter().cloned());
+        }
+        pinned
     }
 }

@@ -1,8 +1,8 @@
 use super::{
-    validate_browser_url, BrowserApprovalRequest, BrowserBounds, BrowserCommand,
-    BrowserDownloadState, BrowserError, BrowserHostEvent, BrowserJournalEntry,
-    BrowserPageLoadState, BrowserResponse, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    validate_browser_url, BrowserAnnotationCandidate, BrowserAnnotationDraft,
+    BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserError,
+    BrowserHostEvent, BrowserJournalEntry, BrowserPageLoadState, BrowserResponse, BrowserRevision,
+    BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -94,6 +94,8 @@ pub enum BrowserPaneAction {
     SubmitAddress,
     SetViewport(BrowserViewportPreset),
     ToggleAnnotation,
+    SaveAnnotation,
+    CancelAnnotation,
     ToggleRecording,
     OpenDevTools,
     OpenDownloads,
@@ -111,6 +113,11 @@ pub struct BrowserPaneTransient {
     pub diagnostic: Option<String>,
     pub action_status: Option<String>,
     pub divider_dragging: bool,
+    pub annotation_mode: bool,
+    pub annotation_draft: Option<BrowserAnnotationDraft>,
+    pub annotation_comment: String,
+    pub annotation_cursor: usize,
+    pub annotation_focused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +136,11 @@ pub struct BrowserPaneModel {
     pub action_status: Option<String>,
     pub journal_entries: Vec<BrowserJournalEntry>,
     pub divider_dragging: bool,
+    pub annotation_mode: bool,
+    pub annotation_draft: Option<BrowserAnnotationDraft>,
+    pub annotation_comment: String,
+    pub annotation_cursor: usize,
+    pub annotation_focused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +197,22 @@ pub enum BrowserPaneEventPlan {
         tab_id: String,
         request: BrowserApprovalRequest,
     },
+    CaptureAnnotation {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+        candidate: BrowserAnnotationCandidate,
+    },
+    ShowAnnotationDraft {
+        workspace_key: BrowserWorkspaceKey,
+        draft: BrowserAnnotationDraft,
+    },
+    AnnotationModeChanged {
+        workspace_key: BrowserWorkspaceKey,
+        enabled: bool,
+    },
+    ClearAnnotation {
+        workspace_key: BrowserWorkspaceKey,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +251,10 @@ impl BrowserPaneModel {
         } else {
             address_draft.chars().count()
         };
+        let annotation_comment = transient.annotation_comment;
+        let annotation_cursor = transient
+            .annotation_cursor
+            .min(annotation_comment.chars().count());
         Self {
             workspace_key,
             eligible: browser_pane_eligible(context),
@@ -243,6 +275,11 @@ impl BrowserPaneModel {
                 .cloned()
                 .collect(),
             divider_dragging: transient.divider_dragging,
+            annotation_mode: transient.annotation_mode,
+            annotation_draft: transient.annotation_draft,
+            annotation_comment,
+            annotation_cursor,
+            annotation_focused: transient.annotation_focused,
         }
     }
 }
@@ -344,10 +381,15 @@ pub fn browser_action_plan(
         }],
         BrowserPaneAction::ResetWorkspace => vec![BrowserCommand::ResetWorkspace],
         BrowserPaneAction::ClearProjectProfile => vec![BrowserCommand::ClearProjectProfile],
-        BrowserPaneAction::ToggleAnnotation | BrowserPaneAction::ToggleRecording => {
+        BrowserPaneAction::ToggleAnnotation => vec![BrowserCommand::SetAnnotationMode {
+            tab_id: selected_tab(snapshot)?.to_string(),
+            enabled: true,
+        }],
+        BrowserPaneAction::ToggleRecording => {
             diagnostic = Some("Not available until browser automation is initialized".to_string());
             Vec::new()
         }
+        BrowserPaneAction::SaveAnnotation | BrowserPaneAction::CancelAnnotation => Vec::new(),
         BrowserPaneAction::DividerBegin { .. }
         | BrowserPaneAction::DividerUpdate { .. }
         | BrowserPaneAction::DividerEnd
@@ -402,6 +444,7 @@ pub fn browser_response_sync(
         | BrowserResponse::Upload { .. }
         | BrowserResponse::Downloads { .. }
         | BrowserResponse::Cdp { .. }
+        | BrowserResponse::AnnotationDraft { .. }
         | BrowserResponse::Acknowledged => None,
     }
 }
@@ -416,6 +459,10 @@ pub fn browser_event_plan(
         | BrowserHostEvent::PageLoad { workspace_key, .. }
         | BrowserHostEvent::UserInput { workspace_key, .. }
         | BrowserHostEvent::DomMutation { workspace_key, .. }
+        | BrowserHostEvent::AnnotationCandidate { workspace_key, .. }
+        | BrowserHostEvent::AnnotationCanceled { workspace_key, .. }
+        | BrowserHostEvent::AnnotationDraftReady { workspace_key, .. }
+        | BrowserHostEvent::AnnotationModeChanged { workspace_key, .. }
         | BrowserHostEvent::AutomationStateChanged { workspace_key, .. }
         | BrowserHostEvent::ApprovalRequested { workspace_key, .. }
         | BrowserHostEvent::NewWindow { workspace_key, .. }
@@ -457,6 +504,30 @@ pub fn browser_event_plan(
                 tab_id: tab_id.clone(),
                 interrupt_agent: false,
                 loading: None,
+            })
+        }
+        BrowserHostEvent::AnnotationCandidate {
+            tab_id, candidate, ..
+        } => Some(BrowserPaneEventPlan::CaptureAnnotation {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.clone(),
+            candidate: candidate.clone(),
+        }),
+        BrowserHostEvent::AnnotationCanceled { .. } => {
+            Some(BrowserPaneEventPlan::ClearAnnotation {
+                workspace_key: workspace_key.clone(),
+            })
+        }
+        BrowserHostEvent::AnnotationDraftReady { draft, .. } => {
+            Some(BrowserPaneEventPlan::ShowAnnotationDraft {
+                workspace_key: workspace_key.clone(),
+                draft: draft.clone(),
+            })
+        }
+        BrowserHostEvent::AnnotationModeChanged { enabled, .. } => {
+            Some(BrowserPaneEventPlan::AnnotationModeChanged {
+                workspace_key: workspace_key.clone(),
+                enabled: *enabled,
             })
         }
         BrowserHostEvent::ApprovalRequested {
@@ -691,12 +762,14 @@ pub struct BrowserPaneActions {
     pub on_action:
         Arc<dyn Fn(BrowserPaneAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_address_key: Box<dyn Fn(&KeyDownEvent, &mut Window, &mut App)>,
+    pub on_annotation_key: Box<dyn Fn(&KeyDownEvent, &mut Window, &mut App)>,
     pub on_page_bounds: Arc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>,
 }
 
 pub fn render_browser_pane(
     model: BrowserPaneModel,
     address_focus: FocusHandle,
+    annotation_focus: FocusHandle,
     actions: BrowserPaneActions,
 ) -> impl IntoElement {
     let action = actions.on_action.clone();
@@ -791,6 +864,89 @@ pub fn render_browser_pane(
         model.address_draft.clone()
     };
     let page_bounds = actions.on_page_bounds.clone();
+    let annotation_editor =
+        model.annotation_draft.as_ref().map(|draft| {
+            let cursor_byte = model
+                .annotation_comment
+                .char_indices()
+                .nth(model.annotation_cursor)
+                .map(|(index, _)| index)
+                .unwrap_or(model.annotation_comment.len());
+            let comment = if model.annotation_comment.is_empty() {
+                "Add a required comment".to_string()
+            } else if model.annotation_focused {
+                format!(
+                    "{}|{}",
+                    &model.annotation_comment[..cursor_byte],
+                    &model.annotation_comment[cursor_byte..]
+                )
+            } else {
+                model.annotation_comment.clone()
+            };
+            let bounds = draft.candidate.bounds;
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .p(px(6.0))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_PRIMARY))
+                .bg(rgb(theme::PANEL_HEADER_BG))
+                .child(div().text_xs().text_color(rgb(theme::TEXT_MUTED)).child(
+                    SharedString::from(format!(
+                        "{:?} at {},{} {}x{} - screenshot {}",
+                        draft.candidate.kind,
+                        bounds.x,
+                        bounds.y,
+                        bounds.width,
+                        bounds.height,
+                        draft.screenshot_resource.0
+                    )),
+                ))
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .flex()
+                        .items_center()
+                        .px(px(6.0))
+                        .border_1()
+                        .border_color(rgb(if model.annotation_focused {
+                            theme::PRIMARY
+                        } else {
+                            theme::BORDER_PRIMARY
+                        }))
+                        .bg(rgb(theme::APP_BG))
+                        .text_xs()
+                        .text_color(rgb(if model.annotation_comment.is_empty() {
+                            theme::TEXT_DIM
+                        } else {
+                            theme::TEXT_PRIMARY
+                        }))
+                        .track_focus(&annotation_focus)
+                        .on_key_down(actions.on_annotation_key)
+                        .child(SharedString::from(comment)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(browser_button(
+                            "Save",
+                            false,
+                            false,
+                            action(BrowserPaneAction::SaveAnnotation),
+                        ))
+                        .child(browser_button(
+                            "Cancel",
+                            false,
+                            true,
+                            action(BrowserPaneAction::CancelAnnotation),
+                        )),
+                )
+                .into_any_element()
+        });
 
     div()
         .h_full()
@@ -921,7 +1077,7 @@ pub fn render_browser_pane(
                 )
                 .child(browser_button(
                     "annotate",
-                    false,
+                    model.annotation_mode,
                     false,
                     action(BrowserPaneAction::ToggleAnnotation),
                 ))
@@ -975,6 +1131,7 @@ pub fn render_browser_pane(
                 }))),
         )
         .child(div().flex_none().flex().flex_col().children(journal_rows))
+        .children(annotation_editor)
         .child(
             div()
                 .flex_1()

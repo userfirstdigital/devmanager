@@ -1,5 +1,6 @@
 use super::{BrowserError, BrowserResourceId, BrowserWorkspaceKey};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ const RESOURCE_HEX_LEN: usize = 32;
 pub enum BrowserResourceKind {
     DomSnapshot,
     Screenshot,
+    AnnotationScreenshot,
     NetworkBody,
     CdpResult,
     PerformanceTrace,
@@ -272,6 +274,61 @@ impl BrowserResourceStore {
         Ok(BrowserResource { metadata, bytes })
     }
 
+    pub fn set_pinned(
+        &self,
+        owner: &BrowserWorkspaceKey,
+        id: &BrowserResourceId,
+        pinned: bool,
+    ) -> Result<BrowserResourceHandle, BrowserError> {
+        validate_resource_id(id)?;
+        let _gate = lock(&self.inner.gate);
+        self.verify_root()?;
+        let metadata_path = metadata_path(&self.inner.root, id)?;
+        if !is_direct_regular_file(&self.inner.root, &metadata_path) {
+            return Err(BrowserError::MissingResource { id: id.clone() });
+        }
+        let encoded = std::fs::read(&metadata_path)
+            .map_err(|error| io_error("read resource metadata", &metadata_path, error))?;
+        let mut metadata: BrowserResourceMetadata = serde_json::from_slice(&encoded)
+            .map_err(|_| BrowserError::MissingResource { id: id.clone() })?;
+        if metadata.id != *id {
+            return Err(BrowserError::MissingResource { id: id.clone() });
+        }
+        if &metadata.owner != owner {
+            return Err(BrowserError::BlockedPermission {
+                permission: "resource ownership".to_string(),
+            });
+        }
+        metadata.pinned = pinned;
+        write_metadata(&metadata_path, &metadata)?;
+        Ok(BrowserResourceHandle::from(&metadata))
+    }
+
+    pub fn reconcile_annotation_pins(
+        &self,
+        owner: &BrowserWorkspaceKey,
+        pinned_ids: &BTreeSet<BrowserResourceId>,
+    ) -> Result<(), BrowserError> {
+        let _gate = lock(&self.inner.gate);
+        self.verify_root()?;
+        for mut metadata in scan_metadata(&self.inner.root)
+            .into_iter()
+            .filter(|metadata| {
+                &metadata.owner == owner
+                    && metadata.kind == BrowserResourceKind::AnnotationScreenshot
+            })
+        {
+            let pinned = pinned_ids.contains(&metadata.id);
+            if metadata.pinned == pinned {
+                continue;
+            }
+            metadata.pinned = pinned;
+            let path = metadata_path(&self.inner.root, &metadata.id)?;
+            write_metadata(&path, &metadata)?;
+        }
+        Ok(())
+    }
+
     fn verify_root(&self) -> Result<(), BrowserError> {
         if let Some(trusted_root) = &self.inner.trusted_root {
             super::downloads::verify_prepared_storage_root(trusted_root, &self.inner.root)?;
@@ -420,6 +477,15 @@ fn io_error(operation: &str, path: &Path, error: std::io::Error) -> BrowserError
         path: path.to_path_buf(),
         message: error.to_string(),
     }
+}
+
+fn write_metadata(path: &Path, metadata: &BrowserResourceMetadata) -> Result<(), BrowserError> {
+    let encoded = serde_json::to_vec_pretty(metadata).map_err(|error| BrowserError::Io {
+        operation: "encode resource metadata".to_string(),
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    std::fs::write(path, encoded).map_err(|error| io_error("write resource metadata", path, error))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

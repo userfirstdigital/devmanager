@@ -1,3 +1,4 @@
+mod annotations;
 mod automation;
 mod commands;
 mod downloads;
@@ -13,6 +14,11 @@ mod recipes;
 mod resources;
 mod storage;
 
+pub use annotations::{
+    crop_annotation_png, parse_browser_annotation_ipc_message,
+    validate_annotation_candidate_context, BrowserAnnotationCandidate, BrowserAnnotationDraft,
+    BrowserAnnotationLifecycle, BrowserAnnotationRoute, MAX_ANNOTATION_IPC_BYTES,
+};
 pub use automation::{
     build_semantic_snapshot, effective_browser_risk, effective_browser_risk_for_targets,
     redact_browser_resource_bytes, redact_browser_text, runtime_target_risk, BrowserAction,

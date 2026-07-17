@@ -1,10 +1,13 @@
 use devmanager::browser::{
     browser_command_channel, browser_lifecycle_control, browser_request_preempts_operation_queue,
-    browser_user_input_initialization_script, prepare_verified_download_root,
+    browser_user_input_initialization_script, crop_annotation_png,
+    parse_browser_annotation_ipc_message, prepare_verified_download_root,
     prepare_verified_profile_root, remove_verified_profile, route_browser_request,
     unique_download_path, unsupported_host_status, unsupported_platform_error,
-    validate_browser_url, BrowserAction, BrowserActionTarget, BrowserCommand, BrowserCommandBridge,
-    BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    validate_annotation_candidate_context, validate_browser_url, BrowserAction,
+    BrowserActionTarget, BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserAnnotationKind,
+    BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserBounds, BrowserCommand,
+    BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
     BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
     BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
@@ -16,6 +19,8 @@ use devmanager::browser::{
     BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1509,6 +1514,406 @@ fn initialization_script_reports_only_trusted_input_metadata() {
 }
 
 #[test]
+fn initialization_script_has_self_cleaning_element_and_region_annotation_overlay() {
+    let script = browser_user_input_initialization_script();
+
+    assert!(script.contains("annotationCandidate"));
+    assert!(script.contains("annotation: {"));
+    assert!(script.contains("setPointerCapture"));
+    assert!(script.contains("elementFromPoint"));
+    assert!(script.contains("kind: \"element\""));
+    assert!(script.contains("kind: \"region\""));
+    assert!(script.contains("removeEventListener"));
+    assert!(script.contains("mutationObserver.takeRecords()"));
+    assert!(script.contains("data-devmanager-annotation-overlay"));
+    assert!(script.contains("computedStyle"));
+    assert!(script.contains("fontSize"));
+    assert!(script.contains("borderRadius"));
+}
+
+#[test]
+fn annotation_overlay_emits_element_and_region_candidates_then_removes_every_owned_hook() {
+    let harness = [
+        r#"
+const messages = [];
+const windowListeners = new Map();
+let activeObserver = null;
+class FakeMutationObserver {
+  constructor(callback) { this.callback = callback; this.records = []; activeObserver = this; }
+  observe() {}
+  takeRecords() { const records = this.records; this.records = []; return records; }
+  record(record) { this.records.push(record); }
+  flush() { if (this.records.length) { const records = this.takeRecords(); this.callback(records); } }
+}
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase(); this.children = []; this.parentElement = null;
+    const style = {};
+    this.style = new Proxy(style, { set: (target, key, value) => { target[key] = value; activeObserver?.record({ target: this, attributeName: "style" }); return true; } });
+    this.dataset = {}; this.listeners = new Map(); this.attributes = new Map();
+    this.innerText = ""; this.id = "";
+  }
+  setAttribute(key, value) { this.attributes.set(key, String(value)); }
+  getAttribute(key) { return this.attributes.has(key) ? this.attributes.get(key) : null; }
+  hasAttribute(key) { return this.attributes.has(key); }
+  addEventListener(type, handler) { this.listeners.set(type, handler); }
+  removeEventListener(type, handler) { if (this.listeners.get(type) === handler) this.listeners.delete(type); }
+  appendChild(child) { child.parentElement = this; this.children.push(child); activeObserver?.record({ target: this, addedNodes: [child], removedNodes: [] }); return child; }
+  remove() { if (!this.parentElement) return; const parent = this.parentElement; parent.children = parent.children.filter((child) => child !== this); this.parentElement = null; activeObserver?.record({ target: parent, addedNodes: [], removedNodes: [this] }); }
+  setPointerCapture() {}
+  getBoundingClientRect() { return this.bounds || { x: 10, y: 12, width: 30, height: 20 }; }
+  matches() { return false; }
+  closest() { return null; }
+  dispatch(type, values) { this.listeners.get(type)?.({ isTrusted: true, preventDefault() {}, stopPropagation() {}, pointerId: 1, ...values }); }
+}
+globalThis.Element = FakeElement;
+globalThis.MutationObserver = FakeMutationObserver;
+globalThis.PerformanceObserver = class { observe() {} };
+globalThis.XMLHttpRequest = class {};
+XMLHttpRequest.prototype.open = function() {};
+XMLHttpRequest.prototype.send = function() {};
+globalThis.CSS = { escape: (value) => String(value) };
+globalThis.location = new URL("https://example.test/form");
+globalThis.performance = { now: () => 0, getEntriesByType: () => [] };
+globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible", opacity: "1", position: "static", color: "rgb(0, 0, 0)", backgroundColor: "rgb(255, 255, 255)", fontFamily: "sans-serif", fontSize: "14px", fontWeight: "400", border: "0px none", borderRadius: "4px", padding: "2px", margin: "0px" });
+const body = new FakeElement("body");
+const documentElement = new FakeElement("html");
+const target = new FakeElement("button"); target.innerText = "Save"; target.setAttribute("role", "button"); target.setAttribute("data-testid", "");
+target.bounds = { x: -20, y: -5, width: 140, height: 70 };
+globalThis.document = {
+  body, documentElement,
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  elementFromPoint: () => target,
+  activeElement: target,
+};
+globalThis.window = {
+  innerWidth: 100, innerHeight: 50, devicePixelRatio: 2,
+  ipc: { postMessage: (message) => messages.push(JSON.parse(message)) },
+  addEventListener(type, handler) { const values = windowListeners.get(type) || []; values.push(handler); windowListeners.set(type, values); },
+  removeEventListener(type, handler) { windowListeners.set(type, (windowListeners.get(type) || []).filter((value) => value !== handler)); },
+};
+"#,
+        browser_user_input_initialization_script(),
+        r#"
+const annotation = window.__devmanagerBrowser.annotation;
+annotation.start({ url: "https://example.test/form", revision: 7 });
+activeObserver.flush();
+let overlay = body.children[0];
+overlay.dispatch("pointerdown", { clientX: 12, clientY: 14 });
+overlay.dispatch("pointerup", { clientX: 12, clientY: 14 });
+if (body.children.length !== 0) throw new Error("element overlay leaked");
+if ((windowListeners.get("keydown") || []).length !== 1) throw new Error("base key listener count changed");
+
+annotation.start({ url: "https://example.test/form", revision: 7 });
+overlay = body.children[0];
+overlay.dispatch("pointerdown", { clientX: 4, clientY: 5 });
+overlay.dispatch("pointermove", { clientX: 44, clientY: 25 });
+overlay.dispatch("pointerup", { clientX: 44, clientY: 25 });
+if (body.children.length !== 0) throw new Error("region overlay leaked");
+
+annotation.start({ url: "https://example.test/form", revision: 7 });
+for (const handler of [...(windowListeners.get("keydown") || [])]) handler({ isTrusted: true, key: "Escape", preventDefault() {}, stopPropagation() {} });
+activeObserver.flush();
+if (body.children.length !== 0) throw new Error("escape overlay leaked");
+if (messages.some((message) => message.type === "domMutation")) throw new Error("overlay staled the page revision");
+const candidates = messages.filter((message) => message.type === "annotationCandidate").map((message) => message.candidate);
+if (candidates.length !== 2 || candidates[0].kind !== "element" || candidates[1].kind !== "region") throw new Error("candidate kinds missing");
+if (candidates[0].locator.testId !== null || candidates[0].locator.accessibilityName !== "Save" || candidates[0].computedStyles.fontSize !== "14px") throw new Error("semantic metadata normalization missing");
+if (JSON.stringify(candidates[0].bounds) !== JSON.stringify({ x: 0, y: 0, width: 100, height: 50 })) throw new Error("element bounds were not viewport-clamped");
+if (!messages.some((message) => message.type === "annotationCanceled")) throw new Error("escape cancellation missing");
+process.stdout.write(JSON.stringify({ candidates: candidates.length, children: body.children.length }));
+"#,
+    ]
+    .concat();
+    let temp = TestDir::new("annotation-overlay-node");
+    let harness_path = temp.path().join("harness.js");
+    std::fs::write(&harness_path, harness).expect("write annotation overlay harness");
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("execute annotation overlay in Node");
+    assert!(
+        output.status.success(),
+        "Node harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        r#"{"candidates":2,"children":0}"#
+    );
+}
+
+fn annotation_candidate() -> BrowserAnnotationCandidate {
+    BrowserAnnotationCandidate {
+        kind: BrowserAnnotationKind::Element,
+        url: "https://example.test/form".to_string(),
+        revision: BrowserRevision(7),
+        locator: BrowserLocator {
+            accessibility_role: Some("button".to_string()),
+            accessibility_name: Some("Save".to_string()),
+            test_id: Some("save".to_string()),
+            css_selectors: vec!["[data-testid=save]".to_string()],
+        },
+        bounds: BrowserBounds {
+            x: 10,
+            y: 12,
+            width: 30,
+            height: 20,
+        },
+        viewport: BrowserViewport {
+            width: 100,
+            height: 50,
+            scale_percent: 200,
+        },
+        computed_styles: BTreeMap::from([
+            ("display".to_string(), "block".to_string()),
+            ("fontSize".to_string(), "14px".to_string()),
+        ]),
+    }
+}
+
+#[test]
+fn annotation_candidate_validation_is_strict_and_style_allowlisted() {
+    annotation_candidate().validate().unwrap();
+
+    let mut unknown_style = annotation_candidate();
+    unknown_style
+        .computed_styles
+        .insert("backgroundImage".to_string(), "url(secret)".to_string());
+    assert!(matches!(
+        unknown_style.validate(),
+        Err(BrowserError::InvalidAnnotation { field, .. }) if field == "computedStyles"
+    ));
+
+    let mut outside_viewport = annotation_candidate();
+    outside_viewport.bounds.x = 101;
+    assert!(matches!(
+        outside_viewport.validate(),
+        Err(BrowserError::InvalidAnnotation { field, .. }) if field == "bounds"
+    ));
+
+    let encoded = serde_json::to_value(annotation_candidate()).unwrap();
+    let mut unknown = encoded.as_object().unwrap().clone();
+    unknown.insert("pageHtml".to_string(), serde_json::json!("<secret>"));
+    assert!(serde_json::from_value::<BrowserAnnotationCandidate>(unknown.into()).is_err());
+
+    for bounds in [
+        BrowserBounds {
+            x: -1,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        BrowserBounds {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1,
+        },
+        BrowserBounds {
+            x: i32::MAX,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+        BrowserBounds {
+            x: 90,
+            y: 0,
+            width: 20,
+            height: 1,
+        },
+        BrowserBounds {
+            x: 0,
+            y: 45,
+            width: 1,
+            height: 10,
+        },
+    ] {
+        let mut invalid = annotation_candidate();
+        invalid.bounds = bounds;
+        assert!(invalid.validate().is_err(), "accepted bounds {bounds:?}");
+    }
+
+    let mut oversized = annotation_candidate();
+    oversized.locator.accessibility_name = Some("n".repeat(1_001));
+    assert!(oversized.validate().is_err());
+    let mut too_many_selectors = annotation_candidate();
+    too_many_selectors.locator.css_selectors = vec!["button".to_string(); 9];
+    assert!(too_many_selectors.validate().is_err());
+    let mut oversized_selector = annotation_candidate();
+    oversized_selector.locator.css_selectors = vec!["x".repeat(513)];
+    assert!(oversized_selector.validate().is_err());
+    let mut oversized_style = annotation_candidate();
+    oversized_style
+        .computed_styles
+        .insert("display".to_string(), "x".repeat(257));
+    assert!(oversized_style.validate().is_err());
+}
+
+#[test]
+fn annotation_ipc_is_bounded_before_deserialize_and_context_is_host_verified() {
+    let candidate = annotation_candidate();
+    let body = serde_json::json!({
+        "type": "annotationCandidate",
+        "candidate": candidate,
+    })
+    .to_string();
+    let parsed = parse_browser_annotation_ipc_message(&body).unwrap();
+    validate_annotation_candidate_context(&parsed, "https://example.test/form", BrowserRevision(7))
+        .unwrap();
+
+    assert!(matches!(
+        validate_annotation_candidate_context(
+            &parsed,
+            "https://example.test/other",
+            BrowserRevision(7)
+        ),
+        Err(BrowserError::InvalidAnnotation { field, .. }) if field == "url"
+    ));
+    assert!(matches!(
+        validate_annotation_candidate_context(
+            &parsed,
+            "https://example.test/form",
+            BrowserRevision(8)
+        ),
+        Err(BrowserError::StaleReference { .. })
+    ));
+    assert!(matches!(
+        parse_browser_annotation_ipc_message(&"x".repeat(32_769)),
+        Err(BrowserError::InvalidAnnotation { field, .. }) if field == "ipcBody"
+    ));
+}
+
+#[test]
+fn annotation_lifecycle_is_route_owned_and_cancels_modes_and_drafts() {
+    let workspace_a = workspace("project-a", "conversation-a");
+    let workspace_b = workspace("project-a", "conversation-b");
+    let route_a = BrowserAnnotationRoute::new(workspace_a.clone(), "tab-a").unwrap();
+    let route_b = BrowserAnnotationRoute::new(workspace_b.clone(), "tab-b").unwrap();
+    let mut lifecycle = BrowserAnnotationLifecycle::default();
+    lifecycle.activate(
+        route_a.clone(),
+        "https://example.test/form",
+        BrowserRevision(7),
+    );
+    assert!(lifecycle.is_active(&route_a));
+    assert!(lifecycle
+        .accept_candidate(&route_b, annotation_candidate())
+        .is_err());
+    assert!(lifecycle.is_active(&route_a));
+    lifecycle
+        .accept_candidate(&route_a, annotation_candidate())
+        .unwrap();
+    assert!(!lifecycle.is_active(&route_a));
+
+    let draft = BrowserAnnotationDraft::new(
+        "tab-a",
+        annotation_candidate(),
+        devmanager::browser::BrowserResourceId(format!("res-{}", "0".repeat(32))),
+    )
+    .unwrap();
+    let draft_id = draft.id.clone();
+    assert!(matches!(
+        draft.clone().into_annotation(" \n "),
+        Err(BrowserError::InvalidAnnotation { field, .. }) if field == "comment"
+    ));
+    let saved = draft
+        .clone()
+        .into_annotation("Review the Save button")
+        .unwrap();
+    assert!(saved.id.starts_with("ann-"));
+    assert_eq!(saved.tab_id, "tab-a");
+    assert_eq!(saved.anchor_revision, BrowserRevision(7));
+    lifecycle.store_draft(route_a.clone(), draft).unwrap();
+    assert!(matches!(
+        lifecycle.take_draft(&workspace_b, &draft_id),
+        Err(BrowserError::BlockedPermission { .. })
+    ));
+    assert_eq!(lifecycle.cancel_route(&route_a).len(), 1);
+    assert!(lifecycle.take_draft(&workspace_a, &draft_id).is_err());
+
+    lifecycle.activate(
+        route_a.clone(),
+        "https://example.test/form",
+        BrowserRevision(7),
+    );
+    lifecycle.activate(
+        route_b.clone(),
+        "https://example.test/form",
+        BrowserRevision(7),
+    );
+    lifecycle.cancel_workspace(&workspace_a);
+    assert!(!lifecycle.is_active(&route_a));
+    assert!(lifecycle.is_active(&route_b));
+    lifecycle.cancel_project("project-a");
+    assert!(!lifecycle.is_active(&route_b));
+}
+
+#[test]
+fn annotation_save_and_cancel_transitions_are_failure_safe() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let commands = &source[source.find("fn handle_available_command(").unwrap()..];
+    let save_start = commands
+        .find("BrowserCommand::SaveAnnotationDraft { draft_id, comment } =>")
+        .unwrap();
+    let cancel_start = commands
+        .find("BrowserCommand::CancelAnnotationDraft { draft_id } =>")
+        .unwrap();
+    let list_start = commands.find("BrowserCommand::ListTabs =>").unwrap();
+    let save = &commands[save_start..cancel_start];
+    let cancel = &commands[cancel_start..list_start];
+
+    assert!(save.contains("restore_draft(route, draft)"));
+    assert!(save.contains("if let Err(error) = self.reconcile_annotation_pins(workspace_key)"));
+    assert!(save.contains("Ok(BrowserResponse::Workspace { mutation })"));
+    assert!(cancel.contains("if let Err(error) ="));
+    assert!(cancel.contains("restore_draft(route, draft)"));
+    assert!(cancel.contains("return Err(error)"));
+
+    let completion_start = source.find("fn complete_annotation_capture(").unwrap();
+    let completion_end = source[completion_start..]
+        .find("fn complete_async_operation(")
+        .unwrap()
+        + completion_start;
+    let completion = &source[completion_start..completion_end];
+    assert!(completion.contains("let draft = match BrowserAnnotationDraft::new("));
+    assert!(completion.contains("set_resource_pinned("));
+    assert!(completion.contains("return Err(error);"));
+}
+
+#[test]
+fn annotation_crop_maps_css_viewport_bounds_to_png_pixels_and_clamps() {
+    let mut source = image::RgbaImage::new(200, 100);
+    for (x, y, pixel) in source.enumerate_pixels_mut() {
+        *pixel = image::Rgba([x as u8, y as u8, 90, 255]);
+    }
+    let mut encoded = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(source)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+
+    let candidate = annotation_candidate();
+    let crop =
+        crop_annotation_png(encoded.get_ref(), candidate.bounds, &candidate.viewport).unwrap();
+    let decoded = image::load_from_memory(&crop).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (60, 40));
+
+    assert!(crop_annotation_png(
+        encoded.get_ref(),
+        BrowserBounds {
+            x: 250,
+            y: 250,
+            width: 10,
+            height: 10,
+        },
+        &candidate.viewport,
+    )
+    .is_err());
+}
+
+#[test]
 fn initialization_script_coalesces_dom_mutations_and_bounds_redacted_telemetry() {
     let script = browser_user_input_initialization_script();
     assert!(script.contains("MutationObserver"));
@@ -1951,6 +2356,72 @@ fn verified_resource_store_revalidates_after_open_before_each_write() {
     ));
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     remove_directory_redirect(&resources);
+}
+
+#[test]
+fn annotation_resource_pins_reconcile_by_owner_and_survive_reopen() {
+    let temp = TestDir::new("annotation-pins");
+    let limits = BrowserResourceLimits {
+        max_temporary_count: 0,
+        max_temporary_bytes: 0,
+        max_resource_bytes: 1024,
+    };
+    let owner_a = workspace("project-a", "conversation-a");
+    let owner_b = workspace("project-a", "conversation-b");
+    let store = BrowserResourceStore::open(temp.path(), limits).unwrap();
+    let kept = store
+        .put(
+            &owner_a,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"kept",
+            true,
+        )
+        .unwrap();
+    let released = store
+        .put(
+            &owner_a,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"released",
+            true,
+        )
+        .unwrap();
+    let other_owner = store
+        .put(
+            &owner_b,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"other",
+            true,
+        )
+        .unwrap();
+
+    store
+        .reconcile_annotation_pins(&owner_a, &BTreeSet::from([kept.id.clone()]))
+        .unwrap();
+    assert!(store.read(&owner_a, &released.id).is_ok());
+    assert!(!store.read(&owner_a, &released.id).unwrap().metadata.pinned);
+    assert!(store.read(&owner_a, &kept.id).unwrap().metadata.pinned);
+    assert!(
+        store
+            .read(&owner_b, &other_owner.id)
+            .unwrap()
+            .metadata
+            .pinned
+    );
+
+    drop(store);
+    let reopened = BrowserResourceStore::open(temp.path(), limits).unwrap();
+    assert!(reopened.read(&owner_a, &kept.id).unwrap().metadata.pinned);
+    reopened.set_pinned(&owner_a, &released.id, true).unwrap();
+    assert!(
+        reopened
+            .read(&owner_a, &released.id)
+            .unwrap()
+            .metadata
+            .pinned
+    );
 }
 
 #[test]

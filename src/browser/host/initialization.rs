@@ -17,6 +17,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     requestSequence: 0,
     tracing: false,
     traceStartedAt: 0,
+    annotationActive: false,
   };
 
   const boundedPush = (list, value, maximum) => {
@@ -72,7 +73,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   const now = () => Math.max(0, Math.round(performance.now()));
 
   const reportInput = (kind) => (event) => {
-    if (!event.isTrusted) return;
+    if (!event.isTrusted || state.annotationActive) return;
     window.ipc.postMessage(JSON.stringify({ type: "userInput", kind }));
   };
   window.addEventListener("pointerdown", reportInput("pointer"), true);
@@ -248,6 +249,27 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       ""
     ).trim().slice(0, 1000) || null;
   };
+  const annotationSemantic = (value) => {
+    if (value === null || value === undefined) return null;
+    const normalized = redact(String(value))
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+      .trim()
+      .slice(0, 1000);
+    return normalized || null;
+  };
+  const clampedAnnotationBounds = (bounds) => {
+    const viewportWidth = Math.max(1, Math.round(window.innerWidth));
+    const viewportHeight = Math.max(1, Math.round(window.innerHeight));
+    const rawLeft = Number.isFinite(bounds.left) ? bounds.left : bounds.x;
+    const rawTop = Number.isFinite(bounds.top) ? bounds.top : bounds.y;
+    const rawRight = Number.isFinite(bounds.right) ? bounds.right : rawLeft + bounds.width;
+    const rawBottom = Number.isFinite(bounds.bottom) ? bounds.bottom : rawTop + bounds.height;
+    const left = Math.max(0, Math.min(viewportWidth - 1, Math.floor(rawLeft)));
+    const top = Math.max(0, Math.min(viewportHeight - 1, Math.floor(rawTop)));
+    const right = Math.max(left + 1, Math.min(viewportWidth, Math.ceil(rawRight)));
+    const bottom = Math.max(top + 1, Math.min(viewportHeight, Math.ceil(rawBottom)));
+    return { x: left, y: top, width: right - left, height: bottom - top };
+  };
   const isVisible = (element) => {
     if (!(element instanceof Element)) return false;
     const bounds = element.getBoundingClientRect();
@@ -265,6 +287,163 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       selectors.push(`${element.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(element) + 1})`);
     }
     return selectors.slice(0, 4);
+  };
+  const annotationStyleKeys = [
+    "display", "position", "color", "backgroundColor", "fontFamily", "fontSize",
+    "fontWeight", "border", "borderRadius", "padding", "margin", "opacity", "visibility",
+  ];
+  const annotationComputedStyle = (element) => {
+    if (!element) return {};
+    const computedStyle = getComputedStyle(element);
+    return Object.fromEntries(annotationStyleKeys.map((key) => [key, redact(computedStyle[key] || "").slice(0, 256)]));
+  };
+  let annotationSession = null;
+  const annotationOverlayMutation = (operation) => {
+    const result = operation();
+    mutationObserver.takeRecords();
+    return result;
+  };
+  const annotationCleanup = (notify) => {
+    const session = annotationSession;
+    if (!session) return;
+    annotationSession = null;
+    state.annotationActive = false;
+    session.overlay.removeEventListener("pointerdown", session.pointerDown);
+    session.overlay.removeEventListener("pointermove", session.pointerMove);
+    session.overlay.removeEventListener("pointerup", session.pointerUp);
+    session.overlay.removeEventListener("pointercancel", session.pointerCancel);
+    window.removeEventListener("keydown", session.keyDown, true);
+    window.removeEventListener("resize", session.resize, true);
+    annotationOverlayMutation(() => session.overlay.remove());
+    if (notify) window.ipc.postMessage(JSON.stringify({ type: "annotationCanceled" }));
+  };
+  const annotationElementAt = (overlay, x, y) => annotationOverlayMutation(() => {
+    const previous = overlay.style.display;
+    overlay.style.display = "none";
+    const element = document.elementFromPoint(x, y);
+    overlay.style.display = previous;
+    return element;
+  });
+  const annotationStart = (context) => {
+    annotationCleanup(false);
+    const revision = Number(context?.revision);
+    const url = String(context?.url || "");
+    if (!Number.isSafeInteger(revision) || revision < 0 || !url) return false;
+
+    const overlay = document.createElement("div");
+    overlay.setAttribute("data-devmanager-annotation-overlay", "true");
+    Object.assign(overlay.style, {
+      position: "fixed", inset: "0", zIndex: "2147483647", cursor: "crosshair",
+      background: "rgba(59, 130, 246, 0.04)", pointerEvents: "auto", userSelect: "none",
+    });
+    const selection = document.createElement("div");
+    selection.setAttribute("data-devmanager-annotation-selection", "true");
+    Object.assign(selection.style, {
+      position: "fixed", display: "none", border: "2px solid #3b82f6",
+      background: "rgba(59, 130, 246, 0.16)", pointerEvents: "none",
+      boxSizing: "border-box",
+    });
+    overlay.appendChild(selection);
+
+    let start = null;
+    let dragged = false;
+    const updateSelection = (x, y) => {
+      if (!start) return;
+      const left = Math.max(0, Math.min(start.x, x));
+      const top = Math.max(0, Math.min(start.y, y));
+      const right = Math.min(window.innerWidth, Math.max(start.x, x));
+      const bottom = Math.min(window.innerHeight, Math.max(start.y, y));
+      dragged = Math.abs(x - start.x) >= 4 || Math.abs(y - start.y) >= 4;
+      annotationOverlayMutation(() => Object.assign(selection.style, {
+        display: "block", left: `${left}px`, top: `${top}px`,
+        width: `${Math.max(1, right - left)}px`, height: `${Math.max(1, bottom - top)}px`,
+      }));
+    };
+    const candidateContext = () => ({
+      url,
+      revision,
+      viewport: {
+        width: Math.max(1, Math.round(window.innerWidth)),
+        height: Math.max(1, Math.round(window.innerHeight)),
+        scalePercent: Math.max(25, Math.min(500, Math.round((window.devicePixelRatio || 1) * 100))),
+      },
+    });
+    const finalize = (x, y) => {
+      if (!start) return;
+      let candidate;
+      if (dragged) {
+        const left = Math.max(0, Math.min(start.x, x));
+        const top = Math.max(0, Math.min(start.y, y));
+        const right = Math.min(window.innerWidth, Math.max(start.x, x));
+        const bottom = Math.min(window.innerHeight, Math.max(start.y, y));
+        candidate = {
+          kind: "region",
+          ...candidateContext(),
+          locator: { accessibilityRole: null, accessibilityName: null, testId: null, cssSelectors: [] },
+          bounds: clampedAnnotationBounds({ x: left, y: top, width: right - left, height: bottom - top }),
+          computedStyles: {},
+        };
+      } else {
+        const element = annotationElementAt(overlay, x, y);
+        if (!(element instanceof Element) || !isVisible(element)) {
+          annotationCleanup(true);
+          return;
+        }
+        const bounds = element.getBoundingClientRect();
+        candidate = {
+          kind: "element",
+          ...candidateContext(),
+          locator: {
+            accessibilityRole: annotationSemantic(roleOf(element)),
+            accessibilityName: annotationSemantic(nameOf(element)),
+            testId: annotationSemantic(element.getAttribute?.("data-testid")),
+            cssSelectors: cssFallbacks(element),
+          },
+          bounds: clampedAnnotationBounds(bounds),
+          computedStyles: annotationComputedStyle(element),
+        };
+      }
+      annotationCleanup(false);
+      window.ipc.postMessage(JSON.stringify({ type: "annotationCandidate", candidate }));
+    };
+    const pointerDown = (event) => {
+      if (!event.isTrusted) return;
+      event.preventDefault(); event.stopPropagation();
+      start = { x: event.clientX, y: event.clientY };
+      dragged = false;
+      overlay.setPointerCapture?.(event.pointerId);
+      updateSelection(event.clientX, event.clientY);
+    };
+    const pointerMove = (event) => {
+      if (!start || !event.isTrusted) return;
+      event.preventDefault(); event.stopPropagation();
+      updateSelection(event.clientX, event.clientY);
+    };
+    const pointerUp = (event) => {
+      if (!start || !event.isTrusted) return;
+      event.preventDefault(); event.stopPropagation();
+      updateSelection(event.clientX, event.clientY);
+      finalize(event.clientX, event.clientY);
+    };
+    const pointerCancel = (event) => {
+      if (event.isTrusted) annotationCleanup(true);
+    };
+    const keyDown = (event) => {
+      if (event.isTrusted && event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation(); annotationCleanup(true);
+      }
+    };
+    const resize = () => annotationCleanup(true);
+    annotationSession = { overlay, pointerDown, pointerMove, pointerUp, pointerCancel, keyDown, resize };
+    state.annotationActive = true;
+    overlay.addEventListener("pointerdown", pointerDown);
+    overlay.addEventListener("pointermove", pointerMove);
+    overlay.addEventListener("pointerup", pointerUp);
+    overlay.addEventListener("pointercancel", pointerCancel);
+    window.addEventListener("keydown", keyDown, true);
+    window.addEventListener("resize", resize, true);
+    annotationOverlayMutation(() => document.body.appendChild(overlay));
+    return true;
   };
   const resolveTarget = (target) => {
     const locator = target?.locator || target?.elementRef?.locator || {};
@@ -428,6 +607,11 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       if (!element || element.tagName?.toLowerCase() !== "input" || String(element.type).toLowerCase() !== "file") return false;
       element.setAttribute("data-devmanager-upload", token);
       return true;
+    },
+    annotation: {
+      start: annotationStart,
+      cancel: () => annotationCleanup(false),
+      active: () => Boolean(annotationSession),
     },
   };
 })();

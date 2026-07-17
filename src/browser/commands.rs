@@ -1,11 +1,11 @@
 use super::{
-    BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry,
-    BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation, BrowserError,
-    BrowserNetworkEntry, BrowserNetworkOperation, BrowserPerformanceOperation,
-    BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserRisk, BrowserScreenshotMode,
-    BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
-    BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation,
-    BrowserWorkspaceSnapshot,
+    BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserAnnotationCandidate,
+    BrowserAnnotationDraft, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDownloadEntry,
+    BrowserDownloadOperation, BrowserError, BrowserNetworkEntry, BrowserNetworkOperation,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserRisk,
+    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult,
+    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey,
+    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -143,6 +143,21 @@ pub enum BrowserCommand {
     SetPaneOpen {
         open: bool,
     },
+    SetAnnotationMode {
+        tab_id: String,
+        enabled: bool,
+    },
+    CaptureAnnotation {
+        tab_id: String,
+        candidate: BrowserAnnotationCandidate,
+    },
+    SaveAnnotationDraft {
+        draft_id: String,
+        comment: String,
+    },
+    CancelAnnotationDraft {
+        draft_id: String,
+    },
     ListTabs,
     CreateTab {
         url: Option<String>,
@@ -232,6 +247,10 @@ impl BrowserCommand {
             Self::WorkspaceState => "workspaceState",
             Self::Ensure { .. } => "ensure",
             Self::SetPaneOpen { .. } => "setPaneOpen",
+            Self::SetAnnotationMode { .. } => "setAnnotationMode",
+            Self::CaptureAnnotation { .. } => "captureAnnotation",
+            Self::SaveAnnotationDraft { .. } => "saveAnnotationDraft",
+            Self::CancelAnnotationDraft { .. } => "cancelAnnotationDraft",
             Self::ListTabs => "listTabs",
             Self::CreateTab { .. } => "createTab",
             Self::SelectTab { .. } => "selectTab",
@@ -262,6 +281,8 @@ impl BrowserCommand {
     pub(crate) fn tab_id(&self) -> Option<&str> {
         match self {
             Self::SelectTab { tab_id }
+            | Self::SetAnnotationMode { tab_id, .. }
+            | Self::CaptureAnnotation { tab_id, .. }
             | Self::CloseTab { tab_id }
             | Self::Navigate { tab_id, .. }
             | Self::Back { tab_id }
@@ -284,6 +305,8 @@ impl BrowserCommand {
             | Self::WorkspaceState
             | Self::Ensure { .. }
             | Self::SetPaneOpen { .. }
+            | Self::SaveAnnotationDraft { .. }
+            | Self::CancelAnnotationDraft { .. }
             | Self::ListTabs
             | Self::CreateTab { .. }
             | Self::ResetWorkspace
@@ -400,6 +423,9 @@ pub enum BrowserResponse {
         inline_result: Option<serde_json::Value>,
         resource: Option<BrowserResourceHandle>,
     },
+    AnnotationDraft {
+        draft: BrowserAnnotationDraft,
+    },
     Acknowledged,
 }
 
@@ -468,6 +494,25 @@ pub enum BrowserHostEvent {
     DomMutation {
         workspace_key: BrowserWorkspaceKey,
         tab_id: String,
+    },
+    AnnotationCandidate {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+        candidate: BrowserAnnotationCandidate,
+    },
+    AnnotationCanceled {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+    },
+    AnnotationDraftReady {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+        draft: BrowserAnnotationDraft,
+    },
+    AnnotationModeChanged {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+        enabled: bool,
     },
     AutomationStateChanged {
         workspace_key: BrowserWorkspaceKey,

@@ -436,6 +436,84 @@ fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
 }
 
 #[test]
+fn annotation_control_starts_capture_for_the_selected_tab() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let snapshot = BrowserWorkspaceSnapshot {
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: "https://fixture.test".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+
+    let plan = browser_action_plan(
+        Some(&key),
+        Some(&snapshot),
+        "",
+        BrowserPaneAction::ToggleAnnotation,
+    )
+    .unwrap();
+    assert!(plan.diagnostic.is_none());
+    assert_eq!(plan.commands.len(), 1);
+    let encoded = serde_json::to_value(&plan.commands[0]).unwrap();
+    assert_eq!(encoded["type"], "setAnnotationMode");
+    assert_eq!(encoded["tabId"], "tab-a");
+    assert_eq!(encoded["enabled"], true);
+}
+
+#[test]
+fn annotation_mode_changes_and_route_cancellation_have_distinct_ui_plans() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let open = [key.clone()];
+
+    assert!(matches!(
+        browser_event_plan(
+            &open,
+            &BrowserHostEvent::AnnotationModeChanged {
+                workspace_key: key.clone(),
+                tab_id: "tab-a".to_string(),
+                enabled: false,
+            },
+        ),
+        Some(BrowserPaneEventPlan::AnnotationModeChanged {
+            workspace_key,
+            enabled: false,
+        }) if workspace_key == key
+    ));
+
+    assert!(matches!(
+        browser_event_plan(
+            &open,
+            &BrowserHostEvent::AnnotationCanceled {
+                workspace_key: key.clone(),
+                tab_id: "tab-a".to_string(),
+            },
+        ),
+        Some(BrowserPaneEventPlan::ClearAnnotation { workspace_key }) if workspace_key == key
+    ));
+}
+
+#[test]
+fn native_editor_keeps_ready_drafts_on_mode_off_and_clears_only_on_cancellation() {
+    let source = include_str!("../src/app/mod.rs");
+    let pump = &source[source.find("fn pump_browser_events").unwrap()..];
+    let mode_start = pump
+        .find("BrowserPaneEventPlan::AnnotationModeChanged")
+        .unwrap();
+    let clear_start = pump.find("BrowserPaneEventPlan::ClearAnnotation").unwrap();
+    let approval_start = pump.find("BrowserPaneEventPlan::ConfirmApproval").unwrap();
+    let mode = &pump[mode_start..clear_start];
+    let clear = &pump[clear_start..approval_start];
+
+    assert!(!mode.contains("annotation_draft"));
+    assert!(clear.contains("ui.annotation_draft = None"));
+    assert!(clear.contains("ui.annotation_comment.clear()"));
+}
+
+#[test]
 fn host_visibility_is_selected_only_for_an_open_eligible_pane() {
     let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
     let mut snapshot = BrowserWorkspaceSnapshot {
