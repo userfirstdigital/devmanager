@@ -213,6 +213,86 @@ fn native_shell_drains_priority_host_controls_before_async_completions() {
 }
 
 #[test]
+fn native_shell_projects_attachments_at_every_local_snapshot_ingress_before_replacement() {
+    let source = include_str!("../src/app/mod.rs");
+
+    let response_start = source.find("fn synchronize_browser_response(").unwrap();
+    let response_end = source[response_start..]
+        .find("fn handle_browser_request(")
+        .map(|offset| response_start + offset)
+        .unwrap();
+    let response = &source[response_start..response_end];
+    assert!(
+        response.find("project_local_browser_snapshot").unwrap()
+            < response.find("update_browser_workspace").unwrap()
+    );
+
+    let pump_start = source.find("fn pump_browser_events(").unwrap();
+    let pump_end = source[pump_start..]
+        .find("fn with_browser_host_control_barrier")
+        .map(|offset| pump_start + offset)
+        .unwrap();
+    let pump = &source[pump_start..pump_end];
+    assert!(
+        pump.find("project_local_browser_snapshot").unwrap()
+            < pump.find("move |current| *current = snapshot").unwrap()
+    );
+
+    let constructor =
+        &source[source.find("fn new(cx:").unwrap()..source.find("fn start_browser_tasks").unwrap()];
+    assert!(
+        constructor
+            .find("reconcile_restored_browser_attachment_state")
+            .unwrap()
+            < constructor.find("restore_saved_tabs(").unwrap()
+    );
+}
+
+#[test]
+fn empty_browser_event_pump_reconciles_retryable_dirty_projections_before_return() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source.find("fn pump_browser_events(").unwrap();
+    let end = source[start..]
+        .find("fn with_browser_host_control_barrier")
+        .map(|offset| start + offset)
+        .unwrap();
+    let pump = &source[start..end];
+    let reconcile = pump
+        .find("reconcile_browser_attachment_projections")
+        .unwrap();
+    let empty_return = pump.find("if events.is_empty()").unwrap();
+    assert!(reconcile < empty_return);
+
+    let reconcile_start = source
+        .find("fn reconcile_browser_attachment_projections(")
+        .unwrap();
+    let reconcile_end = source[reconcile_start..]
+        .find("fn handle_browser_request(")
+        .map(|offset| reconcile_start + offset)
+        .unwrap();
+    let body = &source[reconcile_start..reconcile_end];
+    let observe = body.find("dirty_projections()").unwrap();
+    let host_lock = body.find("with_browser_host_control_barrier").unwrap();
+    let persist = body.find("save_session_state()").unwrap();
+    let acknowledge = body.find("acknowledge_dirty_projection").unwrap();
+    assert!(observe < host_lock && host_lock < persist && persist < acknowledge);
+}
+
+#[test]
+fn remote_client_snapshot_merge_never_overlays_the_local_attachment_broker() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source.find("fn merge_remote_snapshot_into_state(").unwrap();
+    let end = source[start..]
+        .find("fn remote_has_control(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let merge = &source[start..end];
+    assert!(!merge.contains("browser_attachment_broker"));
+    assert!(!merge.contains("project_local_browser_snapshot"));
+    assert!(!merge.contains("overlay_snapshot"));
+}
+
+#[test]
 fn synchronous_ui_commands_enter_the_host_inside_the_control_barrier() {
     let source = include_str!("../src/app/mod.rs");
     let start = source.find("fn dispatch_browser_command").unwrap();

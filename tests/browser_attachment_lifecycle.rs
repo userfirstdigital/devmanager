@@ -100,3 +100,26 @@ fn replacement_binding_is_installed_before_the_old_session_is_forgotten() {
         "replacement must bind before old PTY cleanup"
     );
 }
+
+#[test]
+fn reset_and_clear_drop_state_only_while_local_close_fully_retires_the_workspace() {
+    let app = include_str!("../src/app/mod.rs");
+    let process_manager = include_str!("../src/services/process_manager.rs");
+
+    let sync = source_region(
+        app,
+        "fn synchronize_browser_response",
+        "fn project_local_browser_snapshot",
+    );
+    assert!(sync.contains("BrowserCommand::ResetWorkspace"));
+    assert!(sync.contains("BrowserCommand::ClearProjectProfile"));
+    assert!(sync.contains("reset_workspace_state"));
+    assert!(!sync.contains("retire_workspace"));
+
+    let close = source_region(
+        process_manager,
+        "pub fn close_ai_session_with_response",
+        "pub fn reconcile_saved_ai_tabs",
+    );
+    assert!(close.contains("retire_workspace(&workspace_key)"));
+}

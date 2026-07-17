@@ -5,12 +5,12 @@ use crate::assets::AppAssets;
 use crate::browser::{
     browser_action_plan, browser_command_channel, browser_event_plan, browser_host_reconcile_plan,
     browser_pane_open_fallback, browser_response_sync, browser_settings_plan,
-    calculate_browser_split, render_browser_pane, route_browser_request, BrowserBounds,
-    BrowserCommand, BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
-    BrowserGatewayHandle, BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions,
-    BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface,
-    BrowserPaneTransient, BrowserResponse, BrowserSettingsAction, BrowserWebViewHost,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    calculate_browser_split, render_browser_pane, route_browser_request, BrowserAttachmentBroker,
+    BrowserBounds, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
+    BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
+    BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
+    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse,
+    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -665,6 +665,31 @@ fn build_remote_status_bar_state(
     }
 }
 
+fn reconcile_restored_browser_attachment_state(
+    state: &mut AppState,
+    broker: &BrowserAttachmentBroker,
+) -> bool {
+    let mut changed = false;
+    for tab in &mut state.open_tabs {
+        if !matches!(tab.tab_type, TabType::Claude | TabType::Codex) {
+            continue;
+        }
+        let Ok(workspace_key) = BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone())
+        else {
+            continue;
+        };
+        let Some(snapshot) = tab.browser_workspace.as_mut() else {
+            continue;
+        };
+        broker.observe_workspace(workspace_key.clone(), snapshot);
+        changed = broker.overlay_snapshot(&workspace_key, snapshot) || changed;
+    }
+    if changed {
+        state.mark_dirty();
+    }
+    changed
+}
+
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
@@ -868,6 +893,10 @@ impl NativeShell {
             state.active_tab_id = None;
             state.sidebar_collapsed = false;
         } else {
+            reconcile_restored_browser_attachment_state(
+                &mut state,
+                &process_manager.browser_attachment_broker(),
+            );
             terminal_notice =
                 restore_saved_tabs(&process_manager, &mut state, SessionDimensions::default());
         }
@@ -1109,7 +1138,8 @@ impl NativeShell {
         let open_workspaces = self.open_browser_workspace_keys();
         let mut persist = false;
         if let Some(sync) = browser_response_sync(&open_workspaces, workspace_key, response) {
-            let snapshot = sync.snapshot;
+            let mut snapshot = sync.snapshot;
+            self.project_local_browser_snapshot(&sync.workspace_key, &mut snapshot);
             persist = self.state.update_browser_workspace(
                 &sync.workspace_key.ai_tab_id,
                 move |current| {
@@ -1124,6 +1154,9 @@ impl NativeShell {
         } else if matches!(response, BrowserResponse::Acknowledged) {
             match command {
                 BrowserCommand::ResetWorkspace => {
+                    self.process_manager
+                        .browser_attachment_broker()
+                        .reset_workspace_state(workspace_key);
                     persist = self
                         .state
                         .update_browser_workspace(&workspace_key.ai_tab_id, |snapshot| {
@@ -1140,6 +1173,11 @@ impl NativeShell {
                         .map(|tab| tab.id.clone())
                         .collect();
                     for tab_id in tab_ids {
+                        if let Some(key) = self.state.browser_workspace_key(&tab_id) {
+                            self.process_manager
+                                .browser_attachment_broker()
+                                .reset_workspace_state(&key);
+                        }
                         persist = self.state.update_browser_workspace(&tab_id, |snapshot| {
                             *snapshot = BrowserWorkspaceSnapshot::default();
                         }) || persist;
@@ -1159,6 +1197,63 @@ impl NativeShell {
         if persist {
             self.save_session_state();
         }
+    }
+
+    fn project_local_browser_snapshot(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        snapshot: &mut BrowserWorkspaceSnapshot,
+    ) -> bool {
+        if self.remote_mode.is_some() {
+            return false;
+        }
+        let broker = self.process_manager.browser_attachment_broker();
+        broker.observe_workspace(workspace_key.clone(), snapshot);
+        broker.overlay_snapshot(workspace_key, snapshot)
+    }
+
+    fn reconcile_browser_attachment_projections(&mut self, window: &Window) -> bool {
+        if self.remote_mode.is_some() {
+            return false;
+        }
+        let broker = self.process_manager.browser_attachment_broker();
+        let projections = broker.dirty_projections();
+        let mut changed = false;
+        for projection in projections {
+            if !self.browser_route_is_open(&projection.workspace_key) {
+                continue;
+            }
+            let applied = self.with_browser_host_control_barrier(window, |browser_host| {
+                browser_host.acknowledge_attachment_projection(&projection)
+            });
+            let mut snapshot = match applied {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.browser_ui
+                        .entry(projection.workspace_key.clone())
+                        .or_default()
+                        .diagnostic = Some(error.to_string());
+                    continue;
+                }
+            };
+
+            broker.observe_workspace(projection.workspace_key.clone(), &snapshot);
+            broker.overlay_snapshot(&projection.workspace_key, &mut snapshot);
+            if !self
+                .state
+                .update_browser_workspace(&projection.workspace_key.ai_tab_id, move |current| {
+                    *current = snapshot
+                })
+            {
+                continue;
+            }
+            if !self.save_session_state() {
+                continue;
+            }
+            broker.acknowledge_dirty_projection(&projection);
+            changed = true;
+        }
+        changed
     }
 
     fn handle_browser_request(
@@ -1196,7 +1291,11 @@ impl NativeShell {
             events.extend(completion_events);
             events
         });
+        let projected_attachments = self.reconcile_browser_attachment_projections(window);
         if events.is_empty() {
+            if projected_attachments {
+                cx.notify();
+            }
             return;
         }
         let mut events = VecDeque::from(events);
@@ -1220,11 +1319,12 @@ impl NativeShell {
                             .or_default()
                             .loading = loading;
                     }
-                    if let Some(snapshot) = self
+                    if let Some(mut snapshot) = self
                         .browser_host
                         .workspace_snapshot(&workspace_key)
                         .cloned()
                     {
+                        self.project_local_browser_snapshot(&workspace_key, &mut snapshot);
                         persist =
                             self.state.update_browser_workspace(
                                 &workspace_key.ai_tab_id,
@@ -2205,15 +2305,18 @@ impl NativeShell {
         }
     }
 
-    fn save_session_state(&mut self) {
+    fn save_session_state(&mut self) -> bool {
         if self.remote_mode.is_some() {
-            return;
+            return false;
         }
         if let Err(error) = self
             .session_manager
             .save_session(&persisted_session_state(&self.state))
         {
             self.terminal_notice = Some(format!("Failed to save session state: {error}"));
+            false
+        } else {
+            true
         }
     }
 
@@ -14883,6 +14986,65 @@ mod tests {
                 .expect("browser workspace fixture"),
             ),
         }
+    }
+
+    fn attachment_snapshot(ids: &[&str]) -> BrowserWorkspaceSnapshot {
+        let annotations = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "kind": "element",
+                    "tabId": "page",
+                    "anchorRevision": 1,
+                    "comment": format!("Review {id}"),
+                    "url": "https://example.test/page",
+                    "locator": {},
+                    "bounds": { "x": 1, "y": 2, "width": 3, "height": 4 },
+                    "viewport": {},
+                    "screenshotResource": format!("shot-{id}"),
+                    "computedStyles": {},
+                    "resolved": false
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(serde_json::json!({
+            "annotations": annotations,
+            "pendingAnnotationRevision": ids.len(),
+            "pendingAnnotationIds": ids,
+        }))
+        .expect("attachment snapshot fixture")
+    }
+
+    #[test]
+    fn restored_attachment_state_overlays_tombstones_and_unions_new_annotations() {
+        let broker = BrowserAttachmentBroker::default();
+        let key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let original = attachment_snapshot(&["ann-delivered"]);
+        broker.observe_workspace(key.clone(), &original);
+        let observed = broker.dirty_projections().pop().unwrap();
+        assert!(broker.acknowledge_dirty_projection(&observed));
+        broker.bind_session("session-1", key);
+        let reservation = broker
+            .reserve_for_input(
+                "session-1",
+                crate::browser::BrowserPromptInput::Text("prompt"),
+            )
+            .unwrap();
+        broker.commit(reservation).unwrap();
+
+        let mut state = AppState::default();
+        let mut tab = sample_ai_tab();
+        tab.browser_workspace = Some(attachment_snapshot(&["ann-delivered", "ann-new"]));
+        state.open_tabs.push(tab);
+
+        assert!(reconcile_restored_browser_attachment_state(
+            &mut state, &broker
+        ));
+        let restored = state.browser_workspace("tab-1").unwrap();
+        assert_eq!(restored.pending_annotation_ids, vec!["ann-new"]);
+        assert_eq!(restored.annotations.len(), 2);
+        assert!(restored.pending_annotation_revision.0 >= 3);
     }
 
     fn sample_server_tab() -> SessionTab {

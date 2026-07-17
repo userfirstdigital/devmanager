@@ -107,6 +107,8 @@ pub struct BrowserAttachmentProjection {
     pub revision: BrowserAttachmentRevision,
     pub pending_annotation_ids: Vec<String>,
     pub pending_annotations: Vec<BrowserAnnotation>,
+    pub tombstone_annotation_ids: Vec<String>,
+    generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +130,8 @@ struct AttachmentWorkspaceState {
     pending_order: Vec<String>,
     annotations: HashMap<String, BrowserAnnotation>,
     tombstones: VecDeque<AttachmentTombstone>,
+    unacknowledged_tombstone_ids: Vec<String>,
+    projection_generation: u64,
     active_reservation: Option<ActiveReservation>,
 }
 
@@ -150,8 +154,14 @@ impl AttachmentWorkspaceState {
         while self.tombstones.len() >= MAX_BROWSER_ATTACHMENT_TOMBSTONES {
             self.tombstones.pop_front();
         }
-        self.tombstones
-            .push_back(AttachmentTombstone { annotation_id });
+        self.tombstones.push_back(AttachmentTombstone {
+            annotation_id: annotation_id.clone(),
+        });
+        self.unacknowledged_tombstone_ids.push(annotation_id);
+    }
+
+    fn mark_projection_dirty(&mut self) {
+        self.projection_generation = self.projection_generation.saturating_add(1);
     }
 }
 
@@ -233,8 +243,10 @@ impl BrowserAttachmentBroker {
             workspace.advance_revision();
         }
 
-        let after = projection_for(&workspace_key, workspace);
+        let mut after = projection_for(&workspace_key, workspace);
         if after != before {
+            workspace.mark_projection_dirty();
+            after = projection_for(&workspace_key, workspace);
             broker.dirty_workspaces.insert(workspace_key);
         }
         after
@@ -425,11 +437,14 @@ impl BrowserAttachmentBroker {
             for annotation_id in exact_annotation_ids {
                 workspace.add_tombstone(annotation_id);
             }
+            workspace.mark_projection_dirty();
         }
         let projection = projection_for(&reservation.workspace_key, workspace);
-        broker
-            .dirty_workspaces
-            .insert(reservation.workspace_key.clone());
+        if previous_len != workspace.pending_order.len() {
+            broker
+                .dirty_workspaces
+                .insert(reservation.workspace_key.clone());
+        }
         Ok(projection)
     }
 
@@ -479,6 +494,7 @@ impl BrowserAttachmentBroker {
             if changed {
                 workspace.advance_revision();
                 workspace.add_tombstone(annotation_id.to_string());
+                workspace.mark_projection_dirty();
             }
             (projection_for(workspace_key, workspace), changed)
         };
@@ -499,6 +515,8 @@ impl BrowserAttachmentBroker {
                 revision: BrowserAttachmentRevision::default(),
                 pending_annotation_ids: Vec::new(),
                 pending_annotations: Vec::new(),
+                tombstone_annotation_ids: Vec::new(),
+                generation: 0,
             })
     }
 
@@ -526,9 +544,9 @@ impl BrowserAttachmentBroker {
         changed
     }
 
-    pub fn drain_dirty_projections(&self) -> Vec<BrowserAttachmentProjection> {
-        let mut broker = self.lock();
-        let mut keys = broker.dirty_workspaces.drain().collect::<Vec<_>>();
+    pub fn dirty_projections(&self) -> Vec<BrowserAttachmentProjection> {
+        let broker = self.lock();
+        let mut keys = broker.dirty_workspaces.iter().cloned().collect::<Vec<_>>();
         keys.sort_by(|left, right| {
             (&left.project_id, &left.ai_tab_id).cmp(&(&right.project_id, &right.ai_tab_id))
         });
@@ -543,9 +561,30 @@ impl BrowserAttachmentBroker {
                         revision: BrowserAttachmentRevision::default(),
                         pending_annotation_ids: Vec::new(),
                         pending_annotations: Vec::new(),
+                        tombstone_annotation_ids: Vec::new(),
+                        generation: 0,
                     })
             })
             .collect()
+    }
+
+    pub fn acknowledge_dirty_projection(&self, projection: &BrowserAttachmentProjection) -> bool {
+        let mut broker = self.lock();
+        let Some(workspace) = broker.workspaces.get_mut(&projection.workspace_key) else {
+            return false;
+        };
+        if workspace.projection_generation != projection.generation {
+            return false;
+        }
+        workspace.unacknowledged_tombstone_ids.clear();
+        broker.dirty_workspaces.remove(&projection.workspace_key);
+        true
+    }
+
+    pub fn reset_workspace_state(&self, workspace_key: &BrowserWorkspaceKey) {
+        let mut broker = self.lock();
+        broker.workspaces.remove(workspace_key);
+        broker.dirty_workspaces.remove(workspace_key);
     }
 
     pub fn retire_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
@@ -571,6 +610,8 @@ fn projection_for(
             .iter()
             .filter_map(|id| workspace.annotations.get(id).cloned())
             .collect(),
+        tombstone_annotation_ids: workspace.unacknowledged_tombstone_ids.clone(),
+        generation: workspace.projection_generation,
     }
 }
 
@@ -848,6 +889,84 @@ mod tests {
 
         assert_eq!(projection.pending_annotation_ids, vec!["ann-2"]);
         assert_eq!(projection.revision, BrowserAttachmentRevision(3));
+    }
+
+    #[test]
+    fn dirty_projection_is_acknowledged_only_after_success_and_carries_exact_tombstones() {
+        let workspace_key = key("project", "conversation");
+        let mut snapshot = snapshot_with(annotation("ann-1", "first", "https://one.test"));
+        snapshot
+            .save_annotation(annotation("ann-2", "second", "https://two.test"))
+            .unwrap();
+        let broker = BrowserAttachmentBroker::default();
+        broker.observe_workspace(workspace_key.clone(), &snapshot);
+        let initial = broker.dirty_projections();
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].tombstone_annotation_ids.is_empty());
+        assert_eq!(broker.dirty_projections(), initial);
+        assert!(broker.acknowledge_dirty_projection(&initial[0]));
+        assert!(broker.dirty_projections().is_empty());
+
+        broker.detach(&workspace_key, "ann-1");
+        let detach = broker.dirty_projections();
+        assert_eq!(detach.len(), 1);
+        assert_eq!(detach[0].pending_annotation_ids, vec!["ann-2"]);
+        assert_eq!(detach[0].tombstone_annotation_ids, vec!["ann-1"]);
+        assert!(broker.acknowledge_dirty_projection(&detach[0]));
+
+        broker.bind_session("session", workspace_key.clone());
+        let reservation = broker
+            .reserve_for_input("session", BrowserPromptInput::Text("prompt"))
+            .unwrap();
+        broker.commit(reservation).unwrap();
+        let delivery = broker.dirty_projections();
+        assert_eq!(delivery.len(), 1);
+        assert_eq!(delivery[0].tombstone_annotation_ids, vec!["ann-2"]);
+
+        // A failed host/AppState application does not acknowledge the captured
+        // projection, so the exact removal delta remains retryable.
+        assert_eq!(broker.dirty_projections(), delivery);
+    }
+
+    #[test]
+    fn acknowledging_an_older_projection_keeps_a_concurrent_newer_projection_dirty() {
+        let workspace_key = key("project", "conversation");
+        let broker = BrowserAttachmentBroker::default();
+        broker.observe_workspace(
+            workspace_key.clone(),
+            &snapshot_with(annotation("ann-1", "first", "https://one.test")),
+        );
+        let captured = broker.dirty_projections().pop().unwrap();
+
+        let mut newer = snapshot_with(annotation("ann-2", "second", "https://two.test"));
+        newer.pending_annotation_revision = BrowserAttachmentRevision(2);
+        broker.observe_workspace(workspace_key, &newer);
+
+        assert!(!broker.acknowledge_dirty_projection(&captured));
+        let retry = broker.dirty_projections();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].pending_annotation_ids, vec!["ann-1", "ann-2"]);
+    }
+
+    #[test]
+    fn state_reset_preserves_live_binding_while_retirement_removes_it() {
+        let workspace_key = key("project", "conversation");
+        let broker = BrowserAttachmentBroker::default();
+        broker.observe_workspace(
+            workspace_key.clone(),
+            &snapshot_with(annotation("ann-1", "first", "https://one.test")),
+        );
+        let binding = broker.bind_session("session", workspace_key.clone());
+
+        broker.reset_workspace_state(&workspace_key);
+        assert_eq!(broker.binding("session"), Some(binding));
+        assert!(broker
+            .projection(&workspace_key)
+            .pending_annotation_ids
+            .is_empty());
+
+        broker.retire_workspace(&workspace_key);
+        assert!(broker.binding("session").is_none());
     }
 
     #[test]

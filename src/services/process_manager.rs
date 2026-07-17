@@ -2400,11 +2400,17 @@ impl ProcessManager {
         tab_id: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        let attachment_workspace_key = app_state.browser_workspace_key(tab_id);
         let session_id = app_state
             .find_ai_tab(tab_id)
             .and_then(|tab| tab.pty_session_id.clone());
 
         app_state.remove_tab(tab_id);
+        if let Some(workspace_key) = attachment_workspace_key {
+            self.inner
+                .browser_attachment_broker
+                .retire_workspace(&workspace_key);
+        }
         if let Some(session_id) = session_id {
             self.schedule_close_ai(&session_id, response)?;
         }
@@ -6514,6 +6520,43 @@ mod tests {
                 .browser_attachment_broker()
                 .binding("attachment-no-gateway"),
             Some(binding)
+        );
+    }
+
+    #[test]
+    fn local_ai_tab_close_fully_retires_only_its_attachment_workspace() {
+        let manager = ProcessManager::new();
+        let mut state = AppState::default();
+        for (tab_id, annotation_id) in [("tab-a", "ann-a"), ("tab-b", "ann-b")] {
+            state.open_tabs.push(SessionTab {
+                id: tab_id.to_string(),
+                tab_type: TabType::Claude,
+                project_id: "project".to_string(),
+                command_id: None,
+                pty_session_id: None,
+                label: None,
+                ssh_connection_id: None,
+                browser_workspace: Some(browser_attachment_snapshot(annotation_id)),
+            });
+        }
+        let key_a = BrowserWorkspaceKey::new("project", "tab-a").unwrap();
+        let key_b = BrowserWorkspaceKey::new("project", "tab-b").unwrap();
+        let broker = manager.browser_attachment_broker();
+        broker.observe_workspace(key_a.clone(), state.browser_workspace("tab-a").unwrap());
+        broker.observe_workspace(key_b.clone(), state.browser_workspace("tab-b").unwrap());
+        broker.bind_session("binding-a", key_a.clone());
+        broker.bind_session("binding-b", key_b.clone());
+
+        manager.close_ai_session(&mut state, "tab-a").unwrap();
+
+        assert!(state.find_tab("tab-a").is_none());
+        assert!(state.find_tab("tab-b").is_some());
+        assert!(broker.binding("binding-a").is_none());
+        assert!(broker.projection(&key_a).pending_annotation_ids.is_empty());
+        assert!(broker.binding("binding-b").is_some());
+        assert_eq!(
+            broker.projection(&key_b).pending_annotation_ids,
+            vec!["ann-b"]
         );
     }
 

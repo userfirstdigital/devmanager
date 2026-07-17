@@ -1,0 +1,26 @@
+# DevManager Per-Conversation Browser V1 (2026-07-16)
+
+Execution location: clean `master`, explicitly authorized by the user.
+Task 1: complete - clean baseline (`cargo build --locked`; 545 library tests plus integration suites green) and browser subsystem interfaces locked.
+Task 2: complete - browser domain, persistence, security, storage layout, annotations, and recipes (`9ebb1dd`, secret-serialization review fix `fff9fd5`; task review approved).
+Task 3: complete - Windows WebView2 host (`a5c5072`, wake/cancellation fix `3f851b5`) plus GPUI split companion pane (`ae31d3f`). Focused review found restored-open panes did not recreate their host workspace; TDD fix `fd4d16a` ensures only absent host state and preserves newer live state. Re-review approved. The large host slice still receives a focused check in the whole-branch review because earlier independent host reviewers stalled on the generated package.
+Task 4: complete - authenticated rmcp gateway and Claude/Codex session injection (`25f83f2`). Parallel security/process review found startup readiness, bounded shutdown, terminal-exit/write-failure cleanup, Cmd path quoting, live MCP state, and shutdown/register race gaps; strict TDD hardening `d2eea73` passed browser 57/57, ProcessManager 62/62, Codex 32/32, all-targets check/build, and both re-reviews approved.
+Task 5: in progress - Task 5A automation, resources, approvals, cancellation, storage, and redaction complete through approved hardening commit `e37f170` (127 browser tests, ProcessManager 62/62 single-threaded, Codex 32/32). Task 5B persistence/restored AI workspaces landed in `ae1229b`; native element/region capture landed in `5a066c1` with independently approved lifecycle hardening `fe90233` (98 focused tests). The exact authenticated `browser_annotations` group landed in `dab9ff3`; independently approved TDD hardening `4b7016f` fixed live-draft pin loss, direct-Get pin leaks, and redacted-URL false staleness (151 focused browser tests). Checkpoint 4A attachment core is independently approved through `c846a21`. Checkpoint 4B1 session lifecycle/local user-input routing is independently approved through `a4c5ef9` and race hardening `8f4613e` (12 attachment, 12 terminal, 69 ProcessManager, lifecycle and browser gates). Checkpoint 4B2 now adds authoritative acknowledge-after-success AppState/host projection, exact tombstone deltas, pin reconciliation, remote-client snapshot authority, state-only reset/clear, and exact local-close retirement (15 attachment, 70 ProcessManager, and 156 browser-suite tests). Native chips and remote composer provenance remain before Task 5B is complete. Task 5C recording/replay follows.
+Task 6: pending - full automated, cross-platform, and real-provider acceptance verification.
+Task 7: pending - whole-branch review and finish.
+
+# Prior SSH Feature Ledger
+
+Task 1: complete (commits 70adf20..bddf7af, review clean)
+Task 2 minors (for final review triage): (a) safe_key_file_name("") unguarded -> dir.join("") writes to dir path, unhelpful IO error; (b) no test for lone-\r input to sanitize_private_key.
+Task 2: complete (commits bddf7af..9204e83 incl. icacls-path fix, review clean)
+Task 3: complete (commits 9204e83..0ee7f3e, review clean)
+Task 3 minors (triage): (a) spawn_ssh_session early-return could someday skip respawn while key_error notice still writes; (b) raw materialize error string unsanitized in terminal notice.
+Task 4: complete (commits 0ee7f3e..7fb0d52 incl. local-only cleanup fix, review clean)
+Task 4 note (triage): host-side RemoteAction::SaveSsh apply path does not clean stale key file when key cleared remotely — accepted best-effort gap per spec.
+Task 5: complete (commits 7fb0d52..66b716c, review clean)
+Task 5 minor (triage): terminal_text_bounds gate change (line ~9685) was required compile fix, verified consistent with terminal_dimensions:3549 precedent; no test coverage for it.
+Task 6: complete (3x full suite green, clippy clean; final whole-branch review "with fixes"; fix batch e798670 + docs 9d09825; re-review: ready for merge preparation)
+Wire-exposure decision (user, 2026-07-10): accept + document; redaction w/ keep-sentinel folded into encryption-at-rest follow-up.
+Outstanding before merge: interactive manual QA (7 steps from final review) — requires user's environment.
+Known pre-existing flake (NOT this branch): remote::tests::native_client_connections_are_recorded_in_activity_log (src/remote/mod.rs:5031) — access-log persist race, reproduced 1/5 runs; src/remote/ and src/persistence/ untouched by branch (git diff empty). Suggest follow-up to deflake.

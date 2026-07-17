@@ -1,8 +1,9 @@
 use super::{
     redacted_browser_annotation, BrowserAnnotation, BrowserAnnotationDetails,
-    BrowserAnnotationOperation, BrowserAnnotationSummary, BrowserError, BrowserResourceHandle,
-    BrowserResourceKind, BrowserResourceStore, BrowserRevision, BrowserStorageLayout,
-    BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserAnnotationOperation, BrowserAnnotationSummary, BrowserAttachmentRevision, BrowserError,
+    BrowserResourceHandle, BrowserResourceKind, BrowserResourceStore, BrowserRevision,
+    BrowserStorageLayout, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 mod initialization;
 mod unsupported;
@@ -165,6 +166,36 @@ impl BrowserHostState {
     ) -> Result<BrowserWorkspaceMutation, BrowserError> {
         let snapshot = self.workspace_mut(workspace_key)?;
         snapshot.save_annotation(annotation)?;
+        Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
+    }
+
+    pub fn acknowledge_attachment_projection(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        revision: BrowserAttachmentRevision,
+        pending_annotation_ids: &[String],
+        tombstone_annotation_ids: &[String],
+    ) -> Result<BrowserWorkspaceMutation, BrowserError> {
+        let snapshot = self.workspace_mut(workspace_key)?;
+        snapshot.pending_annotation_ids.retain(|pending| {
+            !tombstone_annotation_ids
+                .iter()
+                .any(|tombstone| tombstone == pending)
+        });
+        for annotation_id in pending_annotation_ids {
+            if tombstone_annotation_ids
+                .iter()
+                .any(|tombstone| tombstone == annotation_id)
+                || snapshot
+                    .pending_annotation_ids
+                    .iter()
+                    .any(|pending| pending == annotation_id)
+            {
+                continue;
+            }
+            snapshot.pending_annotation_ids.push(annotation_id.clone());
+        }
+        snapshot.pending_annotation_revision = snapshot.pending_annotation_revision.max(revision);
         Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
     }
 

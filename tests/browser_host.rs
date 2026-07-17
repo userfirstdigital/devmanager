@@ -7,10 +7,11 @@ use devmanager::browser::{
     unsupported_platform_error, validate_annotation_candidate_context, validate_browser_url,
     BrowserAction, BrowserActionTarget, BrowserAnnotation, BrowserAnnotationCandidate,
     BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationKind,
-    BrowserAnnotationLifecycle, BrowserAnnotationOperation, BrowserAnnotationRoute, BrowserBounds,
-    BrowserCommand, BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation,
-    BrowserDiagnosticLevel, BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef,
-    BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
+    BrowserAnnotationLifecycle, BrowserAnnotationOperation, BrowserAnnotationRoute,
+    BrowserAttachmentRevision, BrowserBounds, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
+    BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserMemoryTarget, BrowserNetworkOperation, BrowserOperationQueue,
     BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
@@ -30,6 +31,114 @@ use std::time::Duration;
 
 fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
     BrowserWorkspaceKey::new(project, conversation).expect("valid browser workspace key")
+}
+
+#[test]
+fn attachment_acknowledgement_preserves_host_workspace_and_concurrent_additions() {
+    let key = workspace("project", "conversation");
+    let mut state = BrowserHostState::new(".");
+    let page_revision = BrowserRevision(41);
+    let selected_tab_id = Some("tab-b".to_string());
+    state
+        .ensure_workspace(
+            key.clone(),
+            BrowserWorkspaceSnapshot {
+                revision: page_revision,
+                tabs: vec![
+                    BrowserTabSnapshot {
+                        id: "tab-a".to_string(),
+                        title: "A".to_string(),
+                        url: "https://a.test".to_string(),
+                        viewport: BrowserViewport::default(),
+                    },
+                    BrowserTabSnapshot {
+                        id: "tab-b".to_string(),
+                        title: "B".to_string(),
+                        url: "https://b.test".to_string(),
+                        viewport: BrowserViewport::default(),
+                    },
+                ],
+                selected_tab_id: selected_tab_id.clone(),
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        )
+        .unwrap();
+    state
+        .save_annotation(
+            &key,
+            stored_annotation(
+                "ann-delivered",
+                BrowserResourceId("shot-old".to_string()),
+                "old",
+            ),
+        )
+        .unwrap();
+    state
+        .save_annotation(
+            &key,
+            stored_annotation(
+                "ann-concurrent",
+                BrowserResourceId("shot-new".to_string()),
+                "new",
+            ),
+        )
+        .unwrap();
+    state
+        .set_annotation_resolved(&key, "ann-delivered", true)
+        .unwrap();
+    let saved_annotations = state.workspace(&key).unwrap().annotations.clone();
+
+    let mutation = state
+        .acknowledge_attachment_projection(
+            &key,
+            BrowserAttachmentRevision(9),
+            &[],
+            &["ann-delivered".to_string()],
+        )
+        .unwrap();
+
+    assert_eq!(mutation.revision, page_revision);
+    assert_eq!(mutation.snapshot.revision, page_revision);
+    assert_eq!(mutation.snapshot.tabs.len(), 2);
+    assert_eq!(mutation.snapshot.selected_tab_id, selected_tab_id);
+    assert_eq!(mutation.snapshot.annotations, saved_annotations);
+    assert_eq!(
+        mutation.snapshot.pending_annotation_ids,
+        vec!["ann-concurrent"]
+    );
+    assert_eq!(
+        mutation.snapshot.pending_annotation_revision,
+        BrowserAttachmentRevision(9)
+    );
+    assert_eq!(
+        mutation.snapshot.pinned_annotation_resource_ids(),
+        BTreeSet::from([BrowserResourceId("shot-new".to_string())])
+    );
+    assert!(
+        mutation.snapshot.annotation("ann-concurrent").is_ok(),
+        "unresolved saved annotation context remains available"
+    );
+}
+
+#[test]
+fn windows_attachment_acknowledgement_reconciles_resource_pins_after_state_mutation() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let start = source
+        .find("pub fn acknowledge_attachment_projection(")
+        .expect("Windows host attachment acknowledgement");
+    let end = source[start..]
+        .find("\n    fn ")
+        .map(|offset| start + offset)
+        .expect("next Windows host method");
+    let body = &source[start..end];
+
+    let mutation = body
+        .find("self.state.acknowledge_attachment_projection(")
+        .expect("narrow host-state mutation");
+    let pins = body
+        .find("self.reconcile_annotation_pins(")
+        .expect("attachment acknowledgement pin reconciliation");
+    assert!(mutation < pins);
 }
 
 fn stored_annotation(

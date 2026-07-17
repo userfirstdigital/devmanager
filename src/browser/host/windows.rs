@@ -14,17 +14,17 @@ use crate::browser::{
     redact_browser_text, remove_verified_profile, validate_annotation_candidate_context,
     BrowserAction, BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
     BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationRoute,
-    BrowserApprovalPolicy, BrowserApprovalRequest, BrowserBounds, BrowserCommand,
-    BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
-    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
-    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
-    BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget,
-    BrowserPageIpcMessage, BrowserPageLoadState, BrowserPerformanceOperation,
-    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserResourceHandle,
-    BrowserResourceId, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
-    BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary,
-    BrowserStorageLayout, BrowserUploadResult, BrowserWaitResult, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
+    BrowserApprovalPolicy, BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds,
+    BrowserCommand, BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation,
+    BrowserDiagnosticLevel, BrowserDownloadState, BrowserDownloadStore, BrowserError,
+    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
+    BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation,
+    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode,
+    BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult, BrowserWaitResult,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -2364,6 +2364,20 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
     ) -> Option<&BrowserWorkspaceSnapshot> {
         self.state.workspace(workspace_key)
+    }
+
+    pub fn acknowledge_attachment_projection(
+        &mut self,
+        projection: &BrowserAttachmentProjection,
+    ) -> Result<BrowserWorkspaceSnapshot, BrowserError> {
+        let mutation = self.state.acknowledge_attachment_projection(
+            &projection.workspace_key,
+            projection.revision,
+            &projection.pending_annotation_ids,
+            &projection.tombstone_annotation_ids,
+        )?;
+        self.reconcile_annotation_pins(&projection.workspace_key)?;
+        Ok(mutation.snapshot)
     }
 
     fn handle_command_inner(

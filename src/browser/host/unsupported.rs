@@ -7,6 +7,8 @@ use super::super::{BrowserError, BrowserHostStatus};
 #[cfg(not(target_os = "windows"))]
 use super::{BrowserHostState, BrowserWorkspaceSnapshot};
 #[cfg(not(target_os = "windows"))]
+use crate::browser::BrowserAttachmentProjection;
+#[cfg(not(target_os = "windows"))]
 use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -139,5 +141,19 @@ impl BrowserWebViewHost {
         workspace_key: &super::super::BrowserWorkspaceKey,
     ) -> Option<&BrowserWorkspaceSnapshot> {
         self.state.workspace(workspace_key)
+    }
+
+    pub fn acknowledge_attachment_projection(
+        &mut self,
+        projection: &BrowserAttachmentProjection,
+    ) -> Result<BrowserWorkspaceSnapshot, BrowserError> {
+        self.state
+            .acknowledge_attachment_projection(
+                &projection.workspace_key,
+                projection.revision,
+                &projection.pending_annotation_ids,
+                &projection.tombstone_annotation_ids,
+            )
+            .map(|mutation| mutation.snapshot)
     }
 }
