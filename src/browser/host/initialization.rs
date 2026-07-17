@@ -15,6 +15,8 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     bodies: new Map(),
     sequence: 0,
     requestSequence: 0,
+    inflightRequests: 0,
+    lastNetworkActivityAt: 0,
     tracing: false,
     traceStartedAt: 0,
     annotationActive: false,
@@ -148,21 +150,27 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     }, MAX_CONSOLE);
   });
 
-  const beginRequest = (url, method) => ({
-    requestId: `request-${++state.requestSequence}`,
-    url: safeUrl(url),
-    method: String(method || "GET").toUpperCase().slice(0, 32),
-    status: null,
-    failed: false,
-    bodyAvailable: false,
-    durationMs: null,
-    startedAt: now(),
-  });
+  const beginRequest = (url, method) => {
+    state.inflightRequests += 1;
+    state.lastNetworkActivityAt = now();
+    return {
+      requestId: `request-${++state.requestSequence}`,
+      url: safeUrl(url),
+      method: String(method || "GET").toUpperCase().slice(0, 32),
+      status: null,
+      failed: false,
+      bodyAvailable: false,
+      durationMs: null,
+      startedAt: now(),
+    };
+  };
   const finishRequest = (entry, status, failed) => {
     entry.status = Number.isFinite(status) ? status : null;
     entry.failed = Boolean(failed);
     entry.durationMs = Math.max(0, now() - entry.startedAt);
     delete entry.startedAt;
+    state.inflightRequests = Math.max(0, state.inflightRequests - 1);
+    state.lastNetworkActivityAt = now();
     boundedPush(state.network, entry, MAX_NETWORK);
   };
   const captureBody = async (entry, response) => {
@@ -531,9 +539,18 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       case "duration": return elapsed >= condition.durationMs;
       case "url": return condition.exact ? location.href === condition.value : location.href.includes(condition.value);
       case "load": return document.readyState === "complete";
+      case "networkIdle": return state.inflightRequests === 0 && now() - state.lastNetworkActivityAt >= 500;
+      case "title": return condition.exact ? document.title === condition.value : document.title.includes(condition.value);
       case "elementPresent": return Boolean(resolveTarget(condition.target));
+      case "elementAbsent": return !resolveTarget(condition.target);
       case "elementVisible": return isVisible(resolveTarget(condition.target));
       case "elementHidden": return !isVisible(resolveTarget(condition.target));
+      case "elementValue": {
+        const element = resolveTarget(condition.target);
+        if (!element) return false;
+        const value = "value" in element ? element.value : element.getAttribute?.("value");
+        return String(value ?? "") === String(condition.value ?? "");
+      }
       case "textPresent": return (document.body?.innerText || "").includes(condition.text);
       case "textAbsent": return !(document.body?.innerText || "").includes(condition.text);
       case "javaScript": {

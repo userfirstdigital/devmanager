@@ -1939,6 +1939,80 @@ fn initialization_script_reports_only_trusted_input_metadata() {
 }
 
 #[test]
+fn typed_replay_waits_are_injected_without_javascript_predicates() {
+    let target = BrowserActionTarget {
+        locator: BrowserLocator {
+            test_id: Some("result".to_string()),
+            ..BrowserLocator::default()
+        },
+        ..BrowserActionTarget::default()
+    };
+    let cases = [
+        (
+            BrowserWaitCondition::NetworkIdle,
+            serde_json::json!({"type": "networkIdle"}),
+        ),
+        (
+            BrowserWaitCondition::Title {
+                value: "Ready".to_string(),
+                exact: true,
+            },
+            serde_json::json!({"type": "title", "value": "Ready", "exact": true}),
+        ),
+        (
+            BrowserWaitCondition::ElementAbsent {
+                target: target.clone(),
+            },
+            serde_json::json!({"type": "elementAbsent", "target": target}),
+        ),
+        (
+            BrowserWaitCondition::ElementValue {
+                target: BrowserActionTarget {
+                    locator: BrowserLocator {
+                        test_id: Some("result".to_string()),
+                        ..BrowserLocator::default()
+                    },
+                    ..BrowserActionTarget::default()
+                },
+                value: "42".to_string(),
+            },
+            serde_json::json!({
+                "type": "elementValue",
+                "target": {
+                    "elementRef": null,
+                    "locator": {
+                        "accessibilityRole": null,
+                        "accessibilityName": null,
+                        "testId": "result",
+                        "cssSelectors": []
+                    },
+                    "coordinates": null
+                },
+                "value": "42"
+            }),
+        ),
+    ];
+    for (condition, expected) in cases {
+        assert_eq!(serde_json::to_value(condition).unwrap(), expected);
+    }
+
+    let script = browser_user_input_initialization_script();
+    for required in [
+        "case \"networkIdle\"",
+        "case \"title\"",
+        "case \"elementAbsent\"",
+        "case \"elementValue\"",
+        "inflightRequests",
+        "lastNetworkActivityAt",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing injected wait: {required}"
+        );
+    }
+}
+
+#[test]
 fn initialization_script_has_self_cleaning_element_and_region_annotation_overlay() {
     let script = browser_user_input_initialization_script();
 

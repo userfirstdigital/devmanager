@@ -2576,8 +2576,10 @@ impl BrowserWebViewHost {
         use crate::browser::BrowserWaitCondition;
         let target = match condition {
             BrowserWaitCondition::ElementPresent { target }
+            | BrowserWaitCondition::ElementAbsent { target }
             | BrowserWaitCondition::ElementVisible { target }
-            | BrowserWaitCondition::ElementHidden { target } => Some(target),
+            | BrowserWaitCondition::ElementHidden { target }
+            | BrowserWaitCondition::ElementValue { target, .. } => Some(target),
             _ => None,
         };
         if let Some(element) = target.and_then(|target| target.element_ref.as_ref()) {

@@ -1062,6 +1062,7 @@ fn prepare_wait_action(
             timeout_ms,
         },
         BrowserWaitCondition::Load => BrowserRecipeWait::Load { timeout_ms },
+        BrowserWaitCondition::NetworkIdle => BrowserRecipeWait::NetworkIdle { timeout_ms },
         BrowserWaitCondition::ElementPresent { target } => BrowserRecipeWait::ElementPresent {
             locator: recipe_locator(target),
             timeout_ms,
@@ -1086,7 +1087,10 @@ fn prepare_wait_action(
             },
             timeout_ms,
         },
-        BrowserWaitCondition::JavaScript { .. } => {
+        BrowserWaitCondition::Title { .. }
+        | BrowserWaitCondition::ElementAbsent { .. }
+        | BrowserWaitCondition::ElementValue { .. }
+        | BrowserWaitCondition::JavaScript { .. } => {
             return Err(BrowserRecordingError::InvalidAction)
         }
     };

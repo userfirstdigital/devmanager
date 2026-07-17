@@ -184,15 +184,44 @@ pub enum BrowserScreenshotMode {
     rename_all_fields = "camelCase"
 )]
 pub enum BrowserWaitCondition {
-    Duration { duration_ms: u64 },
-    Url { value: String, exact: bool },
+    Duration {
+        duration_ms: u64,
+    },
+    Url {
+        value: String,
+        exact: bool,
+    },
     Load,
-    ElementPresent { target: BrowserActionTarget },
-    ElementVisible { target: BrowserActionTarget },
-    ElementHidden { target: BrowserActionTarget },
-    TextPresent { text: String },
-    TextAbsent { text: String },
-    JavaScript { predicate: String },
+    NetworkIdle,
+    Title {
+        value: String,
+        exact: bool,
+    },
+    ElementPresent {
+        target: BrowserActionTarget,
+    },
+    ElementAbsent {
+        target: BrowserActionTarget,
+    },
+    ElementVisible {
+        target: BrowserActionTarget,
+    },
+    ElementHidden {
+        target: BrowserActionTarget,
+    },
+    ElementValue {
+        target: BrowserActionTarget,
+        value: String,
+    },
+    TextPresent {
+        text: String,
+    },
+    TextAbsent {
+        text: String,
+    },
+    JavaScript {
+        predicate: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
