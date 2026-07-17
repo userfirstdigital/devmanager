@@ -13,11 +13,11 @@ assert_impl_all!(BrowserReplayPlan: Send, Sync);
 assert_impl_all!(BrowserReplayCoordinator: Clone, Send, Sync);
 assert_impl_all!(BrowserReplayProjection: Clone, Send, Sync, std::fmt::Debug, serde::Serialize);
 assert_impl_all!(BrowserReplayCancellationLease: Clone, Send, Sync);
-assert_impl_all!(BrowserReplayExecutionHandle: Clone, Send, Sync);
+assert_impl_all!(BrowserReplayExecutionHandle: Send, Sync);
 assert_not_impl_any!(BrowserReplayPublicInput: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayPlan: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayCancellationLease: std::fmt::Debug, serde::Serialize);
-assert_not_impl_any!(BrowserReplayExecutionHandle: std::fmt::Debug, serde::Serialize);
+assert_not_impl_any!(BrowserReplayExecutionHandle: Clone, std::fmt::Debug, serde::Serialize);
 
 fn locator(test_id: &str) -> BrowserRecipeLocator {
     BrowserRecipeLocator {
@@ -938,16 +938,18 @@ fn replay_execution_handle_shares_plan_and_cancellation_authority() {
             plan_without_secrets(),
         )
         .expect("start replay");
-    let clone = started.lease.clone();
+    let lease_clone = started.lease.clone();
 
-    assert!(started.lease.same_authority(&clone));
-    assert!(started.lease.same_plan(&clone));
+    assert!(started.lease.same_authority(&lease_clone));
+    assert!(started.execution.same_instance(&started.instance));
+    assert!(started.execution.same_authority(&started.lease));
 
     coordinator
         .cancel(&started.instance)
         .expect("cancel exact replay");
     assert!(started.lease.is_cancelled());
-    assert!(clone.is_cancelled());
+    assert!(lease_clone.is_cancelled());
+    assert!(started.execution.is_cancelled());
 
     let replacement = coordinator
         .start(
@@ -956,7 +958,8 @@ fn replay_execution_handle_shares_plan_and_cancellation_authority() {
         )
         .expect("start unrelated replay");
     assert!(!started.lease.same_authority(&replacement.lease));
-    assert!(!started.lease.same_plan(&replacement.lease));
+    assert!(!started.execution.same_instance(&replacement.instance));
+    assert!(!replacement.execution.same_instance(&started.instance));
 }
 
 #[test]

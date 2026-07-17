@@ -226,6 +226,7 @@ pub struct BrowserReplayStart {
     pub instance: BrowserReplayInstance,
     pub projection: BrowserReplayProjection,
     pub lease: BrowserReplayCancellationLease,
+    pub execution: BrowserReplayExecutionHandle,
 }
 
 struct BrowserReplayCancellationAuthority {
@@ -234,14 +235,11 @@ struct BrowserReplayCancellationAuthority {
 }
 
 #[derive(Clone)]
-pub struct BrowserReplayExecutionHandle {
+pub struct BrowserReplayCancellationLease {
     authority: Arc<BrowserReplayCancellationAuthority>,
-    plan: Arc<BrowserReplayPlan>,
 }
 
-pub type BrowserReplayCancellationLease = BrowserReplayExecutionHandle;
-
-impl BrowserReplayExecutionHandle {
+impl BrowserReplayCancellationLease {
     pub fn authority_id(&self) -> u64 {
         self.authority.id
     }
@@ -250,12 +248,28 @@ impl BrowserReplayExecutionHandle {
         Arc::ptr_eq(&self.authority, &other.authority)
     }
 
-    pub fn same_plan(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.plan, &other.plan)
+    pub fn is_cancelled(&self) -> bool {
+        self.authority.cancelled.load(Ordering::Acquire)
+    }
+}
+
+pub struct BrowserReplayExecutionHandle {
+    instance: BrowserReplayInstance,
+    plan: Arc<BrowserReplayPlan>,
+    lease: BrowserReplayCancellationLease,
+}
+
+impl BrowserReplayExecutionHandle {
+    pub fn same_instance(&self, instance: &BrowserReplayInstance) -> bool {
+        self.instance == *instance
+    }
+
+    pub fn same_authority(&self, lease: &BrowserReplayCancellationLease) -> bool {
+        self.lease.same_authority(lease)
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.authority.cancelled.load(Ordering::Acquire)
+        self.lease.is_cancelled()
     }
 
     pub(crate) fn plan(&self) -> &BrowserReplayPlan {
@@ -265,6 +279,7 @@ impl BrowserReplayExecutionHandle {
 
 struct ActiveBrowserReplay {
     instance: BrowserReplayInstance,
+    plan: Arc<BrowserReplayPlan>,
     projection: BrowserReplayProjection,
     lease: BrowserReplayCancellationLease,
 }
@@ -394,8 +409,7 @@ impl BrowserReplayCoordinator {
             }
             active.projection.current_step_index += 1;
             active.projection.current_step_id = active
-                .lease
-                .plan()
+                .plan
                 .steps
                 .get(active.projection.current_step_index)
                 .map(|step| step.id.clone());
@@ -529,32 +543,38 @@ impl BrowserReplayCoordinator {
             id: instance_id,
             scope: state.scope.clone(),
         };
-        let lease = BrowserReplayExecutionHandle {
+        let plan = Arc::new(plan);
+        let lease = BrowserReplayCancellationLease {
             authority: Arc::new(BrowserReplayCancellationAuthority {
                 id: instance_id,
                 cancelled: AtomicBool::new(false),
             }),
-            plan: Arc::new(plan),
+        };
+        let execution = BrowserReplayExecutionHandle {
+            instance: instance.clone(),
+            plan: Arc::clone(&plan),
+            lease: lease.clone(),
         };
         let projection = BrowserReplayProjection {
             workspace_key: workspace_key.clone(),
             instance_id,
-            recipe_id: lease.plan.recipe_id.clone(),
-            status: if lease.plan.unresolved_secret_inputs.is_empty() {
+            recipe_id: plan.recipe_id.clone(),
+            status: if plan.unresolved_secret_inputs.is_empty() {
                 BrowserReplayStatus::Pending
             } else {
                 BrowserReplayStatus::NeedsUserSecret
             },
             current_step_index: 0,
-            total_steps: lease.plan.steps.len(),
-            current_step_id: lease.plan.steps.first().map(|step| step.id.clone()),
-            unresolved_secret_inputs: lease.plan.unresolved_secret_inputs.clone(),
+            total_steps: plan.steps.len(),
+            current_step_id: plan.steps.first().map(|step| step.id.clone()),
+            unresolved_secret_inputs: plan.unresolved_secret_inputs.clone(),
             failure: None,
         };
         state.active.insert(
             workspace_key,
             ActiveBrowserReplay {
                 instance: instance.clone(),
+                plan,
                 projection: projection.clone(),
                 lease: lease.clone(),
             },
@@ -563,6 +583,7 @@ impl BrowserReplayCoordinator {
             instance,
             projection,
             lease,
+            execution,
         })
     }
 
@@ -869,6 +890,28 @@ mod tests {
         };
         assert_eq!(error, BrowserReplayError::InstanceIdExhausted);
         assert!(!coordinator.lock().active.contains_key(&workspace_key));
+    }
+
+    #[test]
+    fn retained_cancellation_lease_does_not_retain_terminal_plan() {
+        let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+        let workspace_key = BrowserWorkspaceKey::new("project", "plan-drop").unwrap();
+        let started = coordinator
+            .start(workspace_key, internal_plan(Vec::new()))
+            .unwrap();
+        let BrowserReplayStart {
+            instance,
+            projection: _,
+            lease,
+            execution,
+        } = started;
+        let plan = Arc::downgrade(&execution.plan);
+
+        drop(execution);
+        coordinator.cancel(&instance).unwrap();
+
+        assert!(lease.is_cancelled());
+        assert!(plan.upgrade().is_none());
     }
 
     #[test]
