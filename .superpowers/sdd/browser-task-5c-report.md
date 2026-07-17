@@ -26,6 +26,14 @@ Checkpoints 7 through 12 are not implemented. This checkpoint adds no workflow r
 4. Save/discard policy: RED failed on absent overwrite probe, effective risk, exact mutation, and recording approval-resume APIs. GREEN proves Normal new save, Destructive overwrite/discard, exact-instance resume, replacement stale fencing, successful retirement, failure retention, and no-clobber failure when a destination appears after risk probe.
 5. Failure/platform behavior: GREEN keeps observation/lifecycle operations direct, queues save/discard, returns typed non-terminal tool failures, and rejects every operation through the macOS/unsupported adapter.
 
+### Independent-review hardening
+
+The initial checkpoint-6 implementation landed as `8d0d8a29e6a1cf186e8cfa7658d296d18d6dfc09`. Independent review rejected three boundaries, each reproduced by a focused test before the production fix:
+
+1. Resource error disclosure: RED showed a failed review-resource `put` could expose the store path through `BrowserError::Io`/`ToolFailure`. GREEN maps review encoding and persistence plus both Stop/Review trusted-root/store-open failures to `RecordingResourceUnavailable`, whose MCP code and message are fixed and path-free. The real rmcp regression proves project root, resource root, `.devmanager`, and injected underlying error detail stay absent while the exact Review instance remains active and the same authenticated session still reports Review.
+2. Root preflight ordering: RED exercised all six operations with a UNC root. Each eventually returned a safe invalid-request result, but the host had already observed Ensure, pane-open, and workspace-state lifecycle work. GREEN runs one shared canonical-directory/local/non-UNC validator before first-use initialization and reuses it in the lower controller and save seams. No host command or recording state effect occurs on rejection. The Windows prefix classifier permits canonical local `VerbatimDisk` paths while rejecting only `UNC` and `VerbatimUNC` roots.
+3. Workspace mutation target: RED failed to compile because Save/Discard had no stable workspace-target seam; the Windows host fell back to the currently selected tab, so a selection change could create a second concurrent queue/approval target. GREEN derives `__workspace__` for both operations regardless of selection. The regression queues Save under one selected tab, changes selection before Discard, then proves one target, ordered approval/mutation resume, and exact queue completion.
+
 ### Verification
 
 - Recording gateway tests: 3 passed, 0 failed; recording MCP domain tests: 2 passed, 0 failed.
@@ -35,6 +43,12 @@ Checkpoints 7 through 12 are not implemented. This checkpoint adds no workflow r
 - ProcessManager gate: 69 passed and the documented pre-existing `stopped_server_can_start_again_on_same_terminal_session` timeout recurred; its exact rerun passed 1/1 in 1.69 seconds. This checkpoint has no `src/services` diff.
 - `cargo check --locked --all-targets`, native Windows `cargo build --locked`, `cargo fmt --all -- --check`, and `git diff --check`: passed.
 - `cargo check --locked --target aarch64-apple-darwin --lib` was attempted from Windows but stopped in third-party `ring`/`psm`/`aws-lc-sys` build scripts because no Apple-target `cc` is installed. The platform-neutral unsupported seam is compiled and behavior-tested on Windows for all six macOS operations; native macOS compilation remains environment-limited.
+
+Review-hardening verification:
+
+- Recording MCP domain: 3 passed, 0 failed; real gateway: 18 passed, 0 failed; host/platform/queue: 86 passed, 0 failed; exact all-six root preflight unit: 1 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1`: 117 matching tests passed across all targets, 0 failed.
+- `cargo check --locked --all-targets`, native Windows `cargo build --locked`, `cargo fmt --all -- --check`, and `git diff --check`: passed.
 
 ### Files
 

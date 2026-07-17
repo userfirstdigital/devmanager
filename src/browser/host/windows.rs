@@ -8,35 +8,35 @@ use crate::browser::downloads::{
 };
 use crate::browser::{
     apply_browser_workflow_review_mutation, browser_lifecycle_control,
-    browser_page_origin_from_url, browser_recording_review_result,
+    browser_operation_target_tab_id, browser_page_origin_from_url, browser_recording_review_result,
     browser_recording_save_would_overwrite, browser_recording_status_result,
     browser_request_preempts_operation_queue, browser_response_resource_ids,
     browser_workflow_review_projection, build_semantic_snapshot, crop_annotation_png,
     discard_browser_recording, discard_browser_workflow_review, effective_browser_annotation_risk,
     effective_browser_recording_risk, effective_browser_risk, effective_browser_risk_for_targets,
     parse_browser_page_ipc_message, prepare_verified_download_root,
-    preview_browser_workflow_review, redact_browser_resource_bytes, redact_browser_text,
-    remove_verified_profile, save_browser_recording_review, save_browser_workflow_review,
-    validate_annotation_candidate_context, BrowserAction, BrowserActionResult,
-    BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDraft,
-    BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
-    BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
-    BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
-    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
-    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
-    BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget,
-    BrowserPageIpcMessage, BrowserPageLoadState, BrowserPageRecordingAuthority,
-    BrowserPageRecordingEnvelope, BrowserPageRecordingIngress, BrowserPageRecordingIpc,
-    BrowserPageRecordingIpcError, BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
-    BrowserPageRecordingTransportFailureKind, BrowserPaneSurface, BrowserPerformanceOperation,
-    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
-    BrowserRecordingInstance, BrowserRecordingOperation, BrowserRecordingReview,
-    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget,
-    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
-    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
-    BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
-    MAX_BROWSER_ACTIONS,
+    preview_browser_workflow_review, recording_resource_unavailable, redact_browser_resource_bytes,
+    redact_browser_text, remove_verified_profile, save_browser_recording_review,
+    save_browser_workflow_review, validate_annotation_candidate_context, BrowserAction,
+    BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
+    BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationRoute,
+    BrowserApprovalPolicy, BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds,
+    BrowserCommand, BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation,
+    BrowserDiagnosticLevel, BrowserDownloadState, BrowserDownloadStore, BrowserError,
+    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
+    BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation,
+    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
+    BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingSubmit,
+    BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind, BrowserPaneSurface,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
+    BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance, BrowserRecordingOperation,
+    BrowserRecordingReview, BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
+    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout,
+    BrowserUploadResult, BrowserWaitResult, BrowserWorkflowCoordinator,
+    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -620,11 +620,8 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         command: &BrowserCommand,
     ) -> BrowserOperationTarget {
-        let tab_id = command
-            .tab_id()
-            .map(ToOwned::to_owned)
-            .or_else(|| self.selected_tab_id(workspace_key))
-            .unwrap_or_else(|| WORKSPACE_OPERATION_TAB.to_string());
+        let selected_tab_id = self.selected_tab_id(workspace_key);
+        let tab_id = browser_operation_target_tab_id(command, selected_tab_id.as_deref());
         BrowserOperationTarget::new(workspace_key.clone(), tab_id)
             .expect("host operation target always has a nonblank tab id")
     }
@@ -3246,11 +3243,7 @@ impl BrowserWebViewHost {
                         .ok_or_else(stale_recording_instance)?;
                     self.stop_page_recording(&instance)
                         .map_err(recording_ipc_browser_error)?;
-                    let resources = BrowserResourceStore::open_verified(
-                        self.verified_trusted_app_config_dir()?,
-                        &workspace_key.project_id,
-                        BrowserResourceLimits::default(),
-                    )?;
+                    let resources = self.recording_review_resource_store(workspace_key)?;
                     Ok(BrowserResponse::Recording {
                         result: browser_recording_review_result(
                             &self.workflow_coordinator,
@@ -3261,11 +3254,7 @@ impl BrowserWebViewHost {
                     })
                 }
                 BrowserRecordingOperation::Review => {
-                    let resources = BrowserResourceStore::open_verified(
-                        self.verified_trusted_app_config_dir()?,
-                        &workspace_key.project_id,
-                        BrowserResourceLimits::default(),
-                    )?;
+                    let resources = self.recording_review_resource_store(workspace_key)?;
                     Ok(BrowserResponse::Recording {
                         result: browser_recording_review_result(
                             &self.workflow_coordinator,
@@ -3453,6 +3442,21 @@ impl BrowserWebViewHost {
                 })?;
         verify_prepared_storage_root(trusted_app_config_dir, trusted_app_config_dir)?;
         Ok(trusted_app_config_dir)
+    }
+
+    fn recording_review_resource_store(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Result<BrowserResourceStore, BrowserError> {
+        let trusted_root = self
+            .verified_trusted_app_config_dir()
+            .map_err(|_| recording_resource_unavailable())?;
+        BrowserResourceStore::open_verified(
+            trusted_root,
+            &workspace_key.project_id,
+            BrowserResourceLimits::default(),
+        )
+        .map_err(|_| recording_resource_unavailable())
     }
 
     fn ensure_selected_view(
@@ -4045,6 +4049,7 @@ fn browser_error_code(error: &BrowserError) -> &'static str {
         BrowserError::InvalidRecipe { .. } | BrowserError::UnsupportedRecipeVersion { .. } => {
             "invalid_recipe"
         }
+        BrowserError::RecordingResourceUnavailable => "recording_resource_unavailable",
         BrowserError::Interrupted => "user_interrupted",
         BrowserError::Timeout { .. } => "timeout",
         BrowserError::NavigationFailure { .. } => "navigation_failure",

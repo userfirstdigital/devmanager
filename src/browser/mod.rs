@@ -45,16 +45,16 @@ pub use automation::{
     BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition, BrowserWaitResult,
     MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
 };
-pub(crate) use commands::BrowserRegistrationLease;
 pub use commands::{
-    browser_command_channel, browser_lifecycle_control, browser_request_preempts_operation_queue,
-    browser_response_resource_ids, route_browser_request, BrowserApprovalRequest, BrowserCommand,
-    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserController,
-    BrowserDiagnosticLevel, BrowserDownloadState, BrowserHostControl, BrowserHostEvent,
-    BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext, BrowserPageLoadState,
-    BrowserRecordingInputSummary, BrowserRecordingOperation, BrowserRecordingResult,
-    BrowserResponse, BrowserUserInputKind,
+    browser_command_channel, browser_lifecycle_control, browser_operation_target_tab_id,
+    browser_request_preempts_operation_queue, browser_response_resource_ids, route_browser_request,
+    BrowserApprovalRequest, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
+    BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel, BrowserDownloadState,
+    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserPageLoadState, BrowserRecordingInputSummary,
+    BrowserRecordingOperation, BrowserRecordingResult, BrowserResponse, BrowserUserInputKind,
 };
+pub(crate) use commands::{verified_authenticated_local_project_root, BrowserRegistrationLease};
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
     BrowserDownloadStore,
@@ -126,6 +126,7 @@ pub use recording_ipc::{
     MAX_BROWSER_PAGE_RECORDING_LOCATOR_FALLBACKS, MAX_BROWSER_PAGE_RECORDING_SELECT_VALUES,
     MAX_BROWSER_PAGE_RECORDING_STRING_BYTES,
 };
+pub(crate) use recording_mcp::recording_resource_unavailable;
 pub use recording_mcp::{
     browser_recording_review_result, browser_recording_save_would_overwrite,
     browser_recording_status_result, discard_browser_recording, effective_browser_recording_risk,

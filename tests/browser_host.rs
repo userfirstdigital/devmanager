@@ -1,7 +1,8 @@
 use devmanager::browser::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_command_channel,
-    browser_lifecycle_control, browser_request_preempts_operation_queue,
-    browser_response_resource_ids, browser_user_input_initialization_script, crop_annotation_png,
+    browser_lifecycle_control, browser_operation_target_tab_id,
+    browser_request_preempts_operation_queue, browser_response_resource_ids,
+    browser_user_input_initialization_script, crop_annotation_png,
     effective_browser_annotation_risk, parse_browser_annotation_ipc_message,
     parse_browser_page_ipc_message, prepare_verified_download_root, prepare_verified_profile_root,
     remove_verified_profile, route_browser_request, unique_download_path,
@@ -24,6 +25,51 @@ use devmanager::browser::{
     BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
     MAX_BROWSER_JOURNAL_ENTRIES,
 };
+
+#[test]
+fn recording_save_and_discard_share_one_workspace_target_across_selection_changes() {
+    let key = workspace("project-a", "conversation-a");
+    let save = BrowserCommand::Recording {
+        operation: BrowserRecordingOperation::Save,
+    };
+    let discard = BrowserCommand::Recording {
+        operation: BrowserRecordingOperation::Discard,
+    };
+    let save_target = BrowserOperationTarget::new(
+        key.clone(),
+        browser_operation_target_tab_id(&save, Some("selected-tab-a")),
+    )
+    .unwrap();
+    let discard_target = BrowserOperationTarget::new(
+        key,
+        browser_operation_target_tab_id(&discard, Some("selected-tab-b")),
+    )
+    .unwrap();
+
+    assert_eq!(save_target, discard_target);
+    assert_eq!(save_target.tab_id, "__workspace__");
+
+    let mut queue = BrowserOperationQueue::default();
+    assert_eq!(
+        queue.enqueue(save_target.clone(), "save-approval", "save"),
+        Some("save")
+    );
+    assert_eq!(
+        queue.enqueue(discard_target.clone(), "discard-approval", "discard"),
+        None,
+        "selection changes must not allow concurrent workspace mutation approvals"
+    );
+    assert_eq!(
+        queue.complete(&save_target, "save-approval"),
+        Some("discard")
+    );
+    assert_eq!(
+        queue.active_operation_id(&discard_target),
+        Some("discard-approval")
+    );
+    assert_eq!(queue.complete(&discard_target, "discard-approval"), None);
+    assert_eq!(queue.active_operation_id(&discard_target), None);
+}
 
 #[test]
 fn recording_observation_preempts_but_destructive_lifecycle_uses_the_approval_queue() {
@@ -53,6 +99,7 @@ fn recording_save_and_discard_use_authenticated_root_and_resume_exact_risk_appro
     for contract in [
         "BrowserApprovalResume::Recording",
         "fn begin_recording_request",
+        "browser_operation_target_tab_id(command, selected_tab_id.as_deref())",
         "request.local_project_root()",
         "effective_browser_recording_risk",
         "browser_recording_save_would_overwrite",
@@ -64,6 +111,13 @@ fn recording_save_and_discard_use_authenticated_root_and_resume_exact_risk_appro
             "missing host contract: {contract}"
         );
     }
+    assert_eq!(
+        source
+            .matches("self.recording_review_resource_store(workspace_key)?")
+            .count(),
+        2,
+        "Stop and Review must share the fixed path-free resource-store opener"
+    );
 }
 
 #[test]

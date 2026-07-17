@@ -1,15 +1,16 @@
 use base64::Engine as _;
 use devmanager::browser::{
-    browser_command_channel, BrowserActionResult, BrowserAnnotation, BrowserCommand,
-    BrowserCommandInbox, BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle,
-    BrowserHostControl, BrowserHostState, BrowserHostStatus, BrowserInvocationActor,
-    BrowserInvocationContext, BrowserNetworkEntry, BrowserPerformanceSnapshot,
-    BrowserRecipeInputKind, BrowserRecordingInputSummary, BrowserRecordingOperation,
-    BrowserRecordingResult, BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId,
-    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
-    BrowserRevision, BrowserRisk, BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot,
-    BrowserUploadResult, BrowserViewport, BrowserWaitResult, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    browser_command_channel, browser_recording_review_result, browser_recording_status_result,
+    BrowserActionResult, BrowserAnnotation, BrowserCommand, BrowserCommandInbox,
+    BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostControl,
+    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
+    BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserRecipeInputKind,
+    BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingInputSummary,
+    BrowserRecordingOperation, BrowserRecordingResult, BrowserRecordingStatus,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserSnapshotSummary,
+    BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
+    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -466,6 +467,52 @@ async fn run_recording_bridge_host(
                 })
             }
             other => panic!("unexpected recording bridge command: {other:?}"),
+        };
+        request.respond(result);
+    }
+}
+
+async fn run_recording_resource_failure_host(
+    mut inbox: BrowserCommandInbox,
+    coordinator: BrowserWorkflowCoordinator,
+    resources: BrowserResourceStore,
+) {
+    let mut host = BrowserHostState::new(PathBuf::from("recording-resource-failure-fake-host"));
+    while let Some(request) = inbox.recv().await {
+        let workspace_key = request.workspace_key().clone();
+        let result = match request.command().clone() {
+            BrowserCommand::Ensure { snapshot } => host
+                .ensure_workspace(workspace_key, snapshot)
+                .map(|mutation| BrowserResponse::Workspace { mutation }),
+            BrowserCommand::SetPaneOpen { open } => host
+                .set_pane_open(&workspace_key, open)
+                .map(|mutation| BrowserResponse::Workspace { mutation }),
+            BrowserCommand::WorkspaceState => host
+                .workspace(&workspace_key)
+                .cloned()
+                .map(|snapshot| BrowserResponse::WorkspaceState { snapshot })
+                .ok_or_else(|| devmanager::browser::BrowserError::CrashedView {
+                    message: "missing recording resource failure workspace".to_string(),
+                }),
+            BrowserCommand::Recording {
+                operation: BrowserRecordingOperation::Review,
+            } => browser_recording_review_result(
+                &coordinator,
+                &workspace_key,
+                BrowserRecordingOperation::Review,
+                &resources,
+            )
+            .map(|result| BrowserResponse::Recording { result }),
+            BrowserCommand::Recording {
+                operation: BrowserRecordingOperation::Status,
+            } => Ok(BrowserResponse::Recording {
+                result: browser_recording_status_result(
+                    &coordinator,
+                    &workspace_key,
+                    BrowserRecordingOperation::Status,
+                ),
+            }),
+            other => panic!("unexpected recording resource failure command: {other:?}"),
         };
         request.respond(result);
     }
@@ -1847,6 +1894,127 @@ async fn browser_recording_tool_failure_is_typed_and_does_not_end_the_authentica
             .count(),
         2
     );
+    std::fs::remove_dir_all(project_root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_recording_resource_failure_is_typed_path_free_and_retains_review() {
+    let (bridge, inbox) = browser_command_channel(8);
+    let owner = workspace(
+        "recording-resource-failure-project",
+        "recording-resource-failure-conversation",
+    );
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let instance = coordinator.start(owner.clone()).unwrap();
+    let reservation = coordinator
+        .reserve_on(
+            &instance,
+            BrowserRecordingActor::Agent,
+            "tab-a",
+            BrowserRisk::Normal,
+        )
+        .unwrap();
+    coordinator
+        .commit(
+            reservation,
+            BrowserRecordingAction::navigate("https://example.test/review").unwrap(),
+        )
+        .unwrap();
+    coordinator.stop(&instance).unwrap();
+
+    let resource_root = unique_gateway_config_dir("recording-resource-path-sentinel");
+    let resources =
+        BrowserResourceStore::open(&resource_root, BrowserResourceLimits::default()).unwrap();
+    std::fs::remove_dir_all(resources.root()).unwrap();
+    std::fs::write(
+        resources.root(),
+        b"recording-resource-underlying-error-detail-sentinel",
+    )
+    .unwrap();
+
+    let project_root = unique_gateway_config_dir("recording-project-root-path-sentinel");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let canonical_project_root = project_root.canonicalize().unwrap();
+    let canonical_project_root_text = canonical_project_root.to_string_lossy().into_owned();
+    let resource_root_text = resource_root.to_string_lossy().into_owned();
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register_with_project_root(
+            "recording-resource-failure-process",
+            owner.clone(),
+            BrowserWorkspaceSnapshot::default(),
+            &project_root,
+        )
+        .unwrap();
+    let host = run_recording_resource_failure_host(inbox, coordinator.clone(), resources.clone());
+    let scenario = async move {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default().serve(transport).await.unwrap();
+        let failed = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_recording").with_arguments(arguments(json!({
+                    "intent": "review the exact workflow recording",
+                    "risk": "normal",
+                    "operation": "review",
+                }))),
+            )
+            .await
+            .expect("resource persistence failure returns a tool result");
+        assert_eq!(failed.is_error, Some(true));
+        let body = failed
+            .structured_content
+            .expect("structured resource error");
+        assert_eq!(body["error"]["code"], "recording_resource_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "browser recording review resource is unavailable"
+        );
+        let serialized = serde_json::to_string(&body).unwrap();
+        for forbidden in [
+            canonical_project_root_text.as_str(),
+            resource_root_text.as_str(),
+            "recording-project-root-path-sentinel",
+            "recording-resource-path-sentinel",
+            "recording-resource-underlying-error-detail-sentinel",
+            ".devmanager",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "resource failure leaked forbidden detail {forbidden}: {serialized}"
+            );
+        }
+
+        let status = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_recording").with_arguments(arguments(json!({
+                    "intent": "check the recording after resource failure",
+                    "risk": "normal",
+                    "operation": "status",
+                }))),
+            )
+            .await
+            .expect("session remains usable after resource failure");
+        assert_eq!(status.is_error, Some(false));
+        assert_eq!(
+            status.structured_content.unwrap()["recording"]["status"],
+            "review"
+        );
+        client.cancel().await.unwrap();
+    };
+    tokio::join!(host, scenario);
+
+    assert_eq!(coordinator.status(&owner), BrowserRecordingStatus::Review);
+    assert_eq!(
+        coordinator.current_instance(&owner).unwrap().id(),
+        instance.id()
+    );
+    std::fs::remove_file(resource_root).unwrap();
     std::fs::remove_dir_all(project_root).unwrap();
 }
 

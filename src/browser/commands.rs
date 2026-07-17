@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+#[cfg(windows)]
+use std::path::{Component, Prefix};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -362,6 +364,27 @@ impl BrowserCommand {
             | Self::DownloadDirectory => None,
         }
     }
+}
+
+const WORKSPACE_OPERATION_TARGET_TAB_ID: &str = "__workspace__";
+
+pub fn browser_operation_target_tab_id(
+    command: &BrowserCommand,
+    selected_tab_id: Option<&str>,
+) -> String {
+    if matches!(
+        command,
+        BrowserCommand::Recording {
+            operation: BrowserRecordingOperation::Save | BrowserRecordingOperation::Discard,
+        }
+    ) {
+        return WORKSPACE_OPERATION_TARGET_TAB_ID.to_string();
+    }
+    command
+        .tab_id()
+        .or(selected_tab_id)
+        .unwrap_or(WORKSPACE_OPERATION_TARGET_TAB_ID)
+        .to_string()
 }
 
 pub fn browser_lifecycle_control(
@@ -918,17 +941,7 @@ impl BrowserController {
         context: BrowserInvocationContext,
         local_project_root: &std::path::Path,
     ) -> Result<BrowserResponse, BrowserError> {
-        let canonical =
-            local_project_root
-                .canonicalize()
-                .map_err(|_| BrowserError::InvalidInvocation {
-                    field: "localProjectRoot".to_string(),
-                })?;
-        if canonical != local_project_root {
-            return Err(BrowserError::InvalidInvocation {
-                field: "localProjectRoot".to_string(),
-            });
-        }
+        let canonical = verified_authenticated_local_project_root(local_project_root)?;
         self.request_with_context_and_local_project_root(command, context, Some(canonical))
             .await
     }
@@ -1140,6 +1153,46 @@ impl BrowserController {
                 });
                 Ok(subscriptions)
             })
+    }
+}
+
+pub(crate) fn verified_authenticated_local_project_root(
+    project_root: &Path,
+) -> Result<PathBuf, BrowserError> {
+    if browser_project_root_is_remote(project_root) {
+        return Err(invalid_local_project_root());
+    }
+    let canonical = project_root
+        .canonicalize()
+        .map_err(|_| invalid_local_project_root())?;
+    if canonical != project_root
+        || !canonical.is_dir()
+        || browser_project_root_is_remote(&canonical)
+    {
+        return Err(invalid_local_project_root());
+    }
+    Ok(canonical)
+}
+
+fn invalid_local_project_root() -> BrowserError {
+    BrowserError::InvalidInvocation {
+        field: "localProjectRoot".to_string(),
+    }
+}
+
+fn browser_project_root_is_remote(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let text = path.as_os_str().to_string_lossy();
+        text.starts_with(r"\\") || text.starts_with("//")
     }
 }
 

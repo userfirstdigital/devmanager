@@ -1,10 +1,11 @@
 use super::{
-    classify_upload_path, effective_browser_risk, resource_id_from_uri, BrowserAction,
-    BrowserActionTarget, BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation,
-    BrowserController, BrowserDownloadOperation, BrowserError, BrowserInvocationContext,
-    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserRecordingOperation,
-    BrowserResourceStore, BrowserResponse, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot,
-    BrowserWaitCondition, BrowserWorkspaceSnapshot,
+    classify_upload_path, effective_browser_risk, resource_id_from_uri,
+    verified_authenticated_local_project_root, BrowserAction, BrowserActionTarget,
+    BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation, BrowserController,
+    BrowserDownloadOperation, BrowserError, BrowserInvocationContext, BrowserNetworkOperation,
+    BrowserPerformanceOperation, BrowserRecordingOperation, BrowserResourceStore, BrowserResponse,
+    BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
+    BrowserWorkspaceSnapshot,
 };
 use base64::Engine as _;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -695,6 +696,9 @@ impl BrowserMcpServer {
                 ));
             }
             let context = invocation_context(&request.intent, request.risk)?;
+            let project_root =
+                verified_authenticated_local_project_root(&self.context.project_root)
+                    .map_err(ToolFailure::from)?;
             self.validate_and_ensure(&context).await?;
             let response = self
                 .context
@@ -704,7 +708,7 @@ impl BrowserMcpServer {
                         operation: request.operation,
                     },
                     context,
-                    &self.context.project_root,
+                    &project_root,
                 )
                 .await
                 .map_err(ToolFailure::from)?;
@@ -1181,6 +1185,7 @@ impl From<BrowserError> for ToolFailure {
             BrowserError::InvalidRecipe { .. } | BrowserError::UnsupportedRecipeVersion { .. } => {
                 "invalid_recipe"
             }
+            BrowserError::RecordingResourceUnavailable => "recording_resource_unavailable",
             BrowserError::Interrupted => "user_interrupted",
             BrowserError::Timeout { .. } => "timeout",
             BrowserError::NavigationFailure { .. } => "navigation_failure",
@@ -1255,4 +1260,112 @@ fn tabs_payload(snapshot: &BrowserWorkspaceSnapshot) -> Value {
         "selectedTabId": snapshot.selected_tab_id,
         "tabs": snapshot.tabs.iter().map(compact_tab).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browser::{
+        browser_command_channel, BrowserHostState, BrowserRecordingResult, BrowserRecordingStatus,
+        BrowserResourceLimits, BrowserWorkspaceKey,
+    };
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn recording_rejects_unc_root_before_all_six_operations_or_lifecycle_effects() {
+        let (bridge, mut inbox) = browser_command_channel(16);
+        let owner =
+            BrowserWorkspaceKey::new("root-fence-project", "root-fence-conversation").unwrap();
+        let controller = bridge.bind(owner, Duration::from_secs(1));
+        drop(bridge);
+        let resource_root = std::env::temp_dir().join(format!(
+            "devmanager-recording-root-fence-test-{}",
+            std::process::id()
+        ));
+        let resources =
+            BrowserResourceStore::open(&resource_root, BrowserResourceLimits::default()).unwrap();
+        let remote_root = PathBuf::from(r"\\recording-root-path-sentinel\share\project");
+        let server = BrowserMcpServer::new(
+            controller,
+            BrowserWorkspaceSnapshot::default(),
+            resources,
+            remote_root.clone(),
+        );
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let host_observed = Arc::clone(&observed);
+
+        let host = async move {
+            let mut state = BrowserHostState::new(PathBuf::from("root-fence-fake-host"));
+            while let Some(request) = inbox.recv().await {
+                let key = request.workspace_key().clone();
+                let command = request.command().clone();
+                host_observed.lock().unwrap().push(command.clone());
+                let response = match command {
+                    BrowserCommand::Ensure { snapshot } => state
+                        .ensure_workspace(key, snapshot)
+                        .map(|mutation| BrowserResponse::Workspace { mutation }),
+                    BrowserCommand::SetPaneOpen { open } => state
+                        .set_pane_open(&key, open)
+                        .map(|mutation| BrowserResponse::Workspace { mutation }),
+                    BrowserCommand::WorkspaceState => Ok(BrowserResponse::WorkspaceState {
+                        snapshot: state.workspace(&key).unwrap().clone(),
+                    }),
+                    BrowserCommand::Recording { operation } => Ok(BrowserResponse::Recording {
+                        result: BrowserRecordingResult {
+                            operation,
+                            status: BrowserRecordingStatus::Inactive,
+                            recording_id: None,
+                            recipe_id: None,
+                            step_count: 0,
+                            inputs: Vec::new(),
+                            valid: false,
+                            resource: None,
+                            overwrote_existing: None,
+                        },
+                    }),
+                    other => panic!("unexpected root-fence command: {other:?}"),
+                };
+                request.respond(response);
+            }
+        };
+        let scenario = async move {
+            for operation in [
+                BrowserRecordingOperation::Status,
+                BrowserRecordingOperation::Start,
+                BrowserRecordingOperation::Stop,
+                BrowserRecordingOperation::Review,
+                BrowserRecordingOperation::Discard,
+                BrowserRecordingOperation::Save,
+            ] {
+                let response = server
+                    .browser_recording(Parameters(BrowserRecordingRequest {
+                        parsed: Ok(BrowserRecordingRequestWire {
+                            intent: format!("test {operation:?} root fence"),
+                            risk: BrowserMcpRisk::Normal,
+                            operation,
+                        }),
+                    }))
+                    .await;
+                assert_eq!(
+                    response.is_error,
+                    Some(true),
+                    "{operation:?} was not rejected"
+                );
+                let body = response.structured_content.expect("typed root-fence error");
+                assert_eq!(body["error"]["code"], "invalid_request");
+                let encoded = serde_json::to_string(&body).unwrap();
+                assert!(!encoded.contains("recording-root-path-sentinel"));
+                assert!(!encoded.contains(remote_root.to_string_lossy().as_ref()));
+            }
+            drop(server);
+        };
+
+        tokio::join!(host, scenario);
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "root rejection must occur before ensure, status, or recording commands"
+        );
+        std::fs::remove_dir_all(resource_root).unwrap();
+    }
 }

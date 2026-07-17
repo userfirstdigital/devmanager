@@ -1,7 +1,7 @@
 use devmanager::browser::{
     browser_recording_review_result, browser_recording_save_would_overwrite,
     browser_recording_status_result, discard_browser_recording, effective_browser_recording_risk,
-    load_recipe, save_browser_recording_review, save_recipe, BrowserRecipeInputKind,
+    load_recipe, save_browser_recording_review, save_recipe, BrowserError, BrowserRecipeInputKind,
     BrowserRecipeLocator, BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingOperation,
     BrowserRecordingStatus, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
     BrowserRisk, BrowserWorkflowCoordinator, BrowserWorkspaceKey,
@@ -289,4 +289,40 @@ fn recording_save_escalates_overwrite_and_only_retires_after_atomic_success() {
 
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(race_root).unwrap();
+}
+
+#[test]
+fn recording_review_resource_failure_is_fixed_path_free_and_retains_review() {
+    let root = temporary_root("recording-resource-path-sentinel");
+    let store = BrowserResourceStore::open(&root, BrowserResourceLimits::default()).unwrap();
+    let owner = workspace("project-a", "conversation-a");
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let instance_id = reviewed_navigation(&coordinator, &owner, "https://example.test/review");
+
+    std::fs::remove_dir_all(store.root()).unwrap();
+    std::fs::write(store.root(), b"force resource persistence failure").unwrap();
+    let error = browser_recording_review_result(
+        &coordinator,
+        &owner,
+        BrowserRecordingOperation::Review,
+        &store,
+    )
+    .expect_err("resource persistence must fail");
+
+    assert_eq!(error, BrowserError::RecordingResourceUnavailable);
+    assert_eq!(
+        error.to_string(),
+        "browser recording review resource is unavailable"
+    );
+    assert!(!error
+        .to_string()
+        .contains("recording-resource-path-sentinel"));
+    assert_eq!(
+        coordinator.current_instance(&owner).unwrap().id(),
+        instance_id,
+        "resource failure must retain the exact Review state",
+    );
+    assert_eq!(coordinator.status(&owner), BrowserRecordingStatus::Review);
+
+    std::fs::remove_file(root).unwrap();
 }

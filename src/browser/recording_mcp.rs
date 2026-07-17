@@ -1,12 +1,11 @@
 use super::{
-    effective_browser_risk, BrowserError, BrowserRecordingInputSummary, BrowserRecordingOperation,
-    BrowserRecordingResult, BrowserRecordingStatus, BrowserResourceKind, BrowserResourceStore,
-    BrowserRisk, BrowserWorkflowCoordinator, BrowserWorkspaceKey,
+    effective_browser_risk, verified_authenticated_local_project_root, BrowserError,
+    BrowserRecordingInputSummary, BrowserRecordingOperation, BrowserRecordingResult,
+    BrowserRecordingStatus, BrowserResourceKind, BrowserResourceStore, BrowserRisk,
+    BrowserWorkflowCoordinator, BrowserWorkspaceKey,
 };
 use serde::Serialize;
-#[cfg(windows)]
-use std::path::{Component, Prefix};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,17 +56,17 @@ pub fn browser_recording_review_result(
             recording_id: review.instance().id(),
             recipe: &recipe,
         })
-        .map_err(|error| BrowserError::InvalidRecipe {
-            message: format!("recording review could not be encoded: {error}"),
-        })?;
+        .map_err(|_| recording_resource_unavailable())?;
         bytes.push(b'\n');
-        let resource = resources.put(
-            workspace_key,
-            BrowserResourceKind::WorkflowReview,
-            "application/json",
-            bytes,
-            false,
-        )?;
+        let resource = resources
+            .put(
+                workspace_key,
+                BrowserResourceKind::WorkflowReview,
+                "application/json",
+                bytes,
+                false,
+            )
+            .map_err(|_| recording_resource_unavailable())?;
         Ok(result_from_review(operation, &review, Some(resource)))
     })
 }
@@ -211,28 +210,8 @@ fn stale_recording_review() -> BrowserError {
     }
 }
 
-fn verified_authenticated_local_project_root(project_root: &Path) -> Result<PathBuf, BrowserError> {
-    let canonical = project_root
-        .canonicalize()
-        .map_err(|_| recording_storage_error("access"))?;
-    if canonical != project_root || !canonical.is_dir() || is_remote_path(&canonical) {
-        return Err(recording_storage_error("access"));
-    }
-    Ok(canonical)
-}
-
-#[cfg(windows)]
-fn is_remote_path(path: &Path) -> bool {
-    matches!(
-        path.components().next(),
-        Some(Component::Prefix(prefix))
-            if matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
-    )
-}
-
-#[cfg(not(windows))]
-fn is_remote_path(_path: &Path) -> bool {
-    false
+pub(crate) fn recording_resource_unavailable() -> BrowserError {
+    BrowserError::RecordingResourceUnavailable
 }
 
 fn recording_storage_error(operation: &str) -> BrowserError {

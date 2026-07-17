@@ -217,6 +217,7 @@ pub enum BrowserError {
     UnsupportedRecipeVersion {
         version: u32,
     },
+    RecordingResourceUnavailable,
     Interrupted,
     Timeout {
         operation: String,
@@ -290,6 +291,9 @@ impl fmt::Display for BrowserError {
                     formatter,
                     "unsupported browser recipe schema version {version}"
                 )
+            }
+            Self::RecordingResourceUnavailable => {
+                formatter.write_str("browser recording review resource is unavailable")
             }
             Self::Interrupted => formatter.write_str("browser operation was interrupted"),
             Self::Timeout { operation } => {
