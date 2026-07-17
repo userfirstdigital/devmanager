@@ -49,7 +49,7 @@ use gpui::{
     WindowOptions,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -177,6 +177,7 @@ struct NativeShell {
     process_manager: ProcessManager,
     browser_gateway: Option<BrowserGatewayHandle>,
     browser_host: BrowserWebViewHost,
+    browser_app_config_dir: Option<std::path::PathBuf>,
     browser_bridge: BrowserCommandBridge,
     browser_inbox: Option<BrowserCommandInbox>,
     browser_tasks_started: bool,
@@ -661,9 +662,26 @@ fn build_remote_status_bar_state(
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
-        let browser_app_config_dir =
-            crate::persistence::app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let browser_host = BrowserWebViewHost::new(&browser_app_config_dir);
+        let (browser_host, browser_app_config_dir, browser_config_diagnostic) =
+            match crate::persistence::app_config_dir() {
+                Ok(app_config_dir) => {
+                    let browser_host = BrowserWebViewHost::new(&app_config_dir);
+                    let trusted_app_config_dir = browser_host
+                        .trusted_app_config_dir()
+                        .map(std::path::Path::to_path_buf);
+                    (browser_host, trusted_app_config_dir, None)
+                }
+                Err(error) => {
+                    let diagnostic = format!(
+                        "Browser configuration is unavailable; browser tools are disabled while AI terminals continue normally: {error}"
+                    );
+                    (
+                        BrowserWebViewHost::unavailable(diagnostic.clone()),
+                        None,
+                        Some(diagnostic),
+                    )
+                }
+            };
         let (browser_bridge, browser_inbox) = browser_command_channel(64);
         let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
@@ -676,6 +694,12 @@ impl NativeShell {
                 )),
             ),
         };
+        if let Some(diagnostic) = browser_config_diagnostic {
+            startup_notice = Some(match startup_notice {
+                Some(existing) => format!("{existing}\n{diagnostic}"),
+                None => diagnostic,
+            });
+        }
         pid_file::cleanup_orphaned_processes();
 
         let process_manager = ProcessManager::new();
@@ -685,24 +709,30 @@ impl NativeShell {
         let browser_gateway = if state.config.settings.browser_enabled
             && browser_host.status().available
         {
-            match BrowserGatewayHandle::start_with_app_config_dir(
-                browser_bridge.clone(),
-                &browser_app_config_dir,
-            ) {
-                Ok(gateway) => {
-                    process_manager.set_browser_gateway_registrar(Some(gateway.registrar()));
-                    Some(gateway)
+            match browser_app_config_dir.as_ref() {
+                Some(browser_app_config_dir) => {
+                    match BrowserGatewayHandle::start_with_app_config_dir(
+                        browser_bridge.clone(),
+                        browser_app_config_dir,
+                    ) {
+                        Ok(gateway) => {
+                            process_manager
+                                .set_browser_gateway_registrar(Some(gateway.registrar()));
+                            Some(gateway)
+                        }
+                        Err(error) => {
+                            let diagnostic = format!(
+                                    "Browser tools are unavailable; AI terminals will continue normally: {error}"
+                                );
+                            startup_notice = Some(match startup_notice {
+                                Some(existing) => format!("{existing}\n{diagnostic}"),
+                                None => diagnostic,
+                            });
+                            None
+                        }
+                    }
                 }
-                Err(error) => {
-                    let diagnostic = format!(
-                        "Browser tools are unavailable; AI terminals will continue normally: {error}"
-                    );
-                    startup_notice = Some(match startup_notice {
-                        Some(existing) => format!("{existing}\n{diagnostic}"),
-                        None => diagnostic,
-                    });
-                    None
-                }
+                None => None,
             }
         } else {
             None
@@ -853,6 +883,7 @@ impl NativeShell {
             process_manager,
             browser_gateway,
             browser_host,
+            browser_app_config_dir,
             browser_bridge,
             browser_inbox: Some(browser_inbox),
             browser_tasks_started: false,
@@ -974,8 +1005,14 @@ impl NativeShell {
         if self.browser_gateway.is_some() {
             return None;
         }
-        let browser_app_config_dir =
-            crate::persistence::app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let Some(browser_app_config_dir) = self.browser_app_config_dir.as_ref() else {
+            self.process_manager.set_browser_gateway_registrar(None);
+            self.browser_gateway = None;
+            return Some(
+                "Browser configuration is unavailable; browser tools are disabled while AI terminals continue normally"
+                    .to_string(),
+            );
+        };
         match BrowserGatewayHandle::start_with_app_config_dir(
             self.browser_bridge.clone(),
             browser_app_config_dir,
@@ -1019,9 +1056,31 @@ impl NativeShell {
                 message: "browser command route does not match an open AI conversation".to_string(),
             });
         }
-        let result = self
-            .browser_host
-            .handle_command(window, workspace_key, command.clone());
+        let open_workspaces = self.open_browser_workspace_keys();
+        let browser_host = &mut self.browser_host;
+        let result = self.browser_bridge.with_locked_host_controls_for_command(
+            workspace_key,
+            &command,
+            |controls, lifecycle_requests| {
+                for control in controls {
+                    browser_host.handle_control(control);
+                }
+                for request in lifecycle_requests {
+                    if open_workspaces
+                        .iter()
+                        .any(|open| open == request.workspace_key())
+                    {
+                        browser_host.handle_request(window, request);
+                    } else {
+                        request.respond(Err(BrowserError::CrashedView {
+                            message: "browser command route does not match an open AI conversation"
+                                .to_string(),
+                        }));
+                    }
+                }
+                browser_host.handle_command(window, workspace_key, command.clone())
+            },
+        );
         match &result {
             Ok(response) => self.synchronize_browser_response(workspace_key, &command, response),
             Err(error) => {
@@ -1103,9 +1162,12 @@ impl NativeShell {
     ) {
         let workspace_key = request.workspace_key().clone();
         let route_is_open = self.browser_route_is_open(&workspace_key);
-        if let Err(error) = route_browser_request(route_is_open, request, |request| {
-            self.browser_host.handle_request(window, request)
-        }) {
+        let route_result = self.with_browser_host_control_barrier(window, |browser_host| {
+            route_browser_request(route_is_open, request, |request| {
+                browser_host.handle_request(window, request)
+            })
+        });
+        if let Err(error) = route_result {
             self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(error.to_string());
         }
         self.sync_browser_host_visibility(Some(window));
@@ -1113,14 +1175,27 @@ impl NativeShell {
     }
 
     fn pump_browser_events(&mut self, window: &Window, cx: &mut Context<Self>) {
-        self.browser_host.pump_async_completions(window);
-        let events = self.browser_host.drain_events();
+        let browser_bridge = self.browser_bridge.clone();
+        let events = self.with_browser_host_control_barrier(window, |browser_host| {
+            let mut events = browser_host.drain_events();
+            for event in &events {
+                browser_bridge.observe_host_event(event);
+            }
+            browser_host.pump_async_completions(window);
+            let completion_events = browser_host.drain_events();
+            for event in &completion_events {
+                browser_bridge.observe_host_event(event);
+            }
+            events.extend(completion_events);
+            events
+        });
         if events.is_empty() {
             return;
         }
+        let mut events = VecDeque::from(events);
         let open_workspaces = self.open_browser_workspace_keys();
         let mut persist = false;
-        for event in events {
+        while let Some(event) = events.pop_front() {
             let Some(plan) = browser_event_plan(&open_workspaces, &event) else {
                 continue;
             };
@@ -1131,9 +1206,7 @@ impl NativeShell {
                     loading,
                     ..
                 } => {
-                    if interrupt_agent {
-                        self.browser_bridge.observe_host_event(&event);
-                    }
+                    let _ = interrupt_agent;
                     if let Some(loading) = loading {
                         self.browser_ui
                             .entry(workspace_key.clone())
@@ -1179,6 +1252,16 @@ impl NativeShell {
                     tab_id,
                     request,
                 } => {
+                    let pending = self.with_browser_host_control_barrier(window, |browser_host| {
+                        browser_host.is_pending_approval(
+                            &workspace_key,
+                            &tab_id,
+                            &request.operation_id,
+                        )
+                    });
+                    if !pending {
+                        continue;
+                    }
                     let description = format!(
                         "Actor: {:?}\nIntent: {}\nRisk: {:?}\nAction: {}\nOrigin: {}",
                         request.actor,
@@ -1195,13 +1278,24 @@ impl NativeShell {
                         .set_buttons(MessageButtons::YesNo)
                         .show()
                         == MessageDialogResult::Yes;
-                    match self.browser_host.resolve_approval(
-                        window,
-                        &workspace_key,
-                        &tab_id,
-                        &request.operation_id,
-                        approved,
-                    ) {
+                    let browser_bridge = self.browser_bridge.clone();
+                    let (post_dialog_events, resolution) =
+                        self.with_browser_host_control_barrier(window, |browser_host| {
+                            let events = browser_host.drain_events();
+                            for event in &events {
+                                browser_bridge.observe_host_event(event);
+                            }
+                            let resolution = browser_host.resolve_approval(
+                                window,
+                                &workspace_key,
+                                &tab_id,
+                                &request.operation_id,
+                                approved,
+                            );
+                            (events, resolution)
+                        });
+                    events.extend(post_dialog_events);
+                    match resolution {
                         Ok(()) => {
                             self.browser_ui
                                 .entry(workspace_key)
@@ -1225,6 +1319,35 @@ impl NativeShell {
         }
         self.sync_browser_host_visibility(Some(window));
         cx.notify();
+    }
+
+    fn with_browser_host_control_barrier<R>(
+        &mut self,
+        window: &Window,
+        enter_host: impl FnOnce(&mut BrowserWebViewHost) -> R,
+    ) -> R {
+        let open_workspaces = self.open_browser_workspace_keys();
+        let browser_host = &mut self.browser_host;
+        self.browser_bridge
+            .with_locked_host_work(|controls, lifecycle_requests| {
+                for control in controls {
+                    browser_host.handle_control(control);
+                }
+                for request in lifecycle_requests {
+                    if open_workspaces
+                        .iter()
+                        .any(|open| open == request.workspace_key())
+                    {
+                        browser_host.handle_request(window, request);
+                    } else {
+                        request.respond(Err(BrowserError::CrashedView {
+                            message: "browser command route does not match an open AI conversation"
+                                .to_string(),
+                        }));
+                    }
+                }
+                enter_host(browser_host)
+            })
     }
 
     fn browser_pane_context(&self) -> BrowserPaneContext {
@@ -1464,16 +1587,6 @@ impl NativeShell {
 
         let mut failed = None;
         for command in plan.commands {
-            if let BrowserCommand::Stop { tab_id } = &command {
-                let controller = self
-                    .browser_bridge
-                    .bind(plan.workspace_key.clone(), Duration::from_secs(30));
-                if let Some(tab_id) = tab_id {
-                    controller.interrupt_tab(tab_id);
-                } else {
-                    controller.interrupt_workspace();
-                }
-            }
             match self.dispatch_browser_command(&plan.workspace_key, command, window) {
                 Ok(BrowserResponse::DownloadDirectory { path }) => {
                     if let Err(error) = platform_service::open_path(&path) {
@@ -1497,7 +1610,6 @@ impl NativeShell {
                 self.state
                     .update_browser_workspace(&plan.workspace_key.ai_tab_id, |snapshot| {
                         snapshot.pane_open = pane_open;
-                        snapshot.advance_revision();
                     });
                 self.save_session_state();
             }

@@ -830,6 +830,11 @@ impl ServerHandler for BrowserMcpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
+        let lease_ticket = self
+            .context
+            .controller
+            .capture_registration_lease_ticket()
+            .map_err(|_| ErrorData::resource_not_found("resource store unavailable", None))?;
         let owner = self.context.controller.workspace_key();
         let resources = self
             .context
@@ -843,6 +848,16 @@ impl ServerHandler for BrowserMcpServer {
                     .with_size(handle.byte_size)
             })
             .collect();
+        if !self
+            .context
+            .controller
+            .registration_lease_is_current(lease_ticket)
+        {
+            return Err(ErrorData::resource_not_found(
+                "resource store unavailable",
+                None,
+            ));
+        }
         Ok(ListResourcesResult::with_all_items(resources))
     }
 
@@ -851,6 +866,11 @@ impl ServerHandler for BrowserMcpServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
+        let lease_ticket = self
+            .context
+            .controller
+            .capture_registration_lease_ticket()
+            .map_err(|_| ErrorData::resource_not_found("resource not found", None))?;
         let id = resource_id_from_uri(&request.uri)
             .map_err(|_| ErrorData::resource_not_found("resource not found", None))?;
         let resource = self
@@ -866,6 +886,13 @@ impl ServerHandler for BrowserMcpServer {
             let blob = base64::engine::general_purpose::STANDARD.encode(resource.bytes);
             ResourceContents::blob(blob, request.uri).with_mime_type(resource.metadata.mime_type)
         };
+        if !self
+            .context
+            .controller
+            .registration_lease_is_current(lease_ticket)
+        {
+            return Err(ErrorData::resource_not_found("resource not found", None));
+        }
         Ok(ReadResourceResult::new(vec![contents]))
     }
 }

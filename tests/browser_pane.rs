@@ -140,6 +140,25 @@ fn native_shell_awaits_browser_commands_in_a_window_local_main_thread_task() {
 }
 
 #[test]
+fn native_browser_storage_never_treats_the_process_cwd_as_trusted_config() {
+    let source = include_str!("../src/app/mod.rs");
+    assert!(!source.contains(
+        "crate::persistence::app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from(\".\"))"
+    ));
+    assert!(source.contains("BrowserWebViewHost::unavailable"));
+    assert!(source.contains("Browser configuration is unavailable"));
+    assert!(source.contains("browser_app_config_dir: Option<std::path::PathBuf>"));
+    let reconcile = source.find("fn reconcile_browser_gateway").unwrap();
+    let reconcile_end = source[reconcile..]
+        .find("fn open_browser_workspace_keys")
+        .unwrap()
+        + reconcile;
+    let reconcile = &source[reconcile..reconcile_end];
+    assert!(reconcile.contains("self.browser_app_config_dir.as_ref()"));
+    assert!(!reconcile.contains("persistence::app_config_dir()"));
+}
+
+#[test]
 fn native_shell_routes_mcp_requests_through_the_async_host_queue() {
     let source = include_str!("../src/app/mod.rs");
     let start = source
@@ -153,11 +172,12 @@ fn native_shell_routes_mcp_requests_through_the_async_host_queue() {
 
     assert!(handler.contains("route_browser_request("));
     assert!(handler.contains("browser_host.handle_request(window, request)"));
+    assert!(handler.contains("with_browser_host_control_barrier"));
     assert!(!handler.contains("dispatch_browser_command"));
 }
 
 #[test]
-fn native_shell_pumps_async_browser_completions_before_host_events() {
+fn native_shell_applies_host_input_before_async_browser_completions() {
     let source = include_str!("../src/app/mod.rs");
     let pump = source
         .find("fn pump_browser_events")
@@ -166,11 +186,118 @@ fn native_shell_pumps_async_browser_completions_before_host_events() {
     let completions = body
         .find("browser_host.pump_async_completions(window)")
         .expect("the GPUI pump should drain async WebView2 completions");
-    let events = body
+    let events_before = body
         .find("browser_host.drain_events()")
         .expect("the GPUI pump should drain host events");
+    let events_after = body
+        .rfind("browser_host.drain_events()")
+        .expect("the GPUI pump should also drain completion-generated events");
 
-    assert!(completions < events);
+    assert!(events_before < completions);
+    assert!(completions < events_after);
+    assert!(body[events_before..completions].contains("observe_host_event"));
+}
+
+#[test]
+fn native_shell_drains_priority_host_controls_before_async_completions() {
+    let source = include_str!("../src/app/mod.rs");
+    let pump = source.find("fn pump_browser_events").unwrap();
+    let body = &source[pump..];
+    let controls = body
+        .find("with_browser_host_control_barrier")
+        .expect("host-control barrier must cover the GPUI pump");
+    let completions = body
+        .find("browser_host.pump_async_completions(window)")
+        .expect("async completions remain on the GPUI pump");
+    assert!(controls < completions);
+}
+
+#[test]
+fn synchronous_ui_commands_enter_the_host_inside_the_control_barrier() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source.find("fn dispatch_browser_command").unwrap();
+    let end = source[start..]
+        .find("fn synchronize_browser_response")
+        .unwrap()
+        + start;
+    let dispatch = &source[start..end];
+    let barrier = dispatch
+        .find("with_locked_host_controls_for_command")
+        .unwrap();
+    let host_entry = dispatch.find("browser_host.handle_command").unwrap();
+    assert!(barrier < host_entry);
+}
+
+#[test]
+fn synchronous_ui_lifecycle_commands_do_not_leave_duplicate_deferred_controls() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source.find("fn apply_browser_pane_action").unwrap();
+    let end = source[start..]
+        .find("fn apply_browser_settings_action")
+        .unwrap()
+        + start;
+    let handler = &source[start..end];
+
+    assert!(handler.contains("dispatch_browser_command"));
+    assert!(!handler.contains("controller.interrupt_tab"));
+    assert!(!handler.contains("controller.interrupt_workspace"));
+    assert!(!handler.contains("snapshot.advance_revision()"));
+}
+
+#[test]
+fn native_approval_rechecks_priority_work_and_user_input_after_dialog_before_resume() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source
+        .find("BrowserPaneEventPlan::ConfirmApproval")
+        .unwrap();
+    let body = &source[start..];
+    let dialog = body.find(".show()").unwrap();
+    let barrier = body[dialog..]
+        .find("with_browser_host_control_barrier")
+        .map(|offset| dialog + offset)
+        .expect("priority lifecycle work received during the dialog must be applied");
+    let input = body[barrier..]
+        .find("browser_host.drain_events()")
+        .map(|offset| barrier + offset)
+        .expect("trusted user input received during the dialog must cancel host work");
+    let observe = body[input..]
+        .find("browser_bridge.observe_host_event(event)")
+        .map(|offset| input + offset)
+        .unwrap();
+    let resume = body.find("browser_host.resolve_approval(").unwrap();
+    let resolution_match = body[resume..]
+        .find("match resolution")
+        .map(|offset| resume + offset)
+        .unwrap();
+    let atomic_post_dialog = &body[dialog..resolution_match];
+
+    assert!(dialog < barrier);
+    assert!(barrier < input);
+    assert!(input < observe);
+    assert!(observe < resume);
+    assert_eq!(
+        atomic_post_dialog
+            .matches("with_browser_host_control_barrier")
+            .count(),
+        1,
+        "trusted input publication must not fit between event observation and approval resolution"
+    );
+    assert!(!body[observe..resume].contains("events.extend("));
+}
+
+#[test]
+fn canceled_buffered_approval_is_filtered_before_the_native_dialog() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source
+        .find("BrowserPaneEventPlan::ConfirmApproval")
+        .unwrap();
+    let body = &source[start..];
+    let pending = body
+        .find("browser_host.is_pending_approval(")
+        .expect("stale buffered approvals must be validated against live host state");
+    let dialog = body.find("MessageDialog::new()").unwrap();
+    assert!(pending < dialog);
+    assert!(body[..pending].contains("with_browser_host_control_barrier"));
 }
 
 #[test]
@@ -269,11 +396,11 @@ fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
         )
         .pane_open
     );
-    assert!(opened.revision.0 > initial.revision.0);
+    assert_eq!(opened.revision, initial.revision);
 
     let collapsed = host.set_pane_open(&key, false).unwrap();
     assert!(!collapsed.snapshot.pane_open);
-    assert!(collapsed.revision.0 > opened.revision.0);
+    assert_eq!(collapsed.revision, opened.revision);
 
     let actions = [
         BrowserPaneAction::Open,

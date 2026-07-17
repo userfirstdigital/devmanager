@@ -1,7 +1,9 @@
+use super::commands::BrowserRegistrationLeaseTicket;
+use super::downloads::{verified_app_config_root, verify_prepared_storage_root};
 use super::mcp::BrowserMcpServer;
 use super::{
-    BrowserCommandBridge, BrowserProviderAccess, BrowserResourceLimits, BrowserResourceStore,
-    BrowserStorageLayout, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserCommandBridge, BrowserProviderAccess, BrowserRegistrationLease, BrowserResourceLimits,
+    BrowserResourceStore, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use axum::body::Body;
 use axum::extract::State;
@@ -31,6 +33,13 @@ struct ActiveRegistration {
     process_session_id: String,
     workspace_key: BrowserWorkspaceKey,
     service: RegistrationService,
+    lease: BrowserRegistrationLease,
+}
+
+struct RegistrationDispatchSnapshot {
+    service: RegistrationService,
+    lease: BrowserRegistrationLease,
+    ticket: BrowserRegistrationLeaseTicket,
 }
 
 #[derive(Default)]
@@ -142,6 +151,8 @@ impl BrowserGatewayHandle {
     where
         F: FnOnce() -> Result<tokio::runtime::Runtime, String> + Send + 'static,
     {
+        let app_config_dir = verified_app_config_root(&app_config_dir)
+            .map_err(|error| format!("verify browser gateway storage root: {error}"))?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("bind DevManager browser MCP gateway: {error}"))?;
         listener
@@ -319,13 +330,17 @@ impl BrowserGatewayRegistrar {
             .map_err(|error| format!("canonicalize browser project root: {error}"))?;
         let token = generate_token()?;
         let access = BrowserProviderAccess::new(self.inner.endpoint.clone(), token.clone())?;
-        let controller = self
-            .inner
-            .bridge
-            .bind(workspace_key.clone(), Duration::from_secs(30));
-        let resource_store = BrowserResourceStore::open(
-            BrowserStorageLayout::new(&self.inner.app_config_dir, &workspace_key.project_id)
-                .resources_dir,
+        let lease = BrowserRegistrationLease::new();
+        let controller = self.inner.bridge.bind_with_registration_lease(
+            workspace_key.clone(),
+            Duration::from_secs(30),
+            Some(lease.clone()),
+        );
+        verify_prepared_storage_root(&self.inner.app_config_dir, &self.inner.app_config_dir)
+            .map_err(|error| format!("revalidate browser gateway storage root: {error}"))?;
+        let resource_store = BrowserResourceStore::open_verified(
+            &self.inner.app_config_dir,
+            &workspace_key.project_id,
             BrowserResourceLimits::default(),
         )
         .map_err(|error| format!("open DevManager browser resource store: {error}"))?;
@@ -344,6 +359,7 @@ impl BrowserGatewayRegistrar {
             process_session_id: process_session_id.clone(),
             workspace_key: workspace_key.clone(),
             service,
+            lease,
         };
         before_store();
         let mut registrations = lock(&self.inner.registrations);
@@ -352,10 +368,19 @@ impl BrowserGatewayRegistrar {
         }
         if let Some(old_token) = registrations
             .token_by_process
-            .insert(process_session_id.clone(), token.clone())
+            .get(&process_session_id)
+            .cloned()
         {
+            if let Some(old_registration) = registrations.by_token.get(&old_token) {
+                self.inner
+                    .bridge
+                    .revoke_registration(&old_registration.workspace_key, &old_registration.lease);
+            }
             registrations.by_token.remove(&old_token);
         }
+        registrations
+            .token_by_process
+            .insert(process_session_id.clone(), token.clone());
         registrations.by_token.insert(token, active);
         Ok(BrowserGatewayRegistration {
             process_session_id,
@@ -374,9 +399,11 @@ impl BrowserGatewayRegistrar {
         if !matches {
             return false;
         }
-        self.inner
-            .bridge
-            .interrupt_workspace(&registration.workspace_key);
+        if let Some(active) = registrations.by_token.get(token) {
+            self.inner
+                .bridge
+                .revoke_registration(&active.workspace_key, &active.lease);
+        }
         registrations.by_token.remove(token);
         if registrations
             .token_by_process
@@ -392,13 +419,26 @@ impl BrowserGatewayRegistrar {
 
     pub fn revoke_process(&self, process_session_id: &str) -> bool {
         let mut registrations = lock(&self.inner.registrations);
-        let Some(token) = registrations.token_by_process.remove(process_session_id) else {
+        let Some(token) = registrations
+            .token_by_process
+            .get(process_session_id)
+            .cloned()
+        else {
             return false;
         };
+        let Some((workspace_key, lease)) = registrations
+            .by_token
+            .get(&token)
+            .map(|active| (active.workspace_key.clone(), active.lease.clone()))
+        else {
+            registrations.token_by_process.remove(process_session_id);
+            return false;
+        };
+        self.inner
+            .bridge
+            .revoke_registration(&workspace_key, &lease);
+        registrations.token_by_process.remove(process_session_id);
         let removed = registrations.by_token.remove(&token);
-        if let Some(active) = &removed {
-            self.inner.bridge.interrupt_workspace(&active.workspace_key);
-        }
         removed.is_some()
     }
 
@@ -407,7 +447,7 @@ impl BrowserGatewayRegistrar {
         for registration in registrations.by_token.values() {
             self.inner
                 .bridge
-                .interrupt_workspace(&registration.workspace_key);
+                .revoke_registration(&registration.workspace_key, &registration.lease);
         }
         registrations.by_token.clear();
         registrations.token_by_process.clear();
@@ -428,7 +468,7 @@ fn stop_and_clear_registrations(inner: &BrowserGatewayInner) {
     for registration in registrations.by_token.values() {
         inner
             .bridge
-            .interrupt_workspace(&registration.workspace_key);
+            .revoke_registration(&registration.workspace_key, &registration.lease);
     }
     registrations.by_token.clear();
     registrations.token_by_process.clear();
@@ -451,20 +491,46 @@ async fn dispatch_mcp(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let service = {
-        let registrations = lock(&inner.registrations);
-        registrations
-            .by_token
-            .get(token)
-            .map(|registration| registration.service.clone())
-    };
-    let Some(mut service) = service else {
+    let Some(snapshot) = registration_dispatch_snapshot(&inner, token) else {
         return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
     };
-    match service.call(request).await {
+    dispatch_registration(snapshot, request).await
+}
+
+fn registration_dispatch_snapshot(
+    inner: &BrowserGatewayInner,
+    token: &str,
+) -> Option<RegistrationDispatchSnapshot> {
+    let registrations = lock(&inner.registrations);
+    let registration = registrations.by_token.get(token)?;
+    let (ticket, _cancellation) = registration.lease.capture().ok()?;
+    Some(RegistrationDispatchSnapshot {
+        service: registration.service.clone(),
+        lease: registration.lease.clone(),
+        ticket,
+    })
+}
+
+async fn dispatch_registration(
+    snapshot: RegistrationDispatchSnapshot,
+    request: Request<Body>,
+) -> Response<Body> {
+    let RegistrationDispatchSnapshot {
+        mut service,
+        lease,
+        ticket,
+    } = snapshot;
+    if !lease.is_current(ticket) {
+        return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let response = match service.call(request).await {
         Ok(response) => response.map(Body::new),
         Err(never) => match never {},
+    };
+    if !lease.is_current(ticket) {
+        return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    response
 }
 
 fn validate_host(request: &Request<Body>, port: u16) -> Result<(), Response<Body>> {
@@ -531,7 +597,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::browser_command_channel;
+    use crate::browser::{browser_command_channel, BrowserCommand, BrowserError};
 
     #[test]
     fn start_waits_for_thread_runtime_failure_before_returning() {
@@ -570,5 +636,76 @@ mod tests {
             .expect_err("shutdown must fence a registration that has not reached the store")
             .contains("not running"));
         assert_eq!(registrar.active_registration_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_initialize_snapshot_cannot_dispatch_after_revocation() {
+        let (bridge, _inbox) = browser_command_channel(1);
+        let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+        let registrar = gateway.registrar();
+        let registration = registrar
+            .register(
+                "lease-race-process",
+                BrowserWorkspaceKey::new("project", "conversation").unwrap(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .expect("register lease race fixture");
+        let token = registration.access().bearer_token_for_launch();
+        let snapshot = registration_dispatch_snapshot(&gateway.inner, token)
+            .expect("capture authenticated dispatch snapshot");
+
+        assert!(registrar.revoke(&registration));
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"lease-race","version":"1"}}}"#,
+            ))
+            .unwrap();
+        let response = dispatch_registration(snapshot, request).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn revoked_old_controller_stop_cannot_interrupt_replacement_registration_work() {
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let workspace_key = BrowserWorkspaceKey::new("project", "conversation").unwrap();
+        let old_lease = BrowserRegistrationLease::new();
+        let old_controller = bridge.bind_with_registration_lease(
+            workspace_key.clone(),
+            Duration::from_secs(1),
+            Some(old_lease.clone()),
+        );
+
+        bridge.revoke_registration(&workspace_key, &old_lease);
+        assert_eq!(bridge.drain_host_controls().len(), 1);
+
+        let replacement_controller = bridge.bind_with_registration_lease(
+            workspace_key,
+            Duration::from_secs(1),
+            Some(BrowserRegistrationLease::new()),
+        );
+        replacement_controller
+            .notify(BrowserCommand::Status)
+            .await
+            .expect("queue replacement registration work");
+        let replacement_request = inbox.recv().await.expect("replacement request");
+        assert!(replacement_request.cancellation_is_current());
+
+        assert!(matches!(
+            old_controller
+                .notify(BrowserCommand::Stop { tab_id: None })
+                .await,
+            Err(BrowserError::Interrupted)
+        ));
+        assert!(
+            replacement_request.cancellation_is_current(),
+            "a revoked controller must not advance shared cancellation epochs"
+        );
+        let (_controls, lifecycle_requests) =
+            bridge.with_locked_host_work(|controls, requests| (controls, requests));
+        assert!(lifecycle_requests.is_empty());
     }
 }

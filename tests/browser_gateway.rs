@@ -1,12 +1,13 @@
 use base64::Engine as _;
 use devmanager::browser::{
     browser_command_channel, BrowserActionResult, BrowserCommand, BrowserCommandInbox,
-    BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostState,
-    BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext, BrowserNetworkEntry,
-    BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
-    BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult,
-    BrowserViewport, BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostControl,
+    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
+    BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserResourceId,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
+    BrowserRevision, BrowserRisk, BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserUploadResult, BrowserViewport, BrowserWaitResult, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -14,9 +15,11 @@ use rmcp::transport::{
 };
 use rmcp::ServiceExt as _;
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +31,34 @@ fn unique_gateway_config_dir(label: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn create_directory_redirect(target: &std::path::Path, link: &std::path::Path) {
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "create directory junction");
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_directory_redirect(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(target_os = "windows")]
+fn remove_directory_redirect(link: &std::path::Path) {
+    std::fs::remove_dir(link).unwrap();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn remove_directory_redirect(link: &std::path::Path) {
+    std::fs::remove_file(link).unwrap();
 }
 
 fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
@@ -129,7 +160,26 @@ async fn run_fake_host_with_state(
     commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>>,
     host: Arc<Mutex<BrowserHostState>>,
 ) {
-    while let Some(request) = inbox.recv().await {
+    let mut priority_requests = VecDeque::new();
+    let mut ordinary_request = None;
+    let mut inbox_closed = false;
+    loop {
+        let queued = inbox.with_locked_host_work(|_controls, requests| requests);
+        priority_requests.extend(queued);
+        let request = if let Some(request) = priority_requests.pop_front() {
+            request
+        } else if let Some(request) = ordinary_request.take() {
+            request
+        } else if inbox_closed {
+            break;
+        } else {
+            match tokio::time::timeout(Duration::from_millis(5), inbox.recv()).await {
+                Ok(Some(request)) => ordinary_request = Some(request),
+                Ok(None) => inbox_closed = true,
+                Err(_) => {}
+            }
+            continue;
+        };
         let key = request.workspace_key().clone();
         let command = request.command().clone();
         commands
@@ -288,12 +338,13 @@ async fn run_fake_host_with_state(
 #[test]
 fn token_is_256_bits_rotates_on_replacement_and_stale_auth_is_rejected() {
     let (bridge, _inbox) = browser_command_channel(8);
-    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let gateway = BrowserGatewayHandle::start(bridge.clone()).expect("start gateway");
     let registrar = gateway.registrar();
+    let old_workspace = workspace("project-a", "conversation-a");
     let first = registrar
         .register(
             "ai-process-a",
-            workspace("project-a", "conversation-a"),
+            old_workspace.clone(),
             BrowserWorkspaceSnapshot::default(),
         )
         .expect("register first token");
@@ -306,13 +357,19 @@ fn token_is_256_bits_rotates_on_replacement_and_stale_auth_is_rejected() {
     let replacement = registrar
         .register(
             "ai-process-a",
-            workspace("project-a", "conversation-a"),
+            workspace("project-b", "conversation-b"),
             BrowserWorkspaceSnapshot::default(),
         )
         .expect("register replacement token");
     assert_ne!(
         first.access().bearer_token_for_launch(),
         replacement.access().bearer_token_for_launch()
+    );
+    assert_eq!(
+        bridge.drain_host_controls(),
+        vec![BrowserHostControl::InterruptWorkspace {
+            workspace_key: old_workspace,
+        }]
     );
 
     let host = format!("127.0.0.1:{}", gateway.port());
@@ -341,6 +398,83 @@ fn token_is_256_bits_rotates_on_replacement_and_stale_auth_is_rejected() {
     assert_eq!(status_code(&current), 200, "{current}");
     assert_eq!(registrar.active_registration_count(), 1);
     assert!(!format!("{registrar:?}").contains(replacement.access().bearer_token_for_launch()));
+}
+
+#[test]
+fn authenticated_dispatch_snapshots_and_rechecks_the_registration_lease() {
+    let source = include_str!("../src/browser/gateway.rs");
+    let dispatch_start = source.find("async fn dispatch_mcp(").unwrap();
+    let snapshot_start = source.find("fn registration_dispatch_snapshot(").unwrap();
+    let guarded_start = source.find("async fn dispatch_registration(").unwrap();
+    let end = source[guarded_start..].find("fn validate_host(").unwrap() + guarded_start;
+    let dispatch = &source[dispatch_start..snapshot_start];
+    let snapshot = &source[snapshot_start..guarded_start];
+    let guarded = &source[guarded_start..end];
+    let capture = snapshot.find("registration.lease.capture()").unwrap();
+    let clone = snapshot.find("registration.service.clone()").unwrap();
+    let first_current = guarded.find("lease.is_current(ticket)").unwrap();
+    let call = guarded.find("service.call(request).await").unwrap();
+    let second_current = guarded[call..]
+        .find("lease.is_current(ticket)")
+        .map(|offset| call + offset)
+        .unwrap();
+
+    assert!(dispatch.contains("registration_dispatch_snapshot(&inner, token)"));
+    assert!(dispatch.contains("dispatch_registration(snapshot, request).await"));
+    assert!(capture < clone);
+    assert!(first_current < call);
+    assert!(call < second_current);
+}
+
+#[test]
+fn gateway_revocation_publishes_priority_host_cancellation() {
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge.clone()).expect("start gateway");
+    let key = workspace("project-revoke", "conversation-revoke");
+    let registration = gateway
+        .registrar()
+        .register(
+            "revoked-process",
+            key.clone(),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register revocation fixture");
+
+    assert!(gateway.registrar().revoke(&registration));
+    assert_eq!(
+        bridge.drain_host_controls(),
+        vec![BrowserHostControl::InterruptWorkspace { workspace_key: key }]
+    );
+}
+
+#[test]
+fn gateway_registration_rejects_post_start_trust_root_swap_without_outside_writes() {
+    let config = unique_gateway_config_dir("root-swap");
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start_with_app_config_dir(bridge, &config)
+        .expect("start gateway with retained trust root");
+    let parked = config.with_extension("parked");
+    std::fs::rename(&config, &parked).unwrap();
+    let outside = config.with_extension("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    create_directory_redirect(&outside, &config);
+
+    let error = gateway
+        .registrar()
+        .register(
+            "swapped-process",
+            workspace("project-swap", "conversation-swap"),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect_err("swapped trust root must be rejected");
+    assert!(error.contains("storage root") || error.contains("OutsideWorkspace"));
+    assert!(!outside.join("browser").exists());
+
+    remove_directory_redirect(&config);
+    std::fs::rename(&parked, &config).unwrap();
+    drop(gateway);
+    let _ = std::fs::remove_dir_all(&config);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 #[test]

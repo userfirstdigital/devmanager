@@ -23,9 +23,36 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     list.push(value);
     while (list.length > maximum) list.shift();
   };
-  const redact = (value) => String(value ?? "")
-    .replace(/((?:authorization|cookie|password|passwd|token|secret|api[_-]?key)\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
-    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+/gi, `Bearer ${REDACTED}`)
+  const SECRET_KEY_SUFFIXES = ["token", "secret", "cookie"];
+  const SECRET_KEY_PREFIXES = ["authorization", "password", "passwd"];
+  const secretKey = (key) => {
+    const normalized = String(key).replace(/[^a-z0-9]/gi, "").toLowerCase();
+    return ["apikey", "privatekey"].includes(normalized) ||
+      SECRET_KEY_SUFFIXES.some((suffix) => normalized === suffix || normalized.endsWith(suffix)) ||
+      SECRET_KEY_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(prefix));
+  };
+  const redactStructured = (value) => {
+    const text = String(value ?? "");
+    if (!/^[\s]*[\[{]/.test(text)) return text;
+    try {
+      const visit = (current) => {
+        if (Array.isArray(current)) return current.map(visit);
+        if (!current || typeof current !== "object") return current;
+        return Object.fromEntries(Object.entries(current).map(([key, nested]) =>
+          [key, secretKey(key) ? REDACTED : visit(nested)]
+        ));
+      };
+      return JSON.stringify(visit(JSON.parse(text)));
+    } catch (_) {
+      return text;
+    }
+  };
+  const redact = (value) => redactStructured(value)
+    .replace(/\bBasic\s+[A-Za-z0-9._~+\/=\-]+/gi, `Basic ${REDACTED}`)
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/=\-]+/gi, `Bearer ${REDACTED}`)
+    .replace(/("([^"\\]*(?:\\.[^"\\]*)*)"\s*:\s*")((?:\\.|[^"\\])*)(")/g,
+      (match, prefix, key, _secret, suffix) => secretKey(key) ? `${prefix}${REDACTED}${suffix}` : match)
+    .replace(/((?:[a-z0-9_-]*(?:token|secret|cookie)|(?:authorization|password|passwd)[a-z0-9_-]*|(?:api|private)[_-]?key)\s*[:=]\s*)([^\s,;]+)/gi, `$1${REDACTED}`)
     .slice(0, 4000);
   const safeUrl = (value) => {
     try {
@@ -75,9 +102,9 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
         sequence: ++state.sequence,
         level,
         message: redact(args.map((arg) => {
-          try { return typeof arg === "string" ? arg : JSON.stringify(arg); }
-          catch (_) { return String(arg); }
-        }).join(" ")),
+          try { return redact(typeof arg === "string" ? arg : JSON.stringify(arg)); }
+          catch (_) { return redact(String(arg)); }
+        }).join(" ")).slice(0, 4000),
         timestampMs: Date.now(),
       }, MAX_CONSOLE);
       return original(...args);
@@ -207,15 +234,20 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
     return redact(explicit?.innerText || element.closest?.("label")?.innerText || "").slice(0, 1000) || null;
   };
-  const nameOf = (element) => redact(
-    element.getAttribute?.("aria-label") ||
-    element.getAttribute?.("alt") ||
-    element.getAttribute?.("title") ||
-    labelOf(element) ||
-    element.innerText ||
-    element.getAttribute?.("value") ||
-    ""
-  ).trim().slice(0, 1000) || null;
+  const isPasswordElement = (element) =>
+    String(element?.getAttribute?.("type") || "").toLowerCase() === "password";
+  const nameOf = (element) => {
+    const valueFallback = isPasswordElement(element) ? "" : element.getAttribute?.("value");
+    return redact(
+      element.getAttribute?.("aria-label") ||
+      element.getAttribute?.("alt") ||
+      element.getAttribute?.("title") ||
+      labelOf(element) ||
+      element.innerText ||
+      valueFallback ||
+      ""
+    ).trim().slice(0, 1000) || null;
+  };
   const isVisible = (element) => {
     if (!(element instanceof Element)) return false;
     const bounds = element.getBoundingClientRect();
@@ -323,7 +355,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       return [...document.querySelectorAll(useful)].filter(isVisible).slice(0, 2000).map((element) => {
         const bounds = element.getBoundingClientRect();
         const inputType = element.getAttribute?.("type");
-        const password = String(inputType || "").toLowerCase() === "password";
+        const password = isPasswordElement(element);
         const value = "value" in element ? (password ? REDACTED : redact(element.value)) : null;
         return {
           role: roleOf(element),
@@ -341,8 +373,13 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
         };
       });
     },
-    inspectTargets: (actions) => actions.map((action) => {
-      const element = resolveTarget(action.target || action.source);
+    inspectTargets: (actions) => actions.flatMap((action) => {
+      const elements = action.operation === "dragDrop"
+        ? [resolveTarget(action.source), resolveTarget(action.destination)]
+        : action.operation === "keypress" && !action.target
+          ? [document.activeElement]
+          : [resolveTarget(action.target || action.source)];
+      return elements.map((element) => {
       const form = element?.closest?.("form");
       return {
         originUrl: location.origin,
@@ -352,6 +389,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
         formAction: form?.action ? safeUrl(form.action) : null,
         permission: null,
       };
+      });
     }),
     act: (actions) => {
       let completedActions = 0;

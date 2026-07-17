@@ -86,6 +86,7 @@ pub struct BrowserResource {
 #[derive(Debug)]
 struct BrowserResourceStoreInner {
     root: PathBuf,
+    trusted_root: Option<PathBuf>,
     limits: BrowserResourceLimits,
     gate: Mutex<()>,
     last_created_at: AtomicU64,
@@ -125,6 +126,32 @@ impl BrowserResourceStore {
         Ok(Self {
             inner: Arc::new(BrowserResourceStoreInner {
                 root,
+                trusted_root: None,
+                limits,
+                gate: Mutex::new(()),
+                last_created_at: AtomicU64::new(max_created),
+            }),
+        })
+    }
+
+    pub fn open_verified(
+        app_config_dir: impl AsRef<Path>,
+        project_id: impl AsRef<str>,
+        limits: BrowserResourceLimits,
+    ) -> Result<Self, BrowserError> {
+        let (trusted_root, root) = super::downloads::prepare_verified_resource_root(
+            app_config_dir.as_ref(),
+            project_id.as_ref(),
+        )?;
+        let max_created = scan_metadata(&root)
+            .into_iter()
+            .map(|metadata| metadata.created_at_epoch_ms)
+            .max()
+            .unwrap_or_default();
+        Ok(Self {
+            inner: Arc::new(BrowserResourceStoreInner {
+                root,
+                trusted_root: Some(trusted_root),
                 limits,
                 gate: Mutex::new(()),
                 last_created_at: AtomicU64::new(max_created),
@@ -159,6 +186,7 @@ impl BrowserResourceStore {
             });
         }
         let _gate = lock(&self.inner.gate);
+        self.verify_root()?;
         let id = generate_resource_id()?;
         let created_at_epoch_ms = self.next_created_at();
         let metadata = BrowserResourceMetadata {
@@ -192,6 +220,7 @@ impl BrowserResourceStore {
         owner: &BrowserWorkspaceKey,
     ) -> Result<Vec<BrowserResourceHandle>, BrowserError> {
         let _gate = lock(&self.inner.gate);
+        self.verify_root()?;
         let mut resources: Vec<_> = scan_metadata(&self.inner.root)
             .into_iter()
             .filter(|metadata| &metadata.owner == owner)
@@ -214,6 +243,7 @@ impl BrowserResourceStore {
     ) -> Result<BrowserResource, BrowserError> {
         validate_resource_id(id)?;
         let _gate = lock(&self.inner.gate);
+        self.verify_root()?;
         let metadata_path = metadata_path(&self.inner.root, id)?;
         if !is_direct_regular_file(&self.inner.root, &metadata_path) {
             return Err(BrowserError::MissingResource { id: id.clone() });
@@ -240,6 +270,13 @@ impl BrowserResourceStore {
             return Err(BrowserError::MissingResource { id: id.clone() });
         }
         Ok(BrowserResource { metadata, bytes })
+    }
+
+    fn verify_root(&self) -> Result<(), BrowserError> {
+        if let Some(trusted_root) = &self.inner.trusted_root {
+            super::downloads::verify_prepared_storage_root(trusted_root, &self.inner.root)?;
+        }
+        Ok(())
     }
 
     fn next_created_at(&self) -> u64 {

@@ -34,12 +34,16 @@ impl BrowserStorageLayout {
 
     pub fn ensure(&self) -> Result<(), BrowserError> {
         for path in [&self.profile_dir, &self.downloads_dir, &self.resources_dir] {
-            std::fs::create_dir_all(path).map_err(|error| BrowserError::Io {
-                operation: "create storage directory".to_string(),
-                path: path.clone(),
-                message: error.to_string(),
-            })?;
+            ensure_storage_directory(path)?;
         }
         Ok(())
     }
+}
+
+fn ensure_storage_directory(path: &Path) -> Result<(), BrowserError> {
+    std::fs::create_dir_all(path).map_err(|error| BrowserError::Io {
+        operation: "create storage directory".to_string(),
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })
 }

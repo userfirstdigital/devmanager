@@ -140,6 +140,33 @@ impl<T> BrowserOperationQueue<T> {
             .collect()
     }
 
+    pub fn cancel_project(
+        &mut self,
+        project_id: &str,
+    ) -> Vec<(BrowserOperationTarget, BrowserQueueCancellation<T>)> {
+        let mut targets: Vec<_> = self
+            .active
+            .keys()
+            .chain(self.queued.keys())
+            .filter(|target| target.workspace_key.project_id == project_id)
+            .cloned()
+            .collect();
+        targets.sort_by(|left, right| {
+            left.workspace_key
+                .ai_tab_id
+                .cmp(&right.workspace_key.ai_tab_id)
+                .then_with(|| left.tab_id.cmp(&right.tab_id))
+        });
+        targets.dedup();
+        targets
+            .into_iter()
+            .map(|target| {
+                let cancellation = self.cancel_tab(&target);
+                (target, cancellation)
+            })
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.active.is_empty() && self.queued.is_empty()
     }

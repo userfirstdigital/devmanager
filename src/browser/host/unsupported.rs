@@ -1,12 +1,17 @@
 #[cfg(not(target_os = "windows"))]
 use super::super::{
-    BrowserBounds, BrowserCommand, BrowserCommandRequest, BrowserHostEvent, BrowserResponse,
+    BrowserBounds, BrowserCommand, BrowserCommandRequest, BrowserHostControl, BrowserHostEvent,
+    BrowserResponse,
 };
 use super::super::{BrowserError, BrowserHostStatus};
 #[cfg(not(target_os = "windows"))]
 use super::{BrowserHostState, BrowserWorkspaceSnapshot};
 #[cfg(not(target_os = "windows"))]
-use std::{marker::PhantomData, path::Path, rc::Rc};
+use std::{
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus {
     let platform = platform.into();
@@ -44,8 +49,25 @@ impl BrowserWebViewHost {
         }
     }
 
+    pub fn unavailable(diagnostic: impl Into<String>) -> Self {
+        Self {
+            status: BrowserHostStatus {
+                available: false,
+                diagnostic: Some(diagnostic.into()),
+                platform: std::env::consts::OS.to_string(),
+                version: None,
+            },
+            state: BrowserHostState::new(PathBuf::new()),
+            _main_thread_only: PhantomData,
+        }
+    }
+
     pub fn status(&self) -> BrowserHostStatus {
         self.status.clone()
+    }
+
+    pub fn trusted_app_config_dir(&self) -> Option<&Path> {
+        None
     }
 
     pub fn handle_command(
@@ -64,12 +86,27 @@ impl BrowserWebViewHost {
     }
 
     pub fn handle_request(&mut self, window: &gpui::Window, request: BrowserCommandRequest) {
+        if !request.cancellation_is_current() {
+            request.respond(Err(BrowserError::Interrupted));
+            return;
+        }
         let result =
             self.handle_command(window, request.workspace_key(), request.command().clone());
         request.respond(result);
     }
 
+    pub fn handle_control(&mut self, _control: BrowserHostControl) {}
+
     pub fn pump_async_completions(&mut self, _window: &gpui::Window) {}
+
+    pub fn is_pending_approval(
+        &self,
+        _workspace_key: &super::super::BrowserWorkspaceKey,
+        _tab_id: &str,
+        _operation_id: &str,
+    ) -> bool {
+        false
+    }
 
     pub fn resolve_approval(
         &mut self,

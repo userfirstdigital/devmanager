@@ -1,20 +1,26 @@
 use super::{
-    browser_user_input_initialization_script, unique_download_path, validate_browser_url,
-    BrowserHostState, BrowserMemoryTarget,
+    browser_user_input_initialization_script, validate_browser_url, BrowserHostState,
+    BrowserMemoryTarget,
+};
+use crate::browser::downloads::{
+    prepare_verified_storage_layout, verified_app_config_root, verified_unique_download_path,
+    verify_prepared_storage_root,
 };
 use crate::browser::{
-    build_semantic_snapshot, effective_browser_risk, redact_browser_text, BrowserAction,
+    browser_lifecycle_control, browser_request_preempts_operation_queue, build_semantic_snapshot,
+    effective_browser_risk, effective_browser_risk_for_targets, prepare_verified_download_root,
+    redact_browser_resource_bytes, redact_browser_text, remove_verified_profile, BrowserAction,
     BrowserActionResult, BrowserApprovalPolicy, BrowserApprovalRequest, BrowserBounds,
     BrowserCommand, BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation,
     BrowserDiagnosticLevel, BrowserDownloadState, BrowserDownloadStore, BrowserError,
-    BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor,
-    BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue,
-    BrowserOperationTarget, BrowserPageLoadState, BrowserPerformanceOperation,
-    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserResourceHandle,
-    BrowserResourceId, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
-    BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary,
-    BrowserStorageLayout, BrowserUploadResult, BrowserUserInputKind, BrowserWaitResult,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
+    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
+    BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation,
+    BrowserOperationQueue, BrowserOperationTarget, BrowserPageLoadState,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode,
+    BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult, BrowserUserInputKind,
+    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -120,13 +126,12 @@ struct BrowserScriptEnvelope {
 }
 
 struct BrowserProjectRuntime {
-    layout: BrowserStorageLayout,
     context: WebContext,
 }
 
 pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
-    app_config_dir: PathBuf,
+    trusted_app_config_dir: Option<PathBuf>,
     state: BrowserHostState,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
@@ -143,7 +148,7 @@ pub struct BrowserWebViewHost {
 impl BrowserWebViewHost {
     pub fn new(app_config_dir: impl AsRef<Path>) -> Self {
         let app_config_dir = absolute_path(app_config_dir.as_ref());
-        let status = match wry::webview_version() {
+        let mut status = match wry::webview_version() {
             Ok(version) => BrowserHostStatus {
                 available: true,
                 platform: std::env::consts::OS.to_string(),
@@ -157,12 +162,51 @@ impl BrowserWebViewHost {
                 diagnostic: Some(format!("WebView2 runtime is unavailable: {error}")),
             },
         };
+        let trusted_app_config_dir = if status.available {
+            match verified_app_config_root(&app_config_dir) {
+                Ok(trusted_app_config_dir) => Some(trusted_app_config_dir),
+                Err(error) => {
+                    status.available = false;
+                    status.diagnostic = Some(format!(
+                        "Browser storage is unavailable; browser tools are disabled: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self::with_status(app_config_dir, trusted_app_config_dir, status)
+    }
+
+    pub fn unavailable(diagnostic: impl Into<String>) -> Self {
+        Self::with_status(
+            PathBuf::new(),
+            None,
+            BrowserHostStatus {
+                available: false,
+                platform: std::env::consts::OS.to_string(),
+                version: None,
+                diagnostic: Some(diagnostic.into()),
+            },
+        )
+    }
+
+    fn with_status(
+        app_config_dir: PathBuf,
+        trusted_app_config_dir: Option<PathBuf>,
+        status: BrowserHostStatus,
+    ) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
         let (async_sender, async_receiver) = mpsc::channel();
+        let state_app_config_dir = trusted_app_config_dir
+            .as_ref()
+            .unwrap_or(&app_config_dir)
+            .clone();
         Self {
             status,
-            state: BrowserHostState::new(&app_config_dir),
-            app_config_dir,
+            state: BrowserHostState::new(state_app_config_dir),
+            trusted_app_config_dir,
             projects: HashMap::new(),
             views: HashMap::new(),
             bounds: BrowserBounds {
@@ -185,12 +229,19 @@ impl BrowserWebViewHost {
         self.status.clone()
     }
 
+    pub fn trusted_app_config_dir(&self) -> Option<&Path> {
+        self.trusted_app_config_dir.as_deref()
+    }
+
     pub fn handle_command(
         &mut self,
         window: &gpui::Window,
         workspace_key: &BrowserWorkspaceKey,
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
+        if let Some(control) = browser_lifecycle_control(workspace_key, &command) {
+            self.handle_control(control);
+        }
         let diagnostic_tab = command
             .tab_id()
             .map(ToOwned::to_owned)
@@ -204,35 +255,30 @@ impl BrowserWebViewHost {
         result
     }
 
-    pub fn handle_request(&mut self, window: &gpui::Window, request: BrowserCommandRequest) {
-        let workspace_key = request.workspace_key().clone();
-        let command = request.command().clone();
-        if let BrowserCommand::Stop { tab_id } = &command {
-            match tab_id {
-                Some(tab_id) => self.cancel_tab_operations(&workspace_key, tab_id),
-                None => self.cancel_workspace_operations(&workspace_key),
+    pub fn handle_control(&mut self, control: BrowserHostControl) {
+        match control {
+            BrowserHostControl::InterruptProject { project_id } => {
+                self.cancel_project_operations(&project_id);
             }
-            let result = self.handle_command(window, &workspace_key, command);
-            self.respond_request(request, result);
-            return;
-        }
-        match &command {
-            BrowserCommand::CloseTab { tab_id } => {
-                self.cancel_tab_operations(&workspace_key, tab_id);
-            }
-            BrowserCommand::ResetWorkspace | BrowserCommand::ClearProjectProfile => {
+            BrowserHostControl::InterruptWorkspace { workspace_key } => {
                 self.cancel_workspace_operations(&workspace_key);
             }
-            _ => {}
+            BrowserHostControl::InterruptTab {
+                workspace_key,
+                tab_id,
+            } => self.cancel_tab_operations(&workspace_key, &tab_id),
         }
+    }
+
+    pub fn handle_request(&mut self, window: &gpui::Window, request: BrowserCommandRequest) {
+        if !request.cancellation_is_current() {
+            request.respond(Err(BrowserError::Interrupted));
+            return;
+        }
+        let workspace_key = request.workspace_key().clone();
+        let command = request.command().clone();
         if request.context().actor != BrowserInvocationActor::Agent
-            || browser_request_is_immediate(&command)
-            || matches!(
-                command,
-                BrowserCommand::CloseTab { .. }
-                    | BrowserCommand::ResetWorkspace
-                    | BrowserCommand::ClearProjectProfile
-            )
+            || browser_request_preempts_operation_queue(&command)
         {
             let result = self.handle_command(window, &workspace_key, command);
             self.respond_request(request, result);
@@ -276,6 +322,16 @@ impl BrowserWebViewHost {
         request: BrowserCommandRequest,
     ) {
         let operation_id = request.context().operation_id.clone();
+        if !request.cancellation_is_current() {
+            self.finish_queued_request(
+                window,
+                target,
+                operation_id,
+                request,
+                Err(BrowserError::Interrupted),
+            );
+            return;
+        }
         if browser_command_is_automation(request.command()) {
             match self.begin_automation_request(window, &target, &request, None) {
                 BrowserStartResult::Pending(phase) => {
@@ -404,6 +460,17 @@ impl BrowserWebViewHost {
 
     fn cancel_workspace_operations(&mut self, workspace_key: &BrowserWorkspaceKey) {
         for (target, cancellation) in self.operation_queue.cancel_workspace(workspace_key) {
+            if let Some(active) = self.active_requests.remove(&target) {
+                self.respond_request(active.request, Err(BrowserError::Interrupted));
+            }
+            for queued in cancellation.queued {
+                self.respond_request(queued, Err(BrowserError::Interrupted));
+            }
+        }
+    }
+
+    fn cancel_project_operations(&mut self, project_id: &str) {
+        for (target, cancellation) in self.operation_queue.cancel_project(project_id) {
             if let Some(active) = self.active_requests.remove(&target) {
                 self.respond_request(active.request, Err(BrowserError::Interrupted));
             }
@@ -747,6 +814,16 @@ impl BrowserWebViewHost {
             return;
         };
         let operation_id = completion.operation_id;
+        if !active.request.cancellation_is_current() {
+            self.finish_queued_request(
+                window,
+                completion.target,
+                operation_id,
+                active.request,
+                Err(BrowserError::Interrupted),
+            );
+            return;
+        }
         let raw = match completion.result {
             Ok(raw) => raw,
             Err(_) => {
@@ -798,11 +875,11 @@ impl BrowserWebViewHost {
                         return;
                     }
                 };
-                let effective_risk = runtime_targets
-                    .iter()
-                    .fold(active.request.context().declared_risk, |risk, runtime| {
-                        effective_browser_risk(risk, Some(runtime), None)
-                    });
+                let effective_risk = effective_browser_risk_for_targets(
+                    active.request.context().declared_risk,
+                    &runtime_targets,
+                    None,
+                );
                 if BrowserApprovalPolicy::trust_project().requires_confirmation(effective_risk)
                     && active.approved_risk != Some(effective_risk)
                 {
@@ -882,6 +959,28 @@ impl BrowserWebViewHost {
         );
     }
 
+    pub fn is_pending_approval(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        operation_id: &str,
+    ) -> bool {
+        let Ok(target) = BrowserOperationTarget::new(workspace_key.clone(), tab_id) else {
+            return false;
+        };
+        if self.operation_queue.active_operation_id(&target) != Some(operation_id) {
+            return false;
+        }
+        let Some(active) = self.active_requests.get(&target) else {
+            return false;
+        };
+        if !active.request.cancellation_is_current() {
+            self.cancel_tab_operations(workspace_key, tab_id);
+            return false;
+        }
+        matches!(&active.phase, BrowserAsyncPhase::Approval { .. })
+    }
+
     pub fn resolve_approval(
         &mut self,
         window: &gpui::Window,
@@ -897,6 +996,16 @@ impl BrowserWebViewHost {
         let Some(mut active) = self.active_requests.remove(&target) else {
             return Err(BrowserError::Interrupted);
         };
+        if !active.request.cancellation_is_current() {
+            self.finish_queued_request(
+                window,
+                target,
+                operation_id.to_string(),
+                active.request,
+                Err(BrowserError::Interrupted),
+            );
+            return Err(BrowserError::Interrupted);
+        }
         let phase = std::mem::replace(&mut active.phase, BrowserAsyncPhase::Cdp);
         let BrowserAsyncPhase::Approval { risk, resume } = phase else {
             self.active_requests.insert(target, active);
@@ -1297,15 +1406,17 @@ impl BrowserWebViewHost {
         request: &BrowserCommandRequest,
         raw: &str,
     ) -> Result<BrowserResponse, BrowserError> {
-        let value: Value = serde_json::from_str(raw).map_err(|_| BrowserError::CrashedView {
-            message: "browser CDP callback returned invalid JSON".to_string(),
-        })?;
-        if raw.len() > INLINE_RESULT_LIMIT {
+        let redacted = redact_browser_resource_bytes("application/json", raw.as_bytes());
+        let value: Value =
+            serde_json::from_slice(&redacted).map_err(|_| BrowserError::CrashedView {
+                message: "browser CDP callback returned invalid JSON".to_string(),
+            })?;
+        if redacted.len() > INLINE_RESULT_LIMIT {
             let resource = self.store_resource(
                 request.workspace_key(),
                 BrowserResourceKind::CdpResult,
                 "application/json",
-                raw.as_bytes(),
+                &redacted,
             )?;
             Ok(BrowserResponse::Cdp {
                 inline_result: None,
@@ -1469,14 +1580,13 @@ impl BrowserWebViewHost {
         mime_type: &str,
         bytes: impl AsRef<[u8]>,
     ) -> Result<BrowserResourceHandle, BrowserError> {
-        let layout = BrowserStorageLayout::new(&self.app_config_dir, &workspace_key.project_id);
-        BrowserResourceStore::open(layout.resources_dir, BrowserResourceLimits::default())?.put(
-            workspace_key,
-            kind,
-            mime_type,
-            bytes,
-            false,
-        )
+        let bytes = redact_browser_resource_bytes(mime_type, bytes.as_ref());
+        BrowserResourceStore::open_verified(
+            self.verified_trusted_app_config_dir()?,
+            &workspace_key.project_id,
+            BrowserResourceLimits::default(),
+        )?
+        .put(workspace_key, kind, mime_type, bytes, false)
     }
 
     fn validate_action_references(
@@ -1569,9 +1679,10 @@ impl BrowserWebViewHost {
             } => (*operation, download_id.as_deref()),
             _ => unreachable!("download handler belongs to downloads command"),
         };
-        let layout =
-            BrowserStorageLayout::new(&self.app_config_dir, &request.workspace_key().project_id);
-        let downloads = BrowserDownloadStore::open(&layout.downloads_dir)?;
+        let downloads = BrowserDownloadStore::open_verified(
+            self.verified_trusted_app_config_dir()?,
+            &request.workspace_key().project_id,
+        )?;
         match operation {
             crate::browser::BrowserDownloadOperation::List => Ok(BrowserResponse::Downloads {
                 downloads: downloads.list()?,
@@ -1686,32 +1797,27 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
+        if command != BrowserCommand::Status {
+            self.ensure_runtime_available()?;
+        }
         match command {
             BrowserCommand::Status => Ok(BrowserResponse::Status {
                 status: self.status(),
             }),
             BrowserCommand::DownloadDirectory => {
-                let layout =
-                    BrowserStorageLayout::new(&self.app_config_dir, &workspace_key.project_id);
-                std::fs::create_dir_all(&layout.downloads_dir).map_err(|error| {
-                    BrowserError::Io {
-                        operation: "create browser download directory".to_string(),
-                        path: layout.downloads_dir.clone(),
-                        message: error.to_string(),
-                    }
-                })?;
+                let downloads_dir = prepare_verified_download_root(
+                    self.verified_trusted_app_config_dir()?,
+                    &workspace_key.project_id,
+                )?;
                 Ok(BrowserResponse::DownloadDirectory {
-                    path: layout.downloads_dir,
+                    path: downloads_dir,
                 })
             }
             BrowserCommand::ClearProjectProfile => {
                 self.clear_project_profile(workspace_key)?;
                 Ok(BrowserResponse::Acknowledged)
             }
-            command => {
-                self.ensure_runtime_available()?;
-                self.handle_available_command(window, workspace_key, command)
-            }
+            command => self.handle_available_command(window, workspace_key, command),
         }
     }
 
@@ -1869,6 +1975,17 @@ impl BrowserWebViewHost {
         }
     }
 
+    fn verified_trusted_app_config_dir(&self) -> Result<&Path, BrowserError> {
+        let trusted_app_config_dir =
+            self.trusted_app_config_dir
+                .as_deref()
+                .ok_or_else(|| BrowserError::CrashedView {
+                    message: "browser storage trust root is unavailable".to_string(),
+                })?;
+        verify_prepared_storage_root(trusted_app_config_dir, trusted_app_config_dir)?;
+        Ok(trusted_app_config_dir)
+    }
+
     fn ensure_selected_view(
         &mut self,
         window: &gpui::Window,
@@ -1908,27 +2025,24 @@ impl BrowserWebViewHost {
             return Ok(());
         }
         let url = validate_browser_url(url)?;
-        let layout = BrowserStorageLayout::new(&self.app_config_dir, &workspace_key.project_id);
-        layout.ensure()?;
+        let retained_trust_root = self.verified_trusted_app_config_dir()?.to_path_buf();
+        let (trusted_app_config_dir, layout) =
+            prepare_verified_storage_layout(&retained_trust_root, &workspace_key.project_id)?;
+        if trusted_app_config_dir != retained_trust_root {
+            return Err(BrowserError::OutsideWorkspace {
+                path: retained_trust_root,
+            });
+        }
+        let downloads_dir = layout.downloads_dir.clone();
         self.projects
             .entry(workspace_key.project_id.clone())
             .or_insert_with(|| BrowserProjectRuntime {
                 context: WebContext::new(Some(layout.profile_dir.clone())),
-                layout: layout.clone(),
             });
 
         let sender = self.event_sender.clone();
         let callback_workspace = workspace_key.clone();
         let callback_tab = tab_id.to_string();
-        let downloads_dir = self
-            .projects
-            .get(&workspace_key.project_id)
-            .ok_or_else(|| BrowserError::CrashedView {
-                message: "browser project context was not initialized".to_string(),
-            })?
-            .layout
-            .downloads_dir
-            .clone();
         let bounds = wry_bounds(self.bounds);
         let webview = {
             let project = self
@@ -1942,6 +2056,7 @@ impl BrowserWebViewHost {
                 sender,
                 callback_workspace,
                 callback_tab,
+                trusted_app_config_dir,
                 downloads_dir,
                 url,
                 bounds,
@@ -2044,7 +2159,13 @@ impl BrowserWebViewHost {
         &mut self,
         workspace_key: &BrowserWorkspaceKey,
     ) -> Result<(), BrowserError> {
-        let layout = BrowserStorageLayout::new(&self.app_config_dir, &workspace_key.project_id);
+        let trusted_app_config_dir =
+            self.trusted_app_config_dir
+                .clone()
+                .ok_or_else(|| BrowserError::CrashedView {
+                    message: "browser storage trust root is unavailable".to_string(),
+                })?;
+        let layout = BrowserStorageLayout::new(&trusted_app_config_dir, &workspace_key.project_id);
         let plan = self
             .state
             .profile_clear_plan(workspace_key, &layout.profile_dir)?;
@@ -2054,7 +2175,7 @@ impl BrowserWebViewHost {
         self.projects.remove(&workspace_key.project_id);
         self.state
             .clear_project_workspaces(&workspace_key.project_id);
-        remove_verified_profile(&self.app_config_dir, &plan.profile_dir)
+        remove_verified_profile(&trusted_app_config_dir, &plan.profile_dir)
     }
 
     fn emit_diagnostic(&self, workspace_key: &BrowserWorkspaceKey, tab_id: &str, message: String) {
@@ -2147,6 +2268,7 @@ fn configured_builder<'a>(
     event_sender: Sender<BrowserHostEvent>,
     workspace_key: BrowserWorkspaceKey,
     tab_id: String,
+    trusted_app_config_dir: PathBuf,
     downloads_dir: PathBuf,
     url: String,
     bounds: Rect,
@@ -2247,7 +2369,11 @@ fn configured_builder<'a>(
             NewWindowResponse::Deny
         })
         .with_download_started_handler(move |url, suggested_path| {
-            match unique_download_path(&downloads_dir, &*suggested_path) {
+            match verified_unique_download_path(
+                &trusted_app_config_dir,
+                &downloads_dir,
+                &*suggested_path,
+            ) {
                 Ok(path) => {
                     *suggested_path = path.clone();
                     let _ = download_sender.send(BrowserHostEvent::Download {
@@ -2293,16 +2419,6 @@ fn view_key(workspace_key: &BrowserWorkspaceKey, tab_id: &str) -> BrowserViewKey
         workspace_key: workspace_key.clone(),
         tab_id: tab_id.to_string(),
     }
-}
-
-fn browser_request_is_immediate(command: &BrowserCommand) -> bool {
-    matches!(
-        command,
-        BrowserCommand::Status
-            | BrowserCommand::WorkspaceState
-            | BrowserCommand::ListTabs
-            | BrowserCommand::DownloadDirectory
-    )
 }
 
 fn browser_command_is_automation(command: &BrowserCommand) -> bool {
@@ -2466,60 +2582,6 @@ fn absolute_path(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
-}
-
-fn remove_verified_profile(app_config_dir: &Path, profile_dir: &Path) -> Result<(), BrowserError> {
-    if !profile_dir.exists() {
-        return Ok(());
-    }
-    let metadata = std::fs::symlink_metadata(profile_dir).map_err(|error| BrowserError::Io {
-        operation: "inspect browser profile directory".to_string(),
-        path: profile_dir.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(BrowserError::OutsideWorkspace {
-            path: profile_dir.to_path_buf(),
-        });
-    }
-    let canonical_app = app_config_dir
-        .canonicalize()
-        .map_err(|error| BrowserError::Io {
-            operation: "verify browser app data directory".to_string(),
-            path: app_config_dir.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    let canonical_profile = profile_dir
-        .canonicalize()
-        .map_err(|error| BrowserError::Io {
-            operation: "verify browser profile directory".to_string(),
-            path: profile_dir.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    let canonical_parent = profile_dir
-        .parent()
-        .ok_or_else(|| BrowserError::OutsideWorkspace {
-            path: profile_dir.to_path_buf(),
-        })?
-        .canonicalize()
-        .map_err(|error| BrowserError::Io {
-            operation: "verify browser profiles root".to_string(),
-            path: profile_dir.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    let verified = canonical_parent.starts_with(&canonical_app)
-        && canonical_profile.parent() == Some(canonical_parent.as_path())
-        && canonical_profile.file_name() == profile_dir.file_name();
-    if !verified {
-        return Err(BrowserError::OutsideWorkspace {
-            path: profile_dir.to_path_buf(),
-        });
-    }
-    std::fs::remove_dir_all(&canonical_profile).map_err(|error| BrowserError::Io {
-        operation: "clear browser project profile".to_string(),
-        path: canonical_profile,
-        message: error.to_string(),
-    })
 }
 
 fn missing_workspace() -> BrowserError {

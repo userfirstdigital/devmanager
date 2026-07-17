@@ -14,24 +14,29 @@ mod resources;
 mod storage;
 
 pub use automation::{
-    build_semantic_snapshot, effective_browser_risk, redact_browser_text, runtime_target_risk,
-    BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry,
-    BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation,
-    BrowserLocatorStrategy, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
+    build_semantic_snapshot, effective_browser_risk, effective_browser_risk_for_targets,
+    redact_browser_resource_bytes, redact_browser_text, runtime_target_risk, BrowserAction,
+    BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry, BrowserConsoleOperation,
+    BrowserDownloadEntry, BrowserDownloadOperation, BrowserLocatorStrategy, BrowserNetworkEntry,
+    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
     BrowserRawSemanticElement, BrowserRedactedAction, BrowserRuntimeTarget, BrowserScreenshotMode,
     BrowserSemanticElement, BrowserSemanticSnapshot, BrowserSnapshotSummary,
     BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition, BrowserWaitResult,
     MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
 };
+pub(crate) use commands::BrowserRegistrationLease;
 pub use commands::{
-    browser_command_channel, route_browser_request, BrowserApprovalRequest, BrowserCommand,
-    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserController,
-    BrowserDiagnosticLevel, BrowserDownloadState, BrowserHostEvent, BrowserHostStatus,
+    browser_command_channel, browser_lifecycle_control, browser_request_preempts_operation_queue,
+    route_browser_request, BrowserApprovalRequest, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandInbox, BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel,
+    BrowserDownloadState, BrowserHostControl, BrowserHostEvent, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserPageLoadState, BrowserResponse,
     BrowserUserInputKind,
 };
-pub use downloads::BrowserDownloadStore;
+pub use downloads::{
+    prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
+    BrowserDownloadStore,
+};
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub use host::{
     browser_user_input_initialization_script, unique_download_path, unsupported_host_status,

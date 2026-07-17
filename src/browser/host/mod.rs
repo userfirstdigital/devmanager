@@ -301,7 +301,6 @@ impl BrowserHostState {
     ) -> Result<BrowserWorkspaceMutation, BrowserError> {
         let snapshot = self.workspace_mut(workspace_key)?;
         snapshot.append_journal_entry(entry);
-        snapshot.advance_revision();
         Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
     }
 
@@ -396,7 +395,6 @@ impl BrowserHostState {
                 })?;
         if snapshot.pane_open != open {
             snapshot.pane_open = open;
-            snapshot.advance_revision();
         }
         Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
     }
@@ -517,39 +515,7 @@ pub fn unique_download_path(
     downloads_dir: impl AsRef<Path>,
     suggested_path: impl AsRef<Path>,
 ) -> Result<PathBuf, BrowserError> {
-    let downloads_dir = downloads_dir.as_ref();
-    std::fs::create_dir_all(downloads_dir).map_err(|error| BrowserError::Io {
-        operation: "create browser download directory".to_string(),
-        path: downloads_dir.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    let suggested_name = suggested_path
-        .as_ref()
-        .file_name()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| std::ffi::OsStr::new("download"));
-    let direct = downloads_dir.join(suggested_name);
-    if !direct.exists() {
-        return Ok(direct);
-    }
-
-    let suggested = Path::new(suggested_name);
-    let stem = suggested
-        .file_stem()
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| std::ffi::OsStr::new("download"))
-        .to_string_lossy();
-    let extension = suggested.extension().map(|value| value.to_string_lossy());
-    for suffix in 1_u64.. {
-        let name = match &extension {
-            Some(extension) => format!("{stem} ({suffix}).{extension}"),
-            None => format!("{stem} ({suffix})"),
-        };
-        let candidate = downloads_dir.join(name);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    unreachable!("the download suffix space is unbounded")
+    let downloads_dir = super::downloads::prepare_untrusted_download_root(downloads_dir.as_ref())?;
+    super::downloads::unique_path_in(&downloads_dir, suggested_path.as_ref())
 }
 pub use initialization::browser_user_input_initialization_script;

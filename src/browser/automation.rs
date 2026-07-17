@@ -11,13 +11,21 @@ use std::sync::LazyLock;
 
 static SECRET_ASSIGNMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
-        r"(?i)((?:authorization|cookie|password|passwd|token|secret|api[_-]?key)\s*[:=]\s*)([^\s,;&#]+)",
+        r"(?i)(((?:[a-z0-9_-]*(?:token|secret|cookie)|(?:authorization|password|passwd)[a-z0-9_-]*|(?:api|private)[_-]?key))\s*[:=]\s*)([^\s,;&#]+)",
     )
     .expect("browser secret-assignment regex is valid")
 });
+static JSON_QUOTED_ASSIGNMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(\"((?:\\.|[^\"\\])*)\"\s*:\s*\")((?:\\.|[^\"\\])*)(\")"#)
+        .expect("browser JSON quoted-assignment regex is valid")
+});
 static BEARER_SECRET: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+")
+    regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
         .expect("browser bearer-token regex is valid")
+});
+static BASIC_SECRET: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bBasic\s+[A-Za-z0-9._~+/=-]+")
+        .expect("browser basic-credential regex is valid")
 });
 
 pub const MAX_BROWSER_ACTIONS: usize = 32;
@@ -402,9 +410,17 @@ pub fn build_semantic_snapshot(
         .into_iter()
         .take(2_000)
         .map(|raw| {
+            let is_password = raw
+                .input_type
+                .as_deref()
+                .is_some_and(|input_type| input_type.eq_ignore_ascii_case("password"));
+            let password_value = raw.value.as_deref();
+            let name = clean_semantic_metadata(raw.name, is_password, password_value, 2_000);
+            let label = clean_semantic_metadata(raw.label, is_password, password_value, 2_000);
+            let text = clean_semantic_metadata(raw.text, is_password, password_value, 2_000);
             let locator = BrowserLocator {
                 accessibility_role: clean_optional(raw.role.clone()),
-                accessibility_name: clean_optional(raw.name.clone()),
+                accessibility_name: name.clone(),
                 test_id: clean_optional(raw.test_id.clone()),
                 css_selectors: raw
                     .css_selectors
@@ -414,10 +430,6 @@ pub fn build_semantic_snapshot(
                     .map(|value| truncate(value.trim(), 512))
                     .collect(),
             };
-            let is_password = raw
-                .input_type
-                .as_deref()
-                .is_some_and(|input_type| input_type.eq_ignore_ascii_case("password"));
             BrowserSemanticElement {
                 element_ref: BrowserElementRef {
                     revision,
@@ -425,9 +437,9 @@ pub fn build_semantic_snapshot(
                     backend_node_id: None,
                 },
                 role: clean_optional(raw.role),
-                name: clean_optional(raw.name),
-                label: clean_optional(raw.label),
-                text: raw.text.map(|value| truncate(value.trim(), 2_000)),
+                name,
+                label,
+                text,
                 bounds: raw.bounds,
                 enabled: raw.enabled,
                 checked: raw.checked,
@@ -477,6 +489,17 @@ pub fn effective_browser_risk(
     .into_iter()
     .max_by_key(|risk| risk_severity(*risk))
     .unwrap_or(BrowserRisk::Normal)
+}
+
+pub fn effective_browser_risk_for_targets(
+    declared: BrowserRisk,
+    runtime_targets: &[BrowserRuntimeTarget],
+    path_risk: Option<BrowserRisk>,
+) -> BrowserRisk {
+    runtime_targets.iter().fold(
+        effective_browser_risk(declared, None, path_risk),
+        |risk, runtime| effective_browser_risk(risk, Some(runtime), None),
+    )
 }
 
 pub fn runtime_target_risk(target: &BrowserRuntimeTarget) -> BrowserRisk {
@@ -595,6 +618,25 @@ fn clean_optional(value: Option<String>) -> Option<String> {
         .map(|value| truncate(&value, 2_000))
 }
 
+fn clean_semantic_metadata(
+    value: Option<String>,
+    is_password: bool,
+    password_value: Option<&str>,
+    max_chars: usize,
+) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| {
+            !is_password
+                || !password_value
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .is_some_and(|secret| value == secret)
+        })
+        .map(|value| truncate(&value, max_chars))
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
@@ -604,12 +646,90 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 }
 
 pub fn redact_browser_text(value: &str) -> String {
-    let redacted = SECRET_ASSIGNMENT.replace_all(value, format!("$1{REDACTED_VALUE}"));
-    BEARER_SECRET
-        .replace_all(&redacted, format!("Bearer {REDACTED_VALUE}"))
+    let redacted = serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|mut value| {
+            redact_json_value(&mut value);
+            serde_json::to_string(&value).ok()
+        })
+        .unwrap_or_else(|| redact_browser_secrets(value));
+    redacted.chars().take(4_000).collect()
+}
+
+fn redact_browser_secrets(value: &str) -> String {
+    let redacted = BASIC_SECRET.replace_all(value, format!("Basic {REDACTED_VALUE}"));
+    let redacted = BEARER_SECRET.replace_all(&redacted, format!("Bearer {REDACTED_VALUE}"));
+    let redacted =
+        JSON_QUOTED_ASSIGNMENT.replace_all(&redacted, |captures: &regex::Captures<'_>| {
+            if browser_secret_key(&captures[2]) {
+                format!("{}{REDACTED_VALUE}{}", &captures[1], &captures[4])
+            } else {
+                captures[0].to_string()
+            }
+        });
+    SECRET_ASSIGNMENT
+        .replace_all(&redacted, format!("$1{REDACTED_VALUE}"))
+        .into_owned()
+}
+
+pub fn redact_browser_resource_bytes(mime_type: &str, bytes: &[u8]) -> Vec<u8> {
+    let mime_type = mime_type.to_ascii_lowercase();
+    let text_like = mime_type.contains("json")
+        || mime_type.starts_with("text/")
+        || mime_type.contains("javascript")
+        || mime_type.contains("xml")
+        || mime_type.contains("form");
+    if !text_like {
+        return bytes.to_vec();
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    if mime_type.contains("json") {
+        if let Ok(mut value) = serde_json::from_str::<Value>(text) {
+            redact_json_value(&mut value);
+            if let Ok(encoded) = serde_json::to_vec(&value) {
+                return encoded;
+            }
+        }
+    }
+    redact_browser_secrets(text).into_bytes()
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(entries) => {
+            for (key, value) in entries {
+                if browser_secret_key(key) {
+                    *value = Value::String(REDACTED_VALUE.to_string());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_json_value(value);
+            }
+        }
+        Value::String(value) => *value = redact_browser_secrets(value),
+        _ => {}
+    }
+}
+
+fn browser_secret_key(key: &str) -> bool {
+    let normalized = key
         .chars()
-        .take(4_000)
-        .collect()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(normalized.as_str(), "apikey" | "privatekey")
+        || ["token", "secret", "cookie"]
+            .iter()
+            .any(|suffix| normalized == *suffix || normalized.ends_with(suffix))
+        || ["authorization", "password", "passwd"]
+            .iter()
+            .any(|prefix| normalized == *prefix || normalized.starts_with(prefix))
 }
 
 impl BrowserWorkspaceSnapshot {

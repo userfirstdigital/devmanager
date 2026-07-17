@@ -8,12 +8,12 @@ use super::{
     BrowserWorkspaceSnapshot,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
@@ -293,6 +293,44 @@ impl BrowserCommand {
     }
 }
 
+pub fn browser_lifecycle_control(
+    workspace_key: &BrowserWorkspaceKey,
+    command: &BrowserCommand,
+) -> Option<BrowserHostControl> {
+    match command {
+        BrowserCommand::Stop {
+            tab_id: Some(tab_id),
+        }
+        | BrowserCommand::CloseTab { tab_id } => Some(BrowserHostControl::InterruptTab {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.clone(),
+        }),
+        BrowserCommand::Stop { tab_id: None } | BrowserCommand::ResetWorkspace => {
+            Some(BrowserHostControl::InterruptWorkspace {
+                workspace_key: workspace_key.clone(),
+            })
+        }
+        BrowserCommand::ClearProjectProfile => Some(BrowserHostControl::InterruptProject {
+            project_id: workspace_key.project_id.clone(),
+        }),
+        _ => None,
+    }
+}
+
+pub fn browser_request_preempts_operation_queue(command: &BrowserCommand) -> bool {
+    matches!(
+        command,
+        BrowserCommand::Status
+            | BrowserCommand::WorkspaceState
+            | BrowserCommand::ListTabs
+            | BrowserCommand::DownloadDirectory
+            | BrowserCommand::Stop { .. }
+            | BrowserCommand::CloseTab { .. }
+            | BrowserCommand::ResetWorkspace
+            | BrowserCommand::ClearProjectProfile
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserHostStatus {
@@ -460,10 +498,76 @@ pub enum BrowserHostEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserHostControl {
+    InterruptProject {
+        project_id: String,
+    },
+    InterruptWorkspace {
+        workspace_key: BrowserWorkspaceKey,
+    },
+    InterruptTab {
+        workspace_key: BrowserWorkspaceKey,
+        tab_id: String,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserRegistrationLease {
+    active: Arc<AtomicBool>,
+    cancellation: watch::Sender<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BrowserRegistrationLeaseTicket(u64);
+
+impl BrowserRegistrationLease {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(true)),
+            cancellation: watch::channel(0).0,
+        }
+    }
+
+    pub(crate) fn capture(
+        &self,
+    ) -> Result<(BrowserRegistrationLeaseTicket, watch::Receiver<u64>), BrowserError> {
+        let receiver = self.cancellation.subscribe();
+        let ticket = BrowserRegistrationLeaseTicket(*receiver.borrow());
+        if !self.is_current(ticket) {
+            return Err(BrowserError::Interrupted);
+        }
+        Ok((ticket, receiver))
+    }
+
+    pub(crate) fn is_current(&self, ticket: BrowserRegistrationLeaseTicket) -> bool {
+        self.active.load(Ordering::Acquire) && *self.cancellation.borrow() == ticket.0
+    }
+
+    fn revoke(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            advance(&self.cancellation);
+        }
+    }
+}
+
+fn registration_ticket_is_current(
+    registration_lease: Option<&BrowserRegistrationLease>,
+    ticket: Option<BrowserRegistrationLeaseTicket>,
+) -> bool {
+    match (registration_lease, ticket) {
+        (None, None) => true,
+        (Some(registration_lease), Some(ticket)) => registration_lease.is_current(ticket),
+        _ => false,
+    }
+}
+
 struct BrowserCommandEnvelope {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
     context: BrowserInvocationContext,
+    cancellation_ticket: CancellationTicket,
+    registration_lease: Option<BrowserRegistrationLease>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     pending_work: PendingWorkGuard,
 }
@@ -472,17 +576,29 @@ struct BrowserCommandEnvelope {
 pub struct BrowserCommandBridge {
     sender: mpsc::Sender<BrowserCommandEnvelope>,
     cancellations: Arc<CancellationEpochs>,
+    host_controls: Arc<HostControlQueue>,
     pending_work: Arc<PendingWork>,
 }
 
 impl BrowserCommandBridge {
     pub fn bind(&self, workspace_key: BrowserWorkspaceKey, timeout: Duration) -> BrowserController {
+        self.bind_with_registration_lease(workspace_key, timeout, None)
+    }
+
+    pub(crate) fn bind_with_registration_lease(
+        &self,
+        workspace_key: BrowserWorkspaceKey,
+        timeout: Duration,
+        registration_lease: Option<BrowserRegistrationLease>,
+    ) -> BrowserController {
         BrowserController {
             workspace_key,
             sender: self.sender.clone(),
             timeout,
             cancellations: Arc::clone(&self.cancellations),
+            host_controls: Arc::clone(&self.host_controls),
             pending_work: Arc::clone(&self.pending_work),
+            registration_lease,
         }
     }
 
@@ -495,11 +611,99 @@ impl BrowserCommandBridge {
     }
 
     pub fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
-        self.cancellations.interrupt_workspace(workspace_key);
+        let control = BrowserHostControl::InterruptWorkspace {
+            workspace_key: workspace_key.clone(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            self.cancellations.interrupt_control(&control)
+        });
+    }
+
+    pub(crate) fn revoke_registration(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        registration_lease: &BrowserRegistrationLease,
+    ) {
+        let control = BrowserHostControl::InterruptWorkspace {
+            workspace_key: workspace_key.clone(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            registration_lease.revoke();
+            self.cancellations.interrupt_control(&control);
+        });
+    }
+
+    pub fn interrupt_project(&self, project_id: &str) {
+        let control = BrowserHostControl::InterruptProject {
+            project_id: project_id.to_string(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            self.cancellations.interrupt_control(&control)
+        });
     }
 
     pub fn interrupt_tab(&self, workspace_key: &BrowserWorkspaceKey, tab_id: &str) {
-        self.cancellations.interrupt_tab(workspace_key, tab_id);
+        let control = BrowserHostControl::InterruptTab {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.to_string(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            self.cancellations.interrupt_control(&control)
+        });
+    }
+
+    pub fn with_locked_host_controls_for_command<R>(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        command: &BrowserCommand,
+        apply: impl FnOnce(Vec<BrowserHostControl>, Vec<BrowserCommandRequest>) -> R,
+    ) -> R {
+        self.host_controls
+            .with_drain_locked(|controls, lifecycle_requests| {
+                if let Some(control) = browser_lifecycle_control(workspace_key, command) {
+                    self.cancellations.interrupt_control(&control);
+                }
+                let lifecycle_requests = lifecycle_requests
+                    .into_iter()
+                    .map(|envelope| {
+                        BrowserCommandRequest::from_envelope(
+                            envelope,
+                            Arc::clone(&self.cancellations),
+                        )
+                    })
+                    .collect();
+                apply(controls, lifecycle_requests)
+            })
+    }
+
+    pub fn drain_host_controls(&self) -> Vec<BrowserHostControl> {
+        self.host_controls.drain()
+    }
+
+    pub fn with_locked_host_controls<R>(
+        &self,
+        apply: impl FnOnce(Vec<BrowserHostControl>) -> R,
+    ) -> R {
+        self.host_controls.with_drain_controls_locked(apply)
+    }
+
+    pub fn with_locked_host_work<R>(
+        &self,
+        apply: impl FnOnce(Vec<BrowserHostControl>, Vec<BrowserCommandRequest>) -> R,
+    ) -> R {
+        self.host_controls
+            .with_drain_locked(|controls, lifecycle_requests| {
+                let lifecycle_requests = lifecycle_requests
+                    .into_iter()
+                    .map(|envelope| {
+                        BrowserCommandRequest::from_envelope(
+                            envelope,
+                            Arc::clone(&self.cancellations),
+                        )
+                    })
+                    .collect();
+                apply(controls, lifecycle_requests)
+            })
     }
 }
 
@@ -509,7 +713,9 @@ pub struct BrowserController {
     sender: mpsc::Sender<BrowserCommandEnvelope>,
     timeout: Duration,
     cancellations: Arc<CancellationEpochs>,
+    host_controls: Arc<HostControlQueue>,
     pending_work: Arc<PendingWork>,
+    registration_lease: Option<BrowserRegistrationLease>,
 }
 
 impl BrowserController {
@@ -519,6 +725,26 @@ impl BrowserController {
 
     pub fn pending_work_count(&self) -> usize {
         self.pending_work.count()
+    }
+
+    pub(crate) fn capture_registration_lease_ticket(
+        &self,
+    ) -> Result<Option<BrowserRegistrationLeaseTicket>, BrowserError> {
+        self.registration_lease
+            .as_ref()
+            .map(|registration_lease| {
+                registration_lease
+                    .capture()
+                    .map(|(ticket, _cancellation)| ticket)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn registration_lease_is_current(
+        &self,
+        ticket: Option<BrowserRegistrationLeaseTicket>,
+    ) -> bool {
+        registration_ticket_is_current(self.registration_lease.as_ref(), ticket)
     }
 
     pub async fn request(&self, command: BrowserCommand) -> Result<BrowserResponse, BrowserError> {
@@ -532,42 +758,66 @@ impl BrowserController {
         context: BrowserInvocationContext,
     ) -> Result<BrowserResponse, BrowserError> {
         context.validate()?;
-        self.interrupt_for_command(&command);
         let operation = command.operation_name().to_string();
-        let cancellations = self
-            .cancellations
-            .subscribe(&self.workspace_key, command.tab_id());
+        let transport_timeout = command_transport_timeout(self.timeout, &command);
+        let is_lifecycle = browser_lifecycle_control(&self.workspace_key, &command).is_some();
+        let (response, receiver) = oneshot::channel();
+        let timeout = tokio::time::sleep(transport_timeout);
+        tokio::pin!(timeout);
+        let cancellations = if is_lifecycle {
+            self.enqueue_lifecycle_command(command.clone(), context.clone(), response)?
+        } else {
+            let (cancellation_ticket, cancellations) =
+                self.cancellation_state_for_command(&command)?;
+            let send = self.sender.send(BrowserCommandEnvelope {
+                workspace_key: self.workspace_key.clone(),
+                command,
+                context,
+                cancellation_ticket,
+                registration_lease: self.registration_lease.clone(),
+                response,
+                pending_work: self.pending_work.track(),
+            });
+            tokio::pin!(send);
+            let mut project_cancellation = cancellations.project;
+            let mut workspace_cancellation = cancellations.workspace;
+            let mut tab_cancellation = cancellations.tab;
+            let mut registration_cancellation = cancellations.registration;
+            tokio::select! {
+                result = &mut send => result.map_err(|_| BrowserError::CrashedView {
+                    message: "browser command inbox is closed".to_string(),
+                })?,
+                _ = project_cancellation.changed() => return Err(BrowserError::Interrupted),
+                _ = workspace_cancellation.changed() => return Err(BrowserError::Interrupted),
+                _ = wait_for_tab_cancellation(&mut tab_cancellation) => {
+                    return Err(BrowserError::Interrupted);
+                }
+                _ = wait_for_registration_cancellation(&mut registration_cancellation) => {
+                    return Err(BrowserError::Interrupted);
+                }
+                _ = &mut timeout => return Err(BrowserError::Timeout { operation }),
+            }
+            CancellationSubscriptions {
+                project: project_cancellation,
+                workspace: workspace_cancellation,
+                tab: tab_cancellation,
+                registration: registration_cancellation,
+            }
+        };
+        let mut project_cancellation = cancellations.project;
         let mut workspace_cancellation = cancellations.workspace;
         let mut tab_cancellation = cancellations.tab;
-        let (response, receiver) = oneshot::channel();
-        let timeout = tokio::time::sleep(command_transport_timeout(self.timeout, &command));
-        tokio::pin!(timeout);
-        let send = self.sender.send(BrowserCommandEnvelope {
-            workspace_key: self.workspace_key.clone(),
-            command,
-            context,
-            response,
-            pending_work: self.pending_work.track(),
-        });
-        tokio::pin!(send);
-        tokio::select! {
-            result = &mut send => result.map_err(|_| BrowserError::CrashedView {
-                message: "browser command inbox is closed".to_string(),
-            })?,
-            _ = workspace_cancellation.changed() => return Err(BrowserError::Interrupted),
-            _ = wait_for_tab_cancellation(&mut tab_cancellation) => {
-                return Err(BrowserError::Interrupted);
-            }
-            _ = &mut timeout => return Err(BrowserError::Timeout { operation }),
-        }
+        let mut registration_cancellation = cancellations.registration;
         tokio::select! {
             response = receiver => response.unwrap_or_else(|_| {
                 Err(BrowserError::CrashedView {
                     message: "browser command request was dropped without a response".to_string(),
                 })
             }),
+            _ = project_cancellation.changed() => Err(BrowserError::Interrupted),
             _ = workspace_cancellation.changed() => Err(BrowserError::Interrupted),
             _ = wait_for_tab_cancellation(&mut tab_cancellation) => Err(BrowserError::Interrupted),
+            _ = wait_for_registration_cancellation(&mut registration_cancellation) => Err(BrowserError::Interrupted),
             _ = &mut timeout => Err(BrowserError::Timeout { operation }),
         }
     }
@@ -583,14 +833,20 @@ impl BrowserController {
         context: BrowserInvocationContext,
     ) -> Result<(), BrowserError> {
         context.validate()?;
-        self.interrupt_for_command(&command);
         let (response, receiver) = oneshot::channel();
         drop(receiver);
+        if browser_lifecycle_control(&self.workspace_key, &command).is_some() {
+            self.enqueue_lifecycle_command(command, context, response)?;
+            return Ok(());
+        }
+        let cancellation_ticket = self.cancellation_ticket_for_command(&command)?;
         self.sender
             .send(BrowserCommandEnvelope {
                 workspace_key: self.workspace_key.clone(),
                 command,
                 context,
+                cancellation_ticket,
+                registration_lease: self.registration_lease.clone(),
                 response,
                 pending_work: self.pending_work.track(),
             })
@@ -601,22 +857,98 @@ impl BrowserController {
     }
 
     pub fn interrupt_workspace(&self) {
-        self.cancellations.interrupt_workspace(&self.workspace_key);
+        let control = BrowserHostControl::InterruptWorkspace {
+            workspace_key: self.workspace_key.clone(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            self.cancellations.interrupt_control(&control)
+        });
     }
 
     pub fn interrupt_tab(&self, tab_id: &str) {
-        self.cancellations
-            .interrupt_tab(&self.workspace_key, tab_id);
+        let control = BrowserHostControl::InterruptTab {
+            workspace_key: self.workspace_key.clone(),
+            tab_id: tab_id.to_string(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            self.cancellations.interrupt_control(&control)
+        });
     }
 
-    fn interrupt_for_command(&self, command: &BrowserCommand) {
-        if let BrowserCommand::Stop { tab_id } = command {
-            if let Some(tab_id) = tab_id {
-                self.interrupt_tab(tab_id);
-            } else {
-                self.interrupt_workspace();
+    fn cancellation_ticket_for_command(
+        &self,
+        command: &BrowserCommand,
+    ) -> Result<CancellationTicket, BrowserError> {
+        self.host_controls.with_locked(|| {
+            let mut ticket = self
+                .cancellations
+                .ticket(&self.workspace_key, command.tab_id());
+            if let Some(registration_lease) = &self.registration_lease {
+                let (registration_ticket, _) = registration_lease.capture()?;
+                ticket.registration = Some(registration_ticket);
             }
-        }
+            Ok(ticket)
+        })
+    }
+
+    fn cancellation_state_for_command(
+        &self,
+        command: &BrowserCommand,
+    ) -> Result<(CancellationTicket, CancellationSubscriptions), BrowserError> {
+        self.host_controls.with_locked(|| {
+            let mut ticket = self
+                .cancellations
+                .ticket(&self.workspace_key, command.tab_id());
+            let mut subscriptions = self
+                .cancellations
+                .subscribe(&self.workspace_key, command.tab_id());
+            if let Some(registration_lease) = &self.registration_lease {
+                let (registration_ticket, registration_cancellation) =
+                    registration_lease.capture()?;
+                ticket.registration = Some(registration_ticket);
+                subscriptions.registration = Some(registration_cancellation);
+            }
+            Ok((ticket, subscriptions))
+        })
+    }
+
+    fn enqueue_lifecycle_command(
+        &self,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+        response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
+    ) -> Result<CancellationSubscriptions, BrowserError> {
+        let control = browser_lifecycle_control(&self.workspace_key, &command)
+            .expect("only lifecycle commands use the priority host queue");
+        self.host_controls
+            .with_lifecycle_queue_locked(|lifecycle_requests| {
+                let registration_state = self
+                    .registration_lease
+                    .as_ref()
+                    .map(BrowserRegistrationLease::capture)
+                    .transpose()?;
+                self.cancellations.interrupt_control(&control);
+                let mut cancellation_ticket = self
+                    .cancellations
+                    .ticket(&self.workspace_key, command.tab_id());
+                let mut subscriptions = self
+                    .cancellations
+                    .subscribe(&self.workspace_key, command.tab_id());
+                if let Some((registration_ticket, registration_cancellation)) = registration_state {
+                    cancellation_ticket.registration = Some(registration_ticket);
+                    subscriptions.registration = Some(registration_cancellation);
+                }
+                lifecycle_requests.push_back(BrowserCommandEnvelope {
+                    workspace_key: self.workspace_key.clone(),
+                    command,
+                    context,
+                    cancellation_ticket,
+                    registration_lease: self.registration_lease.clone(),
+                    response,
+                    pending_work: self.pending_work.track(),
+                });
+                Ok(subscriptions)
+            })
     }
 }
 
@@ -632,13 +964,30 @@ fn command_transport_timeout(base: Duration, command: &BrowserCommand) -> Durati
 pub struct BrowserCommandInbox {
     receiver: mpsc::Receiver<BrowserCommandEnvelope>,
     cancellations: Arc<CancellationEpochs>,
+    host_controls: Arc<HostControlQueue>,
     pending_work: Arc<PendingWork>,
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
 impl BrowserCommandInbox {
     pub async fn recv(&mut self) -> Option<BrowserCommandRequest> {
-        self.receiver.recv().await.map(BrowserCommandRequest::from)
+        while let Some(envelope) = self.receiver.recv().await {
+            if self.cancellations.is_current(
+                &envelope.workspace_key,
+                envelope.command.tab_id(),
+                envelope.cancellation_ticket,
+            ) && registration_ticket_is_current(
+                envelope.registration_lease.as_ref(),
+                envelope.cancellation_ticket.registration,
+            ) {
+                return Some(BrowserCommandRequest::from_envelope(
+                    envelope,
+                    Arc::clone(&self.cancellations),
+                ));
+            }
+            let _ = envelope.response.send(Err(BrowserError::Interrupted));
+        }
+        None
     }
 
     pub fn pending_work_count(&self) -> usize {
@@ -646,11 +995,45 @@ impl BrowserCommandInbox {
     }
 
     pub fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
-        self.cancellations.interrupt_workspace(workspace_key);
+        let control = BrowserHostControl::InterruptWorkspace {
+            workspace_key: workspace_key.clone(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            self.cancellations.interrupt_control(&control)
+        });
     }
 
     pub fn interrupt_tab(&self, workspace_key: &BrowserWorkspaceKey, tab_id: &str) {
-        self.cancellations.interrupt_tab(workspace_key, tab_id);
+        let control = BrowserHostControl::InterruptTab {
+            workspace_key: workspace_key.clone(),
+            tab_id: tab_id.to_string(),
+        };
+        self.host_controls.push_and(control.clone(), || {
+            self.cancellations.interrupt_control(&control)
+        });
+    }
+
+    pub fn drain_host_controls(&self) -> Vec<BrowserHostControl> {
+        self.host_controls.drain()
+    }
+
+    pub fn with_locked_host_work<R>(
+        &self,
+        apply: impl FnOnce(Vec<BrowserHostControl>, Vec<BrowserCommandRequest>) -> R,
+    ) -> R {
+        self.host_controls
+            .with_drain_locked(|controls, lifecycle_requests| {
+                let lifecycle_requests = lifecycle_requests
+                    .into_iter()
+                    .map(|envelope| {
+                        BrowserCommandRequest::from_envelope(
+                            envelope,
+                            Arc::clone(&self.cancellations),
+                        )
+                    })
+                    .collect();
+                apply(controls, lifecycle_requests)
+            })
     }
 
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
@@ -662,6 +1045,9 @@ pub struct BrowserCommandRequest {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
     context: BrowserInvocationContext,
+    cancellation_ticket: CancellationTicket,
+    cancellations: Arc<CancellationEpochs>,
+    registration_lease: Option<BrowserRegistrationLease>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     _pending_work: PendingWorkGuard,
     started_at: String,
@@ -679,6 +1065,17 @@ impl BrowserCommandRequest {
 
     pub fn context(&self) -> &BrowserInvocationContext {
         &self.context
+    }
+
+    pub fn cancellation_is_current(&self) -> bool {
+        self.cancellations.is_current(
+            &self.workspace_key,
+            self.command.tab_id(),
+            self.cancellation_ticket,
+        ) && registration_ticket_is_current(
+            self.registration_lease.as_ref(),
+            self.cancellation_ticket.registration,
+        )
     }
 
     pub(crate) fn started_at(&self) -> &str {
@@ -710,12 +1107,17 @@ pub fn route_browser_request(
     Ok(())
 }
 
-impl From<BrowserCommandEnvelope> for BrowserCommandRequest {
-    fn from(envelope: BrowserCommandEnvelope) -> Self {
+impl BrowserCommandRequest {
+    fn from_envelope(
+        envelope: BrowserCommandEnvelope,
+        cancellations: Arc<CancellationEpochs>,
+    ) -> Self {
         let BrowserCommandEnvelope {
             workspace_key,
             command,
             context,
+            cancellation_ticket,
+            registration_lease,
             response,
             pending_work,
         } = envelope;
@@ -723,6 +1125,9 @@ impl From<BrowserCommandEnvelope> for BrowserCommandRequest {
             workspace_key,
             command,
             context,
+            cancellation_ticket,
+            cancellations,
+            registration_lease,
             response,
             _pending_work: pending_work,
             started_at: OffsetDateTime::now_utc()
@@ -736,20 +1141,85 @@ impl From<BrowserCommandEnvelope> for BrowserCommandRequest {
 pub fn browser_command_channel(capacity: usize) -> (BrowserCommandBridge, BrowserCommandInbox) {
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let cancellations = Arc::new(CancellationEpochs::default());
+    let host_controls = Arc::new(HostControlQueue::default());
     let pending_work = Arc::new(PendingWork::default());
     (
         BrowserCommandBridge {
             sender,
             cancellations: Arc::clone(&cancellations),
+            host_controls: Arc::clone(&host_controls),
             pending_work: Arc::clone(&pending_work),
         },
         BrowserCommandInbox {
             receiver,
             cancellations,
+            host_controls,
             pending_work,
             _main_thread_only: PhantomData,
         },
     )
+}
+
+#[derive(Default)]
+struct HostPriorityQueue {
+    controls: VecDeque<BrowserHostControl>,
+    lifecycle_requests: VecDeque<BrowserCommandEnvelope>,
+}
+
+#[derive(Default)]
+struct HostControlQueue {
+    queued: Mutex<HostPriorityQueue>,
+}
+
+impl HostControlQueue {
+    fn push_and<R>(&self, control: BrowserHostControl, then: impl FnOnce() -> R) -> R {
+        let mut queued = lock(&self.queued);
+        queued.controls.push_back(control);
+        let result = then();
+        drop(queued);
+        result
+    }
+
+    fn with_locked<R>(&self, apply: impl FnOnce() -> R) -> R {
+        let queued = lock(&self.queued);
+        let result = apply();
+        drop(queued);
+        result
+    }
+
+    fn drain(&self) -> Vec<BrowserHostControl> {
+        lock(&self.queued).controls.drain(..).collect()
+    }
+
+    fn with_lifecycle_queue_locked<R>(
+        &self,
+        apply: impl FnOnce(&mut VecDeque<BrowserCommandEnvelope>) -> R,
+    ) -> R {
+        let mut queued = lock(&self.queued);
+        let result = apply(&mut queued.lifecycle_requests);
+        drop(queued);
+        result
+    }
+
+    fn with_drain_controls_locked<R>(&self, apply: impl FnOnce(Vec<BrowserHostControl>) -> R) -> R {
+        let mut queued = lock(&self.queued);
+        let controls = queued.controls.drain(..).collect();
+        let result = apply(controls);
+        drop(queued);
+        result
+    }
+
+    fn with_drain_locked<R>(
+        &self,
+        apply: impl FnOnce(Vec<BrowserHostControl>, Vec<BrowserCommandEnvelope>) -> R,
+    ) -> R {
+        let mut queued = lock(&self.queued);
+        let controls = queued.controls.drain(..).collect();
+        let lifecycle_requests = queued.lifecycle_requests.drain(..).collect();
+        let result = apply(controls, lifecycle_requests);
+        drop(queued);
+        result
+    }
 }
 
 #[derive(Default)]
@@ -781,8 +1251,17 @@ impl Drop for PendingWorkGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CancellationTicket {
+    project: u64,
+    workspace: u64,
+    tab: Option<u64>,
+    registration: Option<BrowserRegistrationLeaseTicket>,
+}
+
 #[derive(Default)]
 struct CancellationEpochs {
+    projects: Mutex<HashMap<String, watch::Sender<u64>>>,
     workspaces: Mutex<HashMap<BrowserWorkspaceKey, watch::Sender<u64>>>,
     tabs: Mutex<HashMap<(BrowserWorkspaceKey, String), watch::Sender<u64>>>,
 }
@@ -793,6 +1272,8 @@ impl CancellationEpochs {
         workspace_key: &BrowserWorkspaceKey,
         tab_id: Option<&str>,
     ) -> CancellationSubscriptions {
+        let project =
+            sender_for(&mut lock(&self.projects), workspace_key.project_id.clone()).subscribe();
         let workspace = sender_for(&mut lock(&self.workspaces), workspace_key.clone()).subscribe();
         let tab = tab_id.map(|tab_id| {
             sender_for(
@@ -801,7 +1282,71 @@ impl CancellationEpochs {
             )
             .subscribe()
         });
-        CancellationSubscriptions { workspace, tab }
+        CancellationSubscriptions {
+            project,
+            workspace,
+            tab,
+            registration: None,
+        }
+    }
+
+    fn ticket(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: Option<&str>,
+    ) -> CancellationTicket {
+        let project = current_epoch(&mut lock(&self.projects), workspace_key.project_id.clone());
+        let workspace = current_epoch(&mut lock(&self.workspaces), workspace_key.clone());
+        let tab = tab_id.map(|tab_id| {
+            current_epoch(
+                &mut lock(&self.tabs),
+                (workspace_key.clone(), tab_id.to_string()),
+            )
+        });
+        CancellationTicket {
+            project,
+            workspace,
+            tab,
+            registration: None,
+        }
+    }
+
+    fn is_current(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: Option<&str>,
+        ticket: CancellationTicket,
+    ) -> bool {
+        current_epoch(&mut lock(&self.projects), workspace_key.project_id.clone()) == ticket.project
+            && current_epoch(&mut lock(&self.workspaces), workspace_key.clone()) == ticket.workspace
+            && tab_id.map(|tab_id| {
+                current_epoch(
+                    &mut lock(&self.tabs),
+                    (workspace_key.clone(), tab_id.to_string()),
+                )
+            }) == ticket.tab
+    }
+
+    fn interrupt_control(&self, control: &BrowserHostControl) {
+        match control {
+            BrowserHostControl::InterruptProject { project_id } => {
+                self.interrupt_project(project_id)
+            }
+            BrowserHostControl::InterruptWorkspace { workspace_key } => {
+                self.interrupt_workspace(workspace_key)
+            }
+            BrowserHostControl::InterruptTab {
+                workspace_key,
+                tab_id,
+            } => self.interrupt_tab(workspace_key, tab_id),
+        }
+    }
+
+    fn interrupt_project(&self, project_id: &str) {
+        advance(sender_for(
+            &mut lock(&self.projects),
+            project_id.to_string(),
+        ));
     }
 
     fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
@@ -831,14 +1376,25 @@ impl CancellationEpochs {
 }
 
 struct CancellationSubscriptions {
+    project: watch::Receiver<u64>,
     workspace: watch::Receiver<u64>,
     tab: Option<watch::Receiver<u64>>,
+    registration: Option<watch::Receiver<u64>>,
 }
 
 async fn wait_for_tab_cancellation(tab: &mut Option<watch::Receiver<u64>>) {
     match tab {
         Some(tab) => {
             let _ = tab.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn wait_for_registration_cancellation(registration: &mut Option<watch::Receiver<u64>>) {
+    match registration {
+        Some(registration) => {
+            let _ = registration.changed().await;
         }
         None => std::future::pending::<()>().await,
     }
@@ -855,6 +1411,15 @@ where
     Key: Eq + std::hash::Hash,
 {
     senders.entry(key).or_insert_with(|| watch::channel(0).0)
+}
+
+fn current_epoch<Key>(senders: &mut HashMap<Key, watch::Sender<u64>>, key: Key) -> u64
+where
+    Key: Eq + std::hash::Hash,
+{
+    let sender = sender_for(senders, key);
+    let epoch = *sender.borrow();
+    epoch
 }
 
 fn advance(sender: &watch::Sender<u64>) {
