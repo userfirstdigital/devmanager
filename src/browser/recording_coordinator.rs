@@ -11,6 +11,59 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAX_RECORDING_TAB_ALIASES: usize = 64;
+const USER_CHROME_WORKSPACE_TAB: &str = "__workspace__";
+
+/// Opaque ownership of one user-chrome recording slot. It deliberately has no
+/// `Debug`, `Clone`, or serialization implementation so neither the sanitized
+/// intent nor the reservation can escape through logging or wire formats.
+pub struct BrowserUserChromeCapture {
+    instance: BrowserRecordingInstance,
+    reservation: BrowserRecordingReservation,
+    intent: BrowserUserChromeIntent,
+}
+
+enum BrowserUserChromeIntent {
+    CreateTab {
+        capture_url: bool,
+    },
+    SelectTab {
+        runtime_tab_id: String,
+    },
+    CloseTab {
+        runtime_tab_id: String,
+    },
+    Navigate {
+        runtime_tab_id: String,
+    },
+    Back {
+        runtime_tab_id: String,
+    },
+    Forward {
+        runtime_tab_id: String,
+    },
+    Reload {
+        runtime_tab_id: String,
+    },
+    UpdateViewport {
+        runtime_tab_id: String,
+        viewport: BrowserRecipeViewport,
+    },
+}
+
+impl BrowserUserChromeIntent {
+    fn reservation_tab_id(&self) -> &str {
+        match self {
+            Self::CreateTab { .. } => USER_CHROME_WORKSPACE_TAB,
+            Self::SelectTab { runtime_tab_id }
+            | Self::CloseTab { runtime_tab_id }
+            | Self::Navigate { runtime_tab_id }
+            | Self::Back { runtime_tab_id }
+            | Self::Forward { runtime_tab_id }
+            | Self::Reload { runtime_tab_id }
+            | Self::UpdateViewport { runtime_tab_id, .. } => runtime_tab_id,
+        }
+    }
+}
 
 struct BrowserRecordingTabAliases {
     instance_id: u64,
@@ -366,104 +419,105 @@ impl BrowserWorkflowCoordinator {
         }
     }
 
-    pub fn record_user_chrome_result(
+    /// Sanitizes a supported user-chrome command and reserves its source-order
+    /// slot before browser state can change. A preflight failure invalidates
+    /// only the exact recording that attempted the capture.
+    pub fn begin_user_chrome_capture(
         &self,
         workspace_key: &BrowserWorkspaceKey,
         command: &BrowserCommand,
-        result: &Result<BrowserResponse, BrowserError>,
-    ) -> Result<BrowserRecordingCommit, BrowserRecordingError> {
-        let Ok(BrowserResponse::Workspace { mutation }) = result else {
-            return Ok(BrowserRecordingCommit::Ignored);
-        };
+    ) -> Result<Option<BrowserUserChromeCapture>, BrowserRecordingError> {
         let mut state = self.lock();
         let Some(instance) = state.recorder.active_instance(workspace_key) else {
-            return Ok(BrowserRecordingCommit::Ignored);
+            return Ok(None);
         };
-
-        let runtime_tab_id = match command {
-            BrowserCommand::CreateTab { .. } => mutation
-                .snapshot
-                .selected_tab_id
-                .as_deref()
-                .ok_or(BrowserRecordingError::InvalidAction)?,
-            BrowserCommand::SelectTab { tab_id }
-            | BrowserCommand::CloseTab { tab_id }
-            | BrowserCommand::Navigate { tab_id, .. }
-            | BrowserCommand::Back { tab_id }
-            | BrowserCommand::Forward { tab_id }
-            | BrowserCommand::Reload { tab_id }
-            | BrowserCommand::UpdateViewport { tab_id, .. } => tab_id,
-            _ => return Ok(BrowserRecordingCommit::Ignored),
+        let intent = match prepare_user_chrome_intent(command) {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                invalidate_exact_recording(&mut state, &instance);
+                return Err(error);
+            }
         };
-        let tab_alias = {
-            let aliases = state
-                .tab_aliases
-                .get_mut(workspace_key)
-                .filter(|aliases| aliases.instance_id == instance.id())
-                .ok_or(BrowserRecordingError::StaleInstance)?;
-            aliases.alias_for(runtime_tab_id)?
-        };
-        let action = match command {
-            BrowserCommand::CreateTab { url } => {
-                let captured_url = if url.is_some() {
-                    mutation
-                        .snapshot
-                        .tabs
-                        .iter()
-                        .find(|tab| tab.id == runtime_tab_id)
-                        .map(|tab| BrowserRecipeValue::Literal {
-                            value: tab.url.clone(),
-                        })
-                } else {
-                    None
-                };
-                BrowserRecordingAction::recipe(BrowserRecipeAction::CreateTab {
-                    tab: tab_alias,
-                    url: captured_url,
-                })?
-            }
-            BrowserCommand::SelectTab { .. } => {
-                BrowserRecordingAction::recipe(BrowserRecipeAction::SelectTab { tab: tab_alias })?
-            }
-            BrowserCommand::CloseTab { .. } => {
-                BrowserRecordingAction::recipe(BrowserRecipeAction::CloseTab { tab: tab_alias })?
-            }
-            BrowserCommand::Navigate { .. } => {
-                let url = mutation
-                    .snapshot
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.id == runtime_tab_id)
-                    .map(|tab| tab.url.as_str())
-                    .ok_or(BrowserRecordingError::InvalidAction)?;
-                BrowserRecordingAction::navigate(url)?
-            }
-            BrowserCommand::Back { .. } => {
-                BrowserRecordingAction::recipe(BrowserRecipeAction::Back)?
-            }
-            BrowserCommand::Forward { .. } => {
-                BrowserRecordingAction::recipe(BrowserRecipeAction::Forward)?
-            }
-            BrowserCommand::Reload { .. } => {
-                BrowserRecordingAction::recipe(BrowserRecipeAction::Reload)?
-            }
-            BrowserCommand::UpdateViewport { viewport, .. } => {
-                BrowserRecordingAction::recipe(BrowserRecipeAction::SetViewport {
-                    viewport: BrowserRecipeViewport::from(viewport.clone()),
-                })?
-            }
-            _ => return Ok(BrowserRecordingCommit::Ignored),
-        };
-        let reservation = state.recorder.reserve_on(
+        let reservation = match state.recorder.reserve_on(
             &instance,
             BrowserRecordingActor::User,
-            runtime_tab_id,
+            intent.reservation_tab_id(),
             BrowserRisk::Normal,
-        )?;
-        let committed = state.recorder.commit(reservation, action)?;
-        if matches!(command, BrowserCommand::CloseTab { .. }) {
-            if let Some(aliases) = state.tab_aliases.get_mut(workspace_key) {
-                aliases.runtime_to_alias.remove(runtime_tab_id);
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                invalidate_exact_recording(&mut state, &instance);
+                return Err(error);
+            }
+        };
+        Ok(Some(BrowserUserChromeCapture {
+            instance,
+            reservation,
+            intent,
+        }))
+    }
+
+    /// Cancels a failed browser mutation or commits the response-derived typed
+    /// action. Any post-success capture failure invalidates only this token's
+    /// exact recording, so an incomplete draft can never remain saveable.
+    pub fn complete_user_chrome_capture(
+        &self,
+        capture: BrowserUserChromeCapture,
+        result: &Result<BrowserResponse, BrowserError>,
+    ) -> Result<BrowserRecordingCommit, BrowserRecordingError> {
+        let BrowserUserChromeCapture {
+            instance,
+            reservation,
+            intent,
+        } = capture;
+        let mut state = self.lock();
+
+        if result.is_err() {
+            return match state.recorder.cancel(reservation) {
+                Ok(BrowserRecordingCommit::Recorded | BrowserRecordingCommit::Buffered) => {
+                    Ok(BrowserRecordingCommit::Ignored)
+                }
+                Ok(BrowserRecordingCommit::Ignored) => {
+                    invalidate_exact_recording(&mut state, &instance);
+                    Err(BrowserRecordingError::StaleReservation)
+                }
+                Err(error) => {
+                    invalidate_exact_recording(&mut state, &instance);
+                    Err(error)
+                }
+            };
+        }
+
+        if !active_instance_matches(&state, &instance) {
+            invalidate_exact_recording(&mut state, &instance);
+            return Err(BrowserRecordingError::StaleInstance);
+        }
+        let prepared =
+            prepare_user_chrome_action(&mut state.tab_aliases, &instance, &intent, result);
+        let (action, closed_runtime_tab) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                invalidate_exact_recording(&mut state, &instance);
+                return Err(error);
+            }
+        };
+        let committed = match state.recorder.commit(reservation, action) {
+            Ok(commit @ (BrowserRecordingCommit::Recorded | BrowserRecordingCommit::Buffered)) => {
+                commit
+            }
+            Ok(BrowserRecordingCommit::Ignored) => {
+                invalidate_exact_recording(&mut state, &instance);
+                return Err(BrowserRecordingError::StaleReservation);
+            }
+            Err(error) => {
+                invalidate_exact_recording(&mut state, &instance);
+                return Err(error);
+            }
+        };
+        if let Some(runtime_tab_id) = closed_runtime_tab {
+            if let Some(aliases) = state.tab_aliases.get_mut(instance.workspace_key()) {
+                aliases.runtime_to_alias.remove(&runtime_tab_id);
             }
         }
         Ok(committed)
@@ -481,6 +535,170 @@ impl BrowserWorkflowCoordinator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn prepare_user_chrome_intent(
+    command: &BrowserCommand,
+) -> Result<Option<BrowserUserChromeIntent>, BrowserRecordingError> {
+    let intent = match command {
+        BrowserCommand::CreateTab { url } => {
+            if let Some(url) = url {
+                BrowserRecordingAction::navigate(url)?;
+            }
+            BrowserUserChromeIntent::CreateTab {
+                capture_url: url.is_some(),
+            }
+        }
+        BrowserCommand::SelectTab { tab_id } => BrowserUserChromeIntent::SelectTab {
+            runtime_tab_id: tab_id.clone(),
+        },
+        BrowserCommand::CloseTab { tab_id } => BrowserUserChromeIntent::CloseTab {
+            runtime_tab_id: tab_id.clone(),
+        },
+        BrowserCommand::Navigate { tab_id, url } => {
+            BrowserRecordingAction::navigate(url)?;
+            BrowserUserChromeIntent::Navigate {
+                runtime_tab_id: tab_id.clone(),
+            }
+        }
+        BrowserCommand::Back { tab_id } => BrowserUserChromeIntent::Back {
+            runtime_tab_id: tab_id.clone(),
+        },
+        BrowserCommand::Forward { tab_id } => BrowserUserChromeIntent::Forward {
+            runtime_tab_id: tab_id.clone(),
+        },
+        BrowserCommand::Reload { tab_id } => BrowserUserChromeIntent::Reload {
+            runtime_tab_id: tab_id.clone(),
+        },
+        BrowserCommand::UpdateViewport { tab_id, viewport } => {
+            let viewport = BrowserRecipeViewport::from(viewport.clone());
+            BrowserRecordingAction::recipe(BrowserRecipeAction::SetViewport {
+                viewport: viewport.clone(),
+            })?;
+            BrowserUserChromeIntent::UpdateViewport {
+                runtime_tab_id: tab_id.clone(),
+                viewport,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(intent))
+}
+
+fn prepare_user_chrome_action(
+    tab_aliases: &mut HashMap<BrowserWorkspaceKey, BrowserRecordingTabAliases>,
+    instance: &BrowserRecordingInstance,
+    intent: &BrowserUserChromeIntent,
+    result: &Result<BrowserResponse, BrowserError>,
+) -> Result<(BrowserRecordingAction, Option<String>), BrowserRecordingError> {
+    let Ok(BrowserResponse::Workspace { mutation }) = result else {
+        return Err(BrowserRecordingError::InvalidAction);
+    };
+    let runtime_tab_id = match intent {
+        BrowserUserChromeIntent::CreateTab { .. } => mutation
+            .snapshot
+            .selected_tab_id
+            .as_deref()
+            .ok_or(BrowserRecordingError::InvalidAction)?,
+        BrowserUserChromeIntent::SelectTab { runtime_tab_id }
+        | BrowserUserChromeIntent::CloseTab { runtime_tab_id }
+        | BrowserUserChromeIntent::Navigate { runtime_tab_id }
+        | BrowserUserChromeIntent::Back { runtime_tab_id }
+        | BrowserUserChromeIntent::Forward { runtime_tab_id }
+        | BrowserUserChromeIntent::Reload { runtime_tab_id }
+        | BrowserUserChromeIntent::UpdateViewport { runtime_tab_id, .. } => runtime_tab_id,
+    };
+    let tab_alias = tab_aliases
+        .get_mut(instance.workspace_key())
+        .filter(|aliases| aliases.instance_id == instance.id())
+        .ok_or(BrowserRecordingError::StaleInstance)?
+        .alias_for(runtime_tab_id)?;
+
+    let action = match intent {
+        BrowserUserChromeIntent::CreateTab { capture_url } => {
+            let captured_url = if *capture_url {
+                Some(BrowserRecipeValue::Literal {
+                    value: mutation
+                        .snapshot
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == runtime_tab_id)
+                        .map(|tab| tab.url.clone())
+                        .ok_or(BrowserRecordingError::InvalidAction)?,
+                })
+            } else {
+                None
+            };
+            BrowserRecordingAction::recipe(BrowserRecipeAction::CreateTab {
+                tab: tab_alias,
+                url: captured_url,
+            })?
+        }
+        BrowserUserChromeIntent::SelectTab { .. } => {
+            BrowserRecordingAction::recipe(BrowserRecipeAction::SelectTab { tab: tab_alias })?
+        }
+        BrowserUserChromeIntent::CloseTab { .. } => {
+            BrowserRecordingAction::recipe(BrowserRecipeAction::CloseTab { tab: tab_alias })?
+        }
+        BrowserUserChromeIntent::Navigate { .. } => {
+            let url = mutation
+                .snapshot
+                .tabs
+                .iter()
+                .find(|tab| tab.id == runtime_tab_id)
+                .map(|tab| tab.url.as_str())
+                .ok_or(BrowserRecordingError::InvalidAction)?;
+            BrowserRecordingAction::navigate(url)?
+        }
+        BrowserUserChromeIntent::Back { .. } => {
+            BrowserRecordingAction::recipe(BrowserRecipeAction::Back)?
+        }
+        BrowserUserChromeIntent::Forward { .. } => {
+            BrowserRecordingAction::recipe(BrowserRecipeAction::Forward)?
+        }
+        BrowserUserChromeIntent::Reload { .. } => {
+            BrowserRecordingAction::recipe(BrowserRecipeAction::Reload)?
+        }
+        BrowserUserChromeIntent::UpdateViewport { viewport, .. } => {
+            BrowserRecordingAction::recipe(BrowserRecipeAction::SetViewport {
+                viewport: viewport.clone(),
+            })?
+        }
+    };
+    let closed_runtime_tab = matches!(intent, BrowserUserChromeIntent::CloseTab { .. })
+        .then(|| runtime_tab_id.to_string());
+    Ok((action, closed_runtime_tab))
+}
+
+fn active_instance_matches(
+    state: &BrowserWorkflowCoordinatorState,
+    instance: &BrowserRecordingInstance,
+) -> bool {
+    state
+        .recorder
+        .active_instance(instance.workspace_key())
+        .is_some_and(|active| active.id() == instance.id())
+}
+
+fn invalidate_exact_recording(
+    state: &mut BrowserWorkflowCoordinatorState,
+    instance: &BrowserRecordingInstance,
+) -> bool {
+    if active_instance_matches(state, instance) {
+        if state.recorder.stop(instance).is_err() {
+            return false;
+        }
+    } else if state.recorder.review(instance).is_err() {
+        return false;
+    }
+    if state.recorder.discard(instance).is_err() {
+        return false;
+    }
+    state.tab_aliases.remove(instance.workspace_key());
+    state
+        .agent_commands
+        .retain(|(workspace_key, _), _| workspace_key != instance.workspace_key());
+    true
 }
 
 fn cancel_pending_agent(recorder: &mut BrowserWorkflowRecorder, pending: PendingAgentRecording) {
@@ -836,4 +1054,53 @@ fn prepare_wait_action(
         }
     };
     BrowserRecordingAction::recipe(BrowserRecipeAction::Wait { condition })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browser::{BrowserRevision, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot};
+
+    #[test]
+    fn post_success_commit_failure_invalidates_the_exact_user_chrome_recording() {
+        let coordinator = BrowserWorkflowCoordinator::default();
+        let workspace = BrowserWorkspaceKey {
+            project_id: "project-commit-failure".to_string(),
+            ai_tab_id: "conversation-commit-failure".to_string(),
+        };
+        coordinator
+            .start(workspace.clone())
+            .expect("start exact recording");
+        let capture = coordinator
+            .begin_user_chrome_capture(
+                &workspace,
+                &BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                },
+            )
+            .expect("preflight user chrome action")
+            .expect("reload reserves before mutation");
+
+        coordinator
+            .cancel(capture.reservation.clone())
+            .expect("induce a stale commit reservation");
+        let result = Ok(BrowserResponse::Workspace {
+            mutation: BrowserWorkspaceMutation {
+                revision: BrowserRevision(1),
+                snapshot: BrowserWorkspaceSnapshot {
+                    revision: BrowserRevision(1),
+                    ..BrowserWorkspaceSnapshot::default()
+                },
+            },
+        });
+        assert_eq!(
+            coordinator.complete_user_chrome_capture(capture, &result),
+            Err(BrowserRecordingError::StaleReservation),
+        );
+        assert_eq!(
+            coordinator.status(&workspace),
+            BrowserRecordingStatus::Inactive,
+            "a successful browser mutation with a failed commit must not leave a draft"
+        );
+    }
 }

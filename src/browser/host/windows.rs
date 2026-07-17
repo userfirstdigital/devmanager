@@ -366,14 +366,31 @@ impl BrowserWebViewHost {
         capture_user_chrome: bool,
     ) -> Result<BrowserResponse, BrowserError> {
         let annotation_command = matches!(&command, BrowserCommand::Annotations { .. });
-        let recording_command = capture_user_chrome.then(|| command.clone());
-        if let Some(control) = browser_lifecycle_control(workspace_key, &command) {
-            self.handle_control(control);
-        }
         let diagnostic_tab = command
             .tab_id()
             .map(ToOwned::to_owned)
             .or_else(|| self.selected_tab_id(workspace_key));
+        let user_chrome_capture = if capture_user_chrome {
+            match self
+                .workflow_coordinator
+                .begin_user_chrome_capture(workspace_key, &command)
+            {
+                Ok(capture) => capture,
+                Err(error) => {
+                    self.emit_diagnostic(
+                        workspace_key,
+                        diagnostic_tab.as_deref().unwrap_or(WORKSPACE_OPERATION_TAB),
+                        format!("browser recording invalidated before chrome action: {error}"),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(control) = browser_lifecycle_control(workspace_key, &command) {
+            self.handle_control(control);
+        }
         let mut result = self.handle_command_inner(window, workspace_key, command);
         if annotation_command {
             if let Ok(response) = result.as_mut() {
@@ -393,22 +410,19 @@ impl BrowserWebViewHost {
                 }
             }
         }
-        if let Some(command) = recording_command {
-            if let Err(error) = self.workflow_coordinator.record_user_chrome_result(
-                workspace_key,
-                &command,
-                &result,
-            ) {
-                if let Some(tab_id) = diagnostic_tab
+        if let Some(capture) = user_chrome_capture {
+            if let Err(error) = self
+                .workflow_coordinator
+                .complete_user_chrome_capture(capture, &result)
+            {
+                let tab_id = diagnostic_tab
                     .clone()
-                    .or_else(|| self.selected_tab_id(workspace_key))
-                {
-                    self.emit_diagnostic(
-                        workspace_key,
-                        &tab_id,
-                        format!("browser recording could not capture chrome action: {error}"),
-                    );
-                }
+                    .or_else(|| self.selected_tab_id(workspace_key));
+                self.emit_diagnostic(
+                    workspace_key,
+                    tab_id.as_deref().unwrap_or(WORKSPACE_OPERATION_TAB),
+                    format!("browser recording invalidated after chrome action: {error}"),
+                );
             }
         }
         if let Err(error) = &result {

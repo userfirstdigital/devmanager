@@ -4,15 +4,15 @@
 
 ### Status
 
-Checkpoint 4 started from the approved clean `master` head `5972652c5df5706ece58ba83b59fd3aa57b563a7`. It adds only unified in-memory capture for user chrome and queued agent/controller actions through the existing page/recording authority. The immutable final head, stable patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
+Checkpoint 4 started from the approved clean `master` head `5972652c5df5706ece58ba83b59fd3aa57b563a7` and initially landed as `1f43913c872ce0476cbe476a0b8ae79b826223b2`. It adds only unified in-memory capture for user chrome and queued agent/controller actions through the existing page/recording authority. Independent review rejected the initial implementation because user-chrome capture reserved only after a successful browser mutation, so a recorder capacity/conversion/commit failure could silently leave a saveable draft missing that action. The focused strict-TDD hardening below fixes that transaction boundary. The immutable follow-up head, stable patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
 
 Checkpoints 5 through 12 are not implemented. This checkpoint adds no pane Record/review UI, MCP recording surface, recipe persistence call, replay compiler/executor, runtime secret prompt, or locator repair.
 
 ### Contract decisions
 
 - `BrowserWorkflowCoordinator` is the single platform-neutral owner used by Windows host page IPC, user chrome, and agent capture. There is no host recorder mirror, agent recorder, or duplicate workspace-instance map.
-- Every producer uses the checkpoint-2 reserve/commit/cancel sequence. Accepted page messages drain before a user command or agent request reserves, agent work reserves before queue admission, and asynchronous completion timing cannot reorder source actions.
-- User chrome records only after an exact successful Workspace response. Create/select/close use deterministic per-instance logical aliases (`tab-1`, `tab-2`, and so on); runtime tab IDs are never emitted. Navigation uses the returned post-success URL and the existing credential-stripping boundary. Page click/type/select/upload/download remain page IPC only, so chrome capture cannot duplicate them.
+- Every producer uses the checkpoint-2 reserve/commit/cancel sequence. Accepted page messages drain before a user command or agent request reserves, user chrome reserves before its browser mutation, agent work reserves before queue admission, and asynchronous completion timing cannot reorder source actions.
+- User chrome preflights a sanitized non-sensitive intent before mutation and retains no raw command URL. Browser failure cancels the reservation. Exact successful Workspace responses are converted into response-derived typed actions and committed; every sanitizer, capacity, alias, conversion, and commit failure invalidates/discards only that transaction's exact incomplete recording and emits a typed host diagnostic. Create/select/close use deterministic per-instance logical aliases (`tab-1`, `tab-2`, and so on); runtime tab IDs are never emitted. Navigation uses the returned post-success URL and the existing credential-stripping boundary. Page click/type/select/upload/download remain page IPC only, so chrome capture cannot duplicate them.
 - Agent `Act` target metadata is runtime-inspected before any command text is copied into recorder-owned state. Password/security/credential targets and password/one-time-code autocomplete values create only an unset Secret input. Sensitive targets retain only these fixed non-text keys: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Home`, `End`, `PageUp`, and `PageDown`. Printable values, whitespace, modifiers, chords, and arbitrary key names are cancelled.
 - Upload capture accepts only the semantic locator and materializes an unset File input. CDP capture accepts only the typed method marker. Upload paths/files and CDP params, request bodies, response bodies, resource data, and inline results never enter coordinator state.
 - Inactive capture is an unconditional no-op. Stop/discard remove pending agent state for that exact instance; late completions are ignored. Direct user input, Stop/close/reset/profile clear, approval denial, callback/process failure, stale cancellation, and queue interruption converge on the same response finalization/cancellation path available at this checkpoint.
@@ -22,7 +22,7 @@ Checkpoints 5 through 12 are not implemented. This checkpoint adds no pane Recor
 - Added a cloneable, mutex-protected coordinator over one `BrowserWorkflowRecorder`, including exact active-instance/project queries, shared page-recorder ingress, bounded logical tab aliases, and pending agent reservations keyed by workspace and operation.
 - Replaced the Windows host's separate recorder plus duplicate instance map with the coordinator. Start/Stop, reinjection, overflow invalidation, reset/profile clear, page IPC, user chrome, and agent queue/controller paths now consult the same authority.
 - Extended strict recipe v1 with typed create/select/close tab, back/forward/reload, viewport, and method-only CDP marker actions. Each variant participates in strict deserialize/validate/reference/redaction/review traversal; create-tab URLs pass the existing recording URL sanitizer.
-- Captured successful user tab create/select/close, navigate, back, forward, reload, and viewport changes. User `Act` remains ignored by chrome capture because semantic page actions arrive only through the private IPC.
+- Captured user tab create/select/close, navigate, back, forward, reload, and viewport changes with an opaque non-Debug/non-Serialize transaction token that owns the exact instance, pre-mutation reservation, and sanitized intent through success commit or browser-failure cancellation. User `Act` remains ignored by chrome capture because semantic page actions arrive only through the private IPC.
 - Reserved every recordable agent command before enqueue, prepared `Act` actions only after runtime target inspection, upgraded reservation risk to effective runtime risk, and finalized before delivering the response. Only exact Workspace/Action/Wait/Screenshot/Upload/CDP response shapes can commit; every other result cancels.
 - Added safe conversions for semantic actions, waits, screenshots, uploads, and CDP method markers. Invalid or unsupported conversions cancel their reservation without blocking later source-order slots.
 
@@ -44,6 +44,26 @@ Checkpoints 5 through 12 are not implemented. This checkpoint adds no pane Recor
 - Native Windows `cargo build --locked` -> exit 0.
 - `cargo fmt --all -- --check` -> exit 0.
 - `git diff --check` -> exit 0.
+
+### Independent review hardening
+
+The review finding was reproduced before production edits: `cargo test --test browser_workflow_coordinator --no-fail-fast` exited 1 with 12 `E0599` compile errors for the absent `begin_user_chrome_capture` and `complete_user_chrome_capture` transaction API. GREEN establishes the transaction at Windows host ingress after draining prior page IPC and before `handle_command_inner` mutates browser state.
+
+- Preflight runs the recording URL/action sanitizer and reserves capacity without retaining a raw command URL. A sanitizer, invalid-action, or reservation/capacity error synchronously stops and discards only the exact active recording before the host proceeds with the browser command, and the host emits a typed `BrowserHostEvent::Diagnostic`.
+- Browser failure cancels the reservation and leaves a complete recording. Exact Workspace success supplies the final tab alias, returned URL, and typed action. Alias exhaustion, response URL rejection, response conversion failure, an ignored/stale commit, or a recorder commit error invalidates and discards only the token's exact recording, so no draft missing a successful mutation remains saveable.
+- Exact-instance invalidation holds the coordinator lock, matches the token's instance ID, and handles either Recording or Review state. A late completion from a stopped/discarded instance cannot stop, discard, or remove aliases from a newer restarted instance.
+- Behavioral coverage includes the complete successful chrome sequence; browser-failure cancellation; direct preflight URL rejection; zero-capacity reservation failure; 65th logical-alias failure; unsafe returned-URL rejection; a genuine post-success stale-reservation commit failure; exact-instance restart fencing; and page-IPC-before-chrome reservation order.
+
+Follow-up verification:
+
+- `cargo test --locked --test browser_workflow_coordinator -- --test-threads=1` -> 13 passed, 0 failed.
+- `cargo test --lib post_success_commit_failure_invalidates_the_exact_user_chrome_recording` -> 1 passed, 0 failed.
+- Focused host, recording, recording IPC, and coordinator integration targets -> 117 passed, 0 failed.
+- Full browser integration targets covering annotations, attachment lifecycle, automation, core, fixture, gateway, host, pane, provider, recipes, recording, recording IPC, and coordinator -> 221 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 110 matching tests passed across all targets, 0 failed.
+- `cargo check --locked --all-targets` -> exit 0.
+- Native Windows `cargo build --locked` -> exit 0.
+- `cargo fmt --all -- --check` and `git diff --check` -> exit 0.
 
 ### Files
 

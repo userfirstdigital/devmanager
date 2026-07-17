@@ -199,22 +199,30 @@ fn successful_user_chrome_commands_record_without_duplicating_page_actions() {
     ];
 
     for (command, response) in cases {
+        let capture = coordinator
+            .begin_user_chrome_capture(&workspace, &command)
+            .expect("preflight successful chrome command")
+            .expect("supported chrome command reserves before mutation");
         assert_eq!(
             coordinator
-                .record_user_chrome_result(&workspace, &command, &Ok(response))
-                .expect("record successful chrome command"),
+                .complete_user_chrome_capture(capture, &Ok(response))
+                .expect("commit successful chrome command"),
             BrowserRecordingCommit::Recorded,
         );
     }
 
+    let failed_command = BrowserCommand::Navigate {
+        tab_id: "tab-new".to_string(),
+        url: "https://example.test/failed".to_string(),
+    };
+    let failed_capture = coordinator
+        .begin_user_chrome_capture(&workspace, &failed_command)
+        .expect("preflight failed browser mutation")
+        .expect("supported failed mutation still reserves before execution");
     assert_eq!(
         coordinator
-            .record_user_chrome_result(
-                &workspace,
-                &BrowserCommand::Navigate {
-                    tab_id: "tab-new".to_string(),
-                    url: "https://example.test/failed".to_string(),
-                },
+            .complete_user_chrome_capture(
+                failed_capture,
                 &Err(BrowserError::NavigationFailure {
                     url: "https://example.test/failed".to_string(),
                     message: "failed".to_string(),
@@ -226,7 +234,7 @@ fn successful_user_chrome_commands_record_without_duplicating_page_actions() {
 
     assert_eq!(
         coordinator
-            .record_user_chrome_result(
+            .begin_user_chrome_capture(
                 &workspace,
                 &BrowserCommand::Act {
                     tab_id: "tab-new".to_string(),
@@ -234,15 +242,10 @@ fn successful_user_chrome_commands_record_without_duplicating_page_actions() {
                         target: BrowserActionTarget::default(),
                     }],
                 },
-                &Ok(devmanager::browser::BrowserResponse::Action {
-                    result: devmanager::browser::BrowserActionResult {
-                        completed_actions: 1,
-                        revision: devmanager::browser::BrowserRevision(8),
-                    },
-                }),
             )
-            .expect("page action must remain on semantic IPC"),
-        BrowserRecordingCommit::Ignored,
+            .expect("page action must remain on semantic IPC")
+            .is_none(),
+        true,
         "user page clicks and typing must not be captured again from host commands"
     );
 
@@ -284,13 +287,177 @@ fn successful_user_chrome_commands_record_without_duplicating_page_actions() {
 }
 
 #[test]
+fn user_chrome_capture_failures_never_leave_a_saveable_incomplete_recording() {
+    let workspace = workspace();
+
+    let preflight_sanitizer = BrowserWorkflowCoordinator::default();
+    preflight_sanitizer
+        .start(workspace.clone())
+        .expect("start preflight sanitizer recording");
+    assert!(matches!(
+        preflight_sanitizer.begin_user_chrome_capture(
+            &workspace,
+            &BrowserCommand::Navigate {
+                tab_id: "tab-a".to_string(),
+                url: "https://user:secret@example.test/private".to_string(),
+            },
+        ),
+        Err(devmanager::browser::BrowserRecordingError::InvalidAction)
+    ));
+    assert_eq!(
+        preflight_sanitizer.status(&workspace),
+        BrowserRecordingStatus::Inactive
+    );
+
+    let capacity = BrowserWorkflowCoordinator::with_capacity(0);
+    capacity
+        .start(workspace.clone())
+        .expect("start capacity recording");
+    assert!(matches!(
+        capacity.begin_user_chrome_capture(
+            &workspace,
+            &BrowserCommand::Reload {
+                tab_id: "tab-a".to_string(),
+            },
+        ),
+        Err(devmanager::browser::BrowserRecordingError::CapacityExceeded)
+    ));
+    assert_eq!(
+        capacity.status(&workspace),
+        BrowserRecordingStatus::Inactive
+    );
+
+    let alias = BrowserWorkflowCoordinator::default();
+    alias
+        .start(workspace.clone())
+        .expect("start alias recording");
+    for index in 0..64 {
+        let tab_id = format!("tab-{index}");
+        let alias_capture = alias
+            .begin_user_chrome_capture(
+                &workspace,
+                &BrowserCommand::SelectTab {
+                    tab_id: tab_id.clone(),
+                },
+            )
+            .expect("reserve before alias conversion")
+            .expect("select tab is captured");
+        alias
+            .complete_user_chrome_capture(
+                alias_capture,
+                &Ok(workspace_response("https://example.test/", &tab_id)),
+            )
+            .expect("fill one bounded logical alias");
+    }
+    let alias_capture = alias
+        .begin_user_chrome_capture(
+            &workspace,
+            &BrowserCommand::SelectTab {
+                tab_id: "tab-overflow".to_string(),
+            },
+        )
+        .expect("reserve before alias conversion")
+        .expect("select tab is captured");
+    assert_eq!(
+        alias.complete_user_chrome_capture(
+            alias_capture,
+            &Ok(workspace_response("https://example.test/", "tab-overflow",)),
+        ),
+        Err(devmanager::browser::BrowserRecordingError::CapacityExceeded),
+    );
+    assert_eq!(alias.status(&workspace), BrowserRecordingStatus::Inactive);
+
+    let sanitizer = BrowserWorkflowCoordinator::default();
+    sanitizer
+        .start(workspace.clone())
+        .expect("start sanitizer recording");
+    let sanitizer_capture = sanitizer
+        .begin_user_chrome_capture(
+            &workspace,
+            &BrowserCommand::Navigate {
+                tab_id: "tab-a".to_string(),
+                url: "https://example.test/safe".to_string(),
+            },
+        )
+        .expect("safe intent passes preflight")
+        .expect("navigate is captured");
+    assert_eq!(
+        sanitizer.complete_user_chrome_capture(
+            sanitizer_capture,
+            &Ok(workspace_response(
+                "https://user:secret@example.test/private",
+                "tab-a",
+            )),
+        ),
+        Err(devmanager::browser::BrowserRecordingError::InvalidAction),
+    );
+    assert_eq!(
+        sanitizer.status(&workspace),
+        BrowserRecordingStatus::Inactive
+    );
+}
+
+#[test]
+fn stale_user_chrome_completion_cannot_discard_a_restarted_recording() {
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let workspace = workspace();
+    let old = coordinator
+        .start(workspace.clone())
+        .expect("start old recording");
+    let capture = coordinator
+        .begin_user_chrome_capture(
+            &workspace,
+            &BrowserCommand::Reload {
+                tab_id: "tab-old".to_string(),
+            },
+        )
+        .expect("reserve old mutation")
+        .expect("reload is captured");
+    coordinator.stop(&old).expect("stop old exact instance");
+    coordinator
+        .discard(&old)
+        .expect("discard old exact instance");
+    let replacement = coordinator
+        .start(workspace.clone())
+        .expect("start replacement recording");
+
+    assert!(coordinator
+        .complete_user_chrome_capture(
+            capture,
+            &Ok(workspace_response("https://example.test/", "tab-old")),
+        )
+        .is_err());
+    assert_eq!(
+        coordinator.active_instance(&workspace),
+        Some(replacement),
+        "stale completion must not discard the replacement instance"
+    );
+    assert_eq!(
+        coordinator.status(&workspace),
+        BrowserRecordingStatus::Recording
+    );
+}
+
+#[test]
 fn windows_host_routes_page_ipc_and_user_chrome_through_the_shared_coordinator() {
     let windows = include_str!("../src/browser/host/windows.rs");
     assert!(windows.contains("workflow_coordinator: BrowserWorkflowCoordinator"));
     assert!(!windows.contains("workflow_recorder: BrowserWorkflowRecorder"));
     assert!(!windows.contains("recording_instances:"));
     assert!(windows.contains("workflow_coordinator.with_recorder"));
-    assert!(windows.contains("record_user_chrome_result"));
+    assert!(windows.contains("begin_user_chrome_capture"));
+    assert!(windows.contains("complete_user_chrome_capture"));
+    assert!(!windows.contains("record_user_chrome_result"));
+    let begin = windows
+        .find(".begin_user_chrome_capture(")
+        .expect("user chrome preflight reservation");
+    let mutate = windows
+        .find("self.handle_command_inner(window, workspace_key, command)")
+        .expect("user chrome browser mutation");
+    assert!(
+        begin < mutate,
+        "capture must reserve before browser mutation"
+    );
 }
 
 #[test]
@@ -585,13 +752,17 @@ fn stop_restart_and_workspace_lifecycle_fence_late_agent_completions() {
             BrowserRisk::Normal,
         )
         .expect("reserve old instance action");
+    let workspace_b_command = BrowserCommand::Navigate {
+        tab_id: "tab-b".to_string(),
+        url: "https://example.test/workspace-b".to_string(),
+    };
+    let workspace_b_capture = coordinator
+        .begin_user_chrome_capture(&workspace_b, &workspace_b_command)
+        .expect("preflight independent workspace B action")
+        .expect("navigate reserves before mutation");
     coordinator
-        .record_user_chrome_result(
-            &workspace_b,
-            &BrowserCommand::Navigate {
-                tab_id: "tab-b".to_string(),
-                url: "https://example.test/workspace-b".to_string(),
-            },
+        .complete_user_chrome_capture(
+            workspace_b_capture,
             &Ok(workspace_response(
                 "https://example.test/workspace-b",
                 "tab-b",
@@ -629,10 +800,13 @@ fn stop_restart_and_workspace_lifecycle_fence_late_agent_completions() {
     let create = BrowserCommand::CreateTab {
         url: Some("https://example.test/restarted".to_string()),
     };
+    let restarted_capture = coordinator
+        .begin_user_chrome_capture(&workspace_a, &create)
+        .expect("preflight restarted authority")
+        .expect("create tab reserves before mutation");
     coordinator
-        .record_user_chrome_result(
-            &workspace_a,
-            &create,
+        .complete_user_chrome_capture(
+            restarted_capture,
             &Ok(workspace_response(
                 "https://example.test/restarted",
                 "runtime-tab-after-restart",
