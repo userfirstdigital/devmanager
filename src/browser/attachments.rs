@@ -1,10 +1,11 @@
 use super::{
     redact_browser_text, BrowserAnnotation, BrowserAttachmentRevision, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserWorkspaceSnapshot, REDACTED_VALUE,
 };
+use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub const MAX_BROWSER_ATTACHMENT_PREAMBLE_BYTES: usize = 2_048;
 const MAX_BROWSER_ATTACHMENT_TOMBSTONES: usize = 512;
@@ -30,8 +31,24 @@ fn prompt_text_opens_boundary(text: &str) -> bool {
     !text.is_empty()
         && text.chars().all(|character| {
             matches!(character, ' ' | '\r' | '\n')
-                || (!character.is_control() && !character.is_whitespace())
+                || (!character.is_control()
+                    && !character.is_whitespace()
+                    && !is_non_printable_unicode(character))
         })
+}
+
+fn is_non_printable_unicode(character: char) -> bool {
+    static NON_PRINTABLE: OnceLock<Regex> = OnceLock::new();
+    let expression = NON_PRINTABLE.get_or_init(|| {
+        // Rust `char` excludes UTF-16 surrogate code points. Cc is covered
+        // by `char::is_control`; this covers the remaining representable
+        // non-printing General Category C values without rejecting combining
+        // marks or ordinary emoji/text.
+        Regex::new(r"[\p{Format}\p{Private_Use}\p{Unassigned}]")
+            .expect("non-printable Unicode category expression is valid")
+    });
+    let mut encoded = [0; 4];
+    expression.is_match(character.encode_utf8(&mut encoded))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +185,14 @@ impl BrowserAttachmentBroker {
         let workspace = broker.workspaces.entry(workspace_key.clone()).or_default();
         let before = projection_for(&workspace_key, workspace);
 
+        // A saved annotation remains in this map after it is delivered or
+        // detached. That identity is the durable suppression record once the
+        // bounded tombstone queue has evicted an old entry.
+        let previously_known_annotation_ids = workspace
+            .annotations
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         for annotation in &snapshot.annotations {
             workspace
                 .annotations
@@ -188,6 +213,7 @@ impl BrowserAttachmentBroker {
         let mut added_pending_annotation = false;
         for annotation_id in &snapshot.pending_annotation_ids {
             if workspace.has_tombstone(annotation_id)
+                || previously_known_annotation_ids.contains(annotation_id)
                 || !workspace.annotations.contains_key(annotation_id)
                 || workspace
                     .pending_order
@@ -528,7 +554,7 @@ fn build_attachment_preamble(annotations: &[BrowserAnnotation]) -> String {
         preamble.push_str(" comment=");
         preamble.push_str(&compact_redacted(&annotation.comment, 180));
         preamble.push_str(" url=");
-        preamble.push_str(&compact_redacted(&annotation.url, 240));
+        preamble.push_str(&compact_redacted_url(&annotation.url, 240));
     }
     const SUFFIX: &str = "] ";
     truncate_utf8_bytes(
@@ -557,6 +583,57 @@ fn compact_redacted(value: &str, max_chars: usize) -> String {
         }
     }
     compact.trim().to_string()
+}
+
+fn compact_redacted_url(value: &str, max_chars: usize) -> String {
+    compact_redacted(&redacted_url_summary(value), max_chars)
+}
+
+fn redacted_url_summary(value: &str) -> String {
+    let without_fragment = value.split('#').next().unwrap_or_default();
+    let (base, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(base, query)| {
+            (base, Some(query))
+        });
+    let mut summary = strip_url_userinfo(base);
+    let Some(query) = query else {
+        return summary;
+    };
+    summary.push('?');
+    for (index, entry) in query.split('&').enumerate() {
+        if index > 0 {
+            summary.push('&');
+        }
+        let key = entry.split_once('=').map_or(entry, |(key, _)| key);
+        summary.push_str(&compact_redacted(key, 64));
+        summary.push('=');
+        summary.push_str(REDACTED_VALUE);
+    }
+    summary
+}
+
+fn strip_url_userinfo(base: &str) -> String {
+    let Some(scheme_end) = base.find("://") else {
+        return base.to_string();
+    };
+    let scheme = &base[..scheme_end];
+    if !scheme.chars().enumerate().all(|(index, character)| {
+        (index == 0 && character.is_ascii_alphabetic())
+            || (index > 0
+                && (character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')))
+    }) {
+        return base.to_string();
+    }
+    let authority_start = scheme_end + 3;
+    let authority_end = base[authority_start..]
+        .find('/')
+        .map_or(base.len(), |offset| authority_start + offset);
+    let authority = &base[authority_start..authority_end];
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_and_port)| host_and_port);
+    format!("{}://{}{}", scheme, host_and_port, &base[authority_end..])
 }
 
 fn truncate_utf8_bytes(value: &mut String, max_bytes: usize) {
@@ -616,6 +693,8 @@ mod tests {
     fn prompt_boundary_classifier_accepts_only_user_prompt_content() {
         for input in [
             BrowserPromptInput::Text("hello"),
+            BrowserPromptInput::Text("emoji 😀"),
+            BrowserPromptInput::Text("combining e\u{301}"),
             BrowserPromptInput::Text("é"),
             BrowserPromptInput::Text(" "),
             BrowserPromptInput::Text("\r"),
@@ -634,6 +713,10 @@ mod tests {
             BrowserPromptInput::Text("\u{80}"),
             BrowserPromptInput::Text("\u{a0}"),
             BrowserPromptInput::Text("\u{2028}"),
+            BrowserPromptInput::Text("zero\u{200b}width"),
+            BrowserPromptInput::Text("reordered\u{202e}text"),
+            BrowserPromptInput::Text("private\u{e000}use"),
+            BrowserPromptInput::Text("unassigned\u{0378}codepoint"),
             BrowserPromptInput::RawBytes(&[0xff]),
             BrowserPromptInput::RawBytes(b"\x1b[M !!"),
             BrowserPromptInput::RawBytes(b""),
@@ -682,6 +765,39 @@ mod tests {
         assert!(!reservation.preamble.contains("hunter2"));
         assert!(!reservation.preamble.contains("top-secret"));
         assert!(!reservation.preamble.contains("cssSelectors"));
+    }
+
+    #[test]
+    fn reserved_preamble_never_leaks_url_userinfo_query_or_fragment_values() {
+        let workspace_key = key("project", "conversation");
+        let snapshot = snapshot_with(annotation(
+            "ann-1",
+            "review redirect",
+            "https://alice:password@example.test/signed/path?code=oauth-code&X-Amz-Signature=signed-value&safe=yes#access_token=fragment-secret",
+        ));
+        let broker = BrowserAttachmentBroker::default();
+        broker.observe_workspace(workspace_key.clone(), &snapshot);
+        broker.bind_session("session", workspace_key);
+
+        let reservation = broker
+            .reserve_for_input("session", BrowserPromptInput::Text("go"))
+            .unwrap();
+
+        assert!(reservation
+            .preamble
+            .contains("https://example.test/signed/path"));
+        assert!(reservation.preamble.contains("code=[redacted]"));
+        assert!(reservation.preamble.contains("X-Amz-Signature=[redacted]"));
+        for secret in [
+            "alice",
+            "password",
+            "oauth-code",
+            "signed-value",
+            "safe=yes",
+            "fragment-secret",
+        ] {
+            assert!(!reservation.preamble.contains(secret), "leaked {secret}");
+        }
     }
 
     #[test]
@@ -757,6 +873,31 @@ mod tests {
         broker.observe_workspace(workspace_key.clone(), &second);
         broker.detach(&workspace_key, "ann-2");
         broker.observe_workspace(workspace_key.clone(), &second);
+        assert!(broker
+            .projection(&workspace_key)
+            .pending_annotation_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn stale_snapshots_cannot_resurrect_after_bounded_tombstone_eviction() {
+        let workspace_key = key("project", "conversation");
+        let original = snapshot_with(annotation("ann-0", "first", "https://one.test"));
+        let broker = BrowserAttachmentBroker::default();
+        broker.observe_workspace(workspace_key.clone(), &original);
+        broker.detach(&workspace_key, "ann-0");
+
+        for index in 1..=MAX_BROWSER_ATTACHMENT_TOMBSTONES {
+            let snapshot = snapshot_with(annotation(
+                &format!("ann-{index}"),
+                "later",
+                "https://later.test",
+            ));
+            broker.observe_workspace(workspace_key.clone(), &snapshot);
+            broker.detach(&workspace_key, &format!("ann-{index}"));
+        }
+
+        broker.observe_workspace(workspace_key.clone(), &original);
         assert!(broker
             .projection(&workspace_key)
             .pending_annotation_ids
