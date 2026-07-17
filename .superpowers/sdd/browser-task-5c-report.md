@@ -1,5 +1,58 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 6: Exact `browser_recording` MCP
+
+### Status
+
+Checkpoint 6 started from the approved clean checkpoint-5 head `e39693c6bcf6d7d78d11d469423df0d072099ec2`. It implements only the exact authenticated recording MCP group and its host/store safety path. The immutable final head, stable patch ID, and review package range are recorded by the checkpoint handoff after the commit exists.
+
+Checkpoints 7 through 12 are not implemented. This checkpoint adds no workflow replay/compiler/status, replay cancellation lease, runtime secret prompt, locator failure/repair state, or `browser_workflow` MCP group.
+
+### Contract decisions
+
+- `browser_recording` is one exact v1 group with only `status | start | stop | review | discard | save`. Its deny-unknown-fields schema contains only required `intent`, `risk`, and `operation`; intent is nonblank and bounded to 1024 bytes, risk is the existing exact seven-value enum, and no workspace, route, tab, instance, token, password, secret, path, or file-content argument exists.
+- The bearer-authenticated registration remains the sole source of the `BrowserWorkspaceKey` and canonical owning local project root. The root travels in a private request envelope, never in `BrowserCommand`, the MCP schema, response, resource handle, or journal. Missing, noncanonical, UNC/remote, stale-registration, cross-workspace, and unavailable-host paths fail closed.
+- The checkpoint-4 `BrowserWorkflowCoordinator` remains the only Recording/Review authority. Status is inactive by default, start is explicit, stop transitions the exact active instance to Review without saving, and successful save/discard retires only the expected instance. Approval resume carries the original instance ID and immutable request route/root; a replacement review is never mutated by a stale resume.
+- Status/start/stop/review return compact value-free inline state. Stop/review expose the full validated v1 recipe only through an owner-scoped bounded `WorkflowReview` resource. Inline Secret/File data is name/kind only; resource generation revalidates the recipe and cannot retain captured credential text or file material.
+- New-file save has Normal path risk. Runtime-observed overwrite and every discard add Destructive path risk through the existing conservative effective-risk ordering. Save/discard use the existing per-workspace queue and approval event; every operation retains safe actor/intent/timing/result/resource-ID journal metadata without recipe literals or storage paths.
+- Save holds the coordinator review lock across validation, hardened repository IO, and exact discard. The store supports an atomic no-clobber path for Normal new-file writes and atomic replace after overwrite approval. A destination appearing after the risk probe fails closed; storage failure retains Review, while only successful save or explicit discard retires it.
+- The unsupported adapter returns typed platform-unavailable for all six operations. A failed tool call is a typed MCP result and does not terminate the authenticated session.
+
+### RED to GREEN evidence
+
+1. Exact schema/dispatch: RED failed because `browser_recording` did not exist. GREEN proves the exact operation/risk enums, three required fields, bounded intent, forbidden route/secret/path vocabulary, typed malformed errors, all-six authenticated dispatch, and v1 `devmanager-browser` results.
+2. Coordinator/resource handoff: RED failed on absent typed command/result/resource functions. GREEN routes the bearer workspace to the one coordinator and returns owner-isolated validated resources whose Secret/File inputs contain only name/kind and whose bytes omit a captured bearer sentinel.
+3. Authenticated root: RED failed on the absent private root seam. GREEN carries the registration's canonical root in a private request envelope for every operation while keeping it absent from public command/schema/result wires.
+4. Save/discard policy: RED failed on absent overwrite probe, effective risk, exact mutation, and recording approval-resume APIs. GREEN proves Normal new save, Destructive overwrite/discard, exact-instance resume, replacement stale fencing, successful retirement, failure retention, and no-clobber failure when a destination appears after risk probe.
+5. Failure/platform behavior: GREEN keeps observation/lifecycle operations direct, queues save/discard, returns typed non-terminal tool failures, and rejects every operation through the macOS/unsupported adapter.
+
+### Verification
+
+- Recording gateway tests: 3 passed, 0 failed; recording MCP domain tests: 2 passed, 0 failed.
+- Final focused host plus recording MCP gate: 87 passed, 0 failed.
+- Full 15-target browser integration gate: 242 passed, 0 failed before the final unsupported-adapter regression; the final focused gate covers that added regression.
+- `cargo test --locked browser -- --test-threads=1`: 115 matching tests passed, 0 failed.
+- ProcessManager gate: 69 passed and the documented pre-existing `stopped_server_can_start_again_on_same_terminal_session` timeout recurred; its exact rerun passed 1/1 in 1.69 seconds. This checkpoint has no `src/services` diff.
+- `cargo check --locked --all-targets`, native Windows `cargo build --locked`, `cargo fmt --all -- --check`, and `git diff --check`: passed.
+- `cargo check --locked --target aarch64-apple-darwin --lib` was attempted from Windows but stopped in third-party `ring`/`psm`/`aws-lc-sys` build scripts because no Apple-target `cc` is installed. The platform-neutral unsupported seam is compiled and behavior-tested on Windows for all six macOS operations; native macOS compilation remains environment-limited.
+
+### Files
+
+- `src/browser/commands.rs`
+- `src/browser/host/mod.rs`
+- `src/browser/host/unsupported.rs`
+- `src/browser/host/windows.rs`
+- `src/browser/mcp.rs`
+- `src/browser/mod.rs`
+- `src/browser/pane.rs`
+- `src/browser/recipes.rs`
+- `src/browser/recording.rs`
+- `src/browser/recording_mcp.rs`
+- `src/browser/resources.rs`
+- `tests/browser_gateway.rs`
+- `tests/browser_host.rs`
+- `tests/browser_recording_mcp.rs`
+
 ## Checkpoint 5: Pane Record/review UI
 
 ### Status

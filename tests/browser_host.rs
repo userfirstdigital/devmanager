@@ -4,9 +4,10 @@ use devmanager::browser::{
     browser_response_resource_ids, browser_user_input_initialization_script, crop_annotation_png,
     effective_browser_annotation_risk, parse_browser_annotation_ipc_message,
     parse_browser_page_ipc_message, prepare_verified_download_root, prepare_verified_profile_root,
-    remove_verified_profile, route_browser_request, unique_download_path, unsupported_host_status,
-    unsupported_platform_error, validate_annotation_candidate_context, validate_browser_url,
-    BrowserAction, BrowserActionTarget, BrowserAnnotation, BrowserAnnotationCandidate,
+    remove_verified_profile, route_browser_request, unique_download_path,
+    unsupported_command_response, unsupported_host_status, unsupported_platform_error,
+    validate_annotation_candidate_context, validate_browser_url, BrowserAction,
+    BrowserActionTarget, BrowserAnnotation, BrowserAnnotationCandidate,
     BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationKind,
     BrowserAnnotationLifecycle, BrowserAnnotationOperation, BrowserAnnotationRoute,
     BrowserAttachmentBroker, BrowserAttachmentRevision, BrowserBounds, BrowserCommand,
@@ -16,12 +17,73 @@ use devmanager::browser::{
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserMemoryTarget, BrowserNetworkOperation, BrowserOperationQueue,
     BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
-    BrowserPerformanceOperation, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
-    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
-    BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
-    BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost, BrowserWorkspaceKey,
-    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot, MAX_BROWSER_JOURNAL_ENTRIES,
+    BrowserPerformanceOperation, BrowserRecordingOperation, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
+    BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind,
+    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost,
+    BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    MAX_BROWSER_JOURNAL_ENTRIES,
 };
+
+#[test]
+fn recording_observation_preempts_but_destructive_lifecycle_uses_the_approval_queue() {
+    for operation in [
+        BrowserRecordingOperation::Status,
+        BrowserRecordingOperation::Start,
+        BrowserRecordingOperation::Stop,
+        BrowserRecordingOperation::Review,
+    ] {
+        assert!(browser_request_preempts_operation_queue(
+            &BrowserCommand::Recording { operation }
+        ));
+    }
+    for operation in [
+        BrowserRecordingOperation::Discard,
+        BrowserRecordingOperation::Save,
+    ] {
+        assert!(!browser_request_preempts_operation_queue(
+            &BrowserCommand::Recording { operation }
+        ));
+    }
+}
+
+#[test]
+fn recording_save_and_discard_use_authenticated_root_and_resume_exact_risk_approval() {
+    let source = std::fs::read_to_string("src/browser/host/windows.rs").unwrap();
+    for contract in [
+        "BrowserApprovalResume::Recording",
+        "fn begin_recording_request",
+        "request.local_project_root()",
+        "effective_browser_recording_risk",
+        "browser_recording_save_would_overwrite",
+        "save_browser_recording_review",
+        "discard_browser_recording",
+    ] {
+        assert!(
+            source.contains(contract),
+            "missing host contract: {contract}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_macos_rejects_every_recording_operation_with_the_typed_platform_error() {
+    for operation in [
+        BrowserRecordingOperation::Status,
+        BrowserRecordingOperation::Start,
+        BrowserRecordingOperation::Stop,
+        BrowserRecordingOperation::Review,
+        BrowserRecordingOperation::Discard,
+        BrowserRecordingOperation::Save,
+    ] {
+        assert_eq!(
+            unsupported_command_response("macos", BrowserCommand::Recording { operation },),
+            Err(BrowserError::UnavailablePlatform {
+                platform: "macos".to_string(),
+            }),
+        );
+    }
+}
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;

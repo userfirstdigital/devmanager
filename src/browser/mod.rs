@@ -15,6 +15,7 @@ mod recipes;
 mod recording;
 mod recording_coordinator;
 mod recording_ipc;
+mod recording_mcp;
 mod resources;
 mod storage;
 
@@ -51,6 +52,7 @@ pub use commands::{
     BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserController,
     BrowserDiagnosticLevel, BrowserDownloadState, BrowserHostControl, BrowserHostEvent,
     BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext, BrowserPageLoadState,
+    BrowserRecordingInputSummary, BrowserRecordingOperation, BrowserRecordingResult,
     BrowserResponse, BrowserUserInputKind,
 };
 pub use downloads::{
@@ -60,10 +62,11 @@ pub use downloads::{
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub use host::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
-    unique_download_path, unsupported_host_status, unsupported_platform_error,
-    validate_browser_url, BrowserAnnotationMutationResult, BrowserHostState, BrowserMemoryTarget,
-    BrowserProfileClearPlan, BrowserProjectContextKey, BrowserViewCreationPlan,
-    BrowserViewVisibilityPlan, BrowserWebViewHost, BrowserWorkspaceMutation,
+    unique_download_path, unsupported_command_response, unsupported_host_status,
+    unsupported_platform_error, validate_browser_url, BrowserAnnotationMutationResult,
+    BrowserHostState, BrowserMemoryTarget, BrowserProfileClearPlan, BrowserProjectContextKey,
+    BrowserViewCreationPlan, BrowserViewVisibilityPlan, BrowserWebViewHost,
+    BrowserWorkspaceMutation,
 };
 pub use model::{
     BrowserAnnotation, BrowserAnnotationKind, BrowserAttachmentRevision, BrowserBounds,
@@ -122,6 +125,11 @@ pub use recording_ipc::{
     MAX_BROWSER_PAGE_RECORDING_IPC_DEPTH, MAX_BROWSER_PAGE_RECORDING_IPC_STRINGS,
     MAX_BROWSER_PAGE_RECORDING_LOCATOR_FALLBACKS, MAX_BROWSER_PAGE_RECORDING_SELECT_VALUES,
     MAX_BROWSER_PAGE_RECORDING_STRING_BYTES,
+};
+pub use recording_mcp::{
+    browser_recording_review_result, browser_recording_save_would_overwrite,
+    browser_recording_status_result, discard_browser_recording, effective_browser_recording_risk,
+    save_browser_recording_review,
 };
 pub use resources::{
     resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,

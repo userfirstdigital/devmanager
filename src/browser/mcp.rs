@@ -2,9 +2,9 @@ use super::{
     classify_upload_path, effective_browser_risk, resource_id_from_uri, BrowserAction,
     BrowserActionTarget, BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation,
     BrowserController, BrowserDownloadOperation, BrowserError, BrowserInvocationContext,
-    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserResourceStore, BrowserResponse,
-    BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
-    BrowserWorkspaceSnapshot,
+    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserRecordingOperation,
+    BrowserResourceStore, BrowserResponse, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot,
+    BrowserWaitCondition, BrowserWorkspaceSnapshot,
 };
 use base64::Engine as _;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+const MAX_BROWSER_MCP_INTENT_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +70,42 @@ struct BrowserAnnotationsRequestWire {
 #[derive(Debug)]
 struct BrowserAnnotationsRequest {
     parsed: Result<BrowserAnnotationsRequestWire, String>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserRecordingRequestWire {
+    #[schemars(length(max = 1024))]
+    intent: String,
+    risk: BrowserMcpRisk,
+    operation: BrowserRecordingOperation,
+}
+
+#[derive(Debug)]
+struct BrowserRecordingRequest {
+    parsed: Result<BrowserRecordingRequestWire, String>,
+}
+
+impl<'de> Deserialize<'de> for BrowserRecordingRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Ok(Self {
+            parsed: serde_json::from_value(value).map_err(|error| error.to_string()),
+        })
+    }
+}
+
+impl rmcp::schemars::JsonSchema for BrowserRecordingRequest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "BrowserRecordingRequest".into()
+    }
+
+    fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        BrowserRecordingRequestWire::json_schema(generator)
+    }
 }
 
 impl<'de> Deserialize<'de> for BrowserAnnotationsRequest {
@@ -632,6 +670,69 @@ impl BrowserMcpServer {
                     "browser host returned the wrong annotation response type",
                 )),
             }
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_recording",
+        description = "Inspect or explicitly control the workflow recording owned by this conversation's DevManager browser pane."
+    )]
+    async fn browser_recording(
+        &self,
+        Parameters(request): Parameters<BrowserRecordingRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let request = request.parsed.map_err(|message| {
+                ToolFailure::invalid_request(format!(
+                    "malformed browser_recording request: {message}"
+                ))
+            })?;
+            if request.intent.len() > MAX_BROWSER_MCP_INTENT_BYTES {
+                return Err(ToolFailure::invalid_request(
+                    "intent must be at most 1024 bytes",
+                ));
+            }
+            let context = invocation_context(&request.intent, request.risk)?;
+            self.validate_and_ensure(&context).await?;
+            let response = self
+                .context
+                .controller
+                .request_with_local_project_root(
+                    BrowserCommand::Recording {
+                        operation: request.operation,
+                    },
+                    context,
+                    &self.context.project_root,
+                )
+                .await
+                .map_err(ToolFailure::from)?;
+            let BrowserResponse::Recording { result } = response else {
+                return Err(ToolFailure::invalid_response(
+                    "browser host returned the wrong recording response type",
+                ));
+            };
+            if result.operation != request.operation {
+                return Err(ToolFailure::invalid_response(
+                    "browser host returned the wrong recording operation",
+                ));
+            }
+            Ok(json!({
+                "ok": true,
+                "version": 1,
+                "operation": result.operation,
+                "recording": {
+                    "status": result.status,
+                    "recordingId": result.recording_id,
+                    "recipeId": result.recipe_id,
+                    "stepCount": result.step_count,
+                    "inputs": result.inputs,
+                    "valid": result.valid,
+                },
+                "resource": result.resource,
+                "overwroteExisting": result.overwrote_existing,
+            }))
         }
         .await;
         into_tool_result(result)

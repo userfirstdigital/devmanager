@@ -4,6 +4,7 @@ use super::{
     BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
     BrowserRecipeWait, BrowserRisk, BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
@@ -19,7 +20,8 @@ pub enum BrowserRecordingActor {
     Agent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub enum BrowserRecordingStatus {
     Inactive,
     Recording,

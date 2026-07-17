@@ -16,7 +16,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 pub use unsupported::BrowserWebViewHost;
-pub use unsupported::{unsupported_host_status, unsupported_platform_error};
+pub use unsupported::{
+    unsupported_command_response, unsupported_host_status, unsupported_platform_error,
+};
 #[cfg(target_os = "windows")]
 pub use windows::BrowserWebViewHost;
 

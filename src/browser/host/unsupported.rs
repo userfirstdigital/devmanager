@@ -2,13 +2,13 @@
 use super::super::{
     apply_browser_workflow_review_mutation, browser_workflow_review_projection,
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
-    BrowserBounds, BrowserCommand, BrowserCommandRequest, BrowserHostControl, BrowserHostEvent,
+    BrowserBounds, BrowserCommandRequest, BrowserHostControl, BrowserHostEvent,
     BrowserPageRecordingIpcError, BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError,
-    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus, BrowserResponse,
+    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus,
     BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
     BrowserWorkspaceKey,
 };
-use super::super::{BrowserError, BrowserHostStatus};
+use super::super::{BrowserCommand, BrowserError, BrowserHostStatus, BrowserResponse};
 #[cfg(not(target_os = "windows"))]
 use super::{BrowserHostState, BrowserWorkspaceSnapshot};
 #[cfg(not(target_os = "windows"))]
@@ -35,6 +35,20 @@ pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus
 pub fn unsupported_platform_error(platform: impl Into<String>) -> BrowserError {
     BrowserError::UnavailablePlatform {
         platform: platform.into(),
+    }
+}
+
+pub fn unsupported_command_response(
+    platform: impl Into<String>,
+    command: BrowserCommand,
+) -> Result<BrowserResponse, BrowserError> {
+    let platform = platform.into();
+    if command == BrowserCommand::Status {
+        Ok(BrowserResponse::Status {
+            status: unsupported_host_status(platform),
+        })
+    } else {
+        Err(unsupported_platform_error(platform))
     }
 }
 
@@ -202,13 +216,7 @@ impl BrowserWebViewHost {
         _workspace_key: &super::super::BrowserWorkspaceKey,
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
-        if command == BrowserCommand::Status {
-            Ok(BrowserResponse::Status {
-                status: self.status(),
-            })
-        } else {
-            Err(unsupported_platform_error(std::env::consts::OS))
-        }
+        unsupported_command_response(std::env::consts::OS, command)
     }
 
     pub fn handle_request(&mut self, window: &gpui::Window, request: BrowserCommandRequest) {

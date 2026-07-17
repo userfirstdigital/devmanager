@@ -8,12 +8,15 @@ use crate::browser::downloads::{
 };
 use crate::browser::{
     apply_browser_workflow_review_mutation, browser_lifecycle_control,
-    browser_page_origin_from_url, browser_request_preempts_operation_queue,
-    browser_response_resource_ids, browser_workflow_review_projection, build_semantic_snapshot,
-    crop_annotation_png, discard_browser_workflow_review, effective_browser_annotation_risk,
-    effective_browser_risk, effective_browser_risk_for_targets, parse_browser_page_ipc_message,
-    prepare_verified_download_root, preview_browser_workflow_review, redact_browser_resource_bytes,
-    redact_browser_text, remove_verified_profile, save_browser_workflow_review,
+    browser_page_origin_from_url, browser_recording_review_result,
+    browser_recording_save_would_overwrite, browser_recording_status_result,
+    browser_request_preempts_operation_queue, browser_response_resource_ids,
+    browser_workflow_review_projection, build_semantic_snapshot, crop_annotation_png,
+    discard_browser_recording, discard_browser_workflow_review, effective_browser_annotation_risk,
+    effective_browser_recording_risk, effective_browser_risk, effective_browser_risk_for_targets,
+    parse_browser_page_ipc_message, prepare_verified_download_root,
+    preview_browser_workflow_review, redact_browser_resource_bytes, redact_browser_text,
+    remove_verified_profile, save_browser_recording_review, save_browser_workflow_review,
     validate_annotation_candidate_context, BrowserAction, BrowserActionResult,
     BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDraft,
     BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
@@ -27,12 +30,13 @@ use crate::browser::{
     BrowserPageRecordingIpcError, BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
     BrowserPageRecordingTransportFailureKind, BrowserPaneSurface, BrowserPerformanceOperation,
     BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
-    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus,
-    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
-    BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode,
-    BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult, BrowserWaitResult,
-    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
+    BrowserRecordingInstance, BrowserRecordingOperation, BrowserRecordingReview,
+    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget,
+    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
+    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
+    BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -110,6 +114,7 @@ enum BrowserAsyncPhase {
 enum BrowserApprovalResume {
     Command,
     Annotation,
+    Recording { instance_id: u64 },
     Actions(Vec<BrowserAction>),
 }
 
@@ -662,6 +667,30 @@ impl BrowserWebViewHost {
         }
         if matches!(request.command(), BrowserCommand::Annotations { .. }) {
             match self.begin_annotation_request(window, &target, &request, None) {
+                BrowserStartResult::Pending(phase) => {
+                    self.active_requests.insert(
+                        target,
+                        ActiveBrowserRequest {
+                            request,
+                            phase,
+                            approved_risk: None,
+                            _started_at: Instant::now(),
+                        },
+                    );
+                }
+                BrowserStartResult::Complete(result) => {
+                    self.finish_queued_request(window, target, operation_id, request, result);
+                }
+            }
+            return;
+        }
+        if matches!(
+            request.command(),
+            BrowserCommand::Recording {
+                operation: BrowserRecordingOperation::Discard | BrowserRecordingOperation::Save,
+            }
+        ) {
+            match self.begin_recording_request(window, &target, &request, None, None) {
                 BrowserStartResult::Pending(phase) => {
                     self.active_requests.insert(
                         target,
@@ -1242,6 +1271,108 @@ impl BrowserWebViewHost {
         ))
     }
 
+    fn begin_recording_request(
+        &mut self,
+        _window: &gpui::Window,
+        target: &BrowserOperationTarget,
+        request: &BrowserCommandRequest,
+        approved_risk: Option<crate::browser::BrowserRisk>,
+        expected_instance_id: Option<u64>,
+    ) -> BrowserStartResult {
+        let BrowserCommand::Recording { operation } = request.command() else {
+            return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
+                message: "unexpected browser recording command".to_string(),
+            }));
+        };
+        if !matches!(
+            operation,
+            BrowserRecordingOperation::Discard | BrowserRecordingOperation::Save
+        ) {
+            return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
+                message: "unexpected browser recording observation on the mutation path"
+                    .to_string(),
+            }));
+        }
+        if let Err(error) = self.ensure_runtime_available() {
+            return BrowserStartResult::Complete(Err(error));
+        }
+        let Some(instance) = self
+            .workflow_coordinator
+            .current_instance(request.workspace_key())
+        else {
+            return BrowserStartResult::Complete(Err(stale_recording_instance()));
+        };
+        if expected_instance_id.is_some_and(|expected| expected != instance.id()) {
+            return BrowserStartResult::Complete(Err(stale_recording_instance()));
+        }
+        let instance_id = instance.id();
+        let overwrites_existing = match operation {
+            BrowserRecordingOperation::Save => {
+                let Some(project_root) = request.local_project_root() else {
+                    return BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
+                        field: "localProjectRoot".to_string(),
+                    }));
+                };
+                match browser_recording_save_would_overwrite(
+                    &self.workflow_coordinator,
+                    request.workspace_key(),
+                    instance_id,
+                    project_root,
+                ) {
+                    Ok(overwrites_existing) => overwrites_existing,
+                    Err(error) => return BrowserStartResult::Complete(Err(error)),
+                }
+            }
+            BrowserRecordingOperation::Discard => false,
+            _ => unreachable!("recording mutation operation checked above"),
+        };
+        let effective_risk = effective_browser_recording_risk(
+            request.context().declared_risk,
+            *operation,
+            overwrites_existing,
+        );
+        if BrowserApprovalPolicy::trust_project().requires_confirmation(effective_risk)
+            && approved_risk != Some(effective_risk)
+        {
+            return self.await_approval(
+                target,
+                request,
+                effective_risk,
+                browser_command_summary(request.command()),
+                BrowserApprovalResume::Recording { instance_id },
+            );
+        }
+
+        let result = match operation {
+            BrowserRecordingOperation::Save => {
+                let Some(project_root) = request.local_project_root() else {
+                    return BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
+                        field: "localProjectRoot".to_string(),
+                    }));
+                };
+                save_browser_recording_review(
+                    &self.workflow_coordinator,
+                    request.workspace_key(),
+                    instance_id,
+                    project_root,
+                    overwrites_existing,
+                )
+            }
+            BrowserRecordingOperation::Discard => {
+                self.fence_workspace_recording_views(request.workspace_key());
+                self.pump_page_recording_ipc();
+                self.remove_workspace_recording_views(request.workspace_key());
+                discard_browser_recording(
+                    &self.workflow_coordinator,
+                    request.workspace_key(),
+                    instance_id,
+                )
+            }
+            _ => unreachable!("recording mutation operation checked above"),
+        };
+        BrowserStartResult::Complete(result.map(|result| BrowserResponse::Recording { result }))
+    }
+
     fn await_approval(
         &mut self,
         target: &BrowserOperationTarget,
@@ -1743,6 +1874,27 @@ impl BrowserWebViewHost {
             }
             BrowserApprovalResume::Annotation => {
                 match self.begin_annotation_request(window, &target, &active.request, Some(risk)) {
+                    BrowserStartResult::Pending(phase) => {
+                        active.phase = phase;
+                        self.active_requests.insert(target, active);
+                    }
+                    BrowserStartResult::Complete(result) => self.finish_queued_request(
+                        window,
+                        target,
+                        operation_id.to_string(),
+                        active.request,
+                        result,
+                    ),
+                }
+            }
+            BrowserApprovalResume::Recording { instance_id } => {
+                match self.begin_recording_request(
+                    window,
+                    &target,
+                    &active.request,
+                    Some(risk),
+                    Some(instance_id),
+                ) {
                     BrowserStartResult::Pending(phase) => {
                         active.phase = phase;
                         self.active_requests.insert(target, active);
@@ -3068,6 +3220,69 @@ impl BrowserWebViewHost {
                     }
                 }
             }
+            BrowserCommand::Recording { operation } => match operation {
+                BrowserRecordingOperation::Status => Ok(BrowserResponse::Recording {
+                    result: browser_recording_status_result(
+                        &self.workflow_coordinator,
+                        workspace_key,
+                        operation,
+                    ),
+                }),
+                BrowserRecordingOperation::Start => {
+                    self.start_page_recording(workspace_key)
+                        .map_err(recording_ipc_browser_error)?;
+                    Ok(BrowserResponse::Recording {
+                        result: browser_recording_status_result(
+                            &self.workflow_coordinator,
+                            workspace_key,
+                            operation,
+                        ),
+                    })
+                }
+                BrowserRecordingOperation::Stop => {
+                    let instance = self
+                        .workflow_coordinator
+                        .active_instance(workspace_key)
+                        .ok_or_else(stale_recording_instance)?;
+                    self.stop_page_recording(&instance)
+                        .map_err(recording_ipc_browser_error)?;
+                    let resources = BrowserResourceStore::open_verified(
+                        self.verified_trusted_app_config_dir()?,
+                        &workspace_key.project_id,
+                        BrowserResourceLimits::default(),
+                    )?;
+                    Ok(BrowserResponse::Recording {
+                        result: browser_recording_review_result(
+                            &self.workflow_coordinator,
+                            workspace_key,
+                            operation,
+                            &resources,
+                        )?,
+                    })
+                }
+                BrowserRecordingOperation::Review => {
+                    let resources = BrowserResourceStore::open_verified(
+                        self.verified_trusted_app_config_dir()?,
+                        &workspace_key.project_id,
+                        BrowserResourceLimits::default(),
+                    )?;
+                    Ok(BrowserResponse::Recording {
+                        result: browser_recording_review_result(
+                            &self.workflow_coordinator,
+                            workspace_key,
+                            operation,
+                            &resources,
+                        )?,
+                    })
+                }
+                BrowserRecordingOperation::Discard | BrowserRecordingOperation::Save => {
+                    Err(BrowserError::CrashedView {
+                        message:
+                            "browser recording mutation requires the authenticated request path"
+                                .to_string(),
+                    })
+                }
+            },
             BrowserCommand::ListTabs => {
                 let snapshot = self
                     .state
@@ -3473,6 +3688,29 @@ fn map_page_recording_error(error: BrowserRecordingError) -> BrowserPageRecordin
     }
 }
 
+fn recording_ipc_browser_error(error: BrowserPageRecordingIpcError) -> BrowserError {
+    match error {
+        BrowserPageRecordingIpcError::Unavailable => BrowserError::UnavailablePlatform {
+            platform: std::env::consts::OS.to_string(),
+        },
+        BrowserPageRecordingIpcError::Inactive
+        | BrowserPageRecordingIpcError::Untrusted
+        | BrowserPageRecordingIpcError::TransportInvalidated => stale_recording_instance(),
+        BrowserPageRecordingIpcError::AlreadyActive => BrowserError::InvalidInvocation {
+            field: "recording".to_string(),
+        },
+        _ => BrowserError::CrashedView {
+            message: "browser recording host operation failed".to_string(),
+        },
+    }
+}
+
+fn stale_recording_instance() -> BrowserError {
+    BrowserError::InvalidRecipe {
+        message: "recording instance is not active".to_string(),
+    }
+}
+
 fn map_agent_recording_error(error: BrowserRecordingError) -> BrowserError {
     BrowserError::CrashedView {
         message: format!("browser workflow capture failed: {error}"),
@@ -3847,6 +4085,9 @@ fn browser_command_summary(command: &BrowserCommand) -> String {
         BrowserCommand::CancelAnnotationDraft { .. } => "cancel browser annotation".to_string(),
         BrowserCommand::Annotations { operation, .. } => {
             format!("browser annotations {operation:?}").to_ascii_lowercase()
+        }
+        BrowserCommand::Recording { operation } => {
+            format!("browser recording {operation:?}").to_ascii_lowercase()
         }
         BrowserCommand::ListTabs => "list browser tabs".to_string(),
         BrowserCommand::CreateTab { .. } => "create browser tab".to_string(),

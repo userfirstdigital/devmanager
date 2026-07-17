@@ -22,6 +22,7 @@ pub enum BrowserResourceKind {
     PerformanceTrace,
     ConsoleLog,
     NetworkLog,
+    WorkflowReview,
     Other,
 }
 

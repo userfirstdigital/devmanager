@@ -1368,6 +1368,7 @@ pub fn browser_response_sync(
         | BrowserResponse::Downloads { .. }
         | BrowserResponse::Cdp { .. }
         | BrowserResponse::AnnotationDraft { .. }
+        | BrowserResponse::Recording { .. }
         | BrowserResponse::Acknowledged => None,
     }
 }

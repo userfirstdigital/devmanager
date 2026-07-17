@@ -4,10 +4,12 @@ use devmanager::browser::{
     BrowserCommandInbox, BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle,
     BrowserHostControl, BrowserHostState, BrowserHostStatus, BrowserInvocationActor,
     BrowserInvocationContext, BrowserNetworkEntry, BrowserPerformanceSnapshot,
-    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
-    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserSnapshotSummary,
-    BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
-    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserRecipeInputKind, BrowserRecordingInputSummary, BrowserRecordingOperation,
+    BrowserRecordingResult, BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
+    BrowserRevision, BrowserRisk, BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserUploadResult, BrowserViewport, BrowserWaitResult, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -18,7 +20,7 @@ use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -408,6 +410,63 @@ async fn run_fake_host_with_state(
             other => panic!("unexpected fake-host command: {other:?}"),
         };
         drop(host);
+        request.respond(result);
+    }
+}
+
+async fn run_recording_bridge_host(
+    mut inbox: BrowserCommandInbox,
+    observed: Arc<
+        Mutex<
+            Vec<(
+                BrowserWorkspaceKey,
+                BrowserCommand,
+                BrowserInvocationContext,
+                Option<PathBuf>,
+            )>,
+        >,
+    >,
+    scripted: Arc<
+        Mutex<VecDeque<Result<BrowserRecordingResult, devmanager::browser::BrowserError>>>,
+    >,
+) {
+    let mut host = BrowserHostState::new(PathBuf::from("recording-bridge-fake-host"));
+    while let Some(request) = inbox.recv().await {
+        let workspace_key = request.workspace_key().clone();
+        let command = request.command().clone();
+        observed.lock().unwrap().push((
+            workspace_key.clone(),
+            command.clone(),
+            request.context().clone(),
+            request.local_project_root().map(Path::to_path_buf),
+        ));
+        let result = match command {
+            BrowserCommand::Ensure { snapshot } => host
+                .ensure_workspace(workspace_key, snapshot)
+                .map(|mutation| BrowserResponse::Workspace { mutation }),
+            BrowserCommand::SetPaneOpen { open } => host
+                .set_pane_open(&workspace_key, open)
+                .map(|mutation| BrowserResponse::Workspace { mutation }),
+            BrowserCommand::WorkspaceState => host
+                .workspace(&workspace_key)
+                .cloned()
+                .map(|snapshot| BrowserResponse::WorkspaceState { snapshot })
+                .ok_or_else(|| devmanager::browser::BrowserError::CrashedView {
+                    message: "missing recording fake workspace".to_string(),
+                }),
+            BrowserCommand::Recording { operation } => {
+                let response = scripted
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted recording response");
+                response.and_then(|response| {
+                    assert_eq!(response.operation, operation);
+                    Ok(BrowserResponse::Recording { result: response })
+                })
+            }
+            other => panic!("unexpected recording bridge command: {other:?}"),
+        };
         request.respond(result);
     }
 }
@@ -1089,6 +1148,7 @@ async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
                 "browser_navigate",
                 "browser_network",
                 "browser_performance",
+                "browser_recording",
                 "browser_screenshot",
                 "browser_snapshot",
                 "browser_status",
@@ -1363,6 +1423,431 @@ async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
         let _ = client.cancel().await;
     };
     let (_, ()) = tokio::join!(run_fake_host(inbox, commands), scenario);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_recording_has_one_exact_bounded_route_free_schema_and_typed_malformed_errors() {
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register(
+            "recording-schema-process",
+            workspace("recording-schema-project", "recording-schema-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register recording schema token");
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+            .auth_header(registration.access().bearer_token_for_launch()),
+    );
+    let client = ClientInfo::default()
+        .serve(transport)
+        .await
+        .expect("initialize recording schema client");
+
+    let listed = client.peer().list_tools(None).await.expect("list tools");
+    let recording = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == "browser_recording")
+        .expect("browser_recording tool");
+    assert_eq!(recording.input_schema["additionalProperties"], false);
+    assert_eq!(
+        recording.input_schema["required"],
+        json!(["intent", "risk", "operation"])
+    );
+    let properties = recording.input_schema["properties"]
+        .as_object()
+        .expect("recording properties");
+    let mut property_names = properties.keys().cloned().collect::<Vec<_>>();
+    property_names.sort();
+    assert_eq!(property_names, vec!["intent", "operation", "risk"]);
+    let operation_ref = recording.input_schema["properties"]["operation"]["$ref"]
+        .as_str()
+        .expect("recording operation enum reference");
+    let operation_definition = operation_ref
+        .strip_prefix("#/$defs/")
+        .expect("local recording operation definition");
+    assert_eq!(
+        recording.input_schema["$defs"][operation_definition]["enum"],
+        json!(["status", "start", "stop", "review", "discard", "save"])
+    );
+    let risk_ref = recording.input_schema["properties"]["risk"]["$ref"]
+        .as_str()
+        .expect("recording risk enum reference");
+    let risk_definition = risk_ref
+        .strip_prefix("#/$defs/")
+        .expect("local recording risk definition");
+    assert_eq!(
+        recording.input_schema["$defs"][risk_definition]["enum"],
+        json!([
+            "normal",
+            "financial",
+            "destructive",
+            "accountSecurity",
+            "permissionChange",
+            "outsideWorkspaceFile",
+            "osPermission"
+        ])
+    );
+    assert_eq!(
+        recording.input_schema["properties"]["intent"]["maxLength"],
+        1024
+    );
+    let schema_text = serde_json::to_string(&recording.input_schema).unwrap();
+    for forbidden in [
+        "projectId",
+        "conversationId",
+        "aiTabId",
+        "workspaceKey",
+        "route",
+        "tabId",
+        "token",
+        "password",
+        "secret",
+        "path",
+        "fileContent",
+    ] {
+        assert!(
+            !schema_text.contains(forbidden),
+            "recording schema exposed forbidden field {forbidden}"
+        );
+    }
+
+    for malformed in [
+        json!({
+            "intent": "attempt client-side routing",
+            "risk": "normal",
+            "operation": "status",
+            "projectId": "other-project"
+        }),
+        json!({
+            "intent": "   ",
+            "risk": "normal",
+            "operation": "status"
+        }),
+        json!({
+            "intent": "x".repeat(1025),
+            "risk": "normal",
+            "operation": "status"
+        }),
+        json!({
+            "intent": "inspect the recording",
+            "risk": "normal",
+            "operation": "status",
+            "instanceId": 1
+        }),
+        json!({
+            "intent": "inspect the recording",
+            "risk": "normal",
+            "operation": "mutate"
+        }),
+    ] {
+        let result = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_recording")
+                    .with_arguments(arguments(malformed)),
+            )
+            .await
+            .expect("malformed recording arguments return a tool result");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+    }
+
+    client
+        .cancel()
+        .await
+        .expect("close recording schema client");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_recording_valid_operations_dispatch_through_the_authenticated_workspace_bridge() {
+    let (bridge, inbox) = browser_command_channel(16);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let review_resource = fixture_resource(
+        "res-00000000000000000000000000000009",
+        BrowserResourceKind::WorkflowReview,
+        "application/json",
+        512,
+    );
+    let result = |operation, status, resource| BrowserRecordingResult {
+        operation,
+        status,
+        recording_id: (status != BrowserRecordingStatus::Inactive).then_some(41),
+        recipe_id: (status == BrowserRecordingStatus::Review).then(|| "checkout-flow".to_string()),
+        step_count: usize::from(status == BrowserRecordingStatus::Review) * 2,
+        inputs: (status == BrowserRecordingStatus::Review)
+            .then(|| {
+                vec![
+                    BrowserRecordingInputSummary {
+                        name: "customer_name".to_string(),
+                        kind: BrowserRecipeInputKind::Text,
+                    },
+                    BrowserRecordingInputSummary {
+                        name: "account_password".to_string(),
+                        kind: BrowserRecipeInputKind::Secret,
+                    },
+                ]
+            })
+            .unwrap_or_default(),
+        valid: status == BrowserRecordingStatus::Review,
+        resource,
+        overwrote_existing: None,
+    };
+    let scripted = Arc::new(Mutex::new(VecDeque::from([
+        Ok(result(
+            BrowserRecordingOperation::Status,
+            BrowserRecordingStatus::Inactive,
+            None,
+        )),
+        Ok(result(
+            BrowserRecordingOperation::Start,
+            BrowserRecordingStatus::Recording,
+            None,
+        )),
+        Ok(result(
+            BrowserRecordingOperation::Stop,
+            BrowserRecordingStatus::Review,
+            Some(review_resource.clone()),
+        )),
+        Ok(result(
+            BrowserRecordingOperation::Review,
+            BrowserRecordingStatus::Review,
+            Some(review_resource),
+        )),
+        Ok(BrowserRecordingResult {
+            operation: BrowserRecordingOperation::Discard,
+            status: BrowserRecordingStatus::Inactive,
+            recording_id: Some(41),
+            recipe_id: Some("checkout-flow".to_string()),
+            step_count: 0,
+            inputs: Vec::new(),
+            valid: false,
+            resource: None,
+            overwrote_existing: None,
+        }),
+        Ok(BrowserRecordingResult {
+            operation: BrowserRecordingOperation::Save,
+            status: BrowserRecordingStatus::Inactive,
+            recording_id: Some(42),
+            recipe_id: Some("checkout-flow".to_string()),
+            step_count: 2,
+            inputs: Vec::new(),
+            valid: true,
+            resource: None,
+            overwrote_existing: Some(false),
+        }),
+    ])));
+    let project_root = unique_gateway_config_dir("recording-bridge-root");
+    std::fs::create_dir_all(&project_root).expect("create recording bridge project root");
+    let canonical_project_root = project_root.canonicalize().unwrap();
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let expected_workspace = workspace("recording-project", "recording-conversation");
+    let registration = gateway
+        .registrar()
+        .register_with_project_root(
+            "recording-bridge-process",
+            expected_workspace.clone(),
+            BrowserWorkspaceSnapshot::default(),
+            &project_root,
+        )
+        .expect("register recording bridge token");
+    let host = run_recording_bridge_host(inbox, Arc::clone(&observed), scripted);
+    let scenario = async move {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize recording bridge client");
+
+        for (operation, expected_status) in [
+            ("status", "inactive"),
+            ("start", "recording"),
+            ("stop", "review"),
+            ("review", "review"),
+            ("discard", "inactive"),
+            ("save", "inactive"),
+        ] {
+            let response = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new("browser_recording").with_arguments(arguments(
+                        json!({
+                            "intent": format!("{operation} the exact workflow recording"),
+                            "risk": "normal",
+                            "operation": operation,
+                        }),
+                    )),
+                )
+                .await
+                .expect("recording operation returns a tool result");
+            assert_eq!(response.is_error, Some(false), "{operation} failed");
+            let body = response.structured_content.expect("recording result body");
+            assert_eq!(body["version"], 1);
+            assert_eq!(body["operation"], operation);
+            assert_eq!(body["recording"]["status"], expected_status);
+            assert!(body.get("workspace").is_none());
+            assert!(body.get("path").is_none());
+            if matches!(operation, "stop" | "review") {
+                assert_eq!(body["recording"]["stepCount"], 2);
+                assert_eq!(
+                    body["recording"]["inputs"],
+                    json!([
+                        {"name":"customer_name","kind":"text"},
+                        {"name":"account_password","kind":"secret"}
+                    ])
+                );
+                assert!(body["resource"]["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.starts_with("devmanager-browser://resource/")));
+            }
+            if operation == "save" {
+                assert_eq!(body["overwroteExisting"], false);
+            }
+        }
+
+        let calls = observed.lock().unwrap().clone();
+        let recording_calls = calls
+            .iter()
+            .filter_map(
+                |(workspace_key, command, context, project_root)| match command {
+                    BrowserCommand::Recording { operation } => {
+                        Some((workspace_key, operation, context, project_root))
+                    }
+                    _ => None,
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(recording_calls.len(), 6);
+        assert!(recording_calls
+            .iter()
+            .all(|(workspace_key, _, _, _)| *workspace_key == &expected_workspace));
+        assert_eq!(
+            recording_calls
+                .iter()
+                .map(|(_, operation, _, _)| **operation)
+                .collect::<Vec<_>>(),
+            vec![
+                BrowserRecordingOperation::Status,
+                BrowserRecordingOperation::Start,
+                BrowserRecordingOperation::Stop,
+                BrowserRecordingOperation::Review,
+                BrowserRecordingOperation::Discard,
+                BrowserRecordingOperation::Save,
+            ]
+        );
+        assert!(recording_calls.iter().all(|(_, _, context, project_root)| {
+            context.actor == BrowserInvocationActor::Agent
+                && context.declared_risk == BrowserRisk::Normal
+                && !context.intent.trim().is_empty()
+                && project_root.as_ref() == Some(&canonical_project_root)
+        }));
+
+        client
+            .cancel()
+            .await
+            .expect("close recording bridge client");
+    };
+    tokio::join!(host, scenario);
+    std::fs::remove_dir_all(project_root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_recording_tool_failure_is_typed_and_does_not_end_the_authenticated_session() {
+    let (bridge, inbox) = browser_command_channel(8);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let scripted = Arc::new(Mutex::new(VecDeque::from([
+        Err(devmanager::browser::BrowserError::CrashedView {
+            message: "fixture recording failure".to_string(),
+        }),
+        Ok(BrowserRecordingResult {
+            operation: BrowserRecordingOperation::Status,
+            status: BrowserRecordingStatus::Inactive,
+            recording_id: None,
+            recipe_id: None,
+            step_count: 0,
+            inputs: Vec::new(),
+            valid: false,
+            resource: None,
+            overwrote_existing: None,
+        }),
+    ])));
+    let project_root = unique_gateway_config_dir("recording-failure-root");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register_with_project_root(
+            "recording-failure-process",
+            workspace(
+                "recording-failure-project",
+                "recording-failure-conversation",
+            ),
+            BrowserWorkspaceSnapshot::default(),
+            &project_root,
+        )
+        .unwrap();
+    let host = run_recording_bridge_host(inbox, Arc::clone(&observed), scripted);
+    let scenario = async move {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default().serve(transport).await.unwrap();
+        let failed = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_recording").with_arguments(arguments(json!({
+                    "intent": "review the current workflow recording",
+                    "risk": "normal",
+                    "operation": "review",
+                }))),
+            )
+            .await
+            .expect("host failure is returned as a tool result");
+        assert_eq!(failed.is_error, Some(true));
+        assert_eq!(
+            failed.structured_content.unwrap()["error"]["code"],
+            "crashed_view"
+        );
+
+        let status = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_recording").with_arguments(arguments(json!({
+                    "intent": "check recording state after the failure",
+                    "risk": "normal",
+                    "operation": "status",
+                }))),
+            )
+            .await
+            .expect("same authenticated session remains usable");
+        assert_eq!(status.is_error, Some(false));
+        assert_eq!(
+            status.structured_content.unwrap()["recording"]["status"],
+            "inactive"
+        );
+        client.cancel().await.unwrap();
+    };
+    tokio::join!(host, scenario);
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, command, _, _)| matches!(command, BrowserCommand::Recording { .. }))
+            .count(),
+        2
+    );
+    std::fs::remove_dir_all(project_root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1669,6 +1669,34 @@ pub fn save_recipe(
     project_root: impl AsRef<Path>,
     recipe: &BrowserRecipeV1,
 ) -> Result<PathBuf, BrowserError> {
+    save_recipe_with_overwrite_policy(project_root.as_ref(), recipe, true)
+        .map(|(path, _overwrote_existing)| path)
+}
+
+pub(crate) fn recipe_exists(
+    project_root: impl AsRef<Path>,
+    recipe_id: &str,
+) -> Result<bool, BrowserError> {
+    let expected_path = recipe_path(&project_root, recipe_id)?;
+    let Some(parent) = verified_workflow_directory(project_root.as_ref(), false)? else {
+        return Ok(false);
+    };
+    let path = parent.join(format!("{recipe_id}.json"));
+    if path != expected_path {
+        return Err(BrowserError::OutsideWorkspace { path });
+    }
+    let boundary_verifier = OsRecipeBoundaryVerifier {
+        project_root: project_root.as_ref(),
+    };
+    boundary_verifier.verify(RecipeIoBoundary::BeforeList, &parent, &parent)?;
+    validate_existing_path(&path, RecipePathKind::RegularFile)
+}
+
+pub(crate) fn save_recipe_with_overwrite_policy(
+    project_root: impl AsRef<Path>,
+    recipe: &BrowserRecipeV1,
+    allow_overwrite: bool,
+) -> Result<(PathBuf, bool), BrowserError> {
     recipe.validate()?;
     let _write_guard = RECIPE_WRITE_GATE
         .lock()
@@ -1680,11 +1708,26 @@ pub fn save_recipe(
     let boundary_verifier = OsRecipeBoundaryVerifier { project_root };
     boundary_verifier.verify(RecipeIoBoundary::BeforeList, &parent, &parent)?;
     scavenge_stale_recipe_temps(&parent)?;
+    let overwrote_existing = validate_existing_path(&path, RecipePathKind::RegularFile)?;
+    if overwrote_existing && !allow_overwrite {
+        return Err(invalid_recipe(
+            "recording save requires destructive overwrite approval",
+        ));
+    }
     let mut json = serde_json::to_vec_pretty(recipe)
         .map_err(|error| invalid_recipe(format!("could not serialize recipe: {error}")))?;
     json.push(b'\n');
-    atomic_write_with_boundaries(&path, &json, &OsRecipeFileReplacer, &boundary_verifier)?;
-    Ok(path)
+    if allow_overwrite {
+        atomic_write_with_boundaries(&path, &json, &OsRecipeFileReplacer, &boundary_verifier)?;
+    } else {
+        atomic_write_with_boundaries(
+            &path,
+            &json,
+            &NoClobberRecipeFileReplacer,
+            &boundary_verifier,
+        )?;
+    }
+    Ok((path, overwrote_existing))
 }
 
 pub fn load_recipe(
@@ -2097,6 +2140,14 @@ impl RecipeFileReplacer for OsRecipeFileReplacer {
     }
 }
 
+struct NoClobberRecipeFileReplacer;
+
+impl RecipeFileReplacer for NoClobberRecipeFileReplacer {
+    fn replace(&self, temporary: &Path, destination: &Path) -> std::io::Result<()> {
+        replace_sibling_file_without_overwrite(temporary, destination)
+    }
+}
+
 #[cfg(test)]
 fn atomic_write_with(
     path: &Path,
@@ -2200,6 +2251,39 @@ fn create_sibling_temp(
 #[cfg(not(windows))]
 fn replace_sibling_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(temporary, destination)
+}
+
+#[cfg(not(windows))]
+fn replace_sibling_file_without_overwrite(
+    temporary: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    std::fs::hard_link(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_sibling_file_without_overwrite(
+    temporary: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(std::io::Error::from)
+    }
 }
 
 #[cfg(windows)]

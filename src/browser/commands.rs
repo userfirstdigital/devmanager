@@ -4,11 +4,13 @@ use super::{
     BrowserAnnotationOperation, BrowserAnnotationSummary, BrowserConsoleEntry,
     BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation, BrowserError,
     BrowserNetworkEntry, BrowserNetworkOperation, BrowserPerformanceOperation,
-    BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserResourceId, BrowserRisk,
-    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult,
-    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey,
-    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BrowserPerformanceSnapshot, BrowserRecipeInputKind, BrowserRecordingStatus,
+    BrowserResourceHandle, BrowserResourceId, BrowserRisk, BrowserScreenshotMode,
+    BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
+    BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation,
+    BrowserWorkspaceSnapshot,
 };
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
@@ -117,6 +119,39 @@ pub struct BrowserApprovalRequest {
     pub origin_url: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename_all = "camelCase")]
+pub enum BrowserRecordingOperation {
+    Status,
+    Start,
+    Stop,
+    Review,
+    Discard,
+    Save,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserRecordingInputSummary {
+    pub name: String,
+    pub kind: BrowserRecipeInputKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserRecordingResult {
+    pub operation: BrowserRecordingOperation,
+    pub status: BrowserRecordingStatus,
+    pub recording_id: Option<u64>,
+    pub recipe_id: Option<String>,
+    pub step_count: usize,
+    pub inputs: Vec<BrowserRecordingInputSummary>,
+    pub valid: bool,
+    pub resource: Option<BrowserResourceHandle>,
+    pub overwrote_existing: Option<bool>,
+}
+
 fn random_operation_id() -> Result<String, BrowserError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| BrowserError::CrashedView {
@@ -163,6 +198,9 @@ pub enum BrowserCommand {
     Annotations {
         operation: BrowserAnnotationOperation,
         annotation_id: Option<String>,
+    },
+    Recording {
+        operation: BrowserRecordingOperation,
     },
     ListTabs,
     CreateTab {
@@ -258,6 +296,7 @@ impl BrowserCommand {
             Self::SaveAnnotationDraft { .. } => "saveAnnotationDraft",
             Self::CancelAnnotationDraft { .. } => "cancelAnnotationDraft",
             Self::Annotations { .. } => "annotations",
+            Self::Recording { .. } => "recording",
             Self::ListTabs => "listTabs",
             Self::CreateTab { .. } => "createTab",
             Self::SelectTab { .. } => "selectTab",
@@ -315,6 +354,7 @@ impl BrowserCommand {
             | Self::SaveAnnotationDraft { .. }
             | Self::CancelAnnotationDraft { .. }
             | Self::Annotations { .. }
+            | Self::Recording { .. }
             | Self::ListTabs
             | Self::CreateTab { .. }
             | Self::ResetWorkspace
@@ -354,6 +394,12 @@ pub fn browser_request_preempts_operation_queue(command: &BrowserCommand) -> boo
         BrowserCommand::Status
             | BrowserCommand::WorkspaceState
             | BrowserCommand::ListTabs
+            | BrowserCommand::Recording {
+                operation: BrowserRecordingOperation::Status
+                    | BrowserRecordingOperation::Start
+                    | BrowserRecordingOperation::Stop
+                    | BrowserRecordingOperation::Review,
+            }
             | BrowserCommand::DownloadDirectory
             | BrowserCommand::Stop { .. }
             | BrowserCommand::CloseTab { .. }
@@ -445,6 +491,9 @@ pub enum BrowserResponse {
     AnnotationMutation {
         result: BrowserAnnotationMutationResult,
     },
+    Recording {
+        result: BrowserRecordingResult,
+    },
     Acknowledged,
 }
 
@@ -459,6 +508,11 @@ pub fn browser_response_resource_ids(response: &BrowserResponse) -> Vec<BrowserR
             details.details_resource.id.clone(),
         ],
         BrowserResponse::AnnotationMutation { result } => vec![result.screenshot.id.clone()],
+        BrowserResponse::Recording { result } => result
+            .resource
+            .as_ref()
+            .map(|resource| vec![resource.id.clone()])
+            .unwrap_or_default(),
         BrowserResponse::Console { resource, .. }
         | BrowserResponse::Network { resource, .. }
         | BrowserResponse::Performance { resource, .. }
@@ -662,6 +716,7 @@ struct BrowserCommandEnvelope {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
     context: BrowserInvocationContext,
+    local_project_root: Option<PathBuf>,
     cancellation_ticket: CancellationTicket,
     registration_lease: Option<BrowserRegistrationLease>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
@@ -853,6 +908,37 @@ impl BrowserController {
         command: BrowserCommand,
         context: BrowserInvocationContext,
     ) -> Result<BrowserResponse, BrowserError> {
+        self.request_with_context_and_local_project_root(command, context, None)
+            .await
+    }
+
+    pub(crate) async fn request_with_local_project_root(
+        &self,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+        local_project_root: &std::path::Path,
+    ) -> Result<BrowserResponse, BrowserError> {
+        let canonical =
+            local_project_root
+                .canonicalize()
+                .map_err(|_| BrowserError::InvalidInvocation {
+                    field: "localProjectRoot".to_string(),
+                })?;
+        if canonical != local_project_root {
+            return Err(BrowserError::InvalidInvocation {
+                field: "localProjectRoot".to_string(),
+            });
+        }
+        self.request_with_context_and_local_project_root(command, context, Some(canonical))
+            .await
+    }
+
+    async fn request_with_context_and_local_project_root(
+        &self,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+        local_project_root: Option<PathBuf>,
+    ) -> Result<BrowserResponse, BrowserError> {
         context.validate()?;
         let operation = command.operation_name().to_string();
         let transport_timeout = command_transport_timeout(self.timeout, &command);
@@ -861,7 +947,12 @@ impl BrowserController {
         let timeout = tokio::time::sleep(transport_timeout);
         tokio::pin!(timeout);
         let cancellations = if is_lifecycle {
-            self.enqueue_lifecycle_command(command.clone(), context.clone(), response)?
+            self.enqueue_lifecycle_command(
+                command.clone(),
+                context.clone(),
+                local_project_root.clone(),
+                response,
+            )?
         } else {
             let (cancellation_ticket, cancellations) =
                 self.cancellation_state_for_command(&command)?;
@@ -869,6 +960,7 @@ impl BrowserController {
                 workspace_key: self.workspace_key.clone(),
                 command,
                 context,
+                local_project_root,
                 cancellation_ticket,
                 registration_lease: self.registration_lease.clone(),
                 response,
@@ -932,7 +1024,7 @@ impl BrowserController {
         let (response, receiver) = oneshot::channel();
         drop(receiver);
         if browser_lifecycle_control(&self.workspace_key, &command).is_some() {
-            self.enqueue_lifecycle_command(command, context, response)?;
+            self.enqueue_lifecycle_command(command, context, None, response)?;
             return Ok(());
         }
         let cancellation_ticket = self.cancellation_ticket_for_command(&command)?;
@@ -941,6 +1033,7 @@ impl BrowserController {
                 workspace_key: self.workspace_key.clone(),
                 command,
                 context,
+                local_project_root: None,
                 cancellation_ticket,
                 registration_lease: self.registration_lease.clone(),
                 response,
@@ -1012,6 +1105,7 @@ impl BrowserController {
         &self,
         command: BrowserCommand,
         context: BrowserInvocationContext,
+        local_project_root: Option<PathBuf>,
         response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     ) -> Result<CancellationSubscriptions, BrowserError> {
         let control = browser_lifecycle_control(&self.workspace_key, &command)
@@ -1038,6 +1132,7 @@ impl BrowserController {
                     workspace_key: self.workspace_key.clone(),
                     command,
                     context,
+                    local_project_root,
                     cancellation_ticket,
                     registration_lease: self.registration_lease.clone(),
                     response,
@@ -1141,6 +1236,7 @@ pub struct BrowserCommandRequest {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
     context: BrowserInvocationContext,
+    local_project_root: Option<PathBuf>,
     cancellation_ticket: CancellationTicket,
     cancellations: Arc<CancellationEpochs>,
     registration_lease: Option<BrowserRegistrationLease>,
@@ -1161,6 +1257,10 @@ impl BrowserCommandRequest {
 
     pub fn context(&self) -> &BrowserInvocationContext {
         &self.context
+    }
+
+    pub fn local_project_root(&self) -> Option<&std::path::Path> {
+        self.local_project_root.as_deref()
     }
 
     pub fn cancellation_is_current(&self) -> bool {
@@ -1212,6 +1312,7 @@ impl BrowserCommandRequest {
             workspace_key,
             command,
             context,
+            local_project_root,
             cancellation_ticket,
             registration_lease,
             response,
@@ -1221,6 +1322,7 @@ impl BrowserCommandRequest {
             workspace_key,
             command,
             context,
+            local_project_root,
             cancellation_ticket,
             cancellations,
             registration_lease,
