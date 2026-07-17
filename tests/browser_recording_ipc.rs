@@ -1,12 +1,12 @@
 use devmanager::browser::{
-    browser_user_input_initialization_script, BrowserPageRecordingAuthority,
-    BrowserPageRecordingEnvelope, BrowserPageRecordingEvent, BrowserPageRecordingIpc,
-    BrowserPageRecordingIpcError, BrowserRecipeAction, BrowserRecipeInputKind, BrowserRecipeValue,
-    BrowserRecordingActor, BrowserRecordingCommit, BrowserRevision, BrowserWorkflowRecorder,
-    BrowserWorkspaceKey, MAX_BROWSER_PAGE_RECORDING_IPC_BYTES,
-    MAX_BROWSER_PAGE_RECORDING_IPC_DEPTH, MAX_BROWSER_PAGE_RECORDING_IPC_STRINGS,
-    MAX_BROWSER_PAGE_RECORDING_LOCATOR_FALLBACKS, MAX_BROWSER_PAGE_RECORDING_SELECT_VALUES,
-    MAX_BROWSER_PAGE_RECORDING_STRING_BYTES,
+    browser_user_input_initialization_script, canonical_browser_page_origin,
+    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingEvent,
+    BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserRecipeAction,
+    BrowserRecipeInputKind, BrowserRecipeValue, BrowserRecordingActor, BrowserRecordingCommit,
+    BrowserRevision, BrowserWorkflowRecorder, BrowserWorkspaceKey,
+    MAX_BROWSER_PAGE_RECORDING_IPC_BYTES, MAX_BROWSER_PAGE_RECORDING_IPC_DEPTH,
+    MAX_BROWSER_PAGE_RECORDING_IPC_STRINGS, MAX_BROWSER_PAGE_RECORDING_LOCATOR_FALLBACKS,
+    MAX_BROWSER_PAGE_RECORDING_SELECT_VALUES, MAX_BROWSER_PAGE_RECORDING_STRING_BYTES,
 };
 use static_assertions::assert_not_impl_any;
 use std::process::Command;
@@ -399,6 +399,90 @@ fn semantic_events_coalesce_and_never_retain_password_file_clipboard_or_url_secr
 }
 
 #[test]
+fn crafted_bare_tokens_in_text_select_or_locator_metadata_never_reach_recording_state() {
+    let mut recorder = BrowserWorkflowRecorder::default();
+    let instance = recorder
+        .start(workspace("project-a", "ai-a"))
+        .expect("start recorder");
+    let nonce = "6c9bca4bd7eb4f65a1865966cedc9f78";
+    let mut ipc = BrowserPageRecordingIpc::default();
+    ipc.activate(
+        BrowserPageRecordingAuthority::new(
+            instance.clone(),
+            "tab-a",
+            BrowserRevision(7),
+            "https://example.test",
+            nonce,
+        )
+        .expect("authority"),
+    )
+    .expect("activate");
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQtdXNlciJ9.dGhpc2lzYXNpZ25hdHVyZQ";
+    let api_key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+    let github = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let hostile_events = [
+        serde_json::json!({
+            "type": "textEdit",
+            "locator": semantic_locator("Query"),
+            "edit": { "type": "text", "text": jwt },
+        }),
+        serde_json::json!({
+            "type": "textEdit",
+            "locator": semantic_locator("Query"),
+            "edit": { "type": "text", "text": api_key },
+        }),
+        serde_json::json!({
+            "type": "select",
+            "locator": semantic_locator("Plan"),
+            "values": [github, aws],
+        }),
+        serde_json::json!({
+            "type": "click",
+            "locator": {
+                "accessibilityRole": "button",
+                "accessibilityName": jwt,
+                "testId": "safe-button",
+                "cssSelectors": ["#safe-button"],
+            },
+        }),
+    ];
+    for event in hostile_events {
+        assert_eq!(
+            ipc.ingest(
+                &mut recorder,
+                &semantic_json(instance.id(), 0, nonce, event)
+            ),
+            Err(BrowserPageRecordingIpcError::Malformed)
+        );
+    }
+    assert_eq!(recorder.active_step_count(&instance), Ok(0));
+    assert_eq!(
+        ipc.ingest(
+            &mut recorder,
+            &click_json(
+                "project-a",
+                "ai-a",
+                "tab-a",
+                7,
+                instance.id(),
+                0,
+                "https://example.test",
+                nonce,
+            ),
+        ),
+        Ok(BrowserRecordingCommit::Recorded)
+    );
+    let review = recorder
+        .stop(&instance)
+        .expect("stop clean rejected capture");
+    let recipe_json = serde_json::to_string(review.recipe()).expect("safe empty recipe JSON");
+    for forbidden in [jwt, api_key, github, aws] {
+        assert!(!recipe_json.contains(forbidden));
+    }
+}
+
+#[test]
 fn recording_script_exists_only_for_the_exact_active_authority_and_has_a_safe_teardown() {
     assert!(
         !browser_user_input_initialization_script().contains("browserRecording"),
@@ -522,6 +606,7 @@ class FakeElement {{
     this.labels = options.label ? [{{ innerText: options.label }}] : [];
     this.parentElement = null;
     this.options = options.options || [];
+    this.ariaLabel = options.ariaLabel || null;
     this.download = Boolean(options.download);
     this._type = type;
     this._value = value;
@@ -535,7 +620,7 @@ class FakeElement {{
   getAttribute(name) {{
     if (name === "type") return this._type;
     if (name === "data-testid") return this.id;
-    if (name === "aria-label") return this.labels[0]?.innerText || null;
+    if (name === "aria-label") return this.ariaLabel;
     if (name === "href") return this.tagName === "A" ? "/download" : null;
     return null;
   }}
@@ -556,19 +641,34 @@ input({{ isTrusted: true, target: new FakeElement("file", "C:/private/file-path-
 input({{ isTrusted: true, target: new FakeElement("text", "clipboard-value-sentinel", {{ label: "Notes", throwValue: true }}), inputType: "insertFromPaste" }});
 input({{ isTrusted: true, target: new FakeElement("text", "Bearer token-value-sentinel", {{ label: "Token" }}), inputType: "insertText" }});
 input({{ isTrusted: true, target: new FakeElement("text", "ordinary value", {{ label: "Query" }}), inputType: "insertText" }});
+const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQtdXNlciJ9.dGhpc2lzYXNpZ25hdHVyZQ";
+const apiKey = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+const github = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+const aws = "AKIAIOSFODNN7EXAMPLE";
+for (const token of [jwt, apiKey, github, aws]) {{
+  input({{ isTrusted: true, target: new FakeElement("text", token, {{ label: "Token" }}), inputType: "insertText" }});
+}}
+input({{ isTrusted: true, target: new FakeElement("select", "", {{ tagName: "SELECT", label: "Plan", options: [{{ selected: true, value: github }}] }}), inputType: "insertText" }});
+input({{ isTrusted: true, target: new FakeElement("text", "aria safe value", {{ ariaLabel: jwt, id: "safe-aria" }}), inputType: "insertText" }});
+input({{ isTrusted: true, target: new FakeElement("text", "label safe value", {{ label: apiKey, id: "safe-label" }}), inputType: "insertText" }});
 click({{ isTrusted: true, target: new FakeElement("", "", {{ tagName: "A", id: "download", innerText: "Download", download: true }}) }});
 input({{ isTrusted: false, target: new FakeElement("text", "untrusted-value-sentinel", {{ label: "Query" }}), inputType: "insertText" }});
 
-if (messages.length !== 6) throw new Error(`expected 6 messages, got ${{messages.length}}`);
+if (messages.length !== 13) throw new Error(`expected 13 messages, got ${{messages.length}}`);
 if (messages.some((message, index) => message.sequence !== index)) throw new Error("source sequence drifted");
 if (messages[0].event.edit.type !== "password" || Object.hasOwn(messages[0].event.edit, "text")) throw new Error("password value crossed IPC");
 if (messages[1].event.type !== "upload" || Object.hasOwn(messages[1].event, "path")) throw new Error("file data crossed IPC");
 if (messages[2].event.edit.type !== "clipboard" || Object.hasOwn(messages[2].event.edit, "text")) throw new Error("clipboard data crossed IPC");
 if (messages[3].event.edit.type !== "password") throw new Error("credential-like text crossed IPC");
 if (messages[4].event.edit.text !== "ordinary value") throw new Error("ordinary text was not recorded");
-if (messages[5].event.type !== "download") throw new Error("download marker missing");
+for (const index of [5, 6, 7, 8, 9]) {{
+  if (messages[index].event.edit?.type !== "password") throw new Error(`secret marker missing at ${{index}}`);
+}}
+if (messages[10].event.edit?.text !== "aria safe value") throw new Error("safe aria fallback value missing");
+if (messages[11].event.edit?.text !== "label safe value") throw new Error("safe label fallback value missing");
+if (messages[12].event.type !== "download") throw new Error("download marker missing");
 const wire = JSON.stringify(messages);
-for (const forbidden of ["password-value-sentinel", "file-path-sentinel", "clipboard-value-sentinel", "token-value-sentinel", "untrusted-value-sentinel"]) {{
+for (const forbidden of ["password-value-sentinel", "file-path-sentinel", "clipboard-value-sentinel", "token-value-sentinel", "untrusted-value-sentinel", jwt, apiKey, github, aws]) {{
   if (wire.includes(forbidden)) throw new Error(`leaked ${{forbidden}}`);
 }}
 
@@ -593,11 +693,12 @@ if ([...listeners.keys()].some((key) => key === "document:input" || key === "doc
 #[test]
 fn windows_host_uses_a_private_active_only_recording_channel_and_fences_view_lifecycle() {
     let windows = include_str!("../src/browser/host/windows.rs");
+    let recording_ipc = include_str!("../src/browser/recording_ipc.rs");
     let unsupported = include_str!("../src/browser/host/unsupported.rs");
+    assert!(recording_ipc.contains("pub(crate) struct BrowserPageRecordingRawMessage"));
     for required in [
-        "struct BrowserPageRecordingRawMessage",
-        "recording_sender: SyncSender<BrowserPageRecordingRawMessage>",
-        "recording_receiver: Receiver<BrowserPageRecordingRawMessage>",
+        "recording_transport: BrowserPageRecordingTransport",
+        "recording_ingresses: HashMap<BrowserViewKey, BrowserPageRecordingIngress>",
         "pub fn start_page_recording(",
         "pub fn stop_page_recording(",
         "fn install_page_recording_view(",
@@ -764,10 +865,48 @@ fn page_recording_ipc_enforces_count_and_decoded_string_bounds_before_retention(
 #[test]
 fn windows_recording_transport_is_bounded_before_raw_page_messages_can_queue() {
     let windows = include_str!("../src/browser/host/windows.rs");
-    assert!(windows.contains("recording_sender: SyncSender<BrowserPageRecordingRawMessage>"));
-    assert!(windows.contains("mpsc::sync_channel(MAX_BROWSER_PAGE_RECORDING_QUEUE)"));
-    assert!(windows.contains("ipc_recording_sender.try_send("));
-    assert!(!windows.contains("ipc_recording_sender.send("));
+    assert!(windows.contains("BrowserPageRecordingTransport"));
+    assert!(windows.contains("MAX_BROWSER_PAGE_RECORDING_QUEUE"));
+    assert!(windows.contains("BrowserPageRecordingSubmit::Overflow"));
+    assert!(windows.contains("BrowserPageRecordingSubmit::Disconnected"));
+    assert!(!windows.contains("let _ = ipc_recording_sender.try_send("));
+}
+
+#[test]
+fn windows_stop_fences_transport_then_drains_before_retiring_the_exact_recorder() {
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let stop_start = windows
+        .find("pub fn stop_page_recording(")
+        .expect("stop seam");
+    let stop_end = windows[stop_start..]
+        .find("\n    pub fn handle_command(")
+        .map(|offset| stop_start + offset)
+        .expect("stop seam end");
+    let stop = &windows[stop_start..stop_end];
+    let fence = stop
+        .find("fence_workspace_recording_views")
+        .expect("synchronous transport fence");
+    let drain = stop
+        .find("pump_page_recording_ipc")
+        .expect("accepted-message drain");
+    let retire = stop
+        .find("recording_instances.remove")
+        .expect("authority retirement");
+    let recorder_stop = stop.find("workflow_recorder").expect("recorder Stop");
+    assert!(fence < drain && drain < retire && retire < recorder_stop);
+    assert!(windows.contains("self.pump_page_recording_ipc();\n        let instance"));
+    assert!(windows.contains("invalidate_page_recording_transport"));
+    let invalidation_start = windows
+        .find("fn invalidate_page_recording_transport(")
+        .expect("typed invalidation helper");
+    let invalidation_end = windows[invalidation_start..]
+        .find("\n    fn install_page_recording_view(")
+        .map(|offset| invalidation_start + offset)
+        .expect("typed invalidation helper end");
+    let invalidation = &windows[invalidation_start..invalidation_end];
+    assert!(invalidation.contains("self.discard_page_recording(workspace_key);"));
+    assert!(invalidation.contains("the incomplete recording was discarded"));
+    assert!(stop.contains("BrowserPageRecordingIpcError::TransportInvalidated"));
 }
 
 #[test]
@@ -868,4 +1007,90 @@ fn late_page_ipc_old_instances_and_transport_origin_replays_never_reach_a_new_re
         Ok(BrowserRecordingCommit::Recorded)
     );
     assert_eq!(recorder.active_step_count(&second), Ok(1));
+}
+
+#[test]
+fn canonical_http_origins_equate_real_url_forms_and_reject_spoofs() {
+    for (input, expected) in [
+        ("HTTPS://Example.COM:443", "https://example.com"),
+        ("http://Example.COM:80/", "http://example.com"),
+        ("https://Example.COM:8443", "https://example.com:8443"),
+        ("https://[2001:DB8::1]:443", "https://[2001:db8::1]"),
+        ("https://bücher.example", "https://xn--bcher-kva.example"),
+    ] {
+        assert_eq!(
+            canonical_browser_page_origin(input),
+            Ok(expected.to_string()),
+            "canonical origin for {input}"
+        );
+    }
+    for spoof in [
+        "https://user:password@example.com",
+        "https://example.com@evil.test",
+        "https://example.com.evil.test/path",
+        "https://example.com?next=https://evil.test",
+        "https://example.com#https://evil.test",
+        "javascript://example.com",
+        "file://example.com",
+        "https://[2001:db8::1",
+        "https://",
+    ] {
+        assert_eq!(
+            canonical_browser_page_origin(spoof),
+            Err(BrowserPageRecordingIpcError::InvalidAuthority),
+            "reject spoofed or malformed origin {spoof}"
+        );
+    }
+
+    let mut recorder = BrowserWorkflowRecorder::default();
+    let instance = recorder
+        .start(workspace("project-a", "ai-a"))
+        .expect("start recorder");
+    let nonce = "6c9bca4bd7eb4f65a1865966cedc9f78";
+    let mut ipc = BrowserPageRecordingIpc::default();
+    ipc.activate(
+        BrowserPageRecordingAuthority::new(
+            instance.clone(),
+            "tab-a",
+            BrowserRevision(7),
+            "HTTPS://EXAMPLE.TEST:443",
+            nonce,
+        )
+        .expect("canonical authority"),
+    )
+    .expect("activate");
+    assert_eq!(
+        ipc.ingest_from_origin(
+            &mut recorder,
+            "https://Example.Test:443",
+            &click_json(
+                "project-a",
+                "ai-a",
+                "tab-a",
+                7,
+                instance.id(),
+                0,
+                "https://example.test",
+                nonce,
+            ),
+        ),
+        Ok(BrowserRecordingCommit::Recorded)
+    );
+    assert_eq!(
+        ipc.ingest_from_origin(
+            &mut recorder,
+            "https://example.test.evil",
+            &click_json(
+                "project-a",
+                "ai-a",
+                "tab-a",
+                7,
+                instance.id(),
+                1,
+                "https://example.test",
+                nonce,
+            ),
+        ),
+        Err(BrowserPageRecordingIpcError::Untrusted)
+    );
 }

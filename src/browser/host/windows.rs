@@ -7,12 +7,13 @@ use crate::browser::downloads::{
     verify_prepared_storage_root,
 };
 use crate::browser::{
-    browser_lifecycle_control, browser_request_preempts_operation_queue,
-    browser_response_resource_ids, build_semantic_snapshot, crop_annotation_png,
-    effective_browser_annotation_risk, effective_browser_risk, effective_browser_risk_for_targets,
-    parse_browser_page_ipc_message, prepare_verified_download_root, redact_browser_resource_bytes,
-    redact_browser_text, remove_verified_profile, validate_annotation_candidate_context,
-    BrowserAction, BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
+    browser_lifecycle_control, browser_page_origin_from_url,
+    browser_request_preempts_operation_queue, browser_response_resource_ids,
+    build_semantic_snapshot, crop_annotation_png, effective_browser_annotation_risk,
+    effective_browser_risk, effective_browser_risk_for_targets, parse_browser_page_ipc_message,
+    prepare_verified_download_root, redact_browser_resource_bytes, redact_browser_text,
+    remove_verified_profile, validate_annotation_candidate_context, BrowserAction,
+    BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
     BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationRoute,
     BrowserApprovalPolicy, BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds,
     BrowserCommand, BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation,
@@ -20,14 +21,16 @@ use crate::browser::{
     BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
     BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation,
     BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
-    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIpc,
-    BrowserPageRecordingIpcError, BrowserPerformanceOperation, BrowserPerformanceSnapshot,
-    BrowserRawSemanticElement, BrowserRecordingError, BrowserRecordingInstance,
-    BrowserRecordingReview, BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId,
-    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
-    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout,
-    BrowserUploadResult, BrowserWaitResult, BrowserWorkflowRecorder, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
+    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
+    BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingSubmit,
+    BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
+    BrowserRecordingError, BrowserRecordingInstance, BrowserRecordingReview,
+    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget,
+    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
+    BrowserWaitResult, BrowserWorkflowRecorder, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -37,7 +40,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
@@ -149,13 +152,6 @@ struct BrowserProjectRuntime {
     context: WebContext,
 }
 
-struct BrowserPageRecordingRawMessage {
-    workspace_key: BrowserWorkspaceKey,
-    tab_id: String,
-    observed_origin: String,
-    body: String,
-}
-
 pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     trusted_app_config_dir: Option<PathBuf>,
@@ -165,8 +161,8 @@ pub struct BrowserWebViewHost {
     bounds: BrowserBounds,
     event_sender: Sender<BrowserHostEvent>,
     event_receiver: Receiver<BrowserHostEvent>,
-    recording_sender: SyncSender<BrowserPageRecordingRawMessage>,
-    recording_receiver: Receiver<BrowserPageRecordingRawMessage>,
+    recording_transport: BrowserPageRecordingTransport,
+    recording_ingresses: HashMap<BrowserViewKey, BrowserPageRecordingIngress>,
     workflow_recorder: BrowserWorkflowRecorder,
     recording_instances: HashMap<BrowserWorkspaceKey, BrowserRecordingInstance>,
     recording_views: HashMap<BrowserViewKey, BrowserPageRecordingIpc>,
@@ -236,8 +232,6 @@ impl BrowserWebViewHost {
         status: BrowserHostStatus,
     ) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
-        let (recording_sender, recording_receiver) =
-            mpsc::sync_channel(MAX_BROWSER_PAGE_RECORDING_QUEUE);
         let (async_sender, async_receiver) = mpsc::channel();
         let (annotation_sender, annotation_receiver) = mpsc::channel();
         let state_app_config_dir = trusted_app_config_dir
@@ -258,8 +252,10 @@ impl BrowserWebViewHost {
             },
             event_sender,
             event_receiver,
-            recording_sender,
-            recording_receiver,
+            recording_transport: BrowserPageRecordingTransport::with_capacity(
+                MAX_BROWSER_PAGE_RECORDING_QUEUE,
+            ),
+            recording_ingresses: HashMap::new(),
             workflow_recorder: BrowserWorkflowRecorder::default(),
             recording_instances: HashMap::new(),
             recording_views: HashMap::new(),
@@ -307,6 +303,7 @@ impl BrowserWebViewHost {
             .iter()
             .map(|tab| tab.id.clone())
             .collect::<Vec<_>>();
+        self.pump_page_recording_ipc();
         let instance = self
             .workflow_recorder
             .start(workspace_key.clone())
@@ -340,6 +337,15 @@ impl BrowserWebViewHost {
             .is_none_or(|active| active.id() != instance.id())
         {
             return Err(BrowserPageRecordingIpcError::Untrusted);
+        }
+        self.fence_workspace_recording_views(instance.workspace_key());
+        self.pump_page_recording_ipc();
+        if self
+            .recording_instances
+            .get(instance.workspace_key())
+            .is_none_or(|active| active.id() != instance.id())
+        {
+            return Err(BrowserPageRecordingIpcError::TransportInvalidated);
         }
         self.remove_workspace_recording_views(instance.workspace_key());
         self.recording_instances.remove(instance.workspace_key());
@@ -2460,8 +2466,28 @@ impl BrowserWebViewHost {
     }
 
     fn pump_page_recording_ipc(&mut self) {
-        let incoming = self.recording_receiver.try_iter().collect::<Vec<_>>();
-        for message in incoming {
+        let batch = self.recording_transport.drain();
+        for failure in batch.failures {
+            if self
+                .recording_instances
+                .get(&failure.workspace_key)
+                .is_some_and(|active| active.id() == failure.instance_id)
+            {
+                self.invalidate_page_recording_transport(
+                    &failure.workspace_key,
+                    &failure.tab_id,
+                    failure.kind,
+                );
+            }
+        }
+        for message in batch.messages {
+            if self
+                .recording_instances
+                .get(&message.workspace_key)
+                .is_none_or(|active| active.id() != message.instance_id)
+            {
+                continue;
+            }
             let key = view_key(&message.workspace_key, &message.tab_id);
             let Some(ipc) = self.recording_views.get_mut(&key) else {
                 continue;
@@ -2472,6 +2498,24 @@ impl BrowserWebViewHost {
                 &message.body,
             );
         }
+    }
+
+    fn invalidate_page_recording_transport(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        kind: BrowserPageRecordingTransportFailureKind,
+    ) {
+        let detail = match kind {
+            BrowserPageRecordingTransportFailureKind::Overflow => "overflowed",
+            BrowserPageRecordingTransportFailureKind::Disconnected => "disconnected",
+        };
+        self.discard_page_recording(workspace_key);
+        self.emit_diagnostic(
+            workspace_key,
+            tab_id,
+            format!("browser recording transport {detail}; the incomplete recording was discarded"),
+        );
     }
 
     fn install_page_recording_view(
@@ -2506,14 +2550,24 @@ impl BrowserWebViewHost {
         let nonce = random_page_recording_nonce()?;
         let authority =
             BrowserPageRecordingAuthority::new(instance, tab_id, revision, origin, nonce)?;
+        let ingress = self
+            .recording_ingresses
+            .get(&key)
+            .ok_or(BrowserPageRecordingIpcError::HostFailure)?;
+        ingress.activate(authority.instance_id(), authority.nonce())?;
         let mut ipc = BrowserPageRecordingIpc::default();
         ipc.activate(authority)?;
         let script = ipc.activation_script()?;
-        self.views
+        let install = self
+            .views
             .get(&key)
             .ok_or(BrowserPageRecordingIpcError::HostFailure)?
             .evaluate_script(&script)
-            .map_err(|_| BrowserPageRecordingIpcError::HostFailure)?;
+            .map_err(|_| BrowserPageRecordingIpcError::HostFailure);
+        if install.is_err() {
+            let _ = ipc.fence_transport(ingress);
+            return install;
+        }
         self.recording_views.insert(key, ipc);
         Ok(())
     }
@@ -2527,6 +2581,9 @@ impl BrowserWebViewHost {
         let Some(mut ipc) = self.recording_views.remove(&key) else {
             return Ok(());
         };
+        if let Some(ingress) = self.recording_ingresses.get(&key) {
+            let _ = ipc.fence_transport(ingress);
+        }
         let script = ipc.deactivation_script()?;
         let result = self
             .views
@@ -2536,6 +2593,26 @@ impl BrowserWebViewHost {
             .map_err(|_| BrowserPageRecordingIpcError::HostFailure);
         ipc.deactivate();
         result.map(|_| ())
+    }
+
+    fn fence_workspace_recording_views(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        let keys = self
+            .recording_views
+            .keys()
+            .filter(|key| &key.workspace_key == workspace_key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(ipc) = self.recording_views.get(&key) else {
+                continue;
+            };
+            if let Some(ingress) = self.recording_ingresses.get(&key) {
+                let _ = ipc.fence_transport(ingress);
+            }
+            if let (Ok(script), Some(view)) = (ipc.deactivation_script(), self.views.get(&key)) {
+                let _ = view.evaluate_script(&script);
+            }
+        }
     }
 
     fn remove_workspace_recording_views(&mut self, workspace_key: &BrowserWorkspaceKey) {
@@ -2836,6 +2913,7 @@ impl BrowserWebViewHost {
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
                 let key = view_key(workspace_key, &tab_id);
                 self.views.remove(&key);
+                self.recording_ingresses.remove(&key);
                 let mutation = self.state.close_tab(workspace_key, &tab_id)?;
                 self.ensure_selected_view(window, workspace_key)?;
                 self.apply_visibility_plan()?;
@@ -2923,6 +3001,8 @@ impl BrowserWebViewHost {
             BrowserCommand::ResetWorkspace => {
                 self.discard_page_recording(workspace_key);
                 self.views
+                    .retain(|key, _| key.workspace_key != *workspace_key);
+                self.recording_ingresses
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.state.reset_workspace(workspace_key);
                 self.apply_visibility_plan()?;
@@ -3027,7 +3107,9 @@ impl BrowserWebViewHost {
             });
 
         let sender = self.event_sender.clone();
-        let recording_sender = self.recording_sender.clone();
+        let recording_ingress = self
+            .recording_transport
+            .ingress(workspace_key.clone(), tab_id.to_string());
         let callback_workspace = workspace_key.clone();
         let callback_tab = tab_id.to_string();
         let bounds = wry_bounds(self.bounds);
@@ -3041,7 +3123,7 @@ impl BrowserWebViewHost {
             let builder = configured_builder(
                 &mut project.context,
                 sender,
-                recording_sender,
+                recording_ingress.clone(),
                 callback_workspace,
                 callback_tab,
                 trusted_app_config_dir,
@@ -3074,6 +3156,8 @@ impl BrowserWebViewHost {
         webview
             .set_memory_usage_level(MemoryUsageLevel::Low)
             .map_err(view_failure)?;
+        self.recording_ingresses
+            .insert(key.clone(), recording_ingress);
         self.views.insert(key, webview);
         if self.recording_instances.contains_key(workspace_key) {
             self.install_page_recording_view(workspace_key, tab_id)
@@ -3167,6 +3251,8 @@ impl BrowserWebViewHost {
         self.discard_project_page_recordings(&workspace_key.project_id);
         self.views
             .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
+        self.recording_ingresses
+            .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
         self.projects.remove(&workspace_key.project_id);
         self.state
             .clear_project_workspaces(&workspace_key.project_id);
@@ -3196,16 +3282,7 @@ fn map_page_recording_error(error: BrowserRecordingError) -> BrowserPageRecordin
 }
 
 fn page_origin(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if !matches!(scheme, "https" | "http") {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
-    {
-        return None;
-    }
-    Some(format!("{scheme}://{authority}"))
+    browser_page_origin_from_url(url)
 }
 
 fn random_page_recording_nonce() -> Result<String, BrowserPageRecordingIpcError> {
@@ -3297,7 +3374,7 @@ fn permission_name(kind: COREWEBVIEW2_PERMISSION_KIND) -> &'static str {
 fn configured_builder<'a>(
     context: &'a mut WebContext,
     event_sender: Sender<BrowserHostEvent>,
-    recording_sender: SyncSender<BrowserPageRecordingRawMessage>,
+    recording_ingress: BrowserPageRecordingIngress,
     workspace_key: BrowserWorkspaceKey,
     tab_id: String,
     trusted_app_config_dir: PathBuf,
@@ -3315,7 +3392,8 @@ fn configured_builder<'a>(
     let load_workspace = workspace_key.clone();
     let load_tab = tab_id.clone();
     let ipc_sender = event_sender.clone();
-    let ipc_recording_sender = recording_sender;
+    let ipc_failure_sender = event_sender.clone();
+    let ipc_recording_ingress = recording_ingress;
     let ipc_workspace = workspace_key.clone();
     let ipc_tab = tab_id.clone();
     let window_sender = event_sender.clone();
@@ -3382,12 +3460,20 @@ fn configured_builder<'a>(
                     .zip(request.uri().authority())
                     .map(|(scheme, authority)| format!("{scheme}://{}", authority.as_str()))
                     .unwrap_or_default();
-                let _ = ipc_recording_sender.try_send(BrowserPageRecordingRawMessage {
-                    workspace_key: ipc_workspace.clone(),
-                    tab_id: ipc_tab.clone(),
-                    observed_origin,
-                    body: body.to_string(),
-                });
+                let submitted = ipc_recording_ingress.submit(&observed_origin, body.to_string());
+                if matches!(
+                    submitted,
+                    BrowserPageRecordingSubmit::Overflow
+                        | BrowserPageRecordingSubmit::Disconnected
+                ) {
+                    let _ = ipc_failure_sender.send(BrowserHostEvent::Diagnostic {
+                        workspace_key: ipc_workspace.clone(),
+                        tab_id: ipc_tab.clone(),
+                        level: BrowserDiagnosticLevel::Error,
+                        message: "browser recording transport failed; the incomplete recording will be discarded"
+                            .to_string(),
+                    });
+                }
                 return;
             }
             let event = match parse_browser_page_ipc_message(body) {

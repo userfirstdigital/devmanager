@@ -101,12 +101,17 @@ pub use recording::{
     MAX_BROWSER_RECORDING_ASSERTIONS, MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION,
     MAX_BROWSER_RECORDING_INPUTS,
 };
+pub(crate) use recording_ipc::{
+    browser_page_origin_from_url, BrowserPageRecordingIngress, BrowserPageRecordingSubmit,
+    BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind,
+};
 pub use recording_ipc::{
-    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingEvent,
-    BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingTextEdit,
-    MAX_BROWSER_PAGE_RECORDING_IPC_BYTES, MAX_BROWSER_PAGE_RECORDING_IPC_DEPTH,
-    MAX_BROWSER_PAGE_RECORDING_IPC_STRINGS, MAX_BROWSER_PAGE_RECORDING_LOCATOR_FALLBACKS,
-    MAX_BROWSER_PAGE_RECORDING_SELECT_VALUES, MAX_BROWSER_PAGE_RECORDING_STRING_BYTES,
+    canonical_browser_page_origin, BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope,
+    BrowserPageRecordingEvent, BrowserPageRecordingIpc, BrowserPageRecordingIpcError,
+    BrowserPageRecordingTextEdit, MAX_BROWSER_PAGE_RECORDING_IPC_BYTES,
+    MAX_BROWSER_PAGE_RECORDING_IPC_DEPTH, MAX_BROWSER_PAGE_RECORDING_IPC_STRINGS,
+    MAX_BROWSER_PAGE_RECORDING_LOCATOR_FALLBACKS, MAX_BROWSER_PAGE_RECORDING_SELECT_VALUES,
+    MAX_BROWSER_PAGE_RECORDING_STRING_BYTES,
 };
 pub use resources::{
     resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,

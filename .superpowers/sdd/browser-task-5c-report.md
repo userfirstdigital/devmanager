@@ -23,6 +23,19 @@ Checkpoints 4 through 12 are not implemented. In particular, this checkpoint add
 - Added the Windows host's private 256-message recording queue, exact per-view authorities, explicit start/stop/status seam, post-load reinjection with a fresh nonce, and teardown/discard across all destructive view/workspace/profile lifecycle paths.
 - Added a compile-safe unsupported-platform adapter that reports recording unavailable/inactive without exposing a partial implementation.
 
+### Independent review hardening
+
+- Stop now synchronously fences each exact per-view transport authority, drains every already-accepted raw message through the still-active recorder in global source order, and only then retires the view authorities and stops the recorder. Post-fence delivery is ignored before queueing; Start drains prior transport state before publishing a replacement instance.
+- The bounded transport no longer ignores `try_send` failure. Overflow/disconnection produces a private typed per-view failure plus a diagnostic; an overflow for the exact live instance discards the incomplete recording, and old-instance traffic is rejected at the ingress gate before it can consume replacement capacity.
+- Source-side credential detection now covers bare JWT, OpenAI-style, GitHub-style, AWS-style, and Google-style high-confidence tokens in ordinary text, selected values, and locator metadata. Sensitive selections become content-free Secret markers. Locator capture no longer reads label or element text, and the Rust parser independently rejects crafted sensitive text/select/navigation/locator values before reservation.
+- All authority, envelope, script, and observed-request origin checks share the `url` parser's canonical HTTP(S) origin form, including case folding, default-port normalization, IPv6, and IDN handling. Credentials, non-HTTP(S), malformed origins, and origin fields containing paths, queries, or fragments fail closed.
+
+Review RED to GREEN:
+
+- Queue RED: the behavioral transport tests failed with E0425/E0433 because no instance-gated transport or typed submit/failure result existed; the Windows Stop-order regression then failed at the missing synchronous fence. GREEN: 2/2 transport behaviors and the exact Windows fence/drain/retire order passed, including accepted pre-Stop retention, late suppression, overflow signaling, and restart starvation fencing.
+- Secret RED: crafted JWT text returned `Ok(Recorded)` instead of `Err(Malformed)`, while the executable Node harness failed with `secret marker missing at 5`. GREEN: both Rust defense-in-depth and raw-wire Node tests passed for JWT, `sk-proj`, GitHub, AWS, aria, label, text, and select sentinels; neither wire JSON nor recipe JSON contains them.
+- Origin RED: the canonical-origin regression failed with E0432 because no shared canonical origin API existed. GREEN: canonical equivalence and spoof rejection passed across case/default ports, IPv6, IDN, credentials, malformed/non-HTTP schemes, and authority mismatches.
+
 ### RED to GREEN evidence
 
 1. Strict authority/envelope/parser:
@@ -43,9 +56,10 @@ Checkpoints 4 through 12 are not implemented. In particular, this checkpoint add
 
 ### Verification
 
-- `cargo test --locked --test browser_recording_ipc --test browser_recording --test browser_host -- --test-threads=1` -> 101 passed, 0 failed.
-- Full browser integration target command covering annotations, attachment lifecycle, automation, core, fixture, gateway, host, pane, provider, recipes, recording, and recording IPC -> 205 passed, 0 failed.
-- `cargo test --locked browser -- --test-threads=1` -> 107 matching tests passed across all targets, 0 failed.
+- `cargo test --locked --lib browser::recording_ipc::transport_tests -- --test-threads=1` -> 2 passed, 0 failed.
+- `cargo test --locked --test browser_recording_ipc --test browser_recording --test browser_host -- --test-threads=1` -> 104 passed, 0 failed.
+- Full browser integration target command covering annotations, attachment lifecycle, automation, core, fixture, gateway, host, pane, provider, recipes, recording, and recording IPC -> 208 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 109 matching tests passed across all targets, 0 failed.
 - `cargo test --locked services::process_manager::tests --lib -- --test-threads=1` -> 70 passed, 0 failed.
 - `cargo check --locked --all-targets` -> exit 0.
 - Native Windows `cargo build --locked` -> exit 0.
@@ -63,6 +77,8 @@ Checkpoints 4 through 12 are not implemented. In particular, this checkpoint add
 - `.superpowers/sdd/browser-task-5c-checkpoints.md`
 - `.superpowers/sdd/progress.md`
 - `.superpowers/sdd/browser-task-5c-report.md`
+- `Cargo.toml`
+- `Cargo.lock`
 
 ## Checkpoint 2: Pure recording/review domain
 

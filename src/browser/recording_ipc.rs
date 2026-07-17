@@ -7,6 +7,11 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::sync::OnceLock;
+use std::sync::{
+    mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
+    Arc, Mutex,
+};
 
 pub const MAX_BROWSER_PAGE_RECORDING_IPC_BYTES: usize = 8 * 1024;
 pub const MAX_BROWSER_PAGE_RECORDING_IPC_DEPTH: usize = 8;
@@ -24,6 +29,7 @@ pub enum BrowserPageRecordingIpcError {
     AlreadyActive,
     Unavailable,
     HostFailure,
+    TransportInvalidated,
     InvalidAuthority,
     Malformed,
     Oversized,
@@ -41,6 +47,9 @@ impl fmt::Display for BrowserPageRecordingIpcError {
             Self::AlreadyActive => "browser page recording IPC is already active",
             Self::Unavailable => "browser page recording IPC is unavailable",
             Self::HostFailure => "browser page recording host operation failed",
+            Self::TransportInvalidated => {
+                "browser page recording transport invalidated the incomplete recording"
+            }
             Self::InvalidAuthority => "browser page recording authority is invalid",
             Self::Malformed => "browser page recording IPC is malformed",
             Self::Oversized => "browser page recording IPC is oversized",
@@ -73,10 +82,9 @@ impl BrowserPageRecordingAuthority {
         nonce: impl Into<String>,
     ) -> Result<Self, BrowserPageRecordingIpcError> {
         let tab_id = tab_id.into();
-        let origin = origin.into();
+        let origin = canonical_browser_page_origin(&origin.into())?;
         let nonce = nonce.into();
         if !valid_identifier(&tab_id, 256)
-            || !valid_origin(&origin)
             || !(32..=64).contains(&nonce.len())
             || !nonce
                 .bytes()
@@ -91,6 +99,14 @@ impl BrowserPageRecordingAuthority {
             origin,
             nonce,
         })
+    }
+
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance.id()
+    }
+
+    pub(crate) fn nonce(&self) -> &str {
+        &self.nonce
     }
 }
 
@@ -200,6 +216,8 @@ impl BrowserPageRecordingEnvelope {
             serde_json::from_str(body).map_err(|_| BrowserPageRecordingIpcError::Malformed)?;
         let document: BrowserPageRecordingEnvelopeDocument = serde_json::from_value(strict.0)
             .map_err(|_| BrowserPageRecordingIpcError::Malformed)?;
+        let origin = canonical_browser_page_origin(&document.origin)
+            .map_err(|_| BrowserPageRecordingIpcError::Malformed)?;
         let envelope = Self {
             version: document.version,
             channel: document.channel,
@@ -210,7 +228,7 @@ impl BrowserPageRecordingEnvelope {
             sequence: document.sequence,
             actor: document.actor,
             source: document.source,
-            origin: document.origin,
+            origin,
             event: document.event,
             nonce: document.nonce,
         };
@@ -228,7 +246,6 @@ impl BrowserPageRecordingEnvelope {
             || !valid_identifier(&self.workspace.project_id, 256)
             || !valid_identifier(&self.workspace.ai_tab_id, 256)
             || !valid_identifier(&self.tab_id, 256)
-            || !valid_origin(&self.origin)
             || self.instance_id == 0
             || self.sequence > MAX_JAVASCRIPT_SAFE_INTEGER
             || !(32..=64).contains(&self.nonce.len())
@@ -251,6 +268,7 @@ impl BrowserPageRecordingEvent {
                 edit: BrowserPageRecordingTextEdit::Text { text },
                 ..
             } if text.len() > MAX_BROWSER_PAGE_RECORDING_STRING_BYTES
+                || contains_sensitive_page_text(text)
                 || text.chars().any(|character| {
                     character.is_control() && !matches!(character, '\n' | '\r' | '\t')
                 }) =>
@@ -261,6 +279,7 @@ impl BrowserPageRecordingEvent {
                 if values.len() > MAX_BROWSER_PAGE_RECORDING_SELECT_VALUES
                     || values.iter().any(|value| {
                         value.len() > 512
+                            || contains_sensitive_page_text(value)
                             || value.chars().any(|character| {
                                 character.is_control() && !matches!(character, '\n' | '\r' | '\t')
                             })
@@ -268,7 +287,7 @@ impl BrowserPageRecordingEvent {
             {
                 Err(BrowserPageRecordingIpcError::Malformed)
             }
-            Self::Navigation { url } if url.len() > 4_000 => {
+            Self::Navigation { url } if url.len() > 4_000 || contains_sensitive_page_text(url) => {
                 Err(BrowserPageRecordingIpcError::Malformed)
             }
             _ => self
@@ -344,6 +363,207 @@ pub struct BrowserPageRecordingIpc {
     last_sequence: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserPageRecordingSubmit {
+    Accepted,
+    Fenced,
+    Inactive,
+    Stale,
+    Invalid,
+    Overflow,
+    Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserPageRecordingTransportFailureKind {
+    Overflow,
+    Disconnected,
+}
+
+pub(crate) struct BrowserPageRecordingRawMessage {
+    pub(crate) workspace_key: super::BrowserWorkspaceKey,
+    pub(crate) tab_id: String,
+    pub(crate) observed_origin: String,
+    pub(crate) body: String,
+    pub(crate) instance_id: u64,
+}
+
+pub(crate) struct BrowserPageRecordingTransportFailure {
+    pub(crate) workspace_key: super::BrowserWorkspaceKey,
+    pub(crate) tab_id: String,
+    pub(crate) instance_id: u64,
+    pub(crate) kind: BrowserPageRecordingTransportFailureKind,
+}
+
+pub(crate) struct BrowserPageRecordingTransportBatch {
+    pub(crate) messages: Vec<BrowserPageRecordingRawMessage>,
+    pub(crate) failures: Vec<BrowserPageRecordingTransportFailure>,
+}
+
+struct BrowserPageRecordingTransportIdentity {
+    instance_id: u64,
+    nonce: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserPageRecordingIngress {
+    sender: SyncSender<BrowserPageRecordingRawMessage>,
+    failure_sender: Sender<BrowserPageRecordingTransportFailure>,
+    workspace_key: super::BrowserWorkspaceKey,
+    tab_id: String,
+    active: Arc<Mutex<Option<BrowserPageRecordingTransportIdentity>>>,
+}
+
+pub(crate) struct BrowserPageRecordingTransport {
+    sender: SyncSender<BrowserPageRecordingRawMessage>,
+    receiver: Receiver<BrowserPageRecordingRawMessage>,
+    failure_sender: Sender<BrowserPageRecordingTransportFailure>,
+    failure_receiver: Receiver<BrowserPageRecordingTransportFailure>,
+}
+
+#[cfg(test)]
+fn browser_page_recording_transport(
+    capacity: usize,
+    workspace_key: super::BrowserWorkspaceKey,
+    tab_id: String,
+) -> (BrowserPageRecordingTransport, BrowserPageRecordingIngress) {
+    let transport = BrowserPageRecordingTransport::with_capacity(capacity);
+    let ingress = transport.ingress(workspace_key, tab_id);
+    (transport, ingress)
+}
+
+impl BrowserPageRecordingTransport {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver,
+            failure_sender,
+            failure_receiver,
+        }
+    }
+
+    pub(crate) fn ingress(
+        &self,
+        workspace_key: super::BrowserWorkspaceKey,
+        tab_id: String,
+    ) -> BrowserPageRecordingIngress {
+        BrowserPageRecordingIngress {
+            sender: self.sender.clone(),
+            failure_sender: self.failure_sender.clone(),
+            workspace_key,
+            tab_id,
+            active: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl BrowserPageRecordingIngress {
+    pub(crate) fn activate(
+        &self,
+        instance_id: u64,
+        nonce: &str,
+    ) -> Result<(), BrowserPageRecordingIpcError> {
+        if instance_id == 0
+            || !(32..=64).contains(&nonce.len())
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(BrowserPageRecordingIpcError::InvalidAuthority);
+        }
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BrowserPageRecordingIpcError::HostFailure)?;
+        *active = Some(BrowserPageRecordingTransportIdentity {
+            instance_id,
+            nonce: nonce.to_string(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn fence(&self, instance_id: u64, nonce: &str) -> BrowserPageRecordingSubmit {
+        let Ok(mut active) = self.active.lock() else {
+            return BrowserPageRecordingSubmit::Disconnected;
+        };
+        match active.as_ref() {
+            Some(identity) if identity.instance_id == instance_id && identity.nonce == nonce => {
+                *active = None;
+                BrowserPageRecordingSubmit::Fenced
+            }
+            Some(_) => BrowserPageRecordingSubmit::Stale,
+            None => BrowserPageRecordingSubmit::Inactive,
+        }
+    }
+
+    pub(crate) fn submit(&self, observed_origin: &str, body: String) -> BrowserPageRecordingSubmit {
+        let Ok(envelope) = BrowserPageRecordingEnvelope::parse(&body) else {
+            return BrowserPageRecordingSubmit::Invalid;
+        };
+        if envelope.workspace.project_id != self.workspace_key.project_id
+            || envelope.workspace.ai_tab_id != self.workspace_key.ai_tab_id
+            || envelope.tab_id != self.tab_id
+        {
+            return BrowserPageRecordingSubmit::Stale;
+        }
+        let Ok(mut active) = self.active.lock() else {
+            return BrowserPageRecordingSubmit::Disconnected;
+        };
+        let Some(identity) = active.as_ref() else {
+            return BrowserPageRecordingSubmit::Inactive;
+        };
+        if envelope.instance_id != identity.instance_id || envelope.nonce != identity.nonce {
+            return BrowserPageRecordingSubmit::Stale;
+        }
+        let instance_id = identity.instance_id;
+        let message = BrowserPageRecordingRawMessage {
+            workspace_key: self.workspace_key.clone(),
+            tab_id: self.tab_id.clone(),
+            observed_origin: observed_origin.to_string(),
+            body,
+            instance_id,
+        };
+        match self.sender.try_send(message) {
+            Ok(()) => BrowserPageRecordingSubmit::Accepted,
+            Err(TrySendError::Full(_)) => {
+                *active = None;
+                let _ = self
+                    .failure_sender
+                    .send(BrowserPageRecordingTransportFailure {
+                        workspace_key: self.workspace_key.clone(),
+                        tab_id: self.tab_id.clone(),
+                        instance_id,
+                        kind: BrowserPageRecordingTransportFailureKind::Overflow,
+                    });
+                BrowserPageRecordingSubmit::Overflow
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                *active = None;
+                let _ = self
+                    .failure_sender
+                    .send(BrowserPageRecordingTransportFailure {
+                        workspace_key: self.workspace_key.clone(),
+                        tab_id: self.tab_id.clone(),
+                        instance_id,
+                        kind: BrowserPageRecordingTransportFailureKind::Disconnected,
+                    });
+                BrowserPageRecordingSubmit::Disconnected
+            }
+        }
+    }
+}
+
+impl BrowserPageRecordingTransport {
+    pub(crate) fn drain(&self) -> BrowserPageRecordingTransportBatch {
+        BrowserPageRecordingTransportBatch {
+            messages: self.receiver.try_iter().collect(),
+            failures: self.failure_receiver.try_iter().collect(),
+        }
+    }
+}
+
 impl BrowserPageRecordingIpc {
     pub fn activate(
         &mut self,
@@ -360,6 +580,16 @@ impl BrowserPageRecordingIpc {
     pub fn deactivate(&mut self) {
         self.authority = None;
         self.last_sequence = None;
+    }
+
+    pub(crate) fn fence_transport(
+        &self,
+        ingress: &BrowserPageRecordingIngress,
+    ) -> BrowserPageRecordingSubmit {
+        let Some(authority) = self.authority.as_ref() else {
+            return BrowserPageRecordingSubmit::Inactive;
+        };
+        ingress.fence(authority.instance.id(), &authority.nonce)
     }
 
     pub fn activation_script(&self) -> Result<String, BrowserPageRecordingIpcError> {
@@ -435,6 +665,8 @@ impl BrowserPageRecordingIpc {
             .authority
             .as_ref()
             .ok_or(BrowserPageRecordingIpcError::Inactive)?;
+        let observed_origin = canonical_browser_page_origin(observed_origin)
+            .map_err(|_| BrowserPageRecordingIpcError::Untrusted)?;
         if observed_origin != authority.origin {
             return Err(BrowserPageRecordingIpcError::Untrusted);
         }
@@ -496,7 +728,12 @@ const PAGE_RECORDING_SCRIPT_TEMPLATE: &str = r#"
     const text = String(value ?? "");
     return /\b(?:Basic|Bearer)\s+[A-Za-z0-9._~+\/=\-]+/i.test(text) ||
       /(?:authorization|password|passwd|token|secret|cookie|api[_-]?key|private[_-]?key)\s*[:=]\s*\S+/i.test(text) ||
-      /["'](?:authorization|password|passwd|token|secret|cookie|api[_-]?key|private[_-]?key)["']\s*:\s*["'][^"']+/i.test(text);
+      /["'](?:authorization|password|passwd|token|secret|cookie|api[_-]?key|private[_-]?key)["']\s*:\s*["'][^"']+/i.test(text) ||
+      /(?:^|[^A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[^A-Za-z0-9_-])/.test(text) ||
+      /(?:^|[^A-Za-z0-9_-])sk-(?:proj-)?[A-Za-z0-9_-]{20,}(?:$|[^A-Za-z0-9_-])/i.test(text) ||
+      /(?:^|[^A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9]{20,}(?:$|[^A-Za-z0-9])/i.test(text) ||
+      /(?:^|[^A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?:$|[^A-Z0-9])/.test(text) ||
+      /(?:^|[^A-Za-z0-9_-])AIza[A-Za-z0-9_-]{30,}(?:$|[^A-Za-z0-9_-])/.test(text);
   };
   const safeMetadata = (value, maximum) => {
     const text = bounded(value, maximum);
@@ -516,7 +753,7 @@ const PAGE_RECORDING_SCRIPT_TEMPLATE: &str = r#"
         parsed.hash = "";
       }
       const result = parsed.toString();
-      return result.length <= 4000 ? result : null;
+      return result.length <= 4000 && !credentialText(result) ? result : null;
     } catch (_) {
       return null;
     }
@@ -538,11 +775,8 @@ const PAGE_RECORDING_SCRIPT_TEMPLATE: &str = r#"
   };
   const semanticName = (element) => safeMetadata(
     element.getAttribute?.("aria-label") ||
-    element.labels?.[0]?.innerText ||
-    element.closest?.("label")?.innerText ||
     element.getAttribute?.("alt") ||
     element.getAttribute?.("title") ||
-    element.innerText ||
     "",
     256,
   );
@@ -603,7 +837,10 @@ const PAGE_RECORDING_SCRIPT_TEMPLATE: &str = r#"
         .filter((option) => option.selected)
         .slice(0, 16)
         .map((option) => bounded(option.value, 512));
-      if (values.some(credentialText)) return;
+      if (values.some(credentialText)) {
+        emit({ type: "textEdit", locator, edit: { type: "password" } });
+        return;
+      }
       emit({ type: "select", locator, values });
       return;
     }
@@ -699,6 +936,25 @@ fn valid_identifier(value: &str, maximum: usize) -> bool {
 fn validate_locator_bounds(
     locator: &BrowserRecipeLocator,
 ) -> Result<(), BrowserPageRecordingIpcError> {
+    if locator
+        .accessibility_role
+        .as_deref()
+        .is_some_and(contains_sensitive_page_text)
+        || locator
+            .accessibility_name
+            .as_deref()
+            .is_some_and(contains_sensitive_page_text)
+        || locator
+            .test_id
+            .as_deref()
+            .is_some_and(contains_sensitive_page_text)
+        || locator
+            .css_selectors
+            .iter()
+            .any(|selector| contains_sensitive_page_text(selector))
+    {
+        return Err(BrowserPageRecordingIpcError::Malformed);
+    }
     if locator.css_selectors.len() > MAX_BROWSER_PAGE_RECORDING_LOCATOR_FALLBACKS
         || locator
             .accessibility_role
@@ -722,16 +978,54 @@ fn validate_locator_bounds(
     Ok(())
 }
 
-fn valid_origin(value: &str) -> bool {
-    let Some((scheme, authority)) = value.split_once("://") else {
-        return false;
-    };
-    value.len() <= 512
-        && !value.chars().any(char::is_control)
-        && matches!(scheme, "https" | "http")
-        && !authority.is_empty()
-        && !authority.contains(['/', '?', '#', '@'])
-        && !authority.chars().any(char::is_whitespace)
+fn contains_sensitive_page_text(value: &str) -> bool {
+    static SENSITIVE: OnceLock<regex::Regex> = OnceLock::new();
+    SENSITIVE
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?ix)
+                (?:^|[^A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[^A-Za-z0-9_-])
+                |(?:^|[^A-Za-z0-9_-])sk-(?:proj-)?[A-Za-z0-9_-]{20,}(?:$|[^A-Za-z0-9_-])
+                |(?:^|[^A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9]{20,}(?:$|[^A-Za-z0-9])
+                |(?:^|[^A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?:$|[^A-Z0-9])
+                |(?:^|[^A-Za-z0-9_-])AIza[A-Za-z0-9_-]{30,}(?:$|[^A-Za-z0-9_-])",
+            )
+            .expect("static sensitive page text regex")
+        })
+        .is_match(value)
+}
+
+pub fn canonical_browser_page_origin(value: &str) -> Result<String, BrowserPageRecordingIpcError> {
+    canonical_browser_page_origin_inner(value, true)
+}
+
+pub(crate) fn browser_page_origin_from_url(value: &str) -> Option<String> {
+    canonical_browser_page_origin_inner(value, false).ok()
+}
+
+fn canonical_browser_page_origin_inner(
+    value: &str,
+    require_origin_only: bool,
+) -> Result<String, BrowserPageRecordingIpcError> {
+    if value.len() > 4_000 || value.chars().any(char::is_control) {
+        return Err(BrowserPageRecordingIpcError::InvalidAuthority);
+    }
+    let parsed =
+        url::Url::parse(value).map_err(|_| BrowserPageRecordingIpcError::InvalidAuthority)?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || (require_origin_only
+            && (parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some()))
+    {
+        return Err(BrowserPageRecordingIpcError::InvalidAuthority);
+    }
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" || origin.len() > 512 {
+        return Err(BrowserPageRecordingIpcError::InvalidAuthority);
+    }
+    Ok(origin)
 }
 
 fn preflight_json(body: &str) -> Result<(), BrowserPageRecordingIpcError> {
@@ -890,5 +1184,143 @@ impl<'de> Deserialize<'de> for StrictJsonValue {
         }
 
         deserializer.deserialize_any(StrictValueVisitor)
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::browser::{BrowserRecordingCommit, BrowserWorkspaceKey};
+
+    fn workspace() -> BrowserWorkspaceKey {
+        BrowserWorkspaceKey {
+            project_id: "project-a".to_string(),
+            ai_tab_id: "ai-a".to_string(),
+        }
+    }
+
+    fn click_body(instance_id: u64, sequence: u64, nonce: &str) -> String {
+        format!(
+            r##"{{"version":1,"channel":"browserRecording","workspace":{{"projectId":"project-a","aiTabId":"ai-a"}},"tabId":"tab-a","revision":7,"instanceId":{instance_id},"sequence":{sequence},"actor":"user","source":"page","origin":"https://example.test","event":{{"type":"click","locator":{{"accessibilityRole":"button","accessibilityName":"Save","testId":"save","cssSelectors":["#save"]}}}},"nonce":"{nonce}"}}"##
+        )
+    }
+
+    #[test]
+    fn transport_fences_then_drains_pre_stop_and_purges_stale_instances_on_restart() {
+        let nonce_one = "11111111111111111111111111111111";
+        let nonce_two = "22222222222222222222222222222222";
+        let mut recorder = BrowserWorkflowRecorder::default();
+        let first = recorder.start(workspace()).expect("first recording");
+        let authority = BrowserPageRecordingAuthority::new(
+            first.clone(),
+            "tab-a",
+            BrowserRevision(7),
+            "https://example.test",
+            nonce_one,
+        )
+        .expect("first authority");
+        let mut ipc = BrowserPageRecordingIpc::default();
+        ipc.activate(authority).expect("activate first IPC");
+        let (transport, ingress) =
+            browser_page_recording_transport(2, workspace(), "tab-a".to_string());
+        ingress
+            .activate(first.id(), nonce_one)
+            .expect("activate ingress");
+
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(first.id(), 0, nonce_one)),
+            BrowserPageRecordingSubmit::Accepted
+        );
+        assert_eq!(
+            ingress.fence(first.id(), nonce_one),
+            BrowserPageRecordingSubmit::Fenced
+        );
+        let batch = transport.drain();
+        assert!(batch.failures.is_empty());
+        assert_eq!(batch.messages.len(), 1);
+        for message in batch.messages {
+            assert_eq!(
+                ipc.ingest_from_origin(&mut recorder, &message.observed_origin, &message.body),
+                Ok(BrowserRecordingCommit::Recorded)
+            );
+        }
+        let review = recorder.stop(&first).expect("stop after accepted drain");
+        assert_eq!(review.recipe().steps.len(), 1);
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(first.id(), 1, nonce_one)),
+            BrowserPageRecordingSubmit::Inactive,
+            "events arriving after the synchronous fence never enter the queue"
+        );
+        assert!(transport.drain().messages.is_empty());
+        recorder.discard(&first).expect("discard first review");
+
+        let second = recorder.start(workspace()).expect("second recording");
+        ingress
+            .activate(second.id(), nonce_two)
+            .expect("activate replacement");
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(first.id(), 2, nonce_one)),
+            BrowserPageRecordingSubmit::Stale,
+            "old-instance page messages are rejected before consuming bounded capacity"
+        );
+        assert_eq!(
+            ingress.submit(
+                "https://example.test",
+                click_body(second.id(), 0, nonce_two)
+            ),
+            BrowserPageRecordingSubmit::Accepted
+        );
+        let replacement_batch = transport.drain();
+        assert_eq!(replacement_batch.messages.len(), 1);
+        assert_eq!(replacement_batch.messages[0].instance_id, second.id());
+    }
+
+    #[test]
+    fn transport_overflow_is_typed_and_invalidates_only_the_exact_incomplete_instance() {
+        let nonce_one = "11111111111111111111111111111111";
+        let nonce_two = "22222222222222222222222222222222";
+        let (transport, ingress) =
+            browser_page_recording_transport(1, workspace(), "tab-a".to_string());
+        ingress
+            .activate(41, nonce_one)
+            .expect("activate first ingress");
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(41, 0, nonce_one)),
+            BrowserPageRecordingSubmit::Accepted
+        );
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(41, 1, nonce_one)),
+            BrowserPageRecordingSubmit::Overflow
+        );
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(41, 2, nonce_one)),
+            BrowserPageRecordingSubmit::Inactive,
+            "the first transport failure closes the ingress before it can amplify failures"
+        );
+        let failed = transport.drain();
+        assert_eq!(failed.messages.len(), 1);
+        assert_eq!(failed.failures.len(), 1);
+        assert_eq!(failed.failures[0].instance_id, 41);
+        assert_eq!(
+            failed.failures[0].kind,
+            BrowserPageRecordingTransportFailureKind::Overflow
+        );
+
+        ingress
+            .activate(42, nonce_two)
+            .expect("activate replacement");
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(41, 2, nonce_one)),
+            BrowserPageRecordingSubmit::Stale
+        );
+        assert_eq!(
+            ingress.submit("https://example.test", click_body(42, 0, nonce_two)),
+            BrowserPageRecordingSubmit::Accepted,
+            "stale traffic cannot refill or starve the replacement queue"
+        );
+        let replacement = transport.drain();
+        assert!(replacement.failures.is_empty());
+        assert_eq!(replacement.messages.len(), 1);
+        assert_eq!(replacement.messages[0].instance_id, 42);
     }
 }
