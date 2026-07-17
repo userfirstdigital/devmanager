@@ -2,7 +2,7 @@
 
 ## Status
 
-Task 5B is implemented through checkpoint 4C2 and awaits independent review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local and remote exactly-once PTY attachment delivery, authoritative AppState/host projection with attachment pin reconciliation, native pending-annotation chips/preview/remove UI, and remote web input/composer provenance are implemented.
+Task 5B is implemented through checkpoint 4C2 with its first independent-review fix and awaits re-review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local and remote exactly-once PTY attachment delivery, authoritative AppState/host projection with attachment pin reconciliation, native pending-annotation chips/preview/remove UI, and remote web input/composer provenance are implemented.
 
 ## Commit range
 
@@ -15,6 +15,7 @@ Task 5B is implemented through checkpoint 4C2 and awaits independent review. Per
 - Checkpoint 4C1 independent-review hardening: this follow-up commit
 - Checkpoint 4C1 terminal-model notice lifecycle hardening: this second follow-up commit
 - Checkpoint 4C2 remote user-input and composer provenance: this checkpoint commit
+- Checkpoint 4C2 duplicate-paste review fix: this follow-up commit
 - Branch: `master`, explicitly authorized by the user
 
 ## Authenticated MCP architecture
@@ -59,7 +60,7 @@ Task 5B is implemented through checkpoint 4C2 and awaits independent review. Per
 
 ## Remaining Task 5B work
 
-- Complete independent review of checkpoint 4C1 hardening and checkpoint 4C2.
+- Complete independent review of checkpoint 4C1 hardening and re-review checkpoint 4C2.
 
 ## Checkpoint 4A: attachment transaction core
 
@@ -342,3 +343,23 @@ Checkpoint 4B must wire the broker into ProcessManager session lifecycle, explic
 - Web Vitest - PASS, 48 files / 291 tests; TypeScript typecheck and production PWA bundle build - PASS.
 - `cargo fmt --all -- --check`, `git diff --check`, `cargo check --locked --lib`, and `cargo check --locked --all-targets` - PASS.
 - Windows `cargo build --locked` - PASS with no Rust warnings.
+
+## Checkpoint 4C2 duplicate-paste review fix
+
+- Independent review found that `TerminalView` handled clipboard text in an ancestor capture listener but called only `preventDefault`. Xterm registers target paste listeners on both its textarea and terminal element; its clipboard handler emits through `onData` even after default handling is canceled. One browser paste therefore produced the intended Paste frame followed by an unintended Text/Bytes frame.
+- Handled text paste now stops propagation after the single explicit Paste send. Every image clipboard path prevents default and stops propagation before validation or encoding, preserving image-only delivery and preventing xterm's empty/text fallback. Ordinary key events are untouched and continue through `onData` as Text.
+- The real web wire uses lowercase `claude`/`codex` session kinds, while the existing image gate accepted only legacy capitalized values. The gate now recognizes the real lowercase values and retains compatibility with both legacy capitals; other session kinds remain rejected.
+
+### Duplicate-paste RED / GREEN evidence
+
+- A jsdom integration renders the real `TerminalView` and uses the minimum xterm-faithful DOM seam: `open` installs paste listeners on the textarea and terminal element, and those listeners feed the registered `onData` callback. RED observed two text calls (`Paste`, then `Text`) and one image send plus an unintended fallback `Text`; its ordinary-key control case already passed.
+- After propagation ownership, the same integration is GREEN: one clipboard text event produces exactly one Paste, one image event produces exactly one `pasteImage` and no terminal input, and ordinary `a` keydown produces exactly one Text.
+- A second RED used the actual lowercase wire/store kind and could not reach image delivery; helper coverage also rejected lowercase. GREEN accepts lowercase wire values plus legacy capitals and rejects shell/server/SSH/null.
+
+### Duplicate-paste verification
+
+- Focused Terminal/image integration and normalization suite - PASS, 8/8.
+- Full web Vitest - PASS, 49 files / 295 tests; TypeScript typecheck and production PWA bundle build - PASS.
+- Remote wire suite - PASS, 15/15; remote bridge suite - PASS, 99/99; attachment lifecycle - PASS, 3/3.
+- `cargo fmt --all -- --check` and `git diff --check` - PASS.
+- `cargo check --locked --lib` and Windows `cargo build --locked` - PASS with no Rust warnings.

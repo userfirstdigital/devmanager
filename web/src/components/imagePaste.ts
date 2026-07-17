@@ -23,8 +23,15 @@ export type ClipboardImageInspection =
       kind: "none";
     };
 
-export function isAiSessionKind(kind: unknown): kind is "Claude" | "Codex" {
-  return kind === "Claude" || kind === "Codex";
+export function isAiSessionKind(
+  kind: unknown,
+): kind is "claude" | "codex" | "Claude" | "Codex" {
+  return (
+    kind === "claude" ||
+    kind === "codex" ||
+    kind === "Claude" ||
+    kind === "Codex"
+  );
 }
 
 export function inspectClipboardImageItems(

@@ -412,8 +412,8 @@ export function TerminalView({ sessionId }: TerminalProps) {
       terminalRef.current = terminal;
       (window as unknown as { __dmTerm?: unknown }).__dmTerm = terminal;
 
-      // Copy-on-Ctrl+C when there's a selection, paste handled by browser
-      // default on Ctrl+V. Matches the archive's custom handler at
+      // Copy-on-Ctrl+C when there's a selection; paste is owned by the
+      // capture-phase handler below. Matches the archive's custom handler at
       // InteractiveTerminal.tsx lines 304-327.
       terminal.attachCustomKeyEventHandler((event) => {
         if (event.type !== "keydown") return true;
@@ -431,12 +431,16 @@ export function TerminalView({ sessionId }: TerminalProps) {
       const handlePaste = (event: ClipboardEvent) => {
         const inspection = inspectClipboardImageItems(event.clipboardData?.items);
         if (inspection.kind === "none") {
-          forwardTerminalTextPaste(event, (text, inputKind) => {
+          const handled = forwardTerminalTextPaste(event, (text, inputKind) => {
             sendInput(sessionId, text, inputKind);
           });
+          if (handled) {
+            event.stopPropagation();
+          }
           return;
         }
         event.preventDefault();
+        event.stopPropagation();
 
         if (!isAiSessionKind(sessionKindRef.current)) {
           useStore.setState({

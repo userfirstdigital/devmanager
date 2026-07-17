@@ -3,10 +3,20 @@ import { describe, expect, it } from "vitest";
 import {
   buildImagePastePayload,
   inspectClipboardImageItems,
+  isAiSessionKind,
   WEB_PASTE_IMAGE_MAX_BYTES,
 } from "./imagePaste";
 
 describe("imagePaste helpers", () => {
+  it("accepts wire-format and legacy capitalized AI kinds", () => {
+    for (const kind of ["claude", "codex", "Claude", "Codex"]) {
+      expect(isAiSessionKind(kind)).toBe(true);
+    }
+    for (const kind of ["shell", "server", "ssh", null]) {
+      expect(isAiSessionKind(kind)).toBe(false);
+    }
+  });
+
   it("picks the first supported clipboard image item", () => {
     const pngFile = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "shot.png", {
       type: "image/png",
