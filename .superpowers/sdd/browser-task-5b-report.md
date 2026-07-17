@@ -188,15 +188,15 @@ Checkpoint 4B must wire the broker into ProcessManager session lifecycle, explic
 - Dirty projections carry the exact unacknowledged delivery/detach tombstone delta. The host's narrow attachment acknowledgement removes only those exact IDs, unions current broker pending IDs without deleting concurrent host additions, advances only `BrowserAttachmentRevision`, and preserves annotations, page `BrowserRevision`, tabs, and selection.
 - The Windows host reconciles annotation resource pins after the narrow mutation. A delivered resolved screenshot is released, while unresolved saved annotation context and a concurrently added pending annotation remain available and pinned.
 - Locally hosted full-snapshot ingress is observe-then-overlay at restored AppState, synchronous browser responses, and host `SyncSnapshot` events; provider registration already uses the same broker order. Delivered/detached IDs therefore cannot reappear in AppState during the 33ms event-pump interval.
-- The browser event pump reconciles dirty projections before its empty-event early return, persists each changed AppState immediately, and acknowledges the broker only after host mutation, AppState replacement, and persistence succeed. Broker calls occur outside the host/bridge critical section.
-- Remote-client snapshot merge remains remote-host authoritative and contains no local broker overlay path, regardless of whether the local broker is empty or dirty.
+- The browser event pump reconciles dirty projections before its empty-event early return through one behavior-tested transaction, persists each changed AppState immediately, and acknowledges the broker only after host mutation, AppState replacement, and persistence succeed. Broker calls occur outside the host/bridge critical section.
+- Remote-client snapshot merge remains remote-host authoritative and contains no local broker overlay path while connected, regardless of whether the local broker is empty or dirty. On disconnect, the captured local backup is observe-then-overlaid through the local broker after remote mode ends and before it replaces AppState.
 - Reset Workspace and Clear Project Profile discard only their scoped broker workspace state and preserve live PTY bindings. Local AI tab close fully retires the exact workspace and binding without affecting another conversation.
 
 ### Checkpoint 4B2 RED / GREEN evidence
 
 - Broker RED failed to compile on missing nondestructive dirty observation, generation-checked acknowledgement, exact tombstone delta, and state-only reset APIs. GREEN proves retryable observation, exact detach/delivery deltas, concurrent-newer retention, stale-snapshot suppression, and reset-versus-retire binding semantics.
-- Host RED failed on the missing narrow attachment acknowledgement. GREEN proves page revision, tabs, selection, saved annotations, and concurrent pending additions survive while exact delivered IDs are removed and pin projection changes correctly. A Windows source invariant proves pin reconciliation follows the state mutation.
-- Native-shell ingress RED failed because synchronous response, host-event, and restored-state paths did not project through the broker, and because the empty pump returned before dirty reconciliation. GREEN proves observe-before-overlay-before-replacement, host/persistence before broker ack, and no broker call inside remote-client snapshot merge.
+- Host RED failed on the missing narrow attachment acknowledgement. Behavioral GREEN proves page revision, tabs, selection, saved annotations, and concurrent pending additions survive while exact delivered IDs are removed. Real resource-store behavior proves a resolved delivered screenshot becomes unpinned while a pending screenshot stays pinned; a supplemental Windows source invariant ties that helper to the production host path.
+- Native-shell ingress RED failed because synchronous response, host-event, and restored-state paths did not project through the broker, and because the empty pump returned before dirty reconciliation. Behavioral GREEN exercises the production transaction with real AppState/broker state for success, host failure, persistence failure, and a concurrent newer generation. Supplemental source invariants prove the empty-pump call site, lock/persist seams, observe-before-overlay-before-replacement ingress, and absence of local broker calls inside connected remote-client snapshot merge.
 - Local-close RED left the closed workspace binding alive. GREEN fully retires that exact workspace while preserving another conversation; reset/clear retain bindings through the state-only broker reset.
 
 ### Checkpoint 4B2 verification
@@ -206,3 +206,25 @@ Checkpoint 4B must wire the broker into ProcessManager session lifecycle, explic
 - `cargo test --locked --lib state::app_state::tests -- --test-threads=1` - PASS, 3/3.
 - `cargo test --locked --lib services::process_manager::tests -- --test-threads=1` - PASS, 70/70.
 - Affected browser suites - PASS, 156/156: annotations 5, automation 12, core 17, gateway 14, host 81, pane 27.
+
+## Checkpoint 4B2 independent-review recovery hardening
+
+- Disconnecting from a remote host no longer restores `local_state_backup` verbatim. After remote mode is removed, the backup is observed and overlaid through the local attachment broker before AppState assignment, then persisted if projection changed. Connected remote snapshots remain exclusively remote-host authoritative.
+- Extracted the exact pump reconciliation transaction behind an injected host-ack/AppState-persist sink. The native sink keeps host/bridge work and broker calls separated; tests use the same transaction with real AppState and broker state.
+- Host acknowledgement and pin reconciliation now share one production helper used by the Windows host. It unions live draft resource IDs with snapshot-owned pins and reconciles the real resource store after the narrow state mutation.
+
+### Review recovery RED / GREEN evidence
+
+- Disconnect source RED found no local broker reconciliation between `remote_mode.take()` and `self.state = local_state`. GREEN adds that exact order, while a behavioral regression proves a delivered ID in the stale backup is suppressed and the dirty projection remains available for later host acknowledgement.
+- Transaction RED failed to compile on the missing sink, result, and coordinator interfaces. GREEN proves an empty-pump projection applies and persists before acknowledgement; host or persistence failure leaves the projection retryable; and a concurrent newer generation is persisted and remains dirty instead of being cleared by the captured older acknowledgement.
+- Resource-pin RED failed to compile because no production host/resource helper existed. GREEN uses a real `BrowserResourceStore`: resolved delivered screenshot A becomes unpinned and pending screenshot B remains pinned. The Windows source invariant is retained only to prove the behavior-tested helper is the live wrapper path.
+
+### Review recovery verification
+
+- Pump transaction behavior - PASS, 3/3; persistence observes the captured projection still dirty before acknowledgement.
+- Remote-disconnect stale-backup behavior - PASS, 1/1; supplemental disconnect-order source invariant is included in the pane suite.
+- `cargo test --locked --lib browser::attachments::tests -- --test-threads=1 --nocapture` - PASS, 15/15.
+- `cargo test --locked --lib state::app_state::tests -- --test-threads=1` - PASS, 3/3.
+- `cargo test --locked --lib services::process_manager::tests -- --test-threads=1` - PASS, 70/70.
+- `cargo test --locked --test browser_attachment_lifecycle -- --test-threads=1` - PASS, 3/3.
+- Affected browser suites - PASS, 158/158: annotations 5, automation 12, core 17, gateway 14, host 82, pane 28.

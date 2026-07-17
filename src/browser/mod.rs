@@ -55,11 +55,11 @@ pub use downloads::{
 };
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub use host::{
-    browser_user_input_initialization_script, unique_download_path, unsupported_host_status,
-    unsupported_platform_error, validate_browser_url, BrowserAnnotationMutationResult,
-    BrowserHostState, BrowserMemoryTarget, BrowserProfileClearPlan, BrowserProjectContextKey,
-    BrowserViewCreationPlan, BrowserViewVisibilityPlan, BrowserWebViewHost,
-    BrowserWorkspaceMutation,
+    acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
+    unique_download_path, unsupported_host_status, unsupported_platform_error,
+    validate_browser_url, BrowserAnnotationMutationResult, BrowserHostState, BrowserMemoryTarget,
+    BrowserProfileClearPlan, BrowserProjectContextKey, BrowserViewCreationPlan,
+    BrowserViewVisibilityPlan, BrowserWebViewHost, BrowserWorkspaceMutation,
 };
 pub use model::{
     BrowserAnnotation, BrowserAnnotationKind, BrowserAttachmentRevision, BrowserBounds,

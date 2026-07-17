@@ -263,19 +263,29 @@ fn empty_browser_event_pump_reconciles_retryable_dirty_projections_before_return
     let empty_return = pump.find("if events.is_empty()").unwrap();
     assert!(reconcile < empty_return);
 
-    let reconcile_start = source
-        .find("fn reconcile_browser_attachment_projections(")
+    let transaction_start = source
+        .find("fn reconcile_browser_attachment_projection_transaction(")
         .unwrap();
-    let reconcile_end = source[reconcile_start..]
-        .find("fn handle_browser_request(")
-        .map(|offset| reconcile_start + offset)
+    let transaction_end = source[transaction_start..]
+        .find("struct NativeShellBrowserAttachmentProjectionSink")
+        .map(|offset| transaction_start + offset)
         .unwrap();
-    let body = &source[reconcile_start..reconcile_end];
-    let observe = body.find("dirty_projections()").unwrap();
-    let host_lock = body.find("with_browser_host_control_barrier").unwrap();
-    let persist = body.find("save_session_state()").unwrap();
-    let acknowledge = body.find("acknowledge_dirty_projection").unwrap();
-    assert!(observe < host_lock && host_lock < persist && persist < acknowledge);
+    let transaction = &source[transaction_start..transaction_end];
+    let host = transaction.find("sink.acknowledge_host").unwrap();
+    let persist = transaction.find("sink.persist_snapshot").unwrap();
+    let acknowledge = transaction.find("acknowledge_dirty_projection").unwrap();
+    assert!(host < persist && persist < acknowledge);
+
+    let sink_start = source
+        .find("impl BrowserAttachmentProjectionSink for NativeShellBrowserAttachmentProjectionSink")
+        .unwrap();
+    let sink_end = source[sink_start..]
+        .find("impl NativeShell {")
+        .map(|offset| sink_start + offset)
+        .unwrap();
+    let sink = &source[sink_start..sink_end];
+    assert!(sink.contains("with_browser_host_control_barrier"));
+    assert!(sink.contains("save_session_state()"));
 }
 
 #[test]
@@ -290,6 +300,23 @@ fn remote_client_snapshot_merge_never_overlays_the_local_attachment_broker() {
     assert!(!merge.contains("browser_attachment_broker"));
     assert!(!merge.contains("project_local_browser_snapshot"));
     assert!(!merge.contains("overlay_snapshot"));
+}
+
+#[test]
+fn remote_disconnect_reconciles_the_local_backup_after_leaving_remote_mode_before_restore() {
+    let source = include_str!("../src/app/mod.rs");
+    let start = source.find("fn disconnect_remote_host(").unwrap();
+    let end = source[start..]
+        .find("fn current_runtime_snapshot(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let disconnect = &source[start..end];
+    let leave_remote = disconnect.find("self.remote_mode.take()").unwrap();
+    let reconcile = disconnect
+        .find("reconcile_restored_browser_attachment_state")
+        .expect("local backup must be projected through the broker");
+    let restore = disconnect.find("self.state = local_state").unwrap();
+    assert!(leave_remote < reconcile && reconcile < restore);
 }
 
 #[test]

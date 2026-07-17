@@ -6,11 +6,12 @@ use crate::browser::{
     browser_action_plan, browser_command_channel, browser_event_plan, browser_host_reconcile_plan,
     browser_pane_open_fallback, browser_response_sync, browser_settings_plan,
     calculate_browser_split, render_browser_pane, route_browser_request, BrowserAttachmentBroker,
-    BrowserBounds, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
-    BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
-    BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
-    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse,
-    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandInbox, BrowserCommandRequest, BrowserError, BrowserGatewayHandle,
+    BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions, BrowserPaneContext,
+    BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
+    BrowserResponse, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -690,6 +691,76 @@ fn reconcile_restored_browser_attachment_state(
     changed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserAttachmentProjectionTransaction {
+    Applied,
+    PersistFailed,
+    NewerProjectionRemainsDirty,
+}
+
+trait BrowserAttachmentProjectionSink {
+    fn acknowledge_host(
+        &mut self,
+        projection: &BrowserAttachmentProjection,
+    ) -> Result<BrowserWorkspaceSnapshot, BrowserError>;
+
+    fn persist_snapshot(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        snapshot: BrowserWorkspaceSnapshot,
+    ) -> bool;
+}
+
+fn reconcile_browser_attachment_projection_transaction(
+    broker: &BrowserAttachmentBroker,
+    projection: &BrowserAttachmentProjection,
+    sink: &mut impl BrowserAttachmentProjectionSink,
+) -> Result<BrowserAttachmentProjectionTransaction, BrowserError> {
+    let mut snapshot = sink.acknowledge_host(projection)?;
+    broker.observe_workspace(projection.workspace_key.clone(), &snapshot);
+    broker.overlay_snapshot(&projection.workspace_key, &mut snapshot);
+    if !sink.persist_snapshot(&projection.workspace_key, snapshot) {
+        return Ok(BrowserAttachmentProjectionTransaction::PersistFailed);
+    }
+    if broker.acknowledge_dirty_projection(projection) {
+        Ok(BrowserAttachmentProjectionTransaction::Applied)
+    } else {
+        Ok(BrowserAttachmentProjectionTransaction::NewerProjectionRemainsDirty)
+    }
+}
+
+struct NativeShellBrowserAttachmentProjectionSink<'a, 'b> {
+    shell: &'a mut NativeShell,
+    window: &'b Window,
+}
+
+impl BrowserAttachmentProjectionSink for NativeShellBrowserAttachmentProjectionSink<'_, '_> {
+    fn acknowledge_host(
+        &mut self,
+        projection: &BrowserAttachmentProjection,
+    ) -> Result<BrowserWorkspaceSnapshot, BrowserError> {
+        self.shell
+            .with_browser_host_control_barrier(self.window, |browser_host| {
+                browser_host.acknowledge_attachment_projection(projection)
+            })
+    }
+
+    fn persist_snapshot(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        snapshot: BrowserWorkspaceSnapshot,
+    ) -> bool {
+        if !self
+            .shell
+            .state
+            .update_browser_workspace(&workspace_key.ai_tab_id, move |current| *current = snapshot)
+        {
+            return false;
+        }
+        self.shell.save_session_state()
+    }
+}
+
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
@@ -1223,35 +1294,26 @@ impl NativeShell {
             if !self.browser_route_is_open(&projection.workspace_key) {
                 continue;
             }
-            let applied = self.with_browser_host_control_barrier(window, |browser_host| {
-                browser_host.acknowledge_attachment_projection(&projection)
-            });
-            let mut snapshot = match applied {
-                Ok(snapshot) => snapshot,
+            let transaction = {
+                let mut sink = NativeShellBrowserAttachmentProjectionSink {
+                    shell: self,
+                    window,
+                };
+                reconcile_browser_attachment_projection_transaction(&broker, &projection, &mut sink)
+            };
+            match transaction {
+                Ok(BrowserAttachmentProjectionTransaction::Applied)
+                | Ok(BrowserAttachmentProjectionTransaction::NewerProjectionRemainsDirty) => {
+                    changed = true;
+                }
+                Ok(BrowserAttachmentProjectionTransaction::PersistFailed) => {}
                 Err(error) => {
                     self.browser_ui
                         .entry(projection.workspace_key.clone())
                         .or_default()
                         .diagnostic = Some(error.to_string());
-                    continue;
                 }
-            };
-
-            broker.observe_workspace(projection.workspace_key.clone(), &snapshot);
-            broker.overlay_snapshot(&projection.workspace_key, &mut snapshot);
-            if !self
-                .state
-                .update_browser_workspace(&projection.workspace_key.ai_tab_id, move |current| {
-                    *current = snapshot
-                })
-            {
-                continue;
             }
-            if !self.save_session_state() {
-                continue;
-            }
-            broker.acknowledge_dirty_projection(&projection);
-            changed = true;
         }
         changed
     }
@@ -3536,8 +3598,15 @@ impl NativeShell {
             self.remote_client_pool.remove(&remote_mode.pool_key);
             remote_mode.client.disconnect();
         }
-        if let Some(local_state) = self.local_state_backup.take() {
+        if let Some(mut local_state) = self.local_state_backup.take() {
+            let changed = reconcile_restored_browser_attachment_state(
+                &mut local_state,
+                &self.process_manager.browser_attachment_broker(),
+            );
             self.state = local_state;
+            if changed {
+                self.save_session_state();
+            }
         }
         self.synced_session_id = None;
         self.last_dimensions = None;
@@ -15016,6 +15085,179 @@ mod tests {
         .expect("attachment snapshot fixture")
     }
 
+    struct RecordingAttachmentProjectionSink {
+        state: AppState,
+        host_snapshot: BrowserWorkspaceSnapshot,
+        fail_host: bool,
+        fail_persist: bool,
+        host_calls: usize,
+        persist_calls: usize,
+        broker_for_persist_observation: BrowserAttachmentBroker,
+        dirty_during_persist: bool,
+        concurrent_observation: Option<(BrowserAttachmentBroker, BrowserWorkspaceSnapshot)>,
+    }
+
+    impl BrowserAttachmentProjectionSink for RecordingAttachmentProjectionSink {
+        fn acknowledge_host(
+            &mut self,
+            projection: &crate::browser::BrowserAttachmentProjection,
+        ) -> Result<BrowserWorkspaceSnapshot, BrowserError> {
+            self.host_calls += 1;
+            if let Some((broker, snapshot)) = self.concurrent_observation.take() {
+                broker.observe_workspace(projection.workspace_key.clone(), &snapshot);
+            }
+            if self.fail_host {
+                return Err(BrowserError::CrashedView {
+                    message: "host acknowledgement failed".to_string(),
+                });
+            }
+            Ok(self.host_snapshot.clone())
+        }
+
+        fn persist_snapshot(
+            &mut self,
+            workspace_key: &BrowserWorkspaceKey,
+            snapshot: BrowserWorkspaceSnapshot,
+        ) -> bool {
+            self.persist_calls += 1;
+            self.dirty_during_persist = !self
+                .broker_for_persist_observation
+                .dirty_projections()
+                .is_empty();
+            let updated = self
+                .state
+                .update_browser_workspace(&workspace_key.ai_tab_id, move |current| {
+                    *current = snapshot
+                });
+            updated && !self.fail_persist
+        }
+    }
+
+    fn delivered_projection_fixture() -> (
+        BrowserAttachmentBroker,
+        crate::browser::BrowserAttachmentProjection,
+        BrowserWorkspaceSnapshot,
+    ) {
+        let broker = BrowserAttachmentBroker::default();
+        let key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let stale = attachment_snapshot(&["ann-delivered"]);
+        broker.observe_workspace(key.clone(), &stale);
+        let initial = broker.dirty_projections().pop().unwrap();
+        assert!(broker.acknowledge_dirty_projection(&initial));
+        broker.bind_session("session-1", key);
+        let reservation = broker
+            .reserve_for_input(
+                "session-1",
+                crate::browser::BrowserPromptInput::Text("prompt"),
+            )
+            .unwrap();
+        broker.commit(reservation).unwrap();
+        let projection = broker.dirty_projections().pop().unwrap();
+        (broker, projection, stale)
+    }
+
+    fn projection_sink(
+        stale: BrowserWorkspaceSnapshot,
+        broker: BrowserAttachmentBroker,
+    ) -> RecordingAttachmentProjectionSink {
+        let mut state = AppState::default();
+        let mut tab = sample_ai_tab();
+        tab.browser_workspace = Some(stale.clone());
+        state.open_tabs.push(tab);
+        let mut host_snapshot = stale;
+        host_snapshot.pending_annotation_ids.clear();
+        RecordingAttachmentProjectionSink {
+            state,
+            host_snapshot,
+            fail_host: false,
+            fail_persist: false,
+            host_calls: 0,
+            persist_calls: 0,
+            broker_for_persist_observation: broker,
+            dirty_during_persist: false,
+            concurrent_observation: None,
+        }
+    }
+
+    #[test]
+    fn empty_pump_projection_transaction_applies_persists_then_acknowledges() {
+        let (broker, projection, stale) = delivered_projection_fixture();
+        let mut sink = projection_sink(stale, broker.clone());
+
+        let result =
+            reconcile_browser_attachment_projection_transaction(&broker, &projection, &mut sink)
+                .unwrap();
+
+        assert_eq!(result, BrowserAttachmentProjectionTransaction::Applied);
+        assert_eq!(sink.host_calls, 1);
+        assert_eq!(sink.persist_calls, 1);
+        assert!(sink.dirty_during_persist);
+        assert!(sink
+            .state
+            .browser_workspace("tab-1")
+            .unwrap()
+            .pending_annotation_ids
+            .is_empty());
+        assert!(broker.dirty_projections().is_empty());
+    }
+
+    #[test]
+    fn projection_transaction_host_or_persist_failure_remains_retryable() {
+        for (fail_host, fail_persist, expected_persist_calls) in
+            [(true, false, 0), (false, true, 1)]
+        {
+            let (broker, projection, stale) = delivered_projection_fixture();
+            let mut sink = projection_sink(stale, broker.clone());
+            sink.fail_host = fail_host;
+            sink.fail_persist = fail_persist;
+
+            let result = reconcile_browser_attachment_projection_transaction(
+                &broker,
+                &projection,
+                &mut sink,
+            );
+
+            if fail_host {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    BrowserAttachmentProjectionTransaction::PersistFailed
+                );
+            }
+            assert_eq!(sink.persist_calls, expected_persist_calls);
+            assert_eq!(broker.dirty_projections(), vec![projection]);
+        }
+    }
+
+    #[test]
+    fn projection_transaction_preserves_a_concurrent_newer_generation_as_dirty() {
+        let (broker, projection, stale) = delivered_projection_fixture();
+        let newer = attachment_snapshot(&["ann-delivered", "ann-new"]);
+        let mut sink = projection_sink(stale, broker.clone());
+        sink.host_snapshot = newer.clone();
+        sink.concurrent_observation = Some((broker.clone(), newer));
+
+        let result =
+            reconcile_browser_attachment_projection_transaction(&broker, &projection, &mut sink)
+                .unwrap();
+
+        assert_eq!(
+            result,
+            BrowserAttachmentProjectionTransaction::NewerProjectionRemainsDirty
+        );
+        assert_eq!(
+            sink.state
+                .browser_workspace("tab-1")
+                .unwrap()
+                .pending_annotation_ids,
+            vec!["ann-new"]
+        );
+        let retry = broker.dirty_projections();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].pending_annotation_ids, vec!["ann-new"]);
+    }
+
     #[test]
     fn restored_attachment_state_overlays_tombstones_and_unions_new_annotations() {
         let broker = BrowserAttachmentBroker::default();
@@ -15045,6 +15287,27 @@ mod tests {
         assert_eq!(restored.pending_annotation_ids, vec!["ann-new"]);
         assert_eq!(restored.annotations.len(), 2);
         assert!(restored.pending_annotation_revision.0 >= 3);
+    }
+
+    #[test]
+    fn remote_disconnect_backup_projection_suppresses_a_stale_delivered_id() {
+        let (broker, _projection, stale) = delivered_projection_fixture();
+        let mut backup = AppState::default();
+        let mut tab = sample_ai_tab();
+        tab.browser_workspace = Some(stale);
+        backup.open_tabs.push(tab);
+
+        assert!(reconcile_restored_browser_attachment_state(
+            &mut backup,
+            &broker
+        ));
+
+        assert!(backup
+            .browser_workspace("tab-1")
+            .unwrap()
+            .pending_annotation_ids
+            .is_empty());
+        assert_eq!(broker.dirty_projections().len(), 1);
     }
 
     fn sample_server_tab() -> SessionTab {

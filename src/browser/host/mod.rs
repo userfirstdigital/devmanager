@@ -1,9 +1,9 @@
 use super::{
     redacted_browser_annotation, BrowserAnnotation, BrowserAnnotationDetails,
-    BrowserAnnotationOperation, BrowserAnnotationSummary, BrowserAttachmentRevision, BrowserError,
-    BrowserResourceHandle, BrowserResourceKind, BrowserResourceStore, BrowserRevision,
-    BrowserStorageLayout, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserAnnotationOperation, BrowserAnnotationSummary, BrowserAttachmentProjection,
+    BrowserAttachmentRevision, BrowserError, BrowserResourceHandle, BrowserResourceId,
+    BrowserResourceKind, BrowserResourceStore, BrowserRevision, BrowserStorageLayout,
+    BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 mod initialization;
 mod unsupported;
@@ -11,7 +11,7 @@ mod unsupported;
 mod windows;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
@@ -34,6 +34,24 @@ impl BrowserWorkspaceMutation {
             snapshot,
         }
     }
+}
+
+pub fn acknowledge_attachment_projection_and_reconcile_pins(
+    state: &mut BrowserHostState,
+    resources: &BrowserResourceStore,
+    projection: &BrowserAttachmentProjection,
+    mut additional_pinned_resource_ids: BTreeSet<BrowserResourceId>,
+) -> Result<BrowserWorkspaceSnapshot, BrowserError> {
+    let mutation = state.acknowledge_attachment_projection(
+        &projection.workspace_key,
+        projection.revision,
+        &projection.pending_annotation_ids,
+        &projection.tombstone_annotation_ids,
+    )?;
+    additional_pinned_resource_ids.extend(mutation.snapshot.pinned_annotation_resource_ids());
+    resources
+        .reconcile_annotation_pins(&projection.workspace_key, &additional_pinned_resource_ids)?;
+    Ok(mutation.snapshot)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

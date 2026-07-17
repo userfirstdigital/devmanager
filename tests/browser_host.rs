@@ -1,5 +1,6 @@
 use devmanager::browser::{
-    browser_command_channel, browser_lifecycle_control, browser_request_preempts_operation_queue,
+    acknowledge_attachment_projection_and_reconcile_pins, browser_command_channel,
+    browser_lifecycle_control, browser_request_preempts_operation_queue,
     browser_response_resource_ids, browser_user_input_initialization_script, crop_annotation_png,
     effective_browser_annotation_risk, parse_browser_annotation_ipc_message,
     parse_browser_page_ipc_message, prepare_verified_download_root, prepare_verified_profile_root,
@@ -8,8 +9,8 @@ use devmanager::browser::{
     BrowserAction, BrowserActionTarget, BrowserAnnotation, BrowserAnnotationCandidate,
     BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationKind,
     BrowserAnnotationLifecycle, BrowserAnnotationOperation, BrowserAnnotationRoute,
-    BrowserAttachmentRevision, BrowserBounds, BrowserCommand, BrowserCommandBridge,
-    BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserAttachmentBroker, BrowserAttachmentRevision, BrowserBounds, BrowserCommand,
+    BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
     BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
     BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
@@ -132,13 +133,88 @@ fn windows_attachment_acknowledgement_reconciles_resource_pins_after_state_mutat
         .expect("next Windows host method");
     let body = &source[start..end];
 
-    let mutation = body
-        .find("self.state.acknowledge_attachment_projection(")
-        .expect("narrow host-state mutation");
-    let pins = body
-        .find("self.reconcile_annotation_pins(")
-        .expect("attachment acknowledgement pin reconciliation");
-    assert!(mutation < pins);
+    assert!(body.contains("draft_resource_ids_for_workspace"));
+    assert!(body.contains("BrowserResourceStore::open_verified"));
+    assert!(body.contains("acknowledge_attachment_projection_and_reconcile_pins"));
+}
+
+#[test]
+fn attachment_acknowledgement_behavior_unpins_resolved_delivery_and_keeps_pending_pin() {
+    let temp = TestDir::new("attachment-ack-pins");
+    let key = workspace("project", "conversation");
+    let store = BrowserResourceStore::open_verified(
+        temp.path(),
+        &key.project_id,
+        BrowserResourceLimits::default(),
+    )
+    .unwrap();
+    let screenshot_a = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"a",
+            true,
+        )
+        .unwrap();
+    let screenshot_b = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"b",
+            true,
+        )
+        .unwrap();
+    let mut state = BrowserHostState::new(temp.path());
+    state
+        .ensure_workspace(
+            key.clone(),
+            BrowserWorkspaceSnapshot {
+                tabs: vec![BrowserTabSnapshot {
+                    id: "tab-a".to_string(),
+                    title: "A".to_string(),
+                    url: "https://example.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                }],
+                selected_tab_id: Some("tab-a".to_string()),
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        )
+        .unwrap();
+    state
+        .save_annotation(
+            &key,
+            stored_annotation("ann-a", screenshot_a.id.clone(), "resolved delivery"),
+        )
+        .unwrap();
+    state.set_annotation_resolved(&key, "ann-a", true).unwrap();
+    state
+        .save_annotation(
+            &key,
+            stored_annotation("ann-b", screenshot_b.id.clone(), "pending"),
+        )
+        .unwrap();
+
+    let snapshot = state.workspace(&key).unwrap().clone();
+    let broker = BrowserAttachmentBroker::default();
+    broker.observe_workspace(key.clone(), &snapshot);
+    let initial = broker.dirty_projections().pop().unwrap();
+    broker.acknowledge_dirty_projection(&initial);
+    broker.detach(&key, "ann-a");
+    let projection = broker.dirty_projections().pop().unwrap();
+
+    let result = acknowledge_attachment_projection_and_reconcile_pins(
+        &mut state,
+        &store,
+        &projection,
+        BTreeSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(result.pending_annotation_ids, vec!["ann-b"]);
+    assert!(!store.handle(&key, &screenshot_a.id).unwrap().pinned);
+    assert!(store.handle(&key, &screenshot_b.id).unwrap().pinned);
 }
 
 fn stored_annotation(

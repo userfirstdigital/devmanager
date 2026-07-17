@@ -1,6 +1,6 @@
 use super::{
-    browser_user_input_initialization_script, validate_browser_url, BrowserHostState,
-    BrowserMemoryTarget,
+    acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
+    validate_browser_url, BrowserHostState, BrowserMemoryTarget,
 };
 use crate::browser::downloads::{
     prepare_verified_storage_layout, verified_app_config_root, verified_unique_download_path,
@@ -2370,14 +2370,20 @@ impl BrowserWebViewHost {
         &mut self,
         projection: &BrowserAttachmentProjection,
     ) -> Result<BrowserWorkspaceSnapshot, BrowserError> {
-        let mutation = self.state.acknowledge_attachment_projection(
-            &projection.workspace_key,
-            projection.revision,
-            &projection.pending_annotation_ids,
-            &projection.tombstone_annotation_ids,
+        let additional_pinned_resource_ids = self
+            .annotation_lifecycle
+            .draft_resource_ids_for_workspace(&projection.workspace_key);
+        let resources = BrowserResourceStore::open_verified(
+            self.verified_trusted_app_config_dir()?,
+            &projection.workspace_key.project_id,
+            BrowserResourceLimits::default(),
         )?;
-        self.reconcile_annotation_pins(&projection.workspace_key)?;
-        Ok(mutation.snapshot)
+        acknowledge_attachment_projection_and_reconcile_pins(
+            &mut self.state,
+            &resources,
+            projection,
+            additional_pinned_resource_ids,
+        )
     }
 
     fn handle_command_inner(
