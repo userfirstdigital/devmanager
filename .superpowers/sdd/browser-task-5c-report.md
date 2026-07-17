@@ -4,7 +4,7 @@
 
 ### Status
 
-Checkpoint 2 is complete on the approved checkpoint-1 head `64c9f394f1e3fd3229d9c9b79bd765d5ed748c91`. This report is part of the focused checkpoint commit. The immutable final head, patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
+Checkpoint 2 started on the approved checkpoint-1 head `64c9f394f1e3fd3229d9c9b79bd765d5ed748c91` and landed initially as `36a3bf189e66f6cbe65283611f350d512fdcf7f1`. Independent review did not approve that first implementation and identified four Important findings. All four are addressed under strict RED-to-GREEN in the focused follow-up documented below. The immutable follow-up head, patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
 
 Checkpoints 3 through 12 are not implemented. This checkpoint adds no page IPC, host/pane integration, persistence or recipe-store write, MCP tool, replay, secret prompt, locator repair, or lifecycle wiring.
 
@@ -12,7 +12,7 @@ Checkpoints 3 through 12 are not implemented. This checkpoint adds no page IPC, 
 
 - `BrowserWorkflowRecorder` is a platform-neutral, in-memory authority keyed only by `BrowserWorkspaceKey`. It is inactive by default, starts only explicitly, and does not implement serialization or persistence.
 - `start` returns an exact `BrowserRecordingInstance`. Reservations carry the instance/workspace fence and a monotonic source-order ticket; asynchronous completion order cannot reorder source actions.
-- Capture values cross a non-`Debug`, non-`Serialize` `BrowserRecordingAction` boundary. Password, clipboard, and file constructors accept no value/content. Credential-like text is replaced with an unset Secret marker before pending state; sensitive URL query members are removed before retention.
+- Capture values cross a non-`Debug`, non-`Serialize` `BrowserRecordingAction` boundary. Password, clipboard, and file constructors accept no value/content. Credential-like text is replaced with an unset Secret marker before pending state; raw, encoded, and repeatedly encoded URL query/fragment credential keys are removed before retention, while invalid percent encodings fail closed.
 - Stop cancels unresolved slots, drains successes that completed before Stop in source order, fences later completions as `Ignored`, and returns an immutable review clone. Discard removes only that exact instance.
 - Review edits mutate the recorder-owned copy and return fresh immutable previews. `recipe_for_save` clones only after `BrowserRecipeV1::validate`; it does not call the recipe store.
 
@@ -24,6 +24,19 @@ Checkpoints 3 through 12 are not implemented. This checkpoint adds no page IPC, 
 - Added unset generated Secret/File inputs. Password, credential-like text, clipboard content, file paths/contents, cookies, tokens, bearer/basic values, and credential URL query members cannot enter retained state.
 - Added review metadata, delete/reorder, literal-to-Text/URL conversion, input add/rename/default/remove with reference safety, wait replacement, assertion add/remove, immutable preview, strict save handoff validation, and discard.
 - Kept recorder, capture action, metadata, and review non-`Debug` and non-`Serialize`; tests assert these boundaries at compile time.
+
+### Independent review hardening
+
+- URL security inspection now validates raw percent encoding, repeatedly decodes an inspection-only copy through eight bounded passes, removes credential-bearing query pairs or fragments after decoding, recognizes session keys, and preserves the original bytes of legitimate encoded query/fragment values.
+- Review state now tracks generated-input provenance privately. Deleting a step removes only generated Secret/File/Text/URL definitions that are no longer referenced, retains generated definitions shared by another step, and never removes explicitly user-added review inputs. Provenance follows rename and explicit removal.
+- Generic captured actions, waits, and assertions fail closed on every `BrowserRecipeValue::Input`; no unresolved input reference can enter pending or retained capture state. Literal navigation and generated Secret/File constructors remain the supported capture paths.
+- Exported hard bounds cover 64 total review inputs, 16 assertions per captured/review action, and 256 total review assertions. Buffered generated-input/assertion commitments reserve against the same totals; capture and review overflow return typed `CapacityExceeded`, cancel the rejected reservation when needed, and leave retained recipe state atomic.
+
+Consolidated review RED to GREEN:
+
+- RED: `cargo test --locked --test browser_recording review_hardening_rejects_encoded_secrets_or_unbounded_invalid_state -- --exact --test-threads=1` exited 1 with exactly `encoded URL credentials, generated input garbage collection, unresolved generic input capture, retained collection capacity and atomicity`.
+- Each minimal production slice removed only its corresponding finding from the same failure. After URL inspection, generated-input provenance, and generic-input fail-closed changes, the exact remaining failure was `retained collection capacity and atomicity`.
+- GREEN: the same exact command passed 1/1 after the fixed collection bounds and atomic overflow handling landed.
 
 ### RED to GREEN evidence
 
@@ -54,11 +67,11 @@ Checkpoints 3 through 12 are not implemented. This checkpoint adds no page IPC, 
 
 ### Verification
 
-- `cargo test --locked --test browser_recording -- --test-threads=1` -> 8 passed, 0 failed.
+- `cargo test --locked --test browser_recording -- --test-threads=1` -> 9 passed, 0 failed.
 - `cargo test --locked --test browser_recipes -- --test-threads=1` -> 15 passed, 0 failed.
 - `cargo test --locked --lib browser::recipes::tests -- --test-threads=1` -> 5 passed, 0 failed.
 - `cargo test --locked browser -- --test-threads=1` -> 107 matching tests passed across all targets, 0 failed.
-- Full browser target command covering annotations, attachment lifecycle, automation/resources, core/model/errors, fixture, gateway, host, pane, provider, recipes, and recording -> 194 passed, 0 failed.
+- Full browser target command covering annotations, attachment lifecycle, automation/resources, core/model/errors, fixture, gateway, host, pane, provider, recipes, and recording -> 195 passed, 0 failed.
 - `cargo check --locked --all-targets` -> exit 0.
 - Native Windows `cargo build --locked` -> exit 0.
 - `cargo fmt --all -- --check` -> exit 0.

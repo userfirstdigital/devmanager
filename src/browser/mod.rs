@@ -97,6 +97,8 @@ pub use recording::{
     BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingCommit, BrowserRecordingError,
     BrowserRecordingInstance, BrowserRecordingMetadata, BrowserRecordingReservation,
     BrowserRecordingReview, BrowserRecordingStatus, BrowserWorkflowRecorder,
+    MAX_BROWSER_RECORDING_ASSERTIONS, MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION,
+    MAX_BROWSER_RECORDING_INPUTS,
 };
 pub use resources::{
     resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,

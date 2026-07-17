@@ -4,6 +4,8 @@ use devmanager::browser::{
     BrowserRecipeWait, BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingCommit,
     BrowserRecordingError, BrowserRecordingInstance, BrowserRecordingMetadata,
     BrowserRecordingStatus, BrowserRisk, BrowserWorkflowRecorder, BrowserWorkspaceKey,
+    MAX_BROWSER_RECORDING_ASSERTIONS, MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION,
+    MAX_BROWSER_RECORDING_INPUTS,
 };
 use static_assertions::assert_not_impl_any;
 
@@ -776,4 +778,336 @@ fn sensitive_typing_coalesces_without_allocating_orphan_inputs() {
     assert_eq!(review.recipe().steps.len(), 2, "actor change is a boundary");
     assert_eq!(review.recipe().inputs.len(), 2, "no orphan secret input");
     review.recipe().validate().expect("valid coalesced recipe");
+}
+
+#[test]
+fn review_hardening_rejects_encoded_secrets_or_unbounded_invalid_state() {
+    let mut defects = Vec::new();
+
+    let mut url_recorder = BrowserWorkflowRecorder::default();
+    let url_instance = url_recorder
+        .start(workspace("url-project", "url-tab"))
+        .expect("start URL recording");
+    for url in [
+        "https://example.test/path?keep=ok&%74oken=query-token-sentinel&%2561uthorization=double-authorization-sentinel&%73ession=session-sentinel#route?%63ookie=fragment-cookie-sentinel&%2570assword=fragment-password-sentinel",
+        "https://example.test/path?q=hello%20world#section-2",
+    ] {
+        let reservation = url_recorder
+            .reserve(&url_instance, BrowserRecordingActor::User)
+            .expect("reserve URL action");
+        url_recorder
+            .commit(
+                reservation,
+                BrowserRecordingAction::navigate(url).expect("construct encoded URL action"),
+            )
+            .expect("commit URL action");
+    }
+    let url_review = url_recorder
+        .stop(&url_instance)
+        .expect("stop URL recording");
+    let url_json = serde_json::to_string(url_review.recipe()).expect("serialize safe URL review");
+    let safe_url_preserved = matches!(
+        &url_review.recipe().steps[1].action,
+        BrowserRecipeAction::Navigate {
+            url: BrowserRecipeValue::Literal { value },
+        } if value == "https://example.test/path?q=hello%20world#section-2"
+    );
+    let invalid_encoding_rejected = matches!(
+        BrowserRecordingAction::navigate("https://example.test/?%ZZoken=invalid-sentinel"),
+        Err(BrowserRecordingError::InvalidAction)
+    );
+    if [
+        "query-token-sentinel",
+        "double-authorization-sentinel",
+        "session-sentinel",
+        "fragment-cookie-sentinel",
+        "fragment-password-sentinel",
+        "%74oken",
+        "%2561uthorization",
+        "%73ession",
+        "%63ookie",
+        "%2570assword",
+    ]
+    .iter()
+    .any(|sentinel| url_json.contains(sentinel))
+        || !safe_url_preserved
+        || !invalid_encoding_rejected
+    {
+        defects.push("encoded URL credentials");
+    }
+
+    let mut delete_recorder = BrowserWorkflowRecorder::default();
+    let delete_instance = delete_recorder
+        .start(workspace("delete-project", "delete-tab"))
+        .expect("start delete recording");
+    let actions = [
+        BrowserRecordingAction::type_password(locator("password")).expect("password marker"),
+        BrowserRecordingAction::upload(locator("upload")).expect("file marker"),
+        BrowserRecordingAction::type_text(locator("query"), "alpha").expect("literal text"),
+        navigate("https://example.test/destination"),
+        BrowserRecordingAction::recipe(BrowserRecipeAction::Click {
+            locator: locator("keeper"),
+        })
+        .expect("keeper click"),
+    ];
+    for action in actions {
+        let reservation = delete_recorder
+            .reserve(&delete_instance, BrowserRecordingActor::User)
+            .expect("reserve generated-input action");
+        delete_recorder
+            .commit(reservation, action)
+            .expect("commit generated-input action");
+    }
+    delete_recorder
+        .stop(&delete_instance)
+        .expect("stop delete recording");
+    delete_recorder
+        .convert_action_value_to_input(
+            &delete_instance,
+            "step-3",
+            "generated_text",
+            BrowserRecipeInputKind::Text,
+        )
+        .expect("generate text input");
+    delete_recorder
+        .convert_action_value_to_input(
+            &delete_instance,
+            "step-4",
+            "generated_url",
+            BrowserRecipeInputKind::Url,
+        )
+        .expect("generate URL input");
+    delete_recorder
+        .set_step_wait(
+            &delete_instance,
+            "step-5",
+            Some(BrowserRecipeWait::Url {
+                value: BrowserRecipeValue::Input {
+                    name: "generated_url".to_string(),
+                },
+                exact: true,
+                timeout_ms: 1_000,
+            }),
+        )
+        .expect("share generated URL input");
+    delete_recorder
+        .add_input(
+            &delete_instance,
+            BrowserRecipeInput {
+                name: "manual_input".to_string(),
+                kind: BrowserRecipeInputKind::Text,
+                default_value: Some("manual".to_string()),
+            },
+        )
+        .expect("add explicit review input");
+    for step_id in ["step-1", "step-2", "step-3", "step-4"] {
+        delete_recorder
+            .delete_step(&delete_instance, step_id)
+            .expect("delete generated-input step");
+    }
+    let delete_review = delete_recorder
+        .review(&delete_instance)
+        .expect("review generated-input collection");
+    let remaining_names = delete_review
+        .recipe()
+        .inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect::<Vec<_>>();
+    if remaining_names != ["generated_url", "manual_input"]
+        || delete_recorder.recipe_for_save(&delete_instance).is_err()
+    {
+        defects.push("generated input garbage collection");
+    }
+
+    let unresolved_generic = BrowserRecordingAction::recipe(BrowserRecipeAction::Navigate {
+        url: BrowserRecipeValue::Input {
+            name: "missing_url".to_string(),
+        },
+    });
+    if !matches!(
+        unresolved_generic,
+        Err(BrowserRecordingError::InvalidAction)
+    ) || BrowserRecordingAction::navigate("https://example.test/literal").is_err()
+        || BrowserRecordingAction::type_password(locator("normal-password-marker")).is_err()
+        || BrowserRecordingAction::upload(locator("normal-upload-marker")).is_err()
+    {
+        defects.push("unresolved generic input capture");
+    }
+
+    let title_assertion = || BrowserRecipeAssertion::Title {
+        value: BrowserRecipeValue::Literal {
+            value: "Ready".to_string(),
+        },
+        exact: true,
+    };
+    let action_assertion_overflow = BrowserRecordingAction::recipe(BrowserRecipeAction::Click {
+        locator: locator("bounded-action"),
+    })
+    .expect("bounded action")
+    .with_assertions(vec![
+        title_assertion();
+        MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION + 1
+    ]);
+    let mut bounds_failed = !matches!(
+        action_assertion_overflow,
+        Err(BrowserRecordingError::CapacityExceeded)
+    );
+
+    let mut input_recorder = BrowserWorkflowRecorder::default();
+    let input_instance = input_recorder
+        .start(workspace("input-cap-project", "input-cap-tab"))
+        .expect("start input-cap recording");
+    let input_step = input_recorder
+        .reserve(&input_instance, BrowserRecordingActor::User)
+        .expect("reserve input-cap step");
+    input_recorder
+        .commit(input_step, navigate("https://example.test/input-cap"))
+        .expect("commit input-cap step");
+    input_recorder
+        .stop(&input_instance)
+        .expect("stop input-cap recording");
+    for index in 0..MAX_BROWSER_RECORDING_INPUTS {
+        input_recorder
+            .add_input(
+                &input_instance,
+                BrowserRecipeInput {
+                    name: format!("manual_{index}"),
+                    kind: BrowserRecipeInputKind::Text,
+                    default_value: None,
+                },
+            )
+            .expect("fill review input capacity");
+    }
+    let input_overflow = input_recorder.add_input(
+        &input_instance,
+        BrowserRecipeInput {
+            name: "manual_overflow".to_string(),
+            kind: BrowserRecipeInputKind::Text,
+            default_value: None,
+        },
+    );
+    let conversion_overflow = input_recorder.convert_action_value_to_input(
+        &input_instance,
+        "step-1",
+        "converted_overflow",
+        BrowserRecipeInputKind::Url,
+    );
+    let bounded_input_review = input_recorder
+        .review(&input_instance)
+        .expect("review atomic input rejection");
+    bounds_failed |= !matches!(input_overflow, Err(BrowserRecordingError::CapacityExceeded))
+        || !matches!(
+            conversion_overflow,
+            Err(BrowserRecordingError::CapacityExceeded)
+        )
+        || bounded_input_review.recipe().inputs.len() != MAX_BROWSER_RECORDING_INPUTS
+        || !matches!(
+            &bounded_input_review.recipe().steps[0].action,
+            BrowserRecipeAction::Navigate {
+                url: BrowserRecipeValue::Literal { .. }
+            }
+        );
+
+    let mut assertion_recorder = BrowserWorkflowRecorder::default();
+    let assertion_instance = assertion_recorder
+        .start(workspace("assertion-cap-project", "assertion-cap-tab"))
+        .expect("start assertion-cap recording");
+    for index in
+        0..=(MAX_BROWSER_RECORDING_ASSERTIONS / MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION)
+    {
+        let reservation = assertion_recorder
+            .reserve(&assertion_instance, BrowserRecordingActor::User)
+            .expect("reserve assertion-cap step");
+        assertion_recorder
+            .commit(
+                reservation,
+                BrowserRecordingAction::recipe(BrowserRecipeAction::Click {
+                    locator: locator(&format!("assertion-step-{index}")),
+                })
+                .expect("assertion-cap click"),
+            )
+            .expect("commit assertion-cap step");
+    }
+    assertion_recorder
+        .stop(&assertion_instance)
+        .expect("stop assertion-cap recording");
+    for step_index in
+        0..(MAX_BROWSER_RECORDING_ASSERTIONS / MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION)
+    {
+        for _ in 0..MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION {
+            assertion_recorder
+                .add_step_assertion(
+                    &assertion_instance,
+                    &format!("step-{}", step_index + 1),
+                    title_assertion(),
+                )
+                .expect("fill total assertion capacity");
+        }
+    }
+    let assertion_overflow = assertion_recorder.add_step_assertion(
+        &assertion_instance,
+        &format!(
+            "step-{}",
+            (MAX_BROWSER_RECORDING_ASSERTIONS / MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION) + 1
+        ),
+        title_assertion(),
+    );
+    let bounded_assertion_review = assertion_recorder
+        .review(&assertion_instance)
+        .expect("review atomic assertion rejection");
+    bounds_failed |= !matches!(
+        assertion_overflow,
+        Err(BrowserRecordingError::CapacityExceeded)
+    ) || bounded_assertion_review
+        .recipe()
+        .steps
+        .iter()
+        .map(|step| step.assertions.len())
+        .sum::<usize>()
+        != MAX_BROWSER_RECORDING_ASSERTIONS;
+
+    let mut generated_recorder =
+        BrowserWorkflowRecorder::with_capacity(MAX_BROWSER_RECORDING_INPUTS + 1);
+    let generated_instance = generated_recorder
+        .start(workspace("generated-cap-project", "generated-cap-tab"))
+        .expect("start generated-cap recording");
+    for index in 0..MAX_BROWSER_RECORDING_INPUTS {
+        let reservation = generated_recorder
+            .reserve(&generated_instance, BrowserRecordingActor::User)
+            .expect("reserve generated input");
+        generated_recorder
+            .commit(
+                reservation,
+                BrowserRecordingAction::type_password(locator(&format!("password-{index}")))
+                    .expect("generated secret marker"),
+            )
+            .expect("fill generated input capacity");
+    }
+    let generated_overflow_reservation = generated_recorder
+        .reserve(&generated_instance, BrowserRecordingActor::User)
+        .expect("reserve generated overflow");
+    let generated_overflow = generated_recorder.commit(
+        generated_overflow_reservation,
+        BrowserRecordingAction::type_password(locator("password-overflow"))
+            .expect("generated overflow marker"),
+    );
+    let generated_review = generated_recorder
+        .stop(&generated_instance)
+        .expect("stop generated-cap recording");
+    bounds_failed |= !matches!(
+        generated_overflow,
+        Err(BrowserRecordingError::CapacityExceeded)
+    ) || generated_review.recipe().inputs.len() != MAX_BROWSER_RECORDING_INPUTS
+        || generated_review.recipe().steps.len() != MAX_BROWSER_RECORDING_INPUTS;
+
+    if bounds_failed {
+        defects.push("retained collection capacity and atomicity");
+    }
+
+    assert!(
+        defects.is_empty(),
+        "unfixed recording review findings: {}",
+        defects.join(", ")
+    );
 }

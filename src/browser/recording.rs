@@ -4,10 +4,14 @@ use super::{
     BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
     BrowserRecipeWait, BrowserRisk, BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 const DEFAULT_RECORDING_CAPACITY: usize = 256;
+const MAX_RECORDING_PERCENT_DECODE_PASSES: usize = 8;
+pub const MAX_BROWSER_RECORDING_INPUTS: usize = 64;
+pub const MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION: usize = 16;
+pub const MAX_BROWSER_RECORDING_ASSERTIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserRecordingActor {
@@ -74,6 +78,7 @@ impl BrowserRecordingInstance {
 pub struct BrowserRecordingReview {
     instance: BrowserRecordingInstance,
     recipe: BrowserRecipeV1,
+    generated_inputs: BTreeSet<String>,
 }
 
 /// Mutable review metadata is accepted by value and sanitized before it is
@@ -180,6 +185,9 @@ impl BrowserRecordingAction {
     }
 
     pub fn with_wait(mut self, wait: BrowserRecipeWait) -> Result<Self, BrowserRecordingError> {
+        if wait_has_input_reference(&wait) {
+            return Err(BrowserRecordingError::InvalidAction);
+        }
         validate_wire_node(&wait)?;
         self.wait = Some(wait);
         Ok(self)
@@ -189,7 +197,13 @@ impl BrowserRecordingAction {
         mut self,
         assertions: Vec<BrowserRecipeAssertion>,
     ) -> Result<Self, BrowserRecordingError> {
+        if assertions.len() > MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION {
+            return Err(BrowserRecordingError::CapacityExceeded);
+        }
         for assertion in &assertions {
+            if assertion_has_input_reference(assertion) {
+                return Err(BrowserRecordingError::InvalidAction);
+            }
             validate_wire_node(assertion)?;
         }
         self.assertions = assertions;
@@ -234,6 +248,7 @@ struct ActiveRecording {
     next_to_drain: u64,
     reservations: BTreeMap<u64, ReservationSlot>,
     inputs: Vec<BrowserRecipeInput>,
+    generated_inputs: BTreeSet<String>,
     steps: Vec<RecordedStep>,
 }
 
@@ -291,6 +306,7 @@ impl BrowserWorkflowRecorder {
                 next_to_drain: 0,
                 reservations: BTreeMap::new(),
                 inputs: Vec::new(),
+                generated_inputs: BTreeSet::new(),
                 steps: Vec::new(),
             }),
         );
@@ -356,11 +372,28 @@ impl BrowserWorkflowRecorder {
         };
         let slot = active
             .reservations
-            .get_mut(&reservation.sequence)
+            .get(&reservation.sequence)
             .ok_or(BrowserRecordingError::StaleReservation)?;
         if !matches!(slot.state, ReservationState::Pending) {
             return Err(BrowserRecordingError::StaleReservation);
         }
+        let exceeds_capacity = retained_assertion_count(active)
+            .saturating_add(action.assertions.len())
+            > MAX_BROWSER_RECORDING_ASSERTIONS
+            || projected_generated_input_count(active)
+                .saturating_add(action_generated_input_count(&action))
+                > MAX_BROWSER_RECORDING_INPUTS;
+        if exceeds_capacity {
+            let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
+                return Err(BrowserRecordingError::StaleReservation);
+            };
+            slot.state = ReservationState::Cancelled;
+            drain_ready(active);
+            return Err(BrowserRecordingError::CapacityExceeded);
+        }
+        let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
+            return Err(BrowserRecordingError::StaleReservation);
+        };
         slot.state = ReservationState::Ready(action);
         let previous_next = active.next_to_drain;
         drain_ready(active);
@@ -448,6 +481,7 @@ impl BrowserWorkflowRecorder {
         let review = BrowserRecordingReview {
             instance: instance.clone(),
             recipe,
+            generated_inputs: active.generated_inputs,
         };
         self.workspaces.insert(
             instance.workspace_key.clone(),
@@ -498,6 +532,7 @@ impl BrowserWorkflowRecorder {
             .position(|step| step.id == step_id)
             .ok_or(BrowserRecordingError::InvalidMutation)?;
         review.recipe.steps.remove(index);
+        garbage_collect_generated_inputs(review);
         Ok(review.clone())
     }
 
@@ -583,6 +618,9 @@ impl BrowserWorkflowRecorder {
         {
             return Err(BrowserRecordingError::InvalidMutation);
         }
+        if review.recipe.inputs.len() >= MAX_BROWSER_RECORDING_INPUTS {
+            return Err(BrowserRecordingError::CapacityExceeded);
+        }
         let step = review
             .recipe
             .steps
@@ -593,6 +631,7 @@ impl BrowserWorkflowRecorder {
             BrowserRecipeValue::Input {
                 name: input.name.clone(),
             };
+        review.generated_inputs.insert(input.name.clone());
         review.recipe.inputs.push(input);
         Ok(review.clone())
     }
@@ -611,6 +650,9 @@ impl BrowserWorkflowRecorder {
             .any(|existing| existing.name == input.name)
         {
             return Err(BrowserRecordingError::InvalidMutation);
+        }
+        if review.recipe.inputs.len() >= MAX_BROWSER_RECORDING_INPUTS {
+            return Err(BrowserRecordingError::CapacityExceeded);
         }
         review.recipe.inputs.push(input);
         Ok(review.clone())
@@ -644,8 +686,13 @@ impl BrowserWorkflowRecorder {
             default_value: review.recipe.inputs[index].default_value.clone(),
         };
         validate_wire_node(&candidate).map_err(|_| BrowserRecordingError::InvalidMutation)?;
+        let was_generated = review.generated_inputs.contains(previous_name);
         review.recipe.inputs[index] = candidate;
         rename_value_references(&mut review.recipe, previous_name, new_name);
+        if was_generated {
+            review.generated_inputs.remove(previous_name);
+            review.generated_inputs.insert(new_name.to_string());
+        }
         Ok(review.clone())
     }
 
@@ -688,6 +735,7 @@ impl BrowserWorkflowRecorder {
             .position(|input| input.name == input_name)
             .ok_or(BrowserRecordingError::InvalidMutation)?;
         review.recipe.inputs.remove(index);
+        review.generated_inputs.remove(input_name);
         Ok(review.clone())
     }
 
@@ -719,13 +767,25 @@ impl BrowserWorkflowRecorder {
     ) -> Result<BrowserRecordingReview, BrowserRecordingError> {
         validate_wire_node(&assertion).map_err(|_| BrowserRecordingError::InvalidMutation)?;
         let review = self.review_mut(instance)?;
-        let step = review
+        let step_index = review
             .recipe
             .steps
-            .iter_mut()
-            .find(|step| step.id == step_id)
+            .iter()
+            .position(|step| step.id == step_id)
             .ok_or(BrowserRecordingError::InvalidMutation)?;
-        step.assertions.push(assertion);
+        let total_assertions = review
+            .recipe
+            .steps
+            .iter()
+            .map(|step| step.assertions.len())
+            .sum::<usize>();
+        if review.recipe.steps[step_index].assertions.len()
+            >= MAX_BROWSER_RECORDING_ASSERTIONS_PER_ACTION
+            || total_assertions >= MAX_BROWSER_RECORDING_ASSERTIONS
+        {
+            return Err(BrowserRecordingError::CapacityExceeded);
+        }
+        review.recipe.steps[step_index].assertions.push(assertion);
         Ok(review.clone())
     }
 
@@ -824,6 +884,39 @@ fn commit_result(previous_next: u64, next_to_drain: u64) -> BrowserRecordingComm
     }
 }
 
+fn retained_assertion_count(active: &ActiveRecording) -> usize {
+    let recorded = active
+        .steps
+        .iter()
+        .map(|step| step.step.assertions.len())
+        .sum::<usize>();
+    active.reservations.values().fold(recorded, |count, slot| {
+        count.saturating_add(match &slot.state {
+            ReservationState::Ready(action) => action.assertions.len(),
+            ReservationState::Pending | ReservationState::Cancelled => 0,
+        })
+    })
+}
+
+fn projected_generated_input_count(active: &ActiveRecording) -> usize {
+    active
+        .reservations
+        .values()
+        .fold(active.inputs.len(), |count, slot| {
+            count.saturating_add(match &slot.state {
+                ReservationState::Ready(action) => action_generated_input_count(action),
+                ReservationState::Pending | ReservationState::Cancelled => 0,
+            })
+        })
+}
+
+fn action_generated_input_count(action: &BrowserRecordingAction) -> usize {
+    usize::from(matches!(
+        &action.action,
+        PendingRecordingAction::SecretType(_) | PendingRecordingAction::FileUpload(_)
+    ))
+}
+
 fn drain_ready(active: &mut ActiveRecording) {
     loop {
         let Some(slot) = active.reservations.remove(&active.next_to_drain) else {
@@ -837,8 +930,13 @@ fn drain_ready(active: &mut ActiveRecording) {
                     active.next_to_drain = active.next_to_drain.saturating_add(1);
                     continue;
                 }
-                let recorded =
-                    materialize_action(action, slot.context, sequence, &mut active.inputs);
+                let recorded = materialize_action(
+                    action,
+                    slot.context,
+                    sequence,
+                    &mut active.inputs,
+                    &mut active.generated_inputs,
+                );
                 if !coalesce_step(&mut active.steps, &recorded) {
                     active.steps.push(recorded);
                 }
@@ -895,6 +993,7 @@ fn materialize_action(
     context: ReservationContext,
     sequence: u64,
     inputs: &mut Vec<BrowserRecipeInput>,
+    generated_inputs: &mut BTreeSet<String>,
 ) -> RecordedStep {
     let BrowserRecordingAction {
         action,
@@ -910,6 +1009,7 @@ fn materialize_action(
                 kind: BrowserRecipeInputKind::Secret,
                 default_value: None,
             });
+            generated_inputs.insert(name.clone());
             BrowserRecipeAction::Type {
                 locator,
                 value: BrowserRecipeValue::Input { name },
@@ -922,6 +1022,7 @@ fn materialize_action(
                 kind: BrowserRecipeInputKind::File,
                 default_value: None,
             });
+            generated_inputs.insert(name.clone());
             BrowserRecipeAction::Upload {
                 locator,
                 file: BrowserRecipeValue::Input { name },
@@ -1164,6 +1265,25 @@ fn recipe_references_input(recipe: &BrowserRecipeV1, input_name: &str) -> bool {
     })
 }
 
+fn garbage_collect_generated_inputs(review: &mut BrowserRecordingReview) {
+    let unreferenced = review
+        .generated_inputs
+        .iter()
+        .filter(|name| !recipe_references_input(&review.recipe, name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if unreferenced.is_empty() {
+        return;
+    }
+    review
+        .recipe
+        .inputs
+        .retain(|input| !unreferenced.contains(&input.name));
+    review
+        .generated_inputs
+        .retain(|name| !unreferenced.contains(name));
+}
+
 fn action_references_input(action: &BrowserRecipeAction, input_name: &str) -> bool {
     match action {
         BrowserRecipeAction::Navigate { url } => value_references_input(url, input_name),
@@ -1230,6 +1350,9 @@ where
 fn sanitize_recipe_action(
     action: BrowserRecipeAction,
 ) -> Result<PendingRecordingAction, BrowserRecordingError> {
+    if action_has_input_reference(&action) {
+        return Err(BrowserRecordingError::InvalidAction);
+    }
     match action {
         BrowserRecipeAction::Navigate {
             url: BrowserRecipeValue::Literal { value },
@@ -1270,6 +1393,53 @@ fn sanitize_recipe_action(
     }
 }
 
+fn action_has_input_reference(action: &BrowserRecipeAction) -> bool {
+    match action {
+        BrowserRecipeAction::Navigate { url } => value_has_input_reference(url),
+        BrowserRecipeAction::Type { value, .. } => value_has_input_reference(value),
+        BrowserRecipeAction::Select { values, .. } => values.iter().any(value_has_input_reference),
+        BrowserRecipeAction::Keypress { key, .. } => value_has_input_reference(key),
+        BrowserRecipeAction::Upload { file, .. } => value_has_input_reference(file),
+        BrowserRecipeAction::Wait { condition } => wait_has_input_reference(condition),
+        BrowserRecipeAction::Click { .. }
+        | BrowserRecipeAction::Hover { .. }
+        | BrowserRecipeAction::Focus { .. }
+        | BrowserRecipeAction::Clear { .. }
+        | BrowserRecipeAction::Scroll { .. }
+        | BrowserRecipeAction::DragDrop { .. }
+        | BrowserRecipeAction::Download { .. }
+        | BrowserRecipeAction::Screenshot { .. } => false,
+    }
+}
+
+fn wait_has_input_reference(wait: &BrowserRecipeWait) -> bool {
+    match wait {
+        BrowserRecipeWait::Url { value, .. }
+        | BrowserRecipeWait::TextPresent { value, .. }
+        | BrowserRecipeWait::TextAbsent { value, .. } => value_has_input_reference(value),
+        BrowserRecipeWait::Duration { .. }
+        | BrowserRecipeWait::Load { .. }
+        | BrowserRecipeWait::NetworkIdle { .. }
+        | BrowserRecipeWait::ElementPresent { .. }
+        | BrowserRecipeWait::ElementVisible { .. }
+        | BrowserRecipeWait::ElementHidden { .. } => false,
+    }
+}
+
+fn assertion_has_input_reference(assertion: &BrowserRecipeAssertion) -> bool {
+    match assertion {
+        BrowserRecipeAssertion::Url { value, .. }
+        | BrowserRecipeAssertion::Title { value, .. }
+        | BrowserRecipeAssertion::Text { value, .. }
+        | BrowserRecipeAssertion::Value { value, .. } => value_has_input_reference(value),
+        BrowserRecipeAssertion::Element { .. } => false,
+    }
+}
+
+fn value_has_input_reference(value: &BrowserRecipeValue) -> bool {
+    matches!(value, BrowserRecipeValue::Input { .. })
+}
+
 fn locator_looks_sensitive(locator: &BrowserRecipeLocator) -> bool {
     locator
         .accessibility_name
@@ -1294,6 +1464,7 @@ fn sensitive_name(value: &str) -> bool {
         "apikey",
         "privatekey",
         "cookie",
+        "session",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
@@ -1323,15 +1494,24 @@ fn sanitize_recording_url(value: &str) -> Result<String, BrowserRecordingError> 
         return Err(BrowserRecordingError::InvalidAction);
     }
 
-    let safe_query = query
-        .into_iter()
-        .flat_map(|query| query.split('&'))
-        .filter(|pair| {
-            let key = pair.split('=').next().unwrap_or_default();
-            !sensitive_name(key) && redact_browser_text(pair) == *pair
-        })
-        .collect::<Vec<_>>();
-    let safe_fragment = fragment.filter(|fragment| redact_browser_text(fragment) == *fragment);
+    let mut safe_query = Vec::new();
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            let decoded_pair = percent_decode_for_inspection(pair)?;
+            let key = decoded_pair.split('=').next().unwrap_or_default();
+            if !sensitive_name(key) && redact_browser_text(&decoded_pair) == decoded_pair {
+                safe_query.push(pair);
+            }
+        }
+    }
+    let safe_fragment = match fragment {
+        Some(fragment) => {
+            let decoded = percent_decode_for_inspection(fragment)?;
+            (!fragment_has_sensitive_key(&decoded) && redact_browser_text(&decoded) == decoded)
+                .then_some(fragment)
+        }
+        None => None,
+    };
     let mut sanitized = base.to_string();
     if !safe_query.is_empty() {
         sanitized.push('?');
@@ -1346,4 +1526,82 @@ fn sanitize_recording_url(value: &str) -> Result<String, BrowserRecordingError> 
         return Err(BrowserRecordingError::InvalidAction);
     }
     Ok(sanitized)
+}
+
+fn percent_decode_for_inspection(value: &str) -> Result<String, BrowserRecordingError> {
+    validate_percent_encoding(value)?;
+    let mut decoded = value.to_string();
+    for _ in 0..MAX_RECORDING_PERCENT_DECODE_PASSES {
+        let next = percent_decode_once(&decoded)?;
+        if next == decoded {
+            return Ok(decoded);
+        }
+        decoded = next;
+    }
+    if has_percent_triplet(&decoded) {
+        return Err(BrowserRecordingError::InvalidAction);
+    }
+    Ok(decoded)
+}
+
+fn validate_percent_encoding(value: &str) -> Result<(), BrowserRecordingError> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || hex_value(bytes[index + 1]).is_none()
+                || hex_value(bytes[index + 2]).is_none()
+            {
+                return Err(BrowserRecordingError::InvalidAction);
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn percent_decode_once(value: &str) -> Result<String, BrowserRecordingError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).map_err(|_| BrowserRecordingError::InvalidAction)
+}
+
+fn has_percent_triplet(value: &str) -> bool {
+    value.as_bytes().windows(3).any(|window| {
+        window[0] == b'%' && hex_value(window[1]).is_some() && hex_value(window[2]).is_some()
+    })
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn fragment_has_sensitive_key(fragment: &str) -> bool {
+    fragment.split(['?', '&', ';']).any(|component| {
+        component
+            .split_once(['=', ':'])
+            .is_some_and(|(key, _)| sensitive_name(key))
+    })
 }
