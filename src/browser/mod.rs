@@ -75,14 +75,20 @@ pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,
 };
 pub use pane::{
-    browser_action_plan, browser_annotation_preview_plan, browser_content_bounds,
-    browser_event_plan, browser_host_reconcile_plan, browser_host_visibility,
-    browser_pane_eligible, browser_pane_open_fallback, browser_response_sync,
-    browser_settings_plan, calculate_browser_split, normalize_browser_address, render_browser_pane,
+    apply_browser_workflow_review_mutation, browser_action_plan, browser_annotation_preview_plan,
+    browser_content_bounds, browser_event_plan, browser_host_reconcile_plan,
+    browser_host_visibility, browser_pane_eligible, browser_pane_open_fallback,
+    browser_response_sync, browser_settings_plan, browser_workflow_review_projection,
+    calculate_browser_split, discard_browser_workflow_review, normalize_browser_address,
+    preview_browser_workflow_review, render_browser_pane, save_browser_workflow_review,
     selected_browser_tab_id, BrowserActionPlan, BrowserHostReconcilePlan, BrowserHostVisibility,
     BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
     BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserSettingsAction,
     BrowserSettingsPlan, BrowserSnapshotSync, BrowserSplitLayout, BrowserViewportPreset,
+    BrowserWorkflowReviewEditor, BrowserWorkflowReviewEditorField,
+    BrowserWorkflowReviewInputProjection, BrowserWorkflowReviewMetadataProjection,
+    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
+    BrowserWorkflowReviewStepProjection, BrowserWorkflowReviewUiState,
 };
 pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserRisk};
 pub use provider::{

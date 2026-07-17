@@ -1,5 +1,68 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 5: Pane Record/review UI
+
+### Status
+
+Checkpoint 5 started from the approved clean checkpoint-4 head `59846cbf0ff28671125f640aac88d7d4280555d5`. It implements only the native split-pane recording controls and in-memory review/save experience. The immutable final head, stable patch ID, and review package range are recorded by the checkpoint handoff after the commit exists.
+
+Checkpoints 6 through 12 are not implemented. This checkpoint adds no `browser_recording` or `browser_workflow` MCP group, replay compiler/executor/status, runtime secret prompt, locator-failure state, repair preview/apply, or replay lifecycle lease.
+
+### Contract decisions
+
+- The checkpoint-4 `BrowserWorkflowCoordinator` remains the one recording/review authority. The App and host add no mirrored draft, status, or instance map. Every UI action is fenced by the currently active `BrowserWorkspaceKey`, Claude/Codex surface, and exact recording instance.
+- Record is explicit and off by default. Only local Claude/Codex panes project Record, active red Stop Recording, or Review controls. Server, SSH, and remote-client surfaces project none. Stop fences page delivery, drains accepted source-order events, and transitions to review without saving.
+- The pane receives a bounded value-free projection: safe metadata, step ID/index, User/Agent actor, fixed action summary, eligible conversion kind, wait/assertion counts, and input name/kind/unset status. Captured action values, locators, file paths/content, secret values, tokens, cookies, and headers do not cross this projection or its `Debug` output.
+- Review, preview, and keyboard-editor state is volatile and never enters `AppState`. Switching AI routes, leaving for Server/SSH, entering remote mode, disabling Browser, reset, project interrupt, or workspace destruction discards the exact in-memory workflow state; collapsing and reopening the same pane does not. Active recording is never restored after restart.
+- Save resolves only the exact owning local project's real canonical root, then uses the existing hardened deterministic atomic recipe store for `.devmanager/browser-workflows/<slug>.json`. Remote clients are rejected before storage. The coordinator lock spans validate/save/discard so another mutation cannot race the bytes; save failure retains the review, and discard happens only after successful atomic replacement.
+- Review replaces the page canvas and is vertically scrollable. Metadata and viewport, ordered actor-labelled steps, delete/reorder, ordinary Text/URL conversion, bounded unset Text/URL/File/Secret input creation, rename/default/remove, Duration/Load/NetworkIdle wait replacement/removal, URL/title/text/element/value assertion addition/removal, validated preview, Save, and Discard are all reachable native controls. Shared keyboard editing uses Enter to validate/commit and Escape to cancel. Nested browser buttons stop event propagation.
+- Volatile preview carriers do not implement `Debug`; the editor and mutation types use manual value-redacting `Debug`. Generated add-input names select the first unused bounded name, so remove/re-add cannot collide and no add control is emitted at capacity.
+
+### Implemented
+
+- Added safe workflow review projection, typed mutation, immutable preview, atomic local save, and exact discard functions in `browser::pane`, plus a private actor map preserved from the recorder's committed source steps.
+- Extended the coordinator and both Windows/unsupported host adapters with one current Recording-or-Review instance seam and review operations. Windows destructive lifecycle now fences/drains/removes recording instrumentation and discards either state for exact workspace/project ownership.
+- Replaced the placeholder pane recording action with explicit Start/Stop/Preview/Save/Discard/Mutate/Focus/Cancel actions and state-driven controls. Review mode hides the WebView and renders the responsive native editor and preview.
+- Added App dispatch for exact start/stop/review operations, canonical local project-root resolution, fixed path-free failure messages, route-owned volatile state, shared keyboard editing, and WebView visibility suppression during review.
+- Added integration coverage for projection redaction and ownership, every typed mutation, immutable preview, atomic save/failure retention/discard, explicit action/model vocabulary, host bridging, App routing without persistence, lifecycle cleanup, rendered control reachability, redacted editor/debug boundaries, and Recording-or-Review project enumeration.
+
+### RED to GREEN evidence
+
+1. Projection and ownership: RED failed with `E0432` because no review projection/state API existed. GREEN projects only exact local Claude/Codex state, preserves User/Agent labels, and omits captured literal/file/secret values.
+2. Typed edits: RED failed with unresolved mutation types/functions. GREEN exercises metadata, delete/reorder, Text/URL conversion, add/rename/default/remove input, wait set/remove, and assertion add/remove against exact workspace/instance fences.
+3. Preview/save/discard: RED failed with three unresolved APIs. GREEN proves preview clones are immutable, remote/cross-route saves fail before writes, atomic local output has deterministic trailing-newline bytes, failed stores retain review, successful stores and explicit discard retire it.
+4. Pane/App/host wiring: successive REDs failed on absent explicit action/model fields, canonical-root helper, host methods, App dispatch calls, safe metadata/index/convertibility fields, editor actions, and Recording-or-Review lifecycle enumeration. Each focused test turned GREEN only after its bounded production seam existed.
+5. Native reachability audit: RED reported `BrowserRecipeWait::Duration` was unreachable and then exposed GPUI's requirement for stable scroll IDs. GREEN covers metadata, viewport, delete/reorder/convert, all four input kinds plus rename/default/remove, three safe wait presets/removal, all five assertion kinds/removal, preview/save/discard, keyboard commits, and scrollable review/preview surfaces.
+6. Self-review input naming: RED failed with `E0432` for the absent first-unused bounded helper. GREEN fills a removed-name hole without colliding and returns no candidate at the 64-input capacity.
+7. Self-review diagnostics: RED proved the pane/App preview carriers still derived `Debug`. GREEN removes that diagnostic path while retaining manual redacted `Debug` for editor and mutation types.
+
+### Verification
+
+- `cargo test --locked --test browser_workflow_review_ui -- --test-threads=1` -> 10 passed, 0 failed.
+- Add-input collision unit regression -> 1 passed, 0 failed.
+- Full 14-target browser integration gate covering annotations, attachment lifecycle, automation, core, fixture, gateway, host, pane, provider, recipes, recording, recording IPC, coordinator, and review UI -> 231 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 112 matching tests passed across all targets, 0 failed.
+- `cargo test --locked --lib app::tests -- --test-threads=1` -> 67 passed, 0 failed.
+- ProcessManager surrounding gate produced 69 passes plus the same `stopped_server_can_start_again_on_same_terminal_session` server-start timeout on both full runs; the exact failed test reran GREEN 1/1 in 1.53 seconds. This checkpoint has no diff under `src/services`; the repeated full-suite limitation is reported rather than expanding checkpoint-5 scope.
+- `cargo check --locked --all-targets` -> exit 0.
+- Native Windows `cargo build --locked` -> exit 0.
+- `cargo fmt --all -- --check` and `git diff --check` -> exit 0.
+
+### Files
+
+- `src/app/mod.rs`
+- `src/browser/host/unsupported.rs`
+- `src/browser/host/windows.rs`
+- `src/browser/mod.rs`
+- `src/browser/pane.rs`
+- `src/browser/recording.rs`
+- `src/browser/recording_coordinator.rs`
+- `tests/browser_pane.rs`
+- `tests/browser_workflow_review_ui.rs`
+- `.superpowers/sdd/browser-task-5c-checkpoints.md`
+- `.superpowers/sdd/progress.md`
+- `.superpowers/sdd/browser-task-5c-report.md`
+
 ## Checkpoint 4: Unified host capture
 
 ### Status

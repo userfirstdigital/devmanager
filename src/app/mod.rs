@@ -11,7 +11,8 @@ use crate::browser::{
     BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
     BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
     BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse,
-    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor,
+    BrowserWorkflowReviewEditorField, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -185,8 +186,10 @@ struct NativeShell {
     browser_inbox: Option<BrowserCommandInbox>,
     browser_tasks_started: bool,
     browser_ui: HashMap<BrowserWorkspaceKey, BrowserWorkspaceUiState>,
+    browser_workflow_route: Option<BrowserWorkspaceKey>,
     browser_address_focus: FocusHandle,
     browser_annotation_focus: FocusHandle,
+    browser_workflow_focus: FocusHandle,
     browser_split_bounds: Option<BrowserBounds>,
     browser_page_bounds: Option<BrowserBounds>,
     browser_divider_drag: Option<BrowserDividerDrag>,
@@ -249,7 +252,7 @@ struct NativeDialogPauseGuard {
     blockers: Arc<AtomicUsize>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct BrowserWorkspaceUiState {
     address_draft: Option<String>,
     address_cursor: usize,
@@ -262,6 +265,8 @@ struct BrowserWorkspaceUiState {
     annotation_comment: String,
     annotation_cursor: usize,
     annotation_focused: bool,
+    workflow_preview: Option<String>,
+    workflow_editor: Option<BrowserWorkflowReviewEditor>,
 }
 
 #[derive(Debug, Clone)]
@@ -1140,8 +1145,10 @@ impl NativeShell {
             browser_inbox: Some(browser_inbox),
             browser_tasks_started: false,
             browser_ui: HashMap::new(),
+            browser_workflow_route: None,
             browser_address_focus: cx.focus_handle(),
             browser_annotation_focus: cx.focus_handle(),
+            browser_workflow_focus: cx.focus_handle(),
             browser_split_bounds: None,
             browser_page_bounds: None,
             browser_divider_drag: None,
@@ -1732,6 +1739,28 @@ impl NativeShell {
     }
 
     fn sync_browser_host_visibility(&mut self, window: Option<&Window>) {
+        let workflow_route = if self.remote_mode.is_none()
+            && self.state.settings().browser_enabled
+            && self.browser_host.status().available
+        {
+            self.state.active_tab().and_then(|tab| {
+                matches!(tab.tab_type, TabType::Claude | TabType::Codex)
+                    .then(|| BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok())
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        if self.browser_workflow_route != workflow_route {
+            if let Some(previous) = self.browser_workflow_route.take() {
+                self.browser_host.discard_workflow_state(&previous);
+                if let Some(ui) = self.browser_ui.get_mut(&previous) {
+                    ui.workflow_preview = None;
+                    ui.workflow_editor = None;
+                }
+            }
+            self.browser_workflow_route = workflow_route;
+        }
         let context = self.browser_pane_context();
         let plan = self.state.active_tab().and_then(|tab| {
             let key = BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()?;
@@ -1750,23 +1779,28 @@ impl NativeShell {
             }
             Some(BrowserHostVisibility::Hidden) | None => None,
         };
+        if active_workspace.as_ref().is_some_and(|workspace_key| {
+            self.browser_host.page_recording_status(workspace_key)
+                == crate::browser::BrowserRecordingStatus::Review
+        }) {
+            active_workspace = None;
+        }
         if let Some(snapshot) = plan.and_then(|plan| plan.ensure_snapshot) {
             let Some(window) = window else {
                 let _ = self.browser_host.set_active_workspace(None);
                 return;
             };
-            let Some(workspace_key) = active_workspace.as_ref() else {
-                return;
-            };
-            if self
-                .dispatch_browser_command(
-                    workspace_key,
-                    BrowserCommand::Ensure { snapshot },
-                    window,
-                )
-                .is_err()
-            {
-                active_workspace = None;
+            if let Some(workspace_key) = active_workspace.as_ref() {
+                if self
+                    .dispatch_browser_command(
+                        workspace_key,
+                        BrowserCommand::Ensure { snapshot },
+                        window,
+                    )
+                    .is_err()
+                {
+                    active_workspace = None;
+                }
             }
         }
         if let Err(error) = self
@@ -1796,6 +1830,18 @@ impl NativeShell {
         let diagnostic = ui
             .diagnostic
             .or_else(|| self.process_manager.browser_diagnostic(&tab.id));
+        let workflow_review = if self.remote_mode.is_none() {
+            self.browser_host.workflow_review_projection(
+                &workspace_key,
+                match tab.tab_type {
+                    TabType::Claude => BrowserPaneSurface::Claude,
+                    TabType::Codex => BrowserPaneSurface::Codex,
+                    TabType::Server | TabType::Ssh => return None,
+                },
+            )
+        } else {
+            None
+        };
         Some(BrowserPaneModel::new(
             workspace_key,
             &self.browser_pane_context(),
@@ -1813,6 +1859,9 @@ impl NativeShell {
                 annotation_comment: ui.annotation_comment,
                 annotation_cursor: ui.annotation_cursor,
                 annotation_focused: ui.annotation_focused,
+                workflow_review,
+                workflow_preview: ui.workflow_preview,
+                workflow_editor: ui.workflow_editor,
             },
         ))
     }
@@ -2110,6 +2159,16 @@ impl NativeShell {
             cx.notify();
             return;
         };
+        let workflow_surface = match self.state.active_tab().map(|tab| tab.tab_type.clone()) {
+            Some(TabType::Claude) => BrowserPaneSurface::Claude,
+            Some(TabType::Codex) => BrowserPaneSurface::Codex,
+            Some(TabType::Server | TabType::Ssh) | None => {
+                self.terminal_notice =
+                    Some("Select a Claude or Codex conversation first.".to_string());
+                cx.notify();
+                return;
+            }
+        };
 
         match action {
             BrowserPaneAction::DividerBegin { .. } => {
@@ -2287,6 +2346,274 @@ impl NativeShell {
                 cx.notify();
                 return;
             }
+            BrowserPaneAction::StartRecording => {
+                if self.remote_mode.is_some() {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(
+                        "Browser workflow recording is unavailable from a remote client."
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if self
+                    .browser_host
+                    .workspace_snapshot(&workspace_key)
+                    .is_none()
+                    && self
+                        .dispatch_browser_command(
+                            &workspace_key,
+                            BrowserCommand::Ensure {
+                                snapshot: snapshot.clone(),
+                            },
+                            window,
+                        )
+                        .is_err()
+                {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                        Some("Browser workflow recording could not start.".to_string());
+                    cx.notify();
+                    return;
+                }
+                let result = self.with_browser_host_control_barrier(window, |browser_host| {
+                    browser_host.start_page_recording(&workspace_key)
+                });
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.workflow_preview = None;
+                        ui.workflow_editor = None;
+                        ui.action_status = Some("Recording browser workflow".to_string());
+                    }
+                    Err(_) => {
+                        ui.diagnostic =
+                            Some("Browser workflow recording could not start.".to_string());
+                    }
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::StopRecording { instance_id } => {
+                let instance = self.browser_host.page_recording_instance(&workspace_key);
+                let result = match instance {
+                    Some(instance) if instance.id() == instance_id => self
+                        .with_browser_host_control_barrier(window, |browser_host| {
+                            browser_host.stop_page_recording(&instance)
+                        })
+                        .map(|_| ()),
+                    _ => Err(crate::browser::BrowserPageRecordingIpcError::Untrusted),
+                };
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(()) => {
+                        ui.diagnostic = None;
+                        ui.workflow_preview = None;
+                        ui.workflow_editor = None;
+                        ui.action_status = Some("Recording stopped - review ready".to_string());
+                    }
+                    Err(_) => {
+                        ui.diagnostic =
+                            Some("Browser workflow recording is no longer active.".to_string());
+                    }
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::FocusRecordingReviewField { instance_id, field } => {
+                let result = self.with_browser_host_control_barrier(window, |browser_host| {
+                    browser_host.preview_workflow_review(
+                        Some(&workspace_key),
+                        &workspace_key,
+                        workflow_surface,
+                        instance_id,
+                    )
+                });
+                match result.and_then(|recipe| {
+                    let draft = match &field {
+                        BrowserWorkflowReviewEditorField::Id => recipe.id,
+                        BrowserWorkflowReviewEditorField::Name => recipe.name,
+                        BrowserWorkflowReviewEditorField::Description => recipe.description,
+                        BrowserWorkflowReviewEditorField::StartUrl => recipe.start_url,
+                        BrowserWorkflowReviewEditorField::InputName { input_name } => recipe
+                            .inputs
+                            .iter()
+                            .find(|input| input.name == *input_name)
+                            .map(|input| input.name.clone())
+                            .ok_or_else(|| BrowserError::InvalidRecipe {
+                                message: "review input is no longer active".to_string(),
+                            })?,
+                        BrowserWorkflowReviewEditorField::InputDefault { input_name } => {
+                            let input = recipe
+                                .inputs
+                                .iter()
+                                .find(|input| input.name == *input_name)
+                                .ok_or_else(|| BrowserError::InvalidRecipe {
+                                    message: "review input is no longer active".to_string(),
+                                })?;
+                            if matches!(
+                                input.kind,
+                                crate::browser::BrowserRecipeInputKind::Secret
+                                    | crate::browser::BrowserRecipeInputKind::File
+                            ) {
+                                return Err(BrowserError::InvalidRecipe {
+                                    message: "unset inputs cannot have defaults".to_string(),
+                                });
+                            }
+                            input.default_value.clone().unwrap_or_default()
+                        }
+                    };
+                    Ok(draft)
+                }) {
+                    Ok(draft) => {
+                        let cursor = draft.chars().count();
+                        let ui = self.browser_ui.entry(workspace_key).or_default();
+                        ui.diagnostic = None;
+                        ui.workflow_editor = Some(BrowserWorkflowReviewEditor {
+                            instance_id,
+                            field,
+                            draft,
+                            cursor,
+                            focused: true,
+                        });
+                        window.focus(&self.browser_workflow_focus);
+                    }
+                    Err(_) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some("Workflow review field cannot be edited.".to_string());
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::CancelRecordingReviewEdit => {
+                if let Some(ui) = self.browser_ui.get_mut(&workspace_key) {
+                    ui.workflow_editor = None;
+                }
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::MutateRecordingReview {
+                instance_id,
+                mutation,
+            } => {
+                let result = self.with_browser_host_control_barrier(window, |browser_host| {
+                    browser_host.apply_workflow_review_mutation(
+                        Some(&workspace_key),
+                        &workspace_key,
+                        workflow_surface,
+                        instance_id,
+                        mutation,
+                    )
+                });
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.workflow_preview = None;
+                        ui.workflow_editor = None;
+                        ui.action_status = Some("Updated workflow review".to_string());
+                    }
+                    Err(_) => {
+                        ui.diagnostic = Some("Workflow review change is invalid.".to_string());
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::PreviewRecordingReview { instance_id } => {
+                let result = self.with_browser_host_control_barrier(window, |browser_host| {
+                    browser_host.preview_workflow_review(
+                        Some(&workspace_key),
+                        &workspace_key,
+                        workflow_surface,
+                        instance_id,
+                    )
+                });
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result.and_then(|recipe| {
+                    serde_json::to_string_pretty(&recipe)
+                        .map(|mut preview| {
+                            preview.push('\n');
+                            preview
+                        })
+                        .map_err(|_| BrowserError::InvalidRecipe {
+                            message: "validated preview could not be rendered".to_string(),
+                        })
+                }) {
+                    Ok(preview) => {
+                        ui.diagnostic = None;
+                        ui.workflow_preview = Some(preview);
+                        ui.action_status = Some("Validated workflow preview".to_string());
+                    }
+                    Err(_) => {
+                        ui.diagnostic =
+                            Some("Workflow review must be valid before preview.".to_string());
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::SaveRecordingReview { instance_id } => {
+                let remote_client = self.remote_mode.is_some();
+                let project_root =
+                    local_browser_workflow_project_root(&self.state, &workspace_key, remote_client);
+                let result = project_root.and_then(|project_root| {
+                    self.with_browser_host_control_barrier(window, |browser_host| {
+                        browser_host.save_workflow_review(
+                            Some(&workspace_key),
+                            &workspace_key,
+                            workflow_surface,
+                            instance_id,
+                            &project_root,
+                            remote_client,
+                        )
+                    })
+                });
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.workflow_preview = None;
+                        ui.workflow_editor = None;
+                        ui.action_status = Some("Saved browser workflow".to_string());
+                    }
+                    Err(_) => {
+                        ui.diagnostic = Some(
+                            "Browser workflow could not be saved; review was retained.".to_string(),
+                        );
+                    }
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::DiscardRecordingReview { instance_id } => {
+                let result = self.with_browser_host_control_barrier(window, |browser_host| {
+                    browser_host.discard_workflow_review(
+                        Some(&workspace_key),
+                        &workspace_key,
+                        workflow_surface,
+                        instance_id,
+                    )
+                });
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(()) => {
+                        ui.diagnostic = None;
+                        ui.workflow_preview = None;
+                        ui.workflow_editor = None;
+                        ui.action_status = Some("Discarded workflow review".to_string());
+                    }
+                    Err(_) => {
+                        ui.diagnostic = Some("Workflow review is no longer active.".to_string());
+                    }
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
             _ => {}
         }
 
@@ -2456,6 +2783,142 @@ impl NativeShell {
             true,
         ) {
             ui.annotation_focused = true;
+            ui.diagnostic = None;
+            cx.notify();
+            window.prevent_default();
+        }
+    }
+
+    fn handle_browser_workflow_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((workspace_key, _)) = self.active_browser_workspace() else {
+            return;
+        };
+        let Some(editor) = self
+            .browser_ui
+            .get(&workspace_key)
+            .and_then(|ui| ui.workflow_editor.clone())
+        else {
+            return;
+        };
+        let key = event.keystroke.key.to_ascii_lowercase();
+        if key == "escape" {
+            self.apply_browser_pane_action(
+                BrowserPaneAction::CancelRecordingReviewEdit,
+                window,
+                cx,
+            );
+            window.prevent_default();
+            return;
+        }
+        if key == "enter" {
+            let surface = match self.state.active_tab().map(|tab| tab.tab_type.clone()) {
+                Some(TabType::Claude) => BrowserPaneSurface::Claude,
+                Some(TabType::Codex) => BrowserPaneSurface::Codex,
+                Some(TabType::Server | TabType::Ssh) | None => return,
+            };
+            let recipe = self.with_browser_host_control_barrier(window, |browser_host| {
+                browser_host.preview_workflow_review(
+                    Some(&workspace_key),
+                    &workspace_key,
+                    surface,
+                    editor.instance_id,
+                )
+            });
+            let mutation = recipe.map(|recipe| match editor.field {
+                BrowserWorkflowReviewEditorField::Id => {
+                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
+                        id: editor.draft,
+                        name: recipe.name,
+                        description: recipe.description,
+                        start_url: recipe.start_url,
+                        viewport: recipe.viewport,
+                    }
+                }
+                BrowserWorkflowReviewEditorField::Name => {
+                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
+                        id: recipe.id,
+                        name: editor.draft,
+                        description: recipe.description,
+                        start_url: recipe.start_url,
+                        viewport: recipe.viewport,
+                    }
+                }
+                BrowserWorkflowReviewEditorField::Description => {
+                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
+                        id: recipe.id,
+                        name: recipe.name,
+                        description: editor.draft,
+                        start_url: recipe.start_url,
+                        viewport: recipe.viewport,
+                    }
+                }
+                BrowserWorkflowReviewEditorField::StartUrl => {
+                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
+                        id: recipe.id,
+                        name: recipe.name,
+                        description: recipe.description,
+                        start_url: editor.draft,
+                        viewport: recipe.viewport,
+                    }
+                }
+                BrowserWorkflowReviewEditorField::InputName { input_name } => {
+                    crate::browser::BrowserWorkflowReviewMutation::RenameInput {
+                        previous_name: input_name,
+                        new_name: editor.draft,
+                    }
+                }
+                BrowserWorkflowReviewEditorField::InputDefault { input_name } => {
+                    crate::browser::BrowserWorkflowReviewMutation::SetInputDefault {
+                        input_name,
+                        default_value: (!editor.draft.trim().is_empty()).then_some(editor.draft),
+                    }
+                }
+            });
+            match mutation {
+                Ok(mutation) => self.apply_browser_pane_action(
+                    BrowserPaneAction::MutateRecordingReview {
+                        instance_id: editor.instance_id,
+                        mutation,
+                    },
+                    window,
+                    cx,
+                ),
+                Err(_) => {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                        Some("Workflow review is no longer active.".to_string());
+                    cx.notify();
+                }
+            }
+            window.prevent_default();
+            return;
+        }
+
+        let secondary = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        let paste_text = if secondary && key == "v" {
+            cx.read_from_clipboard().and_then(|item| item.text())
+        } else {
+            None
+        };
+        let ui = self.browser_ui.entry(workspace_key).or_default();
+        let Some(editor) = ui.workflow_editor.as_mut() else {
+            return;
+        };
+        let mut selection = None;
+        if apply_text_key_to_string(
+            &mut editor.draft,
+            &mut editor.cursor,
+            &mut selection,
+            event,
+            paste_text.as_deref(),
+            false,
+            false,
+        ) {
+            editor.focused = true;
             ui.diagnostic = None;
             cx.notify();
             window.prevent_default();
@@ -12775,6 +13238,7 @@ impl Render for NativeShell {
                 > {
                     let browser_entity = browser_entity.clone();
                     Box::new(move |_, window, app| {
+                        app.stop_propagation();
                         let _ = browser_entity.update(app, |this, cx| {
                             this.apply_browser_pane_action(action.clone(), window, cx);
                         });
@@ -13121,6 +13585,9 @@ impl Render for NativeShell {
                                 on_annotation_key: Box::new(
                                     cx.listener(Self::handle_browser_annotation_key),
                                 ),
+                                on_workflow_key: Box::new(
+                                    cx.listener(Self::handle_browser_workflow_key),
+                                ),
                                 on_page_bounds: Arc::new(move |bounds, _window, app| {
                                     let _ = page_entity.update(app, |this, cx| {
                                         this.capture_browser_page_bounds(bounds, cx);
@@ -13228,6 +13695,7 @@ impl Render for NativeShell {
                                             browser,
                                             self.browser_address_focus.clone(),
                                             self.browser_annotation_focus.clone(),
+                                            self.browser_workflow_focus.clone(),
                                             browser_actions,
                                         )),
                                 )
@@ -15473,6 +15941,33 @@ fn config_has_ssh_connection(config: &AppConfig, connection_id: &str) -> bool {
         .any(|connection| connection.id == connection_id)
 }
 
+fn local_browser_workflow_project_root(
+    state: &AppState,
+    workspace_key: &BrowserWorkspaceKey,
+    remote_client: bool,
+) -> Result<std::path::PathBuf, BrowserError> {
+    if remote_client {
+        return Err(BrowserError::InvalidInvocation {
+            field: "localProjectRoot".to_string(),
+        });
+    }
+    let project = state
+        .find_project(&workspace_key.project_id)
+        .ok_or_else(|| BrowserError::InvalidWorkspaceKey {
+            field: "projectId".to_string(),
+        })?;
+    let root = std::path::PathBuf::from(&project.root_path);
+    if !root.is_dir() {
+        return Err(BrowserError::InvalidRecipe {
+            message: "owning project root is unavailable".to_string(),
+        });
+    }
+    root.canonicalize()
+        .map_err(|_| BrowserError::InvalidRecipe {
+            message: "owning project root could not be verified".to_string(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17364,5 +17859,36 @@ mod tests {
                 "\u{1b}a".to_string()
             })
         );
+    }
+
+    #[test]
+    fn browser_workflow_save_root_is_exact_real_and_local_only() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-workflow-root-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create project root");
+        let mut state = AppState::default();
+        state.config.projects.push(Project {
+            id: "project-a".to_string(),
+            root_path: root.to_string_lossy().into_owned(),
+            ..Project::default()
+        });
+        let owned = BrowserWorkspaceKey::new("project-a", "ai-a").expect("workspace");
+        let other = BrowserWorkspaceKey::new("project-b", "ai-a").expect("other workspace");
+
+        assert_eq!(
+            local_browser_workflow_project_root(&state, &owned, false)
+                .expect("exact local project root"),
+            root.canonicalize().expect("canonical project root")
+        );
+        assert!(local_browser_workflow_project_root(&state, &owned, true).is_err());
+        assert!(local_browser_workflow_project_root(&state, &other, false).is_err());
+
+        std::fs::remove_dir_all(root).expect("remove project root");
     }
 }

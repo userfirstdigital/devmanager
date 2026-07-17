@@ -7,30 +7,32 @@ use crate::browser::downloads::{
     verify_prepared_storage_root,
 };
 use crate::browser::{
-    browser_lifecycle_control, browser_page_origin_from_url,
-    browser_request_preempts_operation_queue, browser_response_resource_ids,
-    build_semantic_snapshot, crop_annotation_png, effective_browser_annotation_risk,
+    apply_browser_workflow_review_mutation, browser_lifecycle_control,
+    browser_page_origin_from_url, browser_request_preempts_operation_queue,
+    browser_response_resource_ids, browser_workflow_review_projection, build_semantic_snapshot,
+    crop_annotation_png, discard_browser_workflow_review, effective_browser_annotation_risk,
     effective_browser_risk, effective_browser_risk_for_targets, parse_browser_page_ipc_message,
-    prepare_verified_download_root, redact_browser_resource_bytes, redact_browser_text,
-    remove_verified_profile, validate_annotation_candidate_context, BrowserAction,
-    BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
-    BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationRoute,
-    BrowserApprovalPolicy, BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds,
-    BrowserCommand, BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation,
-    BrowserDiagnosticLevel, BrowserDownloadState, BrowserDownloadStore, BrowserError,
-    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
-    BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
-    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
-    BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingSubmit,
-    BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
-    BrowserRecordingError, BrowserRecordingInstance, BrowserRecordingReview,
-    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget,
-    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
-    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
-    MAX_BROWSER_ACTIONS,
+    prepare_verified_download_root, preview_browser_workflow_review, redact_browser_resource_bytes,
+    redact_browser_text, remove_verified_profile, save_browser_workflow_review,
+    validate_annotation_candidate_context, BrowserAction, BrowserActionResult,
+    BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDraft,
+    BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
+    BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
+    BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
+    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
+    BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget,
+    BrowserPageIpcMessage, BrowserPageLoadState, BrowserPageRecordingAuthority,
+    BrowserPageRecordingEnvelope, BrowserPageRecordingIngress, BrowserPageRecordingIpc,
+    BrowserPageRecordingIpcError, BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
+    BrowserPageRecordingTransportFailureKind, BrowserPaneSurface, BrowserPerformanceOperation,
+    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
+    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget, BrowserScreenshotMode,
+    BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult, BrowserWaitResult,
+    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -286,6 +288,104 @@ impl BrowserWebViewHost {
         self.workflow_coordinator.status(workspace_key)
     }
 
+    pub fn page_recording_instance(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Option<BrowserRecordingInstance> {
+        self.workflow_coordinator.current_instance(workspace_key)
+    }
+
+    pub fn workflow_review_projection(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+    ) -> Option<BrowserWorkflowReviewProjection> {
+        browser_workflow_review_projection(&self.workflow_coordinator, workspace_key, surface)
+    }
+
+    pub fn apply_workflow_review_mutation(
+        &mut self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+        mutation: BrowserWorkflowReviewMutation,
+    ) -> Result<BrowserWorkflowReviewProjection, BrowserRecordingError> {
+        apply_browser_workflow_review_mutation(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+            mutation,
+        )
+    }
+
+    pub fn preview_workflow_review(
+        &self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+    ) -> Result<BrowserRecipeV1, BrowserError> {
+        preview_browser_workflow_review(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+        )
+    }
+
+    pub fn save_workflow_review(
+        &mut self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+        project_root: impl AsRef<Path>,
+        remote_client: bool,
+    ) -> Result<PathBuf, BrowserError> {
+        save_browser_workflow_review(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+            project_root,
+            remote_client,
+        )
+    }
+
+    pub fn discard_workflow_review(
+        &mut self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+    ) -> Result<(), BrowserError> {
+        discard_browser_workflow_review(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+        )
+    }
+
+    pub fn discard_workflow_state(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        self.fence_workspace_recording_views(workspace_key);
+        self.pump_page_recording_ipc();
+        self.remove_workspace_recording_views(workspace_key);
+        let Some(instance) = self.workflow_coordinator.current_instance(workspace_key) else {
+            return;
+        };
+        if self.workflow_coordinator.status(workspace_key) == BrowserRecordingStatus::Recording {
+            let _ = self.workflow_coordinator.stop(&instance);
+        }
+        let _ = self.workflow_coordinator.discard(&instance);
+    }
+
     pub fn start_page_recording(
         &mut self,
         workspace_key: &BrowserWorkspaceKey,
@@ -438,10 +538,12 @@ impl BrowserWebViewHost {
             BrowserHostControl::InterruptProject { project_id } => {
                 self.cancel_project_annotations(&project_id);
                 self.cancel_project_operations(&project_id);
+                self.discard_project_page_recordings(&project_id);
             }
             BrowserHostControl::InterruptWorkspace { workspace_key } => {
                 self.cancel_workspace_annotations(&workspace_key);
                 self.cancel_workspace_operations(&workspace_key);
+                self.discard_workflow_state(&workspace_key);
             }
             BrowserHostControl::InterruptTab {
                 workspace_key,
@@ -2720,19 +2822,13 @@ impl BrowserWebViewHost {
     }
 
     fn discard_page_recording(&mut self, workspace_key: &BrowserWorkspaceKey) {
-        self.remove_workspace_recording_views(workspace_key);
-        let Some(instance) = self.workflow_coordinator.active_instance(workspace_key) else {
-            return;
-        };
-        if self.workflow_coordinator.stop(&instance).is_ok() {
-            let _ = self.workflow_coordinator.discard(&instance);
-        }
+        self.discard_workflow_state(workspace_key);
     }
 
     fn discard_project_page_recordings(&mut self, project_id: &str) {
         let workspace_keys = self
             .workflow_coordinator
-            .active_project_instances(project_id)
+            .current_project_instances(project_id)
             .into_iter()
             .map(|instance| instance.workspace_key().clone())
             .collect::<Vec<_>>();
@@ -3091,7 +3187,7 @@ impl BrowserWebViewHost {
                 Ok(BrowserResponse::Acknowledged)
             }
             BrowserCommand::ResetWorkspace => {
-                self.discard_page_recording(workspace_key);
+                self.discard_workflow_state(workspace_key);
                 self.views
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.recording_ingresses

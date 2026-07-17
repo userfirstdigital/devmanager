@@ -79,6 +79,7 @@ pub struct BrowserRecordingReview {
     instance: BrowserRecordingInstance,
     recipe: BrowserRecipeV1,
     generated_inputs: BTreeSet<String>,
+    step_actors: BTreeMap<String, BrowserRecordingActor>,
 }
 
 /// Mutable review metadata is accepted by value and sanitized before it is
@@ -100,6 +101,10 @@ impl BrowserRecordingReview {
 
     pub fn recipe(&self) -> &BrowserRecipeV1 {
         &self.recipe
+    }
+
+    pub(crate) fn actor_for_step(&self, step_id: &str) -> Option<BrowserRecordingActor> {
+        self.step_actors.get(step_id).copied()
     }
 }
 
@@ -293,6 +298,48 @@ impl BrowserWorkflowRecorder {
         match self.workspaces.get(workspace_key) {
             Some(WorkspaceRecordingState::Recording(active)) => Some(active.instance.clone()),
             Some(WorkspaceRecordingState::Review(_)) | None => None,
+        }
+    }
+
+    pub(crate) fn current_instance(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Option<BrowserRecordingInstance> {
+        match self.workspaces.get(workspace_key) {
+            Some(WorkspaceRecordingState::Recording(active)) => Some(active.instance.clone()),
+            Some(WorkspaceRecordingState::Review(review)) => Some(review.instance.clone()),
+            None => None,
+        }
+    }
+
+    pub(crate) fn current_project_instances(
+        &self,
+        project_id: &str,
+    ) -> Vec<BrowserRecordingInstance> {
+        let mut instances = self
+            .workspaces
+            .iter()
+            .filter(|(workspace_key, _)| workspace_key.project_id == project_id)
+            .map(|(_, state)| match state {
+                WorkspaceRecordingState::Recording(active) => active.instance.clone(),
+                WorkspaceRecordingState::Review(review) => review.instance.clone(),
+            })
+            .collect::<Vec<_>>();
+        instances.sort_by(|left, right| {
+            left.workspace_key()
+                .ai_tab_id
+                .cmp(&right.workspace_key().ai_tab_id)
+        });
+        instances
+    }
+
+    pub(crate) fn review_for_workspace(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Option<BrowserRecordingReview> {
+        match self.workspaces.get(workspace_key) {
+            Some(WorkspaceRecordingState::Review(review)) => Some(review.clone()),
+            Some(WorkspaceRecordingState::Recording(_)) | None => None,
         }
     }
 
@@ -495,6 +542,11 @@ impl BrowserWorkflowRecorder {
             }
         }
         drain_ready(&mut active);
+        let step_actors = active
+            .steps
+            .iter()
+            .map(|recorded| (recorded.step.id.clone(), recorded.actor))
+            .collect();
         let recipe = BrowserRecipeV1 {
             schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
             id: format!("recording-{}", instance.id),
@@ -513,6 +565,7 @@ impl BrowserWorkflowRecorder {
             instance: instance.clone(),
             recipe,
             generated_inputs: active.generated_inputs,
+            step_actors,
         };
         self.workspaces.insert(
             instance.workspace_key.clone(),

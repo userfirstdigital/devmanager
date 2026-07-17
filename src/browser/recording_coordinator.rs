@@ -151,6 +151,17 @@ impl BrowserWorkflowCoordinator {
         self.lock().recorder.active_instance(workspace_key)
     }
 
+    pub fn current_instance(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Option<BrowserRecordingInstance> {
+        self.lock().recorder.current_instance(workspace_key)
+    }
+
+    pub fn current_project_instances(&self, project_id: &str) -> Vec<BrowserRecordingInstance> {
+        self.lock().recorder.current_project_instances(project_id)
+    }
+
     pub fn active_project_instances(&self, project_id: &str) -> Vec<BrowserRecordingInstance> {
         let state = self.lock();
         let mut instances = state

@@ -1,8 +1,12 @@
 #[cfg(not(target_os = "windows"))]
 use super::super::{
+    apply_browser_workflow_review_mutation, browser_workflow_review_projection,
+    discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
     BrowserBounds, BrowserCommand, BrowserCommandRequest, BrowserHostControl, BrowserHostEvent,
-    BrowserPageRecordingIpcError, BrowserRecordingInstance, BrowserRecordingReview,
-    BrowserRecordingStatus, BrowserResponse, BrowserWorkspaceKey,
+    BrowserPageRecordingIpcError, BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError,
+    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus, BrowserResponse,
+    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
+    BrowserWorkspaceKey,
 };
 use super::super::{BrowserError, BrowserHostStatus};
 #[cfg(not(target_os = "windows"))]
@@ -39,6 +43,7 @@ pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     #[allow(dead_code)]
     state: BrowserHostState,
+    workflow_coordinator: BrowserWorkflowCoordinator,
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
@@ -48,6 +53,7 @@ impl BrowserWebViewHost {
         Self {
             status: unsupported_host_status(std::env::consts::OS),
             state: BrowserHostState::new(app_config_dir),
+            workflow_coordinator: BrowserWorkflowCoordinator::default(),
             _main_thread_only: PhantomData,
         }
     }
@@ -61,6 +67,7 @@ impl BrowserWebViewHost {
                 version: None,
             },
             state: BrowserHostState::new(PathBuf::new()),
+            workflow_coordinator: BrowserWorkflowCoordinator::default(),
             _main_thread_only: PhantomData,
         }
     }
@@ -78,6 +85,101 @@ impl BrowserWebViewHost {
         _workspace_key: &BrowserWorkspaceKey,
     ) -> BrowserRecordingStatus {
         BrowserRecordingStatus::Inactive
+    }
+
+    pub fn page_recording_instance(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Option<BrowserRecordingInstance> {
+        self.workflow_coordinator.current_instance(workspace_key)
+    }
+
+    pub fn workflow_review_projection(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+    ) -> Option<BrowserWorkflowReviewProjection> {
+        browser_workflow_review_projection(&self.workflow_coordinator, workspace_key, surface)
+    }
+
+    pub fn apply_workflow_review_mutation(
+        &mut self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+        mutation: BrowserWorkflowReviewMutation,
+    ) -> Result<BrowserWorkflowReviewProjection, BrowserRecordingError> {
+        apply_browser_workflow_review_mutation(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+            mutation,
+        )
+    }
+
+    pub fn preview_workflow_review(
+        &self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+    ) -> Result<BrowserRecipeV1, BrowserError> {
+        preview_browser_workflow_review(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+        )
+    }
+
+    pub fn save_workflow_review(
+        &mut self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+        project_root: impl AsRef<Path>,
+        remote_client: bool,
+    ) -> Result<PathBuf, BrowserError> {
+        save_browser_workflow_review(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+            project_root,
+            remote_client,
+        )
+    }
+
+    pub fn discard_workflow_review(
+        &mut self,
+        active_workspace: Option<&BrowserWorkspaceKey>,
+        action_workspace: &BrowserWorkspaceKey,
+        surface: BrowserPaneSurface,
+        instance_id: u64,
+    ) -> Result<(), BrowserError> {
+        discard_browser_workflow_review(
+            &self.workflow_coordinator,
+            active_workspace,
+            action_workspace,
+            surface,
+            instance_id,
+        )
+    }
+
+    pub fn discard_workflow_state(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        let Some(instance) = self.workflow_coordinator.current_instance(workspace_key) else {
+            return;
+        };
+        if self.workflow_coordinator.status(workspace_key) == BrowserRecordingStatus::Recording {
+            let _ = self.workflow_coordinator.stop(&instance);
+        }
+        let _ = self.workflow_coordinator.discard(&instance);
     }
 
     pub fn start_page_recording(

@@ -702,7 +702,7 @@ fn pane_model_tracks_default_open_collapse_and_control_vocabulary() {
         BrowserPaneAction::SubmitAddress,
         BrowserPaneAction::SetViewport(BrowserViewportPreset::Desktop),
         BrowserPaneAction::ToggleAnnotation,
-        BrowserPaneAction::ToggleRecording,
+        BrowserPaneAction::StartRecording,
         BrowserPaneAction::OpenDevTools,
         BrowserPaneAction::OpenDownloads,
         BrowserPaneAction::Stop,
