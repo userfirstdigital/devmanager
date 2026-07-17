@@ -27,6 +27,17 @@ static BASIC_SECRET: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)\bBasic\s+[A-Za-z0-9._~+/=-]+")
         .expect("browser basic-credential regex is valid")
 });
+static BARE_CREDENTIAL: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?ix)
+        (?:^|[^A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[^A-Za-z0-9_-])
+        |(?:^|[^A-Za-z0-9_-])sk-(?:proj-)?[A-Za-z0-9_-]{20,}(?:$|[^A-Za-z0-9_-])
+        |(?:^|[^A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9]{20,}(?:$|[^A-Za-z0-9])
+        |(?:^|[^A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?:$|[^A-Z0-9])
+        |(?:^|[^A-Za-z0-9_-])AIza[A-Za-z0-9_-]{30,}(?:$|[^A-Za-z0-9_-])",
+    )
+    .expect("browser bare-credential regex is valid")
+});
 
 pub const MAX_BROWSER_ACTIONS: usize = 32;
 pub const MAX_BROWSER_JOURNAL_ENTRIES: usize = 100;
@@ -656,6 +667,18 @@ pub fn redact_browser_text(value: &str) -> String {
         })
         .unwrap_or_else(|| redact_browser_secrets(value));
     redacted.chars().take(4_000).collect()
+}
+
+pub(crate) fn browser_text_contains_secret(value: &str) -> bool {
+    if BARE_CREDENTIAL.is_match(value) {
+        return true;
+    }
+    if let Ok(mut redacted) = serde_json::from_str::<Value>(value) {
+        let original = redacted.clone();
+        redact_json_value(&mut redacted);
+        return redacted != original;
+    }
+    redact_browser_secrets(value) != value
 }
 
 fn redact_browser_secrets(value: &str) -> String {

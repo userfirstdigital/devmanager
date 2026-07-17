@@ -1,5 +1,51 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 7: Replay compiler/status/cancellation lease
+
+### Status
+
+Checkpoint 7 started from the approved clean checkpoint-6 hardening head `0f35ff6552faadf7fa0226d4e59359030848562c`. It implements only the platform-neutral replay compiler, value-free lifecycle projection, exact workspace/instance fencing, bounded terminal cleanup, and one replay-lifetime cancellation lease. The immutable final head, stable patch ID, and review package range are recorded by the checkpoint handoff after the commit exists.
+
+Checkpoints 8 through 12 are not implemented. This checkpoint executes no browser action and adds no host, controller, operation-queue, approval, journal, filesystem, UI, MCP, runtime secret-value store/prompt, locator-failure payload, or repair preview/apply integration.
+
+### Contract decisions
+
+- `compile_browser_replay` validates the complete strict `BrowserRecipeV1` before public inputs. It caps 64 inputs, 256 ordered steps, 128-byte safe names, 64-KiB Text, 8-KiB URL, and 32-KiB File candidates; rejects duplicate, unknown, missing, mismatched, credential-bearing, and every public Secret submission with closed value-free errors; and applies only validated Text/URL defaults.
+- File values remain bounded nonblank control-free opaque candidates. Replay does not normalize, canonicalize, inspect existence, or touch the filesystem. Secret values cannot enter the public compiler; only safe declared Secret names enter the unresolved-name list and cause `NeedsUserSecret`.
+- `BrowserReplayPlan`, public input carriers, and cancellation leases implement neither `Debug` nor `Serialize`. The immutable plan retains the start URL, viewport, ordered steps, and declaration-ordered non-secret bindings only for checkpoint-8 execution. Status/error/Debug/Serialize output contains no recipe name/description/start URL, locator, literal, default, public value, file path, or arbitrary failure message.
+- `BrowserReplayStatus` is exactly `Pending | Running | NeedsUserSecret | PausedLocatorRepair | Completed | Failed | Cancelled`. Legal edges are `Pending -> Running|Cancelled`, internal value-free `NeedsUserSecret -> Running` or `Cancelled`, `Running -> PausedLocatorRepair|Completed|Failed|Cancelled`, and `PausedLocatorRepair -> Running|Failed|Cancelled`. Completion requires every ordered step; terminals are immutable.
+- Each coordinator has one opaque process-local scope shared by clones and distinct across independently constructed coordinators. Every instance is fenced by that scope plus exact workspace and checked monotonic local ID, preventing foreign-coordinator collisions even when workspace and numeric ID match. A second ordinary start fails; explicit replacement cancels/archives the old exact instance before installing the new plan.
+- One `Arc`-backed immutable cancellation authority is minted at replay start. Every lease clone shares its identity and atomic flag across status reads, step gaps, secret wait, and locator pause; no transition rearms or replaces it. Cancel, replacement, and workspace interruption synchronously invalidate it. Completed and Failed replays are not relabelled as cancellation.
+- Active state alone owns the value-bearing plan. Terminal transitions drop it and retain only a safe projection in a configurable at-least-one bounded oldest-first deque. Evicted identities become stale. Mutex poisoning is recovered without exposing values; checked ID overflow fails closed without installing a plan.
+
+### RED to GREEN evidence
+
+1. Compiler: RED failed with unresolved `compile_browser_replay`, `BrowserReplayError`, `BrowserReplayPlan`, and `BrowserReplayPublicInput`. GREEN passed the compiler defaults/order/value-boundary group 4/4.
+2. State/fencing: RED failed with unresolved coordinator/status/projection/failure types plus missing transition errors. GREEN passed 4/4 for all seven statuses, exact progress/pause/completion, one-active replacement/isolation, terminal immutability, stale calls, and capacity-two eviction. The private value-free secret-readiness seam passed 1/1.
+3. Cancellation: RED failed on the absent cancellation lease type and `BrowserReplayStart::lease`. GREEN passed 4/4 across Pending, NeedsUserSecret, Running step gaps, PausedLocatorRepair, replacement, interruption, shared clones, and Completed/Failed non-cancellation.
+4. Audit hardening: an ordered-binding regression first failed because no declaration-order accessor existed. After that slice, the 16-test replay target had exactly two RED failures: safe in-bound 64-KiB Text was rejected by the 4,000-character display-redaction cap, and a credential-bearing Secret name reached projection. A shared nontruncating boolean credential detector and declaration-ordered binding storage made 16/16 pass while existing browser automation and recipe suites remained green.
+5. Exact scope: a foreign coordinator with the same workspace and local instance ID was incorrectly accepted. Adding one opaque coordinator scope to instance equality made the collision regression GREEN without serializing or debugging the scope.
+
+### Verification
+
+- `cargo test --locked --test browser_replay -- --test-threads=1` -> 17 passed, 0 failed.
+- `cargo test --locked --lib browser::replay::tests -- --test-threads=1` -> 3 passed, 0 failed for internal secret readiness, checked ID overflow, and poisoned-lock recovery.
+- Shared-detector regressions: `browser_automation` 12 passed, 0 failed; `browser_recipes` 15 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 120 matching tests passed across library and integration targets, 0 failed.
+- `cargo check --locked --all-targets` and native Windows `cargo build --locked` -> exit 0.
+- `cargo fmt --all -- --check` and `git diff --check` -> exit 0 on the completed source and documentation.
+
+### Files
+
+- `src/browser/automation.rs`
+- `src/browser/mod.rs`
+- `src/browser/recipes.rs`
+- `src/browser/replay.rs`
+- `tests/browser_replay.rs`
+- `.superpowers/sdd/browser-task-5c-checkpoints.md`
+- `.superpowers/sdd/browser-task-5c-report.md`
+- `.superpowers/sdd/progress.md`
+
 ## Checkpoint 6: Exact `browser_recording` MCP
 
 ### Status

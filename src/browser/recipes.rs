@@ -1555,7 +1555,7 @@ fn validate_cdp_marker_method(method: &str) -> Result<(), BrowserError> {
 }
 
 fn reject_obvious_secret(value: &str, label: &str) -> Result<(), BrowserError> {
-    if super::redact_browser_text(value) != value {
+    if super::automation::browser_text_contains_secret(value) {
         Err(invalid_recipe(format!(
             "{label} contains credential-like material"
         )))
@@ -1564,7 +1564,7 @@ fn reject_obvious_secret(value: &str, label: &str) -> Result<(), BrowserError> {
     }
 }
 
-fn validate_safe_url(value: &str, label: &str) -> Result<(), BrowserError> {
+pub(crate) fn validate_safe_url(value: &str, label: &str) -> Result<(), BrowserError> {
     if super::validate_browser_url(value).is_err() {
         return Err(invalid_recipe(format!("{label} is not a safe browser URL")));
     }
@@ -1578,7 +1578,7 @@ fn validate_safe_url(value: &str, label: &str) -> Result<(), BrowserError> {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();
-    if authority.contains('@') || super::redact_browser_text(value) != value {
+    if authority.contains('@') || super::automation::browser_text_contains_secret(value) {
         return Err(invalid_recipe(format!(
             "{label} cannot contain credential material"
         )));

@@ -16,6 +16,7 @@ mod recording;
 mod recording_coordinator;
 mod recording_ipc;
 mod recording_mcp;
+mod replay;
 mod resources;
 mod storage;
 
@@ -131,6 +132,13 @@ pub use recording_mcp::{
     browser_recording_review_result, browser_recording_save_would_overwrite,
     browser_recording_status_result, discard_browser_recording, effective_browser_recording_risk,
     save_browser_recording_review,
+};
+pub use replay::{
+    compile_browser_replay, BrowserReplayCancellationLease, BrowserReplayCoordinator,
+    BrowserReplayError, BrowserReplayFailureCode, BrowserReplayInstance, BrowserReplayPlan,
+    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplayStart, BrowserReplayStatus,
+    MAX_BROWSER_REPLAY_FILE_BYTES, MAX_BROWSER_REPLAY_INPUTS, MAX_BROWSER_REPLAY_INPUT_NAME_BYTES,
+    MAX_BROWSER_REPLAY_STEPS, MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
 pub use resources::{
     resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,
