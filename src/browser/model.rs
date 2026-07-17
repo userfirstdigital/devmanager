@@ -1,3 +1,4 @@
+use super::redact_browser_text;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -452,7 +453,9 @@ impl BrowserWorkspaceSnapshot {
             .tabs
             .iter()
             .find(|tab| tab.id == annotation.tab_id)
-            .is_none_or(|tab| tab.url != annotation.url))
+            .is_none_or(|tab| {
+                redact_browser_text(&tab.url) != redact_browser_text(&annotation.url)
+            }))
     }
 
     pub fn pinned_annotation_resource_ids(&self) -> BTreeSet<BrowserResourceId> {

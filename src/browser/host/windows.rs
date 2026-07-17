@@ -268,6 +268,7 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
+        let annotation_command = matches!(&command, BrowserCommand::Annotations { .. });
         if let Some(control) = browser_lifecycle_control(workspace_key, &command) {
             self.handle_control(control);
         }
@@ -275,7 +276,25 @@ impl BrowserWebViewHost {
             .tab_id()
             .map(ToOwned::to_owned)
             .or_else(|| self.selected_tab_id(workspace_key));
-        let result = self.handle_command_inner(window, workspace_key, command);
+        let mut result = self.handle_command_inner(window, workspace_key, command);
+        if annotation_command {
+            if let Ok(response) = result.as_mut() {
+                if let Err(error) =
+                    self.finalize_annotation_command_resources(workspace_key, response)
+                {
+                    if let Some(tab_id) = diagnostic_tab
+                        .clone()
+                        .or_else(|| self.selected_tab_id(workspace_key))
+                    {
+                        self.emit_diagnostic(
+                            workspace_key,
+                            &tab_id,
+                            format!("annotation resource pin reconciliation will retry: {error}"),
+                        );
+                    }
+                }
+            }
+        }
         if let Err(error) = &result {
             if let Some(tab_id) = diagnostic_tab.or_else(|| self.selected_tab_id(workspace_key)) {
                 self.emit_diagnostic(workspace_key, &tab_id, error.to_string());
@@ -504,8 +523,14 @@ impl BrowserWebViewHost {
                 }
             }
         }
-        if annotation_command || agent_journaled {
-            if let Err(error) = self.reconcile_annotation_pins(&workspace_key) {
+        if annotation_command {
+            let finalized = match result.as_mut() {
+                Ok(response) => {
+                    self.finalize_annotation_command_resources(&workspace_key, response)
+                }
+                Err(_) => self.reconcile_annotation_pins(&workspace_key),
+            };
+            if let Err(error) = finalized {
                 if let Some(tab_id) = self.selected_tab_id(&workspace_key) {
                     self.emit_diagnostic(
                         &workspace_key,
@@ -514,9 +539,14 @@ impl BrowserWebViewHost {
                     );
                 }
             }
-            if annotation_command {
-                if let Ok(response) = result.as_mut() {
-                    let _ = self.refresh_annotation_response_handles(&workspace_key, response);
+        } else if agent_journaled {
+            if let Err(error) = self.reconcile_annotation_pins(&workspace_key) {
+                if let Some(tab_id) = self.selected_tab_id(&workspace_key) {
+                    self.emit_diagnostic(
+                        &workspace_key,
+                        &tab_id,
+                        format!("annotation resource pin reconciliation will retry: {error}"),
+                    );
                 }
             }
         }
@@ -2019,11 +2049,15 @@ impl BrowserWebViewHost {
         &self,
         workspace_key: &BrowserWorkspaceKey,
     ) -> Result<(), BrowserError> {
-        let pinned = self
+        let mut pinned = self
             .state
             .workspace(workspace_key)
             .ok_or_else(missing_workspace)?
             .pinned_annotation_resource_ids();
+        pinned.extend(
+            self.annotation_lifecycle
+                .draft_resource_ids_for_workspace(workspace_key),
+        );
         BrowserResourceStore::open_verified(
             self.verified_trusted_app_config_dir()?,
             &workspace_key.project_id,
@@ -2054,6 +2088,15 @@ impl BrowserWebViewHost {
             _ => {}
         }
         Ok(())
+    }
+
+    fn finalize_annotation_command_resources(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        response: &mut BrowserResponse,
+    ) -> Result<(), BrowserError> {
+        self.reconcile_annotation_pins(workspace_key)?;
+        self.refresh_annotation_response_handles(workspace_key, response)
     }
 
     fn validate_action_references(
@@ -2517,28 +2560,12 @@ impl BrowserWebViewHost {
                     | crate::browser::BrowserAnnotationOperation::Unresolve
                     | crate::browser::BrowserAnnotationOperation::Delete => {
                         let annotation_id = required_annotation_id(annotation_id)?;
-                        let mut result = self.state.apply_annotation_operation(
+                        let result = self.state.apply_annotation_operation(
                             workspace_key,
                             operation,
                             &annotation_id,
                             &resources,
                         )?;
-                        if let Err(error) = self.reconcile_annotation_pins(workspace_key) {
-                            if let Some(tab_id) = self.selected_tab_id(workspace_key) {
-                                self.emit_diagnostic(
-                                    workspace_key,
-                                    &tab_id,
-                                    format!(
-                                        "annotation resource pin reconciliation will retry: {error}"
-                                    ),
-                                );
-                            }
-                        }
-                        if let Ok(screenshot) =
-                            resources.handle(workspace_key, &result.screenshot.id)
-                        {
-                            result.screenshot = screenshot;
-                        }
                         Ok(BrowserResponse::AnnotationMutation { result })
                     }
                 }

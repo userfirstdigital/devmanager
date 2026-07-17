@@ -6,7 +6,7 @@ use super::{
 };
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Cursor;
 
@@ -630,6 +630,17 @@ impl BrowserAnnotationLifecycle {
             .remove(draft_id)
             .expect("draft was checked above")
             .draft)
+    }
+
+    pub fn draft_resource_ids_for_workspace(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> BTreeSet<BrowserResourceId> {
+        self.drafts
+            .values()
+            .filter(|owned| &owned.route.workspace_key == workspace_key)
+            .map(|owned| owned.draft.screenshot_resource.clone())
+            .collect()
     }
 
     pub fn restore_draft(&mut self, route: BrowserAnnotationRoute, draft: BrowserAnnotationDraft) {

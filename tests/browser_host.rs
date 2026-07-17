@@ -1021,11 +1021,32 @@ fn annotation_delete_enters_destructive_approval_before_mutation_and_resumes_dis
     assert!(response.contains("browser_command_is_journaled"));
     assert!(response.contains("append_journal_entry"));
     assert!(response.contains("reconcile_annotation_pins"));
-    assert!(response.contains("if annotation_command || agent_journaled"));
+    assert!(response.contains("if annotation_command"));
+    assert!(response.contains("else if agent_journaled"));
     assert!(
         response.find("append_journal_entry").unwrap()
-            < response.find("reconcile_annotation_pins").unwrap()
+            < response
+                .find("finalize_annotation_command_resources")
+                .unwrap()
     );
+}
+
+#[test]
+fn direct_annotation_commands_finalize_resource_pins_before_returning() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let start = source.find("pub fn handle_command(").unwrap();
+    let end = source[start..].find("pub fn handle_control(").unwrap() + start;
+    let handler = &source[start..end];
+    let classify = handler
+        .find("let annotation_command = matches!(&command, BrowserCommand::Annotations")
+        .expect("direct command path classifies annotation commands");
+    let dispatch = handler
+        .find("self.handle_command_inner(")
+        .expect("direct command path invokes the host command");
+    let finalize = handler
+        .find("self.finalize_annotation_command_resources(")
+        .expect("direct command path finalizes annotation resources");
+    assert!(classify < dispatch && dispatch < finalize);
 }
 
 #[tokio::test]
@@ -2033,6 +2054,97 @@ fn annotation_cleanup_ledger_retries_failed_unpins_without_crossing_owners() {
         })
         .is_empty());
     assert!(ledger.pending_for_workspace(&workspace_a).is_empty());
+}
+
+#[test]
+fn live_draft_screenshot_survives_unrelated_journal_reconciliation_and_quota_cleanup() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let start = source.find("fn reconcile_annotation_pins(").unwrap();
+    let end = source[start..]
+        .find("fn refresh_annotation_response_handles(")
+        .unwrap()
+        + start;
+    let reconciliation = &source[start..end];
+    assert!(reconciliation.contains("annotation_lifecycle"));
+    assert!(reconciliation.contains("draft_resource_ids_for_workspace"));
+
+    let temp = TestDir::new("annotation-live-draft-pin");
+    let store = BrowserResourceStore::open(
+        temp.path(),
+        BrowserResourceLimits {
+            max_temporary_count: 1,
+            max_temporary_bytes: 1024,
+            max_resource_bytes: 1024,
+        },
+    )
+    .unwrap();
+    let key = workspace("project-a", "conversation-a");
+    let screenshot = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"draft screenshot",
+            true,
+        )
+        .unwrap();
+    let route = BrowserAnnotationRoute::new(key.clone(), "tab-a").unwrap();
+    let draft = BrowserAnnotationDraft::new("tab-a", annotation_candidate(), screenshot.id.clone())
+        .unwrap();
+    let draft_id = draft.id.clone();
+    let mut lifecycle = BrowserAnnotationLifecycle::default();
+    lifecycle.store_draft(route, draft).unwrap();
+    let mut snapshot = BrowserWorkspaceSnapshot::default();
+    snapshot.append_journal_entry(BrowserJournalEntry {
+        id: "unrelated-agent-action".to_string(),
+        actor: BrowserJournalActor::Agent,
+        intent: "inspect console".to_string(),
+        url: "https://example.test/form".to_string(),
+        started_at: "2026-07-16T00:00:00Z".to_string(),
+        duration_ms: 1,
+        result: "ok".to_string(),
+        resource_ids: Vec::new(),
+    });
+    let mut pinned = snapshot.pinned_annotation_resource_ids();
+    pinned.extend(lifecycle.draft_resource_ids_for_workspace(&key));
+    store.reconcile_annotation_pins(&key, &pinned).unwrap();
+    store
+        .put(
+            &key,
+            BrowserResourceKind::Other,
+            "text/plain",
+            b"temporary one",
+            false,
+        )
+        .unwrap();
+    store
+        .put(
+            &key,
+            BrowserResourceKind::Other,
+            "text/plain",
+            b"temporary two",
+            false,
+        )
+        .unwrap();
+    assert!(store.handle(&key, &screenshot.id).unwrap().pinned);
+
+    lifecycle.take_draft(&key, &draft_id).unwrap();
+    store
+        .reconcile_annotation_pins(&key, &snapshot.pinned_annotation_resource_ids())
+        .unwrap();
+    store
+        .put(
+            &key,
+            BrowserResourceKind::Other,
+            "text/plain",
+            b"temporary three",
+            false,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.handle(&key, &screenshot.id),
+        Err(BrowserError::MissingResource { .. })
+    ));
 }
 
 #[test]
@@ -3072,26 +3184,6 @@ fn non_annotation_journal_eviction_releases_the_last_annotation_resource_referen
 
 #[test]
 fn direct_annotation_resolve_reconciliation_does_not_leave_a_permanent_pin() {
-    let source = include_str!("../src/browser/host/windows.rs");
-    let handler_start = source.find("fn handle_available_command(").unwrap();
-    let annotation_start = source[handler_start..]
-        .find("BrowserCommand::Annotations {")
-        .unwrap()
-        + handler_start;
-    let annotation_end = source[annotation_start..]
-        .find("BrowserCommand::ListTabs")
-        .unwrap()
-        + annotation_start;
-    let annotation_handler = &source[annotation_start..annotation_end];
-    assert!(
-        annotation_handler
-            .find("apply_annotation_operation")
-            .unwrap()
-            < annotation_handler
-                .find("reconcile_annotation_pins")
-                .unwrap()
-    );
-
     let temp = TestDir::new("annotation-direct-resolve");
     let store = BrowserResourceStore::open(temp.path(), BrowserResourceLimits::default()).unwrap();
     let key = workspace("project-a", "conversation-a");
@@ -3138,6 +3230,103 @@ fn direct_annotation_resolve_reconciliation_does_not_leave_a_permanent_pin() {
         )
         .unwrap();
     assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
+}
+
+#[test]
+fn repeated_direct_get_finalization_releases_details_and_resolved_screenshot_pins() {
+    let temp = TestDir::new("annotation-direct-get");
+    let store = BrowserResourceStore::open(temp.path(), BrowserResourceLimits::default()).unwrap();
+    let key = workspace("project-a", "conversation-a");
+    let screenshot = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"direct get screenshot",
+            false,
+        )
+        .unwrap();
+    let mut annotation = stored_annotation("ann-direct-get", screenshot.id.clone(), "Direct get");
+    annotation.resolved = true;
+    let snapshot = BrowserWorkspaceSnapshot {
+        revision: BrowserRevision(1),
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: annotation.url.clone(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        annotations: vec![annotation],
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    let mut state = BrowserHostState::new(temp.path());
+    state.ensure_workspace(key.clone(), snapshot).unwrap();
+
+    for _ in 0..3 {
+        let details = state
+            .annotation_details(&key, "ann-direct-get", &store)
+            .unwrap();
+        assert!(details.details_resource.pinned);
+        assert!(details.screenshot.pinned);
+        let pinned = state
+            .workspace(&key)
+            .unwrap()
+            .pinned_annotation_resource_ids();
+        store.reconcile_annotation_pins(&key, &pinned).unwrap();
+        assert!(
+            !store
+                .handle(&key, &details.details_resource.id)
+                .unwrap()
+                .pinned
+        );
+        assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
+    }
+
+    let details = store
+        .list(&key)
+        .unwrap()
+        .into_iter()
+        .filter(|resource| resource.kind == BrowserResourceKind::AnnotationDetails)
+        .collect::<Vec<_>>();
+    assert_eq!(details.len(), 3);
+    assert!(details.iter().all(|resource| !resource.pinned));
+}
+
+#[test]
+fn redacted_secret_query_url_does_not_make_a_fresh_annotation_stale() {
+    let mut candidate = annotation_candidate();
+    candidate.url = "https://example.test/form?token=super-secret&view=review".to_string();
+    candidate.revision = BrowserRevision(9);
+    let annotation = BrowserAnnotationDraft::new(
+        "tab-a",
+        candidate.clone(),
+        BrowserResourceId(format!("res-{}", "f".repeat(32))),
+    )
+    .unwrap()
+    .into_annotation("Review the save button")
+    .unwrap();
+    assert_ne!(
+        annotation.url, candidate.url,
+        "secret URL is persisted redacted"
+    );
+    let annotation_id = annotation.id.clone();
+    let mut snapshot = BrowserWorkspaceSnapshot {
+        revision: candidate.revision,
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: candidate.url,
+            viewport: candidate.viewport,
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        annotations: vec![annotation],
+        ..BrowserWorkspaceSnapshot::default()
+    };
+
+    assert!(!snapshot.annotation_anchor_is_stale(&annotation_id).unwrap());
+    snapshot.tabs[0].url = "https://example.test/another-page".to_string();
+    assert!(snapshot.annotation_anchor_is_stale(&annotation_id).unwrap());
 }
 
 #[test]
