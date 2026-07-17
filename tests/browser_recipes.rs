@@ -508,3 +508,70 @@ fn browser_recipe_windows_replace_failure_preserves_old_bytes_and_cleans_temp() 
                 .ends_with(".tmp"))
     );
 }
+
+#[test]
+fn browser_recipe_rejects_duplicate_top_level_and_nested_members() {
+    let valid = serde_json::to_string_pretty(&sample_recipe()).expect("serialize valid recipe");
+    let duplicate_version = valid.replacen(
+        "\"schemaVersion\": 1",
+        "\"schemaVersion\": 2,\n  \"schemaVersion\": 1",
+        1,
+    );
+    let error = serde_json::from_str::<BrowserRecipeV1>(&duplicate_version)
+        .expect_err("duplicate schemaVersion must not use the last value");
+    assert!(error.to_string().contains("duplicate"));
+
+    let duplicate_action_type = valid.replacen(
+        "\"type\": \"type\",\n        \"locator\"",
+        "\"type\": \"click\",\n        \"type\": \"type\",\n        \"locator\"",
+        1,
+    );
+    let error = serde_json::from_str::<BrowserRecipeV1>(&duplicate_action_type)
+        .expect_err("duplicate nested action member must fail");
+    assert!(error.to_string().contains("duplicate"));
+
+    let duplicate_value_name = valid.replacen(
+        "\"type\": \"input\",\n          \"name\": \"query\"",
+        "\"type\": \"input\",\n          \"name\": \"missing\",\n          \"name\": \"query\"",
+        1,
+    );
+    let error = serde_json::from_str::<BrowserRecipeV1>(&duplicate_value_name)
+        .expect_err("duplicate nested value member must fail");
+    assert!(error.to_string().contains("duplicate"));
+}
+
+#[test]
+fn browser_recipe_public_nested_wire_rejects_context_free_unsafe_values() {
+    let upload_literal = r#"{
+        "type":"upload",
+        "locator":{"testId":"file-upload"},
+        "file":{"type":"literal","value":"raw-private-file-contents"}
+    }"#;
+    assert!(serde_json::from_str::<BrowserRecipeAction>(upload_literal).is_err());
+
+    let password_literal = r#"{
+        "type":"type",
+        "locator":{"accessibilityRole":"textbox","accessibilityName":"Password"},
+        "value":{"type":"literal","value":"raw-password-value"}
+    }"#;
+    assert!(serde_json::from_str::<BrowserRecipeAction>(password_literal).is_err());
+
+    assert!(serde_json::from_str::<BrowserRecipeValue>(
+        r#"{"type":"literal","value":"Authorization: Bearer direct-secret"}"#
+    )
+    .is_err());
+    assert!(
+        serde_json::from_str::<BrowserRecipeWait>(r#"{"type":"duration","durationMs":0}"#).is_err()
+    );
+    assert!(serde_json::from_str::<BrowserRecipeViewport>(
+        r#"{"width":0,"height":720,"scalePercent":100}"#
+    )
+    .is_err());
+    assert!(
+        serde_json::from_str::<BrowserRecipeLocator>(r#"{"accessibilityRole":"textbox"}"#).is_err()
+    );
+    assert!(serde_json::from_str::<BrowserRecipeAssertion>(
+        r#"{"type":"text","value":{"type":"literal","value":"   "},"present":true}"#
+    )
+    .is_err());
+}

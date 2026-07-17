@@ -22,6 +22,14 @@ The unreleased flat step wire (`action` string plus `locator`, `valueRef`, `wait
 - Replaced direct writes with a same-directory, random `create_new` sibling temp, full write plus `sync_all`, and one atomic replace. Windows uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`; in-process saves are serialized to avoid Windows replace races.
 - Added RAII temp cleanup, injected replace-failure coverage, a real Windows locked-destination failure test, concurrent-save coverage, and checks that no operation leaves an orphan temp.
 
+## Independent review hardening
+
+- Replaced `serde_json::Value`'s last-member-wins object parsing with a recursive strict parser. Duplicate members now fail at every object depth, including `schemaVersion`, action tags, and nested input/value members; future versions are still reported before v1 body parsing.
+- Made every public object-shaped nested wire type validate on direct deserialization. Context-free invariants now hold even when callers deserialize Action, Value, Wait, Viewport, Locator, Assertion, Step, or Input without going through the top-level recipe.
+- Added Windows `FILE_ATTRIBUTE_REPARSE_POINT` classification in addition to symlink classification. The workflow directory and relevant recipe destination are revalidated immediately before list/read, sibling-temp open, and atomic replace boundaries.
+- Added injected boundary tests for reparse swaps before read, temporary open, and replacement. A rejected replacement preserves the old complete document and removes the sibling temp without calling the replacer.
+- Gave recipe temps an exact store-owned prefix and nonce shape. Save scavenges only direct regular files matching that shape, only after a 24-hour stale threshold, with a 1,024-entry scan bound and 64-delete bound; fresh files, lookalikes, malformed names, and matching directories survive.
+
 ## RED to GREEN evidence
 
 1. Strict typed document and deterministic save/load:
@@ -49,6 +57,18 @@ The unreleased flat step wire (`action` string plus `locator`, `valueRef`, `wait
    - RED 1: `browser_recipe_concurrent_saves_leave_one_complete_document_and_no_temps` failed with Windows error 183 while threads raced directory creation.
    - RED 2: after race-safe directory creation, the same test exposed concurrent Windows replace `Access is denied` failures.
    - GREEN: the same command passed 1/1 after a poisoned-lock-safe in-process write gate; the winner is one complete parseable document and no temp remains.
+9. Duplicate JSON members:
+   - RED: `browser_recipe_rejects_duplicate_top_level_and_nested_members` accepted a duplicate `schemaVersion` document because deserialization first collapsed the object into `serde_json::Value`.
+   - GREEN: the same command passed 1/1; duplicate top-level, action-tag, and nested value members all fail with a duplicate-member error.
+10. Direct nested wire safety:
+   - RED: `browser_recipe_public_nested_wire_rejects_context_free_unsafe_values` constructed a direct Upload action containing a literal file value. After the action gate, it exposed direct `BrowserRecipeValue` deserialization accepting an Authorization bearer literal.
+   - GREEN: the same command passed 1/1 across direct Action, Value, Wait, Viewport, Locator, and Assertion deserialization; Step and Input use the same strict checked boundary.
+11. Reparse and operation-boundary validation:
+   - RED: the new unit regressions failed to compile because there was no reparse-point kind, Windows attribute classifier, operation-boundary verifier, or injected checked read/write seam.
+   - GREEN: `recipe_path_classification_rejects_windows_reparse_attributes` and `injected_reparse_swap_blocks_read_temp_open_and_replace_boundaries` passed. Injected swaps block all three I/O boundaries; replacement is not called, old bytes survive, and the temp is cleaned.
+12. Owned stale-temp cleanup:
+   - RED: the new unit regression failed to compile because no bounded owned-temp scavenger or ownership classifier existed.
+   - GREEN: `stale_temp_scavenger_is_bounded_and_removes_only_owned_regular_files` passed. Fresh exact temps survive; injected stale cleanup removes exactly the 64-file bound while preserving lookalikes, malformed names, and directories.
 
 Additional atomic failure verification:
 
@@ -57,11 +77,11 @@ Additional atomic failure verification:
 
 ## Verification
 
-- `cargo test --locked --test browser_recipes -- --test-threads=1` -> 13 passed, 0 failed.
+- `cargo test --locked --test browser_recipes -- --test-threads=1` -> 15 passed, 0 failed.
 - `cargo test --locked --test browser_core -- --test-threads=1` -> 17 passed, 0 failed.
-- `cargo test --locked --lib browser::recipes::tests -- --test-threads=1` -> 2 passed, 0 failed.
-- `cargo test --locked browser -- --test-threads=1` -> 102 matching tests passed across all targets, 0 failed.
-- Full browser target command covering annotations, attachment lifecycle, automation/resources, core/model/errors, fixture, gateway, host, pane, provider, and recipes -> 184 passed, 0 failed.
+- `cargo test --locked --lib browser::recipes::tests -- --test-threads=1` -> 5 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 107 matching tests passed across all targets, 0 failed.
+- Full browser target command covering annotations, attachment lifecycle, automation/resources, core/model/errors, fixture, gateway, host, pane, provider, and recipes -> 186 passed, 0 failed.
 - `cargo check --locked --all-targets` -> exit 0.
 - Native Windows `cargo build --locked` -> exit 0.
 - `cargo fmt --all -- --check` -> exit 0.

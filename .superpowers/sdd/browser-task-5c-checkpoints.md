@@ -2,9 +2,9 @@
 
 Source requirements: `browser-task-5c-brief.md`. Start only after Task 5B is fully approved. Every checkpoint uses strict RED-to-GREEN TDD, one implementer, immutable-range spec/quality review, and a separate commit.
 
-Status (2026-07-17): checkpoint 1 is complete in the focused commit containing `browser-task-5c-report.md`. Checkpoints 2 through 12 are pending and were not started.
+Status (2026-07-17): checkpoint 1 is complete through the strict-TDD independent-review hardening follow-up recorded in `browser-task-5c-report.md`. Checkpoints 2 through 12 are pending and were not started.
 
-1. **Strict recipe wire/store — complete** — strengthened `recipes.rs` with one deny-unknown-fields v1 wire, typed action/value/wait/assertion structures, reference/type validation, Secret/File default prohibition, redaction gates, deterministic pretty JSON plus newline, contained list/load/save, and atomic sibling-temp replacement with Windows failure coverage. See `browser-task-5c-report.md`.
+1. **Strict recipe wire/store — complete** — strengthened `recipes.rs` with one duplicate-member-rejecting, deny-unknown-fields v1 wire; checked public nested deserialization; typed action/value/wait/assertion structures; reference/type validation; Secret/File default prohibition; redaction gates; deterministic pretty JSON plus newline; contained list/load/save; Windows reparse/operation-boundary checks; bounded owned stale-temp scavenging; and atomic sibling-temp replacement with failure coverage. See `browser-task-5c-report.md`.
 2. **Pure recording/review domain** — new platform-neutral recorder keyed by workspace; off by default; reserve/commit ordering for async user+agent actions; coalescing; generated secret/file inputs; review mutations/discard.
 3. **Semantic page recording IPC** — bounded strict IPC active only during recording; trusted semantic click/type/select/navigation/tab/upload/download; no password/file/clipboard values.
 4. **Unified host capture** — feed user chrome and successful queued agent actions into the same recorder; runtime password inspection creates unset secret input before value retention.
