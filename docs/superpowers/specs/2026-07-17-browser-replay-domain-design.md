@@ -35,8 +35,8 @@ Starting a plan creates a monotonically increasing `BrowserReplayInstance` bound
 
 The coordinator exposes narrow transition methods with these legal edges:
 
-- `Pending -> Running`
-- `NeedsUserSecret -> Running` only through an internal value-free `secrets_ready` seam reserved for checkpoint 9
+- `Pending -> Running | Cancelled`
+- `NeedsUserSecret -> Running` only through an internal value-free `secrets_ready` seam reserved for checkpoint 9, or `NeedsUserSecret -> Cancelled`
 - `Running -> PausedLocatorRepair | Completed | Failed | Cancelled`
 - `PausedLocatorRepair -> Running | Failed | Cancelled`
 
