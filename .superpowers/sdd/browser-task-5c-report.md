@@ -1,16 +1,92 @@
-# Task 5C Report: Checkpoint 1 strict recipe wire/store
+# Task 5C Report: Sequential checkpoints
 
-## Status
+## Checkpoint 2: Pure recording/review domain
+
+### Status
+
+Checkpoint 2 is complete on the approved checkpoint-1 head `64c9f394f1e3fd3229d9c9b79bd765d5ed748c91`. This report is part of the focused checkpoint commit. The immutable final head, patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
+
+Checkpoints 3 through 12 are not implemented. This checkpoint adds no page IPC, host/pane integration, persistence or recipe-store write, MCP tool, replay, secret prompt, locator repair, or lifecycle wiring.
+
+### Contract decisions
+
+- `BrowserWorkflowRecorder` is a platform-neutral, in-memory authority keyed only by `BrowserWorkspaceKey`. It is inactive by default, starts only explicitly, and does not implement serialization or persistence.
+- `start` returns an exact `BrowserRecordingInstance`. Reservations carry the instance/workspace fence and a monotonic source-order ticket; asynchronous completion order cannot reorder source actions.
+- Capture values cross a non-`Debug`, non-`Serialize` `BrowserRecordingAction` boundary. Password, clipboard, and file constructors accept no value/content. Credential-like text is replaced with an unset Secret marker before pending state; sensitive URL query members are removed before retention.
+- Stop cancels unresolved slots, drains successes that completed before Stop in source order, fences later completions as `Ignored`, and returns an immutable review clone. Discard removes only that exact instance.
+- Review edits mutate the recorder-owned copy and return fresh immutable previews. `recipe_for_save` clones only after `BrowserRecipeV1::validate`; it does not call the recipe store.
+
+### Implemented
+
+- Added bounded per-workspace recording state with explicit start/status, deterministic instance/reservation/step/input IDs, reserve/commit/cancel ordering, cross-workspace isolation, restart fencing, and late-completion suppression.
+- Added successful-action capture for strict recipe actions plus safe navigation, text, password, clipboard, and upload constructors. Failed/cancelled actions never become steps.
+- Added deterministic adjacent coalescing for literal typing/clear transitions, repeated select state, exact duplicate navigation, and sensitive typing markers. Coalescing never crosses actor, tab, locator, risk, wait, or assertion boundaries and never creates an orphan Secret input.
+- Added unset generated Secret/File inputs. Password, credential-like text, clipboard content, file paths/contents, cookies, tokens, bearer/basic values, and credential URL query members cannot enter retained state.
+- Added review metadata, delete/reorder, literal-to-Text/URL conversion, input add/rename/default/remove with reference safety, wait replacement, assertion add/remove, immutable preview, strict save handoff validation, and discard.
+- Kept recorder, capture action, metadata, and review non-`Debug` and non-`Serialize`; tests assert these boundaries at compile time.
+
+### RED to GREEN evidence
+
+1. Explicit instance and async source ordering:
+   - RED: `cargo test --locked --test browser_recording recorder_is_explicit_orders_async_commits_and_fences_workspace_instances -- --exact --test-threads=1` exited 1 with E0432 because `BrowserWorkflowRecorder`, actor/status/error types, and instance/ticket ordering did not exist.
+   - GREEN: the same command passed 1/1 with default-off, two-workspace isolation, completion order 2 then 1 producing source order 1 then 2, discard/restart, and stale-instance rejection.
+2. Cancel/failure, capacity, and late completion:
+   - RED: the focused test failed with E0432/E0599 because `BrowserRecordingCommit` and `cancel` did not exist.
+   - GREEN: `cancellation_capacity_and_late_completion_preserve_the_exact_instance` passed 1/1; overflow is typed, cancellation unblocks a buffered success without recording the failure, and post-Stop completion is `Ignored`.
+3. Coalescing and redaction:
+   - RED: the focused test failed with E0432/E0599 because the safe capture action and tab/risk-aware reservation surface did not exist.
+   - GREEN: `coalescing_and_redaction_produce_only_safe_unset_inputs` passed 1/1 with literal typing coalesced, unset Secret/Secret/File inputs, token-query stripping, valid v1 output, and no forbidden sentinel.
+4. Coalescing boundaries and stable IDs:
+   - RED: `coalescing_never_crosses_actor_tab_locator_risk_wait_or_assertion_boundaries` ran and failed with 4 steps instead of 2 for type to clear to type plus exact duplicate navigation.
+   - GREEN: the same command passed 1/1; every required boundary splits, safe transitions coalesce, and retained step IDs remain deterministic.
+5. Immutable review and save handoff:
+   - RED: the focused review test exited 1 with E0432/E0599 across the absent metadata and 21 review/handoff methods or variants.
+   - GREEN: `review_mutations_are_immutable_validated_and_discardable_without_saving` passed 1/1 across metadata, delete/reorder, Text/URL input conversion and editing, wait/assertion editing, immutable previews, invalid secret-default rejection, reference safety, v1 validation, and discard.
+6. Cookie/token/clipboard non-retention:
+   - RED: the focused test exited 1 with E0599 because there was no content-free clipboard capture boundary.
+   - GREEN: `cookie_token_and_clipboard_values_never_enter_recording_state` passed 1/1; all three become unset Secret definitions and no sentinel appears in recipe JSON.
+7. Stop-time ordered drain:
+   - RED: `stop_cancels_unresolved_slots_but_keeps_later_successes_completed_in_time` ran with 0 retained steps instead of 1 when a later ticket completed before Stop behind an unresolved earlier ticket.
+   - GREEN: the same command passed 1/1 after Stop cancels unresolved slots, drains already-ready successes in source order, and fences the late earlier completion.
+8. Sensitive typing coalescing:
+   - RED: `sensitive_typing_coalesces_without_allocating_orphan_inputs` ran with 3 steps instead of 2 because adjacent same-context password markers each allocated a Secret input.
+   - GREEN: the same command passed 1/1 after pre-materialization coalescing reuses the prior unset Secret step only across an exact safe context; an actor change remains a boundary.
+
+### Verification
+
+- `cargo test --locked --test browser_recording -- --test-threads=1` -> 8 passed, 0 failed.
+- `cargo test --locked --test browser_recipes -- --test-threads=1` -> 15 passed, 0 failed.
+- `cargo test --locked --lib browser::recipes::tests -- --test-threads=1` -> 5 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 107 matching tests passed across all targets, 0 failed.
+- Full browser target command covering annotations, attachment lifecycle, automation/resources, core/model/errors, fixture, gateway, host, pane, provider, recipes, and recording -> 194 passed, 0 failed.
+- `cargo check --locked --all-targets` -> exit 0.
+- Native Windows `cargo build --locked` -> exit 0.
+- `cargo fmt --all -- --check` -> exit 0.
+- `git diff --check` -> exit 0.
+- Production-source scan confirms no filesystem/store call and no serialization derive in `recording.rs`; compile-time assertions cover capture/review secret-bearing state.
+
+### Files
+
+- `src/browser/mod.rs`
+- `src/browser/recording.rs`
+- `tests/browser_recording.rs`
+- `.superpowers/sdd/browser-task-5c-checkpoints.md`
+- `.superpowers/sdd/progress.md`
+- `.superpowers/sdd/browser-task-5c-report.md`
+
+## Checkpoint 1: Strict recipe wire/store
+
+### Status
 
 Checkpoint 1 is complete on the approved base `e088ccab1ce10afa73ae58c0ecf15077616d9a82`. This report is part of the focused checkpoint commit. The immutable final head, patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
 
-Checkpoints 2 through 12 are not implemented. There is no recording, review UI, replay, secret prompt, locator repair, or Task 5C MCP surface in this checkpoint.
+At the checkpoint-1 commit, checkpoints 2 through 12 were not implemented. Checkpoint 1 itself contains no recording, review UI, replay, secret prompt, locator repair, or Task 5C MCP surface.
 
-## Contract decision
+### Contract decision
 
 The unreleased flat step wire (`action` string plus `locator`, `valueRef`, `waitCondition`, and string assertions) is not accepted as a second v1 format. The repository has one strict v1 JSON contract. Source-level conversion between shared browser viewport/locator models remains available through `From`, but deserialization does not guess, alias, or partially interpret an old or future shape.
 
-## Implemented
+### Implemented
 
 - Added strict recipe-specific viewport, locator, value, action, wait, assertion, and element-state types. Every object-shaped wire node denies unknown fields.
 - Made top-level deserialization inspect `schemaVersion` before v1 shape parsing. Only exact version 1 is accepted; `load_recipe` returns `UnsupportedRecipeVersion` for a future version even when the future body is not v1.
@@ -22,7 +98,7 @@ The unreleased flat step wire (`action` string plus `locator`, `valueRef`, `wait
 - Replaced direct writes with a same-directory, random `create_new` sibling temp, full write plus `sync_all`, and one atomic replace. Windows uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`; in-process saves are serialized to avoid Windows replace races.
 - Added RAII temp cleanup, injected replace-failure coverage, a real Windows locked-destination failure test, concurrent-save coverage, and checks that no operation leaves an orphan temp.
 
-## Independent review hardening
+### Independent review hardening
 
 - Replaced `serde_json::Value`'s last-member-wins object parsing with a recursive strict parser. Duplicate members now fail at every object depth, including `schemaVersion`, action tags, and nested input/value members; future versions are still reported before v1 body parsing.
 - Made every public object-shaped nested wire type validate on direct deserialization. Context-free invariants now hold even when callers deserialize Action, Value, Wait, Viewport, Locator, Assertion, Step, or Input without going through the top-level recipe.
@@ -30,7 +106,7 @@ The unreleased flat step wire (`action` string plus `locator`, `valueRef`, `wait
 - Added injected boundary tests for reparse swaps before read, temporary open, and replacement. A rejected replacement preserves the old complete document and removes the sibling temp without calling the replacer.
 - Gave recipe temps an exact store-owned prefix and nonce shape. Save scavenges only direct regular files matching that shape, only after a 24-hour stale threshold, with a 1,024-entry scan bound and 64-delete bound; fresh files, lookalikes, malformed names, and matching directories survive.
 
-## RED to GREEN evidence
+### RED to GREEN evidence
 
 1. Strict typed document and deterministic save/load:
    - RED: `cargo test --locked --test browser_recipes browser_recipe_strict_typed_v1_round_trips_with_deterministic_bytes -- --exact --test-threads=1` exited 1 because `BrowserRecipeAssertion`, `BrowserRecipeLocator`, `BrowserRecipeValue`, `BrowserRecipeViewport`, and `BrowserRecipeWait` did not exist; the old action/step fields could not construct the typed fixture.
@@ -75,7 +151,7 @@ Additional atomic failure verification:
 - `browser::recipes::tests::recipe_atomic_replace_failure_preserves_old_file_and_cleans_sibling_temp` passed with an injected same-directory replace failure: the original complete bytes survived and only the destination remained.
 - `browser_recipe_windows_replace_failure_preserves_old_bytes_and_cleans_temp` passed against the real Windows API while the destination was locked against replacement.
 
-## Verification
+### Verification
 
 - `cargo test --locked --test browser_recipes -- --test-threads=1` -> 15 passed, 0 failed.
 - `cargo test --locked --test browser_core -- --test-threads=1` -> 17 passed, 0 failed.
@@ -87,7 +163,7 @@ Additional atomic failure verification:
 - `cargo fmt --all -- --check` -> exit 0.
 - `git diff --check` -> exit 0.
 
-## Files
+### Files
 
 - `Cargo.toml`
 - `src/browser/mod.rs`

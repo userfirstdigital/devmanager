@@ -12,6 +12,7 @@ mod pane;
 mod policy;
 mod provider;
 mod recipes;
+mod recording;
 mod resources;
 mod storage;
 
@@ -91,6 +92,11 @@ pub use recipes::{
     BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind,
     BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
     BrowserRecipeViewport, BrowserRecipeWait, BROWSER_RECIPE_SCHEMA_VERSION,
+};
+pub use recording::{
+    BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingCommit, BrowserRecordingError,
+    BrowserRecordingInstance, BrowserRecordingMetadata, BrowserRecordingReservation,
+    BrowserRecordingReview, BrowserRecordingStatus, BrowserWorkflowRecorder,
 };
 pub use resources::{
     resource_id_from_uri, resource_uri, BrowserResource, BrowserResourceHandle,
