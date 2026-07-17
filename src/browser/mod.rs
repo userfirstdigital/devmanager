@@ -1,4 +1,5 @@
 mod annotations;
+mod attachments;
 mod automation;
 mod commands;
 mod downloads;
@@ -22,6 +23,11 @@ pub use annotations::{
     BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationOperation,
     BrowserAnnotationResourceCleanup, BrowserAnnotationRoute, BrowserAnnotationSummary,
     BrowserPageIpcMessage, MAX_ANNOTATION_IPC_BYTES,
+};
+pub use attachments::{
+    browser_input_opens_prompt_boundary, BrowserAttachmentBroker, BrowserAttachmentError,
+    BrowserAttachmentProjection, BrowserAttachmentReservation, BrowserAttachmentSessionBinding,
+    BrowserPromptInput, MAX_BROWSER_ATTACHMENT_PREAMBLE_BYTES,
 };
 pub use automation::{
     build_semantic_snapshot, effective_browser_risk, effective_browser_risk_for_targets,
@@ -56,9 +62,10 @@ pub use host::{
     BrowserWorkspaceMutation,
 };
 pub use model::{
-    BrowserAnnotation, BrowserAnnotationKind, BrowserBounds, BrowserElementRef, BrowserError,
-    BrowserJournalActor, BrowserJournalEntry, BrowserLocator, BrowserResourceId, BrowserRevision,
-    BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserAnnotation, BrowserAnnotationKind, BrowserAttachmentRevision, BrowserBounds,
+    BrowserElementRef, BrowserError, BrowserJournalActor, BrowserJournalEntry, BrowserLocator,
+    BrowserResourceId, BrowserRevision, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,

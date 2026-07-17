@@ -29,6 +29,16 @@ pub struct BrowserWorkspaceKey {
 #[serde(transparent)]
 pub struct BrowserRevision(pub u64);
 
+/// Monotonic revision for the next-prompt annotation queue.
+///
+/// This is intentionally independent from [`BrowserRevision`], which tracks
+/// live page/DOM state and invalidates semantic element references.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(transparent)]
+pub struct BrowserAttachmentRevision(pub u64);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[serde(transparent)]
 pub struct BrowserResourceId(pub String);
@@ -317,6 +327,7 @@ pub struct BrowserWorkspaceSnapshot {
     pub tabs: Vec<BrowserTabSnapshot>,
     pub selected_tab_id: Option<String>,
     pub annotations: Vec<BrowserAnnotation>,
+    pub pending_annotation_revision: BrowserAttachmentRevision,
     pub pending_annotation_ids: Vec<String>,
     pub journal_entries: Vec<BrowserJournalEntry>,
 }
@@ -330,6 +341,7 @@ impl Default for BrowserWorkspaceSnapshot {
             tabs: Vec::new(),
             selected_tab_id: None,
             annotations: Vec::new(),
+            pending_annotation_revision: BrowserAttachmentRevision::default(),
             pending_annotation_ids: Vec::new(),
             journal_entries: Vec::new(),
         }
@@ -344,6 +356,11 @@ impl BrowserWorkspaceSnapshot {
     pub fn advance_revision(&mut self) -> BrowserRevision {
         self.revision.0 = self.revision.0.saturating_add(1);
         self.revision
+    }
+
+    fn advance_pending_annotation_revision(&mut self) -> BrowserAttachmentRevision {
+        self.pending_annotation_revision.0 = self.pending_annotation_revision.0.saturating_add(1);
+        self.pending_annotation_revision
     }
 
     pub fn validate_element_ref(&self, element: &BrowserElementRef) -> Result<(), BrowserError> {
@@ -394,6 +411,7 @@ impl BrowserWorkspaceSnapshot {
             .any(|pending| pending == &id)
         {
             self.pending_annotation_ids.push(id);
+            self.advance_pending_annotation_revision();
         }
         Ok(())
     }
@@ -433,15 +451,23 @@ impl BrowserWorkspaceSnapshot {
     pub fn remove_pending_annotation(&mut self, id: &str) -> bool {
         let previous_len = self.pending_annotation_ids.len();
         self.pending_annotation_ids.retain(|pending| pending != id);
-        previous_len != self.pending_annotation_ids.len()
+        let changed = previous_len != self.pending_annotation_ids.len();
+        if changed {
+            self.advance_pending_annotation_revision();
+        }
+        changed
     }
 
     pub fn acknowledge_pending_annotations(&mut self, ids: &[String]) {
         if ids.is_empty() {
             return;
         }
+        let previous_len = self.pending_annotation_ids.len();
         self.pending_annotation_ids
             .retain(|pending| !ids.iter().any(|acknowledged| acknowledged == pending));
+        if previous_len != self.pending_annotation_ids.len() {
+            self.advance_pending_annotation_revision();
+        }
     }
 
     pub fn annotation_anchor_is_stale(&self, id: &str) -> Result<bool, BrowserError> {

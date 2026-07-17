@@ -408,17 +408,7 @@ impl TerminalSession {
     }
 
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), String> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| "PTY writer poisoned".to_string())?;
-        writer
-            .write_all(bytes)
-            .map_err(|error| format!("Failed to write to PTY: {error}"))?;
-        writer
-            .flush()
-            .map_err(|error| format!("Failed to flush PTY input: {error}"))?;
-        Ok(())
+        write_composite_pty_payload(&self.writer, b"", bytes)
     }
 
     pub fn write_text(&self, text: &str) -> Result<(), String> {
@@ -442,6 +432,32 @@ impl TerminalSession {
         } else {
             self.write_text(&normalize_plain_paste_text(text))
         }
+    }
+
+    /// Writes a user-origin text boundary and its DevManager prefix as one PTY
+    /// payload. Callers commit attachment delivery only after this succeeds.
+    pub fn write_user_text(&self, prefix: &str, text: &str) -> Result<(), String> {
+        write_composite_pty_payload(&self.writer, prefix.as_bytes(), text.as_bytes())
+    }
+
+    /// Writes a user-origin raw byte boundary and its DevManager prefix as one
+    /// PTY payload.
+    pub fn write_user_bytes(&self, prefix: &str, bytes: &[u8]) -> Result<(), String> {
+        write_composite_pty_payload(&self.writer, prefix.as_bytes(), bytes)
+    }
+
+    /// Pastes user-origin text while keeping the DevManager prefix outside the
+    /// terminal's bracketed-paste markers.
+    pub fn paste_user_text(&self, prefix: &str, text: &str) -> Result<(), String> {
+        let bracketed_paste = {
+            let term = self
+                .term
+                .lock()
+                .map_err(|_| "Terminal state poisoned".to_string())?;
+            term.mode().contains(TermMode::BRACKETED_PASTE)
+        };
+        let payload = composite_paste_payload(prefix, text, bracketed_paste);
+        write_composite_pty_payload(&self.writer, b"", &payload)
     }
 
     pub fn resize(&self, dimensions: SessionDimensions) -> Result<(), String> {
@@ -1345,6 +1361,41 @@ fn sanitize_bracketed_paste_text(text: &str) -> String {
     text.chars()
         .filter(|ch| *ch != '\u{1b}' && *ch != '\u{9b}')
         .collect()
+}
+
+fn composite_paste_payload(prefix: &str, text: &str, bracketed_paste: bool) -> Vec<u8> {
+    let pasted = if bracketed_paste {
+        format!(
+            "\u{1b}[200~{}\u{1b}[201~",
+            sanitize_bracketed_paste_text(text)
+        )
+    } else {
+        normalize_plain_paste_text(text)
+    };
+    let mut payload = Vec::with_capacity(prefix.len().saturating_add(pasted.len()));
+    payload.extend_from_slice(prefix.as_bytes());
+    payload.extend_from_slice(pasted.as_bytes());
+    payload
+}
+
+fn write_composite_pty_payload(
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    prefix: &[u8],
+    input: &[u8],
+) -> Result<(), String> {
+    let mut payload = Vec::with_capacity(prefix.len().saturating_add(input.len()));
+    payload.extend_from_slice(prefix);
+    payload.extend_from_slice(input);
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "PTY writer poisoned".to_string())?;
+    writer
+        .write_all(&payload)
+        .map_err(|error| format!("Failed to write to PTY: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("Failed to flush PTY input: {error}"))?;
+    Ok(())
 }
 
 fn normalize_plain_paste_text(text: &str) -> String {
@@ -2508,6 +2559,84 @@ mod tests {
         let normalized = normalize_plain_paste_text("one\r\ntwo\nthree");
 
         assert_eq!(normalized, "one\rtwo\rthree");
+    }
+
+    #[derive(Default)]
+    struct CountingWriteState {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    struct CountingWriter(Arc<Mutex<CountingWriteState>>);
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut state = self.0.lock().unwrap();
+            state.writes += 1;
+            if state.fail_write {
+                return Err(io::Error::other("write failed"));
+            }
+            state.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.flushes += 1;
+            if state.fail_flush {
+                return Err(io::Error::other("flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    fn counting_writer(state: Arc<Mutex<CountingWriteState>>) -> Arc<Mutex<Box<dyn Write + Send>>> {
+        Arc::new(Mutex::new(Box::new(CountingWriter(state))))
+    }
+
+    #[test]
+    fn composite_user_payload_is_one_write_and_one_flush() {
+        let state = Arc::new(Mutex::new(CountingWriteState::default()));
+        let writer = counting_writer(state.clone());
+
+        write_composite_pty_payload(&writer, b"annotation preamble\n", b"user prompt").unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.bytes, b"annotation preamble\nuser prompt");
+        assert_eq!(state.writes, 1);
+        assert_eq!(state.flushes, 1);
+    }
+
+    #[test]
+    fn composite_bracketed_paste_wraps_only_the_user_text() {
+        let payload = composite_paste_payload("annotation preamble\n", "hello\u{1b}world", true);
+
+        assert_eq!(
+            payload,
+            b"annotation preamble\n\x1b[200~helloworld\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn composite_write_and_flush_failures_are_reported() {
+        let write_state = Arc::new(Mutex::new(CountingWriteState {
+            fail_write: true,
+            ..CountingWriteState::default()
+        }));
+        let error = write_composite_pty_payload(&counting_writer(write_state), b"prefix", b"input")
+            .unwrap_err();
+        assert!(error.contains("write"));
+
+        let flush_state = Arc::new(Mutex::new(CountingWriteState {
+            fail_flush: true,
+            ..CountingWriteState::default()
+        }));
+        let error = write_composite_pty_payload(&counting_writer(flush_state), b"prefix", b"input")
+            .unwrap_err();
+        assert!(error.contains("flush"));
     }
 
     #[test]
