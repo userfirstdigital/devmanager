@@ -3,10 +3,10 @@ use super::{
     BrowserAnnotation, BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserApprovalRequest,
     BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserError, BrowserHostEvent,
     BrowserJournalEntry, BrowserPageLoadState, BrowserRecipeAction, BrowserRecipeAssertion,
-    BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
-    BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait,
-    BrowserRecordingActor, BrowserRecordingError, BrowserRecordingMetadata, BrowserRecordingStatus,
-    BrowserResponse, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
+    BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeV1,
+    BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait, BrowserRecordingActor,
+    BrowserRecordingError, BrowserRecordingMetadata, BrowserRecordingReview,
+    BrowserRecordingStatus, BrowserResponse, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
     BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
     MAX_BROWSER_RECORDING_INPUTS,
 };
@@ -46,6 +46,9 @@ pub struct BrowserWorkflowReviewStepProjection {
     pub convertible_kind: Option<BrowserRecipeInputKind>,
     pub has_wait: bool,
     pub assertion_count: usize,
+    pub has_assertion_locator: bool,
+    pub can_move_up: bool,
+    pub can_move_down: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,8 +73,25 @@ pub enum BrowserWorkflowReviewEditorField {
     Name,
     Description,
     StartUrl,
-    InputName { input_name: String },
-    InputDefault { input_name: String },
+    InputName {
+        input_name: String,
+    },
+    InputDefault {
+        input_name: String,
+    },
+    Assertion {
+        step_id: String,
+        kind: BrowserWorkflowReviewAssertionKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserWorkflowReviewAssertionKind {
+    Url,
+    Title,
+    Text,
+    Element,
+    Value,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -147,6 +167,11 @@ pub enum BrowserWorkflowReviewMutation {
         step_id: String,
         assertion: BrowserRecipeAssertion,
     },
+    AddStepAssertionDraft {
+        step_id: String,
+        kind: BrowserWorkflowReviewAssertionKind,
+        expected: Option<String>,
+    },
     RemoveStepAssertion {
         step_id: String,
         assertion_index: usize,
@@ -166,9 +191,241 @@ impl fmt::Debug for BrowserWorkflowReviewMutation {
             Self::RemoveInput { .. } => "RemoveInput",
             Self::SetStepWait { .. } => "SetStepWait",
             Self::AddStepAssertion { .. } => "AddStepAssertion",
+            Self::AddStepAssertionDraft { .. } => "AddStepAssertionDraft",
             Self::RemoveStepAssertion { .. } => "RemoveStepAssertion",
         })
     }
+}
+
+pub fn browser_workflow_review_editor_for_field(
+    projection: &BrowserWorkflowReviewProjection,
+    instance_id: u64,
+    field: BrowserWorkflowReviewEditorField,
+) -> Result<BrowserWorkflowReviewEditor, BrowserRecordingError> {
+    if !matches!(
+        projection.state,
+        BrowserWorkflowReviewUiState::Review {
+            instance_id: active_instance_id
+        } if active_instance_id == instance_id
+    ) {
+        return Err(BrowserRecordingError::StaleInstance);
+    }
+
+    let draft = match &field {
+        BrowserWorkflowReviewEditorField::Id => projection
+            .metadata
+            .as_ref()
+            .ok_or(BrowserRecordingError::InvalidMutation)?
+            .id
+            .clone(),
+        BrowserWorkflowReviewEditorField::Name => projection
+            .metadata
+            .as_ref()
+            .ok_or(BrowserRecordingError::InvalidMutation)?
+            .name
+            .clone(),
+        BrowserWorkflowReviewEditorField::Description => projection
+            .metadata
+            .as_ref()
+            .ok_or(BrowserRecordingError::InvalidMutation)?
+            .description
+            .clone(),
+        BrowserWorkflowReviewEditorField::StartUrl => projection
+            .metadata
+            .as_ref()
+            .ok_or(BrowserRecordingError::InvalidMutation)?
+            .start_url
+            .clone(),
+        BrowserWorkflowReviewEditorField::InputName { input_name } => projection
+            .inputs
+            .iter()
+            .find(|input| input.name == *input_name)
+            .map(|input| input.name.clone())
+            .ok_or(BrowserRecordingError::InvalidMutation)?,
+        BrowserWorkflowReviewEditorField::InputDefault { input_name } => {
+            let input = projection
+                .inputs
+                .iter()
+                .find(|input| input.name == *input_name)
+                .ok_or(BrowserRecordingError::InvalidMutation)?;
+            if !matches!(
+                input.kind,
+                BrowserRecipeInputKind::Text | BrowserRecipeInputKind::Url
+            ) {
+                return Err(BrowserRecordingError::InvalidMutation);
+            }
+            String::new()
+        }
+        BrowserWorkflowReviewEditorField::Assertion { step_id, kind } => {
+            if !projection.steps.iter().any(|step| {
+                step.id == *step_id
+                    && (!matches!(
+                        kind,
+                        BrowserWorkflowReviewAssertionKind::Element
+                            | BrowserWorkflowReviewAssertionKind::Value
+                    ) || step.has_assertion_locator)
+            }) {
+                return Err(BrowserRecordingError::InvalidMutation);
+            }
+            String::new()
+        }
+    };
+    let cursor = draft.chars().count();
+    Ok(BrowserWorkflowReviewEditor {
+        instance_id,
+        field,
+        draft,
+        cursor,
+        focused: true,
+    })
+}
+
+pub fn browser_workflow_review_editor_mutation(
+    projection: &BrowserWorkflowReviewProjection,
+    editor: &BrowserWorkflowReviewEditor,
+) -> Result<BrowserWorkflowReviewMutation, BrowserRecordingError> {
+    if !matches!(
+        projection.state,
+        BrowserWorkflowReviewUiState::Review {
+            instance_id: active_instance_id
+        } if active_instance_id == editor.instance_id
+    ) {
+        return Err(BrowserRecordingError::StaleInstance);
+    }
+
+    let metadata = projection
+        .metadata
+        .as_ref()
+        .ok_or(BrowserRecordingError::InvalidMutation)?;
+    Ok(match &editor.field {
+        BrowserWorkflowReviewEditorField::Id => BrowserWorkflowReviewMutation::SetMetadata {
+            id: editor.draft.clone(),
+            name: metadata.name.clone(),
+            description: metadata.description.clone(),
+            start_url: metadata.start_url.clone(),
+            viewport: metadata.viewport.clone(),
+        },
+        BrowserWorkflowReviewEditorField::Name => BrowserWorkflowReviewMutation::SetMetadata {
+            id: metadata.id.clone(),
+            name: editor.draft.clone(),
+            description: metadata.description.clone(),
+            start_url: metadata.start_url.clone(),
+            viewport: metadata.viewport.clone(),
+        },
+        BrowserWorkflowReviewEditorField::Description => {
+            BrowserWorkflowReviewMutation::SetMetadata {
+                id: metadata.id.clone(),
+                name: metadata.name.clone(),
+                description: editor.draft.clone(),
+                start_url: metadata.start_url.clone(),
+                viewport: metadata.viewport.clone(),
+            }
+        }
+        BrowserWorkflowReviewEditorField::StartUrl => BrowserWorkflowReviewMutation::SetMetadata {
+            id: metadata.id.clone(),
+            name: metadata.name.clone(),
+            description: metadata.description.clone(),
+            start_url: editor.draft.clone(),
+            viewport: metadata.viewport.clone(),
+        },
+        BrowserWorkflowReviewEditorField::InputName { input_name } => {
+            if !projection
+                .inputs
+                .iter()
+                .any(|input| input.name == *input_name)
+            {
+                return Err(BrowserRecordingError::InvalidMutation);
+            }
+            BrowserWorkflowReviewMutation::RenameInput {
+                previous_name: input_name.clone(),
+                new_name: editor.draft.clone(),
+            }
+        }
+        BrowserWorkflowReviewEditorField::InputDefault { input_name } => {
+            let input = projection
+                .inputs
+                .iter()
+                .find(|input| input.name == *input_name)
+                .ok_or(BrowserRecordingError::InvalidMutation)?;
+            if !matches!(
+                input.kind,
+                BrowserRecipeInputKind::Text | BrowserRecipeInputKind::Url
+            ) {
+                return Err(BrowserRecordingError::InvalidMutation);
+            }
+            BrowserWorkflowReviewMutation::SetInputDefault {
+                input_name: input_name.clone(),
+                default_value: (!editor.draft.trim().is_empty()).then(|| editor.draft.clone()),
+            }
+        }
+        BrowserWorkflowReviewEditorField::Assertion { step_id, kind } => {
+            if !projection.steps.iter().any(|step| {
+                step.id == *step_id
+                    && (!matches!(
+                        kind,
+                        BrowserWorkflowReviewAssertionKind::Element
+                            | BrowserWorkflowReviewAssertionKind::Value
+                    ) || step.has_assertion_locator)
+            }) || editor.draft.trim().is_empty()
+                || matches!(kind, BrowserWorkflowReviewAssertionKind::Element)
+            {
+                return Err(BrowserRecordingError::InvalidMutation);
+            }
+            BrowserWorkflowReviewMutation::AddStepAssertionDraft {
+                step_id: step_id.clone(),
+                kind: *kind,
+                expected: Some(editor.draft.clone()),
+            }
+        }
+    })
+}
+
+fn browser_workflow_review_assertion(
+    review: &BrowserRecordingReview,
+    step_id: &str,
+    kind: BrowserWorkflowReviewAssertionKind,
+    expected: Option<&str>,
+) -> Result<BrowserRecipeAssertion, BrowserRecordingError> {
+    let literal = || {
+        let expected = expected.ok_or(BrowserRecordingError::InvalidMutation)?;
+        if expected.trim().is_empty() {
+            return Err(BrowserRecordingError::InvalidMutation);
+        }
+        Ok(BrowserRecipeValue::Literal {
+            value: expected.to_string(),
+        })
+    };
+    Ok(match kind {
+        BrowserWorkflowReviewAssertionKind::Url => BrowserRecipeAssertion::Url {
+            value: literal()?,
+            exact: true,
+        },
+        BrowserWorkflowReviewAssertionKind::Title => BrowserRecipeAssertion::Title {
+            value: literal()?,
+            exact: false,
+        },
+        BrowserWorkflowReviewAssertionKind::Text => BrowserRecipeAssertion::Text {
+            value: literal()?,
+            present: true,
+        },
+        BrowserWorkflowReviewAssertionKind::Element => {
+            if expected.is_some() {
+                return Err(BrowserRecordingError::InvalidMutation);
+            }
+            BrowserRecipeAssertion::Element {
+                locator: review
+                    .primary_locator_for_step(step_id)
+                    .ok_or(BrowserRecordingError::InvalidMutation)?,
+                state: BrowserRecipeElementState::Visible,
+            }
+        }
+        BrowserWorkflowReviewAssertionKind::Value => BrowserRecipeAssertion::Value {
+            locator: review
+                .primary_locator_for_step(step_id)
+                .ok_or(BrowserRecordingError::InvalidMutation)?,
+            value: literal()?,
+        },
+    })
 }
 
 pub fn apply_browser_workflow_review_mutation(
@@ -242,6 +499,19 @@ pub fn apply_browser_workflow_review_mutation(
                 recorder.set_step_wait(&instance, &step_id, wait)
             }
             BrowserWorkflowReviewMutation::AddStepAssertion { step_id, assertion } => {
+                recorder.add_step_assertion(&instance, &step_id, assertion)
+            }
+            BrowserWorkflowReviewMutation::AddStepAssertionDraft {
+                step_id,
+                kind,
+                expected,
+            } => {
+                let assertion = browser_workflow_review_assertion(
+                    &review,
+                    &step_id,
+                    kind,
+                    expected.as_deref(),
+                )?;
                 recorder.add_step_assertion(&instance, &step_id, assertion)
             }
             BrowserWorkflowReviewMutation::RemoveStepAssertion {
@@ -418,6 +688,12 @@ pub fn browser_workflow_review_projection(
                             ),
                             has_wait: step.wait.is_some(),
                             assertion_count: step.assertions.len(),
+                            has_assertion_locator: review
+                                .primary_locator_for_step(&step.id)
+                                .is_some(),
+                            can_move_up: index > 0 && review.can_move_step(&step.id, index - 1),
+                            can_move_down: index + 1 < recipe.steps.len()
+                                && review.can_move_step(&step.id, index + 1),
                         })
                     })
                     .collect();
@@ -1634,6 +1910,14 @@ pub fn render_browser_pane(
         };
         let instance_id = *instance_id;
         let metadata = review.metadata.as_ref()?;
+        let workflow_control_group = || {
+            div()
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.0))
+        };
         let metadata_rows = [
             (
                 "Name",
@@ -1658,10 +1942,7 @@ pub fn render_browser_pane(
         ]
         .into_iter()
         .map(|(label, value, field)| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
+            workflow_control_group()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(SharedString::from(format!("{label}: {value}")))
@@ -1673,11 +1954,9 @@ pub fn render_browser_pane(
                 ))
                 .into_any_element()
         });
-        let step_count = review.steps.len();
-        let start_url = metadata.start_url.clone();
         let step_rows = review.steps.iter().map(|step| {
             let mut controls = Vec::new();
-            if step.index > 0 {
+            if step.can_move_up {
                 controls.push(
                     browser_button(
                         "up",
@@ -1694,7 +1973,7 @@ pub fn render_browser_pane(
                     .into_any_element(),
                 );
             }
-            if step.index + 1 < step_count {
+            if step.can_move_down {
                 controls.push(
                     browser_button(
                         "down",
@@ -1792,71 +2071,61 @@ pub fn render_browser_pane(
                 )
                 .into_any_element(),
             );
-            let locator = BrowserRecipeLocator {
-                test_id: Some("workflow-review-target".to_string()),
-                ..BrowserRecipeLocator::default()
-            };
-            let assertion_buttons = vec![
-                (
-                    "+ URL",
-                    BrowserRecipeAssertion::Url {
-                        value: BrowserRecipeValue::Literal {
-                            value: start_url.clone(),
-                        },
-                        exact: true,
-                    },
-                ),
-                (
-                    "+ title",
-                    BrowserRecipeAssertion::Title {
-                        value: BrowserRecipeValue::Literal {
-                            value: "Expected title".to_string(),
-                        },
-                        exact: false,
-                    },
-                ),
-                (
-                    "+ text",
-                    BrowserRecipeAssertion::Text {
-                        value: BrowserRecipeValue::Literal {
-                            value: "Expected text".to_string(),
-                        },
-                        present: true,
-                    },
-                ),
-                (
-                    "+ element",
-                    BrowserRecipeAssertion::Element {
-                        locator: locator.clone(),
-                        state: BrowserRecipeElementState::Visible,
-                    },
-                ),
-                (
-                    "+ value",
-                    BrowserRecipeAssertion::Value {
-                        locator,
-                        value: BrowserRecipeValue::Literal {
-                            value: "Expected value".to_string(),
-                        },
-                    },
-                ),
+            let mut assertion_buttons = [
+                ("+ URL", BrowserWorkflowReviewAssertionKind::Url),
+                ("+ title", BrowserWorkflowReviewAssertionKind::Title),
+                ("+ text", BrowserWorkflowReviewAssertionKind::Text),
             ]
             .into_iter()
-            .map(|(label, assertion)| {
+            .map(|(label, kind)| {
                 browser_button(
                     label,
                     false,
                     false,
-                    action(BrowserPaneAction::MutateRecordingReview {
+                    action(BrowserPaneAction::FocusRecordingReviewField {
                         instance_id,
-                        mutation: BrowserWorkflowReviewMutation::AddStepAssertion {
+                        field: BrowserWorkflowReviewEditorField::Assertion {
                             step_id: step.id.clone(),
-                            assertion,
+                            kind,
                         },
                     }),
                 )
                 .into_any_element()
-            });
+            })
+            .collect::<Vec<_>>();
+            if step.has_assertion_locator {
+                assertion_buttons.push(
+                    browser_button(
+                        "+ element",
+                        false,
+                        false,
+                        action(BrowserPaneAction::MutateRecordingReview {
+                            instance_id,
+                            mutation: BrowserWorkflowReviewMutation::AddStepAssertionDraft {
+                                step_id: step.id.clone(),
+                                kind: BrowserWorkflowReviewAssertionKind::Element,
+                                expected: None,
+                            },
+                        }),
+                    )
+                    .into_any_element(),
+                );
+                assertion_buttons.push(
+                    browser_button(
+                        "+ value",
+                        false,
+                        false,
+                        action(BrowserPaneAction::FocusRecordingReviewField {
+                            instance_id,
+                            field: BrowserWorkflowReviewEditorField::Assertion {
+                                step_id: step.id.clone(),
+                                kind: BrowserWorkflowReviewAssertionKind::Value,
+                            },
+                        }),
+                    )
+                    .into_any_element(),
+                );
+            }
             let remove_assertions = (0..step.assertion_count).map(|assertion_index| {
                 browser_button(
                     format!("remove assertion {}", assertion_index + 1),
@@ -1881,22 +2150,20 @@ pub fn render_browser_pane(
                 .border_color(rgb(theme::BORDER_PRIMARY))
                 .child(
                     div()
+                        .w_full()
                         .flex()
-                        .items_center()
-                        .gap(px(4.0))
+                        .flex_col()
+                        .gap(px(3.0))
                         .text_xs()
                         .text_color(rgb(theme::TEXT_PRIMARY))
                         .child(SharedString::from(format!(
                             "{}  {:?}  {}",
                             step.id, step.actor, step.summary
                         )))
-                        .children(controls),
+                        .child(workflow_control_group().children(controls)),
                 )
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(3.0))
+                    workflow_control_group()
                         .children(assertion_buttons)
                         .children(remove_assertions),
                 )
@@ -1950,9 +2217,10 @@ pub fn render_browser_pane(
                 );
             }
             div()
+                .w_full()
                 .flex()
-                .items_center()
-                .gap(px(4.0))
+                .flex_col()
+                .gap(px(3.0))
                 .text_xs()
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(SharedString::from(format!(
@@ -1961,7 +2229,7 @@ pub fn render_browser_pane(
                     input.kind,
                     if input.unset { "unset" } else { "default set" }
                 )))
-                .children(controls)
+                .child(workflow_control_group().children(controls))
                 .into_any_element()
         });
         let editor = model.workflow_editor.as_ref().and_then(|editor| {
@@ -1980,10 +2248,7 @@ pub fn render_browser_pane(
                 &editor.draft[cursor_byte..]
             );
             Some(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
+                workflow_control_group()
                     .p(px(4.0))
                     .border_1()
                     .border_color(rgb(theme::PRIMARY))
@@ -2013,10 +2278,7 @@ pub fn render_browser_pane(
                 .overflow_y_scroll()
                 .bg(rgb(theme::PANEL_BG))
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
+                    workflow_control_group()
                         .child("Recorded workflow review")
                         .child(browser_button(
                             "Preview",
@@ -2046,8 +2308,9 @@ pub fn render_browser_pane(
                         .children(metadata_rows)
                         .child(
                             div()
+                                .w_full()
                                 .flex()
-                                .items_center()
+                                .flex_col()
                                 .gap(px(3.0))
                                 .child(SharedString::from(format!(
                                     "Viewport {}x{} @ {}%",
@@ -2055,37 +2318,43 @@ pub fn render_browser_pane(
                                     metadata.viewport.height,
                                     metadata.viewport.scale_percent
                                 )))
-                                .children(
-                                    [
-                                        BrowserViewportPreset::Desktop,
-                                        BrowserViewportPreset::Tablet,
-                                        BrowserViewportPreset::Mobile,
-                                    ]
-                                    .into_iter()
-                                    .map(|preset| {
-                                        browser_button(
-                                            match preset {
-                                                BrowserViewportPreset::Desktop => "desktop",
-                                                BrowserViewportPreset::Tablet => "tablet",
-                                                BrowserViewportPreset::Mobile => "mobile",
-                                            },
-                                            metadata.viewport
-                                                == BrowserRecipeViewport::from(preset.viewport()),
-                                            false,
-                                            action(BrowserPaneAction::MutateRecordingReview {
-                                                instance_id,
-                                                mutation:
-                                                    BrowserWorkflowReviewMutation::SetMetadata {
-                                                        id: metadata.id.clone(),
-                                                        name: metadata.name.clone(),
-                                                        description: metadata.description.clone(),
-                                                        start_url: metadata.start_url.clone(),
-                                                        viewport: preset.viewport().into(),
-                                                    },
-                                            }),
-                                        )
-                                        .into_any_element()
-                                    }),
+                                .child(
+                                    workflow_control_group().children(
+                                        [
+                                            BrowserViewportPreset::Desktop,
+                                            BrowserViewportPreset::Tablet,
+                                            BrowserViewportPreset::Mobile,
+                                        ]
+                                        .into_iter()
+                                        .map(|preset| {
+                                            browser_button(
+                                                match preset {
+                                                    BrowserViewportPreset::Desktop => "desktop",
+                                                    BrowserViewportPreset::Tablet => "tablet",
+                                                    BrowserViewportPreset::Mobile => "mobile",
+                                                },
+                                                metadata.viewport
+                                                    == BrowserRecipeViewport::from(
+                                                        preset.viewport(),
+                                                    ),
+                                                false,
+                                                action(BrowserPaneAction::MutateRecordingReview {
+                                                    instance_id,
+                                                    mutation:
+                                                        BrowserWorkflowReviewMutation::SetMetadata {
+                                                            id: metadata.id.clone(),
+                                                            name: metadata.name.clone(),
+                                                            description: metadata
+                                                                .description
+                                                                .clone(),
+                                                            start_url: metadata.start_url.clone(),
+                                                            viewport: preset.viewport().into(),
+                                                        },
+                                                }),
+                                            )
+                                            .into_any_element()
+                                        }),
+                                    ),
                                 ),
                         ),
                 )
@@ -2096,30 +2365,22 @@ pub fn render_browser_pane(
                         .flex_col()
                         .gap(px(3.0))
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(3.0))
-                                .child("Inputs")
-                                .children(
-                                    [
-                                        ("add text input", BrowserRecipeInputKind::Text, "text"),
-                                        ("add URL input", BrowserRecipeInputKind::Url, "url"),
-                                        ("add file input", BrowserRecipeInputKind::File, "file"),
-                                        (
-                                            "add secret input",
-                                            BrowserRecipeInputKind::Secret,
-                                            "secret",
-                                        ),
-                                    ]
-                                    .into_iter()
-                                    .filter_map(
-                                        |(label, kind, prefix)| {
-                                            let input_name = browser_workflow_next_input_name(
-                                                &review.inputs,
-                                                prefix,
-                                            )?;
-                                            Some(browser_button(
+                            workflow_control_group().child("Inputs").children(
+                                [
+                                    ("add text input", BrowserRecipeInputKind::Text, "text"),
+                                    ("add URL input", BrowserRecipeInputKind::Url, "url"),
+                                    ("add file input", BrowserRecipeInputKind::File, "file"),
+                                    ("add secret input", BrowserRecipeInputKind::Secret, "secret"),
+                                ]
+                                .into_iter()
+                                .filter_map(
+                                    |(label, kind, prefix)| {
+                                        let input_name = browser_workflow_next_input_name(
+                                            &review.inputs,
+                                            prefix,
+                                        )?;
+                                        Some(
+                                            browser_button(
                                                 label,
                                                 false,
                                                 false,
@@ -2135,10 +2396,11 @@ pub fn render_browser_pane(
                                                         },
                                                 }),
                                             )
-                                            .into_any_element())
-                                        },
-                                    ),
+                                            .into_any_element(),
+                                        )
+                                    },
                                 ),
+                            ),
                         )
                         .children(input_rows),
                 )

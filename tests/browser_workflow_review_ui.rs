@@ -1,14 +1,16 @@
 use devmanager::browser::{
     apply_browser_workflow_review_mutation, browser_action_plan,
+    browser_workflow_review_editor_for_field, browser_workflow_review_editor_mutation,
     browser_workflow_review_projection, discard_browser_workflow_review,
     preview_browser_workflow_review, save_browser_workflow_review, BrowserPaneAction,
     BrowserPaneContext, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
     BrowserRecipeAssertion, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
     BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait, BrowserRecordingAction,
     BrowserRecordingActor, BrowserRecordingError, BrowserRisk, BrowserWebViewHost,
-    BrowserWorkflowCoordinator, BrowserWorkflowReviewEditor, BrowserWorkflowReviewEditorField,
-    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkflowReviewUiState,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserWorkflowCoordinator, BrowserWorkflowReviewAssertionKind, BrowserWorkflowReviewEditor,
+    BrowserWorkflowReviewEditorField, BrowserWorkflowReviewMutation,
+    BrowserWorkflowReviewProjection, BrowserWorkflowReviewUiState, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -336,12 +338,13 @@ fn native_review_surface_reaches_every_required_safe_edit_and_terminal_action() 
         "BrowserRecipeWait::Load",
         "BrowserRecipeWait::NetworkIdle",
         "BrowserWorkflowReviewMutation::SetStepWait",
-        "BrowserRecipeAssertion::Url",
-        "BrowserRecipeAssertion::Title",
-        "BrowserRecipeAssertion::Text",
-        "BrowserRecipeAssertion::Element",
-        "BrowserRecipeAssertion::Value",
-        "BrowserWorkflowReviewMutation::AddStepAssertion",
+        "BrowserWorkflowReviewEditorField::Assertion",
+        "BrowserWorkflowReviewAssertionKind::Url",
+        "BrowserWorkflowReviewAssertionKind::Title",
+        "BrowserWorkflowReviewAssertionKind::Text",
+        "BrowserWorkflowReviewAssertionKind::Element",
+        "BrowserWorkflowReviewAssertionKind::Value",
+        "BrowserWorkflowReviewMutation::AddStepAssertionDraft",
         "BrowserWorkflowReviewMutation::RemoveStepAssertion",
         "BrowserPaneAction::PreviewRecordingReview",
         "BrowserPaneAction::SaveRecordingReview",
@@ -361,9 +364,8 @@ fn native_review_surface_reaches_every_required_safe_edit_and_terminal_action() 
         .expect("workflow editor handler end");
     let editor = &app_source[editor_start..editor_end];
     for required in [
-        "BrowserWorkflowReviewMutation::SetMetadata",
-        "BrowserWorkflowReviewMutation::RenameInput",
-        "BrowserWorkflowReviewMutation::SetInputDefault",
+        "workflow_review_projection",
+        "browser_workflow_review_editor_mutation",
     ] {
         assert!(
             editor.contains(required),
@@ -815,4 +817,514 @@ fn native_lifecycle_discards_volatile_workflow_state_on_route_or_destructive_cha
         .expect("reset");
     let reset_tail = &windows[reset..windows.len().min(reset + 900)];
     assert!(reset_tail.contains("discard_workflow_state"));
+}
+#[test]
+fn invalid_review_metadata_remains_editable_and_can_be_repaired() {
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let owned = workspace("project-repair", "ai-repair");
+    let instance_id = stopped_navigation_review(&coordinator, &owned);
+    let apply = |mutation| {
+        apply_browser_workflow_review_mutation(
+            &coordinator,
+            Some(&owned),
+            &owned,
+            BrowserPaneSurface::Claude,
+            instance_id,
+            mutation,
+        )
+        .expect("draft mutation remains available")
+    };
+
+    apply(BrowserWorkflowReviewMutation::SetMetadata {
+        id: "bad id".to_string(),
+        name: String::new(),
+        description: "repair me".to_string(),
+        start_url: "https://example.test/start".to_string(),
+        viewport: BrowserRecipeViewport {
+            width: 0,
+            height: 720,
+            scale_percent: 100,
+        },
+    });
+    assert!(preview_browser_workflow_review(
+        &coordinator,
+        Some(&owned),
+        &owned,
+        BrowserPaneSurface::Claude,
+        instance_id,
+    )
+    .is_err());
+
+    let projection =
+        browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude)
+            .expect("invalid draft still has a safe projection");
+    let mut name_editor = browser_workflow_review_editor_for_field(
+        &projection,
+        instance_id,
+        BrowserWorkflowReviewEditorField::Name,
+    )
+    .expect("blank name remains editable");
+    assert!(name_editor.draft.is_empty());
+    name_editor.draft = "Repaired workflow".to_string();
+    apply(
+        browser_workflow_review_editor_mutation(&projection, &name_editor)
+            .expect("name repair mutation"),
+    );
+
+    let projection =
+        browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude)
+            .expect("partially repaired projection");
+    let mut id_editor = browser_workflow_review_editor_for_field(
+        &projection,
+        instance_id,
+        BrowserWorkflowReviewEditorField::Id,
+    )
+    .expect("invalid id remains editable");
+    assert_eq!(id_editor.draft, "bad id");
+    id_editor.draft = "repaired-workflow".to_string();
+    apply(
+        browser_workflow_review_editor_mutation(&projection, &id_editor)
+            .expect("id repair mutation"),
+    );
+
+    let projection =
+        browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude)
+            .expect("invalid viewport projection");
+    browser_workflow_review_editor_for_field(
+        &projection,
+        instance_id,
+        BrowserWorkflowReviewEditorField::Description,
+    )
+    .expect("invalid viewport must not block field focus");
+    let metadata = projection.metadata.expect("projected metadata");
+    apply(BrowserWorkflowReviewMutation::SetMetadata {
+        id: metadata.id,
+        name: metadata.name,
+        description: metadata.description,
+        start_url: metadata.start_url,
+        viewport: BrowserRecipeViewport::default(),
+    });
+
+    preview_browser_workflow_review(
+        &coordinator,
+        Some(&owned),
+        &owned,
+        BrowserPaneSurface::Claude,
+        instance_id,
+    )
+    .expect("repaired review previews");
+    let project_root = temporary_project("repair");
+    save_browser_workflow_review(
+        &coordinator,
+        Some(&owned),
+        &owned,
+        BrowserPaneSurface::Claude,
+        instance_id,
+        &project_root,
+        false,
+    )
+    .expect("repaired review saves");
+
+    let pane_source = include_str!("../src/browser/pane.rs");
+    let app_source = include_str!("../src/app/mod.rs");
+
+    assert!(
+        pane_source.contains("browser_workflow_review_editor_for_field"),
+        "review fields need to open from the safe projection even while the draft is invalid"
+    );
+    assert!(
+        pane_source.contains("browser_workflow_review_editor_mutation"),
+        "editor submission needs to preserve the other current draft fields without requiring preview validation"
+    );
+    assert!(
+        app_source.contains("workflow_review_projection"),
+        "focus and Enter handling need to derive repair edits from the current projection"
+    );
+
+    let focus_handler = app_source
+        .split("BrowserPaneAction::FocusRecordingReviewField")
+        .nth(1)
+        .expect("focus handler");
+    let focus_handler = focus_handler
+        .split("BrowserPaneAction::")
+        .next()
+        .expect("bounded focus handler");
+    assert!(
+        !focus_handler.contains("preview_workflow_review"),
+        "an invalid id, blank name, or invalid viewport must not prevent reopening a field for repair"
+    );
+}
+
+#[test]
+fn user_entered_assertion_uses_the_recorded_steps_real_locator() {
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let owned = workspace("project-assertion", "ai-assertion");
+    let instance = coordinator.start(owned.clone()).expect("start recording");
+    for action in [
+        BrowserRecordingAction::recipe(devmanager::browser::BrowserRecipeAction::Click {
+            locator: locator(),
+        })
+        .expect("click action"),
+        BrowserRecordingAction::navigate("https://example.test/after-click")
+            .expect("navigation action"),
+    ] {
+        let reservation = coordinator
+            .reserve_on(
+                &instance,
+                BrowserRecordingActor::User,
+                "tab-a",
+                BrowserRisk::Normal,
+            )
+            .expect("reserve assertion action");
+        coordinator
+            .commit(reservation, action)
+            .expect("commit assertion action");
+    }
+    coordinator.stop(&instance).expect("stop into review");
+    let apply = |mutation| {
+        apply_browser_workflow_review_mutation(
+            &coordinator,
+            Some(&owned),
+            &owned,
+            BrowserPaneSurface::Claude,
+            instance.id(),
+            mutation,
+        )
+    };
+    apply(BrowserWorkflowReviewMutation::SetMetadata {
+        id: "assertion-flow".to_string(),
+        name: "Assertion flow".to_string(),
+        description: "Uses entered assertion values".to_string(),
+        start_url: "https://example.test/start".to_string(),
+        viewport: BrowserRecipeViewport::default(),
+    })
+    .expect("valid metadata");
+
+    let expected_assertions = [
+        (
+            BrowserWorkflowReviewAssertionKind::Url,
+            "https://assert.example/result",
+        ),
+        (
+            BrowserWorkflowReviewAssertionKind::Title,
+            "Quarterly results",
+        ),
+        (BrowserWorkflowReviewAssertionKind::Text, "Completed safely"),
+        (BrowserWorkflowReviewAssertionKind::Value, "42"),
+    ];
+    for (kind, expected) in expected_assertions {
+        let projection =
+            browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude)
+                .expect("assertion projection");
+        let mut editor = browser_workflow_review_editor_for_field(
+            &projection,
+            instance.id(),
+            BrowserWorkflowReviewEditorField::Assertion {
+                step_id: "step-1".to_string(),
+                kind,
+            },
+        )
+        .expect("assertion editor");
+        assert!(editor.draft.is_empty());
+        editor.draft = expected.to_string();
+        assert!(!format!("{editor:?}").contains(expected));
+        let mutation = browser_workflow_review_editor_mutation(&projection, &editor)
+            .expect("entered assertion mutation");
+        assert!(!format!("{mutation:?}").contains(expected));
+        apply(mutation).expect("entered assertion accepted");
+    }
+    apply(BrowserWorkflowReviewMutation::AddStepAssertionDraft {
+        step_id: "step-1".to_string(),
+        kind: BrowserWorkflowReviewAssertionKind::Element,
+        expected: None,
+    })
+    .expect("element assertion derives locator");
+
+    let recipe = preview_browser_workflow_review(
+        &coordinator,
+        Some(&owned),
+        &owned,
+        BrowserPaneSurface::Claude,
+        instance.id(),
+    )
+    .expect("assertion recipe preview");
+    let assertions = &recipe.steps[0].assertions;
+    assert!(matches!(
+        &assertions[0],
+        BrowserRecipeAssertion::Url {
+            value: BrowserRecipeValue::Literal { value },
+            exact: true,
+        } if value == "https://assert.example/result"
+    ));
+    assert!(matches!(
+        &assertions[1],
+        BrowserRecipeAssertion::Title {
+            value: BrowserRecipeValue::Literal { value },
+            exact: false,
+        } if value == "Quarterly results"
+    ));
+    assert!(matches!(
+        &assertions[2],
+        BrowserRecipeAssertion::Text {
+            value: BrowserRecipeValue::Literal { value },
+            present: true,
+        } if value == "Completed safely"
+    ));
+    assert!(matches!(
+        &assertions[3],
+        BrowserRecipeAssertion::Value {
+            locator: BrowserRecipeLocator { test_id: Some(test_id), .. },
+            value: BrowserRecipeValue::Literal { value },
+        } if test_id == "safe-field" && value == "42"
+    ));
+    assert!(matches!(
+        &assertions[4],
+        BrowserRecipeAssertion::Element {
+            locator: BrowserRecipeLocator { test_id: Some(test_id), .. },
+            ..
+        } if test_id == "safe-field"
+    ));
+
+    let projection =
+        browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude)
+            .expect("projection after assertions");
+    assert!(projection.steps[0].has_assertion_locator);
+    assert!(!projection.steps[1].has_assertion_locator);
+    let mut blank = browser_workflow_review_editor_for_field(
+        &projection,
+        instance.id(),
+        BrowserWorkflowReviewEditorField::Assertion {
+            step_id: "step-1".to_string(),
+            kind: BrowserWorkflowReviewAssertionKind::Title,
+        },
+    )
+    .expect("blank assertion editor");
+    blank.draft = "   ".to_string();
+    assert_eq!(
+        browser_workflow_review_editor_mutation(&projection, &blank).unwrap_err(),
+        BrowserRecordingError::InvalidMutation
+    );
+    assert_eq!(
+        apply(BrowserWorkflowReviewMutation::AddStepAssertionDraft {
+            step_id: "step-2".to_string(),
+            kind: BrowserWorkflowReviewAssertionKind::Value,
+            expected: Some("unattached".to_string()),
+        })
+        .unwrap_err(),
+        BrowserRecordingError::InvalidMutation
+    );
+    assert_eq!(
+        preview_browser_workflow_review(
+            &coordinator,
+            Some(&owned),
+            &owned,
+            BrowserPaneSurface::Claude,
+            instance.id(),
+        )
+        .expect("invalid assertion leaves recipe unchanged")
+        .steps[0]
+            .assertions
+            .len(),
+        5
+    );
+
+    let pane_source = include_str!("../src/browser/pane.rs");
+
+    assert!(
+        pane_source.contains("BrowserWorkflowReviewAssertionKind"),
+        "assertion editing needs an explicit typed kind"
+    );
+    assert!(
+        pane_source.contains("AddStepAssertionDraft"),
+        "entered expected text must remain volatile until the coordinator resolves the assertion"
+    );
+    assert!(
+        pane_source.contains("primary_locator_for_step"),
+        "element and value assertions must derive their locator from the actual recorded step"
+    );
+    for placeholder in [
+        "Expected title",
+        "Expected text",
+        "Expected value",
+        "workflow-review-target",
+    ] {
+        assert!(
+            !pane_source.contains(placeholder),
+            "review UI must not manufacture placeholder assertion data: {placeholder}"
+        );
+    }
+
+    let app_source = include_str!("../src/app/mod.rs");
+    let cancel = app_source
+        .split("BrowserPaneAction::CancelRecordingReviewEdit =>")
+        .nth(1)
+        .expect("cancel editor branch")
+        .split("BrowserPaneAction::MutateRecordingReview")
+        .next()
+        .expect("bounded cancel editor branch");
+    assert!(cancel.contains("ui.workflow_editor = None"));
+    assert!(!cancel.contains("apply_workflow_review_mutation"));
+}
+
+#[test]
+fn review_reordering_rejects_tab_lifecycle_boundaries_but_allows_adjacent_actions() {
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let owned = workspace("project-reorder", "ai-reorder");
+    let instance = coordinator.start(owned.clone()).expect("start recording");
+    for action in [
+        devmanager::browser::BrowserRecipeAction::CreateTab {
+            tab: "secondary".to_string(),
+            url: None,
+        },
+        devmanager::browser::BrowserRecipeAction::SelectTab {
+            tab: "secondary".to_string(),
+        },
+        devmanager::browser::BrowserRecipeAction::Click { locator: locator() },
+        devmanager::browser::BrowserRecipeAction::Hover { locator: locator() },
+    ] {
+        let reservation = coordinator
+            .reserve_on(
+                &instance,
+                BrowserRecordingActor::User,
+                "tab-a",
+                BrowserRisk::Normal,
+            )
+            .expect("reserve reorder action");
+        coordinator
+            .commit(
+                reservation,
+                BrowserRecordingAction::recipe(action).expect("recordable reorder action"),
+            )
+            .expect("commit reorder action");
+    }
+    coordinator.stop(&instance).expect("stop into review");
+    let apply = |mutation| {
+        apply_browser_workflow_review_mutation(
+            &coordinator,
+            Some(&owned),
+            &owned,
+            BrowserPaneSurface::Claude,
+            instance.id(),
+            mutation,
+        )
+    };
+    apply(BrowserWorkflowReviewMutation::SetMetadata {
+        id: "safe-reorder".to_string(),
+        name: "Safe reorder".to_string(),
+        description: "Keeps tab lifecycle ordered".to_string(),
+        start_url: "https://example.test/start".to_string(),
+        viewport: BrowserRecipeViewport::default(),
+    })
+    .expect("valid reorder metadata");
+
+    let projection =
+        browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude)
+            .expect("reorder projection");
+    assert_eq!(projection.steps.len(), 4);
+    assert!(!projection.steps[0].can_move_up);
+    assert!(!projection.steps[0].can_move_down);
+    assert!(!projection.steps[1].can_move_up);
+    assert!(!projection.steps[1].can_move_down);
+    assert!(!projection.steps[2].can_move_up);
+    assert!(projection.steps[2].can_move_down);
+    assert!(projection.steps[3].can_move_up);
+    assert!(!projection.steps[3].can_move_down);
+
+    assert_eq!(
+        apply(BrowserWorkflowReviewMutation::MoveStep {
+            step_id: "step-2".to_string(),
+            new_index: 0,
+        })
+        .unwrap_err(),
+        BrowserRecordingError::InvalidMutation
+    );
+    assert_eq!(
+        browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude,)
+            .expect("unchanged projection")
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["step-1", "step-2", "step-3", "step-4"]
+    );
+
+    apply(BrowserWorkflowReviewMutation::MoveStep {
+        step_id: "step-4".to_string(),
+        new_index: 2,
+    })
+    .expect("adjacent non-tab move remains allowed");
+    assert_eq!(
+        browser_workflow_review_projection(&coordinator, &owned, BrowserPaneSurface::Claude,)
+            .expect("safe reordered projection")
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["step-1", "step-2", "step-4", "step-3"]
+    );
+    preview_browser_workflow_review(
+        &coordinator,
+        Some(&owned),
+        &owned,
+        BrowserPaneSurface::Claude,
+        instance.id(),
+    )
+    .expect("safe reorder still previews");
+    let project_root = temporary_project("safe-reorder");
+    save_browser_workflow_review(
+        &coordinator,
+        Some(&owned),
+        &owned,
+        BrowserPaneSurface::Claude,
+        instance.id(),
+        &project_root,
+        false,
+    )
+    .expect("safe reorder still saves");
+
+    let pane_source = include_str!("../src/browser/pane.rs");
+    let recording_source = include_str!("../src/browser/recording.rs");
+
+    assert!(
+        recording_source.contains("can_move_step"),
+        "the recording domain needs one conservative move predicate"
+    );
+    assert!(
+        recording_source.contains("CreateTab")
+            && recording_source.contains("SelectTab")
+            && recording_source.contains("CloseTab"),
+        "the move predicate must recognize every tab lifecycle action"
+    );
+    assert!(
+        pane_source.contains("can_move_up") && pane_source.contains("can_move_down"),
+        "the review projection must expose only moves accepted by the domain predicate"
+    );
+    assert!(
+        pane_source.contains("step.can_move_up") && pane_source.contains("step.can_move_down"),
+        "the UI must hide moves that cross or involve a tab lifecycle boundary while retaining safe adjacent moves"
+    );
+}
+
+#[test]
+fn narrow_review_pane_uses_wrapped_bounded_control_groups() {
+    let pane_source = include_str!("../src/browser/pane.rs");
+
+    assert!(
+        pane_source.contains("workflow_control_group"),
+        "review controls need one narrow-pane-safe layout primitive"
+    );
+    assert!(
+        pane_source.contains(".flex_wrap()"),
+        "multiple step and assertion controls must wrap at the 320px pane minimum"
+    );
+    assert!(
+        pane_source.contains(".overflow_y_scroll()"),
+        "the complete review remains vertically reachable"
+    );
+    assert!(
+        !pane_source.contains(
+            ".children(assertion_buttons)\n                    .children(remove_assertions)"
+        ),
+        "assertion add and remove controls must share a wrapping bounded group"
+    );
 }

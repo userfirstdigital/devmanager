@@ -106,6 +106,55 @@ impl BrowserRecordingReview {
     pub(crate) fn actor_for_step(&self, step_id: &str) -> Option<BrowserRecordingActor> {
         self.step_actors.get(step_id).copied()
     }
+
+    pub(crate) fn primary_locator_for_step(&self, step_id: &str) -> Option<BrowserRecipeLocator> {
+        let step = self.recipe.steps.iter().find(|step| step.id == step_id)?;
+        match &step.action {
+            BrowserRecipeAction::Click { locator }
+            | BrowserRecipeAction::Hover { locator }
+            | BrowserRecipeAction::Focus { locator }
+            | BrowserRecipeAction::Type { locator, .. }
+            | BrowserRecipeAction::Clear { locator }
+            | BrowserRecipeAction::Select { locator, .. }
+            | BrowserRecipeAction::Upload { locator, .. }
+            | BrowserRecipeAction::Download { locator } => Some(locator.clone()),
+            BrowserRecipeAction::Keypress { locator, .. }
+            | BrowserRecipeAction::Scroll { locator, .. } => locator.clone(),
+            BrowserRecipeAction::DragDrop { source, .. } => Some(source.clone()),
+            BrowserRecipeAction::CreateTab { .. }
+            | BrowserRecipeAction::SelectTab { .. }
+            | BrowserRecipeAction::CloseTab { .. }
+            | BrowserRecipeAction::Back
+            | BrowserRecipeAction::Forward
+            | BrowserRecipeAction::Reload
+            | BrowserRecipeAction::SetViewport { .. }
+            | BrowserRecipeAction::CdpMarker { .. }
+            | BrowserRecipeAction::Navigate { .. }
+            | BrowserRecipeAction::Wait { .. }
+            | BrowserRecipeAction::Screenshot { .. } => None,
+        }
+    }
+
+    pub(crate) fn can_move_step(&self, step_id: &str, new_index: usize) -> bool {
+        if new_index >= self.recipe.steps.len() {
+            return false;
+        }
+        let Some(index) = self.recipe.steps.iter().position(|step| step.id == step_id) else {
+            return false;
+        };
+        if index == new_index {
+            return true;
+        }
+        let affected = index.min(new_index)..=index.max(new_index);
+        !self.recipe.steps[affected].iter().any(|step| {
+            matches!(
+                step.action,
+                BrowserRecipeAction::CreateTab { .. }
+                    | BrowserRecipeAction::SelectTab { .. }
+                    | BrowserRecipeAction::CloseTab { .. }
+            )
+        })
+    }
 }
 
 /// An ephemeral capture value. It deliberately implements neither `Debug` nor
@@ -626,7 +675,7 @@ impl BrowserWorkflowRecorder {
         new_index: usize,
     ) -> Result<BrowserRecordingReview, BrowserRecordingError> {
         let review = self.review_mut(instance)?;
-        if new_index >= review.recipe.steps.len() {
+        if !review.can_move_step(step_id, new_index) {
             return Err(BrowserRecordingError::InvalidMutation);
         }
         let index = review

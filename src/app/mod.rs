@@ -5,14 +5,15 @@ use crate::assets::AppAssets;
 use crate::browser::{
     browser_action_plan, browser_annotation_preview_plan, browser_command_channel,
     browser_event_plan, browser_host_reconcile_plan, browser_pane_open_fallback,
-    browser_response_sync, browser_settings_plan, calculate_browser_split, render_browser_pane,
+    browser_response_sync, browser_settings_plan, browser_workflow_review_editor_for_field,
+    browser_workflow_review_editor_mutation, calculate_browser_split, render_browser_pane,
     route_browser_request, BrowserAnnotation, BrowserAttachmentBroker, BrowserAttachmentProjection,
     BrowserBounds, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
     BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
     BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
     BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse,
-    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor,
-    BrowserWorkflowReviewEditorField, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -2422,61 +2423,18 @@ impl NativeShell {
                 return;
             }
             BrowserPaneAction::FocusRecordingReviewField { instance_id, field } => {
-                let result = self.with_browser_host_control_barrier(window, |browser_host| {
-                    browser_host.preview_workflow_review(
-                        Some(&workspace_key),
-                        &workspace_key,
-                        workflow_surface,
-                        instance_id,
-                    )
-                });
-                match result.and_then(|recipe| {
-                    let draft = match &field {
-                        BrowserWorkflowReviewEditorField::Id => recipe.id,
-                        BrowserWorkflowReviewEditorField::Name => recipe.name,
-                        BrowserWorkflowReviewEditorField::Description => recipe.description,
-                        BrowserWorkflowReviewEditorField::StartUrl => recipe.start_url,
-                        BrowserWorkflowReviewEditorField::InputName { input_name } => recipe
-                            .inputs
-                            .iter()
-                            .find(|input| input.name == *input_name)
-                            .map(|input| input.name.clone())
-                            .ok_or_else(|| BrowserError::InvalidRecipe {
-                                message: "review input is no longer active".to_string(),
-                            })?,
-                        BrowserWorkflowReviewEditorField::InputDefault { input_name } => {
-                            let input = recipe
-                                .inputs
-                                .iter()
-                                .find(|input| input.name == *input_name)
-                                .ok_or_else(|| BrowserError::InvalidRecipe {
-                                    message: "review input is no longer active".to_string(),
-                                })?;
-                            if matches!(
-                                input.kind,
-                                crate::browser::BrowserRecipeInputKind::Secret
-                                    | crate::browser::BrowserRecipeInputKind::File
-                            ) {
-                                return Err(BrowserError::InvalidRecipe {
-                                    message: "unset inputs cannot have defaults".to_string(),
-                                });
-                            }
-                            input.default_value.clone().unwrap_or_default()
-                        }
-                    };
-                    Ok(draft)
-                }) {
-                    Ok(draft) => {
-                        let cursor = draft.chars().count();
+                let result = self
+                    .browser_host
+                    .workflow_review_projection(&workspace_key, workflow_surface)
+                    .ok_or(crate::browser::BrowserRecordingError::StaleInstance)
+                    .and_then(|projection| {
+                        browser_workflow_review_editor_for_field(&projection, instance_id, field)
+                    });
+                match result {
+                    Ok(editor) => {
                         let ui = self.browser_ui.entry(workspace_key).or_default();
                         ui.diagnostic = None;
-                        ui.workflow_editor = Some(BrowserWorkflowReviewEditor {
-                            instance_id,
-                            field,
-                            draft,
-                            cursor,
-                            focused: true,
-                        });
+                        ui.workflow_editor = Some(editor);
                         window.focus(&self.browser_workflow_focus);
                     }
                     Err(_) => {
@@ -2821,64 +2779,13 @@ impl NativeShell {
                 Some(TabType::Codex) => BrowserPaneSurface::Codex,
                 Some(TabType::Server | TabType::Ssh) | None => return,
             };
-            let recipe = self.with_browser_host_control_barrier(window, |browser_host| {
-                browser_host.preview_workflow_review(
-                    Some(&workspace_key),
-                    &workspace_key,
-                    surface,
-                    editor.instance_id,
-                )
-            });
-            let mutation = recipe.map(|recipe| match editor.field {
-                BrowserWorkflowReviewEditorField::Id => {
-                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
-                        id: editor.draft,
-                        name: recipe.name,
-                        description: recipe.description,
-                        start_url: recipe.start_url,
-                        viewport: recipe.viewport,
-                    }
-                }
-                BrowserWorkflowReviewEditorField::Name => {
-                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
-                        id: recipe.id,
-                        name: editor.draft,
-                        description: recipe.description,
-                        start_url: recipe.start_url,
-                        viewport: recipe.viewport,
-                    }
-                }
-                BrowserWorkflowReviewEditorField::Description => {
-                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
-                        id: recipe.id,
-                        name: recipe.name,
-                        description: editor.draft,
-                        start_url: recipe.start_url,
-                        viewport: recipe.viewport,
-                    }
-                }
-                BrowserWorkflowReviewEditorField::StartUrl => {
-                    crate::browser::BrowserWorkflowReviewMutation::SetMetadata {
-                        id: recipe.id,
-                        name: recipe.name,
-                        description: recipe.description,
-                        start_url: editor.draft,
-                        viewport: recipe.viewport,
-                    }
-                }
-                BrowserWorkflowReviewEditorField::InputName { input_name } => {
-                    crate::browser::BrowserWorkflowReviewMutation::RenameInput {
-                        previous_name: input_name,
-                        new_name: editor.draft,
-                    }
-                }
-                BrowserWorkflowReviewEditorField::InputDefault { input_name } => {
-                    crate::browser::BrowserWorkflowReviewMutation::SetInputDefault {
-                        input_name,
-                        default_value: (!editor.draft.trim().is_empty()).then_some(editor.draft),
-                    }
-                }
-            });
+            let mutation = self
+                .browser_host
+                .workflow_review_projection(&workspace_key, surface)
+                .ok_or(crate::browser::BrowserRecordingError::StaleInstance)
+                .and_then(|projection| {
+                    browser_workflow_review_editor_mutation(&projection, &editor)
+                });
             match mutation {
                 Ok(mutation) => self.apply_browser_pane_action(
                     BrowserPaneAction::MutateRecordingReview {
