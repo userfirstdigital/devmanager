@@ -4,9 +4,10 @@ use crate::ai::claude_hooks::{
 };
 use crate::ai::codex_bridge::{prepare_codex_adapter, CodexBridgeHandle, PreparedCodexAdapter};
 use crate::browser::{
-    codex_browser_config_overrides, prepare_claude_browser_overlay, BrowserGatewayRegistrar,
-    BrowserGatewayRegistration, BrowserProviderAccess, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
+    browser_input_opens_prompt_boundary, codex_browser_config_overrides,
+    prepare_claude_browser_overlay, BrowserAttachmentBroker, BrowserAttachmentSessionBinding,
+    BrowserGatewayRegistrar, BrowserGatewayRegistration, BrowserPromptInput, BrowserProviderAccess,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, ClaudeBrowserOverlay,
 };
 use crate::models::{
     Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, Settings, TabType,
@@ -140,6 +141,7 @@ struct NativeCodexFallbackTerminalOps;
 
 pub(crate) struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
+    browser_attachment_broker: BrowserAttachmentBroker,
     runtime_state: Arc<RwLock<RuntimeState>>,
     runtime_revision: AtomicU64,
     observed_runtime_generations: Mutex<HashMap<String, u64>>,
@@ -460,6 +462,7 @@ impl ProcessManager {
         let claude_hook_temp_root = prepare_claude_overlay_process_root();
         let inner = Arc::new(ProcessManagerInner {
             sessions: Mutex::new(HashMap::new()),
+            browser_attachment_broker: BrowserAttachmentBroker::default(),
             runtime_state: Arc::new(RwLock::new(RuntimeState::new(debug_enabled))),
             runtime_revision: AtomicU64::new(1),
             observed_runtime_generations: Mutex::new(HashMap::new()),
@@ -1012,18 +1015,23 @@ impl ProcessManager {
         dimensions: SessionDimensions,
         activate: bool,
         response: Option<Sender<RemoteActionResult>>,
+        attachment_binding: impl Into<Option<BrowserAttachmentSessionBinding>>,
     ) -> Result<(), String> {
         let _ = activate;
         let op_id = next_op_id();
-        self.op_queue
-            .submit(ProcessOp::SpawnAi {
-                op_id,
-                launch: launch.clone(),
-                session_id: session_id.to_string(),
-                dimensions,
-                response,
-            })
-            .map(|_| ())
+        let attachment_binding = attachment_binding.into();
+        let result = self.op_queue.submit(ProcessOp::SpawnAi {
+            op_id,
+            launch: launch.clone(),
+            session_id: session_id.to_string(),
+            dimensions,
+            attachment_binding: attachment_binding.clone(),
+            response,
+        });
+        if result.is_err() {
+            unbind_attachment_if_matches(&self.inner, attachment_binding.as_ref());
+        }
+        result.map(|_| ())
     }
 
     fn schedule_restart_ai(
@@ -1033,18 +1041,23 @@ impl ProcessManager {
         session_id: String,
         dimensions: SessionDimensions,
         response: Option<Sender<RemoteActionResult>>,
+        attachment_binding: impl Into<Option<BrowserAttachmentSessionBinding>>,
     ) -> Result<(), String> {
         let op_id = next_op_id();
-        self.op_queue
-            .submit(ProcessOp::RestartAi {
-                op_id,
-                close_session_id,
-                launch,
-                session_id: session_id.clone(),
-                dimensions,
-                response,
-            })
-            .map(|_| ())
+        let attachment_binding = attachment_binding.into();
+        let result = self.op_queue.submit(ProcessOp::RestartAi {
+            op_id,
+            close_session_id,
+            launch,
+            session_id: session_id.clone(),
+            dimensions,
+            attachment_binding: attachment_binding.clone(),
+            response,
+        });
+        if result.is_err() {
+            unbind_attachment_if_matches(&self.inner, attachment_binding.as_ref());
+        }
+        result.map(|_| ())
     }
 
     fn schedule_close_ai(
@@ -1176,6 +1189,10 @@ impl ProcessManager {
         }
     }
 
+    pub fn browser_attachment_broker(&self) -> BrowserAttachmentBroker {
+        self.inner.browser_attachment_broker.clone()
+    }
+
     pub fn browser_diagnostic(&self, ai_tab_id: &str) -> Option<String> {
         self.inner
             .browser_diagnostics
@@ -1201,20 +1218,11 @@ impl ProcessManager {
         &self,
         launch: &mut AiLaunchSpec,
         session_id: &str,
-        initial_snapshot: BrowserWorkspaceSnapshot,
-    ) {
+        mut initial_snapshot: BrowserWorkspaceSnapshot,
+    ) -> Option<BrowserAttachmentSessionBinding> {
         if !matches!(launch.tool, SessionKind::Claude | SessionKind::Codex) {
-            return;
+            return None;
         }
-        let registrar = self
-            .inner
-            .browser_gateway_registrar
-            .read()
-            .ok()
-            .and_then(|registrar| registrar.clone());
-        let Some(registrar) = registrar else {
-            return;
-        };
         let workspace_key =
             match BrowserWorkspaceKey::new(launch.project_id.clone(), launch.tab_id.clone()) {
                 Ok(workspace_key) => workspace_key,
@@ -1223,9 +1231,28 @@ impl ProcessManager {
                         &launch.tab_id,
                         Some(format!("Browser tools unavailable: {error}")),
                     );
-                    return;
+                    return None;
                 }
             };
+        self.inner
+            .browser_attachment_broker
+            .observe_workspace(workspace_key.clone(), &initial_snapshot);
+        self.inner
+            .browser_attachment_broker
+            .overlay_snapshot(&workspace_key, &mut initial_snapshot);
+        let attachment_binding = self
+            .inner
+            .browser_attachment_broker
+            .bind_session(session_id, workspace_key.clone());
+        let registrar = self
+            .inner
+            .browser_gateway_registrar
+            .read()
+            .ok()
+            .and_then(|registrar| registrar.clone());
+        let Some(registrar) = registrar else {
+            return Some(attachment_binding);
+        };
         let registration = match registrar.register_with_project_root(
             session_id,
             workspace_key,
@@ -1238,7 +1265,7 @@ impl ProcessManager {
                     &launch.tab_id,
                     Some(format!("Browser tools unavailable: {error}")),
                 );
-                return;
+                return Some(attachment_binding);
             }
         };
         let claude_overlay = if launch.tool == SessionKind::Claude {
@@ -1256,7 +1283,7 @@ impl ProcessManager {
                         &launch.tab_id,
                         Some(format!("Browser tools unavailable: {error}")),
                     );
-                    return;
+                    return Some(attachment_binding);
                 }
             }
         } else {
@@ -1282,6 +1309,7 @@ impl ProcessManager {
             previous.registrar.revoke(&previous.registration);
         }
         self.set_browser_diagnostic(&launch.tab_id, None);
+        Some(attachment_binding)
     }
 
     fn browser_environment(&self, session_id: &str) -> HashMap<String, String> {
@@ -1859,6 +1887,40 @@ impl ProcessManager {
         session.paste_text(text)
     }
 
+    pub fn write_user_text_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        coordinate_user_origin_write(
+            &self.inner.browser_attachment_broker,
+            session_id,
+            BrowserPromptInput::Text(text),
+            |prefix| session.write_user_text(prefix, text),
+        )
+    }
+
+    pub fn write_user_bytes_to_session(
+        &self,
+        session_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        coordinate_user_origin_write(
+            &self.inner.browser_attachment_broker,
+            session_id,
+            BrowserPromptInput::RawBytes(bytes),
+            |prefix| session.write_user_bytes(prefix, bytes),
+        )
+    }
+
+    pub fn paste_user_text_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
+        let session = self.get_session(session_id)?;
+        coordinate_user_origin_write(
+            &self.inner.browser_attachment_broker,
+            session_id,
+            BrowserPromptInput::Paste(text),
+            |prefix| session.paste_user_text(prefix, text),
+        )
+    }
+
     pub fn write_virtual_text(&self, session_id: &str, text: &str) -> Result<(), String> {
         let session = self.get_session(session_id)?;
         session.write_virtual_text(text);
@@ -1961,7 +2023,10 @@ impl ProcessManager {
     }
 
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
-        self.request_session_close(session_id, true)
+        let attachment_binding = self.inner.browser_attachment_broker.binding(session_id);
+        let result = self.request_session_close(session_id, true);
+        unbind_attachment_if_matches(&self.inner, attachment_binding.as_ref());
+        result
     }
 
     pub fn close_tab(&self, app_state: &mut AppState, tab_id: &str) -> Result<(), String> {
@@ -2151,6 +2216,7 @@ impl ProcessManager {
             .cloned()
             .ok_or_else(|| format!("Unknown project `{}`", tab.project_id))?;
 
+        let mut existing_session_to_forget = None;
         if let Some(existing_session_id) = tab.pty_session_id.as_deref() {
             let existing_runtime = self
                 .runtime_state()
@@ -2173,17 +2239,20 @@ impl ProcessManager {
                 }
                 return Ok(existing_session_id.to_string());
             }
-            self.forget_session(existing_session_id);
+            existing_session_to_forget = Some(existing_session_id.to_string());
         }
 
         let session_id = next_ai_session_id(&tab.tab_type);
         let mut launch =
             build_ai_launch_spec(&app_state.config.settings, &project, &tab, &session_id)?;
-        self.prepare_browser_launch_for_session(
+        let attachment_binding = self.prepare_browser_launch_for_session(
             &mut launch,
             &session_id,
             tab.browser_workspace.clone().unwrap_or_default(),
         );
+        if let Some(existing_session_id) = existing_session_to_forget.as_deref() {
+            self.forget_session(existing_session_id);
+        }
         self.prepare_claude_launch_for_session(
             &mut launch,
             &session_id,
@@ -2205,9 +2274,14 @@ impl ProcessManager {
             state.exit = None;
         });
 
-        if let Err(error) =
-            self.schedule_spawn_ai(&launch, &session_id, dimensions, activate_tab, response)
-        {
+        if let Err(error) = self.schedule_spawn_ai(
+            &launch,
+            &session_id,
+            dimensions,
+            activate_tab,
+            response,
+            attachment_binding,
+        ) {
             self.cleanup_ai_adapters_for_session(&session_id);
             return Err(error);
         }
@@ -2270,7 +2344,7 @@ impl ProcessManager {
         let session_id = next_ai_session_id(&tab.tab_type);
         let mut launch =
             build_ai_launch_spec(&app_state.config.settings, &project, &tab, &session_id)?;
-        self.prepare_browser_launch_for_session(
+        let attachment_binding = self.prepare_browser_launch_for_session(
             &mut launch,
             &session_id,
             tab.browser_workspace.clone().unwrap_or_default(),
@@ -2302,6 +2376,7 @@ impl ProcessManager {
             session_id.clone(),
             dimensions,
             response,
+            attachment_binding,
         ) {
             self.cleanup_ai_adapters_for_session(&session_id);
             return Err(error);
@@ -3364,12 +3439,14 @@ impl ProcessManager {
     }
 
     fn forget_session(&self, session_id: &str) {
+        let attachment_binding = self.inner.browser_attachment_broker.binding(session_id);
         self.cleanup_ai_adapters_for_session(session_id);
         if let Ok(mut sessions) = self.inner.sessions.lock() {
             sessions.remove(session_id);
         }
         mark_remote_session_dirty(&self.inner, session_id);
         emit_remote_session_removed(&self.inner, session_id);
+        unbind_attachment_if_matches(&self.inner, attachment_binding.as_ref());
     }
 
     fn ensure_runtime_entry(&self, session_id: &str, cwd: PathBuf, dimensions: SessionDimensions) {
@@ -3423,6 +3500,55 @@ impl ProcessManager {
         };
         let _ = std::fs::remove_file(dir.join("ssh-keys").join(safe_key_file_name(connection_id)));
     }
+}
+
+fn coordinate_user_origin_write(
+    broker: &BrowserAttachmentBroker,
+    session_id: &str,
+    input: BrowserPromptInput<'_>,
+    write: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if !browser_input_opens_prompt_boundary(input) {
+        return write("");
+    }
+
+    let reservation = broker.reserve_for_input(session_id, input);
+    let prefix = reservation
+        .as_ref()
+        .map(|reservation| reservation.preamble())
+        .unwrap_or_default();
+    if let Err(error) = write(prefix) {
+        if let Some(reservation) = reservation {
+            let _ = broker.rollback(reservation);
+        }
+        return Err(error);
+    }
+    if let Some(reservation) = reservation {
+        broker
+            .commit(reservation)
+            .map(|_| ())
+            .map_err(|error| format!("commit browser attachments: {error}"))?;
+    }
+    Ok(())
+}
+
+fn unbind_attachment_if_matches(
+    inner: &ProcessManagerInner,
+    binding: Option<&BrowserAttachmentSessionBinding>,
+) -> bool {
+    binding.is_some_and(|binding| inner.browser_attachment_broker.unbind_if_matches(binding))
+}
+
+fn renew_attachment_binding_for_codex_fallback(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+) -> Option<BrowserAttachmentSessionBinding> {
+    let current = inner.browser_attachment_broker.binding(session_id)?;
+    Some(
+        inner
+            .browser_attachment_broker
+            .bind_session(session_id, current.workspace_key),
+    )
 }
 
 fn drain_claude_hook_sessions_inner(inner: &ProcessManagerInner) {
@@ -5085,10 +5211,12 @@ fn schedule_codex_original_fallback(
             },
         );
 
+        let attachment_binding = renew_attachment_binding_for_codex_fallback(&inner, &session_id);
         let fallback_result = terminal_ops
             .terminate_and_reap(&inner, &session_id)
             .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch, &environment));
         if fallback_result.is_err() {
+            unbind_attachment_if_matches(&inner, attachment_binding.as_ref());
             let manager = process_manager_from_inner(inner.clone());
             manager.cleanup_browser_provider_session(&session_id);
             manager.set_browser_diagnostic(
@@ -5270,6 +5398,15 @@ fn session_change_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
 ) -> Arc<dyn Fn() + Send + Sync> {
+    let attachment_binding = inner.browser_attachment_broker.binding(&session_id);
+    session_change_notifier_with_attachment_binding(inner, session_id, attachment_binding)
+}
+
+fn session_change_notifier_with_attachment_binding(
+    inner: Arc<ProcessManagerInner>,
+    session_id: String,
+    attachment_binding: Option<BrowserAttachmentSessionBinding>,
+) -> Arc<dyn Fn() + Send + Sync> {
     let claude_registration = inner
         .claude_hook_sessions
         .lock()
@@ -5306,6 +5443,7 @@ fn session_change_notifier(
             })
             .unwrap_or(true);
         if terminal_exited {
+            unbind_attachment_if_matches(&inner, attachment_binding.as_ref());
             if let Some(registration) = claude_registration.as_ref() {
                 cleanup_claude_hook_session_if_matches(&inner, &session_id, registration);
             }
@@ -5683,10 +5821,17 @@ pub(crate) fn execute_process_op_inner(
             launch,
             session_id,
             dimensions,
+            attachment_binding,
             response,
             ..
         } => {
-            let result = spawn_ai_session_with_inner(inner, &launch, &session_id, dimensions);
+            let result = spawn_ai_session_with_attachment_binding(
+                inner,
+                &launch,
+                &session_id,
+                dimensions,
+                attachment_binding,
+            );
             (
                 ProcessOpKind::SpawnAi,
                 result,
@@ -5702,6 +5847,7 @@ pub(crate) fn execute_process_op_inner(
             launch,
             session_id,
             dimensions,
+            attachment_binding,
             response,
             ..
         } => {
@@ -5709,7 +5855,13 @@ pub(crate) fn execute_process_op_inner(
                 let _ = manager.close_session(&close_id);
                 manager.forget_session(&close_id);
             }
-            let result = spawn_ai_session_with_inner(inner, &launch, &session_id, dimensions);
+            let result = spawn_ai_session_with_attachment_binding(
+                inner,
+                &launch,
+                &session_id,
+                dimensions,
+                attachment_binding,
+            );
             (
                 ProcessOpKind::RestartAi,
                 result,
@@ -6012,27 +6164,69 @@ fn spawn_ssh_session_with_inner(
     Ok(())
 }
 
+#[cfg(test)]
 fn spawn_ai_session_with_inner(
     inner: &Arc<ProcessManagerInner>,
     launch: &AiLaunchSpec,
     session_id: &str,
     dimensions: SessionDimensions,
 ) -> Result<(), String> {
-    spawn_ai_session_with_writer(
+    let attachment_binding = inner.browser_attachment_broker.binding(session_id);
+    spawn_ai_session_with_attachment_binding(
+        inner,
+        launch,
+        session_id,
+        dimensions,
+        attachment_binding,
+    )
+}
+
+fn spawn_ai_session_with_attachment_binding(
+    inner: &Arc<ProcessManagerInner>,
+    launch: &AiLaunchSpec,
+    session_id: &str,
+    dimensions: SessionDimensions,
+    attachment_binding: Option<BrowserAttachmentSessionBinding>,
+) -> Result<(), String> {
+    spawn_ai_session_with_writer_and_attachment_binding(
         inner,
         launch,
         session_id,
         dimensions,
         TerminalSession::write_text,
+        attachment_binding,
     )
 }
 
+#[cfg(test)]
 fn spawn_ai_session_with_writer<F>(
     inner: &Arc<ProcessManagerInner>,
     launch: &AiLaunchSpec,
     session_id: &str,
     dimensions: SessionDimensions,
     write_startup_command: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&TerminalSession, &str) -> Result<(), String>,
+{
+    let attachment_binding = inner.browser_attachment_broker.binding(session_id);
+    spawn_ai_session_with_writer_and_attachment_binding(
+        inner,
+        launch,
+        session_id,
+        dimensions,
+        write_startup_command,
+        attachment_binding,
+    )
+}
+
+fn spawn_ai_session_with_writer_and_attachment_binding<F>(
+    inner: &Arc<ProcessManagerInner>,
+    launch: &AiLaunchSpec,
+    session_id: &str,
+    dimensions: SessionDimensions,
+    write_startup_command: F,
+    attachment_binding: Option<BrowserAttachmentSessionBinding>,
 ) -> Result<(), String>
 where
     F: FnOnce(&TerminalSession, &str) -> Result<(), String>,
@@ -6073,9 +6267,10 @@ where
         None,
         inner.runtime_state.clone(),
         inner.debug_enabled,
-        Some(session_change_notifier(
+        Some(session_change_notifier_with_attachment_binding(
             inner.clone(),
             session_id.to_string(),
+            attachment_binding.clone(),
         )),
         Some(session_output_notifier(
             inner.clone(),
@@ -6084,6 +6279,7 @@ where
     )
     .map_err(|error| {
         manager.cleanup_ai_adapters_for_session(session_id);
+        unbind_attachment_if_matches(inner, attachment_binding.as_ref());
         manager.update_session_state(session_id, |state| {
             state.status = SessionStatus::Failed;
             state.exit = Some(SessionExitState {
@@ -6241,6 +6437,264 @@ mod tests {
             shell_args: Vec::new(),
             startup_command: command.to_string(),
         }
+    }
+
+    fn browser_attachment_snapshot(annotation_id: &str) -> BrowserWorkspaceSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "annotations": [{
+                "id": annotation_id,
+                "kind": "element",
+                "tabId": "page",
+                "anchorRevision": 1,
+                "comment": format!("Review {annotation_id}"),
+                "url": "https://example.test/page?token=secret",
+                "locator": {},
+                "bounds": { "x": 1, "y": 2, "width": 30, "height": 40 },
+                "viewport": {},
+                "screenshotResource": format!("shot-{annotation_id}"),
+                "computedStyles": {},
+                "resolved": false
+            }],
+            "pendingAnnotationRevision": 1,
+            "pendingAnnotationIds": [annotation_id]
+        }))
+        .expect("valid attachment snapshot")
+    }
+
+    #[test]
+    fn attachment_binding_precedes_gateway_and_survives_provider_setup_failure() {
+        let manager = ProcessManager::new();
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Err("fixture preparer failed".to_string())
+        }));
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        let binding = manager
+            .prepare_browser_launch_for_session(
+                &mut launch,
+                "attachment-no-gateway",
+                browser_attachment_snapshot("ann-no-gateway"),
+            )
+            .expect("AI launch binds attachments without a gateway");
+
+        assert_eq!(
+            manager
+                .browser_attachment_broker()
+                .binding("attachment-no-gateway"),
+            Some(binding.clone())
+        );
+        assert!(manager
+            .browser_attachment_broker()
+            .reserve_for_input(
+                "attachment-no-gateway",
+                crate::browser::BrowserPromptInput::Text("prompt")
+            )
+            .is_some());
+        let _ = manager.prepare_codex_launch_for_session(&mut launch, "attachment-no-gateway");
+        assert_eq!(
+            manager
+                .browser_attachment_broker()
+                .binding("attachment-no-gateway"),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn replacement_and_same_id_fallback_fence_stale_attachment_cleanup() {
+        let manager = ProcessManager::new();
+        let mut old_launch = browser_test_launch(SessionKind::Claude, "claude --model sonnet");
+        let old = manager
+            .prepare_browser_launch_for_session(
+                &mut old_launch,
+                "attachment-old",
+                browser_attachment_snapshot("ann-restart"),
+            )
+            .unwrap();
+        manager.ensure_runtime_entry(
+            "attachment-old",
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+        );
+        manager.update_session_state("attachment-old", |state| {
+            state.status = SessionStatus::Running;
+        });
+        let old_exit = session_change_notifier(manager.inner.clone(), "attachment-old".into());
+
+        let mut replacement_launch =
+            browser_test_launch(SessionKind::Claude, "claude --model opus");
+        let replacement = manager
+            .prepare_browser_launch_for_session(
+                &mut replacement_launch,
+                "attachment-replacement",
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .unwrap();
+        manager.update_session_state("attachment-old", |state| {
+            state.status = SessionStatus::Exited;
+        });
+        old_exit();
+        assert_eq!(
+            manager
+                .browser_attachment_broker()
+                .binding("attachment-replacement"),
+            Some(replacement)
+        );
+        assert!(!manager.browser_attachment_broker().unbind_if_matches(&old));
+
+        let renewed =
+            renew_attachment_binding_for_codex_fallback(&manager.inner, "attachment-replacement")
+                .expect("same-ID fallback renews its binding");
+        assert!(renewed.generation > old.generation);
+        assert!(!manager.browser_attachment_broker().unbind_if_matches(&old));
+        assert_eq!(
+            manager
+                .browser_attachment_broker()
+                .binding("attachment-replacement"),
+            Some(renewed)
+        );
+    }
+
+    #[test]
+    fn queue_failure_unbinds_only_the_captured_attachment_generation() {
+        let manager = ProcessManager::new();
+        manager.op_queue.shutdown();
+        let mut launch = browser_test_launch(SessionKind::Claude, "claude --model sonnet");
+        let binding = manager
+            .prepare_browser_launch_for_session(
+                &mut launch,
+                "attachment-queue-failure",
+                browser_attachment_snapshot("ann-queue"),
+            )
+            .unwrap();
+
+        let result = manager.schedule_spawn_ai(
+            &launch,
+            "attachment-queue-failure",
+            SessionDimensions::default(),
+            false,
+            None,
+            binding,
+        );
+
+        assert!(result.is_err());
+        assert!(manager
+            .browser_attachment_broker()
+            .binding("attachment-queue-failure")
+            .is_none());
+    }
+
+    #[test]
+    fn user_origin_inputs_share_one_attachment_transaction_and_retry_failures() {
+        let manager = ProcessManager::new();
+        let broker = manager.browser_attachment_broker();
+        let key = BrowserWorkspaceKey::new("project", "conversation").unwrap();
+        broker.observe_workspace(key.clone(), &browser_attachment_snapshot("ann-transaction"));
+        broker.bind_session("transaction-session", key.clone());
+
+        let mut control_payload = None;
+        coordinate_user_origin_write(
+            &broker,
+            "transaction-session",
+            crate::browser::BrowserPromptInput::RawBytes(b"\x03"),
+            |prefix| {
+                control_payload = Some(prefix.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(control_payload.as_deref(), Some(""));
+        assert_eq!(
+            broker.projection(&key).pending_annotation_ids,
+            ["ann-transaction"]
+        );
+
+        let error = coordinate_user_origin_write(
+            &broker,
+            "transaction-session",
+            crate::browser::BrowserPromptInput::Paste("first try"),
+            |prefix| {
+                assert!(prefix.contains("ann-transaction"));
+                Err("fixture write or flush failed".to_string())
+            },
+        )
+        .expect_err("failed compound write rolls back");
+        assert!(error.contains("fixture write or flush failed"));
+
+        let mut successful_prefix = String::new();
+        coordinate_user_origin_write(
+            &broker,
+            "transaction-session",
+            crate::browser::BrowserPromptInput::Text("retry"),
+            |prefix| {
+                successful_prefix = prefix.to_string();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(successful_prefix.contains("ann-transaction"));
+        assert!(broker.projection(&key).pending_annotation_ids.is_empty());
+
+        let mut later_enter_prefix = None;
+        coordinate_user_origin_write(
+            &broker,
+            "transaction-session",
+            crate::browser::BrowserPromptInput::RawBytes(b"\r"),
+            |prefix| {
+                later_enter_prefix = Some(prefix.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(later_enter_prefix.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn user_origin_transactions_are_isolated_by_session_and_workspace() {
+        let broker = crate::browser::BrowserAttachmentBroker::default();
+        let first_key = BrowserWorkspaceKey::new("project", "first").unwrap();
+        let second_key = BrowserWorkspaceKey::new("project", "second").unwrap();
+        broker.observe_workspace(first_key.clone(), &browser_attachment_snapshot("ann-first"));
+        broker.observe_workspace(
+            second_key.clone(),
+            &browser_attachment_snapshot("ann-second"),
+        );
+        broker.bind_session("first-session", first_key.clone());
+        broker.bind_session("second-session", second_key.clone());
+
+        coordinate_user_origin_write(
+            &broker,
+            "first-session",
+            crate::browser::BrowserPromptInput::RawBytes("hello".as_bytes()),
+            |prefix| {
+                assert!(prefix.contains("ann-first"));
+                assert!(!prefix.contains("ann-second"));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(broker
+            .projection(&first_key)
+            .pending_annotation_ids
+            .is_empty());
+        assert_eq!(
+            broker.projection(&second_key).pending_annotation_ids,
+            ["ann-second"]
+        );
+        coordinate_user_origin_write(
+            &broker,
+            "second-session",
+            crate::browser::BrowserPromptInput::Paste("world"),
+            |prefix| {
+                assert!(prefix.contains("ann-second"));
+                assert!(!prefix.contains("ann-first"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(broker
+            .projection(&second_key)
+            .pending_annotation_ids
+            .is_empty());
     }
 
     #[test]
@@ -6486,6 +6940,10 @@ mod tests {
             "codex-browser-fallback",
             crate::browser::BrowserWorkspaceSnapshot::default(),
         );
+        let original_attachment_binding = manager
+            .browser_attachment_broker()
+            .binding("codex-browser-fallback")
+            .expect("initial attachment binding");
         let token = manager.browser_environment("codex-browser-fallback")
             [crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV]
             .clone();
@@ -6540,6 +6998,11 @@ mod tests {
         );
         assert!(!fallback_environments.lock().unwrap()[0]
             .contains_key(crate::ai::codex_bridge::CODEX_BRIDGE_AUTH_TOKEN_ENV));
+        let fallback_attachment_binding = manager
+            .browser_attachment_broker()
+            .binding("codex-browser-fallback")
+            .expect("fallback attachment binding");
+        assert!(fallback_attachment_binding.generation > original_attachment_binding.generation);
     }
 
     #[tokio::test]
@@ -6588,6 +7051,10 @@ mod tests {
         })
         .await
         .expect("failed fallback spawn must revoke browser access");
+        assert!(manager
+            .browser_attachment_broker()
+            .binding("codex-browser-fallback-spawn-failure")
+            .is_none());
     }
 
     #[test]
@@ -6695,6 +7162,41 @@ mod tests {
             manager.runtime_state().sessions[session_id].status,
             SessionStatus::Failed
         );
+        assert!(manager
+            .browser_attachment_broker()
+            .binding(session_id)
+            .is_none());
+    }
+
+    #[test]
+    fn pty_spawn_failure_unbinds_its_captured_attachment_generation() {
+        let manager = ProcessManager::new();
+        let session_id = "attachment-pty-spawn-failure";
+        let mut launch = browser_test_launch(SessionKind::Claude, "claude --model sonnet");
+        launch.shell_program = "definitely-not-a-devmanager-shell".to_string();
+        let binding = manager
+            .prepare_browser_launch_for_session(
+                &mut launch,
+                session_id,
+                browser_attachment_snapshot("ann-spawn-failure"),
+            )
+            .unwrap();
+        manager.ensure_runtime_entry(session_id, launch.cwd.clone(), SessionDimensions::default());
+
+        let error = spawn_ai_session_with_attachment_binding(
+            &manager.inner,
+            &launch,
+            session_id,
+            SessionDimensions::default(),
+            Some(binding),
+        )
+        .expect_err("invalid shell must fail PTY spawn");
+
+        assert!(!error.is_empty());
+        assert!(manager
+            .browser_attachment_broker()
+            .binding(session_id)
+            .is_none());
     }
 
     impl CodexFallbackTerminalOps for RecordingCodexFallbackTerminalOps {

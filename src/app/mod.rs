@@ -11031,7 +11031,9 @@ impl NativeShell {
                                     text,
                                 });
                             } else {
-                                let _ = self.process_manager.paste_to_session(&session_id, &text);
+                                let _ = self
+                                    .process_manager
+                                    .paste_user_text_to_session(&session_id, &text);
                             }
                         }
                         Some(TerminalClipboardPayload::RawBytes(bytes)) => {
@@ -11054,7 +11056,7 @@ impl NativeShell {
                             } else {
                                 let _ = self
                                     .process_manager
-                                    .write_bytes_to_session(&session_id, &bytes);
+                                    .write_user_bytes_to_session(&session_id, &bytes);
                             }
                         }
                         None => {}
@@ -11109,7 +11111,9 @@ impl NativeShell {
                             text,
                         });
                     } else {
-                        let _ = self.process_manager.write_to_session(&session_id, &text);
+                        let _ = self
+                            .process_manager
+                            .write_user_text_to_session(&session_id, &text);
                     }
                     window.prevent_default();
                 }

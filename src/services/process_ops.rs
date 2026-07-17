@@ -1,3 +1,4 @@
+use crate::browser::BrowserAttachmentSessionBinding;
 use crate::remote::RemoteActionResult;
 use crate::services::process_manager::{ManagedShutdownReport, ProcessManagerInner};
 use crate::state::{AiLaunchSpec, ServerLaunchSpec, SessionDimensions, SshLaunchSpec};
@@ -120,6 +121,7 @@ pub enum ProcessOp {
         launch: AiLaunchSpec,
         session_id: String,
         dimensions: SessionDimensions,
+        attachment_binding: Option<BrowserAttachmentSessionBinding>,
         response: Option<Sender<RemoteActionResult>>,
     },
     RestartAi {
@@ -128,6 +130,7 @@ pub enum ProcessOp {
         launch: AiLaunchSpec,
         session_id: String,
         dimensions: SessionDimensions,
+        attachment_binding: Option<BrowserAttachmentSessionBinding>,
         response: Option<Sender<RemoteActionResult>>,
     },
     CloseAi {
