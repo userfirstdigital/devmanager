@@ -337,7 +337,7 @@ pub struct RemoteWebMutationAuthority {
     pub runtime_instance_id: String,
     pub connection_id: u64,
     pub client_id: String,
-    pub lease_generation: u64,
+    pub lease_generation: Option<u64>,
 }
 
 impl Default for RemoteImageAttachment {
@@ -361,6 +361,10 @@ pub enum RemoteTerminalInput {
         session_id: String,
         bytes: Vec<u8>,
     },
+    Control {
+        session_id: String,
+        bytes: Vec<u8>,
+    },
     Paste {
         session_id: String,
         text: String,
@@ -368,6 +372,8 @@ pub enum RemoteTerminalInput {
     Image {
         session_id: String,
         attachment: RemoteImageAttachment,
+        #[serde(default)]
+        authority: Option<RemoteWebMutationAuthority>,
     },
     ComposerBatch {
         session_id: String,
@@ -6126,8 +6132,8 @@ mod tests {
         PendingRemoteRequest, RemoteAccessActivityEvent, RemoteAccessActivityKind,
         RemoteAccessSource, RemoteAction, RemoteClientHandle, RemoteClientInner, RemoteHostConfig,
         RemoteHostService, RemoteHostWorkLimiter, RemoteLatencyStats, RemoteMachineState,
-        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteWorkspaceDelta,
-        RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
+        RemoteSessionBootstrap, RemoteSessionStreamEvent, RemoteTerminalInput,
+        RemoteWorkspaceDelta, RemoteWorkspaceSnapshot, ServerMessage, MAX_PENDING_REMOTE_REQUESTS,
     };
     use crate::models::{PortStatus, SessionTab, TabType};
     use crate::remote::presentation::{
@@ -6185,6 +6191,65 @@ mod tests {
         assert!(!state.host.server_id.is_empty());
         assert!(!state.host.pairing_token.is_empty());
         assert_eq!(state.host.port, 43871);
+    }
+
+    #[test]
+    fn native_terminal_input_origins_round_trip_without_losing_provenance() {
+        let inputs = [
+            RemoteTerminalInput::Text {
+                session_id: "session-text".to_string(),
+                text: "typed".to_string(),
+            },
+            RemoteTerminalInput::Paste {
+                session_id: "session-paste".to_string(),
+                text: "pasted".to_string(),
+            },
+            RemoteTerminalInput::Bytes {
+                session_id: "session-bytes".to_string(),
+                bytes: b"\x1b[A".to_vec(),
+            },
+            RemoteTerminalInput::Control {
+                session_id: "session-control".to_string(),
+                bytes: b"\x03".to_vec(),
+            },
+        ];
+
+        for (index, input) in inputs.into_iter().enumerate() {
+            let encoded = rmp_serde::encode::to_vec_named(&ClientMessage::TerminalInput {
+                input,
+                enqueued_at_epoch_ms: 42,
+            })
+            .expect("encode native terminal input");
+            let decoded: ClientMessage =
+                rmp_serde::decode::from_slice(&encoded).expect("decode native terminal input");
+            let ClientMessage::TerminalInput {
+                input,
+                enqueued_at_epoch_ms,
+            } = decoded
+            else {
+                panic!("expected terminal input");
+            };
+            assert_eq!(enqueued_at_epoch_ms, 42);
+            match (index, input) {
+                (0, RemoteTerminalInput::Text { session_id, text }) => {
+                    assert_eq!(session_id, "session-text");
+                    assert_eq!(text, "typed");
+                }
+                (1, RemoteTerminalInput::Paste { session_id, text }) => {
+                    assert_eq!(session_id, "session-paste");
+                    assert_eq!(text, "pasted");
+                }
+                (2, RemoteTerminalInput::Bytes { session_id, bytes }) => {
+                    assert_eq!(session_id, "session-bytes");
+                    assert_eq!(bytes, b"\x1b[A");
+                }
+                (3, RemoteTerminalInput::Control { session_id, bytes }) => {
+                    assert_eq!(session_id, "session-control");
+                    assert_eq!(bytes, b"\x03");
+                }
+                (_, other) => panic!("input origin changed during round trip: {other:?}"),
+            }
+        }
     }
 
     #[test]

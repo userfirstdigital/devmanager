@@ -997,21 +997,30 @@ impl NativeShell {
             move |input, enqueued_at_epoch_ms| {
                 let result = match input {
                     RemoteTerminalInput::Text { session_id, text } => {
-                        input_manager.write_to_session(&session_id, &text)
+                        input_manager.write_user_text_to_session(&session_id, &text)
                     }
                     RemoteTerminalInput::Bytes { session_id, bytes } => {
+                        input_manager.write_user_bytes_to_session(&session_id, &bytes)
+                    }
+                    RemoteTerminalInput::Control { session_id, bytes } => {
                         input_manager.write_bytes_to_session(&session_id, &bytes)
                     }
                     RemoteTerminalInput::Paste { session_id, text } => {
-                        input_manager.paste_to_session(&session_id, &text)
+                        input_manager.paste_user_text_to_session(&session_id, &text)
                     }
                     RemoteTerminalInput::Image {
                         session_id,
                         attachment,
+                        authority,
                     } => crate::remote::web::image_paste::handle_web_image_paste(
                         &input_manager,
                         &session_id,
                         &attachment,
+                        || {
+                            authority.as_ref().is_none_or(|authority| {
+                                input_host_service.web_mutation_authority_is_current(authority)
+                            })
+                        },
                     ),
                     RemoteTerminalInput::ComposerBatch {
                         session_id,
@@ -11135,7 +11144,7 @@ impl NativeShell {
                         return;
                     };
                     if self.remote_mode.is_some() {
-                        self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                        self.remote_send_terminal_input(RemoteTerminalInput::Control {
                             session_id: session_id.clone(),
                             bytes: sequence.to_vec(),
                         });
@@ -11241,7 +11250,7 @@ impl NativeShell {
                             return;
                         };
                         if self.remote_mode.is_some() {
-                            self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                            self.remote_send_terminal_input(RemoteTerminalInput::Control {
                                 session_id,
                                 bytes: sequence.to_vec(),
                             });
@@ -11371,7 +11380,7 @@ impl NativeShell {
                         return;
                     };
                     if self.remote_mode.is_some() {
-                        self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                        self.remote_send_terminal_input(RemoteTerminalInput::Control {
                             session_id,
                             bytes: sequence.to_vec(),
                         });
@@ -11436,7 +11445,7 @@ impl NativeShell {
                     return;
                 };
                 if self.remote_mode.is_some() {
-                    self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                    self.remote_send_terminal_input(RemoteTerminalInput::Control {
                         session_id,
                         bytes: sequence.to_vec(),
                     });
@@ -11741,7 +11750,7 @@ impl NativeShell {
                     {
                         for sequence in sequences {
                             if self.remote_mode.is_some() {
-                                self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                                self.remote_send_terminal_input(RemoteTerminalInput::Control {
                                     session_id: session_id.clone(),
                                     bytes: sequence.to_vec(),
                                 });
@@ -11761,7 +11770,7 @@ impl NativeShell {
             {
                 let sequence = alt_scroll_bytes(delta_lines);
                 if self.remote_mode.is_some() {
-                    self.remote_send_terminal_input(RemoteTerminalInput::Bytes {
+                    self.remote_send_terminal_input(RemoteTerminalInput::Control {
                         session_id,
                         bytes: sequence.to_vec(),
                     });

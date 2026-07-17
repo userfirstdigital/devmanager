@@ -304,7 +304,7 @@ export function SessionScreen({
                 // Claude keeps provider menus open after the web view returns
                 // to native mode. Close the known interaction at that exact
                 // boundary so the next native prompt starts in the composer.
-                sendInput(summary.sessionId, "\u{1b}");
+                sendInput(summary.sessionId, "\u{1b}", "bytes");
               }
               setProviderInteractionLabel(null);
               setTerminalPinned(false);

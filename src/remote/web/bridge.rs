@@ -50,7 +50,8 @@ use super::lease::MutationBegin;
 use super::lease::{LeaseError, WriterLease};
 use super::wire::{
     ComposerAccepted, ComposerAttachment, ComposerRejectCode, ComposerRejected, ResumeRequest,
-    ResumeState, SemanticReplayDescriptor, SemanticReplayPage, WsInbound, WsOutbound,
+    ResumeState, SemanticReplayDescriptor, SemanticReplayPage, WebTerminalInputKind, WsInbound,
+    WsOutbound,
 };
 use super::{authenticate_request, record_browser_connection, request_is_same_origin, WebState};
 use crate::ai::codex_bridge::canonical_codex_composer_prompt;
@@ -1056,7 +1057,7 @@ fn handle_inbound_core(
                 stable_session_key,
                 1,
                 tokio_tx.clone(),
-                |session_id| RemoteTerminalInput::Bytes {
+                |session_id| RemoteTerminalInput::Control {
                     session_id,
                     bytes: vec![0x03],
                 },
@@ -1213,6 +1214,7 @@ fn handle_inbound_core(
         WsInbound::Input {
             session_id,
             text,
+            input_kind,
             expected_lease_generation,
         } => {
             if !valid_session_id(&session_id) || text.len() > MAX_COMPOSER_TEXT_BYTES {
@@ -1238,9 +1240,19 @@ fn handle_inbound_core(
                 stable_session_key,
                 retained_bytes,
                 tokio_tx.clone(),
-                move |current_session_id| RemoteTerminalInput::Text {
-                    session_id: current_session_id,
-                    text,
+                move |current_session_id| match input_kind {
+                    WebTerminalInputKind::Text => RemoteTerminalInput::Text {
+                        session_id: current_session_id,
+                        text,
+                    },
+                    WebTerminalInputKind::Paste => RemoteTerminalInput::Paste {
+                        session_id: current_session_id,
+                        text,
+                    },
+                    WebTerminalInputKind::Bytes => RemoteTerminalInput::Bytes {
+                        session_id: current_session_id,
+                        bytes: text.into_bytes(),
+                    },
                 },
             );
             match result {
@@ -1300,6 +1312,12 @@ fn handle_inbound_core(
                 });
                 return;
             };
+            let authority = Some(RemoteWebMutationAuthority {
+                runtime_instance_id: inner.runtime_instance_id.clone(),
+                connection_id,
+                client_id: client_id.to_string(),
+                lease_generation: expected_lease_generation,
+            });
             let retained_bytes =
                 bytes.len() + mime_type.len() + file_name.as_ref().map_or(0, String::len);
             let result = enqueue_terminal_input(
@@ -1319,6 +1337,7 @@ fn handle_inbound_core(
                         file_name,
                         bytes,
                     },
+                    authority,
                 },
             );
             match result {
@@ -1811,7 +1830,7 @@ pub(crate) fn web_mutation_authority_is_current(
         connection_id: authority.connection_id,
         client_id: authority.client_id.clone(),
         tombstone: Some(tombstone),
-        lease_generation: Some(authority.lease_generation),
+        lease_generation: authority.lease_generation,
         runtime_instance_id: authority.runtime_instance_id.clone(),
     }
     .is_current()
@@ -3356,7 +3375,7 @@ fn dispatch_composer_submit_for_connection(
                                 runtime_instance_id: fence.inner.runtime_instance_id.clone(),
                                 connection_id,
                                 client_id: fence.client_id.clone(),
-                                lease_generation,
+                                lease_generation: Some(lease_generation),
                             },
                         },
                         execution_epoch_ms,
@@ -5561,6 +5580,7 @@ mod tests {
             WsInbound::Input {
                 session_id: "session-a".to_string(),
                 text: "raw".to_string(),
+                input_kind: WebTerminalInputKind::Text,
                 expected_lease_generation: Some(lease.generation),
             },
             &sender,
@@ -9604,7 +9624,14 @@ mod tests {
             std_tx,
             test_web_sender(),
         );
-        claim_legacy_control(&service.inner, connection_id, client_id, false);
+        let lease = acquire_writer_lease(
+            &service.inner,
+            connection_id,
+            client_id,
+            "phone-image",
+            now_epoch_ms(),
+        );
+        assert!(lease.you_are_owner);
 
         let (seen_tx, seen_rx) = std_mpsc::channel::<RemoteTerminalInput>();
         service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
@@ -9622,7 +9649,7 @@ mod tests {
                 mime_type: "image/png".to_string(),
                 file_name: Some("clip.png".to_string()),
                 data_base64: "AQID".to_string(),
-                expected_lease_generation: None,
+                expected_lease_generation: Some(lease.generation),
             },
             &tokio_tx,
         );
@@ -9634,14 +9661,80 @@ mod tests {
             RemoteTerminalInput::Image {
                 session_id,
                 attachment,
+                authority,
             } => {
                 assert_eq!(session_id, "claude-1");
                 assert_eq!(attachment.mime_type, "image/png");
                 assert_eq!(attachment.file_name.as_deref(), Some("clip.png"));
                 assert_eq!(attachment.bytes, vec![1, 2, 3]);
+                let authority = authority.expect("modern image carries post-staging authority");
+                assert_eq!(
+                    authority.runtime_instance_id,
+                    service.inner.runtime_instance_id
+                );
+                assert_eq!(authority.connection_id, connection_id);
+                assert_eq!(authority.client_id, client_id);
+                assert_eq!(authority.lease_generation, Some(lease.generation));
             }
             other => panic!("unexpected input: {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_paste_image_keeps_a_post_staging_connection_authority() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "claude-legacy-image");
+        let connection_id = 15;
+        let client_id = "legacy-image-client";
+        pair_web_client(&service, client_id);
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(
+            &service.inner,
+            connection_id,
+            client_id,
+            std_tx,
+            test_web_sender(),
+        );
+        claim_legacy_control(&service.inner, connection_id, client_id, false);
+
+        let (seen_tx, seen_rx) = std_mpsc::channel::<RemoteTerminalInput>();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            seen_tx.send(input).expect("forwarded legacy input");
+            Ok(())
+        })));
+
+        let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel::<ServerMessage>();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::PasteImage {
+                session_id: "claude-legacy-image".to_string(),
+                mime_type: "image/png".to_string(),
+                file_name: None,
+                data_base64: "AQID".to_string(),
+                expected_lease_generation: None,
+            },
+            &tokio_tx,
+        );
+
+        let RemoteTerminalInput::Image { authority, .. } = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("legacy image forwarded")
+        else {
+            panic!("expected image input");
+        };
+        let authority = authority.expect("legacy image needs a post-staging connection fence");
+        assert_eq!(authority.lease_generation, None);
+        assert!(web_mutation_authority_is_current(
+            &service.inner,
+            &authority
+        ));
+        unregister_client(&service.inner, connection_id, client_id);
+        assert!(!web_mutation_authority_is_current(
+            &service.inner,
+            &authority
+        ));
     }
 
     #[test]
@@ -9682,6 +9775,7 @@ mod tests {
                 WsInbound::Input {
                     session_id: "session-a".to_string(),
                     text: text.to_string(),
+                    input_kind: WebTerminalInputKind::Text,
                     expected_lease_generation: None,
                 },
                 &tokio_tx,
@@ -9707,6 +9801,7 @@ mod tests {
             WsInbound::Input {
                 session_id: "session-a".to_string(),
                 text: "still-owner".to_string(),
+                input_kind: WebTerminalInputKind::Text,
                 expected_lease_generation: None,
             },
             &tokio_tx,
@@ -9714,6 +9809,68 @@ mod tests {
         assert!(matches!(
             seen_rx.recv_timeout(Duration::from_secs(1)),
             Ok(RemoteTerminalInput::Text { text, .. }) if text == "still-owner"
+        ));
+    }
+
+    #[test]
+    fn web_input_kind_maps_to_matching_native_user_origin_variant() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "session-a");
+        let client_id = "input-origin-owner";
+        let connection_id = 1;
+        pair_web_client(&service, client_id);
+        let (std_tx, _std_rx) = std_mpsc::channel::<ServerMessage>();
+        register_client(
+            &service.inner,
+            connection_id,
+            client_id,
+            std_tx,
+            test_web_sender(),
+        );
+        let (tokio_tx, _tokio_rx) = tokio_mpsc::unbounded_channel();
+        handle_inbound(
+            &service.inner,
+            connection_id,
+            client_id,
+            WsInbound::ClaimControlIfAvailable,
+            &tokio_tx,
+        );
+        let (seen_tx, seen_rx) = std_mpsc::channel();
+        service.set_terminal_input_handler(Some(Arc::new(move |input, _| {
+            seen_tx.send(input).expect("captured input");
+            Ok(())
+        })));
+
+        for (text, input_kind) in [
+            ("typed", WebTerminalInputKind::Text),
+            ("pasted", WebTerminalInputKind::Paste),
+            ("\u{1b}[A", WebTerminalInputKind::Bytes),
+        ] {
+            handle_inbound(
+                &service.inner,
+                connection_id,
+                client_id,
+                WsInbound::Input {
+                    session_id: "session-a".to_string(),
+                    text: text.to_string(),
+                    input_kind,
+                    expected_lease_generation: None,
+                },
+                &tokio_tx,
+            );
+        }
+
+        assert!(matches!(
+            seen_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(RemoteTerminalInput::Text { text, .. }) if text == "typed"
+        ));
+        assert!(matches!(
+            seen_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(RemoteTerminalInput::Paste { text, .. }) if text == "pasted"
+        ));
+        assert!(matches!(
+            seen_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(RemoteTerminalInput::Bytes { bytes, .. }) if bytes == b"\x1b[A"
         ));
     }
 
@@ -9751,6 +9908,7 @@ mod tests {
                 WsInbound::Input {
                     session_id: "session-a".to_string(),
                     text: format!("connection-{connection_id}"),
+                    input_kind: WebTerminalInputKind::Text,
                     expected_lease_generation: Some(generation),
                 },
                 &tokio_tx,
@@ -9815,7 +9973,7 @@ mod tests {
         );
         assert!(matches!(
             seen_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(RemoteTerminalInput::Bytes { session_id, bytes })
+            Ok(RemoteTerminalInput::Control { session_id, bytes })
                 if session_id == "session-a" && bytes == vec![0x03]
         ));
         assert!(seen_rx.try_recv().is_err());
@@ -9851,6 +10009,7 @@ mod tests {
             WsInbound::Input {
                 session_id: "session-a".to_string(),
                 text: "x".repeat(MAX_COMPOSER_TEXT_BYTES + 1),
+                input_kind: WebTerminalInputKind::Text,
                 expected_lease_generation: None,
             },
             &tokio_tx,

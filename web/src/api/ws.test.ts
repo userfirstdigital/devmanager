@@ -311,6 +311,7 @@ describe("WsClient request handling", () => {
         type: "input",
         sessionId: "pty-a",
         text: "hello",
+        inputKind: "paste",
       }),
     ).toBe(true);
     expect(jsonFrames(socket).filter((frame) => frame.type === "input")).toEqual([]);
@@ -343,6 +344,7 @@ describe("WsClient request handling", () => {
         type: "input",
         sessionId: "pty-a",
         text: "hello",
+        inputKind: "paste",
         expectedLeaseGeneration: 12,
       },
     ]);

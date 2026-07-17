@@ -30,6 +30,7 @@ export interface SessionDimensions {
 export type WebAiKind = "claude" | "codex";
 export type WebTabKind = "server" | "claude" | "codex" | "ssh";
 export type WebSessionKind = "shell" | WebTabKind;
+export type WebTerminalInputKind = "text" | "paste" | "bytes";
 
 export interface WebWriterLeaseState {
   ownerClientInstanceId: string | null;
@@ -322,6 +323,7 @@ export type WsInbound =
       type: "input";
       sessionId: string;
       text: string;
+      inputKind?: WebTerminalInputKind;
       expectedLeaseGeneration?: number;
     }
   | {

@@ -103,12 +103,22 @@ pub struct ComposerRejected {
     pub writer_lease: WebWriterLeaseState,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WebTerminalInputKind {
+    #[default]
+    Text,
+    Paste,
+    Bytes,
+}
+
 /// Messages the browser sends to the host over the `/api/ws` text channel.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum WsInbound {
     Resume {
@@ -158,6 +168,8 @@ pub enum WsInbound {
     Input {
         session_id: String,
         text: String,
+        #[serde(default)]
+        input_kind: WebTerminalInputKind,
         #[serde(default)]
         expected_lease_generation: Option<u64>,
     },
@@ -304,14 +316,46 @@ mod tests {
             WsInbound::Input {
                 session_id,
                 text,
+                input_kind,
                 expected_lease_generation,
             } => {
                 assert_eq!(session_id, "srv-1");
                 assert_eq!(text, "echo hi\n");
+                assert_eq!(input_kind, WebTerminalInputKind::Text);
                 assert_eq!(expected_lease_generation, None);
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn inbound_input_preserves_explicit_user_origin_kinds_and_rejects_mixed_payloads() {
+        for (wire_kind, expected) in [
+            ("text", WebTerminalInputKind::Text),
+            ("paste", WebTerminalInputKind::Paste),
+            ("bytes", WebTerminalInputKind::Bytes),
+        ] {
+            let parsed: WsInbound = serde_json::from_value(json!({
+                "type": "input",
+                "sessionId": "claude-1",
+                "text": "payload",
+                "inputKind": wire_kind
+            }))
+            .expect("parse explicit input kind");
+            let WsInbound::Input { input_kind, .. } = parsed else {
+                panic!("expected input");
+            };
+            assert_eq!(input_kind, expected);
+        }
+
+        let mixed = serde_json::from_value::<WsInbound>(json!({
+            "type": "input",
+            "sessionId": "claude-1",
+            "text": "payload",
+            "inputKind": "bytes",
+            "bytes": [27]
+        }));
+        assert!(mixed.is_err(), "mixed text/bytes payload must be rejected");
     }
 
     #[test]

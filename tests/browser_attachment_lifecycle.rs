@@ -12,12 +12,16 @@ fn native_terminal_user_input_routes_only_explicit_user_origins() {
         .map(|offset| remote_start + offset)
         .expect("end of remote terminal input handler region");
     let remote_handler = &app[remote_start..remote_end];
-    assert!(remote_handler.contains("input_manager.write_to_session(&session_id, &text)"));
+    assert!(remote_handler.contains("input_manager.write_user_text_to_session(&session_id, &text)"));
+    assert!(
+        remote_handler.contains("input_manager.write_user_bytes_to_session(&session_id, &bytes)")
+    );
+    assert!(remote_handler.contains("input_manager.paste_user_text_to_session(&session_id, &text)"));
+    assert!(remote_handler.contains("RemoteTerminalInput::Control"));
     assert!(remote_handler.contains("input_manager.write_bytes_to_session(&session_id, &bytes)"));
-    assert!(remote_handler.contains("input_manager.paste_to_session(&session_id, &text)"));
-    assert!(!remote_handler.contains("write_user_text_to_session"));
-    assert!(!remote_handler.contains("write_user_bytes_to_session"));
-    assert!(!remote_handler.contains("paste_user_text_to_session"));
+    assert!(!remote_handler.contains("input_manager.write_to_session(&session_id, &text)"));
+    assert!(!remote_handler.contains("input_manager.paste_to_session(&session_id, &text)"));
+    assert!(remote_handler.contains("web_mutation_authority_is_current(authority)"));
 
     let local_start = app
         .find("TerminalKeyAction::Paste =>")
@@ -64,8 +68,28 @@ fn native_terminal_user_input_routes_only_explicit_user_origins() {
 
     assert!(app.contains("write_to_session(session_id, \"yes\\r\")"));
     assert!(app.contains("write_bytes_to_session(&session_id, &sequence)"));
-    assert!(image_paste.contains("process_manager.paste_to_session"));
-    assert!(!image_paste.contains("paste_user_text_to_session"));
+    assert_eq!(
+        app.matches("remote_send_terminal_input(RemoteTerminalInput::Bytes {")
+            .count(),
+        1,
+        "only the explicit native user RawBytes boundary may use Bytes"
+    );
+    assert_eq!(
+        app.matches("remote_send_terminal_input(RemoteTerminalInput::Control {")
+            .count(),
+        6,
+        "mouse and scroll protocol sequences must stay generic"
+    );
+    assert!(image_paste.contains("process_manager.paste_user_text_to_session"));
+    assert!(!image_paste.contains("process_manager.paste_to_session"));
+    let composer = source_region(
+        image_paste,
+        "pub(crate) fn handle_web_composer_batch",
+        "fn execute_web_composer_batch",
+    );
+    assert!(composer.contains("process_manager.write_user_text_to_session"));
+    assert!(composer.contains("process_manager.write_to_session"));
+    assert!(!composer.contains("write_user_bytes_to_session"));
 }
 
 fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {

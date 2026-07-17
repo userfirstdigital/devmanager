@@ -178,7 +178,7 @@ describe("session slash command integration", () => {
     await screen.findByLabelText("Raw provider interaction");
     await user.click(screen.getByRole("button", { name: /return to native conversation/i }));
 
-    expect(sendInput).toHaveBeenCalledWith("pty-ai-a", "\u{1b}");
+    expect(sendInput).toHaveBeenCalledWith("pty-ai-a", "\u{1b}", "bytes");
     expect(screen.getByLabelText("Native AI conversation")).toBeTruthy();
   });
 

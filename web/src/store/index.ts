@@ -17,6 +17,7 @@ import {
   type WebActionPayload,
   type WebImagePastePayload,
   type WebSessionSummary,
+  type WebTerminalInputKind,
   type WebWorkspaceSnapshot,
   type WebWriterLeaseState,
   type WsOutbound,
@@ -150,7 +151,7 @@ export interface StoreState {
   refreshActiveConnection(): void;
   prepareComposer(): void;
   interruptSession(stableSessionKey: StableSessionKey): void;
-  sendInput(sessionId: string, text: string): void;
+  sendInput(sessionId: string, text: string, inputKind?: WebTerminalInputKind): void;
   pasteImage(sessionId: string, payload: WebImagePastePayload): void;
   sendResize(sessionId: string, rows: number, cols: number): void;
   launchAiTab(projectId: string, tabType: "claude" | "codex"): Promise<void>;
@@ -1790,11 +1791,12 @@ export const useStore = create<StoreState>((set, get) => {
       }
     },
 
-    sendInput(sessionId, text) {
+    sendInput(sessionId, text, inputKind = "text") {
       const accepted = get().client?.sendWithWriterLease({
         type: "input",
         sessionId,
         text,
+        inputKind,
       });
       if (accepted === false) {
         set({ lastError: "Too much terminal input is waiting to be sent." });

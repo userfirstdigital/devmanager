@@ -1611,6 +1611,35 @@ describe("safe compatibility and raw terminal IO", () => {
     expect(JSON.stringify(state.snapshot)).not.toContain("password");
   });
 
+  it("emits one explicit wire frame for each terminal input provenance", () => {
+    useStore.getState().init();
+    useStore.getState().applySnapshot(makeSnapshot());
+    const client = wsClientState.instance;
+
+    useStore.getState().sendInput("pty-a", "typed", "text");
+    useStore.getState().sendInput("pty-a", "pasted", "paste");
+    useStore.getState().sendInput("pty-a", "\u001b[A", "bytes");
+
+    expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(1, {
+      type: "input",
+      sessionId: "pty-a",
+      text: "typed",
+      inputKind: "text",
+    });
+    expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(2, {
+      type: "input",
+      sessionId: "pty-a",
+      text: "pasted",
+      inputKind: "paste",
+    });
+    expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(3, {
+      type: "input",
+      sessionId: "pty-a",
+      text: "\u001b[A",
+      inputKind: "bytes",
+    });
+  });
+
   it("stages raw input and safe actions for automatic writer acquisition", () => {
     useStore.getState().init();
     useStore.getState().applySnapshot(makeSnapshot());
@@ -1629,6 +1658,7 @@ describe("safe compatibility and raw terminal IO", () => {
       type: "input",
       sessionId: "pty-a",
       text: "ls\r",
+      inputKind: "text",
     });
     expect(client?.sendWithWriterLease).toHaveBeenNthCalledWith(2, {
       type: "pasteImage",

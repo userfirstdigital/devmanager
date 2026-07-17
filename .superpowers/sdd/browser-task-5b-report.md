@@ -2,7 +2,7 @@
 
 ## Status
 
-Task 5B is implemented through checkpoint 4C1, including two independent-review hardening follow-ups, and awaits re-review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local native exactly-once PTY attachment, authoritative AppState/host projection with attachment pin reconciliation, and native pending-annotation chips/preview/remove UI are implemented. Remote web input wiring remains intentionally out of scope here.
+Task 5B is implemented through checkpoint 4C2 and awaits independent review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local and remote exactly-once PTY attachment delivery, authoritative AppState/host projection with attachment pin reconciliation, native pending-annotation chips/preview/remove UI, and remote web input/composer provenance are implemented.
 
 ## Commit range
 
@@ -14,6 +14,7 @@ Task 5B is implemented through checkpoint 4C1, including two independent-review 
 - Checkpoint 4C1 native pending-annotation chips: this checkpoint commit
 - Checkpoint 4C1 independent-review hardening: this follow-up commit
 - Checkpoint 4C1 terminal-model notice lifecycle hardening: this second follow-up commit
+- Checkpoint 4C2 remote user-input and composer provenance: this checkpoint commit
 - Branch: `master`, explicitly authorized by the user
 
 ## Authenticated MCP architecture
@@ -58,8 +59,7 @@ Task 5B is implemented through checkpoint 4C1, including two independent-review 
 
 ## Remaining Task 5B work
 
-- Wire remote web composer/input without changing its established wire contract.
-- Complete re-review of checkpoint 4C1 hardening.
+- Complete independent review of checkpoint 4C1 hardening and checkpoint 4C2.
 
 ## Checkpoint 4A: attachment transaction core
 
@@ -316,4 +316,29 @@ Checkpoint 4B must wire the broker into ProcessManager session lifecycle, explic
 - `cargo fmt --all -- --check` - PASS.
 - `git diff --check` - PASS (only existing LF-to-CRLF working-copy notices).
 - `cargo check --locked --lib` - PASS with no Rust warnings.
+- Windows `cargo build --locked` - PASS with no Rust warnings.
+
+## Checkpoint 4C2: remote user-input and composer provenance
+
+- Native remote `Text`, `Paste`, and user `Bytes` now reach the matching ProcessManager user-origin transaction. A distinct internal `Control` variant keeps host interrupts plus native mouse and scroll protocol sequences on generic PTY writes. Native MessagePack round-trip coverage proves all four origins survive transport.
+- The additive web `inputKind` wire field carries `text | paste | bytes`; omitted legacy frames default to `text`, and mixed text/byte-shaped payloads are rejected. Xterm classifies printable keyboard/IME text as Text and C0/C1/DEL/control sequences as Bytes. The capture-phase clipboard handler suppresses xterm's fallback and emits exactly one Paste frame; mobile helpers and provider Escape emit Bytes. Queued writer-lease retry preserves the frame unchanged and does not duplicate it.
+- Image paste stages first, then rechecks the exact web authority before its final prompt-reference Paste. Modern frames retain the lease generation; legacy frames retain an exact connection/controller fence. Authority loss or first user-write failure removes the staged file and leaves pending annotation IDs retryable; success performs one user-origin paste and keeps the referenced file.
+- Composer staging and its authority check precede delivery. Codex's preliminary Escape is generic. An ordinary prompt/reference is one compound user write; a slash command makes exactly its first `/` user-origin while leading whitespace, remaining token characters/arguments, autocomplete separators, Escape, Enter, and Claude's optional second Enter remain generic.
+- The broker commits after the first real prompt write succeeds. A first-write failure rolls back staged files and leaves the exact annotation reservation retryable. Failures in later control writes preserve the committed delivery and staged references. Existing mutation-ID reservation/deduplication remains the outer exactly-once boundary for reconnect and identical retry; conflicts still reject before PTY delivery.
+
+### Checkpoint 4C2 RED / GREEN evidence
+
+- Wire RED failed to compile on the absent `WebTerminalInputKind`/`input_kind`; bridge RED then observed Paste arriving as Text. GREEN covers explicit Text/Paste/Bytes, legacy defaulting, mixed-payload rejection, matching native variants, and MessagePack provenance round trips.
+- Web RED failed on the missing classifier/paste helper and missing `inputKind`; mobile/provider regressions observed two-argument Text calls. GREEN covers printable/control classification, exactly one clipboard Paste, explicit store frames, mobile/control Bytes, and writer-lease queue preservation.
+- Image/composer RED failed on the absent transactional executors, authority field, write-origin callback, and generic Control variant. GREEN covers staging cleanup, modern and legacy post-staging authority fences, first-write retry, successful single consumption, slash/concurrent-annotation behavior, generic Codex/control writes, later-Enter failure, and existing composer deduplication/conflict behavior.
+- Self-review RED found seven native remote `Bytes` constructions where only the explicit user RawBytes boundary should remain; six mouse/scroll protocol sequences now use `Control`. A second RED proved legacy image paste carried no post-staging fence; it now revalidates the exact legacy connection and becomes invalid immediately on disconnect.
+
+### Checkpoint 4C2 verification
+
+- Full Rust library suite - PASS, 604/604.
+- Remote wire suite - PASS, 15/15; remote bridge suite - PASS, 99/99; image/composer module - PASS, 15/15.
+- ProcessManager attachment suite - PASS, 70/70; attachment broker - PASS, 15/15; terminal session - PASS, 12/12; attachment lifecycle - PASS, 3/3.
+- Browser integration matrix - PASS, 173/173: annotations 5, automation 12, core 17, gateway 14, host 82, pane 32, provider 5, pending-annotation terminal UI 6.
+- Web Vitest - PASS, 48 files / 291 tests; TypeScript typecheck and production PWA bundle build - PASS.
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo check --locked --lib`, and `cargo check --locked --all-targets` - PASS.
 - Windows `cargo build --locked` - PASS with no Rust warnings.

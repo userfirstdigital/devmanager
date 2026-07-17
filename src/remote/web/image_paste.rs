@@ -20,10 +20,17 @@ pub(crate) struct StagedImageAttachment {
     pub prompt_reference: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerWriteOrigin {
+    UserText,
+    Generic,
+}
+
 pub(crate) fn handle_web_image_paste(
     process_manager: &ProcessManager,
     session_id: &str,
     attachment: &RemoteImageAttachment,
+    authorize: impl FnOnce() -> bool,
 ) -> Result<(), String> {
     let runtime = process_manager.runtime_state();
     let session = runtime
@@ -31,8 +38,28 @@ pub(crate) fn handle_web_image_paste(
         .get(session_id)
         .cloned()
         .ok_or_else(|| format!("Unknown terminal session: {session_id}"))?;
-    let staged = stage_web_image_for_session(&session, attachment)?;
-    process_manager.paste_to_session(session_id, &format!("{} ", staged.prompt_reference))
+    execute_web_image_paste(&session, attachment, authorize, |reference| {
+        process_manager.paste_user_text_to_session(session_id, reference)
+    })
+}
+
+fn execute_web_image_paste(
+    session: &SessionRuntimeState,
+    attachment: &RemoteImageAttachment,
+    authorize: impl FnOnce() -> bool,
+    paste_user: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let staged = stage_web_image_for_session(session, attachment)?;
+    if !authorize() {
+        rollback_staged_images(std::slice::from_ref(&staged));
+        return Err(WEB_COMPOSER_AUTHORITY_CHANGED.to_string());
+    }
+    let reference = format!("{} ", staged.prompt_reference);
+    if let Err(error) = paste_user(&reference) {
+        rollback_staged_images(std::slice::from_ref(&staged));
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_web_composer_batch(
@@ -48,9 +75,18 @@ pub(crate) fn handle_web_composer_batch(
         .get(session_id)
         .cloned()
         .ok_or_else(|| format!("Unknown terminal session: {session_id}"))?;
-    execute_web_composer_batch(&session, attachments, text, authorize, |prompt| {
-        process_manager.write_to_session(session_id, prompt)
-    })
+    execute_web_composer_batch(
+        &session,
+        attachments,
+        text,
+        authorize,
+        |origin, prompt| match origin {
+            ComposerWriteOrigin::UserText => {
+                process_manager.write_user_text_to_session(session_id, prompt)
+            }
+            ComposerWriteOrigin::Generic => process_manager.write_to_session(session_id, prompt),
+        },
+    )
 }
 
 fn execute_web_composer_batch(
@@ -58,7 +94,7 @@ fn execute_web_composer_batch(
     attachments: &[RemoteImageAttachment],
     text: &str,
     authorize: impl FnOnce() -> bool,
-    mut write: impl FnMut(&str) -> Result<(), String>,
+    mut write: impl FnMut(ComposerWriteOrigin, &str) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut staged = Vec::with_capacity(attachments.len());
     for attachment in attachments {
@@ -96,7 +132,7 @@ fn execute_web_composer_batch(
         // Native mode can be restored while the provider TUI still owns a
         // model, status, or other full-screen interaction. Exit that screen
         // before writing the next prompt so the provider cannot discard it.
-        if let Err(error) = write("\u{1b}") {
+        if let Err(error) = write(ComposerWriteOrigin::Generic, "\u{1b}") {
             rollback_staged_images(&staged);
             return Err(error);
         }
@@ -105,7 +141,7 @@ fn execute_web_composer_batch(
     let prompt_result = if type_slash_command {
         write_slash_command_prompt(&prompt, &mut write)
     } else {
-        write(&prompt)
+        write(ComposerWriteOrigin::UserText, &prompt)
     };
     if let Err(error) = prompt_result {
         rollback_staged_images(&staged);
@@ -124,17 +160,17 @@ fn execute_web_composer_batch(
             // expanding a suggestion. Both providers ignore the whitespace
             // when executing, and the longer settle lets queued ConPTY writes
             // reach the TUI before Enter is delivered.
-            write(" ")?;
+            write(ComposerWriteOrigin::Generic, " ")?;
             std::thread::sleep(Duration::from_millis(500));
         } else if matches!(session.session_kind, crate::state::SessionKind::Codex) {
             // Codex can keep pasted text in its multiline editor. Escape
             // returns it to the composer before Enter submits the prompt as a
             // distinct key event. Claude instead clears a composed prompt when
             // Escape is sent here, so it omits this post-text key entirely.
-            write("\u{1b}")?;
+            write(ComposerWriteOrigin::Generic, "\u{1b}")?;
             std::thread::sleep(Duration::from_millis(120));
         }
-        write(submit)?;
+        write(ComposerWriteOrigin::Generic, submit)?;
         if type_slash_command
             && matches!(session.session_kind, crate::state::SessionKind::Claude)
             && slash_command_has_no_arguments(text)
@@ -144,7 +180,7 @@ fn execute_web_composer_batch(
             // executes the now-complete exact command. Argument-bearing
             // commands already dismissed autocomplete and must submit once.
             std::thread::sleep(Duration::from_millis(180));
-            write(submit)?;
+            write(ComposerWriteOrigin::Generic, submit)?;
         }
     }
     Ok(())
@@ -166,23 +202,28 @@ fn slash_command_has_no_arguments(text: &str) -> bool {
 
 fn write_slash_command_prompt(
     prompt: &str,
-    write: &mut impl FnMut(&str) -> Result<(), String>,
+    write: &mut impl FnMut(ComposerWriteOrigin, &str) -> Result<(), String>,
 ) -> Result<(), String> {
     let trimmed = prompt.trim_start();
     let leading_len = prompt.len() - trimmed.len();
     if leading_len > 0 {
-        write(&prompt[..leading_len])?;
+        write(ComposerWriteOrigin::Generic, &prompt[..leading_len])?;
     }
     let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    for character in trimmed[..token_end].chars() {
+    for (index, character) in trimmed[..token_end].chars().enumerate() {
         let mut encoded = [0_u8; 4];
-        write(character.encode_utf8(&mut encoded))?;
+        let origin = if index == 0 {
+            ComposerWriteOrigin::UserText
+        } else {
+            ComposerWriteOrigin::Generic
+        };
+        write(origin, character.encode_utf8(&mut encoded))?;
         // Keep each command-token byte outside the PTY/channel coalescing
         // window so provider TUIs treat it as typing rather than a paste.
         std::thread::sleep(Duration::from_millis(100));
     }
     if token_end < trimmed.len() {
-        write(&trimmed[token_end..])?;
+        write(ComposerWriteOrigin::Generic, &trimmed[token_end..])?;
     }
     Ok(())
 }
@@ -306,6 +347,9 @@ fn cleanup_staged_images(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::{
+        BrowserAttachmentBroker, BrowserPromptInput, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    };
     use crate::state::{SessionDimensions, SessionKind};
     use crate::terminal::session::TerminalBackend;
 
@@ -362,6 +406,90 @@ mod tests {
     }
 
     #[test]
+    fn image_paste_preserves_reservation_and_cleans_staging_until_user_write_succeeds() {
+        let cwd = temp_test_dir("web-image-paste-transaction");
+        let mut session = SessionRuntimeState::new(
+            "claude-image",
+            cwd.clone(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        let attachment = RemoteImageAttachment {
+            mime_type: "image/png".to_string(),
+            file_name: Some("transaction.png".to_string()),
+            bytes: vec![1, 2, 3],
+        };
+        let broker = BrowserAttachmentBroker::default();
+        let workspace_key = BrowserWorkspaceKey::new("project", "conversation").unwrap();
+        broker.observe_workspace(workspace_key.clone(), &attachment_snapshot("ann-image"));
+        broker.bind_session("claude-image", workspace_key.clone());
+
+        let writes = std::sync::atomic::AtomicUsize::new(0);
+        let authority_error = execute_web_image_paste(
+            &session,
+            &attachment,
+            || false,
+            |_| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("lost authority rejects staged image");
+        assert_eq!(authority_error, WEB_COMPOSER_AUTHORITY_CHANGED);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            broker.projection(&workspace_key).pending_annotation_ids,
+            ["ann-image"]
+        );
+        assert_staging_empty(&cwd);
+
+        let write_error = execute_web_image_paste(
+            &session,
+            &attachment,
+            || true,
+            |reference| {
+                let reservation = broker
+                    .reserve_for_input("claude-image", BrowserPromptInput::Paste(reference))
+                    .expect("image reference reserves pending annotation");
+                assert!(reservation.preamble().contains("ann-image"));
+                broker.rollback(reservation).unwrap();
+                Err("fixture first user write failed".to_string())
+            },
+        )
+        .expect_err("first user write failure is retryable");
+        assert_eq!(write_error, "fixture first user write failed");
+        assert_eq!(
+            broker.projection(&workspace_key).pending_annotation_ids,
+            ["ann-image"]
+        );
+        assert_staging_empty(&cwd);
+
+        let kept_path = std::sync::Mutex::new(None);
+        execute_web_image_paste(
+            &session,
+            &attachment,
+            || true,
+            |reference| {
+                let reservation = broker
+                    .reserve_for_input("claude-image", BrowserPromptInput::Paste(reference))
+                    .expect("retry reserves pending annotation");
+                assert!(reservation.preamble().contains("ann-image"));
+                broker.commit(reservation).unwrap();
+                *kept_path.lock().unwrap() =
+                    Some(cwd.join(reference.trim().trim_start_matches('@')));
+                Ok(())
+            },
+        )
+        .expect("successful image reference write");
+        assert!(broker
+            .projection(&workspace_key)
+            .pending_annotation_ids
+            .is_empty());
+        assert!(kept_path.lock().unwrap().as_ref().unwrap().is_file());
+    }
+
+    #[test]
     fn composer_batch_rolls_back_when_second_attachment_fails_before_any_pty_write() {
         let cwd = temp_test_dir("web-composer-batch-rollback");
         let mut session = SessionRuntimeState::new(
@@ -390,7 +518,7 @@ mod tests {
             &attachments,
             "hello\r",
             || true,
-            |_| {
+            |_, _| {
                 writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             },
@@ -434,7 +562,7 @@ mod tests {
             &attachments,
             "hello\r",
             || true,
-            |prompt| {
+            |_, prompt| {
                 observed_writes.lock().unwrap().push(prompt.to_string());
                 Ok(())
             },
@@ -480,8 +608,11 @@ mod tests {
                 &[],
                 prompt,
                 || true,
-                |text| {
-                    observed_writes.lock().unwrap().push(text.to_string());
+                |origin, text| {
+                    observed_writes
+                        .lock()
+                        .unwrap()
+                        .push((origin, text.to_string()));
                     Ok(())
                 },
             )
@@ -489,16 +620,21 @@ mod tests {
         }
 
         assert_eq!(
-            *observed_writes.lock().unwrap(),
+            observed_writes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(origin, text)| (*origin, text.as_str()))
+                .collect::<Vec<_>>(),
             [
-                "\u{1b}",
-                "first prompt",
-                "\u{1b}",
-                "\r",
-                "\u{1b}",
-                "second prompt",
-                "\u{1b}",
-                "\r",
+                (ComposerWriteOrigin::Generic, "\u{1b}"),
+                (ComposerWriteOrigin::UserText, "first prompt"),
+                (ComposerWriteOrigin::Generic, "\u{1b}"),
+                (ComposerWriteOrigin::Generic, "\r"),
+                (ComposerWriteOrigin::Generic, "\u{1b}"),
+                (ComposerWriteOrigin::UserText, "second prompt"),
+                (ComposerWriteOrigin::Generic, "\u{1b}"),
+                (ComposerWriteOrigin::Generic, "\r"),
             ]
         );
     }
@@ -520,7 +656,7 @@ mod tests {
             &[],
             "unfinished",
             || true,
-            |text| {
+            |_, text| {
                 observed_writes.lock().unwrap().push(text.to_string());
                 Ok(())
             },
@@ -560,7 +696,7 @@ mod tests {
             &[],
             "/model\r",
             || true,
-            |text| {
+            |_, text| {
                 observed_writes.lock().unwrap().push(text.to_string());
                 Ok(())
             },
@@ -590,7 +726,7 @@ mod tests {
             &[],
             "/model\r",
             || true,
-            |text| {
+            |_, text| {
                 observed_writes.lock().unwrap().push(text.to_string());
                 Ok(())
             },
@@ -620,7 +756,7 @@ mod tests {
             &[],
             "/status\r",
             || true,
-            |text| {
+            |_, text| {
                 observed_writes.lock().unwrap().push(text.to_string());
                 Ok(())
             },
@@ -650,7 +786,7 @@ mod tests {
             &[],
             "/model opus\r",
             || true,
-            |text| {
+            |_, text| {
                 observed_writes.lock().unwrap().push(text.to_string());
                 Ok(())
             },
@@ -685,7 +821,7 @@ mod tests {
             &attachments,
             "hello\r",
             || false,
-            |_| {
+            |_, _| {
                 writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             },
@@ -700,11 +836,182 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slash_composer_consumes_on_first_slash_and_preserves_a_concurrent_annotation() {
+        let cwd = temp_test_dir("web-composer-slash-origin");
+        let mut session = SessionRuntimeState::new(
+            "claude-slash-origin",
+            cwd,
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        let broker = BrowserAttachmentBroker::default();
+        let workspace_key = BrowserWorkspaceKey::new("project", "conversation").unwrap();
+        broker.observe_workspace(workspace_key.clone(), &attachment_snapshot("ann-first"));
+        broker.bind_session("claude-slash-origin", workspace_key.clone());
+        let observed = std::sync::Mutex::new(Vec::new());
+
+        execute_web_composer_batch(
+            &session,
+            &[],
+            "  /model\r",
+            || true,
+            |origin, text| {
+                let mut prefix = String::new();
+                if origin == ComposerWriteOrigin::UserText {
+                    let reservation = broker
+                        .reserve_for_input("claude-slash-origin", BrowserPromptInput::Text(text))
+                        .expect("first slash reserves current pending annotation");
+                    prefix = reservation.preamble().to_string();
+                    broker.observe_workspace(
+                        workspace_key.clone(),
+                        &attachment_snapshot("ann-later"),
+                    );
+                    broker.commit(reservation).unwrap();
+                }
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((origin, text.to_string(), prefix));
+                Ok(())
+            },
+        )
+        .expect("slash command writes");
+
+        let observed = observed.lock().unwrap();
+        let user_writes = observed
+            .iter()
+            .filter(|(origin, _, _)| *origin == ComposerWriteOrigin::UserText)
+            .collect::<Vec<_>>();
+        assert_eq!(user_writes.len(), 1);
+        assert_eq!(user_writes[0].1, "/");
+        assert!(user_writes[0].2.contains("ann-first"));
+        assert!(observed
+            .iter()
+            .any(|(origin, text, _)| { *origin == ComposerWriteOrigin::Generic && text == "  " }));
+        assert!(observed
+            .iter()
+            .filter(|(origin, _, _)| *origin == ComposerWriteOrigin::Generic)
+            .all(|(_, _, prefix)| prefix.is_empty()));
+        assert_eq!(
+            broker.projection(&workspace_key).pending_annotation_ids,
+            ["ann-later"]
+        );
+    }
+
+    #[test]
+    fn ordinary_composer_retries_first_user_write_but_keeps_commit_after_enter_failure() {
+        let cwd = temp_test_dir("web-composer-ordinary-transaction");
+        let mut session = SessionRuntimeState::new(
+            "claude-ordinary-origin",
+            cwd.clone(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        session.session_kind = SessionKind::Claude;
+        let attachments = [RemoteImageAttachment {
+            mime_type: "image/png".to_string(),
+            file_name: Some("ordinary.png".to_string()),
+            bytes: vec![1, 2, 3],
+        }];
+        let broker = BrowserAttachmentBroker::default();
+        let workspace_key = BrowserWorkspaceKey::new("project", "ordinary").unwrap();
+        broker.observe_workspace(workspace_key.clone(), &attachment_snapshot("ann-ordinary"));
+        broker.bind_session("claude-ordinary-origin", workspace_key.clone());
+
+        let first_error = execute_web_composer_batch(
+            &session,
+            &attachments,
+            "first try\r",
+            || true,
+            |origin, text| {
+                assert_eq!(origin, ComposerWriteOrigin::UserText);
+                let reservation = broker
+                    .reserve_for_input("claude-ordinary-origin", BrowserPromptInput::Text(text))
+                    .expect("first prompt reserves annotation");
+                broker.rollback(reservation).unwrap();
+                Err("fixture first prompt write failed".to_string())
+            },
+        )
+        .expect_err("first user write fails");
+        assert_eq!(first_error, "fixture first prompt write failed");
+        assert_eq!(
+            broker.projection(&workspace_key).pending_annotation_ids,
+            ["ann-ordinary"]
+        );
+        assert_staging_empty(&cwd);
+
+        let kept_path = std::sync::Mutex::new(None);
+        let later_error = execute_web_composer_batch(
+            &session,
+            &attachments,
+            "retry\r",
+            || true,
+            |origin, text| match origin {
+                ComposerWriteOrigin::UserText => {
+                    let reservation = broker
+                        .reserve_for_input("claude-ordinary-origin", BrowserPromptInput::Text(text))
+                        .expect("new submission retries annotation reservation");
+                    assert!(reservation.preamble().contains("ann-ordinary"));
+                    let reference = text
+                        .split_whitespace()
+                        .find(|part| part.starts_with('@'))
+                        .expect("staged attachment reference");
+                    *kept_path.lock().unwrap() = Some(cwd.join(reference.trim_start_matches('@')));
+                    broker.commit(reservation).unwrap();
+                    Ok(())
+                }
+                ComposerWriteOrigin::Generic if text == "\r" => {
+                    Err("fixture later Enter failed".to_string())
+                }
+                ComposerWriteOrigin::Generic => Ok(()),
+            },
+        )
+        .expect_err("later Enter failure surfaces");
+        assert_eq!(later_error, "fixture later Enter failed");
+        assert!(broker
+            .projection(&workspace_key)
+            .pending_annotation_ids
+            .is_empty());
+        assert!(kept_path.lock().unwrap().as_ref().unwrap().is_file());
+    }
+
     fn temp_test_dir(label: &str) -> PathBuf {
         let path =
             std::env::temp_dir().join(format!("devmanager-tests-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn attachment_snapshot(annotation_id: &str) -> BrowserWorkspaceSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "annotations": [{
+                "id": annotation_id,
+                "kind": "element",
+                "tabId": "page",
+                "anchorRevision": 1,
+                "comment": "Review image",
+                "url": "https://example.test/page",
+                "locator": {},
+                "bounds": { "x": 1, "y": 2, "width": 30, "height": 40 },
+                "viewport": {},
+                "screenshotResource": "shot-image",
+                "computedStyles": {},
+                "resolved": false
+            }],
+            "pendingAnnotationRevision": 1,
+            "pendingAnnotationIds": [annotation_id]
+        }))
+        .expect("valid attachment snapshot")
+    }
+
+    fn assert_staging_empty(cwd: &Path) {
+        let staging = cwd.join(".devmanager").join("pasted-images");
+        assert!(
+            !staging.exists() || fs::read_dir(staging).unwrap().next().is_none(),
+            "failed image transaction left staged files behind"
+        );
     }
 }

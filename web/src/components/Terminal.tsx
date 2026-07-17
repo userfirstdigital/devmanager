@@ -19,6 +19,10 @@ import {
   inspectClipboardImageItems,
   isAiSessionKind,
 } from "./imagePaste";
+import {
+  classifyTerminalInputKind,
+  forwardTerminalTextPaste,
+} from "./terminalInput";
 
 interface TerminalProps {
   sessionId: string;
@@ -427,6 +431,9 @@ export function TerminalView({ sessionId }: TerminalProps) {
       const handlePaste = (event: ClipboardEvent) => {
         const inspection = inspectClipboardImageItems(event.clipboardData?.items);
         if (inspection.kind === "none") {
+          forwardTerminalTextPaste(event, (text, inputKind) => {
+            sendInput(sessionId, text, inputKind);
+          });
           return;
         }
         event.preventDefault();
@@ -462,7 +469,7 @@ export function TerminalView({ sessionId }: TerminalProps) {
       // Forward user keystrokes; writer ownership is acquired automatically
       // before the host accepts input from this browser.
       const dataDisposable = terminal.onData((text) => {
-        sendInput(sessionId, text);
+        sendInput(sessionId, text, classifyTerminalInputKind(text));
       });
       // We intentionally do NOT hook `terminal.onResize` to `sendResize`.
       // The browser is a passive mirror of the host's PTY size; if we

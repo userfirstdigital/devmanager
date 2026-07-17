@@ -23,7 +23,7 @@ export function MobileKeyRow({ sessionId }: MobileKeyRowProps) {
     typeof window !== "undefined" ? window.innerWidth : 0,
   );
 
-  const send = (text: string) => sendInput(sessionId, text);
+  const send = (text: string) => sendInput(sessionId, text, "bytes");
 
   const onKey = (label: string, payload: string) => {
     if (label === "Ctrl") {
