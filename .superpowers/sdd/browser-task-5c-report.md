@@ -1,5 +1,69 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 3: Semantic page recording IPC
+
+### Status
+
+Checkpoint 3 started from the approved clean `master` head `f11183989e324440bd0722c9fa3b51157c5b7c0a`. It adds only the active recording page-IPC and Windows host lifecycle seam. The immutable final head, stable patch ID, and package range are recorded by the checkpoint handoff after the commit exists.
+
+Checkpoints 4 through 12 are not implemented. In particular, this checkpoint adds no pane controls, MCP surface, recipe persistence, replay, runtime secret prompt, locator repair, or agent/chrome action capture. Tab create/select/close remains host chrome capture for checkpoint 4; it is deliberately not accepted from page JavaScript.
+
+### Contract decisions
+
+- The always-on page adapter remains recording-free. A fresh script exists only for an exact active recording workspace/tab/revision/origin/instance/nonce authority and is removed on Stop, navigation/reload/history traversal, tab close, workspace reset, and project-profile clear.
+- Page messages use one strict v1 envelope. Unknown or duplicate members at any object depth, malformed JSON, unsafe identifiers/origins, oversized strings/bodies, excessive nesting/items, stale sequences, and mismatched workspace/tab/revision/origin/instance/actor/source/nonce fail closed.
+- Wry's observed request-URI origin is authoritative; a body origin cannot override it. Raw messages cross a private non-`Debug`, non-serializable bounded `SyncSender` and never enter `BrowserHostEvent`.
+- Only trusted semantic page actions are accepted: click, ordinary text/clear, select, safe navigation, upload marker, and download marker. Password, credential-like text, paste, and file selection branch before value/file access and become content-free Secret/File recording actions.
+- The recorder's checkpoint-2 reserve/commit/cancel authority remains the only retained-state path. Semantic messages drain before generic user-input revision events so the page revision fence reflects the event's source order.
+
+### Implemented
+
+- Added platform-neutral `BrowserPageRecordingAuthority`, strict envelope/event types, bounded parser, duplicate-member visitor, replay fence, transport-origin verification, recorder conversion, and exact activation/deactivation scripts.
+- Added semantic locator capture using bounded accessibility role/name, test ID, and CSS fallbacks. The source script ignores untrusted events and annotation overlays, strips credentials from navigation URLs, and never reads clipboard contents, file lists/paths, cookies, storage, HTML, computed style, or password values.
+- Added the Windows host's private 256-message recording queue, exact per-view authorities, explicit start/stop/status seam, post-load reinjection with a fresh nonce, and teardown/discard across all destructive view/workspace/profile lifecycle paths.
+- Added a compile-safe unsupported-platform adapter that reports recording unavailable/inactive without exposing a partial implementation.
+
+### RED to GREEN evidence
+
+1. Strict authority/envelope/parser:
+   - RED: `cargo test --locked --test browser_recording_ipc -- --test-threads=1` failed with E0432 because the authority, envelope/event, IPC, errors, and bounds did not exist.
+   - GREEN: strict parsing, exact authority, duplicate/unknown-field rejection, origin/nonce/revision fencing, replay rejection, and successful recorder commitment passed.
+2. Secret-safe semantic conversion:
+   - RED: the semantic regression accepted nested `{type: "password", text: ...}` and retained an invalid sensitive shape.
+   - GREEN: strict empty marker variants reject extra fields; password, clipboard, credential-like text, and upload produce only unset Secret/File inputs, while ordinary text/select/navigation/download/click retain safe semantics.
+3. Active-only script lifecycle:
+   - RED: the focused lifecycle test failed with E0599 because activation/deactivation scripts did not exist.
+   - GREEN: the Rust lifecycle test and Node runtime harness passed; password/file getters throw if touched, trusted safe markers emit, untrusted input is ignored, and teardown removes every listener.
+4. Windows host integration:
+   - RED: host coverage first failed because `BrowserPageRecordingRawMessage` and then install/remove/discard helpers and the unsupported adapter were absent.
+   - GREEN: the private bounded channel, start/stop/status seam, pre-revision drain, origin observation, reinjection, and lifecycle fencing all passed.
+5. Adversarial bounds and stale delivery:
+   - RED: count-bound coverage failed before the explicit limits and `TooManyItems` error existed; transport coverage failed before `SyncSender`; reset/profile coverage failed before explicit discard calls.
+   - GREEN: excessive values/fallbacks/strings/depth/body size fail before retention, `try_send` bounds raw queueing, and late old-instance or wrong-origin messages cannot reserve into a replacement recording.
+
+### Verification
+
+- `cargo test --locked --test browser_recording_ipc --test browser_recording --test browser_host -- --test-threads=1` -> 101 passed, 0 failed.
+- Full browser integration target command covering annotations, attachment lifecycle, automation, core, fixture, gateway, host, pane, provider, recipes, recording, and recording IPC -> 205 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 107 matching tests passed across all targets, 0 failed.
+- `cargo test --locked services::process_manager::tests --lib -- --test-threads=1` -> 70 passed, 0 failed.
+- `cargo check --locked --all-targets` -> exit 0.
+- Native Windows `cargo build --locked` -> exit 0.
+- `cargo fmt --all -- --check` -> exit 0.
+- `git diff --check` -> exit 0.
+- Production-source scan found none of the forbidden clipboard/file-list/cookie/storage/HTML/computed-style reads; the Node harness verifies sensitive getters are not evaluated and sentinel values do not cross the wire.
+
+### Files
+
+- `src/browser/recording_ipc.rs`
+- `src/browser/mod.rs`
+- `src/browser/host/windows.rs`
+- `src/browser/host/unsupported.rs`
+- `tests/browser_recording_ipc.rs`
+- `.superpowers/sdd/browser-task-5c-checkpoints.md`
+- `.superpowers/sdd/progress.md`
+- `.superpowers/sdd/browser-task-5c-report.md`
+
 ## Checkpoint 2: Pure recording/review domain
 
 ### Status

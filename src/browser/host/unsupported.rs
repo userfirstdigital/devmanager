@@ -1,7 +1,8 @@
 #[cfg(not(target_os = "windows"))]
 use super::super::{
     BrowserBounds, BrowserCommand, BrowserCommandRequest, BrowserHostControl, BrowserHostEvent,
-    BrowserResponse,
+    BrowserPageRecordingIpcError, BrowserRecordingInstance, BrowserRecordingReview,
+    BrowserRecordingStatus, BrowserResponse, BrowserWorkspaceKey,
 };
 use super::super::{BrowserError, BrowserHostStatus};
 #[cfg(not(target_os = "windows"))]
@@ -70,6 +71,27 @@ impl BrowserWebViewHost {
 
     pub fn trusted_app_config_dir(&self) -> Option<&Path> {
         None
+    }
+
+    pub fn page_recording_status(
+        &self,
+        _workspace_key: &BrowserWorkspaceKey,
+    ) -> BrowserRecordingStatus {
+        BrowserRecordingStatus::Inactive
+    }
+
+    pub fn start_page_recording(
+        &mut self,
+        _workspace_key: &BrowserWorkspaceKey,
+    ) -> Result<BrowserRecordingInstance, BrowserPageRecordingIpcError> {
+        Err(BrowserPageRecordingIpcError::Unavailable)
+    }
+
+    pub fn stop_page_recording(
+        &mut self,
+        _instance: &BrowserRecordingInstance,
+    ) -> Result<BrowserRecordingReview, BrowserPageRecordingIpcError> {
+        Err(BrowserPageRecordingIpcError::Unavailable)
     }
 
     pub fn handle_command(
