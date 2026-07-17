@@ -590,41 +590,22 @@ fn compact_redacted_url(value: &str, max_chars: usize) -> String {
 }
 
 fn redacted_url_summary(value: &str) -> String {
-    let without_fragment = value.split('#').next().unwrap_or_default();
-    let (base, query) = without_fragment
-        .split_once('?')
-        .map_or((without_fragment, None), |(base, query)| {
-            (base, Some(query))
-        });
-    let mut summary = strip_url_userinfo(base);
-    let Some(query) = query else {
-        return summary;
-    };
-    summary.push('?');
-    for (index, entry) in query.split('&').enumerate() {
-        if index > 0 {
-            summary.push('&');
-        }
-        let key = entry.split_once('=').map_or(entry, |(key, _)| key);
-        summary.push_str(&compact_redacted(key, 64));
-        summary.push('=');
-        summary.push_str(REDACTED_VALUE);
-    }
-    summary
+    let base = value.split(['?', '#']).next().unwrap_or_default();
+    safe_url_origin(base).unwrap_or_else(|| REDACTED_VALUE.to_string())
 }
 
-fn strip_url_userinfo(base: &str) -> String {
-    let Some(scheme_end) = base.find("://") else {
-        return base.to_string();
-    };
+fn safe_url_origin(base: &str) -> Option<String> {
+    let scheme_end = base.find("://")?;
     let scheme = &base[..scheme_end];
-    if !scheme.chars().enumerate().all(|(index, character)| {
-        (index == 0 && character.is_ascii_alphabetic())
-            || (index > 0
-                && (character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')))
-    }) {
-        return base.to_string();
-    }
+    if scheme.is_empty()
+        || !scheme.chars().enumerate().all(|(index, character)| {
+            (index == 0 && character.is_ascii_alphabetic())
+                || (index > 0
+                    && (character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')))
+        })
+    {
+        return None;
+    };
     let authority_start = scheme_end + 3;
     let authority_end = base[authority_start..]
         .find('/')
@@ -633,7 +614,7 @@ fn strip_url_userinfo(base: &str) -> String {
     let host_and_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host_and_port)| host_and_port);
-    format!("{}://{}{}", scheme, host_and_port, &base[authority_end..])
+    (!host_and_port.is_empty()).then(|| format!("{scheme}://{host_and_port}"))
 }
 
 fn truncate_utf8_bytes(value: &mut String, max_bytes: usize) {
@@ -733,7 +714,7 @@ mod tests {
         snapshot
             .save_annotation(annotation(
                 "ann-1",
-                &format!("review this\n{} password=hunter2", "x".repeat(4_000)),
+                &format!("review this\npassword=hunter2 {}", "x".repeat(4_000)),
                 "https://example.test/path?token=top-secret&safe=yes",
             ))
             .unwrap();
@@ -768,12 +749,12 @@ mod tests {
     }
 
     #[test]
-    fn reserved_preamble_never_leaks_url_userinfo_query_or_fragment_values() {
+    fn reserved_preamble_retains_only_safe_url_origin() {
         let workspace_key = key("project", "conversation");
         let snapshot = snapshot_with(annotation(
             "ann-1",
             "review redirect",
-            "https://alice:password@example.test/signed/path?code=oauth-code&X-Amz-Signature=signed-value&safe=yes#access_token=fragment-secret",
+            "https://alice:password@example.test:8443/magic/opaque-token?oauth-code-value&access_token=oauth-code&X-Amz-Signature=signed-value#fragment-secret",
         ));
         let broker = BrowserAttachmentBroker::default();
         broker.observe_workspace(workspace_key.clone(), &snapshot);
@@ -783,21 +764,28 @@ mod tests {
             .reserve_for_input("session", BrowserPromptInput::Text("go"))
             .unwrap();
 
-        assert!(reservation
-            .preamble
-            .contains("https://example.test/signed/path"));
-        assert!(reservation.preamble.contains("code=[redacted]"));
-        assert!(reservation.preamble.contains("X-Amz-Signature=[redacted]"));
-        for secret in [
+        assert!(reservation.preamble.contains("https://example.test:8443"));
+        for secret_or_capability_component in [
             "alice",
             "password",
+            "magic",
+            "opaque-token",
+            "oauth-code-value",
+            "access_token",
             "oauth-code",
+            "X-Amz-Signature",
             "signed-value",
-            "safe=yes",
             "fragment-secret",
         ] {
-            assert!(!reservation.preamble.contains(secret), "leaked {secret}");
+            assert!(
+                !reservation
+                    .preamble
+                    .contains(secret_or_capability_component),
+                "leaked {secret_or_capability_component}"
+            );
         }
+        assert!(!reservation.preamble.contains("?"));
+        assert!(!reservation.preamble.contains('#'));
     }
 
     #[test]
