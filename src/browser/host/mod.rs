@@ -1,6 +1,8 @@
 use super::{
-    BrowserAnnotation, BrowserError, BrowserRevision, BrowserStorageLayout, BrowserTabSnapshot,
-    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    redacted_browser_annotation, BrowserAnnotation, BrowserAnnotationDetails,
+    BrowserAnnotationOperation, BrowserAnnotationSummary, BrowserError, BrowserResourceHandle,
+    BrowserResourceKind, BrowserResourceStore, BrowserRevision, BrowserStorageLayout,
+    BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 mod initialization;
 mod unsupported;
@@ -31,6 +33,15 @@ impl BrowserWorkspaceMutation {
             snapshot,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAnnotationMutationResult {
+    pub operation: BrowserAnnotationOperation,
+    pub annotation_id: String,
+    pub screenshot: BrowserResourceHandle,
+    pub mutation: BrowserWorkspaceMutation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,6 +166,141 @@ impl BrowserHostState {
         let snapshot = self.workspace_mut(workspace_key)?;
         snapshot.save_annotation(annotation)?;
         Ok(BrowserWorkspaceMutation::new(snapshot.clone()))
+    }
+
+    pub fn annotation_summaries(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Result<Vec<BrowserAnnotationSummary>, BrowserError> {
+        let snapshot = self
+            .workspace(workspace_key)
+            .ok_or_else(missing_workspace)?;
+        snapshot
+            .annotations
+            .iter()
+            .map(|annotation| {
+                let redacted = redacted_browser_annotation(annotation);
+                Ok(BrowserAnnotationSummary {
+                    id: annotation.id.clone(),
+                    kind: annotation.kind,
+                    comment: truncate_annotation_summary(&redacted.comment, 160),
+                    url: truncate_annotation_summary(&redacted.url, 240),
+                    resolved: annotation.resolved,
+                    stale: snapshot.annotation_anchor_is_stale(&annotation.id)?,
+                    screenshot: None,
+                })
+            })
+            .collect()
+    }
+
+    pub fn annotation_details(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        annotation_id: &str,
+        resources: &BrowserResourceStore,
+    ) -> Result<BrowserAnnotationDetails, BrowserError> {
+        let snapshot = self
+            .workspace(workspace_key)
+            .ok_or_else(missing_workspace)?;
+        let annotation = snapshot.annotation(annotation_id)?.clone();
+        let stale = snapshot.annotation_anchor_is_stale(annotation_id)?;
+        let screenshot = annotation_screenshot_handle(
+            resources,
+            workspace_key,
+            &annotation.screenshot_resource,
+        )?;
+        let screenshot_was_pinned = screenshot.pinned;
+        let screenshot = resources.set_pinned(workspace_key, &screenshot.id, true)?;
+        let annotation = redacted_browser_annotation(&annotation);
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "annotation": annotation,
+            "stale": stale,
+            "screenshot": screenshot,
+        }))
+        .map_err(|error| BrowserError::CrashedView {
+            message: format!("could not encode browser annotation details: {error}"),
+        });
+        let details_resource = encoded.and_then(|encoded| {
+            resources.put(
+                workspace_key,
+                BrowserResourceKind::AnnotationDetails,
+                "application/json",
+                encoded,
+                true,
+            )
+        });
+        let details_resource = match details_resource {
+            Ok(resource) => resource,
+            Err(error) => {
+                if !screenshot_was_pinned {
+                    let _ = resources.set_pinned(workspace_key, &screenshot.id, false);
+                }
+                return Err(error);
+            }
+        };
+        Ok(BrowserAnnotationDetails {
+            annotation,
+            stale,
+            screenshot,
+            details_resource,
+        })
+    }
+
+    pub fn apply_annotation_operation(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        operation: BrowserAnnotationOperation,
+        annotation_id: &str,
+        resources: &BrowserResourceStore,
+    ) -> Result<BrowserAnnotationMutationResult, BrowserError> {
+        if matches!(
+            operation,
+            BrowserAnnotationOperation::List | BrowserAnnotationOperation::Get
+        ) {
+            return Err(BrowserError::InvalidInvocation {
+                field: "annotationOperation".to_string(),
+            });
+        }
+        let annotation = self
+            .workspace(workspace_key)
+            .ok_or_else(missing_workspace)?
+            .annotation(annotation_id)?
+            .clone();
+        let screenshot = annotation_screenshot_handle(
+            resources,
+            workspace_key,
+            &annotation.screenshot_resource,
+        )?;
+        let screenshot_was_pinned = screenshot.pinned;
+        let screenshot = resources.set_pinned(workspace_key, &screenshot.id, true)?;
+        let mutation = match operation {
+            BrowserAnnotationOperation::Resolve => {
+                self.set_annotation_resolved(workspace_key, annotation_id, true)
+            }
+            BrowserAnnotationOperation::Unresolve => {
+                self.set_annotation_resolved(workspace_key, annotation_id, false)
+            }
+            BrowserAnnotationOperation::Delete => self
+                .delete_annotation(workspace_key, annotation_id)
+                .map(|(mutation, _)| mutation),
+            BrowserAnnotationOperation::List | BrowserAnnotationOperation::Get => unreachable!(),
+        };
+        let mutation = match mutation {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                if !screenshot_was_pinned {
+                    let _ = resources.set_pinned(workspace_key, &screenshot.id, false);
+                }
+                return Err(error);
+            }
+        };
+        Ok(BrowserAnnotationMutationResult {
+            operation,
+            annotation_id: annotation_id.to_string(),
+            screenshot,
+            mutation,
+        })
     }
 
     pub fn set_annotation_resolved(
@@ -508,6 +654,24 @@ impl BrowserHostState {
             }
         }
     }
+}
+
+fn annotation_screenshot_handle(
+    resources: &BrowserResourceStore,
+    workspace_key: &BrowserWorkspaceKey,
+    resource_id: &super::BrowserResourceId,
+) -> Result<BrowserResourceHandle, BrowserError> {
+    let handle = resources.handle(workspace_key, resource_id)?;
+    if handle.kind != BrowserResourceKind::AnnotationScreenshot || handle.mime_type != "image/png" {
+        return Err(BrowserError::MissingResource {
+            id: resource_id.clone(),
+        });
+    }
+    Ok(handle)
+}
+
+fn truncate_annotation_summary(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn missing_workspace() -> BrowserError {

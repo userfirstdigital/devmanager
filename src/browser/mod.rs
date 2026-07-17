@@ -14,12 +14,14 @@ mod recipes;
 mod resources;
 mod storage;
 
+pub(crate) use annotations::redacted_browser_annotation;
 pub use annotations::{
-    crop_annotation_png, parse_browser_annotation_ipc_message, parse_browser_page_ipc_message,
-    validate_annotation_candidate_context, BrowserAnnotationCandidate,
-    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationLifecycle,
-    BrowserAnnotationResourceCleanup, BrowserAnnotationRoute, BrowserPageIpcMessage,
-    MAX_ANNOTATION_IPC_BYTES,
+    crop_annotation_png, effective_browser_annotation_risk, parse_browser_annotation_ipc_message,
+    parse_browser_page_ipc_message, validate_annotation_candidate_context,
+    BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDetails,
+    BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationOperation,
+    BrowserAnnotationResourceCleanup, BrowserAnnotationRoute, BrowserAnnotationSummary,
+    BrowserPageIpcMessage, MAX_ANNOTATION_IPC_BYTES,
 };
 pub use automation::{
     build_semantic_snapshot, effective_browser_risk, effective_browser_risk_for_targets,
@@ -35,11 +37,11 @@ pub use automation::{
 pub(crate) use commands::BrowserRegistrationLease;
 pub use commands::{
     browser_command_channel, browser_lifecycle_control, browser_request_preempts_operation_queue,
-    route_browser_request, BrowserApprovalRequest, BrowserCommand, BrowserCommandBridge,
-    BrowserCommandInbox, BrowserCommandRequest, BrowserController, BrowserDiagnosticLevel,
-    BrowserDownloadState, BrowserHostControl, BrowserHostEvent, BrowserHostStatus,
-    BrowserInvocationActor, BrowserInvocationContext, BrowserPageLoadState, BrowserResponse,
-    BrowserUserInputKind,
+    browser_response_resource_ids, route_browser_request, BrowserApprovalRequest, BrowserCommand,
+    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserController,
+    BrowserDiagnosticLevel, BrowserDownloadState, BrowserHostControl, BrowserHostEvent,
+    BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext, BrowserPageLoadState,
+    BrowserResponse, BrowserUserInputKind,
 };
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
@@ -48,9 +50,10 @@ pub use downloads::{
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
 pub use host::{
     browser_user_input_initialization_script, unique_download_path, unsupported_host_status,
-    unsupported_platform_error, validate_browser_url, BrowserHostState, BrowserMemoryTarget,
-    BrowserProfileClearPlan, BrowserProjectContextKey, BrowserViewCreationPlan,
-    BrowserViewVisibilityPlan, BrowserWebViewHost, BrowserWorkspaceMutation,
+    unsupported_platform_error, validate_browser_url, BrowserAnnotationMutationResult,
+    BrowserHostState, BrowserMemoryTarget, BrowserProfileClearPlan, BrowserProjectContextKey,
+    BrowserViewCreationPlan, BrowserViewVisibilityPlan, BrowserWebViewHost,
+    BrowserWorkspaceMutation,
 };
 pub use model::{
     BrowserAnnotation, BrowserAnnotationKind, BrowserBounds, BrowserElementRef, BrowserError,

@@ -433,6 +433,17 @@ pub fn browser_response_sync(
             revision: snapshot.revision,
             snapshot: snapshot.clone(),
         }),
+        BrowserResponse::Annotations { mutation, .. }
+        | BrowserResponse::Annotation { mutation, .. } => Some(BrowserSnapshotSync {
+            workspace_key: route.clone(),
+            revision: mutation.revision,
+            snapshot: mutation.snapshot.clone(),
+        }),
+        BrowserResponse::AnnotationMutation { result } => Some(BrowserSnapshotSync {
+            workspace_key: route.clone(),
+            revision: result.mutation.revision,
+            snapshot: result.mutation.snapshot.clone(),
+        }),
         BrowserResponse::Status { .. }
         | BrowserResponse::Tabs { .. }
         | BrowserResponse::DownloadDirectory { .. }

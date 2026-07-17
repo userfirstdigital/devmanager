@@ -1,13 +1,13 @@
 use base64::Engine as _;
 use devmanager::browser::{
-    browser_command_channel, BrowserActionResult, BrowserCommand, BrowserCommandInbox,
-    BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostControl,
-    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
-    BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserResourceId,
-    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
-    BrowserRevision, BrowserRisk, BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot,
-    BrowserUploadResult, BrowserViewport, BrowserWaitResult, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    browser_command_channel, BrowserActionResult, BrowserAnnotation, BrowserCommand,
+    BrowserCommandInbox, BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle,
+    BrowserHostControl, BrowserHostState, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserNetworkEntry, BrowserPerformanceSnapshot,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserSnapshotSummary,
+    BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
+    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -141,6 +141,33 @@ fn fixture_resource(
     }
 }
 
+fn fixture_annotation(
+    id: &str,
+    screenshot_resource: &BrowserResourceId,
+    comment: &str,
+) -> BrowserAnnotation {
+    serde_json::from_value(json!({
+        "id": id,
+        "kind": "element",
+        "tabId": "tab-a",
+        "anchorRevision": 1,
+        "comment": comment,
+        "url": "https://example.test/form",
+        "locator": {
+            "accessibilityRole": "button",
+            "accessibilityName": "Save",
+            "testId": "save",
+            "cssSelectors": ["[data-testid=save]"]
+        },
+        "bounds": { "x": 10, "y": 20, "width": 120, "height": 32 },
+        "viewport": { "width": 1280, "height": 720, "scalePercent": 100 },
+        "screenshotResource": screenshot_resource,
+        "computedStyles": { "display": "block" },
+        "resolved": false
+    }))
+    .expect("valid annotation fixture")
+}
+
 async fn run_fake_host(
     inbox: BrowserCommandInbox,
     commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>>,
@@ -151,6 +178,7 @@ async fn run_fake_host(
         Arc::new(Mutex::new(BrowserHostState::new(PathBuf::from(
             "gateway-fake-host",
         )))),
+        None,
     )
     .await;
 }
@@ -159,6 +187,7 @@ async fn run_fake_host_with_state(
     mut inbox: BrowserCommandInbox,
     commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>>,
     host: Arc<Mutex<BrowserHostState>>,
+    annotation_resources: Option<BrowserResourceStore>,
 ) {
     let mut priority_requests = VecDeque::new();
     let mut ordinary_request = None;
@@ -209,6 +238,54 @@ async fn run_fake_host_with_state(
             BrowserCommand::SetPaneOpen { open } => host
                 .set_pane_open(&key, open)
                 .map(|mutation| BrowserResponse::Workspace { mutation }),
+            BrowserCommand::Annotations {
+                operation,
+                annotation_id,
+            } => {
+                let resources = annotation_resources
+                    .as_ref()
+                    .expect("annotation fake host requires a resource store");
+                match operation {
+                    devmanager::browser::BrowserAnnotationOperation::List => {
+                        host.annotation_summaries(&key).map(|annotations| {
+                            let snapshot = host.workspace(&key).unwrap().clone();
+                            BrowserResponse::Annotations {
+                                annotations,
+                                mutation: devmanager::browser::BrowserWorkspaceMutation {
+                                    revision: snapshot.revision,
+                                    snapshot,
+                                },
+                            }
+                        })
+                    }
+                    devmanager::browser::BrowserAnnotationOperation::Get => host
+                        .annotation_details(
+                            &key,
+                            annotation_id.as_deref().unwrap_or_default(),
+                            resources,
+                        )
+                        .map(|details| {
+                            let snapshot = host.workspace(&key).unwrap().clone();
+                            BrowserResponse::Annotation {
+                                details,
+                                mutation: devmanager::browser::BrowserWorkspaceMutation {
+                                    revision: snapshot.revision,
+                                    snapshot,
+                                },
+                            }
+                        }),
+                    devmanager::browser::BrowserAnnotationOperation::Resolve
+                    | devmanager::browser::BrowserAnnotationOperation::Unresolve
+                    | devmanager::browser::BrowserAnnotationOperation::Delete => host
+                        .apply_annotation_operation(
+                            &key,
+                            operation,
+                            annotation_id.as_deref().unwrap_or_default(),
+                            resources,
+                        )
+                        .map(|result| BrowserResponse::AnnotationMutation { result }),
+                }
+            }
             BrowserCommand::ListTabs => host
                 .workspace(&key)
                 .cloned()
@@ -710,6 +787,179 @@ async fn real_rmcp_resources_are_standard_and_token_owner_isolated() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_rmcp_annotations_list_get_and_read_resources_are_workspace_owned() {
+    let config_dir = unique_gateway_config_dir("annotations");
+    let layout = BrowserStorageLayout::new(&config_dir, "project-a");
+    let store = BrowserResourceStore::open(&layout.resources_dir, BrowserResourceLimits::default())
+        .expect("open annotation store");
+    let owner_a = workspace("project-a", "conversation-a");
+    let owner_b = workspace("project-a", "conversation-b");
+    let screenshot = store
+        .put(
+            &owner_a,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"owned annotation screenshot",
+            true,
+        )
+        .expect("store annotation screenshot");
+    let snapshot_a = BrowserWorkspaceSnapshot {
+        revision: BrowserRevision(1),
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: "https://example.test/form".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        annotations: vec![fixture_annotation(
+            "ann-a",
+            &screenshot.id,
+            "Review the save button",
+        )],
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    let (bridge, inbox) = browser_command_channel(32);
+    let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let host = Arc::new(Mutex::new(BrowserHostState::new(&config_dir)));
+    let gateway = BrowserGatewayHandle::start_with_app_config_dir(bridge, &config_dir)
+        .expect("start annotation gateway");
+    let registration_a = gateway
+        .registrar()
+        .register("annotation-client-a", owner_a, snapshot_a)
+        .expect("register annotation owner");
+    let registration_b = gateway
+        .registrar()
+        .register(
+            "annotation-client-b",
+            owner_b,
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register second conversation");
+    let transport_a = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+            .auth_header(registration_a.access().bearer_token_for_launch()),
+    );
+    let transport_b = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+            .auth_header(registration_b.access().bearer_token_for_launch()),
+    );
+    let fake_host =
+        run_fake_host_with_state(inbox, Arc::clone(&commands), Arc::clone(&host), Some(store));
+    let scenario = async move {
+        let client_a = ClientInfo::default()
+            .serve(transport_a)
+            .await
+            .expect("initialize owner client");
+        let listed = client_a
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_annotations").with_arguments(arguments(
+                    json!({
+                        "intent": "list the current page annotations",
+                        "risk": "normal",
+                        "operation": "list"
+                    }),
+                )),
+            )
+            .await
+            .expect("list annotations");
+        assert_eq!(listed.is_error, Some(false));
+        let listed = listed
+            .structured_content
+            .expect("structured annotation list");
+        assert_eq!(listed["annotations"][0]["id"], "ann-a");
+        assert!(listed["annotations"][0].get("screenshot").is_none());
+
+        let fetched = client_a
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_annotations").with_arguments(arguments(
+                    json!({
+                        "intent": "inspect the saved annotation details",
+                        "risk": "normal",
+                        "operation": "get",
+                        "annotationId": "ann-a"
+                    }),
+                )),
+            )
+            .await
+            .expect("get annotation");
+        assert_eq!(fetched.is_error, Some(false));
+        let fetched = fetched
+            .structured_content
+            .expect("structured annotation details");
+        let screenshot_uri = fetched["resources"]["screenshot"]["uri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let details_uri = fetched["resources"]["details"]["uri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let screenshot_read = client_a
+            .peer()
+            .read_resource(ReadResourceRequestParams::new(screenshot_uri.clone()))
+            .await
+            .expect("read owned screenshot");
+        assert!(matches!(
+            screenshot_read.contents.as_slice(),
+            [ResourceContents::BlobResourceContents { .. }]
+        ));
+        let details_read = client_a
+            .peer()
+            .read_resource(ReadResourceRequestParams::new(details_uri.clone()))
+            .await
+            .expect("read owned details");
+        assert!(matches!(
+            details_read.contents.as_slice(),
+            [ResourceContents::TextResourceContents { text, .. }] if text.contains("ann-a")
+        ));
+
+        let client_b = ClientInfo::default()
+            .serve(transport_b)
+            .await
+            .expect("initialize other conversation client");
+        let cross_workspace = client_b
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_annotations").with_arguments(arguments(
+                    json!({
+                        "intent": "attempt a cross-workspace lookup",
+                        "risk": "normal",
+                        "operation": "get",
+                        "annotationId": "ann-a"
+                    }),
+                )),
+            )
+            .await
+            .expect("cross-workspace tool result");
+        assert_eq!(cross_workspace.is_error, Some(true));
+        assert_eq!(
+            cross_workspace.structured_content.unwrap()["error"]["code"],
+            "missing_annotation"
+        );
+        assert!(client_b
+            .peer()
+            .read_resource(ReadResourceRequestParams::new(screenshot_uri))
+            .await
+            .is_err());
+        assert!(client_b
+            .peer()
+            .read_resource(ReadResourceRequestParams::new(details_uri))
+            .await
+            .is_err());
+
+        client_b.cancel().await.expect("close other client");
+        client_a.cancel().await.expect("close owner client");
+        drop(gateway);
+    };
+    tokio::join!(fake_host, scenario);
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task4_mcp_commands_retain_one_agent_invocation_context() {
     let (bridge, mut inbox) = browser_command_channel(8);
     let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
@@ -787,7 +1037,7 @@ async fn task4_mcp_commands_retain_one_agent_invocation_context() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_rmcp_client_lists_the_task4_tools_and_all_ten_automation_groups() {
+async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
     let (bridge, inbox) = browser_command_channel(32);
     let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
         Arc::new(Mutex::new(Vec::new()));
@@ -832,6 +1082,7 @@ async fn real_rmcp_client_lists_the_task4_tools_and_all_ten_automation_groups() 
             names,
             vec![
                 "browser_act",
+                "browser_annotations",
                 "browser_cdp",
                 "browser_console",
                 "browser_downloads",
@@ -885,6 +1136,98 @@ async fn real_rmcp_client_lists_the_task4_tools_and_all_ten_automation_groups() 
                 "osPermission"
             ])
         );
+
+        let annotations_tool = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "browser_annotations")
+            .expect("browser_annotations tool");
+        assert_eq!(annotations_tool.input_schema["additionalProperties"], false);
+        assert_eq!(
+            annotations_tool.input_schema["required"],
+            json!(["intent", "risk", "operation"])
+        );
+        let annotation_properties = annotations_tool.input_schema["properties"]
+            .as_object()
+            .expect("annotation properties");
+        let mut annotation_property_names =
+            annotation_properties.keys().cloned().collect::<Vec<_>>();
+        annotation_property_names.sort();
+        assert_eq!(
+            annotation_property_names,
+            vec!["annotationId", "intent", "operation", "risk"]
+        );
+        let operation_ref = annotations_tool.input_schema["properties"]["operation"]["$ref"]
+            .as_str()
+            .expect("annotation operation enum reference");
+        let operation_definition = operation_ref
+            .strip_prefix("#/$defs/")
+            .expect("local operation definition");
+        assert_eq!(
+            annotations_tool.input_schema["$defs"][operation_definition]["enum"],
+            json!(["list", "get", "resolve", "unresolve", "delete"])
+        );
+
+        let unknown_field = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_annotations").with_arguments(arguments(
+                    json!({
+                        "intent": "attempt forbidden client-side routing",
+                        "risk": "normal",
+                        "operation": "list",
+                        "projectId": "other-project"
+                    }),
+                )),
+            )
+            .await
+            .expect("malformed annotation arguments return a tool result");
+        assert_eq!(unknown_field.is_error, Some(true));
+        assert_eq!(
+            unknown_field.structured_content.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+
+        let blank_intent = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_annotations").with_arguments(arguments(
+                    json!({
+                        "intent": "  ",
+                        "risk": "normal",
+                        "operation": "list"
+                    }),
+                )),
+            )
+            .await
+            .expect("blank intent returns a tool result");
+        assert_eq!(blank_intent.is_error, Some(true));
+        assert_eq!(
+            blank_intent.structured_content.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+
+        let missing_annotation_id = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_annotations").with_arguments(arguments(
+                    json!({
+                        "intent": "inspect one annotation",
+                        "risk": "normal",
+                        "operation": "get"
+                    }),
+                )),
+            )
+            .await
+            .expect("missing annotation id returns a tool result");
+        assert_eq!(missing_annotation_id.is_error, Some(true));
+        let missing_annotation_id = missing_annotation_id
+            .structured_content
+            .expect("typed missing-id result");
+        assert_eq!(missing_annotation_id["error"]["code"], "invalid_request");
+        assert!(missing_annotation_id["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("annotationId")));
 
         let status = client
             .peer()
@@ -1240,7 +1583,7 @@ async fn mcp_refreshes_user_changed_workspace_state_before_each_tool_operation()
     let host = Arc::new(Mutex::new(BrowserHostState::new(PathBuf::from(
         "gateway-live-state-host",
     ))));
-    let fake_host = run_fake_host_with_state(inbox, Arc::clone(&commands), Arc::clone(&host));
+    let fake_host = run_fake_host_with_state(inbox, Arc::clone(&commands), Arc::clone(&host), None);
     let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
     let scenario = async move {
         let key = workspace("project-live", "conversation-live");

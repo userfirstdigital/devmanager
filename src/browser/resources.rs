@@ -16,6 +16,7 @@ pub enum BrowserResourceKind {
     DomSnapshot,
     Screenshot,
     AnnotationScreenshot,
+    AnnotationDetails,
     NetworkBody,
     CdpResult,
     PerformanceTrace,
@@ -274,6 +275,38 @@ impl BrowserResourceStore {
         Ok(BrowserResource { metadata, bytes })
     }
 
+    pub fn handle(
+        &self,
+        owner: &BrowserWorkspaceKey,
+        id: &BrowserResourceId,
+    ) -> Result<BrowserResourceHandle, BrowserError> {
+        validate_resource_id(id)?;
+        let _gate = lock(&self.inner.gate);
+        self.verify_root()?;
+        let metadata_path = metadata_path(&self.inner.root, id)?;
+        if !is_direct_regular_file(&self.inner.root, &metadata_path) {
+            return Err(BrowserError::MissingResource { id: id.clone() });
+        }
+        let encoded = std::fs::read(&metadata_path)
+            .map_err(|error| io_error("read resource metadata", &metadata_path, error))?;
+        let metadata: BrowserResourceMetadata = serde_json::from_slice(&encoded)
+            .map_err(|_| BrowserError::MissingResource { id: id.clone() })?;
+        if metadata.id != *id || &metadata.owner != owner {
+            return Err(BrowserError::MissingResource { id: id.clone() });
+        }
+        let data_path = data_path(&self.inner.root, id)?;
+        if !is_direct_regular_file(&self.inner.root, &data_path) {
+            return Err(BrowserError::MissingResource { id: id.clone() });
+        }
+        let actual_size = std::fs::metadata(&data_path)
+            .map_err(|_| BrowserError::MissingResource { id: id.clone() })?
+            .len();
+        if actual_size != metadata.byte_size {
+            return Err(BrowserError::MissingResource { id: id.clone() });
+        }
+        Ok(BrowserResourceHandle::from(&metadata))
+    }
+
     pub fn set_pinned(
         &self,
         owner: &BrowserWorkspaceKey,
@@ -315,7 +348,11 @@ impl BrowserResourceStore {
             .into_iter()
             .filter(|metadata| {
                 &metadata.owner == owner
-                    && metadata.kind == BrowserResourceKind::AnnotationScreenshot
+                    && matches!(
+                        metadata.kind,
+                        BrowserResourceKind::AnnotationScreenshot
+                            | BrowserResourceKind::AnnotationDetails
+                    )
             })
         {
             let pinned = pinned_ids.contains(&metadata.id);

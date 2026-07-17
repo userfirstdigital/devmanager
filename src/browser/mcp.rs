@@ -1,9 +1,10 @@
 use super::{
     classify_upload_path, effective_browser_risk, resource_id_from_uri, BrowserAction,
-    BrowserActionTarget, BrowserCommand, BrowserConsoleOperation, BrowserController,
-    BrowserDownloadOperation, BrowserError, BrowserInvocationContext, BrowserNetworkOperation,
-    BrowserPerformanceOperation, BrowserResourceStore, BrowserResponse, BrowserRisk,
-    BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition, BrowserWorkspaceSnapshot,
+    BrowserActionTarget, BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation,
+    BrowserController, BrowserDownloadOperation, BrowserError, BrowserInvocationContext,
+    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserResourceStore, BrowserResponse,
+    BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
+    BrowserWorkspaceSnapshot,
 };
 use base64::Engine as _;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -53,6 +54,42 @@ impl From<BrowserMcpRisk> for BrowserRisk {
 struct BrowserStatusRequest {
     intent: String,
     risk: BrowserMcpRisk,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserAnnotationsRequestWire {
+    intent: String,
+    risk: BrowserMcpRisk,
+    operation: BrowserAnnotationOperation,
+    annotation_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct BrowserAnnotationsRequest {
+    parsed: Result<BrowserAnnotationsRequestWire, String>,
+}
+
+impl<'de> Deserialize<'de> for BrowserAnnotationsRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Ok(Self {
+            parsed: serde_json::from_value(value).map_err(|error| error.to_string()),
+        })
+    }
+}
+
+impl rmcp::schemars::JsonSchema for BrowserAnnotationsRequest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "BrowserAnnotationsRequest".into()
+    }
+
+    fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        BrowserAnnotationsRequestWire::json_schema(generator)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, rmcp::schemars::JsonSchema)]
@@ -493,6 +530,108 @@ impl BrowserMcpServer {
                 "pendingWorkCount": self.context.controller.pending_work_count(),
                 "diagnostic": status.diagnostic,
             }))
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_annotations",
+        description = "List, inspect, resolve, unresolve, or delete annotations owned by this conversation's DevManager browser pane."
+    )]
+    async fn browser_annotations(
+        &self,
+        Parameters(request): Parameters<BrowserAnnotationsRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let request = request.parsed.map_err(|message| {
+                ToolFailure::invalid_request(format!(
+                    "malformed browser_annotations request: {message}"
+                ))
+            })?;
+            let context = invocation_context(&request.intent, request.risk)?;
+            let annotation_id = match request.operation {
+                BrowserAnnotationOperation::List => request
+                    .annotation_id
+                    .map(|id| required_nonblank(Some(id), "annotationId"))
+                    .transpose()?,
+                BrowserAnnotationOperation::Get
+                | BrowserAnnotationOperation::Resolve
+                | BrowserAnnotationOperation::Unresolve
+                | BrowserAnnotationOperation::Delete => {
+                    Some(required_nonblank(request.annotation_id, "annotationId")?)
+                }
+            };
+            self.validate_and_ensure(&context).await?;
+            let response = self
+                .context
+                .controller
+                .request_with_context(
+                    BrowserCommand::Annotations {
+                        operation: request.operation,
+                        annotation_id,
+                    },
+                    context,
+                )
+                .await
+                .map_err(ToolFailure::from)?;
+            match response {
+                BrowserResponse::Annotations {
+                    annotations,
+                    mutation,
+                } if request.operation == BrowserAnnotationOperation::List => {
+                    *self.context.live_snapshot.lock().await = mutation.snapshot.clone();
+                    Ok(json!({
+                        "ok": true,
+                        "version": 1,
+                        "operation": request.operation,
+                        "revision": mutation.revision,
+                        "annotations": annotations,
+                    }))
+                }
+                BrowserResponse::Annotation { details, mutation }
+                    if request.operation == BrowserAnnotationOperation::Get =>
+                {
+                    *self.context.live_snapshot.lock().await = mutation.snapshot.clone();
+                    Ok(json!({
+                        "ok": true,
+                        "version": 1,
+                        "operation": request.operation,
+                        "revision": mutation.revision,
+                        "annotation": details.annotation,
+                        "stale": details.stale,
+                        "resources": {
+                            "screenshot": details.screenshot,
+                            "details": details.details_resource,
+                        },
+                    }))
+                }
+                BrowserResponse::AnnotationMutation { result }
+                    if result.operation == request.operation =>
+                {
+                    *self.context.live_snapshot.lock().await = result.mutation.snapshot.clone();
+                    Ok(json!({
+                        "ok": true,
+                        "version": 1,
+                        "operation": result.operation,
+                        "annotationId": result.annotation_id,
+                        "revision": result.mutation.revision,
+                        "resolved": result
+                            .mutation
+                            .snapshot
+                            .annotations
+                            .iter()
+                            .find(|annotation| annotation.id == result.annotation_id)
+                            .map(|annotation| annotation.resolved),
+                        "resources": {
+                            "screenshot": result.screenshot,
+                        },
+                    }))
+                }
+                _ => Err(ToolFailure::invalid_response(
+                    "browser host returned the wrong annotation response type",
+                )),
+            }
         }
         .await;
         into_tool_result(result)

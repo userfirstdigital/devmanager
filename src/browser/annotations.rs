@@ -1,7 +1,8 @@
 use super::{
-    redact_browser_text, validate_browser_url, BrowserAnnotation, BrowserAnnotationKind,
-    BrowserBounds, BrowserError, BrowserLocator, BrowserResourceId, BrowserRevision,
-    BrowserUserInputKind, BrowserViewport, BrowserWorkspaceKey,
+    effective_browser_risk, redact_browser_text, validate_browser_url, BrowserAnnotation,
+    BrowserAnnotationKind, BrowserBounds, BrowserError, BrowserLocator, BrowserResourceHandle,
+    BrowserResourceId, BrowserRevision, BrowserRisk, BrowserUserInputKind, BrowserViewport,
+    BrowserWorkspaceKey,
 };
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,80 @@ const STYLE_ALLOWLIST: &[&str] = &[
     "opacity",
     "visibility",
 ];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename_all = "camelCase")]
+pub enum BrowserAnnotationOperation {
+    List,
+    Get,
+    Resolve,
+    Unresolve,
+    Delete,
+}
+
+pub fn effective_browser_annotation_risk(
+    declared: BrowserRisk,
+    operation: BrowserAnnotationOperation,
+) -> BrowserRisk {
+    effective_browser_risk(
+        declared,
+        None,
+        (operation == BrowserAnnotationOperation::Delete).then_some(BrowserRisk::Destructive),
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAnnotationSummary {
+    pub id: String,
+    pub kind: BrowserAnnotationKind,
+    pub comment: String,
+    pub url: String,
+    pub resolved: bool,
+    pub stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<BrowserResourceHandle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAnnotationDetails {
+    pub annotation: BrowserAnnotation,
+    pub stale: bool,
+    pub screenshot: BrowserResourceHandle,
+    pub details_resource: BrowserResourceHandle,
+}
+
+pub(crate) fn redacted_browser_annotation(annotation: &BrowserAnnotation) -> BrowserAnnotation {
+    let mut annotation = annotation.clone();
+    annotation.comment = redact_browser_text(&annotation.comment);
+    annotation.url = redact_browser_text(&annotation.url);
+    annotation.locator.accessibility_role = annotation
+        .locator
+        .accessibility_role
+        .map(|value| redact_browser_text(&value));
+    annotation.locator.accessibility_name = annotation
+        .locator
+        .accessibility_name
+        .map(|value| redact_browser_text(&value));
+    annotation.locator.test_id = annotation
+        .locator
+        .test_id
+        .map(|value| redact_browser_text(&value));
+    annotation.locator.css_selectors = annotation
+        .locator
+        .css_selectors
+        .into_iter()
+        .map(|value| redact_browser_text(&value))
+        .collect();
+    annotation.computed_styles = annotation
+        .computed_styles
+        .into_iter()
+        .map(|(key, value)| (key, redact_browser_text(&value)))
+        .collect();
+    annotation
+}
 
 #[derive(Debug, Clone, Serialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

@@ -1,8 +1,10 @@
 use super::{
     BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserAnnotationCandidate,
-    BrowserAnnotationDraft, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDownloadEntry,
-    BrowserDownloadOperation, BrowserError, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserRisk,
+    BrowserAnnotationDetails, BrowserAnnotationDraft, BrowserAnnotationMutationResult,
+    BrowserAnnotationOperation, BrowserAnnotationSummary, BrowserConsoleEntry,
+    BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation, BrowserError,
+    BrowserNetworkEntry, BrowserNetworkOperation, BrowserPerformanceOperation,
+    BrowserPerformanceSnapshot, BrowserResourceHandle, BrowserResourceId, BrowserRisk,
     BrowserScreenshotMode, BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult,
     BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey,
     BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
@@ -158,6 +160,10 @@ pub enum BrowserCommand {
     CancelAnnotationDraft {
         draft_id: String,
     },
+    Annotations {
+        operation: BrowserAnnotationOperation,
+        annotation_id: Option<String>,
+    },
     ListTabs,
     CreateTab {
         url: Option<String>,
@@ -251,6 +257,7 @@ impl BrowserCommand {
             Self::CaptureAnnotation { .. } => "captureAnnotation",
             Self::SaveAnnotationDraft { .. } => "saveAnnotationDraft",
             Self::CancelAnnotationDraft { .. } => "cancelAnnotationDraft",
+            Self::Annotations { .. } => "annotations",
             Self::ListTabs => "listTabs",
             Self::CreateTab { .. } => "createTab",
             Self::SelectTab { .. } => "selectTab",
@@ -307,6 +314,7 @@ impl BrowserCommand {
             | Self::SetPaneOpen { .. }
             | Self::SaveAnnotationDraft { .. }
             | Self::CancelAnnotationDraft { .. }
+            | Self::Annotations { .. }
             | Self::ListTabs
             | Self::CreateTab { .. }
             | Self::ResetWorkspace
@@ -426,7 +434,50 @@ pub enum BrowserResponse {
     AnnotationDraft {
         draft: BrowserAnnotationDraft,
     },
+    Annotations {
+        annotations: Vec<BrowserAnnotationSummary>,
+        mutation: BrowserWorkspaceMutation,
+    },
+    Annotation {
+        details: BrowserAnnotationDetails,
+        mutation: BrowserWorkspaceMutation,
+    },
+    AnnotationMutation {
+        result: BrowserAnnotationMutationResult,
+    },
     Acknowledged,
+}
+
+pub fn browser_response_resource_ids(response: &BrowserResponse) -> Vec<BrowserResourceId> {
+    match response {
+        BrowserResponse::Snapshot { resource, .. } | BrowserResponse::Screenshot { resource } => {
+            vec![resource.id.clone()]
+        }
+        BrowserResponse::AnnotationDraft { draft } => vec![draft.screenshot_resource.clone()],
+        BrowserResponse::Annotation { details, .. } => vec![
+            details.screenshot.id.clone(),
+            details.details_resource.id.clone(),
+        ],
+        BrowserResponse::AnnotationMutation { result } => vec![result.screenshot.id.clone()],
+        BrowserResponse::Console { resource, .. }
+        | BrowserResponse::Network { resource, .. }
+        | BrowserResponse::Performance { resource, .. }
+        | BrowserResponse::Cdp { resource, .. } => resource
+            .as_ref()
+            .map(|resource| vec![resource.id.clone()])
+            .unwrap_or_default(),
+        BrowserResponse::Status { .. }
+        | BrowserResponse::WorkspaceState { .. }
+        | BrowserResponse::Workspace { .. }
+        | BrowserResponse::Annotations { .. }
+        | BrowserResponse::Tabs { .. }
+        | BrowserResponse::DownloadDirectory { .. }
+        | BrowserResponse::Wait { .. }
+        | BrowserResponse::Action { .. }
+        | BrowserResponse::Upload { .. }
+        | BrowserResponse::Downloads { .. }
+        | BrowserResponse::Acknowledged => Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

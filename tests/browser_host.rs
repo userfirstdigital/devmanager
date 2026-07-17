@@ -1,16 +1,16 @@
 use devmanager::browser::{
     browser_command_channel, browser_lifecycle_control, browser_request_preempts_operation_queue,
-    browser_user_input_initialization_script, crop_annotation_png,
-    parse_browser_annotation_ipc_message, parse_browser_page_ipc_message,
-    prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
-    route_browser_request, unique_download_path, unsupported_host_status,
+    browser_response_resource_ids, browser_user_input_initialization_script, crop_annotation_png,
+    effective_browser_annotation_risk, parse_browser_annotation_ipc_message,
+    parse_browser_page_ipc_message, prepare_verified_download_root, prepare_verified_profile_root,
+    remove_verified_profile, route_browser_request, unique_download_path, unsupported_host_status,
     unsupported_platform_error, validate_annotation_candidate_context, validate_browser_url,
-    BrowserAction, BrowserActionTarget, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
-    BrowserAnnotationDraft, BrowserAnnotationKind, BrowserAnnotationLifecycle,
-    BrowserAnnotationRoute, BrowserBounds, BrowserCommand, BrowserCommandBridge,
-    BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
-    BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
-    BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
+    BrowserAction, BrowserActionTarget, BrowserAnnotation, BrowserAnnotationCandidate,
+    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationKind,
+    BrowserAnnotationLifecycle, BrowserAnnotationOperation, BrowserAnnotationRoute, BrowserBounds,
+    BrowserCommand, BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation,
+    BrowserDiagnosticLevel, BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef,
+    BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserMemoryTarget, BrowserNetworkOperation, BrowserOperationQueue,
     BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
@@ -18,7 +18,7 @@ use devmanager::browser::{
     BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
     BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
     BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot, MAX_BROWSER_JOURNAL_ENTRIES,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +30,37 @@ use std::time::Duration;
 
 fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
     BrowserWorkspaceKey::new(project, conversation).expect("valid browser workspace key")
+}
+
+fn stored_annotation(
+    id: &str,
+    screenshot_resource: BrowserResourceId,
+    comment: &str,
+) -> BrowserAnnotation {
+    BrowserAnnotation {
+        id: id.to_string(),
+        kind: BrowserAnnotationKind::Element,
+        tab_id: "tab-a".to_string(),
+        anchor_revision: BrowserRevision(1),
+        comment: comment.to_string(),
+        url: "https://example.test/form?authorization=super-secret".to_string(),
+        locator: BrowserLocator {
+            accessibility_role: Some("button".to_string()),
+            accessibility_name: Some("Save".to_string()),
+            test_id: Some("save".to_string()),
+            css_selectors: vec!["[data-testid=save]".to_string()],
+        },
+        bounds: BrowserBounds {
+            x: 10,
+            y: 20,
+            width: 120,
+            height: 32,
+        },
+        viewport: BrowserViewport::default(),
+        screenshot_resource,
+        computed_styles: BTreeMap::from([("display".to_string(), "block".to_string())]),
+        resolved: false,
+    }
 }
 
 async fn wait_for_pending_count(bridge: &BrowserCommandBridge, expected: usize) {
@@ -934,6 +965,69 @@ fn pending_approval_validation_requires_the_live_operation_and_approval_phase() 
     assert!(validation.contains("cancel_tab_operations"));
 }
 
+#[test]
+fn annotation_delete_enters_destructive_approval_before_mutation_and_resumes_distinctly() {
+    assert_eq!(
+        effective_browser_annotation_risk(BrowserRisk::Normal, BrowserAnnotationOperation::Delete,),
+        BrowserRisk::Destructive
+    );
+    assert_eq!(
+        effective_browser_annotation_risk(
+            BrowserRisk::Financial,
+            BrowserAnnotationOperation::Resolve,
+        ),
+        BrowserRisk::Financial
+    );
+    let source = include_str!("../src/browser/host/windows.rs");
+    let start = source.find("fn begin_annotation_request(").unwrap();
+    let end = source[start..].find("fn await_approval(").unwrap() + start;
+    let gate = &source[start..end];
+    let delete_risk = gate
+        .find("effective_browser_annotation_risk")
+        .expect("delete has a runtime risk override");
+    let approval = gate
+        .find("requires_confirmation")
+        .expect("annotation operation checks approval policy");
+    let pending = gate
+        .find("BrowserApprovalResume::Annotation")
+        .expect("annotation approval has a distinct resume path");
+    let mutation = gate
+        .find("self.handle_command(")
+        .expect("approved annotation command reaches host mutation");
+    assert!(delete_risk < approval && approval < pending && pending < mutation);
+
+    let resolve_start = source.find("pub fn resolve_approval(").unwrap();
+    let resolve_end = source[resolve_start..]
+        .find("fn continue_actions(")
+        .unwrap()
+        + resolve_start;
+    let resolution = &source[resolve_start..resolve_end];
+    assert!(
+        resolution.find("if !approved").unwrap()
+            < resolution
+                .find("BrowserApprovalResume::Annotation")
+                .unwrap()
+    );
+    assert!(resolution.contains("BrowserError::BlockedPermission"));
+    assert!(resolution.contains("begin_annotation_request(window"));
+    assert!(resolution.contains("Some(risk)"));
+
+    let response_start = source.find("fn respond_request(").unwrap();
+    let response_end = source[response_start..]
+        .find("fn cancel_tab_operations(")
+        .unwrap()
+        + response_start;
+    let response = &source[response_start..response_end];
+    assert!(response.contains("browser_command_is_journaled"));
+    assert!(response.contains("append_journal_entry"));
+    assert!(response.contains("reconcile_annotation_pins"));
+    assert!(response.contains("if annotation_command || agent_journaled"));
+    assert!(
+        response.find("append_journal_entry").unwrap()
+            < response.find("reconcile_annotation_pins").unwrap()
+    );
+}
+
 #[tokio::test]
 async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     let key = workspace("project-a", "conversation-a");
@@ -1205,6 +1299,13 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
             "ensure",
         ),
         (BrowserCommand::SetPaneOpen { open: true }, "setPaneOpen"),
+        (
+            BrowserCommand::Annotations {
+                operation: BrowserAnnotationOperation::Resolve,
+                annotation_id: Some("ann-a".to_string()),
+            },
+            "annotations",
+        ),
         (BrowserCommand::ListTabs, "listTabs"),
         (
             BrowserCommand::CreateTab {
@@ -2535,6 +2636,508 @@ fn annotation_resource_pins_reconcile_by_owner_and_survive_reopen() {
             .metadata
             .pinned
     );
+}
+
+#[test]
+fn annotation_host_contract_redacts_lists_creates_owned_details_and_returns_mutation_resources() {
+    let temp = TestDir::new("annotation-host-contract");
+    let store = BrowserResourceStore::open(temp.path(), BrowserResourceLimits::default())
+        .expect("open annotation resource store");
+    let key = workspace("project-a", "conversation-a");
+    let other = workspace("project-a", "conversation-b");
+    let screenshot = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"screenshot",
+            true,
+        )
+        .expect("store owned screenshot");
+    let other_screenshot = store
+        .put(
+            &other,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"other screenshot",
+            true,
+        )
+        .expect("store other screenshot");
+    let mut state = BrowserHostState::new(temp.path());
+    let snapshot = BrowserWorkspaceSnapshot {
+        revision: BrowserRevision(1),
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: "https://example.test/form".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    state
+        .ensure_workspace(key.clone(), snapshot.clone())
+        .unwrap();
+    state.ensure_workspace(other.clone(), snapshot).unwrap();
+    state
+        .save_annotation(
+            &key,
+            stored_annotation(
+                "ann-owned",
+                screenshot.id.clone(),
+                "Bearer list-secret should never escape",
+            ),
+        )
+        .unwrap();
+    state
+        .save_annotation(
+            &key,
+            stored_annotation(
+                "ann-cross-owner",
+                other_screenshot.id,
+                "Cross-owner fixture",
+            ),
+        )
+        .unwrap();
+
+    let summaries = state
+        .annotation_summaries(&key)
+        .expect("list compact annotations");
+    assert_eq!(summaries.len(), 2);
+    assert!(summaries[0].comment.contains("[redacted]"));
+    assert!(!summaries[0].comment.contains("list-secret"));
+    assert!(summaries[0].screenshot.is_none());
+    assert!(summaries[1].screenshot.is_none());
+
+    let details = state
+        .annotation_details(&key, "ann-owned", &store)
+        .expect("create full annotation details");
+    assert_eq!(details.annotation.id, "ann-owned");
+    assert_eq!(
+        details.details_resource.kind,
+        BrowserResourceKind::AnnotationDetails
+    );
+    assert_eq!(details.screenshot.id, screenshot.id);
+    let details_bytes = store
+        .read(&key, &details.details_resource.id)
+        .expect("read owned details resource")
+        .bytes;
+    let details_text = String::from_utf8(details_bytes).expect("details are UTF-8 JSON");
+    assert!(!details_text.contains("list-secret"));
+    assert!(details_text.contains("[redacted]"));
+    let response_snapshot = state.workspace(&key).unwrap().clone();
+    let response = BrowserResponse::Annotation {
+        details: details.clone(),
+        mutation: BrowserWorkspaceMutation {
+            revision: response_snapshot.revision,
+            snapshot: response_snapshot,
+        },
+    };
+    let response_resources = browser_response_resource_ids(&response);
+    assert_eq!(
+        response_resources,
+        vec![
+            details.screenshot.id.clone(),
+            details.details_resource.id.clone()
+        ]
+    );
+    state
+        .append_journal_entry(
+            &key,
+            BrowserJournalEntry {
+                id: "annotation-get".to_string(),
+                actor: BrowserJournalActor::Agent,
+                intent: "inspect annotation details".to_string(),
+                url: "https://example.test/form".to_string(),
+                started_at: "2026-07-16T00:00:00Z".to_string(),
+                duration_ms: 1,
+                result: "ok".to_string(),
+                resource_ids: response_resources,
+            },
+        )
+        .unwrap();
+    let journal_resources = &state
+        .workspace(&key)
+        .unwrap()
+        .journal_entries
+        .last()
+        .unwrap()
+        .resource_ids;
+    assert!(journal_resources.contains(&details.screenshot.id));
+    assert!(journal_resources.contains(&details.details_resource.id));
+    assert!(matches!(
+        state.annotation_details(&other, "ann-owned", &store),
+        Err(BrowserError::MissingAnnotation { .. })
+    ));
+    assert!(matches!(
+        state.annotation_details(&key, "ann-cross-owner", &store),
+        Err(BrowserError::MissingResource { .. })
+    ));
+    for operation in [
+        BrowserAnnotationOperation::Resolve,
+        BrowserAnnotationOperation::Unresolve,
+        BrowserAnnotationOperation::Delete,
+    ] {
+        assert!(matches!(
+            state.apply_annotation_operation(&key, operation, "ann-cross-owner", &store,),
+            Err(BrowserError::MissingResource { .. })
+        ));
+    }
+    assert!(
+        !state
+            .workspace(&key)
+            .unwrap()
+            .annotation("ann-cross-owner")
+            .unwrap()
+            .resolved
+    );
+
+    let resolved = state
+        .apply_annotation_operation(
+            &key,
+            BrowserAnnotationOperation::Resolve,
+            "ann-owned",
+            &store,
+        )
+        .expect("resolve annotation");
+    assert_eq!(resolved.screenshot.id, screenshot.id);
+    assert_eq!(
+        browser_response_resource_ids(&BrowserResponse::AnnotationMutation {
+            result: resolved.clone(),
+        }),
+        vec![screenshot.id.clone()]
+    );
+    assert!(store.handle(&key, &screenshot.id).unwrap().pinned);
+    assert!(
+        resolved
+            .mutation
+            .snapshot
+            .annotation("ann-owned")
+            .unwrap()
+            .resolved
+    );
+    let unresolved = state
+        .apply_annotation_operation(
+            &key,
+            BrowserAnnotationOperation::Unresolve,
+            "ann-owned",
+            &store,
+        )
+        .expect("unresolve annotation");
+    assert!(
+        !unresolved
+            .mutation
+            .snapshot
+            .annotation("ann-owned")
+            .unwrap()
+            .resolved
+    );
+    let deleted = state
+        .apply_annotation_operation(
+            &key,
+            BrowserAnnotationOperation::Delete,
+            "ann-owned",
+            &store,
+        )
+        .expect("delete annotation");
+    assert_eq!(deleted.annotation_id, "ann-owned");
+    assert!(deleted.mutation.snapshot.annotation("ann-owned").is_err());
+}
+
+#[test]
+fn annotation_details_failure_restores_pin_and_forged_same_owner_resources_are_missing() {
+    let temp = TestDir::new("annotation-details-failure");
+    let store = BrowserResourceStore::open(temp.path(), BrowserResourceLimits::default()).unwrap();
+    let key = workspace("project-a", "conversation-a");
+    let screenshot = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"valid screenshot",
+            false,
+        )
+        .unwrap();
+    let wrong_kind = store
+        .put(
+            &key,
+            BrowserResourceKind::NetworkBody,
+            "image/png",
+            b"not an annotation screenshot",
+            false,
+        )
+        .unwrap();
+    let wrong_mime = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "text/plain",
+            b"not a png",
+            false,
+        )
+        .unwrap();
+    let snapshot = BrowserWorkspaceSnapshot {
+        revision: BrowserRevision(1),
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: "https://example.test/form".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        annotations: vec![
+            stored_annotation("ann-valid", screenshot.id.clone(), "Valid"),
+            stored_annotation("ann-wrong-kind", wrong_kind.id, "Wrong kind"),
+            stored_annotation("ann-wrong-mime", wrong_mime.id, "Wrong mime"),
+        ],
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    let mut state = BrowserHostState::new(temp.path());
+    state.ensure_workspace(key.clone(), snapshot).unwrap();
+    for id in ["ann-wrong-kind", "ann-wrong-mime"] {
+        assert!(matches!(
+            state.annotation_details(&key, id, &store),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        assert!(matches!(
+            state.apply_annotation_operation(&key, BrowserAnnotationOperation::Delete, id, &store,),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        assert!(state.workspace(&key).unwrap().annotation(id).is_ok());
+    }
+
+    let failing_store = BrowserResourceStore::open(
+        temp.path(),
+        BrowserResourceLimits {
+            max_temporary_count: 128,
+            max_temporary_bytes: 64 * 1024 * 1024,
+            max_resource_bytes: 1,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        state.annotation_details(&key, "ann-valid", &failing_store),
+        Err(BrowserError::ResourceTooLarge { .. })
+    ));
+    assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
+    assert!(state.workspace(&key).unwrap().journal_entries.is_empty());
+}
+
+#[test]
+fn annotation_pin_reconciliation_keeps_shared_refs_and_releases_only_after_last_reference() {
+    let temp = TestDir::new("annotation-shared-pins");
+    let store = BrowserResourceStore::open(temp.path(), BrowserResourceLimits::default()).unwrap();
+    let key = workspace("project-a", "conversation-a");
+    let screenshot = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"shared screenshot",
+            false,
+        )
+        .unwrap();
+    let snapshot = BrowserWorkspaceSnapshot {
+        revision: BrowserRevision(1),
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: "https://example.test/form".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        annotations: vec![
+            stored_annotation("ann-one", screenshot.id.clone(), "One"),
+            stored_annotation("ann-two", screenshot.id.clone(), "Two"),
+        ],
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    let mut state = BrowserHostState::new(temp.path());
+    state.ensure_workspace(key.clone(), snapshot).unwrap();
+
+    let resolved = state
+        .apply_annotation_operation(&key, BrowserAnnotationOperation::Resolve, "ann-one", &store)
+        .unwrap();
+    store
+        .reconcile_annotation_pins(
+            &key,
+            &resolved.mutation.snapshot.pinned_annotation_resource_ids(),
+        )
+        .unwrap();
+    assert!(store.handle(&key, &screenshot.id).unwrap().pinned);
+
+    let deleted_second = state
+        .apply_annotation_operation(&key, BrowserAnnotationOperation::Delete, "ann-two", &store)
+        .unwrap();
+    store
+        .reconcile_annotation_pins(
+            &key,
+            &deleted_second
+                .mutation
+                .snapshot
+                .pinned_annotation_resource_ids(),
+        )
+        .unwrap();
+    assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
+
+    let unresolved = state
+        .apply_annotation_operation(
+            &key,
+            BrowserAnnotationOperation::Unresolve,
+            "ann-one",
+            &store,
+        )
+        .unwrap();
+    assert!(
+        !unresolved
+            .mutation
+            .snapshot
+            .annotation("ann-one")
+            .unwrap()
+            .resolved
+    );
+    assert!(store.handle(&key, &screenshot.id).unwrap().pinned);
+
+    let deleted_last = state
+        .apply_annotation_operation(&key, BrowserAnnotationOperation::Delete, "ann-one", &store)
+        .unwrap();
+    store
+        .reconcile_annotation_pins(
+            &key,
+            &deleted_last
+                .mutation
+                .snapshot
+                .pinned_annotation_resource_ids(),
+        )
+        .unwrap();
+    assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
+}
+
+#[test]
+fn non_annotation_journal_eviction_releases_the_last_annotation_resource_reference() {
+    let temp = TestDir::new("annotation-journal-eviction");
+    let store = BrowserResourceStore::open(temp.path(), BrowserResourceLimits::default()).unwrap();
+    let key = workspace("project-a", "conversation-a");
+    let details = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationDetails,
+            "application/json",
+            br#"{"annotation":"fixture"}"#,
+            true,
+        )
+        .unwrap();
+    let mut state = BrowserHostState::new(temp.path());
+    state
+        .ensure_workspace(key.clone(), BrowserWorkspaceSnapshot::default())
+        .unwrap();
+    let entry = |index: usize, resource_ids: Vec<BrowserResourceId>| BrowserJournalEntry {
+        id: format!("journal-{index}"),
+        actor: BrowserJournalActor::Agent,
+        intent: format!("non-annotation operation {index}"),
+        url: "https://example.test".to_string(),
+        started_at: "2026-07-16T00:00:00Z".to_string(),
+        duration_ms: 1,
+        result: "ok".to_string(),
+        resource_ids,
+    };
+    state
+        .append_journal_entry(&key, entry(0, vec![details.id.clone()]))
+        .unwrap();
+    for index in 1..MAX_BROWSER_JOURNAL_ENTRIES {
+        state
+            .append_journal_entry(&key, entry(index, Vec::new()))
+            .unwrap();
+    }
+    let pinned = state
+        .workspace(&key)
+        .unwrap()
+        .pinned_annotation_resource_ids();
+    store.reconcile_annotation_pins(&key, &pinned).unwrap();
+    assert!(store.handle(&key, &details.id).unwrap().pinned);
+
+    state
+        .append_journal_entry(&key, entry(MAX_BROWSER_JOURNAL_ENTRIES, Vec::new()))
+        .unwrap();
+    let after_eviction = state
+        .workspace(&key)
+        .unwrap()
+        .pinned_annotation_resource_ids();
+    assert!(!after_eviction.contains(&details.id));
+    store
+        .reconcile_annotation_pins(&key, &after_eviction)
+        .unwrap();
+    assert!(!store.handle(&key, &details.id).unwrap().pinned);
+}
+
+#[test]
+fn direct_annotation_resolve_reconciliation_does_not_leave_a_permanent_pin() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let handler_start = source.find("fn handle_available_command(").unwrap();
+    let annotation_start = source[handler_start..]
+        .find("BrowserCommand::Annotations {")
+        .unwrap()
+        + handler_start;
+    let annotation_end = source[annotation_start..]
+        .find("BrowserCommand::ListTabs")
+        .unwrap()
+        + annotation_start;
+    let annotation_handler = &source[annotation_start..annotation_end];
+    assert!(
+        annotation_handler
+            .find("apply_annotation_operation")
+            .unwrap()
+            < annotation_handler
+                .find("reconcile_annotation_pins")
+                .unwrap()
+    );
+
+    let temp = TestDir::new("annotation-direct-resolve");
+    let store = BrowserResourceStore::open(temp.path(), BrowserResourceLimits::default()).unwrap();
+    let key = workspace("project-a", "conversation-a");
+    let screenshot = store
+        .put(
+            &key,
+            BrowserResourceKind::AnnotationScreenshot,
+            "image/png",
+            b"direct resolve screenshot",
+            false,
+        )
+        .unwrap();
+    let snapshot = BrowserWorkspaceSnapshot {
+        revision: BrowserRevision(1),
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "Fixture".to_string(),
+            url: "https://example.test/form".to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        annotations: vec![stored_annotation(
+            "ann-direct",
+            screenshot.id.clone(),
+            "Direct",
+        )],
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    let mut state = BrowserHostState::new(temp.path());
+    state.ensure_workspace(key.clone(), snapshot).unwrap();
+    let resolved = state
+        .apply_annotation_operation(
+            &key,
+            BrowserAnnotationOperation::Resolve,
+            "ann-direct",
+            &store,
+        )
+        .unwrap();
+    assert!(store.handle(&key, &screenshot.id).unwrap().pinned);
+    store
+        .reconcile_annotation_pins(
+            &key,
+            &resolved.mutation.snapshot.pinned_annotation_resource_ids(),
+        )
+        .unwrap();
+    assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
 }
 
 #[test]
