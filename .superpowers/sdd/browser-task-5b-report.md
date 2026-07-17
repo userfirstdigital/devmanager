@@ -2,7 +2,7 @@
 
 ## Status
 
-Task 5B is implemented through checkpoint 4C1, including its independent-review hardening, and awaits re-review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local native exactly-once PTY attachment, authoritative AppState/host projection with attachment pin reconciliation, and native pending-annotation chips/preview/remove UI are implemented. Remote web input wiring remains intentionally out of scope here.
+Task 5B is implemented through checkpoint 4C1, including two independent-review hardening follow-ups, and awaits re-review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local native exactly-once PTY attachment, authoritative AppState/host projection with attachment pin reconciliation, and native pending-annotation chips/preview/remove UI are implemented. Remote web input wiring remains intentionally out of scope here.
 
 ## Commit range
 
@@ -13,6 +13,7 @@ Task 5B is implemented through checkpoint 4C1, including its independent-review 
 - Checkpoint 4B1 session lifecycle and local user-origin input: this checkpoint commit
 - Checkpoint 4C1 native pending-annotation chips: this checkpoint commit
 - Checkpoint 4C1 independent-review hardening: this follow-up commit
+- Checkpoint 4C1 terminal-model notice lifecycle hardening: this second follow-up commit
 - Branch: `master`, explicitly authorized by the user
 
 ## Authenticated MCP architecture
@@ -275,6 +276,35 @@ Checkpoint 4B must wire the broker into ProcessManager session lifecycle, explic
 
 ### Review hardening verification
 
+- `cargo test --locked --test terminal_pending_annotations -- --test-threads=1` - PASS, 6/6.
+- `cargo test --locked --lib pending_annotation -- --test-threads=1` - PASS, 5/5.
+- `cargo test --locked --test browser_pane -- --test-threads=1` - PASS, 32/32.
+- `cargo test --locked --test browser_host -- --test-threads=1` - PASS, 82/82.
+- `cargo test --locked --lib browser::attachments::tests -- --test-threads=1` - PASS, 15/15.
+- `cargo test --locked --test browser_annotations -- --test-threads=1` - PASS, 5/5.
+- `cargo test --locked --lib state::app_state::tests -- --test-threads=1` - PASS, 3/3.
+- `cargo test --locked --test browser_attachment_lifecycle -- --test-threads=1` - PASS, 3/3.
+- `cargo fmt --all -- --check` - PASS.
+- `git diff --check` - PASS (only existing LF-to-CRLF working-copy notices).
+- `cargo check --locked --lib` - PASS with no Rust warnings.
+- Windows `cargo build --locked` - PASS with no Rust warnings.
+
+## Checkpoint 4C1 terminal-model notice lifecycle hardening
+
+- Re-review found that the first failure helper still wrote `terminal_notice`, which ordinary local AI passive/active model refresh cleared and remote model refresh recomputed before `TerminalPaneModel` assembly. The browser diagnostic survived, but the collapsed terminal chip surface did not actually render the feedback.
+- Chip-action feedback now has dedicated fixed-vocabulary state keyed to the exact browser workspace and the local/remote mode that produced it. Both production terminal-model returns project it after their ordinary transient-notice lifecycle, so it survives repeated active-AI refresh without changing existing startup/transient fallback priority when no action feedback exists.
+- A same-workspace successful preview/remove clears the feedback. Mode changes and an eight-second expiry clear it; an identity-checked timer requests the expiry render without allowing an older timer to clear newer feedback. Other workspaces never display or consume it. The same projection determines viewport notice reservation.
+- Remote remove now uses the same safe lifecycle and fixed host-directed message. No raw error detail can enter the action notice or browser diagnostic.
+
+### Terminal-model notice RED / GREEN evidence
+
+- `cargo test --locked --lib chip_action_ -- --test-threads=1 --nocapture` was compile-RED with 13 expected `E0425`/`E0433` errors for the absent dedicated notice, expiry, model projection, and success-clear seams. A supplemental fixed-message RED added the missing remote-remove vocabulary.
+- The same command is GREEN, 2/2. One test builds a real active Claude `TerminalPaneModel` from a `pane_open=false` snapshot, refreshes it twice after transient notice clearing, verifies the exact safe message, and constructs the terminal render tree. The second behavior-tests remote projection, workspace isolation, mode clearing, explicit success clearing, expiry, and restoration of the existing transient notice fallback.
+- The terminal chip suite additionally proves both local and remote production `sync_terminal_session` returns use the behavior-tested projection and that viewport sizing reserves its visible banner.
+
+### Terminal-model notice verification
+
+- Behavioral model/lifecycle regressions - PASS, 2/2.
 - `cargo test --locked --test terminal_pending_annotations -- --test-threads=1` - PASS, 6/6.
 - `cargo test --locked --lib pending_annotation -- --test-threads=1` - PASS, 5/5.
 - `cargo test --locked --test browser_pane -- --test-threads=1` - PASS, 32/32.

@@ -245,7 +245,7 @@ fn pending_annotation_action_failures_reach_the_visible_terminal_notice_without_
         .map(|offset| helper_start + offset)
         .unwrap();
     let helper = &source[helper_start..remove_start];
-    assert!(helper.contains("self.terminal_notice = Some(message.to_string())"));
+    assert!(helper.contains("self.pending_annotation_action_notice = Some(notice.clone())"));
     assert!(helper.contains("diagnostic = Some(message.to_string())"));
 
     let preview_start = source[remove_start..]
@@ -263,8 +263,8 @@ fn pending_annotation_action_failures_reach_the_visible_terminal_notice_without_
         remove
             .matches("show_pending_annotation_action_failure")
             .count(),
-        3,
-        "each local remove failure must reach the visible terminal notice"
+        4,
+        "each local or remote remove failure must reach the visible terminal notice"
     );
     assert_eq!(
         preview
@@ -275,6 +275,19 @@ fn pending_annotation_action_failures_reach_the_visible_terminal_notice_without_
     );
     assert!(!remove.contains("error.to_string()"));
     assert!(!preview.contains("error.to_string()"));
+
+    let model_start = source.find("fn sync_terminal_session(").unwrap();
+    let model_end = source[model_start..]
+        .find("fn focus_terminal(")
+        .map(|offset| model_start + offset)
+        .unwrap();
+    assert_eq!(
+        source[model_start..model_end]
+            .matches("refresh_terminal_pane_model_notice")
+            .count(),
+        2,
+        "local and remote AI model refreshes must project action feedback"
+    );
 }
 
 #[test]
@@ -287,6 +300,7 @@ fn terminal_viewport_reserves_space_for_visible_pending_annotation_chips() {
         .map(|offset| start + offset)
         .unwrap();
     let layout = &source[start..end];
+    assert!(layout.contains("pending_annotation_action_notice_message"));
     assert!(layout.contains("pending_annotation_source_for_tab"));
     assert!(layout.contains("PENDING_ANNOTATION_STRIP_HEIGHT_PX + STACK_GAP_PX"));
 }

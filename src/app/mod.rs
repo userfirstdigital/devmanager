@@ -61,6 +61,7 @@ const STACK_GAP_PX: f32 = 4.0;
 const META_TEXT_HEIGHT_PX: f32 = 0.0;
 const NOTICE_HEIGHT_PX: f32 = 26.0;
 const PENDING_ANNOTATION_STRIP_HEIGHT_PX: f32 = 28.0;
+const PENDING_ANNOTATION_ACTION_NOTICE_DURATION: Duration = Duration::from_secs(8);
 const SEARCH_BAR_HEIGHT_PX: f32 = 34.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -192,6 +193,7 @@ struct NativeShell {
     updater: UpdaterService,
     startup_notice: Option<String>,
     terminal_notice: Option<String>,
+    pending_annotation_action_notice: Option<PendingAnnotationActionNotice>,
     terminal_actionable_notice: Option<ActionableNotice>,
     editor_notice: Option<String>,
     remote_machine_state: RemoteMachineState,
@@ -706,6 +708,7 @@ enum PendingAnnotationActionFailure {
     RemoveFailed,
     InvalidSavedUrl,
     PreviewFailed,
+    RemoteRemove,
 }
 
 impl PendingAnnotationActionFailure {
@@ -716,8 +719,91 @@ impl PendingAnnotationActionFailure {
             Self::RemoveFailed => "Could not remove the pending annotation.",
             Self::InvalidSavedUrl => "Saved annotation URL cannot be previewed.",
             Self::PreviewFailed => "Could not open the annotation preview.",
+            Self::RemoteRemove => "Remove pending browser annotations from the connected host.",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAnnotationActionNotice {
+    workspace_key: BrowserWorkspaceKey,
+    failure: PendingAnnotationActionFailure,
+    remote_mode: bool,
+    expires_at: Instant,
+}
+
+impl PendingAnnotationActionNotice {
+    fn new(
+        workspace_key: BrowserWorkspaceKey,
+        failure: PendingAnnotationActionFailure,
+        remote_mode: bool,
+        now: Instant,
+    ) -> Self {
+        Self {
+            workspace_key,
+            failure,
+            remote_mode,
+            expires_at: now + PENDING_ANNOTATION_ACTION_NOTICE_DURATION,
+        }
+    }
+}
+
+fn clear_pending_annotation_action_notice(
+    notice: &mut Option<PendingAnnotationActionNotice>,
+    workspace_key: &BrowserWorkspaceKey,
+) {
+    if notice
+        .as_ref()
+        .is_some_and(|notice| &notice.workspace_key == workspace_key)
+    {
+        *notice = None;
+    }
+}
+
+fn pending_annotation_action_notice_message(
+    notice: Option<&PendingAnnotationActionNotice>,
+    active_workspace: Option<&BrowserWorkspaceKey>,
+    remote_mode: bool,
+    now: Instant,
+) -> Option<&'static str> {
+    notice
+        .filter(|notice| {
+            notice.remote_mode == remote_mode
+                && now < notice.expires_at
+                && Some(&notice.workspace_key) == active_workspace
+        })
+        .map(|notice| notice.failure.notice())
+}
+
+fn browser_workspace_key_for_ai_tab(tab: Option<&SessionTab>) -> Option<BrowserWorkspaceKey> {
+    let tab = tab.filter(|tab| matches!(tab.tab_type, TabType::Claude | TabType::Codex))?;
+    BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()
+}
+
+fn refresh_terminal_pane_model_notice(
+    model: &mut view::TerminalPaneModel,
+    startup_notice: Option<&str>,
+    transient_terminal_notice: Option<&str>,
+    action_notice: &mut Option<PendingAnnotationActionNotice>,
+    active_workspace: Option<&BrowserWorkspaceKey>,
+    remote_mode: bool,
+    now: Instant,
+) {
+    if action_notice
+        .as_ref()
+        .is_some_and(|notice| notice.remote_mode != remote_mode || now >= notice.expires_at)
+    {
+        *action_notice = None;
+    }
+    model.startup_notice = pending_annotation_action_notice_message(
+        action_notice.as_ref(),
+        active_workspace,
+        remote_mode,
+        now,
+    )
+    .map(str::to_string)
+    .or_else(|| startup_notice.map(str::to_string))
+    .or_else(|| transient_terminal_notice.map(str::to_string));
 }
 
 trait BrowserAttachmentProjectionSink {
@@ -1053,6 +1139,7 @@ impl NativeShell {
             updater,
             startup_notice,
             terminal_notice,
+            pending_annotation_action_notice: None,
             terminal_actionable_notice: None,
             editor_notice: None,
             remote_machine_state,
@@ -1792,13 +1879,38 @@ impl NativeShell {
         &mut self,
         workspace_key: &BrowserWorkspaceKey,
         failure: PendingAnnotationActionFailure,
+        cx: &mut Context<Self>,
     ) {
+        let notice = PendingAnnotationActionNotice::new(
+            workspace_key.clone(),
+            failure,
+            self.remote_mode.is_some(),
+            Instant::now(),
+        );
         let message = failure.notice();
-        self.terminal_notice = Some(message.to_string());
+        self.pending_annotation_action_notice = Some(notice.clone());
         self.browser_ui
             .entry(workspace_key.clone())
             .or_default()
             .diagnostic = Some(message.to_string());
+        let background_executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    background_executor
+                        .timer(PENDING_ANNOTATION_ACTION_NOTICE_DURATION)
+                        .await;
+                    let _ = this.update(&mut async_cx, |this, cx| {
+                        if this.pending_annotation_action_notice.as_ref() == Some(&notice) {
+                            this.pending_annotation_action_notice = None;
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
     }
 
     fn remove_pending_annotation_action(
@@ -1808,8 +1920,11 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         if self.remote_mode.is_some() {
-            self.terminal_notice =
-                Some("Remove pending browser annotations from the connected host.".to_string());
+            self.show_pending_annotation_action_failure(
+                &action.workspace_key,
+                PendingAnnotationActionFailure::RemoteRemove,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -1837,6 +1952,10 @@ impl NativeShell {
         match result {
             Ok(BrowserAttachmentProjectionTransaction::Applied)
             | Ok(BrowserAttachmentProjectionTransaction::NewerProjectionRemainsDirty) => {
+                clear_pending_annotation_action_notice(
+                    &mut self.pending_annotation_action_notice,
+                    &active_workspace_key,
+                );
                 let ui = self
                     .browser_ui
                     .entry(active_workspace_key.clone())
@@ -1848,18 +1967,21 @@ impl NativeShell {
                 self.show_pending_annotation_action_failure(
                     &active_workspace_key,
                     PendingAnnotationActionFailure::RemovePersistence,
+                    cx,
                 );
             }
             Err(BrowserError::MissingAnnotation { .. }) => {
                 self.show_pending_annotation_action_failure(
                     &active_workspace_key,
                     PendingAnnotationActionFailure::MissingAnnotation,
+                    cx,
                 );
             }
             Err(_) => {
                 self.show_pending_annotation_action_failure(
                     &active_workspace_key,
                     PendingAnnotationActionFailure::RemoveFailed,
+                    cx,
                 );
             }
         }
@@ -1893,6 +2015,7 @@ impl NativeShell {
                 self.show_pending_annotation_action_failure(
                     &active_workspace_key,
                     PendingAnnotationActionFailure::MissingAnnotation,
+                    cx,
                 );
                 cx.notify();
                 return;
@@ -1901,6 +2024,7 @@ impl NativeShell {
                 self.show_pending_annotation_action_failure(
                     &active_workspace_key,
                     PendingAnnotationActionFailure::InvalidSavedUrl,
+                    cx,
                 );
                 cx.notify();
                 return;
@@ -1921,8 +2045,13 @@ impl NativeShell {
             self.show_pending_annotation_action_failure(
                 &plan.workspace_key,
                 PendingAnnotationActionFailure::PreviewFailed,
+                cx,
             );
         } else {
+            clear_pending_annotation_action_notice(
+                &mut self.pending_annotation_action_notice,
+                &plan.workspace_key,
+            );
             let ui = self
                 .browser_ui
                 .entry(plan.workspace_key.clone())
@@ -8738,7 +8867,8 @@ impl NativeShell {
             let has_active_tab = active_tab_type.is_some();
             let pending_annotations =
                 self.pending_annotation_chip_models_for_tab(active_tab.as_ref());
-            return view::TerminalPaneModel {
+            let active_workspace_key = browser_workspace_key_for_ai_tab(active_tab.as_ref());
+            let mut model = view::TerminalPaneModel {
                 active_project: if has_active_tab {
                     self.state
                         .active_project()
@@ -8754,10 +8884,7 @@ impl NativeShell {
                 },
                 active_tab_type,
                 session: active_session,
-                startup_notice: self
-                    .startup_notice
-                    .clone()
-                    .or_else(|| self.terminal_notice.clone()),
+                startup_notice: None,
                 blocking_notice,
                 actionable_notice: None,
                 pending_annotations,
@@ -8772,6 +8899,18 @@ impl NativeShell {
                 runtime_controls,
                 splash_image: self.splash_image.clone(),
             };
+            let startup_notice = self.startup_notice.clone();
+            let terminal_notice = self.terminal_notice.clone();
+            refresh_terminal_pane_model_notice(
+                &mut model,
+                startup_notice.as_deref(),
+                terminal_notice.as_deref(),
+                &mut self.pending_annotation_action_notice,
+                active_workspace_key.as_ref(),
+                true,
+                Instant::now(),
+            );
+            return model;
         }
 
         let mut active_spec = self.state.active_terminal_spec();
@@ -9078,7 +9217,8 @@ impl NativeShell {
                     }
                 });
         let pending_annotations = self.pending_annotation_chip_models_for_tab(active_tab.as_ref());
-        view::TerminalPaneModel {
+        let active_workspace_key = browser_workspace_key_for_ai_tab(active_tab.as_ref());
+        let mut model = view::TerminalPaneModel {
             active_project: if has_active_tab {
                 self.state
                     .active_project()
@@ -9094,10 +9234,7 @@ impl NativeShell {
             },
             active_tab_type,
             session: active_session,
-            startup_notice: self
-                .startup_notice
-                .clone()
-                .or_else(|| self.terminal_notice.clone()),
+            startup_notice: None,
             blocking_notice,
             actionable_notice,
             pending_annotations,
@@ -9111,7 +9248,19 @@ impl NativeShell {
             scrollbar,
             runtime_controls,
             splash_image: self.splash_image.clone(),
-        }
+        };
+        let startup_notice = self.startup_notice.clone();
+        let terminal_notice = self.terminal_notice.clone();
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            startup_notice.as_deref(),
+            terminal_notice.as_deref(),
+            &mut self.pending_annotation_action_notice,
+            active_workspace_key.as_ref(),
+            false,
+            Instant::now(),
+        );
+        model
     }
 
     fn focus_terminal(&mut self, window: &mut Window) {
@@ -11764,7 +11913,18 @@ impl NativeShell {
         let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
         let mut top = TERMINAL_TOPBAR_HEIGHT_PX;
 
-        if self.startup_notice.is_some() || self.terminal_notice.is_some() {
+        let active_workspace_key = browser_workspace_key_for_ai_tab(self.state.active_tab());
+        let pending_action_notice_visible = pending_annotation_action_notice_message(
+            self.pending_annotation_action_notice.as_ref(),
+            active_workspace_key.as_ref(),
+            self.remote_mode.is_some(),
+            Instant::now(),
+        )
+        .is_some();
+        if self.startup_notice.is_some()
+            || self.terminal_notice.is_some()
+            || pending_action_notice_visible
+        {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
         }
         if self
@@ -15367,6 +15527,37 @@ mod tests {
         .expect("attachment snapshot fixture")
     }
 
+    fn active_ai_terminal_model(
+        workspace_key: &BrowserWorkspaceKey,
+        snapshot: &BrowserWorkspaceSnapshot,
+    ) -> view::TerminalPaneModel {
+        view::TerminalPaneModel {
+            active_project: "Project".to_string(),
+            session_label: "Claude".to_string(),
+            active_tab_type: Some(TabType::Claude),
+            session: None,
+            startup_notice: None,
+            blocking_notice: None,
+            actionable_notice: None,
+            pending_annotations: view::pending_annotation_chip_models(
+                Some(&TabType::Claude),
+                workspace_key,
+                snapshot,
+                &snapshot.annotations,
+            ),
+            debug_enabled: false,
+            font_size: view::TERMINAL_FONT_SIZE,
+            cell_width: 8.0,
+            line_height: view::TERMINAL_LINE_HEIGHT,
+            selection: None,
+            search: None,
+            search_highlight: None,
+            scrollbar: None,
+            runtime_controls: None,
+            splash_image: None,
+        }
+    }
+
     struct RecordingAttachmentProjectionSink {
         state: AppState,
         host_snapshot: BrowserWorkspaceSnapshot,
@@ -15661,6 +15852,10 @@ mod tests {
                 PendingAnnotationActionFailure::PreviewFailed,
                 "Could not open the annotation preview.",
             ),
+            (
+                PendingAnnotationActionFailure::RemoteRemove,
+                "Remove pending browser annotations from the connected host.",
+            ),
         ];
 
         for (failure, expected) in cases {
@@ -15669,6 +15864,158 @@ mod tests {
             assert!(notice.len() <= 64);
             assert!(!notice.contains("super-secret"));
         }
+    }
+
+    #[test]
+    fn chip_action_failure_survives_active_ai_terminal_model_refresh_while_pane_is_collapsed() {
+        let now = Instant::now();
+        let key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let mut snapshot = attachment_snapshot(&["ann-preview"]);
+        snapshot.pane_open = false;
+        let mut action_notice = Some(PendingAnnotationActionNotice::new(
+            key.clone(),
+            PendingAnnotationActionFailure::PreviewFailed,
+            false,
+            now,
+        ));
+        let mut model = active_ai_terminal_model(&key, &snapshot);
+
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            Some("Existing startup notice"),
+            None,
+            &mut action_notice,
+            Some(&key),
+            false,
+            now,
+        );
+        assert!(!snapshot.pane_open);
+        assert_eq!(model.pending_annotations.len(), 1);
+        assert_eq!(
+            model.startup_notice.as_deref(),
+            Some("Could not open the annotation preview.")
+        );
+
+        model.startup_notice = None;
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            None,
+            None,
+            &mut action_notice,
+            Some(&key),
+            false,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            model.startup_notice.as_deref(),
+            Some("Could not open the annotation preview."),
+            "ordinary local AI refresh must not erase chip-action feedback"
+        );
+        let _rendered = view::render_terminal_surface(&model, None);
+    }
+
+    #[test]
+    fn chip_action_notice_is_workspace_and_mode_scoped_then_clears_on_success_or_expiry() {
+        let now = Instant::now();
+        let key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let other = BrowserWorkspaceKey::new("project-1", "tab-2").unwrap();
+        let snapshot = attachment_snapshot(&["ann-preview"]);
+        let mut model = active_ai_terminal_model(&key, &snapshot);
+        let mut action_notice = Some(PendingAnnotationActionNotice::new(
+            key.clone(),
+            PendingAnnotationActionFailure::PreviewFailed,
+            true,
+            now,
+        ));
+
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            None,
+            None,
+            &mut action_notice,
+            Some(&key),
+            true,
+            now,
+        );
+        assert_eq!(
+            model.startup_notice.as_deref(),
+            Some("Could not open the annotation preview."),
+            "remote AI refresh must project remote chip-action feedback"
+        );
+        clear_pending_annotation_action_notice(&mut action_notice, &key);
+        model.startup_notice = None;
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            None,
+            Some("Existing transient notice"),
+            &mut action_notice,
+            Some(&key),
+            true,
+            now,
+        );
+        assert_eq!(
+            model.startup_notice.as_deref(),
+            Some("Existing transient notice")
+        );
+
+        action_notice = Some(PendingAnnotationActionNotice::new(
+            key.clone(),
+            PendingAnnotationActionFailure::RemoveFailed,
+            false,
+            now,
+        ));
+        model.startup_notice = None;
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            None,
+            None,
+            &mut action_notice,
+            Some(&other),
+            false,
+            now,
+        );
+        assert!(model.startup_notice.is_none());
+        assert!(
+            action_notice.is_some(),
+            "another workspace must not consume it"
+        );
+
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            None,
+            None,
+            &mut action_notice,
+            Some(&key),
+            true,
+            now,
+        );
+        assert!(model.startup_notice.is_none());
+        assert!(
+            action_notice.is_none(),
+            "a local/remote mode change clears it"
+        );
+
+        action_notice = Some(PendingAnnotationActionNotice::new(
+            key.clone(),
+            PendingAnnotationActionFailure::InvalidSavedUrl,
+            false,
+            now,
+        ));
+        refresh_terminal_pane_model_notice(
+            &mut model,
+            None,
+            Some("Existing transient notice"),
+            &mut action_notice,
+            Some(&key),
+            false,
+            now + PENDING_ANNOTATION_ACTION_NOTICE_DURATION + Duration::from_millis(1),
+        );
+        assert!(action_notice.is_none());
+        assert_eq!(
+            model.startup_notice.as_deref(),
+            Some("Existing transient notice"),
+            "expiry must restore the existing transient notice lifecycle"
+        );
     }
 
     #[test]
