@@ -170,6 +170,72 @@ fn plan_without_secrets() -> BrowserReplayPlan {
     .unwrap()
 }
 
+fn replay_recipe_without_secret_gate() -> BrowserRecipeV1 {
+    let mut recipe = replay_recipe();
+    recipe
+        .inputs
+        .retain(|input| input.kind != BrowserRecipeInputKind::Secret);
+    recipe.steps[3].action = BrowserRecipeAction::Reload;
+    recipe
+}
+
+fn assert_credential_identifier_never_reaches_replay_history(
+    recipe: BrowserRecipeV1,
+    credential_id: &str,
+    target_step_index: Option<usize>,
+    case_index: usize,
+) {
+    let coordinator = BrowserReplayCoordinator::with_terminal_capacity(4);
+    let result = compile_browser_replay(
+        &recipe,
+        vec![
+            input("query", BrowserRecipeInputKind::Text, "safe-query"),
+            input("upload", BrowserRecipeInputKind::File, "safe-file.txt"),
+        ],
+    );
+
+    match result {
+        Err(error) => {
+            assert_eq!(error, BrowserReplayError::InvalidRecipe);
+            assert!(!format!("{error:?}").contains(credential_id));
+            assert!(!error.to_string().contains(credential_id));
+        }
+        Ok(plan) => {
+            let conversation = format!("credential-id-case-{case_index}");
+            let started = coordinator
+                .start(workspace("credential-id-project", &conversation), plan)
+                .unwrap();
+            let mut projection = started.projection;
+            if let Some(target_step_index) = target_step_index {
+                coordinator.begin(&started.instance).unwrap();
+                for completed_step_index in 0..target_step_index {
+                    projection = coordinator
+                        .advance_step(&started.instance, completed_step_index)
+                        .unwrap();
+                }
+            }
+            let cancelled = coordinator.cancel(&started.instance).unwrap();
+            let history = coordinator.status(&started.instance).unwrap();
+            for surface in [
+                serde_json::to_string(&projection).unwrap(),
+                format!("{projection:?}"),
+                serde_json::to_string(&cancelled).unwrap(),
+                format!("{cancelled:?}"),
+                serde_json::to_string(&history).unwrap(),
+                format!("{history:?}"),
+            ] {
+                assert!(
+                    !surface.contains(credential_id),
+                    "credential-shaped identifier reached replay projection/history"
+                );
+            }
+            panic!("credential-shaped identifier unexpectedly compiled");
+        }
+    }
+
+    assert_eq!(coordinator.retained_terminal_count(), 0);
+}
+
 #[test]
 fn replay_compiler_applies_safe_defaults_and_preserves_ordered_opaque_bindings() {
     let plan = compile_fixture("fixtures/upload.txt").expect("compile replay plan");
@@ -422,6 +488,37 @@ fn replay_compiler_rejects_credential_bearing_secret_names_before_projection() {
         .unresolved_secret_input_names()
         .iter()
         .any(|name| name == "login_secret"));
+}
+
+#[test]
+fn replay_compiler_rejects_credential_shaped_recipe_and_every_step_id_before_history() {
+    let mut case_index = 0;
+    for credential_id in [
+        "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    ] {
+        let mut recipe = replay_recipe_without_secret_gate();
+        recipe.id = credential_id.to_string();
+        assert_credential_identifier_never_reaches_replay_history(
+            recipe,
+            credential_id,
+            None,
+            case_index,
+        );
+        case_index += 1;
+
+        for step_index in 0..replay_recipe_without_secret_gate().steps.len() {
+            let mut recipe = replay_recipe_without_secret_gate();
+            recipe.steps[step_index].id = credential_id.to_string();
+            assert_credential_identifier_never_reaches_replay_history(
+                recipe,
+                credential_id,
+                Some(step_index),
+                case_index,
+            );
+            case_index += 1;
+        }
+    }
 }
 
 #[test]

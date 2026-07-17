@@ -594,12 +594,23 @@ impl<'de> Deserialize<'de> for BrowserRecipeValue {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrowserRecipeStep {
+    #[serde(serialize_with = "serialize_recipe_step_id")]
     pub id: String,
     pub action: BrowserRecipeAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<BrowserRecipeWait>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<BrowserRecipeAssertion>,
+}
+
+fn serialize_recipe_step_id<S>(id: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if !is_safe_recipe_id(id) {
+        return Err(S::Error::custom("recipe step id is not a safe slug"));
+    }
+    id.serialize(serializer)
 }
 
 #[derive(Deserialize)]
@@ -1649,6 +1660,7 @@ fn is_safe_recipe_id(recipe_id: &str) -> bool {
         && recipe_id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        && !super::automation::browser_text_contains_secret(recipe_id)
 }
 
 pub fn recipe_path(

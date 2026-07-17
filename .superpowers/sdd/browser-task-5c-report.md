@@ -26,6 +26,14 @@ Checkpoints 8 through 12 are not implemented. This checkpoint executes no browse
 4. Audit hardening: an ordered-binding regression first failed because no declaration-order accessor existed. After that slice, the 16-test replay target had exactly two RED failures: safe in-bound 64-KiB Text was rejected by the 4,000-character display-redaction cap, and a credential-bearing Secret name reached projection. A shared nontruncating boolean credential detector and declaration-ordered binding storage made 16/16 pass while existing browser automation and recipe suites remained green.
 5. Exact scope: a foreign coordinator with the same workspace and local instance ID was incorrectly accepted. Adding one opaque coordinator scope to instance equality made the collision regression GREEN without serializing or debugging the scope.
 
+### Independent-review hardening
+
+The initial checkpoint-7 implementation landed as `b3ab2e163227228f93ca87e55c5f7ded9dc86e7d`. Independent review rejected one P1 boundary: recipe and step IDs used slug syntax alone, so bare credential shapes such as `sk-proj-*` and `ghp_*` could compile and then appear in serialized/Debug replay projections and bounded terminal history.
+
+- Recipe-wire RED: `browser_recipe_identifiers_reject_bare_credentials_on_every_wire_boundary` failed because `BrowserRecipeV1::validate` returned `Ok(())` for the `sk-proj-*` recipe ID. The completed regression covers both required bare shapes in the recipe ID and step ID, top-level validation/serialization/deserialization, direct `BrowserRecipeStep` serialization/deserialization, fixed non-echoing errors, and normal lookalike IDs.
+- Replay RED: `replay_compiler_rejects_credential_shaped_recipe_and_every_step_id_before_history` compiled the malicious recipe, started it, and failed because serialized/Debug projection and terminal-history surfaces contained the credential-shaped ID. The completed regression checks recipe ID plus every one of four ordered step IDs for both bare shapes and requires rejection before plan/start with zero retained history.
+- GREEN: the existing centralized recipe identifier predicate now combines the unchanged bounded safe-slug syntax with the shared nontruncating credential-content detector. `BrowserRecipeV1` validation and serialization, nested/direct step deserialization, recipe path/list/temp ownership checks, and a new direct-step serialization guard all use that predicate. Ordinary IDs such as `sketch-project_2` and `gh-preview_2` still validate and round-trip with the identical wire shape.
+
 ### Verification
 
 - `cargo test --locked --test browser_replay -- --test-threads=1` -> 17 passed, 0 failed.
@@ -34,6 +42,15 @@ Checkpoints 8 through 12 are not implemented. This checkpoint executes no browse
 - `cargo test --locked browser -- --test-threads=1` -> 120 matching tests passed across library and integration targets, 0 failed.
 - `cargo check --locked --all-targets` and native Windows `cargo build --locked` -> exit 0.
 - `cargo fmt --all -- --check` and `git diff --check` -> exit 0 on the completed source and documentation.
+
+Review-hardening verification:
+
+- `cargo test --locked --test browser_recipes -- --test-threads=1` -> 16 passed, 0 failed.
+- `cargo test --locked --test browser_replay -- --test-threads=1` -> 18 passed, 0 failed.
+- `cargo test --locked --test browser_automation -- --test-threads=1` -> 12 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1` -> 121 matching tests passed across library and integration targets, 0 failed.
+- `cargo check --locked --all-targets` and native Windows `cargo build --locked` -> exit 0.
+- `cargo fmt --all -- --check` and `git diff --check` -> exit 0.
 
 ### Files
 

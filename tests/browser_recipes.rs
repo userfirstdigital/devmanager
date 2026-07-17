@@ -267,6 +267,63 @@ fn browser_recipe_serialization_rejects_credential_material_without_echoing_it()
 }
 
 #[test]
+fn browser_recipe_identifiers_reject_bare_credentials_on_every_wire_boundary() {
+    for credential_id in [
+        "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    ] {
+        let mut recipe = sample_recipe();
+        recipe.id = credential_id.to_string();
+        let validation = recipe.validate().expect_err("recipe id must be rejected");
+        assert!(!format!("{validation:?}").contains(credential_id));
+        let serialization = serde_json::to_string(&recipe)
+            .expect_err("credential-shaped recipe id must not serialize");
+        assert!(!serialization.to_string().contains(credential_id));
+
+        let mut recipe_wire = serde_json::to_value(sample_recipe()).unwrap();
+        recipe_wire["id"] = json!(credential_id);
+        let deserialization = serde_json::from_value::<BrowserRecipeV1>(recipe_wire)
+            .expect_err("credential-shaped recipe id must not deserialize");
+        assert!(!deserialization.to_string().contains(credential_id));
+
+        let mut step = sample_recipe().steps.remove(0);
+        step.id = credential_id.to_string();
+        let direct_serialization = serde_json::to_string(&step)
+            .expect_err("credential-shaped step id must not serialize directly");
+        assert!(!direct_serialization.to_string().contains(credential_id));
+
+        let mut step_wire = serde_json::to_value(sample_recipe().steps.remove(0)).unwrap();
+        step_wire["id"] = json!(credential_id);
+        let direct_deserialization = serde_json::from_value::<BrowserRecipeStep>(step_wire)
+            .expect_err("credential-shaped step id must not deserialize directly");
+        assert!(!direct_deserialization.to_string().contains(credential_id));
+
+        let mut recipe = sample_recipe();
+        recipe.steps[0].id = credential_id.to_string();
+        let validation = recipe.validate().expect_err("step id must be rejected");
+        assert!(!format!("{validation:?}").contains(credential_id));
+        let serialization = serde_json::to_string(&recipe)
+            .expect_err("credential-shaped nested step id must not serialize");
+        assert!(!serialization.to_string().contains(credential_id));
+    }
+
+    let mut ordinary = sample_recipe();
+    ordinary.id = "sketch-project_2".to_string();
+    ordinary.steps[0].id = "gh-preview_2".to_string();
+    assert_eq!(ordinary.validate(), Ok(()));
+    let encoded = serde_json::to_string(&ordinary).unwrap();
+    assert_eq!(
+        serde_json::from_str::<BrowserRecipeV1>(&encoded).unwrap(),
+        ordinary
+    );
+    let step = ordinary.steps[0].clone();
+    assert_eq!(
+        serde_json::from_str::<BrowserRecipeStep>(&serde_json::to_string(&step).unwrap()).unwrap(),
+        step
+    );
+}
+
+#[test]
 fn browser_recipe_validation_rejects_invalid_references_types_and_defaults() {
     let mut recipe = sample_recipe();
     recipe.steps[0].action = BrowserRecipeAction::Navigate {
