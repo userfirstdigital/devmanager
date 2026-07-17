@@ -532,8 +532,7 @@ impl BrowserWorkflowRecorder {
             .position(|step| step.id == step_id)
             .ok_or(BrowserRecordingError::InvalidMutation)?;
         review.recipe.steps.remove(index);
-        garbage_collect_generated_inputs(review);
-        Ok(review.clone())
+        Ok(finish_reference_mutation(review))
     }
 
     pub fn move_step(
@@ -633,7 +632,7 @@ impl BrowserWorkflowRecorder {
             };
         review.generated_inputs.insert(input.name.clone());
         review.recipe.inputs.push(input);
-        Ok(review.clone())
+        Ok(finish_reference_mutation(review))
     }
 
     pub fn add_input(
@@ -693,7 +692,7 @@ impl BrowserWorkflowRecorder {
             review.generated_inputs.remove(previous_name);
             review.generated_inputs.insert(new_name.to_string());
         }
-        Ok(review.clone())
+        Ok(finish_reference_mutation(review))
     }
 
     pub fn set_input_default(
@@ -756,7 +755,7 @@ impl BrowserWorkflowRecorder {
             .find(|step| step.id == step_id)
             .ok_or(BrowserRecordingError::InvalidMutation)?;
         step.wait = wait;
-        Ok(review.clone())
+        Ok(finish_reference_mutation(review))
     }
 
     pub fn add_step_assertion(
@@ -806,7 +805,7 @@ impl BrowserWorkflowRecorder {
             return Err(BrowserRecordingError::InvalidMutation);
         }
         step.assertions.remove(assertion_index);
-        Ok(review.clone())
+        Ok(finish_reference_mutation(review))
     }
 
     pub fn recipe_for_save(
@@ -1282,6 +1281,11 @@ fn garbage_collect_generated_inputs(review: &mut BrowserRecordingReview) {
     review
         .generated_inputs
         .retain(|name| !unreferenced.contains(name));
+}
+
+fn finish_reference_mutation(review: &mut BrowserRecordingReview) -> BrowserRecordingReview {
+    garbage_collect_generated_inputs(review);
+    review.clone()
 }
 
 fn action_references_input(action: &BrowserRecipeAction, input_name: &str) -> bool {

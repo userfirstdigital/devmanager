@@ -18,6 +18,15 @@ fn workspace(project: &str, tab: &str) -> BrowserWorkspaceKey {
     BrowserWorkspaceKey::new(project, tab).expect("valid workspace")
 }
 
+fn review_input_names(review: &devmanager::browser::BrowserRecordingReview) -> Vec<&str> {
+    review
+        .recipe()
+        .inputs
+        .iter()
+        .map(|input| input.name.as_str())
+        .collect()
+}
+
 #[test]
 fn cancellation_capacity_and_late_completion_preserve_the_exact_instance() {
     let workspace = workspace("project-a", "ai-a");
@@ -1108,6 +1117,180 @@ fn review_hardening_rejects_encoded_secrets_or_unbounded_invalid_state() {
     assert!(
         defects.is_empty(),
         "unfixed recording review findings: {}",
+        defects.join(", ")
+    );
+}
+
+#[test]
+fn generated_input_gc_follows_successful_reference_mutations_atomically() {
+    let mut recorder = BrowserWorkflowRecorder::default();
+    let instance = recorder
+        .start(workspace("gc-project", "gc-tab"))
+        .expect("start GC recording");
+    let actions = [
+        navigate("https://example.test/remove-wait"),
+        BrowserRecordingAction::recipe(BrowserRecipeAction::Click {
+            locator: locator("remove-wait-keeper"),
+        })
+        .expect("remove-wait keeper"),
+        navigate("https://example.test/replace-wait"),
+        BrowserRecordingAction::recipe(BrowserRecipeAction::Click {
+            locator: locator("replace-wait-keeper"),
+        })
+        .expect("replace-wait keeper"),
+        BrowserRecordingAction::type_text(locator("assertion-source"), "expected title")
+            .expect("assertion source"),
+        BrowserRecordingAction::recipe(BrowserRecipeAction::Click {
+            locator: locator("assertion-keeper"),
+        })
+        .expect("assertion keeper"),
+    ];
+    for action in actions {
+        let reservation = recorder
+            .reserve(&instance, BrowserRecordingActor::User)
+            .expect("reserve GC action");
+        recorder
+            .commit(reservation, action)
+            .expect("commit GC action");
+    }
+    recorder.stop(&instance).expect("stop GC recording");
+
+    for (step_id, input_name, kind) in [
+        ("step-1", "wait_remove", BrowserRecipeInputKind::Url),
+        ("step-3", "wait_replace", BrowserRecipeInputKind::Url),
+        ("step-5", "assertion_text", BrowserRecipeInputKind::Text),
+    ] {
+        recorder
+            .convert_action_value_to_input(&instance, step_id, input_name, kind)
+            .expect("generate shared input");
+    }
+    recorder
+        .set_step_wait(
+            &instance,
+            "step-2",
+            Some(BrowserRecipeWait::Url {
+                value: BrowserRecipeValue::Input {
+                    name: "wait_remove".to_string(),
+                },
+                exact: true,
+                timeout_ms: 1_000,
+            }),
+        )
+        .expect("share removal wait input");
+    recorder
+        .set_step_wait(
+            &instance,
+            "step-4",
+            Some(BrowserRecipeWait::Url {
+                value: BrowserRecipeValue::Input {
+                    name: "wait_replace".to_string(),
+                },
+                exact: true,
+                timeout_ms: 1_000,
+            }),
+        )
+        .expect("share replacement wait input");
+    recorder
+        .add_step_assertion(
+            &instance,
+            "step-6",
+            BrowserRecipeAssertion::Title {
+                value: BrowserRecipeValue::Input {
+                    name: "assertion_text".to_string(),
+                },
+                exact: true,
+            },
+        )
+        .expect("share assertion input");
+    recorder
+        .add_input(
+            &instance,
+            BrowserRecipeInput {
+                name: "manual_input".to_string(),
+                kind: BrowserRecipeInputKind::Text,
+                default_value: Some("manual".to_string()),
+            },
+        )
+        .expect("add explicit review input");
+
+    for step_id in ["step-1", "step-3", "step-5"] {
+        recorder
+            .delete_step(&instance, step_id)
+            .expect("delete generated-input source step");
+    }
+
+    let mut defects = Vec::new();
+    let shared = recorder.review(&instance).expect("shared review");
+    if review_input_names(&shared)
+        != [
+            "wait_remove",
+            "wait_replace",
+            "assertion_text",
+            "manual_input",
+        ]
+    {
+        defects.push("shared generated inputs were not preserved");
+    }
+
+    let before_invalid_wait = recorder.review(&instance).expect("before invalid wait");
+    let invalid_wait = recorder.set_step_wait(
+        &instance,
+        "step-4",
+        Some(BrowserRecipeWait::Duration { duration_ms: 0 }),
+    );
+    let after_invalid_wait = recorder.review(&instance).expect("after invalid wait");
+    if !matches!(invalid_wait, Err(BrowserRecordingError::InvalidMutation))
+        || before_invalid_wait != after_invalid_wait
+    {
+        defects.push("failed wait mutation was not atomic");
+    }
+
+    let before_invalid_assertion = recorder
+        .review(&instance)
+        .expect("before invalid assertion removal");
+    let invalid_assertion = recorder.remove_step_assertion(&instance, "step-6", 1);
+    let after_invalid_assertion = recorder
+        .review(&instance)
+        .expect("after invalid assertion removal");
+    if !matches!(
+        invalid_assertion,
+        Err(BrowserRecordingError::InvalidMutation)
+    ) || before_invalid_assertion != after_invalid_assertion
+    {
+        defects.push("failed assertion mutation was not atomic");
+    }
+
+    let after_wait_removal = recorder
+        .set_step_wait(&instance, "step-2", None)
+        .expect("remove final wait reference");
+    if review_input_names(&after_wait_removal) != ["wait_replace", "assertion_text", "manual_input"]
+    {
+        defects.push("wait removal left a generated input orphan");
+    }
+
+    let after_wait_replacement = recorder
+        .set_step_wait(
+            &instance,
+            "step-4",
+            Some(BrowserRecipeWait::Load { timeout_ms: 1_000 }),
+        )
+        .expect("replace final wait reference");
+    if review_input_names(&after_wait_replacement) != ["assertion_text", "manual_input"] {
+        defects.push("wait replacement left a generated input orphan");
+    }
+
+    let after_assertion_removal = recorder
+        .remove_step_assertion(&instance, "step-6", 0)
+        .expect("remove final assertion reference");
+    if review_input_names(&after_assertion_removal) != ["manual_input"]
+        || recorder.recipe_for_save(&instance).is_err()
+    {
+        defects.push("assertion removal left a generated input orphan");
+    }
+
+    assert!(
+        defects.is_empty(),
+        "unfixed generated-input lifecycle findings: {}",
         defects.join(", ")
     );
 }
