@@ -29,6 +29,7 @@ pub use attachments::{
     BrowserAttachmentProjection, BrowserAttachmentReservation, BrowserAttachmentSessionBinding,
     BrowserPromptInput, MAX_BROWSER_ATTACHMENT_PREAMBLE_BYTES,
 };
+pub(crate) use attachments::{compact_browser_attachment_text, compact_browser_attachment_url};
 pub use automation::{
     build_semantic_snapshot, effective_browser_risk, effective_browser_risk_for_targets,
     redact_browser_resource_bytes, redact_browser_text, runtime_target_risk, BrowserAction,
@@ -71,14 +72,14 @@ pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,
 };
 pub use pane::{
-    browser_action_plan, browser_content_bounds, browser_event_plan, browser_host_reconcile_plan,
-    browser_host_visibility, browser_pane_eligible, browser_pane_open_fallback,
-    browser_response_sync, browser_settings_plan, calculate_browser_split,
-    normalize_browser_address, render_browser_pane, selected_browser_tab_id, BrowserActionPlan,
-    BrowserHostReconcilePlan, BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions,
-    BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface,
-    BrowserPaneTransient, BrowserSettingsAction, BrowserSettingsPlan, BrowserSnapshotSync,
-    BrowserSplitLayout, BrowserViewportPreset,
+    browser_action_plan, browser_annotation_preview_plan, browser_content_bounds,
+    browser_event_plan, browser_host_reconcile_plan, browser_host_visibility,
+    browser_pane_eligible, browser_pane_open_fallback, browser_response_sync,
+    browser_settings_plan, calculate_browser_split, normalize_browser_address, render_browser_pane,
+    selected_browser_tab_id, BrowserActionPlan, BrowserHostReconcilePlan, BrowserHostVisibility,
+    BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
+    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserSettingsAction,
+    BrowserSettingsPlan, BrowserSnapshotSync, BrowserSplitLayout, BrowserViewportPreset,
 };
 pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserRisk};
 pub use provider::{

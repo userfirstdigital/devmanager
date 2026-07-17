@@ -624,11 +624,11 @@ fn build_attachment_preamble(annotations: &[BrowserAnnotation]) -> String {
             preamble.push_str("; ");
         }
         preamble.push_str("id=");
-        preamble.push_str(&compact_redacted(&annotation.id, 96));
+        preamble.push_str(&compact_browser_attachment_text(&annotation.id, 96));
         preamble.push_str(" comment=");
-        preamble.push_str(&compact_redacted(&annotation.comment, 180));
+        preamble.push_str(&compact_browser_attachment_text(&annotation.comment, 180));
         preamble.push_str(" url=");
-        preamble.push_str(&compact_redacted_url(&annotation.url, 240));
+        preamble.push_str(&compact_browser_attachment_url(&annotation.url, 240));
     }
     const SUFFIX: &str = "] ";
     truncate_utf8_bytes(
@@ -639,7 +639,7 @@ fn build_attachment_preamble(annotations: &[BrowserAnnotation]) -> String {
     preamble
 }
 
-fn compact_redacted(value: &str, max_chars: usize) -> String {
+pub(crate) fn compact_browser_attachment_text(value: &str, max_chars: usize) -> String {
     let mut compact = String::new();
     let mut previous_space = false;
     for character in redact_browser_text(value).chars() {
@@ -659,8 +659,8 @@ fn compact_redacted(value: &str, max_chars: usize) -> String {
     compact.trim().to_string()
 }
 
-fn compact_redacted_url(value: &str, max_chars: usize) -> String {
-    compact_redacted(&redacted_url_summary(value), max_chars)
+pub(crate) fn compact_browser_attachment_url(value: &str, max_chars: usize) -> String {
+    compact_browser_attachment_text(&redacted_url_summary(value), max_chars)
 }
 
 fn redacted_url_summary(value: &str) -> String {

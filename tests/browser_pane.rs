@@ -1,14 +1,14 @@
 use devmanager::browser::{
-    browser_action_plan, browser_content_bounds, browser_event_plan, browser_host_reconcile_plan,
-    browser_host_visibility, browser_pane_eligible, browser_pane_open_fallback,
-    browser_response_sync, browser_settings_plan, calculate_browser_split,
-    normalize_browser_address, BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserError,
-    BrowserHostEvent, BrowserHostState, BrowserHostVisibility, BrowserInvocationActor,
-    BrowserJournalActor, BrowserJournalEntry, BrowserPaneAction, BrowserPaneContext,
-    BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
-    BrowserResponse, BrowserRisk, BrowserSettingsAction, BrowserTabSnapshot, BrowserUserInputKind,
-    BrowserViewport, BrowserViewportPreset, BrowserWorkspaceKey, BrowserWorkspaceMutation,
-    BrowserWorkspaceSnapshot,
+    browser_action_plan, browser_annotation_preview_plan, browser_content_bounds,
+    browser_event_plan, browser_host_reconcile_plan, browser_host_visibility,
+    browser_pane_eligible, browser_pane_open_fallback, browser_response_sync,
+    browser_settings_plan, calculate_browser_split, normalize_browser_address, BrowserAnnotation,
+    BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserError, BrowserHostEvent,
+    BrowserHostState, BrowserHostVisibility, BrowserInvocationActor, BrowserJournalActor,
+    BrowserJournalEntry, BrowserPaneAction, BrowserPaneContext, BrowserPaneEventPlan,
+    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse, BrowserRisk,
+    BrowserSettingsAction, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
+    BrowserViewportPreset, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
 use std::path::PathBuf;
 
@@ -19,6 +19,139 @@ fn context(surface: BrowserPaneSurface) -> BrowserPaneContext {
         active_surface: Some(surface),
         editor_open: false,
         modal_open: false,
+    }
+}
+
+fn pending_annotation(id: &str, tab_id: &str, url: &str) -> BrowserAnnotation {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "kind": "element",
+        "tabId": tab_id,
+        "anchorRevision": 1,
+        "comment": "Review this",
+        "url": url,
+        "locator": {},
+        "bounds": { "x": 1, "y": 2, "width": 3, "height": 4 },
+        "viewport": {},
+        "screenshotResource": format!("shot-{id}"),
+        "computedStyles": {},
+        "resolved": false
+    }))
+    .expect("pending annotation fixture")
+}
+
+#[test]
+fn annotation_preview_selects_and_conditionally_navigates_an_existing_tab_without_consuming() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let saved_url = "https://example.test/saved?token=redacted";
+    let pending = vec![pending_annotation("ann-a", "tab-a", saved_url)];
+    let snapshot = BrowserWorkspaceSnapshot {
+        pane_open: false,
+        tabs: vec![
+            BrowserTabSnapshot {
+                id: "tab-a".to_string(),
+                title: "A".to_string(),
+                url: "https://example.test/current".to_string(),
+                viewport: BrowserViewport::default(),
+            },
+            BrowserTabSnapshot {
+                id: "tab-b".to_string(),
+                title: "B".to_string(),
+                url: "https://other.test".to_string(),
+                viewport: BrowserViewport::default(),
+            },
+        ],
+        selected_tab_id: Some("tab-b".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    let before = pending.clone();
+
+    let plan =
+        browser_annotation_preview_plan(Some(&key), &key, Some(&snapshot), &pending, "ann-a")
+            .unwrap();
+
+    assert!(matches!(plan.commands[0], BrowserCommand::Ensure { .. }));
+    assert_eq!(plan.commands[1], BrowserCommand::SetPaneOpen { open: true });
+    assert_eq!(
+        plan.commands[2],
+        BrowserCommand::SelectTab {
+            tab_id: "tab-a".to_string()
+        }
+    );
+    assert_eq!(
+        plan.commands[3],
+        BrowserCommand::Navigate {
+            tab_id: "tab-a".to_string(),
+            url: saved_url.to_string(),
+        }
+    );
+    assert_eq!(pending, before, "preview must not consume pending context");
+
+    let already_selected = BrowserWorkspaceSnapshot {
+        pane_open: true,
+        tabs: vec![BrowserTabSnapshot {
+            id: "tab-a".to_string(),
+            title: "A".to_string(),
+            url: saved_url.to_string(),
+            viewport: BrowserViewport::default(),
+        }],
+        selected_tab_id: Some("tab-a".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+    let plan = browser_annotation_preview_plan(
+        Some(&key),
+        &key,
+        Some(&already_selected),
+        &pending,
+        "ann-a",
+    )
+    .unwrap();
+    assert_eq!(plan.commands.len(), 1);
+    assert!(matches!(plan.commands[0], BrowserCommand::Ensure { .. }));
+}
+
+#[test]
+fn annotation_preview_creates_a_missing_tab_at_the_saved_url() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let saved_url = "https://example.test/saved";
+    let pending = vec![pending_annotation("ann-a", "missing-tab", saved_url)];
+    let snapshot = BrowserWorkspaceSnapshot::default();
+
+    let plan =
+        browser_annotation_preview_plan(Some(&key), &key, Some(&snapshot), &pending, "ann-a")
+            .unwrap();
+
+    assert!(matches!(plan.commands[0], BrowserCommand::Ensure { .. }));
+    assert_eq!(plan.commands[1], BrowserCommand::SetPaneOpen { open: true });
+    assert_eq!(
+        plan.commands[2],
+        BrowserCommand::CreateTab {
+            url: Some(saved_url.to_string())
+        }
+    );
+    assert!(!plan.commands.iter().any(|command| matches!(
+        command,
+        BrowserCommand::SelectTab { .. } | BrowserCommand::Navigate { .. }
+    )));
+}
+
+#[test]
+fn annotation_preview_rejects_cross_workspace_and_no_longer_pending_actions() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let other = BrowserWorkspaceKey::new("project-b", "conversation-b").unwrap();
+    let pending = vec![pending_annotation("ann-a", "tab-a", "https://example.test")];
+
+    for (action_key, annotation_id) in [(&other, "ann-a"), (&key, "ann-stale")] {
+        assert!(matches!(
+            browser_annotation_preview_plan(
+                Some(&key),
+                action_key,
+                Some(&BrowserWorkspaceSnapshot::default()),
+                &pending,
+                annotation_id,
+            ),
+            Err(BrowserError::MissingAnnotation { .. })
+        ));
     }
 }
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Task 5B is complete through checkpoint 4B2. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local native exactly-once PTY attachment, and authoritative AppState/host projection with attachment pin reconciliation are complete. Remote web input wiring and native chips/preview/remove UI remain intentionally out of scope here.
+Task 5B is implemented through checkpoint 4C1, which awaits independent review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local native exactly-once PTY attachment, authoritative AppState/host projection with attachment pin reconciliation, and native pending-annotation chips/preview/remove UI are implemented. Remote web input wiring remains intentionally out of scope here.
 
 ## Commit range
 
@@ -11,6 +11,7 @@ Task 5B is complete through checkpoint 4B2. Persistence/restored AI workspaces, 
 - Capture lifecycle hardening: `fe90233` (`fix: harden browser annotation lifecycle`)
 - Authenticated MCP operations/resources: this checkpoint commit
 - Checkpoint 4B1 session lifecycle and local user-origin input: this checkpoint commit
+- Checkpoint 4C1 native pending-annotation chips: this checkpoint commit
 - Branch: `master`, explicitly authorized by the user
 
 ## Authenticated MCP architecture
@@ -56,8 +57,7 @@ Task 5B is complete through checkpoint 4B2. Persistence/restored AI workspaces, 
 ## Remaining Task 5B work
 
 - Wire remote web composer/input without changing its established wire contract.
-- Render per-conversation pending annotation chips above the active AI terminal only.
-- Add remove/open-preview actions without deleting the saved annotation.
+- Complete independent review of checkpoint 4C1.
 
 ## Checkpoint 4A: attachment transaction core
 
@@ -228,3 +228,35 @@ Checkpoint 4B must wire the broker into ProcessManager session lifecycle, explic
 - `cargo test --locked --lib services::process_manager::tests -- --test-threads=1` - PASS, 70/70.
 - `cargo test --locked --test browser_attachment_lifecycle -- --test-threads=1` - PASS, 3/3.
 - Affected browser suites - PASS, 158/158: annotations 5, automation 12, core 17, gateway 14, host 82, pane 28.
+
+## Checkpoint 4C1: native pending-annotation chips
+
+- Added terminal-native `PendingAnnotationChipModel`/action DTOs in authoritative pending order. Local conversations source the broker projection and never stale AppState pending IDs; remote-client conversations source the received host snapshot and never overlay or detach through the local broker.
+- The terminal strip renders only for active Claude/Codex tabs, after terminal notices and before search/content. It is independent of browser `pane_open`; Server/SSH remain empty. Terminal viewport sizing now reserves the visible strip height.
+- Display content contains only a bounded/redacted stable ID, 96-character comment, safe URL origin, and stale marker. It reuses the attachment preamble redaction/origin helpers and never carries locator/style/screenshot/query-secret content into rendered text.
+- Local remove validates the active workspace and current broker pending set, calls broker detach, and immediately reuses the 4B2 host/AppState/persist/acknowledge transaction. Host or persistence failure stays dirty for retry. Saved annotation and screenshot references remain; no annotation Delete or new public `BrowserCommand` was added. Remote-client remove refuses local broker mutation with a concise host-directed diagnostic.
+- Preview validates the active workspace and authoritative pending source, then uses existing `Ensure`, `SetPaneOpen`, `SelectTab`, `Navigate`, and `CreateTab` commands through `dispatch_browser_command` and its GPUI bridge/control barrier. Existing tabs select and navigate only when needed; missing tabs are created at the saved URL. Preview never reserves, commits, detaches, or acknowledges an attachment.
+- The nested remove control stops propagation before invoking remove, so it cannot also trigger chip preview; preview clicks also stop before reaching terminal selection handling.
+
+### Checkpoint 4C1 RED / GREEN evidence
+
+- Chip DTO/render RED failed with `E0432` because `pending_annotation_chip_models` did not exist. GREEN proves authoritative ordering, Claude/Codex-only visibility, Server/SSH emptiness, bounded redaction, safe URL origins, stale markers, collapsed-pane independence, and viewport reservation.
+- Remove RED failed with three `E0425` errors because `remove_pending_annotation_projection_transaction` did not exist. GREEN proves exact detach plus host/persist/acknowledge, saved screenshot context retention, cross-workspace/stale rejection before mutation, and dirty retry after persistence failure.
+- Preview RED failed with `E0432` because `browser_annotation_preview_plan` did not exist. GREEN proves conditional existing-tab select/navigation, missing-tab creation at the saved URL, ownership/pending rejection, and no consumption.
+- Callback/source RED failed because the terminal actions lacked preview/remove handlers and the native shell lacked a shared authoritative source. GREEN proves nested remove propagation, local broker versus remote snapshot sourcing, existing barrier dispatch, and absence of Delete/consume calls in preview/remove paths.
+- Viewport RED failed because `PENDING_ANNOTATION_STRIP_HEIGHT_PX` and its layout reservation were absent. GREEN reserves terminal rows whenever authoritative pending chips are visible.
+
+### Checkpoint 4C1 verification
+
+- `cargo test --locked --test terminal_pending_annotations -- --test-threads=1` - PASS, 5/5.
+- `cargo test --locked --lib pending_annotation -- --test-threads=1` - PASS, 4/4 (three checkpoint action tests plus the existing rollback regression).
+- `cargo test --locked --test browser_pane -- --test-threads=1` - PASS, 31/31.
+- `cargo test --locked --test browser_host -- --test-threads=1` - PASS, 82/82.
+- `cargo test --locked --lib browser::attachments::tests -- --test-threads=1` - PASS, 15/15.
+- `cargo test --locked --test browser_annotations -- --test-threads=1` - PASS, 5/5.
+- `cargo test --locked --lib state::app_state::tests -- --test-threads=1` - PASS, 3/3.
+- `cargo test --locked --test browser_attachment_lifecycle -- --test-threads=1` - PASS, 3/3.
+- `cargo fmt --all -- --check` - PASS.
+- `git diff --check` - PASS (only existing LF-to-CRLF working-copy notices).
+- `cargo check --locked --lib` - PASS with no Rust warnings.
+- Windows `cargo build --locked` - PASS with no Rust warnings.

@@ -3,15 +3,15 @@ mod process_monitor;
 
 use crate::assets::AppAssets;
 use crate::browser::{
-    browser_action_plan, browser_command_channel, browser_event_plan, browser_host_reconcile_plan,
-    browser_pane_open_fallback, browser_response_sync, browser_settings_plan,
-    calculate_browser_split, render_browser_pane, route_browser_request, BrowserAttachmentBroker,
-    BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandBridge,
-    BrowserCommandInbox, BrowserCommandRequest, BrowserError, BrowserGatewayHandle,
-    BrowserHostVisibility, BrowserPaneAction, BrowserPaneActions, BrowserPaneContext,
-    BrowserPaneEventPlan, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
-    BrowserResponse, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    browser_action_plan, browser_annotation_preview_plan, browser_command_channel,
+    browser_event_plan, browser_host_reconcile_plan, browser_pane_open_fallback,
+    browser_response_sync, browser_settings_plan, calculate_browser_split, render_browser_pane,
+    route_browser_request, BrowserAnnotation, BrowserAttachmentBroker, BrowserAttachmentProjection,
+    BrowserBounds, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
+    BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
+    BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
+    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse,
+    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -60,6 +60,7 @@ const TERMINAL_TOPBAR_HEIGHT_PX: f32 = 22.0;
 const STACK_GAP_PX: f32 = 4.0;
 const META_TEXT_HEIGHT_PX: f32 = 0.0;
 const NOTICE_HEIGHT_PX: f32 = 26.0;
+const PENDING_ANNOTATION_STRIP_HEIGHT_PX: f32 = 28.0;
 const SEARCH_BAR_HEIGHT_PX: f32 = 34.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -727,6 +728,35 @@ fn reconcile_browser_attachment_projection_transaction(
     } else {
         Ok(BrowserAttachmentProjectionTransaction::NewerProjectionRemainsDirty)
     }
+}
+
+fn remove_pending_annotation_projection_transaction(
+    broker: &BrowserAttachmentBroker,
+    active_workspace_key: &BrowserWorkspaceKey,
+    action: &view::PendingAnnotationAction,
+    sink: &mut impl BrowserAttachmentProjectionSink,
+) -> Result<BrowserAttachmentProjectionTransaction, BrowserError> {
+    let missing = || BrowserError::MissingAnnotation {
+        id: action.annotation_id.clone(),
+    };
+    if &action.workspace_key != active_workspace_key {
+        return Err(missing());
+    }
+    let current = broker.projection(active_workspace_key);
+    if !current
+        .pending_annotation_ids
+        .iter()
+        .any(|pending| pending == &action.annotation_id)
+        || !current
+            .pending_annotations
+            .iter()
+            .any(|annotation| annotation.id == action.annotation_id)
+    {
+        return Err(missing());
+    }
+
+    let projection = broker.detach(active_workspace_key, &action.annotation_id);
+    reconcile_browser_attachment_projection_transaction(broker, &projection, sink)
 }
 
 struct NativeShellBrowserAttachmentProjectionSink<'a, 'b> {
@@ -1679,6 +1709,184 @@ impl NativeShell {
             BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone()).ok()?,
             tab.browser_workspace.clone().unwrap_or_default(),
         ))
+    }
+
+    fn pending_annotation_source_for_tab(
+        &self,
+        tab: Option<&SessionTab>,
+    ) -> Option<(
+        BrowserWorkspaceKey,
+        BrowserWorkspaceSnapshot,
+        Vec<BrowserAnnotation>,
+    )> {
+        let Some(tab) = tab.filter(|tab| matches!(tab.tab_type, TabType::Claude | TabType::Codex))
+        else {
+            return None;
+        };
+        let Ok(workspace_key) = BrowserWorkspaceKey::new(tab.project_id.clone(), tab.id.clone())
+        else {
+            return None;
+        };
+        let snapshot = tab.browser_workspace.clone().unwrap_or_default();
+        let pending_annotations = if self.remote_mode.is_some() {
+            snapshot
+                .pending_annotation_ids
+                .iter()
+                .filter_map(|id| {
+                    snapshot
+                        .annotations
+                        .iter()
+                        .find(|annotation| &annotation.id == id)
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.process_manager
+                .browser_attachment_broker()
+                .projection(&workspace_key)
+                .pending_annotations
+        };
+        Some((workspace_key, snapshot, pending_annotations))
+    }
+
+    fn pending_annotation_chip_models_for_tab(
+        &self,
+        tab: Option<&SessionTab>,
+    ) -> Vec<view::PendingAnnotationChipModel> {
+        let tab_type = tab.map(|tab| &tab.tab_type);
+        let Some((workspace_key, snapshot, pending_annotations)) =
+            self.pending_annotation_source_for_tab(tab)
+        else {
+            return Vec::new();
+        };
+        view::pending_annotation_chip_models(
+            tab_type,
+            &workspace_key,
+            &snapshot,
+            &pending_annotations,
+        )
+    }
+
+    fn remove_pending_annotation_action(
+        &mut self,
+        action: view::PendingAnnotationAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_mode.is_some() {
+            self.terminal_notice =
+                Some("Remove pending browser annotations from the connected host.".to_string());
+            cx.notify();
+            return;
+        }
+        let Some((active_workspace_key, _, _)) =
+            self.pending_annotation_source_for_tab(self.state.active_tab())
+        else {
+            self.terminal_notice =
+                Some("Select the matching Claude or Codex conversation first.".to_string());
+            cx.notify();
+            return;
+        };
+        let broker = self.process_manager.browser_attachment_broker();
+        let result = {
+            let mut sink = NativeShellBrowserAttachmentProjectionSink {
+                shell: self,
+                window,
+            };
+            remove_pending_annotation_projection_transaction(
+                &broker,
+                &active_workspace_key,
+                &action,
+                &mut sink,
+            )
+        };
+        let ui = self
+            .browser_ui
+            .entry(active_workspace_key.clone())
+            .or_default();
+        match result {
+            Ok(BrowserAttachmentProjectionTransaction::Applied)
+            | Ok(BrowserAttachmentProjectionTransaction::NewerProjectionRemainsDirty) => {
+                ui.action_status = Some("Removed annotation from the next prompt".to_string());
+                ui.diagnostic = None;
+            }
+            Ok(BrowserAttachmentProjectionTransaction::PersistFailed) => {
+                ui.diagnostic =
+                    Some("Annotation removal will retry when browser state saves.".to_string());
+            }
+            Err(BrowserError::MissingAnnotation { .. }) => {
+                ui.diagnostic =
+                    Some("Annotation is no longer pending in this conversation.".to_string());
+            }
+            Err(error) => {
+                ui.diagnostic = Some(format!("Could not remove pending annotation: {error}"));
+            }
+        }
+        self.sync_browser_host_visibility(Some(window));
+        cx.notify();
+    }
+
+    fn preview_pending_annotation_action(
+        &mut self,
+        action: view::PendingAnnotationAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((active_workspace_key, snapshot, pending_annotations)) =
+            self.pending_annotation_source_for_tab(self.state.active_tab())
+        else {
+            self.terminal_notice =
+                Some("Select the matching Claude or Codex conversation first.".to_string());
+            cx.notify();
+            return;
+        };
+        let plan = match browser_annotation_preview_plan(
+            Some(&active_workspace_key),
+            &action.workspace_key,
+            Some(&snapshot),
+            &pending_annotations,
+            &action.annotation_id,
+        ) {
+            Ok(plan) => plan,
+            Err(BrowserError::MissingAnnotation { .. }) => {
+                self.browser_ui
+                    .entry(active_workspace_key)
+                    .or_default()
+                    .diagnostic =
+                    Some("Annotation is no longer pending in this conversation.".to_string());
+                cx.notify();
+                return;
+            }
+            Err(_) => {
+                self.browser_ui
+                    .entry(active_workspace_key)
+                    .or_default()
+                    .diagnostic = Some("Saved annotation URL cannot be previewed.".to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        let mut failure = None;
+        for command in plan.commands {
+            if let Err(error) = self.dispatch_browser_command(&plan.workspace_key, command, window)
+            {
+                failure = Some(error.to_string());
+                break;
+            }
+        }
+        let ui = self
+            .browser_ui
+            .entry(plan.workspace_key.clone())
+            .or_default();
+        if let Some(message) = failure {
+            ui.diagnostic = Some(message);
+        } else {
+            ui.action_status = Some("Opened annotation preview".to_string());
+            ui.diagnostic = None;
+        }
+        self.sync_browser_host_visibility(Some(window));
+        cx.notify();
     }
 
     fn capture_browser_split_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
@@ -8483,6 +8691,8 @@ impl NativeShell {
             let search_highlight = self.current_search_highlight(active_session.as_ref());
             let scrollbar = self.terminal_scrollbar_model(active_session.as_ref());
             let has_active_tab = active_tab_type.is_some();
+            let pending_annotations =
+                self.pending_annotation_chip_models_for_tab(active_tab.as_ref());
             return view::TerminalPaneModel {
                 active_project: if has_active_tab {
                     self.state
@@ -8505,6 +8715,7 @@ impl NativeShell {
                     .or_else(|| self.terminal_notice.clone()),
                 blocking_notice,
                 actionable_notice: None,
+                pending_annotations,
                 debug_enabled: self.process_manager.debug_enabled(),
                 font_size: self.terminal_font_size(),
                 cell_width: terminal_metrics.cell_width,
@@ -8821,6 +9032,7 @@ impl NativeShell {
                         })
                     }
                 });
+        let pending_annotations = self.pending_annotation_chip_models_for_tab(active_tab.as_ref());
         view::TerminalPaneModel {
             active_project: if has_active_tab {
                 self.state
@@ -8843,6 +9055,7 @@ impl NativeShell {
                 .or_else(|| self.terminal_notice.clone()),
             blocking_notice,
             actionable_notice,
+            pending_annotations,
             debug_enabled: self.process_manager.debug_enabled(),
             font_size: self.terminal_font_size(),
             cell_width: terminal_metrics.cell_width,
@@ -11515,6 +11728,12 @@ impl NativeShell {
         {
             top += NOTICE_HEIGHT_PX + STACK_GAP_PX;
         }
+        if self
+            .pending_annotation_source_for_tab(self.state.active_tab())
+            .is_some_and(|(_, _, pending_annotations)| !pending_annotations.is_empty())
+        {
+            top += PENDING_ANNOTATION_STRIP_HEIGHT_PX + STACK_GAP_PX;
+        }
         if self.terminal_search.active {
             top += SEARCH_BAR_HEIGHT_PX + STACK_GAP_PX;
         }
@@ -12349,6 +12568,22 @@ impl Render for NativeShell {
                 },
             )
         };
+        let preview_pending_annotation_handler: view::PendingAnnotationActionHandler = {
+            let entity = editor_entity.clone();
+            Arc::new(move |action, _, window, app| {
+                let _ = entity.update(app, move |this, cx| {
+                    this.preview_pending_annotation_action(action, window, cx);
+                });
+            })
+        };
+        let remove_pending_annotation_handler: view::PendingAnnotationActionHandler = {
+            let entity = editor_entity.clone();
+            Arc::new(move |action, _, window, app| {
+                let _ = entity.update(app, move |this, cx| {
+                    this.remove_pending_annotation_action(action, window, cx);
+                });
+            })
+        };
         let make_editor_focus_handler = {
             let editor_entity = editor_entity.clone();
             Arc::new(
@@ -12420,6 +12655,8 @@ impl Render for NativeShell {
                     .as_ref()
                     .filter(|model| model.eligible && !model.pane_open)
                     .map(|_| make_browser_action_handler(BrowserPaneAction::Open)),
+                on_preview_annotation: Some(preview_pending_annotation_handler.clone()),
+                on_remove_annotation: Some(remove_pending_annotation_handler.clone()),
                 on_start_server: controls
                     .filter(|controls| controls.can_start)
                     .map(|_| make_focused_start_handler(command_id.clone())),
@@ -15256,6 +15493,104 @@ mod tests {
         let retry = broker.dirty_projections();
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].pending_annotation_ids, vec!["ann-new"]);
+    }
+
+    #[test]
+    fn pending_annotation_remove_detaches_reconciles_and_retains_saved_context() {
+        let broker = BrowserAttachmentBroker::default();
+        let key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let saved = attachment_snapshot(&["ann-remove"]);
+        let screenshot = saved
+            .annotation("ann-remove")
+            .unwrap()
+            .screenshot_resource
+            .clone();
+        broker.observe_workspace(key.clone(), &saved);
+        let initial = broker.dirty_projections().pop().unwrap();
+        assert!(broker.acknowledge_dirty_projection(&initial));
+        let mut sink = projection_sink(saved, broker.clone());
+        let action = view::PendingAnnotationAction {
+            workspace_key: key.clone(),
+            annotation_id: "ann-remove".to_string(),
+        };
+
+        let result =
+            remove_pending_annotation_projection_transaction(&broker, &key, &action, &mut sink)
+                .unwrap();
+
+        assert_eq!(result, BrowserAttachmentProjectionTransaction::Applied);
+        assert_eq!(sink.host_calls, 1);
+        assert_eq!(sink.persist_calls, 1);
+        assert!(broker.projection(&key).pending_annotation_ids.is_empty());
+        assert!(broker.dirty_projections().is_empty());
+        let persisted = sink.state.browser_workspace("tab-1").unwrap();
+        assert!(persisted.pending_annotation_ids.is_empty());
+        assert_eq!(
+            persisted
+                .annotation("ann-remove")
+                .unwrap()
+                .screenshot_resource,
+            screenshot
+        );
+    }
+
+    #[test]
+    fn pending_annotation_remove_rejects_cross_workspace_or_stale_actions_before_detach() {
+        let broker = BrowserAttachmentBroker::default();
+        let key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let saved = attachment_snapshot(&["ann-pending"]);
+        broker.observe_workspace(key.clone(), &saved);
+        let initial = broker.dirty_projections().pop().unwrap();
+        assert!(broker.acknowledge_dirty_projection(&initial));
+
+        for action in [
+            view::PendingAnnotationAction {
+                workspace_key: BrowserWorkspaceKey::new("project-2", "tab-2").unwrap(),
+                annotation_id: "ann-pending".to_string(),
+            },
+            view::PendingAnnotationAction {
+                workspace_key: key.clone(),
+                annotation_id: "ann-stale".to_string(),
+            },
+        ] {
+            let mut sink = projection_sink(saved.clone(), broker.clone());
+            let error =
+                remove_pending_annotation_projection_transaction(&broker, &key, &action, &mut sink)
+                    .unwrap_err();
+            assert!(matches!(error, BrowserError::MissingAnnotation { .. }));
+            assert_eq!(sink.host_calls, 0);
+            assert_eq!(sink.persist_calls, 0);
+            assert_eq!(
+                broker.projection(&key).pending_annotation_ids,
+                vec!["ann-pending"]
+            );
+        }
+    }
+
+    #[test]
+    fn pending_annotation_remove_persistence_failure_remains_retryable() {
+        let broker = BrowserAttachmentBroker::default();
+        let key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let saved = attachment_snapshot(&["ann-remove"]);
+        broker.observe_workspace(key.clone(), &saved);
+        let initial = broker.dirty_projections().pop().unwrap();
+        assert!(broker.acknowledge_dirty_projection(&initial));
+        let mut sink = projection_sink(saved, broker.clone());
+        sink.fail_persist = true;
+        let action = view::PendingAnnotationAction {
+            workspace_key: key.clone(),
+            annotation_id: "ann-remove".to_string(),
+        };
+
+        let result =
+            remove_pending_annotation_projection_transaction(&broker, &key, &action, &mut sink)
+                .unwrap();
+
+        assert_eq!(
+            result,
+            BrowserAttachmentProjectionTransaction::PersistFailed
+        );
+        assert_eq!(broker.dirty_projections().len(), 1);
     }
 
     #[test]

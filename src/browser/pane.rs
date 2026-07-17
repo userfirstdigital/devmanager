@@ -1,5 +1,5 @@
 use super::{
-    validate_browser_url, BrowserAnnotationCandidate, BrowserAnnotationDraft,
+    validate_browser_url, BrowserAnnotation, BrowserAnnotationCandidate, BrowserAnnotationDraft,
     BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserError,
     BrowserHostEvent, BrowserJournalEntry, BrowserPageLoadState, BrowserResponse, BrowserRevision,
     BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
@@ -403,6 +403,57 @@ pub fn browser_action_plan(
         workspace_key,
         commands,
         diagnostic,
+    })
+}
+
+pub fn browser_annotation_preview_plan(
+    active_workspace: Option<&BrowserWorkspaceKey>,
+    action_workspace: &BrowserWorkspaceKey,
+    snapshot: Option<&BrowserWorkspaceSnapshot>,
+    pending_annotations: &[BrowserAnnotation],
+    annotation_id: &str,
+) -> Result<BrowserActionPlan, BrowserError> {
+    let missing = || BrowserError::MissingAnnotation {
+        id: annotation_id.to_string(),
+    };
+    let active_workspace = active_workspace.ok_or_else(missing)?;
+    if active_workspace != action_workspace {
+        return Err(missing());
+    }
+    let annotation = pending_annotations
+        .iter()
+        .find(|annotation| annotation.id == annotation_id)
+        .ok_or_else(missing)?;
+    let saved_url = validate_browser_url(&annotation.url)?;
+    let snapshot = snapshot.cloned().unwrap_or_default();
+    let mut commands = vec![BrowserCommand::Ensure {
+        snapshot: snapshot.clone(),
+    }];
+    if !snapshot.pane_open {
+        commands.push(BrowserCommand::SetPaneOpen { open: true });
+    }
+    if let Some(tab) = snapshot.tabs.iter().find(|tab| tab.id == annotation.tab_id) {
+        if snapshot.selected_tab_id.as_deref() != Some(annotation.tab_id.as_str()) {
+            commands.push(BrowserCommand::SelectTab {
+                tab_id: annotation.tab_id.clone(),
+            });
+        }
+        if tab.url != saved_url {
+            commands.push(BrowserCommand::Navigate {
+                tab_id: annotation.tab_id.clone(),
+                url: saved_url,
+            });
+        }
+    } else {
+        commands.push(BrowserCommand::CreateTab {
+            url: Some(saved_url),
+        });
+    }
+
+    Ok(BrowserActionPlan {
+        workspace_key: active_workspace.clone(),
+        commands,
+        diagnostic: None,
     })
 }
 

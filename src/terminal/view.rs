@@ -1,3 +1,7 @@
+use crate::browser::{
+    compact_browser_attachment_text, compact_browser_attachment_url, redact_browser_text,
+    BrowserAnnotation, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+};
 use crate::models::TabType;
 use crate::state::{AiActivity, SessionStatus};
 use crate::terminal::session::{
@@ -41,6 +45,7 @@ pub struct TerminalPaneModel {
     pub startup_notice: Option<String>,
     pub blocking_notice: Option<String>,
     pub actionable_notice: Option<TerminalActionableNotice>,
+    pub pending_annotations: Vec<PendingAnnotationChipModel>,
     pub debug_enabled: bool,
     pub font_size: f32,
     pub cell_width: f32,
@@ -53,6 +58,59 @@ pub struct TerminalPaneModel {
     pub splash_image: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAnnotationAction {
+    pub workspace_key: BrowserWorkspaceKey,
+    pub annotation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAnnotationChipModel {
+    pub action: PendingAnnotationAction,
+    pub stable_id: String,
+    pub comment: String,
+    pub url: String,
+    pub stale: bool,
+}
+
+pub fn pending_annotation_chip_models(
+    active_tab_type: Option<&TabType>,
+    workspace_key: &BrowserWorkspaceKey,
+    snapshot: &BrowserWorkspaceSnapshot,
+    pending_annotations: &[BrowserAnnotation],
+) -> Vec<PendingAnnotationChipModel> {
+    if !matches!(active_tab_type, Some(TabType::Claude | TabType::Codex)) {
+        return Vec::new();
+    }
+
+    pending_annotations
+        .iter()
+        .map(|annotation| PendingAnnotationChipModel {
+            action: PendingAnnotationAction {
+                workspace_key: workspace_key.clone(),
+                annotation_id: annotation.id.clone(),
+            },
+            stable_id: compact_browser_attachment_text(&annotation.id, 64),
+            comment: compact_browser_attachment_text(&annotation.comment, 96),
+            url: compact_browser_attachment_url(&annotation.url, 96),
+            stale: pending_annotation_is_stale(snapshot, annotation),
+        })
+        .collect()
+}
+
+fn pending_annotation_is_stale(
+    snapshot: &BrowserWorkspaceSnapshot,
+    annotation: &BrowserAnnotation,
+) -> bool {
+    annotation.tab_id.is_empty()
+        || annotation.anchor_revision != snapshot.revision
+        || snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.id == annotation.tab_id)
+            .is_none_or(|tab| redact_browser_text(&tab.url) != redact_browser_text(&annotation.url))
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalActionableNotice {
     pub message: String,
@@ -62,6 +120,8 @@ pub struct TerminalActionableNotice {
 
 pub struct TerminalPaneActions {
     pub on_open_browser: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
+    pub on_preview_annotation: Option<PendingAnnotationActionHandler>,
+    pub on_remove_annotation: Option<PendingAnnotationActionHandler>,
     pub on_start_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_stop_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_restart_server: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
@@ -86,6 +146,9 @@ pub struct TerminalPaneActions {
     pub on_toggle_read_only: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub scrollbar: Option<TerminalScrollbarActions>,
 }
+
+pub type PendingAnnotationActionHandler =
+    Arc<dyn Fn(PendingAnnotationAction, &MouseDownEvent, &mut Window, &mut App)>;
 
 #[derive(Clone)]
 pub struct TerminalScrollbarActions {
@@ -164,6 +227,12 @@ pub fn render_terminal_surface(
     let open_browser_action = actions
         .as_mut()
         .and_then(|actions| actions.on_open_browser.take());
+    let preview_annotation_action = actions
+        .as_ref()
+        .and_then(|actions| actions.on_preview_annotation.clone());
+    let remove_annotation_action = actions
+        .as_ref()
+        .and_then(|actions| actions.on_remove_annotation.clone());
     // Hide the plain muted startup_notice when an actionable banner is taking over,
     // so we don't show the same text twice.
     let notice = if model.actionable_notice.is_some() {
@@ -365,6 +434,11 @@ pub fn render_terminal_surface(
                     .children(notice)
                     .children(actionable_banner)
                     .children(blocking_notice)
+                    .children(render_pending_annotation_chips(
+                        &model.pending_annotations,
+                        preview_annotation_action,
+                        remove_annotation_action,
+                    ))
                     .children(model.search.as_ref().map(render_search_bar))
                     .children(exit_banner)
                     .child(terminal_body)
@@ -380,6 +454,93 @@ pub fn render_terminal_surface(
                     })),
             ),
         )
+}
+
+fn render_pending_annotation_chips(
+    models: &[PendingAnnotationChipModel],
+    preview: Option<PendingAnnotationActionHandler>,
+    remove: Option<PendingAnnotationActionHandler>,
+) -> Option<AnyElement> {
+    (!models.is_empty()).then(|| {
+        div()
+            .mx_2()
+            .mt_1()
+            .px_2()
+            .py_1()
+            .bg(rgb(theme::PANEL_HEADER_BG))
+            .border_1()
+            .border_color(rgb(theme::BORDER_PRIMARY))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SUBTLE))
+                    .child("Pending"),
+            )
+            .children(models.iter().cloned().map(|model| {
+                let action = model.action.clone();
+                let mut chip = div()
+                    .max_w(px(260.0))
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(if model.stale {
+                        theme::WARNING_TEXT
+                    } else {
+                        theme::BORDER_PRIMARY
+                    }))
+                    .bg(rgb(theme::PROJECT_ROW_BG))
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(format!(
+                                "{}{} · {} · {}",
+                                if model.stale { "stale " } else { "" },
+                                model.stable_id,
+                                model.comment,
+                                model.url
+                            ))),
+                    )
+                    .children(remove.clone().map(|remove| {
+                        let action = action.clone();
+                        div()
+                            .ml_1()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|style| style.bg(rgb(theme::ROW_HOVER_BG)))
+                            .child("×")
+                            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                cx.stop_propagation();
+                                remove(action.clone(), event, window, cx);
+                            })
+                    }));
+                if let Some(preview) = preview.clone() {
+                    chip = chip
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::ROW_HOVER_BG)));
+                    chip = chip.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                        cx.stop_propagation();
+                        preview(action.clone(), event, window, cx);
+                    });
+                }
+                chip
+            }))
+            .into_any_element()
+    })
 }
 
 fn render_grid(
@@ -1071,6 +1232,8 @@ fn render_runtime_actions(
 ) -> impl IntoElement {
     let TerminalPaneActions {
         on_open_browser: _,
+        on_preview_annotation: _,
+        on_remove_annotation: _,
         on_start_server,
         on_stop_server,
         on_restart_server,
