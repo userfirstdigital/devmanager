@@ -111,6 +111,54 @@ fn annotation_preview_selects_and_conditionally_navigates_an_existing_tab_withou
 }
 
 #[test]
+fn annotation_preview_treats_a_persisted_redacted_url_as_the_current_live_url() {
+    let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let live_url = "https://example.test/form?token=super-secret&view=review";
+    let saved_url = devmanager::browser::redact_browser_text(live_url);
+    assert_ne!(
+        saved_url, live_url,
+        "fixture must model persistence redaction"
+    );
+    assert!(!saved_url.contains("super-secret"));
+    let pending = vec![pending_annotation("ann-a", "tab-a", &saved_url)];
+    let snapshot = BrowserWorkspaceSnapshot {
+        pane_open: true,
+        tabs: vec![
+            BrowserTabSnapshot {
+                id: "tab-a".to_string(),
+                title: "Annotated page".to_string(),
+                url: live_url.to_string(),
+                viewport: BrowserViewport::default(),
+            },
+            BrowserTabSnapshot {
+                id: "tab-b".to_string(),
+                title: "Selected page".to_string(),
+                url: "https://other.test".to_string(),
+                viewport: BrowserViewport::default(),
+            },
+        ],
+        selected_tab_id: Some("tab-b".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+
+    let plan =
+        browser_annotation_preview_plan(Some(&key), &key, Some(&snapshot), &pending, "ann-a")
+            .unwrap();
+
+    assert!(matches!(plan.commands[0], BrowserCommand::Ensure { .. }));
+    assert_eq!(
+        plan.commands[1],
+        BrowserCommand::SelectTab {
+            tab_id: "tab-a".to_string()
+        }
+    );
+    assert!(!plan
+        .commands
+        .iter()
+        .any(|command| matches!(command, BrowserCommand::Navigate { .. })));
+}
+
+#[test]
 fn annotation_preview_creates_a_missing_tab_at_the_saved_url() {
     let key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
     let saved_url = "https://example.test/saved";

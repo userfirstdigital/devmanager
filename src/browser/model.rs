@@ -5,6 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
+pub(super) fn browser_annotation_urls_equivalent(left: &str, right: &str) -> bool {
+    redact_browser_text(left) == redact_browser_text(right)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserWorkspaceKey {
@@ -479,9 +483,7 @@ impl BrowserWorkspaceSnapshot {
             .tabs
             .iter()
             .find(|tab| tab.id == annotation.tab_id)
-            .is_none_or(|tab| {
-                redact_browser_text(&tab.url) != redact_browser_text(&annotation.url)
-            }))
+            .is_none_or(|tab| !browser_annotation_urls_equivalent(&tab.url, &annotation.url)))
     }
 
     pub fn pinned_annotation_resource_ids(&self) -> BTreeSet<BrowserResourceId> {

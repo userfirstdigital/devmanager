@@ -2,7 +2,7 @@
 
 ## Status
 
-Task 5B is implemented through checkpoint 4C1, which awaits independent review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local native exactly-once PTY attachment, authoritative AppState/host projection with attachment pin reconciliation, and native pending-annotation chips/preview/remove UI are implemented. Remote web input wiring remains intentionally out of scope here.
+Task 5B is implemented through checkpoint 4C1, including its independent-review hardening, and awaits re-review. Persistence/restored AI workspaces, native element/region capture, the attachment transaction core, ProcessManager session ownership, local native exactly-once PTY attachment, authoritative AppState/host projection with attachment pin reconciliation, and native pending-annotation chips/preview/remove UI are implemented. Remote web input wiring remains intentionally out of scope here.
 
 ## Commit range
 
@@ -12,6 +12,7 @@ Task 5B is implemented through checkpoint 4C1, which awaits independent review. 
 - Authenticated MCP operations/resources: this checkpoint commit
 - Checkpoint 4B1 session lifecycle and local user-origin input: this checkpoint commit
 - Checkpoint 4C1 native pending-annotation chips: this checkpoint commit
+- Checkpoint 4C1 independent-review hardening: this follow-up commit
 - Branch: `master`, explicitly authorized by the user
 
 ## Authenticated MCP architecture
@@ -57,7 +58,7 @@ Task 5B is implemented through checkpoint 4C1, which awaits independent review. 
 ## Remaining Task 5B work
 
 - Wire remote web composer/input without changing its established wire contract.
-- Complete independent review of checkpoint 4C1.
+- Complete re-review of checkpoint 4C1 hardening.
 
 ## Checkpoint 4A: attachment transaction core
 
@@ -251,6 +252,32 @@ Checkpoint 4B must wire the broker into ProcessManager session lifecycle, explic
 - `cargo test --locked --test terminal_pending_annotations -- --test-threads=1` - PASS, 5/5.
 - `cargo test --locked --lib pending_annotation -- --test-threads=1` - PASS, 4/4 (three checkpoint action tests plus the existing rollback regression).
 - `cargo test --locked --test browser_pane -- --test-threads=1` - PASS, 31/31.
+- `cargo test --locked --test browser_host -- --test-threads=1` - PASS, 82/82.
+- `cargo test --locked --lib browser::attachments::tests -- --test-threads=1` - PASS, 15/15.
+- `cargo test --locked --test browser_annotations -- --test-threads=1` - PASS, 5/5.
+- `cargo test --locked --lib state::app_state::tests -- --test-threads=1` - PASS, 3/3.
+- `cargo test --locked --test browser_attachment_lifecycle -- --test-threads=1` - PASS, 3/3.
+- `cargo fmt --all -- --check` - PASS.
+- `git diff --check` - PASS (only existing LF-to-CRLF working-copy notices).
+- `cargo check --locked --lib` - PASS with no Rust warnings.
+- Windows `cargo build --locked` - PASS with no Rust warnings.
+
+## Checkpoint 4C1 independent-review hardening
+
+- Preview no longer raw-compares a persisted redacted annotation URL with the live original URL. One `browser_annotation_urls_equivalent` helper now owns the deterministic-redaction comparison used by both `annotation_anchor_is_stale` and preview planning. A current live secret-query tab is selected without navigation, while genuinely different URLs still navigate and a missing tab is still created at the saved URL.
+- Every local remove/preview failure after an active workspace is known now routes through one `show_pending_annotation_action_failure` helper. Fixed messages reach the terminal notice surface even when the browser pane is collapsed and remain mirrored in browser diagnostics; raw host/dispatch errors are not echoed into either user-visible surface.
+
+### Review RED / GREEN evidence
+
+- `cargo test --locked --test browser_pane annotation_preview_treats_a_persisted_redacted_url_as_the_current_live_url -- --test-threads=1 --nocapture` was RED because the plan contained `BrowserCommand::Navigate`; it is GREEN after sharing redaction-aware URL equivalence.
+- `cargo test --locked --test terminal_pending_annotations pending_annotation_action_failures_reach_the_visible_terminal_notice_without_raw_details -- --test-threads=1 --nocapture` was RED because no terminal-visible failure helper existed; it is GREEN and source-checks all three local remove failures and all three preview failures.
+- `cargo test --locked --lib pending_annotation_action_failure_notices_are_fixed_concise_and_non_sensitive -- --test-threads=1 --nocapture` was compile-RED on the missing fixed failure vocabulary; it is GREEN for five exact bounded messages that cannot carry raw error details.
+
+### Review hardening verification
+
+- `cargo test --locked --test terminal_pending_annotations -- --test-threads=1` - PASS, 6/6.
+- `cargo test --locked --lib pending_annotation -- --test-threads=1` - PASS, 5/5.
+- `cargo test --locked --test browser_pane -- --test-threads=1` - PASS, 32/32.
 - `cargo test --locked --test browser_host -- --test-threads=1` - PASS, 82/82.
 - `cargo test --locked --lib browser::attachments::tests -- --test-threads=1` - PASS, 15/15.
 - `cargo test --locked --test browser_annotations -- --test-threads=1` - PASS, 5/5.

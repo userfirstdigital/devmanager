@@ -699,6 +699,27 @@ enum BrowserAttachmentProjectionTransaction {
     NewerProjectionRemainsDirty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAnnotationActionFailure {
+    RemovePersistence,
+    MissingAnnotation,
+    RemoveFailed,
+    InvalidSavedUrl,
+    PreviewFailed,
+}
+
+impl PendingAnnotationActionFailure {
+    fn notice(self) -> &'static str {
+        match self {
+            Self::RemovePersistence => "Annotation removal will retry when browser state saves.",
+            Self::MissingAnnotation => "Annotation is no longer pending in this conversation.",
+            Self::RemoveFailed => "Could not remove the pending annotation.",
+            Self::InvalidSavedUrl => "Saved annotation URL cannot be previewed.",
+            Self::PreviewFailed => "Could not open the annotation preview.",
+        }
+    }
+}
+
 trait BrowserAttachmentProjectionSink {
     fn acknowledge_host(
         &mut self,
@@ -1767,6 +1788,19 @@ impl NativeShell {
         )
     }
 
+    fn show_pending_annotation_action_failure(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        failure: PendingAnnotationActionFailure,
+    ) {
+        let message = failure.notice();
+        self.terminal_notice = Some(message.to_string());
+        self.browser_ui
+            .entry(workspace_key.clone())
+            .or_default()
+            .diagnostic = Some(message.to_string());
+    }
+
     fn remove_pending_annotation_action(
         &mut self,
         action: view::PendingAnnotationAction,
@@ -1800,26 +1834,33 @@ impl NativeShell {
                 &mut sink,
             )
         };
-        let ui = self
-            .browser_ui
-            .entry(active_workspace_key.clone())
-            .or_default();
         match result {
             Ok(BrowserAttachmentProjectionTransaction::Applied)
             | Ok(BrowserAttachmentProjectionTransaction::NewerProjectionRemainsDirty) => {
+                let ui = self
+                    .browser_ui
+                    .entry(active_workspace_key.clone())
+                    .or_default();
                 ui.action_status = Some("Removed annotation from the next prompt".to_string());
                 ui.diagnostic = None;
             }
             Ok(BrowserAttachmentProjectionTransaction::PersistFailed) => {
-                ui.diagnostic =
-                    Some("Annotation removal will retry when browser state saves.".to_string());
+                self.show_pending_annotation_action_failure(
+                    &active_workspace_key,
+                    PendingAnnotationActionFailure::RemovePersistence,
+                );
             }
             Err(BrowserError::MissingAnnotation { .. }) => {
-                ui.diagnostic =
-                    Some("Annotation is no longer pending in this conversation.".to_string());
+                self.show_pending_annotation_action_failure(
+                    &active_workspace_key,
+                    PendingAnnotationActionFailure::MissingAnnotation,
+                );
             }
-            Err(error) => {
-                ui.diagnostic = Some(format!("Could not remove pending annotation: {error}"));
+            Err(_) => {
+                self.show_pending_annotation_action_failure(
+                    &active_workspace_key,
+                    PendingAnnotationActionFailure::RemoveFailed,
+                );
             }
         }
         self.sync_browser_host_visibility(Some(window));
@@ -1849,39 +1890,43 @@ impl NativeShell {
         ) {
             Ok(plan) => plan,
             Err(BrowserError::MissingAnnotation { .. }) => {
-                self.browser_ui
-                    .entry(active_workspace_key)
-                    .or_default()
-                    .diagnostic =
-                    Some("Annotation is no longer pending in this conversation.".to_string());
+                self.show_pending_annotation_action_failure(
+                    &active_workspace_key,
+                    PendingAnnotationActionFailure::MissingAnnotation,
+                );
                 cx.notify();
                 return;
             }
             Err(_) => {
-                self.browser_ui
-                    .entry(active_workspace_key)
-                    .or_default()
-                    .diagnostic = Some("Saved annotation URL cannot be previewed.".to_string());
+                self.show_pending_annotation_action_failure(
+                    &active_workspace_key,
+                    PendingAnnotationActionFailure::InvalidSavedUrl,
+                );
                 cx.notify();
                 return;
             }
         };
 
-        let mut failure = None;
+        let mut failed = false;
         for command in plan.commands {
-            if let Err(error) = self.dispatch_browser_command(&plan.workspace_key, command, window)
+            if self
+                .dispatch_browser_command(&plan.workspace_key, command, window)
+                .is_err()
             {
-                failure = Some(error.to_string());
+                failed = true;
                 break;
             }
         }
-        let ui = self
-            .browser_ui
-            .entry(plan.workspace_key.clone())
-            .or_default();
-        if let Some(message) = failure {
-            ui.diagnostic = Some(message);
+        if failed {
+            self.show_pending_annotation_action_failure(
+                &plan.workspace_key,
+                PendingAnnotationActionFailure::PreviewFailed,
+            );
         } else {
+            let ui = self
+                .browser_ui
+                .entry(plan.workspace_key.clone())
+                .or_default();
             ui.action_status = Some("Opened annotation preview".to_string());
             ui.diagnostic = None;
         }
@@ -15591,6 +15636,39 @@ mod tests {
             BrowserAttachmentProjectionTransaction::PersistFailed
         );
         assert_eq!(broker.dirty_projections().len(), 1);
+    }
+
+    #[test]
+    fn pending_annotation_action_failure_notices_are_fixed_concise_and_non_sensitive() {
+        let cases = [
+            (
+                PendingAnnotationActionFailure::RemovePersistence,
+                "Annotation removal will retry when browser state saves.",
+            ),
+            (
+                PendingAnnotationActionFailure::MissingAnnotation,
+                "Annotation is no longer pending in this conversation.",
+            ),
+            (
+                PendingAnnotationActionFailure::RemoveFailed,
+                "Could not remove the pending annotation.",
+            ),
+            (
+                PendingAnnotationActionFailure::InvalidSavedUrl,
+                "Saved annotation URL cannot be previewed.",
+            ),
+            (
+                PendingAnnotationActionFailure::PreviewFailed,
+                "Could not open the annotation preview.",
+            ),
+        ];
+
+        for (failure, expected) in cases {
+            let notice = failure.notice();
+            assert_eq!(notice, expected);
+            assert!(notice.len() <= 64);
+            assert!(!notice.contains("super-secret"));
+        }
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use super::{
-    validate_browser_url, BrowserAnnotation, BrowserAnnotationCandidate, BrowserAnnotationDraft,
-    BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserError,
-    BrowserHostEvent, BrowserJournalEntry, BrowserPageLoadState, BrowserResponse, BrowserRevision,
-    BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    model::browser_annotation_urls_equivalent, validate_browser_url, BrowserAnnotation,
+    BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserApprovalRequest, BrowserBounds,
+    BrowserCommand, BrowserDownloadState, BrowserError, BrowserHostEvent, BrowserJournalEntry,
+    BrowserPageLoadState, BrowserResponse, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -438,7 +439,7 @@ pub fn browser_annotation_preview_plan(
                 tab_id: annotation.tab_id.clone(),
             });
         }
-        if tab.url != saved_url {
+        if !browser_annotation_urls_equivalent(&tab.url, &saved_url) {
             commands.push(BrowserCommand::Navigate {
                 tab_id: annotation.tab_id.clone(),
                 url: saved_url,

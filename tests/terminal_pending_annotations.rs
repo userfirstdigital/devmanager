@@ -235,6 +235,49 @@ fn native_chip_actions_reuse_authoritative_sources_and_the_existing_host_barrier
 }
 
 #[test]
+fn pending_annotation_action_failures_reach_the_visible_terminal_notice_without_raw_details() {
+    let source = include_str!("../src/app/mod.rs");
+    let helper_start = source
+        .find("fn show_pending_annotation_action_failure(")
+        .expect("shared terminal-visible chip action failure helper");
+    let remove_start = source[helper_start..]
+        .find("fn remove_pending_annotation_action(")
+        .map(|offset| helper_start + offset)
+        .unwrap();
+    let helper = &source[helper_start..remove_start];
+    assert!(helper.contains("self.terminal_notice = Some(message.to_string())"));
+    assert!(helper.contains("diagnostic = Some(message.to_string())"));
+
+    let preview_start = source[remove_start..]
+        .find("fn preview_pending_annotation_action(")
+        .map(|offset| remove_start + offset)
+        .unwrap();
+    let preview_end = source[preview_start..]
+        .find("fn capture_browser_split_bounds(")
+        .map(|offset| preview_start + offset)
+        .unwrap();
+    let remove = &source[remove_start..preview_start];
+    let preview = &source[preview_start..preview_end];
+
+    assert_eq!(
+        remove
+            .matches("show_pending_annotation_action_failure")
+            .count(),
+        3,
+        "each local remove failure must reach the visible terminal notice"
+    );
+    assert_eq!(
+        preview
+            .matches("show_pending_annotation_action_failure")
+            .count(),
+        3,
+        "each preview failure must reach the visible terminal notice"
+    );
+    assert!(!remove.contains("error.to_string()"));
+    assert!(!preview.contains("error.to_string()"));
+}
+
+#[test]
 fn terminal_viewport_reserves_space_for_visible_pending_annotation_chips() {
     let source = include_str!("../src/app/mod.rs");
     assert!(source.contains("const PENDING_ANNOTATION_STRIP_HEIGHT_PX"));
