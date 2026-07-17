@@ -2,8 +2,8 @@ use devmanager::browser::{
     compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind,
     BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
     BrowserRecipeViewport, BrowserReplayCancellationLease, BrowserReplayCoordinator,
-    BrowserReplayError, BrowserReplayFailureCode, BrowserReplayPlan, BrowserReplayProjection,
-    BrowserReplayPublicInput, BrowserReplayStatus, BrowserWorkspaceKey,
+    BrowserReplayError, BrowserReplayExecutionHandle, BrowserReplayFailureCode, BrowserReplayPlan,
+    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplayStatus, BrowserWorkspaceKey,
     BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
@@ -13,9 +13,11 @@ assert_impl_all!(BrowserReplayPlan: Send, Sync);
 assert_impl_all!(BrowserReplayCoordinator: Clone, Send, Sync);
 assert_impl_all!(BrowserReplayProjection: Clone, Send, Sync, std::fmt::Debug, serde::Serialize);
 assert_impl_all!(BrowserReplayCancellationLease: Clone, Send, Sync);
+assert_impl_all!(BrowserReplayExecutionHandle: Clone, Send, Sync);
 assert_not_impl_any!(BrowserReplayPublicInput: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayPlan: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayCancellationLease: std::fmt::Debug, serde::Serialize);
+assert_not_impl_any!(BrowserReplayExecutionHandle: std::fmt::Debug, serde::Serialize);
 
 fn locator(test_id: &str) -> BrowserRecipeLocator {
     BrowserRecipeLocator {
@@ -925,6 +927,36 @@ fn replay_cancellation_uses_one_authority_across_running_and_locator_pause_gaps(
     assert_eq!(cancelled.status, BrowserReplayStatus::Cancelled);
     assert!(started.lease.is_cancelled());
     assert!(lease_clone.is_cancelled());
+}
+
+#[test]
+fn replay_execution_handle_shares_plan_and_cancellation_authority() {
+    let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+    let started = coordinator
+        .start(
+            workspace("execution-handle", "first"),
+            plan_without_secrets(),
+        )
+        .expect("start replay");
+    let clone = started.lease.clone();
+
+    assert!(started.lease.same_authority(&clone));
+    assert!(started.lease.same_plan(&clone));
+
+    coordinator
+        .cancel(&started.instance)
+        .expect("cancel exact replay");
+    assert!(started.lease.is_cancelled());
+    assert!(clone.is_cancelled());
+
+    let replacement = coordinator
+        .start(
+            workspace("execution-handle", "replacement"),
+            plan_without_secrets(),
+        )
+        .expect("start unrelated replay");
+    assert!(!started.lease.same_authority(&replacement.lease));
+    assert!(!started.lease.same_plan(&replacement.lease));
 }
 
 #[test]

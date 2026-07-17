@@ -234,11 +234,14 @@ struct BrowserReplayCancellationAuthority {
 }
 
 #[derive(Clone)]
-pub struct BrowserReplayCancellationLease {
+pub struct BrowserReplayExecutionHandle {
     authority: Arc<BrowserReplayCancellationAuthority>,
+    plan: Arc<BrowserReplayPlan>,
 }
 
-impl BrowserReplayCancellationLease {
+pub type BrowserReplayCancellationLease = BrowserReplayExecutionHandle;
+
+impl BrowserReplayExecutionHandle {
     pub fn authority_id(&self) -> u64 {
         self.authority.id
     }
@@ -247,14 +250,21 @@ impl BrowserReplayCancellationLease {
         Arc::ptr_eq(&self.authority, &other.authority)
     }
 
+    pub fn same_plan(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.plan, &other.plan)
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.authority.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn plan(&self) -> &BrowserReplayPlan {
+        &self.plan
     }
 }
 
 struct ActiveBrowserReplay {
     instance: BrowserReplayInstance,
-    plan: BrowserReplayPlan,
     projection: BrowserReplayProjection,
     lease: BrowserReplayCancellationLease,
 }
@@ -384,7 +394,8 @@ impl BrowserReplayCoordinator {
             }
             active.projection.current_step_index += 1;
             active.projection.current_step_id = active
-                .plan
+                .lease
+                .plan()
                 .steps
                 .get(active.projection.current_step_index)
                 .map(|step| step.id.clone());
@@ -518,32 +529,32 @@ impl BrowserReplayCoordinator {
             id: instance_id,
             scope: state.scope.clone(),
         };
-        let lease = BrowserReplayCancellationLease {
+        let lease = BrowserReplayExecutionHandle {
             authority: Arc::new(BrowserReplayCancellationAuthority {
                 id: instance_id,
                 cancelled: AtomicBool::new(false),
             }),
+            plan: Arc::new(plan),
         };
         let projection = BrowserReplayProjection {
             workspace_key: workspace_key.clone(),
             instance_id,
-            recipe_id: plan.recipe_id.clone(),
-            status: if plan.unresolved_secret_inputs.is_empty() {
+            recipe_id: lease.plan.recipe_id.clone(),
+            status: if lease.plan.unresolved_secret_inputs.is_empty() {
                 BrowserReplayStatus::Pending
             } else {
                 BrowserReplayStatus::NeedsUserSecret
             },
             current_step_index: 0,
-            total_steps: plan.steps.len(),
-            current_step_id: plan.steps.first().map(|step| step.id.clone()),
-            unresolved_secret_inputs: plan.unresolved_secret_inputs.clone(),
+            total_steps: lease.plan.steps.len(),
+            current_step_id: lease.plan.steps.first().map(|step| step.id.clone()),
+            unresolved_secret_inputs: lease.plan.unresolved_secret_inputs.clone(),
             failure: None,
         };
         state.active.insert(
             workspace_key,
             ActiveBrowserReplay {
                 instance: instance.clone(),
-                plan,
                 projection: projection.clone(),
                 lease: lease.clone(),
             },
