@@ -287,6 +287,54 @@ fn successful_user_chrome_commands_record_without_duplicating_page_actions() {
 }
 
 #[test]
+fn recording_start_seeds_selected_tab_as_tab_one() {
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let workspace = workspace();
+    let instance = coordinator
+        .start_with_selected_tab(workspace.clone(), "runtime-initial")
+        .expect("start recording with the selected runtime tab");
+
+    let select = BrowserCommand::SelectTab {
+        tab_id: "runtime-initial".to_string(),
+    };
+    let capture = coordinator
+        .begin_user_chrome_capture(&workspace, &select)
+        .expect("reserve initial-tab selection")
+        .expect("selection is recordable");
+    coordinator
+        .complete_user_chrome_capture(
+            capture,
+            &Ok(workspace_response(
+                "https://example.test/initial",
+                "runtime-initial",
+            )),
+        )
+        .expect("record initial-tab selection");
+
+    let create = BrowserCommand::CreateTab { url: None };
+    let capture = coordinator
+        .begin_user_chrome_capture(&workspace, &create)
+        .expect("reserve created tab")
+        .expect("create is recordable");
+    coordinator
+        .complete_user_chrome_capture(
+            capture,
+            &Ok(workspace_response("about:blank", "runtime-created")),
+        )
+        .expect("record created tab");
+
+    let review = coordinator.stop(&instance).expect("stop recording");
+    assert!(matches!(
+        &review.recipe().steps[0].action,
+        BrowserRecipeAction::SelectTab { tab } if tab == "tab-1"
+    ));
+    assert!(matches!(
+        &review.recipe().steps[1].action,
+        BrowserRecipeAction::CreateTab { tab, .. } if tab == "tab-2"
+    ));
+}
+
+#[test]
 fn user_chrome_capture_failures_never_leave_a_saveable_incomplete_recording() {
     let workspace = workspace();
 

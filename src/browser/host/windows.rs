@@ -406,11 +406,20 @@ impl BrowserWebViewHost {
             .iter()
             .map(|tab| tab.id.clone())
             .collect::<Vec<_>>();
+        let selected_tab_id = self
+            .state
+            .workspace(workspace_key)
+            .expect("workspace existence checked")
+            .selected_tab_id
+            .clone();
         self.pump_page_recording_ipc();
-        let instance = self
-            .workflow_coordinator
-            .start(workspace_key.clone())
-            .map_err(map_page_recording_error)?;
+        let instance = match selected_tab_id {
+            Some(selected_tab_id) => self
+                .workflow_coordinator
+                .start_with_selected_tab(workspace_key.clone(), selected_tab_id),
+            None => self.workflow_coordinator.start(workspace_key.clone()),
+        }
+        .map_err(map_page_recording_error)?;
         for tab_id in tab_ids {
             if self.views.contains_key(&view_key(workspace_key, &tab_id))
                 && self

@@ -182,12 +182,38 @@ impl BrowserWorkflowCoordinator {
         &self,
         workspace_key: BrowserWorkspaceKey,
     ) -> Result<BrowserRecordingInstance, BrowserRecordingError> {
+        self.start_with_optional_selected_tab(workspace_key, None)
+    }
+
+    pub fn start_with_selected_tab(
+        &self,
+        workspace_key: BrowserWorkspaceKey,
+        selected_tab_id: impl Into<String>,
+    ) -> Result<BrowserRecordingInstance, BrowserRecordingError> {
+        let selected_tab_id = selected_tab_id.into();
+        if selected_tab_id.trim().is_empty() {
+            return Err(BrowserRecordingError::InvalidAction);
+        }
+        self.start_with_optional_selected_tab(workspace_key, Some(selected_tab_id))
+    }
+
+    fn start_with_optional_selected_tab(
+        &self,
+        workspace_key: BrowserWorkspaceKey,
+        selected_tab_id: Option<String>,
+    ) -> Result<BrowserRecordingInstance, BrowserRecordingError> {
         let mut state = self.lock();
         let instance = state.recorder.start(workspace_key.clone())?;
-        state.tab_aliases.insert(
-            workspace_key,
-            BrowserRecordingTabAliases::new(instance.id()),
-        );
+        let mut aliases = BrowserRecordingTabAliases::new(instance.id());
+        if let Some(selected_tab_id) = selected_tab_id {
+            if let Err(error) = aliases.alias_for(&selected_tab_id) {
+                if state.recorder.stop(&instance).is_ok() {
+                    let _ = state.recorder.discard(&instance);
+                }
+                return Err(error);
+            }
+        }
+        state.tab_aliases.insert(workspace_key, aliases);
         Ok(instance)
     }
 

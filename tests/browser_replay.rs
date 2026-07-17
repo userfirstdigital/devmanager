@@ -179,6 +179,28 @@ fn replay_recipe_without_secret_gate() -> BrowserRecipeV1 {
     recipe
 }
 
+fn tab_alias_recipe(actions: Vec<BrowserRecipeAction>) -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "tab-alias-lifecycle".to_string(),
+        name: "Tab alias lifecycle".to_string(),
+        description: "Portable replay tab aliases".to_string(),
+        start_url: "https://example.test/start".to_string(),
+        viewport: BrowserRecipeViewport::default(),
+        inputs: Vec::new(),
+        steps: actions
+            .into_iter()
+            .enumerate()
+            .map(|(index, action)| BrowserRecipeStep {
+                id: format!("step-{}", index + 1),
+                action,
+                wait: None,
+                assertions: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
 fn assert_credential_identifier_never_reaches_replay_history(
     recipe: BrowserRecipeV1,
     credential_id: &str,
@@ -321,6 +343,84 @@ fn replay_compiler_rejects_invalid_recipe_and_exact_public_input_contract_violat
         )),
         BrowserReplayError::InputKindMismatch
     );
+}
+
+#[test]
+fn replay_compile_rejects_invalid_tab_alias_lifecycle() {
+    let invalid_actions = [
+        vec![BrowserRecipeAction::SelectTab {
+            tab: "ambient-tab".to_string(),
+        }],
+        vec![BrowserRecipeAction::CloseTab {
+            tab: "ambient-tab".to_string(),
+        }],
+        vec![
+            BrowserRecipeAction::CreateTab {
+                tab: "created-tab".to_string(),
+                url: None,
+            },
+            BrowserRecipeAction::CreateTab {
+                tab: "created-tab".to_string(),
+                url: None,
+            },
+        ],
+        vec![
+            BrowserRecipeAction::CloseTab {
+                tab: "tab-1".to_string(),
+            },
+            BrowserRecipeAction::SelectTab {
+                tab: "tab-1".to_string(),
+            },
+        ],
+        vec![
+            BrowserRecipeAction::CreateTab {
+                tab: "tab-1".to_string(),
+                url: None,
+            },
+            BrowserRecipeAction::CloseTab {
+                tab: "tab-1".to_string(),
+            },
+            BrowserRecipeAction::CreateTab {
+                tab: "tab-1".to_string(),
+                url: None,
+            },
+        ],
+    ];
+
+    for actions in invalid_actions {
+        assert_eq!(
+            compile_error(compile_browser_replay(
+                &tab_alias_recipe(actions),
+                Vec::new()
+            )),
+            BrowserReplayError::InvalidRecipe
+        );
+    }
+
+    let portable_initial_tab = tab_alias_recipe(vec![
+        BrowserRecipeAction::SelectTab {
+            tab: "tab-1".to_string(),
+        },
+        BrowserRecipeAction::CreateTab {
+            tab: "tab-2".to_string(),
+            url: None,
+        },
+        BrowserRecipeAction::SelectTab {
+            tab: "tab-1".to_string(),
+        },
+    ]);
+    assert!(compile_browser_replay(&portable_initial_tab, Vec::new()).is_ok());
+
+    let legacy_create_tab_one = tab_alias_recipe(vec![
+        BrowserRecipeAction::CreateTab {
+            tab: "tab-1".to_string(),
+            url: None,
+        },
+        BrowserRecipeAction::SelectTab {
+            tab: "tab-1".to_string(),
+        },
+    ]);
+    assert!(compile_browser_replay(&legacy_create_tab_one, Vec::new()).is_ok());
 }
 
 #[test]

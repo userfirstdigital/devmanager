@@ -1,6 +1,6 @@
 use super::{
-    BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
-    BrowserRecipeViewport, BrowserWorkspaceKey,
+    BrowserRecipeAction, BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1,
+    BrowserRecipeValue, BrowserRecipeViewport, BrowserWorkspaceKey,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -634,6 +634,7 @@ pub fn compile_browser_replay(
     {
         return Err(BrowserReplayError::CapacityExceeded);
     }
+    validate_tab_alias_lifecycle(&recipe.steps)?;
     if recipe.inputs.iter().any(|input| {
         input.name.len() > MAX_BROWSER_REPLAY_INPUT_NAME_BYTES
             || input.name.chars().any(char::is_control)
@@ -730,6 +731,44 @@ pub fn compile_browser_replay(
         bindings: ordered_bindings,
         unresolved_secret_inputs,
     })
+}
+
+fn validate_tab_alias_lifecycle(steps: &[BrowserRecipeStep]) -> Result<(), BrowserReplayError> {
+    let legacy_creates_tab_one = steps.iter().any(|step| {
+        matches!(
+            &step.action,
+            BrowserRecipeAction::CreateTab { tab, .. } if tab == "tab-1"
+        )
+    });
+    let mut active = HashSet::new();
+    let mut seen = HashSet::new();
+    if !legacy_creates_tab_one {
+        active.insert("tab-1".to_string());
+        seen.insert("tab-1".to_string());
+    }
+
+    for step in steps {
+        match &step.action {
+            BrowserRecipeAction::CreateTab { tab, .. } => {
+                if !seen.insert(tab.clone()) {
+                    return Err(BrowserReplayError::InvalidRecipe);
+                }
+                active.insert(tab.clone());
+            }
+            BrowserRecipeAction::SelectTab { tab } => {
+                if !active.contains(tab) {
+                    return Err(BrowserReplayError::InvalidRecipe);
+                }
+            }
+            BrowserRecipeAction::CloseTab { tab } => {
+                if !active.remove(tab) {
+                    return Err(BrowserReplayError::InvalidRecipe);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_public_value(
