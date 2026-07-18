@@ -1989,7 +1989,7 @@ where
     })
 }
 
-fn help_advertises_flag(help: &str, flag: &str) -> bool {
+pub(crate) fn help_advertises_flag(help: &str, flag: &str) -> bool {
     if flag.is_empty() {
         return false;
     }
@@ -2074,7 +2074,7 @@ fn parse_codex_command(startup_command: &str) -> Result<ParsedCodexCommand, Stri
     ))
 }
 
-fn split_command_line(command: &str) -> Result<Vec<String>, String> {
+pub(crate) fn split_command_line(command: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -2136,7 +2136,7 @@ fn validate_version_token(version: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn quote_command_for_shell(tokens: &[String], shell_program: &str) -> String {
+pub(crate) fn quote_command_for_shell(tokens: &[String], shell_program: &str) -> String {
     let shell = Path::new(shell_program)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -2164,7 +2164,7 @@ fn quote_command_for_shell(tokens: &[String], shell_program: &str) -> String {
         .join(" ")
 }
 
-fn resolve_executable(program: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_executable(program: &str) -> Result<PathBuf, String> {
     let supplied = PathBuf::from(program);
     if supplied.components().count() > 1 || supplied.is_absolute() {
         return supplied
@@ -2212,7 +2212,7 @@ fn executable_candidate_names(program: &str, windows: bool, path_ext: &str) -> V
     names
 }
 
-fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
+pub(crate) fn run_probe(executable: &Path, args: &[String]) -> Result<String, String> {
     let mut command = std::process::Command::new(executable);
     command
         .args(args)
