@@ -2352,6 +2352,10 @@ impl NativeShell {
             }
         };
 
+        if self.browser_replay_secret_prompt.is_some() && action.is_annotation_editor_action() {
+            return;
+        }
+
         if self.browser_replay_secret_prompt.is_some()
             && matches!(
                 &action,
@@ -2364,7 +2368,6 @@ impl NativeShell {
                     | BrowserPaneAction::Reload
                     | BrowserPaneAction::FocusAddress
                     | BrowserPaneAction::SubmitAddress
-                    | BrowserPaneAction::ToggleAnnotation
                     | BrowserPaneAction::StartRecording
                     | BrowserPaneAction::Stop
                     | BrowserPaneAction::ResetWorkspace
@@ -3055,6 +3058,10 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_replay_secret_prompt.is_some() {
+            window.prevent_default();
+            return;
+        }
         let Some((workspace_key, _)) = self.active_browser_workspace() else {
             return;
         };

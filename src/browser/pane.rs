@@ -93,6 +93,32 @@ struct BrowserReplaySecretPromptValue {
     value: Zeroizing<String>,
 }
 
+impl BrowserReplaySecretPromptValue {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            value: Zeroizing::new(String::with_capacity(MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES)),
+        }
+    }
+
+    fn append(&mut self, text: &str) -> Result<(), BrowserReplaySecretError> {
+        let next_len = self
+            .value
+            .len()
+            .checked_add(text.len())
+            .ok_or(BrowserReplaySecretError::InvalidSubmission)?;
+        if next_len > MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES || next_len > self.value.capacity() {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        let pointer = self.value.as_ptr();
+        let capacity = self.value.capacity();
+        self.value.push_str(text);
+        debug_assert_eq!(self.value.as_ptr(), pointer);
+        debug_assert_eq!(self.value.capacity(), capacity);
+        Ok(())
+    }
+}
+
 pub struct BrowserReplaySecretPromptVault {
     instance: BrowserReplayInstance,
     values: Vec<BrowserReplaySecretPromptValue>,
@@ -109,10 +135,7 @@ impl BrowserReplaySecretPromptVault {
         }
         let values = input_names
             .into_iter()
-            .map(|name| BrowserReplaySecretPromptValue {
-                name,
-                value: Zeroizing::new(String::new()),
-            })
+            .map(BrowserReplaySecretPromptValue::new)
             .collect();
         let vault = Self {
             instance,
@@ -154,15 +177,7 @@ impl BrowserReplaySecretPromptVault {
             .input_index(input_name)
             .ok_or(BrowserReplaySecretError::InvalidSubmission)?;
         let entry = &mut self.values[index];
-        let next_len = entry
-            .value
-            .len()
-            .checked_add(text.len())
-            .ok_or(BrowserReplaySecretError::InvalidSubmission)?;
-        if next_len > MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES {
-            return Err(BrowserReplaySecretError::InvalidSubmission);
-        }
-        entry.value.push_str(text);
+        entry.append(text)?;
         self.focused_index = index;
         Ok(self.event(
             BrowserReplaySecretPromptOperation::Edited,
@@ -325,6 +340,32 @@ fn valid_prompt_input_names(input_names: &[String]) -> bool {
             && !super::automation::browser_text_contains_secret(name)
             && names.insert(name.as_str())
     })
+}
+
+#[cfg(test)]
+mod replay_secret_prompt_memory_tests {
+    use super::{BrowserReplaySecretPromptValue, MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES};
+
+    #[test]
+    fn secret_prompt_value_preallocates_once_and_never_moves_while_filling_to_limit() {
+        let mut value = BrowserReplaySecretPromptValue::new("credential".to_string());
+        let initial_pointer = value.value.as_ptr();
+        let initial_capacity = value.value.capacity();
+        assert!(initial_capacity >= MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES);
+
+        while value.value.len() < MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES {
+            let remaining = MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES - value.value.len();
+            let chunk = "x".repeat(remaining.min(257));
+            value.append(&chunk).expect("bounded append");
+            assert_eq!(value.value.as_ptr(), initial_pointer);
+            assert_eq!(value.value.capacity(), initial_capacity);
+        }
+
+        assert_eq!(value.value.len(), MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES);
+        assert!(value.append("x").is_err());
+        assert_eq!(value.value.as_ptr(), initial_pointer);
+        assert_eq!(value.value.capacity(), initial_capacity);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1261,6 +1302,18 @@ pub enum BrowserPaneAction {
     ClearProjectProfile,
 }
 
+impl BrowserPaneAction {
+    pub fn is_annotation_editor_action(&self) -> bool {
+        matches!(
+            self,
+            Self::FocusAnnotation
+                | Self::ToggleAnnotation
+                | Self::SaveAnnotation
+                | Self::CancelAnnotation
+        )
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct BrowserPaneTransient {
     pub address_draft: Option<String>,
@@ -1481,6 +1534,7 @@ impl BrowserPaneModel {
         let annotation_cursor = transient
             .annotation_cursor
             .min(annotation_comment.chars().count());
+        let annotation_input_available = transient.replay_secret_prompt.is_none();
         Self {
             workspace_key,
             eligible: browser_pane_eligible(context),
@@ -1505,12 +1559,16 @@ impl BrowserPaneModel {
             annotation_draft: transient.annotation_draft,
             annotation_comment,
             annotation_cursor,
-            annotation_focused: transient.annotation_focused,
+            annotation_focused: transient.annotation_focused && annotation_input_available,
             workflow_review: transient.workflow_review,
             workflow_preview: transient.workflow_preview,
             workflow_editor: transient.workflow_editor,
             replay_secret_prompt: transient.replay_secret_prompt,
         }
+    }
+
+    pub fn annotation_editor_visible(&self) -> bool {
+        self.annotation_draft.is_some() && self.replay_secret_prompt.is_none()
     }
 }
 
@@ -2174,8 +2232,11 @@ pub fn render_browser_pane(
         model.address_draft.clone()
     };
     let page_bounds = actions.on_page_bounds.clone();
-    let annotation_editor =
-        model.annotation_draft.as_ref().map(|draft| {
+    let annotation_editor = model
+        .annotation_draft
+        .as_ref()
+        .filter(|_| model.annotation_editor_visible())
+        .map(|draft| {
             let cursor_byte = model
                 .annotation_comment
                 .char_indices()

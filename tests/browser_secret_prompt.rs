@@ -1,12 +1,13 @@
 use devmanager::browser::{
-    browser_replay_secret_mask, compile_browser_replay, BrowserPaneContext, BrowserPaneModel,
-    BrowserPaneSurface, BrowserPaneTransient, BrowserRecipeAction, BrowserRecipeInput,
-    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplaySecretError,
-    BrowserReplaySecretPromptEvent, BrowserReplaySecretPromptOperation,
-    BrowserReplaySecretPromptProjection, BrowserReplaySecretPromptVault, BrowserReplayStatus,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
-    MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES,
+    browser_replay_secret_mask, compile_browser_replay, BrowserAnnotationDraft, BrowserPaneAction,
+    BrowserPaneContext, BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient,
+    BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
+    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
+    BrowserReplayCoordinator, BrowserReplaySecretError, BrowserReplaySecretPromptEvent,
+    BrowserReplaySecretPromptOperation, BrowserReplaySecretPromptProjection,
+    BrowserReplaySecretPromptVault, BrowserReplayStatus, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_REPLAY_SECRET_INPUTS,
+    MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -46,6 +47,24 @@ fn locator(test_id: &str) -> BrowserRecipeLocator {
         test_id: Some(test_id.to_string()),
         ..BrowserRecipeLocator::default()
     }
+}
+
+fn annotation_draft() -> BrowserAnnotationDraft {
+    serde_json::from_value(serde_json::json!({
+        "id": "draft-existing",
+        "tabId": "tab-1",
+        "candidate": {
+            "kind": "element",
+            "url": "https://example.test/form",
+            "revision": 1,
+            "locator": { "testId": "save" },
+            "bounds": { "x": 1, "y": 2, "width": 3, "height": 4 },
+            "viewport": { "width": 1280, "height": 720, "scalePercent": 100 },
+            "computedStyles": {}
+        },
+        "screenshotResource": "resource-existing"
+    }))
+    .expect("valid annotation draft")
 }
 
 fn secret_recipe() -> BrowserRecipeV1 {
@@ -176,10 +195,26 @@ fn secret_prompt_supports_multiple_inputs_with_only_fixed_masked_safe_projection
         },
         &BrowserWorkspaceSnapshot::default(),
         BrowserPaneTransient {
+            annotation_draft: Some(annotation_draft()),
+            annotation_comment: "preserve existing draft".to_string(),
+            annotation_focused: true,
             replay_secret_prompt: Some(projection),
             ..BrowserPaneTransient::default()
         },
     );
+    assert!(model.annotation_draft.is_some());
+    assert_eq!(model.annotation_comment, "preserve existing draft");
+    assert!(!model.annotation_focused);
+    assert!(!model.annotation_editor_visible());
+    for action in [
+        BrowserPaneAction::FocusAnnotation,
+        BrowserPaneAction::ToggleAnnotation,
+        BrowserPaneAction::SaveAnnotation,
+        BrowserPaneAction::CancelAnnotation,
+    ] {
+        assert!(action.is_annotation_editor_action());
+    }
+    assert!(!BrowserPaneAction::FocusAddress.is_annotation_editor_action());
     let pane_debug = format!("{model:?}");
     let persisted_snapshot = serde_json::to_string(&BrowserWorkspaceSnapshot::default()).unwrap();
     let remote_snapshot =
@@ -424,12 +459,40 @@ fn native_shell_owns_plaintext_outside_pane_persisted_and_remote_models_and_bloc
     assert!(!secret_key.contains("read_from_clipboard"));
     assert!(!secret_key.contains("write_user_text_to_session"));
 
+    let annotation_key_start = app.find("fn handle_browser_annotation_key(").unwrap();
+    let annotation_key_end = app[annotation_key_start..]
+        .find("fn handle_browser_workflow_key(")
+        .unwrap()
+        + annotation_key_start;
+    let annotation_key = &app[annotation_key_start..annotation_key_end];
+    let annotation_prompt_guard = annotation_key
+        .find("browser_replay_secret_prompt.is_some()")
+        .expect("annotation key prompt ownership guard");
+    let annotation_workspace_read = annotation_key.find("active_browser_workspace()").unwrap();
+    let annotation_clipboard_read = annotation_key.find("read_from_clipboard").unwrap();
+    let annotation_mutation = annotation_key.find("annotation_comment").unwrap();
+    assert!(annotation_prompt_guard < annotation_workspace_read);
+    assert!(annotation_prompt_guard < annotation_clipboard_read);
+    assert!(annotation_prompt_guard < annotation_mutation);
+    let annotation_guard = &annotation_key[annotation_prompt_guard..annotation_workspace_read];
+    assert!(annotation_guard.contains("window.prevent_default()"));
+    assert!(annotation_guard.contains("return"));
+
     let pane_action_start = app.find("fn apply_browser_pane_action(").unwrap();
     let pane_action_end = app[pane_action_start..]
         .find("fn handle_browser_replay_secret_key(")
         .unwrap()
         + pane_action_start;
     let pane_action = &app[pane_action_start..pane_action_end];
+    let blocked_annotation_action = pane_action
+        .find("action.is_annotation_editor_action()")
+        .expect("stale annotation action guard");
+    assert!(blocked_annotation_action < pane_action.find("match action").unwrap());
+    assert!(blocked_annotation_action < pane_action.find("FocusAnnotation =>").unwrap());
+    assert!(
+        pane_action[blocked_annotation_action..pane_action.find("match action").unwrap()]
+            .contains("return")
+    );
     for action in ["CreateTab", "SelectTab", "CloseTab", "Collapse"] {
         assert!(
             pane_action.contains(&format!("BrowserPaneAction::{action}")),
@@ -439,5 +502,12 @@ fn native_shell_owns_plaintext_outside_pane_persisted_and_remote_models_and_bloc
     assert!(pane_action.contains("cancel_browser_replay_secret_prompt"));
 
     assert!(pane.contains("browser_replay_secret_mask(input.is_set)"));
+    let annotation_editor_start = pane.find("let annotation_editor").unwrap();
+    let annotation_editor_end = pane[annotation_editor_start..]
+        .find("let replay_secret_prompt_panel")
+        .unwrap()
+        + annotation_editor_start;
+    let annotation_editor = &pane[annotation_editor_start..annotation_editor_end];
+    assert!(annotation_editor.contains(".filter(|_| model.annotation_editor_visible())"));
     assert!(!pane.contains("secret_prompt.value"));
 }
