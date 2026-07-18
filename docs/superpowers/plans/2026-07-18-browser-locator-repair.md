@@ -121,7 +121,7 @@
 - Modify: `tests/browser_recipes.rs`
 - Modify: `tests/browser_replay_repair.rs`
 
-1. Write failing tests for the named schema-v1 compact-JSON SHA-256 digest, exact step index+ID+slot+old-locator comparison, every locator slot, optional `Some` versus targetless `None`, changed recipe, invalid candidate, exact-once replay binding to the authenticated canonical root, reparse boundaries, cooperating concurrent apply/save, documented external-writer boundary behavior, injected replacement failure, and temp cleanup.
+1. Write failing tests for `SHA-256("devmanager.browser-recipe-v1.sha256\\0" || compact validated v1 JSON)`, formatting/key-order equivalence after strict load, semantic changes, domain separation, exact step index+ID+slot+old-locator comparison, every locator slot, optional `Some` versus targetless `None`, changed recipe, invalid candidate, exact-once replay binding to the authenticated canonical root, reparse boundaries, cooperating concurrent apply/save, documented external-writer boundary behavior, injected replacement failure, and temp cleanup.
 2. Store the validated canonical digest privately in the replay plan and bind the authenticated canonical root exactly once in the execution handle before the first command. Add locator-at/replace-at helpers and reuse the existing global `RECIPE_WRITE_GATE`; do not add an independent repair gate or claim OS-wide CAS against non-cooperating editors.
 3. Reload and compare, clone and replace only the exact locator, validate the full v1 recipe, recompare at the final boundary, and use the existing atomic sibling replacement. Preserve the old complete file on every failure.
 4. Run recipe/repair tests; commit `feat(browser): atomically save locator repairs`.

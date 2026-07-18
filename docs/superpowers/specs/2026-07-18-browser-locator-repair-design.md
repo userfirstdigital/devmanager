@@ -84,7 +84,7 @@ The same preview API accepts `User` or `Agent`; checkpoint 12 exposes the Agent 
 
 ## Atomic recipe apply
 
-The compiled replay plan stores a private recipe digest identified as `devmanager.browser-recipe-v1.sha256`. Its input is exactly the UTF-8 bytes from compact `serde_json::to_vec` serialization of a fully validated `BrowserRecipeV1` with `schemaVersion == 1`; the struct serializers provide fixed field order, arrays retain source order, and the wire format contains no unordered maps. Before the first browser command, the execution handle binds exactly once to the authenticated canonical local project root supplied by the executor; later execution, repair, and repository operations must match that bound root. Repair state also stores the exact original step ID, index, locator slot, and locator.
+The compiled replay plan stores a private `BrowserRecipeDigestV1`. It is `SHA-256(b"devmanager.browser-recipe-v1.sha256\0" || compact_json)`, where `compact_json` is exactly the UTF-8 bytes from `serde_json::to_vec` serialization of a fully validated `BrowserRecipeV1` with `schemaVersion == 1`. The struct serializers provide fixed field order, arrays retain source order, and the wire format contains no unordered maps. Compile and reload comparisons call this one helper; the domain prefix and NUL separator make future algorithms/schema domains distinct. Before the first browser command, the execution handle binds exactly once to the authenticated canonical local project root supplied by the executor; later execution, repair, and repository operations must match that bound root. Repair state also stores the exact original step ID, index, locator slot, and locator.
 
 Apply requires:
 
