@@ -8,26 +8,9 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   const MAX_PERFORMANCE = 500;
   const MAX_BODY_BYTES = 64 * 1024;
   const REDACTED = "[redacted]";
-  const secretOwnedElements = new WeakSet();
-  const secretOwnedElementRefs = [];
-  const registerSecretOwnedElement = (element) => {
-    if (secretOwnedElements.has(element)) return;
-    secretOwnedElements.add(element);
-    secretOwnedElementRefs.push(new WeakRef(element));
-  };
-  const secretOwnedValues = () => {
-    const values = [];
-    let retained = 0;
-    for (const reference of secretOwnedElementRefs) {
-      const element = reference.deref();
-      if (!element) continue;
-      secretOwnedElementRefs[retained++] = reference;
-      values.push(String(element.value ?? ""));
-    }
-    secretOwnedElementRefs.length = retained;
-    return values;
-  };
-  let activeSecretValue = null;
+  let pendingSecretTicket = null;
+  const MAX_MASKED_SECRET_ELEMENTS = 32;
+  let maskedSecretElementRefs = [];
   const state = {
     console: [],
     network: [],
@@ -40,9 +23,11 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     tracing: false,
     traceStartedAt: 0,
     annotationActive: false,
+    secretTainted: false,
   };
 
   const boundedPush = (list, value, maximum) => {
+    if (state.secretTainted) return;
     list.push(value);
     while (list.length > maximum) list.shift();
   };
@@ -70,18 +55,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       return text;
     }
   };
-  const redactActiveSecret = (value) => {
-    let text = String(value ?? "");
-    for (const secret of [activeSecretValue, ...secretOwnedValues()]) {
-      if (!secret) continue;
-      const encoded = encodeURIComponent(secret);
-      for (const candidate of [secret, encoded, encoded.replace(/%20/g, "+")]) {
-        if (candidate) text = text.split(candidate).join(REDACTED);
-      }
-    }
-    return text;
-  };
-  const redact = (value) => redactStructured(redactActiveSecret(value))
+  const redact = (value) => redactStructured(value)
     .replace(/\bBasic\s+[A-Za-z0-9._~+\/=\-]+/gi, `Basic ${REDACTED}`)
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/=\-]+/gi, `Bearer ${REDACTED}`)
     .replace(/("([^"\\]*(?:\\.[^"\\]*)*)"\s*:\s*")((?:\\.|[^"\\])*)(")/g,
@@ -105,7 +79,25 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   };
   const now = () => Math.max(0, Math.round(performance.now()));
   const rawPostMessage = window.ipc.postMessage.bind(window.ipc);
-  window.ipc.postMessage = (body) => rawPostMessage(redact(body));
+  const valueFreeControlMessage = (body) => {
+    if (typeof body !== "string") return false;
+    try {
+      const parsed = JSON.parse(body);
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return false;
+      const keys = Object.keys(parsed).sort();
+      if (parsed.type === "domMutation" || parsed.type === "annotationCanceled") {
+        return keys.length === 1 && keys[0] === "type";
+      }
+      return parsed.type === "userInput" &&
+        keys.length === 2 && keys[0] === "kind" && keys[1] === "type" &&
+        ["pointer", "keyboard", "textInput"].includes(parsed.kind);
+    } catch (_) {
+      return false;
+    }
+  };
+  window.ipc.postMessage = (body) => {
+    if (!state.secretTainted || valueFreeControlMessage(body)) rawPostMessage(body);
+  };
 
   const reportInput = (kind) => (event) => {
     if (!event.isTrusted || state.annotationActive) return;
@@ -134,8 +126,42 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     ];
     return changedNodes.length > 0 && changedNodes.every(annotationOwnedNode);
   };
+  const registerMaskedSecretElement = (element) => {
+    const retained = [];
+    let found = false;
+    for (const reference of maskedSecretElementRefs) {
+      const current = reference.deref();
+      if (!current || current.isConnected !== true) continue;
+      if (current === element) found = true;
+      retained.push(reference);
+    }
+    if (!found && retained.length >= MAX_MASKED_SECRET_ELEMENTS) {
+      maskedSecretElementRefs = retained;
+      return false;
+    }
+    if (!found) retained.push(new WeakRef(element));
+    maskedSecretElementRefs = retained;
+    return true;
+  };
+  const enforceSecretMask = () => {
+    if (!state.secretTainted) return;
+    const retained = [];
+    for (const reference of maskedSecretElementRefs) {
+      const element = reference.deref();
+      if (!element || element.isConnected !== true) continue;
+      retained.push(reference);
+      if (element.style?.getPropertyValue?.("-webkit-text-security") !== "disc" ||
+          element.style?.getPropertyPriority?.("-webkit-text-security") !== "important") {
+        element.style?.setProperty?.("-webkit-text-security", "disc", "important");
+      }
+    }
+    maskedSecretElementRefs = retained;
+  };
+  const isMaskedSecretElement = (element) =>
+    maskedSecretElementRefs.some((reference) => reference.deref() === element);
   let mutationTimer = null;
   const mutationObserver = new MutationObserver((records) => {
+    enforceSecretMask();
     if (!records.some((record) => !annotationOwnedMutation(record))) return;
     if (mutationTimer !== null) return;
     mutationTimer = setTimeout(() => {
@@ -154,6 +180,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     const original = console[level]?.bind(console);
     if (!original) continue;
     console[level] = (...args) => {
+      if (state.secretTainted) return original(...args);
       boundedPush(state.console, {
         sequence: ++state.sequence,
         level,
@@ -167,6 +194,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     };
   }
   window.addEventListener("error", (event) => {
+    if (state.secretTainted) return;
     boundedPush(state.console, {
       sequence: ++state.sequence,
       level: "error",
@@ -175,6 +203,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     }, MAX_CONSOLE);
   });
   window.addEventListener("unhandledrejection", (event) => {
+    if (state.secretTainted) return;
     boundedPush(state.console, {
       sequence: ++state.sequence,
       level: "error",
@@ -186,6 +215,9 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   const beginRequest = (url, method) => {
     state.inflightRequests += 1;
     state.lastNetworkActivityAt = now();
+    if (state.secretTainted) {
+      return { requestId: null, startedAt: now(), suppressed: true };
+    }
     return {
       requestId: `request-${++state.requestSequence}`,
       url: safeUrl(url),
@@ -198,6 +230,11 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     };
   };
   const finishRequest = (entry, status, failed) => {
+    if (state.secretTainted || entry.suppressed) {
+      state.inflightRequests = Math.max(0, state.inflightRequests - 1);
+      state.lastNetworkActivityAt = now();
+      return;
+    }
     entry.status = Number.isFinite(status) ? status : null;
     entry.failed = Boolean(failed);
     entry.durationMs = Math.max(0, now() - entry.startedAt);
@@ -208,10 +245,12 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   };
   const captureBody = async (entry, response) => {
     try {
+      if (state.secretTainted || entry.suppressed) return;
       if (new URL(response.url).origin !== location.origin) return;
       const contentType = response.headers.get("content-type") || "";
       if (!/json|text|javascript|xml|form/i.test(contentType)) return;
       const body = await response.clone().text();
+      if (state.secretTainted) return;
       if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) return;
       state.bodies.set(entry.requestId, redact(body));
       entry.bodyAvailable = true;
@@ -240,7 +279,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   const xhrSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     const result = xhrOpen.call(this, method, url, ...rest);
-    this.__devmanagerRequestMetadata = { url, method };
+    this.__devmanagerRequestMetadata = state.secretTainted ? null : { url, method };
     return result;
   };
   XMLHttpRequest.prototype.send = function(...args) {
@@ -251,6 +290,10 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       if (finished) return;
       finished = true;
       try {
+        if (state.secretTainted || entry.suppressed) {
+          finishRequest(entry, null, false);
+          return;
+        }
         const contentType = this.getResponseHeader("content-type") || "";
         if (new URL(entry.url).origin === location.origin && /json|text|javascript|xml|form/i.test(contentType)) {
           const body = typeof this.responseText === "string" ? this.responseText : "";
@@ -276,6 +319,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
 
   try {
     const performanceObserver = new PerformanceObserver((list) => {
+      if (state.secretTainted) return;
       for (const entry of list.getEntries()) {
         boundedPush(state.performance, {
           name: safeUrl(entry.name),
@@ -311,7 +355,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     return redact(explicit?.innerText || element.closest?.("label")?.innerText || "").slice(0, 1000) || null;
   };
   const isPasswordElement = (element) =>
-    secretOwnedElements.has(element) ||
+    isMaskedSecretElement(element) ||
     String(element?.getAttribute?.("type") || "").toLowerCase() === "password";
   const nameOf = (element) => {
     const valueFallback = isPasswordElement(element) ? "" : element.getAttribute?.("value");
@@ -611,8 +655,57 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     }
   };
 
+  const runtimeTarget = (element) => {
+    const form = element?.closest?.("form");
+    if (state.secretTainted) {
+      const inputType = String(element?.getAttribute?.("type") || "").toLowerCase();
+      const autocomplete = String(element?.getAttribute?.("autocomplete") || "")
+        .toLowerCase().split(/\s+/).at(-1);
+      let formAction = null;
+      try { formAction = form?.action ? new URL(form.action, location.href).origin : null; }
+      catch (_) {}
+      return {
+        originUrl: location.origin,
+        role: element ? implicitRole(element) : null,
+        name: null,
+        inputType: ["text", "password", "email", "tel", "url", "number", "search"].includes(inputType) ? inputType : null,
+        autocomplete: ["current-password", "new-password", "one-time-code", "username", "email", "off"].includes(autocomplete) ? autocomplete : null,
+        formAction,
+        permission: null,
+      };
+    }
+    return {
+      originUrl: location.origin,
+      role: element ? roleOf(element) : null,
+      name: element ? nameOf(element) : null,
+      inputType: element?.getAttribute?.("type") || null,
+      autocomplete: element?.getAttribute?.("autocomplete") || null,
+      formAction: form?.action ? safeUrl(form.action) : null,
+      permission: null,
+    };
+  };
+  const secretRiskSignature = (element) => JSON.stringify(runtimeTarget(element));
+  const clearContentTelemetry = () => {
+    state.console.length = 0;
+    state.network.length = 0;
+    state.performance.length = 0;
+    state.bodies.clear();
+    state.tracing = false;
+    state.traceStartedAt = 0;
+  };
+  const markSecretTainted = () => {
+    if (state.secretTainted) return;
+    state.secretTainted = true;
+    clearContentTelemetry();
+    annotationCleanup(false);
+  };
+  const requireContentTelemetry = () => {
+    if (state.secretTainted) throw new Error("secret_tainted_document");
+  };
+
   window[marker] = {
     snapshot: () => {
+      requireContentTelemetry();
       const useful = "a,button,input,select,textarea,[role],[data-testid],h1,h2,h3,h4,h5,h6,p,li,summary";
       return [...document.querySelectorAll(useful)].filter(isVisible).slice(0, 2000).map((element) => {
         const bounds = element.getBoundingClientRect();
@@ -641,46 +734,47 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
         : action.operation === "keypress" && !action.target
           ? [document.activeElement]
           : [resolveTarget(action.target || action.source)];
-      return elements.map((element) => {
-      const form = element?.closest?.("form");
-      return {
-        originUrl: location.origin,
-        role: element ? roleOf(element) : null,
-        name: element ? nameOf(element) : null,
-        inputType: element?.getAttribute?.("type") || null,
-        autocomplete: element?.getAttribute?.("autocomplete") || null,
-        formAction: form?.action ? safeUrl(form.action) : null,
-        permission: null,
-      };
-      });
+      return elements.map(runtimeTarget);
     }),
-    inspectSecretTarget: (target) => {
+    inspectSecretTarget: (target, token) => {
+      pendingSecretTicket = null;
+      const normalizedToken = String(token ?? "");
+      if (typeof WeakRef !== "function" || !normalizedToken || normalizedToken.length > 256 || /[\u0000-\u001f\u007f]/.test(normalizedToken)) return null;
       const element = resolveTarget(target);
       if (!element) return null;
-      const form = element?.closest?.("form");
-      return {
-        originUrl: location.origin,
-        role: element ? roleOf(element) : null,
-        name: element ? nameOf(element) : null,
-        inputType: element?.getAttribute?.("type") || null,
-        autocomplete: element?.getAttribute?.("autocomplete") || null,
-        formAction: form?.action ? safeUrl(form.action) : null,
-        permission: null,
-      };
+      const inspectedTarget = runtimeTarget(element);
+      pendingSecretTicket = Object.freeze({
+        token: normalizedToken,
+        element: new WeakRef(element),
+        signature: JSON.stringify(inspectedTarget),
+      });
+      return inspectedTarget;
     },
-    typeSecret: (target, value) => {
-      const element = resolveTarget(target);
-      if (!element) throw new Error("element_not_found");
-      registerSecretOwnedElement(element);
-      activeSecretValue = String(value ?? "");
-      try {
-        element.focus();
-        element.value = activeSecretValue;
-        dispatchValueEvents(element);
-        return { completedActions: 1 };
-      } finally {
-        activeSecretValue = null;
+    typeSecret: (token, value) => {
+      const ticket = pendingSecretTicket;
+      pendingSecretTicket = null;
+      if (!ticket || ticket.token !== String(token ?? "")) {
+        markSecretTainted();
+        throw new Error("element_not_found");
       }
+      const element = ticket.element.deref();
+      if (!element) {
+        markSecretTainted();
+        throw new Error("element_not_found");
+      }
+      const connected = element.isConnected === true;
+      const currentSignature = secretRiskSignature(element);
+      markSecretTainted();
+      if (!connected || ticket.signature !== currentSignature) {
+        throw new Error("target_changed");
+      }
+      if (!registerMaskedSecretElement(element)) throw new Error("target_changed");
+      element.style?.setProperty?.("-webkit-text-security", "disc", "important");
+      element.focus();
+      element.value = String(value ?? "");
+      dispatchValueEvents(element);
+      enforceSecretMask();
+      return { completedActions: 1 };
     },
     act: (actions) => {
       let completedActions = 0;
@@ -700,15 +794,18 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       }
     },
     console: (operation) => {
+      requireContentTelemetry();
       if (operation === "clear") { state.console.length = 0; return []; }
       return state.console.slice();
     },
     network: (operation, requestId) => {
+      requireContentTelemetry();
       if (operation === "clear") { state.network.length = 0; state.bodies.clear(); return []; }
       if (operation === "body") return state.bodies.has(requestId) ? { available: true, body: state.bodies.get(requestId) } : { available: false };
       return state.network.slice();
     },
     performance: (operation) => {
+      requireContentTelemetry();
       if (operation === "traceStart") { state.tracing = true; state.traceStartedAt = now(); state.performance.length = 0; return { tracing: true }; }
       if (operation === "traceStop") { state.tracing = false; return { tracing: false, trace: state.performance.slice() }; }
       const navigation = performance.getEntriesByType("navigation")[0];
@@ -721,10 +818,14 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       return true;
     },
     annotation: {
-      start: annotationStart,
+      start: (context) => {
+        requireContentTelemetry();
+        return annotationStart(context);
+      },
       cancel: () => annotationCleanup(false),
       active: () => Boolean(annotationSession),
     },
+    secretTainted: () => state.secretTainted,
   };
 })();
 "#;

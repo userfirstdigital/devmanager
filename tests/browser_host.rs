@@ -1976,16 +1976,19 @@ fn secure_command_host_phases_never_route_plaintext_through_actions_or_retained_
         .unwrap()
         + phases_start;
     let phases = &windows[phases_start..phases_end];
-    assert!(phases.contains("InspectSecretType,"));
+    assert!(phases.contains("InspectSecretType {"));
+    assert!(phases.contains("ticket: String"));
     assert!(phases.contains("SecretType,"));
-    assert!(!phases.contains("InspectSecretType {"));
-    assert!(!phases.contains("SecretType {"));
+    assert!(!phases.contains("\n    SecretType {"));
+    assert!(!phases.contains("secret_value"));
+    assert!(!phases.contains("value: String"));
 
     let initialization = browser_user_input_initialization_script();
-    assert!(initialization.contains("typeSecret:"));
-    assert!(initialization.contains("secretOwnedElements"));
-    assert!(initialization.contains("activeSecretValue"));
-    assert!(initialization.contains("finally"));
+    assert!(initialization.contains("typeSecret: (token, value)"));
+    assert!(initialization.contains("secretTainted: false"));
+    assert!(initialization.contains("pendingSecretTicket"));
+    assert!(!initialization.contains("secretOwnedValues"));
+    assert!(!initialization.contains("activeSecretValue"));
 }
 
 #[test]
@@ -2948,8 +2951,10 @@ fn initialization_script_inspects_active_keypress_and_both_drag_targets_before_a
     assert!(inspection.contains("document.activeElement"));
     assert!(inspection.contains("resolveTarget(action.source)"));
     assert!(inspection.contains("resolveTarget(action.destination)"));
-    assert!(inspection.contains("inputType: element?.getAttribute?.(\"type\")"));
-    assert!(inspection.contains("autocomplete: element?.getAttribute?.(\"autocomplete\")"));
+    assert!(inspection.contains("elements.map(runtimeTarget)"));
+    assert!(script.contains("inputType: element?.getAttribute?.(\"type\")"));
+    assert!(script.contains("autocomplete: element?.getAttribute?.(\"autocomplete\")"));
+    assert!(script.contains("if (state.secretTainted)"));
 }
 
 #[test]

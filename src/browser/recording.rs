@@ -162,12 +162,14 @@ impl BrowserRecordingReview {
 /// An ephemeral capture value. It deliberately implements neither `Debug` nor
 /// `Serialize`; constructors replace sensitive text with an unset input marker
 /// before the value can enter recorder state.
+#[derive(PartialEq, Eq)]
 pub struct BrowserRecordingAction {
     action: PendingRecordingAction,
     wait: Option<BrowserRecipeWait>,
     assertions: Vec<BrowserRecipeAssertion>,
 }
 
+#[derive(PartialEq, Eq)]
 enum PendingRecordingAction {
     Recipe(BrowserRecipeAction),
     SecretType {
@@ -311,6 +313,7 @@ struct ReservationContext {
 
 enum ReservationState {
     Pending,
+    Prepared(BrowserRecordingAction),
     Ready(BrowserRecordingAction),
     Cancelled,
 }
@@ -501,43 +504,75 @@ impl BrowserWorkflowRecorder {
         action: BrowserRecordingAction,
     ) -> Result<BrowserRecordingCommit, BrowserRecordingError> {
         let instance = BrowserRecordingInstance {
+            workspace_key: reservation.workspace_key.clone(),
+            id: reservation.instance_id,
+        };
+        if self
+            .active_instance(&reservation.workspace_key)
+            .is_none_or(|active| active.id() != instance.id())
+        {
+            return Ok(BrowserRecordingCommit::Ignored);
+        }
+        if let Err(error) = self.prepare(&reservation, action) {
+            let _ = self.cancel(reservation);
+            return Err(error);
+        }
+        self.commit_prepared(reservation)
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        reservation: &BrowserRecordingReservation,
+        action: BrowserRecordingAction,
+    ) -> Result<(), BrowserRecordingError> {
+        let instance = BrowserRecordingInstance {
+            workspace_key: reservation.workspace_key.clone(),
+            id: reservation.instance_id,
+        };
+        let active = self.active_mut(&instance)?;
+        let slot = active
+            .reservations
+            .get(&reservation.sequence)
+            .ok_or(BrowserRecordingError::StaleReservation)?;
+        match &slot.state {
+            ReservationState::Pending => {}
+            ReservationState::Prepared(existing) if existing == &action => return Ok(()),
+            ReservationState::Prepared(_)
+            | ReservationState::Ready(_)
+            | ReservationState::Cancelled => return Err(BrowserRecordingError::StaleReservation),
+        }
+        let projected_inputs = projected_generated_input_count(active, &action)?;
+        let exceeds_capacity = retained_assertion_count(active)
+            .saturating_add(action.assertions.len())
+            > MAX_BROWSER_RECORDING_ASSERTIONS
+            || projected_inputs > MAX_BROWSER_RECORDING_INPUTS;
+        if exceeds_capacity {
+            return Err(BrowserRecordingError::CapacityExceeded);
+        }
+        let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
+            return Err(BrowserRecordingError::StaleReservation);
+        };
+        slot.state = ReservationState::Prepared(action);
+        Ok(())
+    }
+
+    pub(crate) fn commit_prepared(
+        &mut self,
+        reservation: BrowserRecordingReservation,
+    ) -> Result<BrowserRecordingCommit, BrowserRecordingError> {
+        let instance = BrowserRecordingInstance {
             workspace_key: reservation.workspace_key,
             id: reservation.instance_id,
         };
         let Ok(active) = self.active_mut(&instance) else {
             return Ok(BrowserRecordingCommit::Ignored);
         };
-        let slot = active
-            .reservations
-            .get(&reservation.sequence)
-            .ok_or(BrowserRecordingError::StaleReservation)?;
-        if !matches!(slot.state, ReservationState::Pending) {
-            return Err(BrowserRecordingError::StaleReservation);
-        }
-        let projected_inputs = match projected_generated_input_count(active, &action) {
-            Ok(projected) => projected,
-            Err(error) => {
-                let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
-                    return Err(BrowserRecordingError::StaleReservation);
-                };
-                slot.state = ReservationState::Cancelled;
-                drain_ready(active);
-                return Err(error);
-            }
-        };
-        let exceeds_capacity = retained_assertion_count(active)
-            .saturating_add(action.assertions.len())
-            > MAX_BROWSER_RECORDING_ASSERTIONS
-            || projected_inputs > MAX_BROWSER_RECORDING_INPUTS;
-        if exceeds_capacity {
-            let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
-                return Err(BrowserRecordingError::StaleReservation);
-            };
-            slot.state = ReservationState::Cancelled;
-            drain_ready(active);
-            return Err(BrowserRecordingError::CapacityExceeded);
-        }
         let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
+            return Err(BrowserRecordingError::StaleReservation);
+        };
+        let ReservationState::Prepared(action) =
+            std::mem::replace(&mut slot.state, ReservationState::Cancelled)
+        else {
             return Err(BrowserRecordingError::StaleReservation);
         };
         slot.state = ReservationState::Ready(action);
@@ -561,7 +596,10 @@ impl BrowserWorkflowRecorder {
             .reservations
             .get_mut(&reservation.sequence)
             .ok_or(BrowserRecordingError::StaleReservation)?;
-        if !matches!(slot.state, ReservationState::Pending) {
+        if !matches!(
+            &slot.state,
+            ReservationState::Pending | ReservationState::Prepared(_)
+        ) {
             return Err(BrowserRecordingError::StaleReservation);
         }
         slot.state = ReservationState::Cancelled;
@@ -584,7 +622,10 @@ impl BrowserWorkflowRecorder {
             .reservations
             .get_mut(&reservation.sequence)
             .ok_or(BrowserRecordingError::StaleReservation)?;
-        if !matches!(slot.state, ReservationState::Pending) {
+        if !matches!(
+            &slot.state,
+            ReservationState::Pending | ReservationState::Prepared(_)
+        ) {
             return Err(BrowserRecordingError::StaleReservation);
         }
         slot.context.risk = risk;
@@ -626,7 +667,10 @@ impl BrowserWorkflowRecorder {
             return Err(BrowserRecordingError::StaleInstance);
         }
         for slot in active.reservations.values_mut() {
-            if matches!(slot.state, ReservationState::Pending) {
+            if matches!(
+                &slot.state,
+                ReservationState::Pending | ReservationState::Prepared(_)
+            ) {
                 slot.state = ReservationState::Cancelled;
             }
         }
@@ -1064,7 +1108,9 @@ fn retained_assertion_count(active: &ActiveRecording) -> usize {
         .sum::<usize>();
     active.reservations.values().fold(recorded, |count, slot| {
         count.saturating_add(match &slot.state {
-            ReservationState::Ready(action) => action.assertions.len(),
+            ReservationState::Prepared(action) | ReservationState::Ready(action) => {
+                action.assertions.len()
+            }
             ReservationState::Pending | ReservationState::Cancelled => 0,
         })
     })
@@ -1101,7 +1147,7 @@ fn projected_generated_input_count(
         Ok(())
     };
     for slot in active.reservations.values() {
-        if let ReservationState::Ready(action) = &slot.state {
+        if let ReservationState::Prepared(action) | ReservationState::Ready(action) = &slot.state {
             project(action)?;
         }
     }
@@ -1137,7 +1183,7 @@ fn drain_ready(active: &mut ActiveRecording) {
             ReservationState::Cancelled => {
                 active.next_to_drain = active.next_to_drain.saturating_add(1);
             }
-            ReservationState::Pending => {
+            ReservationState::Pending | ReservationState::Prepared(_) => {
                 active.reservations.insert(active.next_to_drain, slot);
                 break;
             }

@@ -105,6 +105,7 @@ struct BrowserWorkflowCoordinatorState {
 }
 
 struct PendingAgentRecording {
+    instance: BrowserRecordingInstance,
     reservations: Vec<BrowserRecordingReservation>,
     prepared_actions: Vec<Option<BrowserRecordingAction>>,
 }
@@ -329,6 +330,7 @@ impl BrowserWorkflowCoordinator {
         state.agent_commands.insert(
             key,
             PendingAgentRecording {
+                instance: instance.clone(),
                 prepared_actions: (0..slot_count).map(|_| None).collect(),
                 reservations,
             },
@@ -393,7 +395,7 @@ impl BrowserWorkflowCoordinator {
         };
         let key = (workspace_key.clone(), operation_id.to_string());
         let mut state = self.lock();
-        let Some(mut pending) = state.agent_commands.remove(&key) else {
+        let Some(pending) = state.agent_commands.remove(&key) else {
             return Ok(());
         };
         if pending.reservations.len() != 1 || pending.prepared_actions.len() != 1 {
@@ -415,7 +417,10 @@ impl BrowserWorkflowCoordinator {
             state.agent_commands.insert(key, pending);
             return Err(error);
         }
-        pending.prepared_actions[0] = Some(prepared);
+        if let Err(error) = state.recorder.prepare(&pending.reservations[0], prepared) {
+            state.agent_commands.insert(key, pending);
+            return Err(error);
+        }
         state.agent_commands.insert(key, pending);
         Ok(())
     }
@@ -438,7 +443,7 @@ impl BrowserWorkflowCoordinator {
         }
 
         match command {
-            BrowserCommand::Act { .. } | BrowserCommand::SecretType { .. } => {
+            BrowserCommand::Act { .. } => {
                 let completed = match result {
                     Ok(BrowserResponse::Action { result }) => result.completed_actions,
                     _ => 0,
@@ -464,6 +469,40 @@ impl BrowserWorkflowCoordinator {
                     }
                 }
                 first_error.map_or(Ok(()), Err)
+            }
+            BrowserCommand::SecretType { .. } => {
+                let exact_instance = pending.instance.clone();
+                if pending.reservations.len() != 1 {
+                    cancel_pending_agent(&mut state.recorder, pending);
+                    return Err(BrowserRecordingError::StaleReservation);
+                }
+                let completed = matches!(
+                    result,
+                    Ok(BrowserResponse::Action { result }) if result.completed_actions == 1
+                );
+                let reservation = pending
+                    .reservations
+                    .pop()
+                    .expect("secret reservation count checked");
+                let outcome = if completed {
+                    match state.recorder.commit_prepared(reservation) {
+                        Ok(BrowserRecordingCommit::Recorded | BrowserRecordingCommit::Buffered) => {
+                            Ok(())
+                        }
+                        Ok(BrowserRecordingCommit::Ignored) => {
+                            Err(BrowserRecordingError::StaleReservation)
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    let _ = state.recorder.cancel(reservation);
+                    Err(BrowserRecordingError::InvalidAction)
+                };
+                if let Err(error) = outcome {
+                    invalidate_exact_recording(&mut state, &exact_instance);
+                    return Err(error);
+                }
+                Ok(())
             }
             _ => {
                 let mut action = match prepared_agent_command_action(
@@ -1144,7 +1183,123 @@ fn prepare_wait_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::{BrowserRevision, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot};
+    use crate::browser::{
+        BrowserActionResult, BrowserLocator, BrowserRevision, BrowserWorkspaceMutation,
+        BrowserWorkspaceSnapshot,
+    };
+
+    fn prepared_secret_command() -> BrowserCommand {
+        BrowserCommand::SecretType {
+            tab_id: "tab-a".to_string(),
+            target: BrowserActionTarget {
+                locator: BrowserLocator {
+                    test_id: Some("credential".to_string()),
+                    ..BrowserLocator::default()
+                },
+                ..BrowserActionTarget::default()
+            },
+            input_name: "credential".to_string(),
+        }
+    }
+
+    fn successful_secret_response() -> Result<BrowserResponse, BrowserError> {
+        Ok(BrowserResponse::Action {
+            result: BrowserActionResult {
+                completed_actions: 1,
+                revision: BrowserRevision(12),
+            },
+        })
+    }
+
+    #[test]
+    fn post_success_secret_commit_failure_invalidates_only_its_exact_recording() {
+        let workspace = BrowserWorkspaceKey {
+            project_id: "project-secret-commit-failure".to_string(),
+            ai_tab_id: "conversation-secret-commit-failure".to_string(),
+        };
+        let command = prepared_secret_command();
+
+        let coordinator = BrowserWorkflowCoordinator::default();
+        coordinator
+            .start(workspace.clone())
+            .expect("start exact recording");
+        coordinator
+            .reserve_agent_command(&workspace, "secret", &command, BrowserRisk::Normal)
+            .expect("reserve secret");
+        coordinator
+            .inspect_agent_secret_type(
+                &workspace,
+                "secret",
+                &command,
+                &BrowserRuntimeTarget::default(),
+                BrowserRisk::AccountSecurity,
+            )
+            .expect("prepare secret");
+        {
+            let mut state = coordinator.lock();
+            let key = (workspace.clone(), "secret".to_string());
+            let reservation = state.agent_commands[&key].reservations[0].clone();
+            state
+                .recorder
+                .cancel(reservation)
+                .expect("induce stale prepared reservation");
+        }
+        assert_eq!(
+            coordinator.complete_agent_command(
+                &workspace,
+                "secret",
+                &command,
+                &successful_secret_response(),
+            ),
+            Err(BrowserRecordingError::StaleReservation),
+        );
+        assert_eq!(
+            coordinator.status(&workspace),
+            BrowserRecordingStatus::Inactive
+        );
+
+        let replacement_coordinator = BrowserWorkflowCoordinator::default();
+        let retired = replacement_coordinator
+            .start(workspace.clone())
+            .expect("start retired recording");
+        replacement_coordinator
+            .reserve_agent_command(&workspace, "retired", &command, BrowserRisk::Normal)
+            .expect("reserve retired secret");
+        replacement_coordinator
+            .inspect_agent_secret_type(
+                &workspace,
+                "retired",
+                &command,
+                &BrowserRuntimeTarget::default(),
+                BrowserRisk::AccountSecurity,
+            )
+            .expect("prepare retired secret");
+        let replacement = {
+            let mut state = replacement_coordinator.lock();
+            state.recorder.stop(&retired).expect("stop retired");
+            state.recorder.discard(&retired).expect("discard retired");
+            state
+                .recorder
+                .start(workspace.clone())
+                .expect("start replacement")
+        };
+        assert_eq!(
+            replacement_coordinator.complete_agent_command(
+                &workspace,
+                "retired",
+                &command,
+                &successful_secret_response(),
+            ),
+            Err(BrowserRecordingError::StaleReservation),
+        );
+        assert_eq!(
+            replacement_coordinator
+                .active_instance(&workspace)
+                .expect("replacement stays active")
+                .id(),
+            replacement.id(),
+        );
+    }
 
     #[test]
     fn post_success_commit_failure_invalidates_the_exact_user_chrome_recording() {

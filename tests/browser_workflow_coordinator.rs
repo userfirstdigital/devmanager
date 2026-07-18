@@ -1,9 +1,9 @@
 use devmanager::browser::{
     BrowserAction, BrowserActionTarget, BrowserCommand, BrowserError, BrowserRecipeAction,
-    BrowserRecipeInputKind, BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingCommit,
-    BrowserRecordingStatus, BrowserRisk, BrowserRuntimeTarget, BrowserTabSnapshot, BrowserViewport,
-    BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceMutation,
-    BrowserWorkspaceSnapshot,
+    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecordingAction, BrowserRecordingActor,
+    BrowserRecordingCommit, BrowserRecordingStatus, BrowserRisk, BrowserRuntimeTarget,
+    BrowserTabSnapshot, BrowserViewport, BrowserWorkflowCoordinator, BrowserWorkspaceKey,
+    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot, MAX_BROWSER_RECORDING_INPUTS,
 };
 use std::path::PathBuf;
 
@@ -890,6 +890,136 @@ fn secret_type_recording_reserves_inspects_and_commits_only_named_unset_secret_r
     ));
     let json = serde_json::to_string(review.recipe()).expect("serialize safe recording");
     assert!(!json.contains("sentinel"));
+}
+
+#[test]
+fn secret_recording_input_collision_is_rejected_during_inspection_before_exposure() {
+    let coordinator = BrowserWorkflowCoordinator::with_capacity(4);
+    let workspace = workspace();
+    let instance = coordinator
+        .start(workspace.clone())
+        .expect("start recording");
+    let upload = coordinator
+        .reserve_on(
+            &instance,
+            BrowserRecordingActor::User,
+            "tab-a",
+            BrowserRisk::Normal,
+        )
+        .expect("reserve upload");
+    coordinator
+        .commit(
+            upload,
+            BrowserRecordingAction::upload(BrowserRecipeLocator {
+                test_id: Some("file".to_string()),
+                ..BrowserRecipeLocator::default()
+            })
+            .expect("prepare upload"),
+        )
+        .expect("commit generated file input");
+
+    let command = BrowserCommand::SecretType {
+        tab_id: "tab-a".to_string(),
+        target: BrowserActionTarget {
+            locator: devmanager::browser::BrowserLocator {
+                test_id: Some("credential".to_string()),
+                ..devmanager::browser::BrowserLocator::default()
+            },
+            ..BrowserActionTarget::default()
+        },
+        input_name: "file".to_string(),
+    };
+    coordinator
+        .reserve_agent_command(&workspace, "collision", &command, BrowserRisk::Normal)
+        .expect("reserve before target inspection");
+    assert!(matches!(
+        coordinator.inspect_agent_secret_type(
+            &workspace,
+            "collision",
+            &command,
+            &BrowserRuntimeTarget::default(),
+            BrowserRisk::AccountSecurity,
+        ),
+        Err(devmanager::browser::BrowserRecordingError::InvalidAction)
+    ));
+    coordinator
+        .complete_agent_command(
+            &workspace,
+            "collision",
+            &command,
+            &Err(BrowserError::Interrupted),
+        )
+        .expect("cancel the unexposed reservation");
+
+    let review = coordinator.stop(&instance).expect("stop recording");
+    assert_eq!(review.recipe().steps.len(), 1);
+    assert_eq!(review.recipe().inputs[0].kind, BrowserRecipeInputKind::File);
+}
+
+#[test]
+fn secret_recording_input_capacity_is_rejected_during_inspection_before_exposure() {
+    let coordinator = BrowserWorkflowCoordinator::with_capacity(MAX_BROWSER_RECORDING_INPUTS + 2);
+    let workspace = workspace();
+    let instance = coordinator
+        .start(workspace.clone())
+        .expect("start recording");
+    for index in 0..MAX_BROWSER_RECORDING_INPUTS {
+        let reservation = coordinator
+            .reserve_on(
+                &instance,
+                BrowserRecordingActor::User,
+                "tab-a",
+                BrowserRisk::Normal,
+            )
+            .expect("reserve generated upload input");
+        coordinator
+            .commit(
+                reservation,
+                BrowserRecordingAction::upload(BrowserRecipeLocator {
+                    test_id: Some(format!("file-{index}")),
+                    ..BrowserRecipeLocator::default()
+                })
+                .expect("prepare generated upload input"),
+            )
+            .expect("commit generated upload input");
+    }
+
+    let command = BrowserCommand::SecretType {
+        tab_id: "tab-a".to_string(),
+        target: BrowserActionTarget {
+            locator: devmanager::browser::BrowserLocator {
+                test_id: Some("credential".to_string()),
+                ..devmanager::browser::BrowserLocator::default()
+            },
+            ..BrowserActionTarget::default()
+        },
+        input_name: "overflow_secret".to_string(),
+    };
+    coordinator
+        .reserve_agent_command(&workspace, "capacity", &command, BrowserRisk::Normal)
+        .expect("step capacity still has room before input preflight");
+    assert!(matches!(
+        coordinator.inspect_agent_secret_type(
+            &workspace,
+            "capacity",
+            &command,
+            &BrowserRuntimeTarget::default(),
+            BrowserRisk::AccountSecurity,
+        ),
+        Err(devmanager::browser::BrowserRecordingError::CapacityExceeded)
+    ));
+    coordinator
+        .complete_agent_command(
+            &workspace,
+            "capacity",
+            &command,
+            &Err(BrowserError::Interrupted),
+        )
+        .expect("cancel the unexposed capacity reservation");
+
+    let review = coordinator.stop(&instance).expect("stop recording");
+    assert_eq!(review.recipe().inputs.len(), MAX_BROWSER_RECORDING_INPUTS);
+    assert_eq!(review.recipe().steps.len(), MAX_BROWSER_RECORDING_INPUTS);
 }
 
 #[test]

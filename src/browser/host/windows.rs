@@ -47,7 +47,9 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Instant;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
@@ -73,6 +75,33 @@ struct BrowserViewKey {
     tab_id: String,
 }
 
+#[derive(Default)]
+struct BrowserDocumentSecretState {
+    tainted: AtomicBool,
+    new_document_loading: AtomicBool,
+}
+
+impl BrowserDocumentSecretState {
+    fn mark_tainted(&self) {
+        self.new_document_loading.store(false, Ordering::Release);
+        self.tainted.store(true, Ordering::Release);
+    }
+
+    fn is_tainted(&self) -> bool {
+        self.tainted.load(Ordering::Acquire)
+    }
+
+    fn page_load_started(&self) {
+        self.new_document_loading.store(true, Ordering::Release);
+    }
+
+    fn page_load_finished(&self) {
+        if self.new_document_loading.swap(false, Ordering::AcqRel) {
+            self.tainted.store(false, Ordering::Release);
+        }
+    }
+}
+
 const WORKSPACE_OPERATION_TAB: &str = "__workspace__";
 const INLINE_RESULT_LIMIT: usize = 8 * 1024;
 const MAX_BROWSER_PAGE_RECORDING_QUEUE: usize = 256;
@@ -88,7 +117,9 @@ enum BrowserAsyncPhase {
     InspectActions {
         actions: Vec<BrowserAction>,
     },
-    InspectSecretType,
+    InspectSecretType {
+        ticket: String,
+    },
     Act {
         mutating: bool,
     },
@@ -170,6 +201,7 @@ pub struct BrowserWebViewHost {
     state: BrowserHostState,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
+    document_secret_states: HashMap<BrowserViewKey, Arc<BrowserDocumentSecretState>>,
     bounds: BrowserBounds,
     event_sender: Sender<BrowserHostEvent>,
     event_receiver: Receiver<BrowserHostEvent>,
@@ -255,6 +287,7 @@ impl BrowserWebViewHost {
             trusted_app_config_dir,
             projects: HashMap::new(),
             views: HashMap::new(),
+            document_secret_states: HashMap::new(),
             bounds: BrowserBounds {
                 x: 0,
                 y: 0,
@@ -764,17 +797,21 @@ impl BrowserWebViewHost {
                 request.command(),
                 &result,
             ) {
-                let tab_id = request
-                    .command()
-                    .tab_id()
-                    .map(ToOwned::to_owned)
-                    .or_else(|| self.selected_tab_id(&workspace_key))
-                    .unwrap_or_else(|| WORKSPACE_OPERATION_TAB.to_string());
-                self.emit_diagnostic(
-                    &workspace_key,
-                    &tab_id,
-                    format!("browser workflow capture could not finalize: {error}"),
-                );
+                if matches!(request.command(), BrowserCommand::SecretType { .. }) {
+                    result = Err(map_agent_recording_error(error));
+                } else {
+                    let tab_id = request
+                        .command()
+                        .tab_id()
+                        .map(ToOwned::to_owned)
+                        .or_else(|| self.selected_tab_id(&workspace_key))
+                        .unwrap_or_else(|| WORKSPACE_OPERATION_TAB.to_string());
+                    self.emit_diagnostic(
+                        &workspace_key,
+                        &tab_id,
+                        format!("browser workflow capture could not finalize: {error}"),
+                    );
+                }
             }
         }
         if matches!(&result, Ok(BrowserResponse::Workspace { .. })) {
@@ -1054,6 +1091,19 @@ impl BrowserWebViewHost {
         if let Err(error) = self.ensure_existing_tab_view(window, workspace_key, tab_id) {
             return BrowserStartResult::Complete(Err(error));
         }
+        if matches!(
+            command,
+            BrowserCommand::Snapshot { .. }
+                | BrowserCommand::Screenshot { .. }
+                | BrowserCommand::Console { .. }
+                | BrowserCommand::Network { .. }
+                | BrowserCommand::Performance { .. }
+                | BrowserCommand::Cdp { .. }
+        ) {
+            if let Err(error) = self.ensure_document_content_available(workspace_key, tab_id) {
+                return BrowserStartResult::Complete(Err(error));
+            }
+        }
         let operation_id = request.context().operation_id.clone();
         let command_risk = match command {
             BrowserCommand::Downloads {
@@ -1097,13 +1147,21 @@ impl BrowserWebViewHost {
                         }))
                     }
                 };
+                let ticket = match random_secret_target_ticket() {
+                    Ok(ticket) => ticket,
+                    Err(error) => return BrowserStartResult::Complete(Err(error)),
+                };
+                let ticket_json =
+                    serde_json::to_string(&ticket).expect("secret target ticket is serializable");
                 start_result(
                     self.start_script(
                         target,
                         &operation_id,
-                        &format!("window.__devmanagerBrowser.inspectSecretTarget({encoded})"),
+                        &format!(
+                            "window.__devmanagerBrowser.inspectSecretTarget({encoded}, {ticket_json})"
+                        ),
                     ),
-                    BrowserAsyncPhase::InspectSecretType,
+                    BrowserAsyncPhase::InspectSecretType { ticket },
                 )
             }
             BrowserCommand::Snapshot { .. } => start_result(
@@ -1530,6 +1588,7 @@ impl BrowserWebViewHost {
         candidate: BrowserAnnotationCandidate,
     ) -> Result<(), BrowserError> {
         let route = BrowserAnnotationRoute::new(workspace_key.clone(), tab_id)?;
+        self.ensure_document_content_available(workspace_key, tab_id)?;
         let accepted = self
             .accepted_annotation_candidates
             .remove(&route)
@@ -1605,6 +1664,17 @@ impl BrowserWebViewHost {
             .annotation_captures
             .remove(&completion.route)
             .expect("capture was checked above");
+        if let Err(error) = self.ensure_document_content_available(
+            &completion.route.workspace_key,
+            &completion.route.tab_id,
+        ) {
+            self.emit_diagnostic(
+                &completion.route.workspace_key,
+                &completion.route.tab_id,
+                error.to_string(),
+            );
+            return;
+        }
         let result = completion
             .result
             .map_err(|_| BrowserError::CrashedView {
@@ -1710,6 +1780,29 @@ impl BrowserWebViewHost {
                 return;
             }
         };
+        if matches!(
+            &active.phase,
+            BrowserAsyncPhase::Snapshot
+                | BrowserAsyncPhase::Screenshot
+                | BrowserAsyncPhase::Console
+                | BrowserAsyncPhase::Network
+                | BrowserAsyncPhase::Performance
+                | BrowserAsyncPhase::Cdp
+        ) {
+            if let Err(error) = self.ensure_document_content_available(
+                active.request.workspace_key(),
+                &completion.target.tab_id,
+            ) {
+                self.finish_queued_request(
+                    window,
+                    completion.target,
+                    operation_id,
+                    active.request,
+                    Err(error),
+                );
+                return;
+            }
+        }
         let phase = std::mem::replace(&mut active.phase, BrowserAsyncPhase::Cdp);
         let result = match phase {
             BrowserAsyncPhase::Snapshot => self.complete_snapshot(&active.request, &raw),
@@ -1791,7 +1884,7 @@ impl BrowserWebViewHost {
                 self.continue_actions(window, completion.target, operation_id, active, actions);
                 return;
             }
-            BrowserAsyncPhase::InspectSecretType => {
+            BrowserAsyncPhase::InspectSecretType { ticket } => {
                 let value = match script_value(&raw) {
                     Ok(value) => value,
                     Err(error) => {
@@ -1872,7 +1965,7 @@ impl BrowserWebViewHost {
                     self.active_requests.insert(completion.target, active);
                     return;
                 }
-                self.continue_secret_type(window, completion.target, operation_id, active);
+                self.continue_secret_type(window, completion.target, operation_id, active, ticket);
                 return;
             }
             BrowserAsyncPhase::Approval { .. } => return,
@@ -2130,6 +2223,7 @@ impl BrowserWebViewHost {
         target: BrowserOperationTarget,
         operation_id: String,
         mut active: ActiveBrowserRequest,
+        ticket: String,
     ) {
         if !active.request.cancellation_is_current() {
             self.finish_queued_request(
@@ -2146,7 +2240,8 @@ impl BrowserWebViewHost {
             return;
         }
         active.phase = BrowserAsyncPhase::SecretType;
-        if let Err(error) = self.start_secret_type(&target, &operation_id, &active.request) {
+        if let Err(error) = self.start_secret_type(&target, &operation_id, &active.request, &ticket)
+        {
             self.finish_queued_request(window, target, operation_id, active.request, Err(error));
         } else {
             self.active_requests.insert(target, active);
@@ -2154,10 +2249,11 @@ impl BrowserWebViewHost {
     }
 
     fn start_secret_type(
-        &self,
+        &mut self,
         target: &BrowserOperationTarget,
         operation_id: &str,
         request: &BrowserCommandRequest,
+        ticket: &str,
     ) -> Result<(), BrowserError> {
         if !request.cancellation_is_current() {
             return Err(BrowserError::Interrupted);
@@ -2172,7 +2268,13 @@ impl BrowserWebViewHost {
             });
         };
         self.validate_action_target_reference(request.workspace_key(), action_target)?;
-        let view = self.view(&target.workspace_key, &target.tab_id)?;
+        let document_secret_state = self
+            .document_secret_states
+            .get(&view_key(&target.workspace_key, &target.tab_id))
+            .cloned()
+            .ok_or_else(|| BrowserError::CrashedView {
+                message: "browser secret containment state is unavailable".to_string(),
+            })?;
         if !request.cancellation_is_current() {
             return Err(BrowserError::Interrupted);
         }
@@ -2186,18 +2288,13 @@ impl BrowserWebViewHost {
         let sender = self.async_sender.clone();
         let callback_target = target.clone();
         let callback_operation_id = operation_id.to_string();
-        lease
+        let accepted = lease
             .with_exposed(|value| {
                 if !request.cancellation_is_current() {
                     return Err(BrowserError::Interrupted);
                 }
-                let mut target_json: Zeroizing<String> = Zeroizing::new(
-                    serde_json::to_string(action_target).map_err(|_| {
-                        BrowserError::CrashedView {
-                            message: "could not encode browser secret target".to_string(),
-                        }
-                    })?,
-                );
+                let ticket_json =
+                    serde_json::to_string(ticket).expect("secret target ticket is serializable");
                 let mut value_json: Zeroizing<String> =
                     Zeroizing::new(serde_json::to_string(value).map_err(|_| {
                         BrowserError::CrashedView {
@@ -2211,13 +2308,16 @@ impl BrowserWebViewHost {
                         return {{ ok: true, value }};
                       }} catch (error) {{
                         const candidate = String(error && error.message || "automation_failed");
-                        return {{ ok: false, error: candidate === "element_not_found" ? candidate : "automation_failed" }};
+                        const known = ["element_not_found", "target_changed"];
+                        return {{ ok: false, error: known.includes(candidate) ? candidate : "automation_failed" }};
                       }}
                     }})()"#,
-                    target_json.as_str(),
+                    ticket_json,
                     value_json.as_str(),
                 ));
-                let accepted = view.evaluate_script_with_callback(&script, move |result| {
+                let accepted = self
+                    .view(&target.workspace_key, &target.tab_id)?
+                    .evaluate_script_with_callback(&script, move |result| {
                     let _ = sender.send(BrowserAsyncCompletion {
                         target: callback_target.clone(),
                         operation_id: callback_operation_id.clone(),
@@ -2226,12 +2326,15 @@ impl BrowserWebViewHost {
                 });
                 script.zeroize();
                 value_json.zeroize();
-                target_json.zeroize();
                 accepted.map_err(view_failure)
             })
             .map_err(|_| BrowserError::InvalidInvocation {
                 field: "secretSidecar".to_string(),
-            })?
+            })?;
+        accepted?;
+        document_secret_state.mark_tainted();
+        self.mark_secret_document_tainted(&target.workspace_key, &target.tab_id);
+        Ok(())
     }
 
     fn complete_snapshot(
@@ -3190,6 +3293,14 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         tab_id: &str,
     ) -> Result<(), BrowserPageRecordingIpcError> {
+        if self
+            .document_secret_states
+            .get(&view_key(workspace_key, tab_id))
+            .is_some_and(|state| state.is_tainted())
+        {
+            let _ = self.remove_page_recording_view(workspace_key, tab_id);
+            return Ok(());
+        }
         let instance = self
             .workflow_coordinator
             .active_instance(workspace_key)
@@ -3405,6 +3516,7 @@ impl BrowserWebViewHost {
                     self.cancel_annotation_route(&route);
                     return Ok(BrowserResponse::Acknowledged);
                 }
+                self.ensure_document_content_available(workspace_key, &tab_id)?;
                 self.cancel_workspace_annotations(workspace_key);
                 let snapshot = self
                     .state
@@ -3435,6 +3547,7 @@ impl BrowserWebViewHost {
                 Ok(BrowserResponse::Acknowledged)
             }
             BrowserCommand::CaptureAnnotation { tab_id, candidate } => {
+                self.ensure_document_content_available(workspace_key, &tab_id)?;
                 self.begin_annotation_capture(window, workspace_key, &tab_id, candidate)?;
                 Ok(BrowserResponse::Acknowledged)
             }
@@ -3629,6 +3742,7 @@ impl BrowserWebViewHost {
                 let key = view_key(workspace_key, &tab_id);
                 self.views.remove(&key);
                 self.recording_ingresses.remove(&key);
+                self.document_secret_states.remove(&key);
                 let mutation = self.state.close_tab(workspace_key, &tab_id)?;
                 self.ensure_selected_view(window, workspace_key)?;
                 self.apply_visibility_plan()?;
@@ -3694,6 +3808,7 @@ impl BrowserWebViewHost {
             }
             BrowserCommand::OpenDevTools { tab_id } => {
                 self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                self.ensure_document_content_available(workspace_key, &tab_id)?;
                 self.view(workspace_key, &tab_id)?.open_devtools();
                 Ok(BrowserResponse::Acknowledged)
             }
@@ -3718,6 +3833,8 @@ impl BrowserWebViewHost {
                 self.views
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.recording_ingresses
+                    .retain(|key, _| key.workspace_key != *workspace_key);
+                self.document_secret_states
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.state.reset_workspace(workspace_key);
                 self.apply_visibility_plan()?;
@@ -3841,6 +3958,7 @@ impl BrowserWebViewHost {
         let recording_ingress = self
             .recording_transport
             .ingress(workspace_key.clone(), tab_id.to_string());
+        let document_secret_state = Arc::new(BrowserDocumentSecretState::default());
         let callback_workspace = workspace_key.clone();
         let callback_tab = tab_id.to_string();
         let bounds = wry_bounds(self.bounds);
@@ -3855,6 +3973,7 @@ impl BrowserWebViewHost {
                 &mut project.context,
                 sender,
                 recording_ingress.clone(),
+                document_secret_state.clone(),
                 callback_workspace,
                 callback_tab,
                 trusted_app_config_dir,
@@ -3889,6 +4008,8 @@ impl BrowserWebViewHost {
             .map_err(view_failure)?;
         self.recording_ingresses
             .insert(key.clone(), recording_ingress);
+        self.document_secret_states
+            .insert(key.clone(), document_secret_state);
         self.views.insert(key, webview);
         if self
             .workflow_coordinator
@@ -3924,6 +4045,32 @@ impl BrowserWebViewHost {
         self.views
             .get(&view_key(workspace_key, tab_id))
             .ok_or_else(|| missing_tab(tab_id))
+    }
+
+    fn ensure_document_content_available(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+    ) -> Result<(), BrowserError> {
+        if self
+            .document_secret_states
+            .get(&view_key(workspace_key, tab_id))
+            .is_some_and(|state| state.is_tainted())
+        {
+            return Err(secret_tainted_document_content());
+        }
+        Ok(())
+    }
+
+    fn mark_secret_document_tainted(&mut self, workspace_key: &BrowserWorkspaceKey, tab_id: &str) {
+        let key = view_key(workspace_key, tab_id);
+        if let Some(state) = self.document_secret_states.get(&key) {
+            state.mark_tainted();
+        }
+        if let Ok(route) = BrowserAnnotationRoute::new(workspace_key.clone(), tab_id) {
+            self.cancel_annotation_route(&route);
+        }
+        let _ = self.remove_page_recording_view(workspace_key, tab_id);
     }
 
     fn selected_tab_id(&self, workspace_key: &BrowserWorkspaceKey) -> Option<String> {
@@ -3987,6 +4134,8 @@ impl BrowserWebViewHost {
         self.views
             .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
         self.recording_ingresses
+            .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
+        self.document_secret_states
             .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
         self.projects.remove(&workspace_key.project_id);
         self.state
@@ -4058,6 +4207,20 @@ fn random_page_recording_nonce() -> Result<String, BrowserPageRecordingIpcError>
         let _ = write!(nonce, "{byte:02x}");
     }
     Ok(nonce)
+}
+
+fn random_secret_target_ticket() -> Result<String, BrowserError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| BrowserError::CrashedView {
+        message: "could not generate browser secret target ticket".to_string(),
+    })?;
+    let mut ticket = String::with_capacity(39);
+    ticket.push_str("secret-");
+    use std::fmt::Write as _;
+    for byte in bytes {
+        let _ = write!(ticket, "{byte:02x}");
+    }
+    Ok(ticket)
 }
 
 fn attach_permission_handler(
@@ -4139,6 +4302,7 @@ fn configured_builder<'a>(
     context: &'a mut WebContext,
     event_sender: Sender<BrowserHostEvent>,
     recording_ingress: BrowserPageRecordingIngress,
+    document_secret_state: Arc<BrowserDocumentSecretState>,
     workspace_key: BrowserWorkspaceKey,
     tab_id: String,
     trusted_app_config_dir: PathBuf,
@@ -4155,9 +4319,11 @@ fn configured_builder<'a>(
     let load_sender = event_sender.clone();
     let load_workspace = workspace_key.clone();
     let load_tab = tab_id.clone();
+    let load_document_secret_state = document_secret_state.clone();
     let ipc_sender = event_sender.clone();
     let ipc_failure_sender = event_sender.clone();
     let ipc_recording_ingress = recording_ingress;
+    let ipc_document_secret_state = document_secret_state;
     let ipc_workspace = workspace_key.clone();
     let ipc_tab = tab_id.clone();
     let window_sender = event_sender.clone();
@@ -4205,8 +4371,14 @@ fn configured_builder<'a>(
         })
         .with_on_page_load_handler(move |state, url| {
             let state = match state {
-                PageLoadEvent::Started => BrowserPageLoadState::Started,
-                PageLoadEvent::Finished => BrowserPageLoadState::Finished,
+                PageLoadEvent::Started => {
+                    load_document_secret_state.page_load_started();
+                    BrowserPageLoadState::Started
+                }
+                PageLoadEvent::Finished => {
+                    load_document_secret_state.page_load_finished();
+                    BrowserPageLoadState::Finished
+                }
             };
             let _ = load_sender.send(BrowserHostEvent::PageLoad {
                 workspace_key: load_workspace.clone(),
@@ -4217,6 +4389,32 @@ fn configured_builder<'a>(
         })
         .with_ipc_handler(move |request| {
             let body = request.body();
+            if ipc_document_secret_state.is_tainted() {
+                let event = match parse_browser_page_ipc_message(body) {
+                    Ok(BrowserPageIpcMessage::UserInput { kind }) => {
+                        Some(BrowserHostEvent::UserInput {
+                            workspace_key: ipc_workspace.clone(),
+                            tab_id: ipc_tab.clone(),
+                            kind,
+                        })
+                    }
+                    Ok(BrowserPageIpcMessage::DomMutation) => Some(BrowserHostEvent::DomMutation {
+                        workspace_key: ipc_workspace.clone(),
+                        tab_id: ipc_tab.clone(),
+                    }),
+                    Ok(BrowserPageIpcMessage::AnnotationCanceled) => {
+                        Some(BrowserHostEvent::AnnotationCanceled {
+                            workspace_key: ipc_workspace.clone(),
+                            tab_id: ipc_tab.clone(),
+                        })
+                    }
+                    Ok(BrowserPageIpcMessage::AnnotationCandidate { .. }) | Err(_) => None,
+                };
+                if let Some(event) = event {
+                    let _ = ipc_sender.send(event);
+                }
+                return;
+            }
             if BrowserPageRecordingEnvelope::parse(body).is_ok() {
                 let observed_origin = request
                     .uri()
@@ -4548,6 +4746,12 @@ fn missing_tab(tab_id: &str) -> BrowserError {
     }
 }
 
+fn secret_tainted_document_content() -> BrowserError {
+    BrowserError::BlockedPermission {
+        permission: "secret-tainted document content".to_string(),
+    }
+}
+
 fn view_failure(error: impl std::fmt::Display) -> BrowserError {
     BrowserError::CrashedView {
         message: error.to_string(),
@@ -4561,5 +4765,45 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         message.clone()
     } else {
         "unknown panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod secret_document_state_tests {
+    use super::BrowserDocumentSecretState;
+
+    #[test]
+    fn taint_clears_only_after_a_later_confirmed_new_document_boundary() {
+        let state = BrowserDocumentSecretState::default();
+        state.mark_tainted();
+
+        state.page_load_finished();
+        assert!(
+            state.is_tainted(),
+            "same-document Finished cannot clear taint"
+        );
+
+        state.page_load_started();
+        assert!(
+            state.is_tainted(),
+            "Started retains old-document protection"
+        );
+        state.mark_tainted();
+        state.page_load_finished();
+        assert!(
+            state.is_tainted(),
+            "typing after ContentLoading belongs to that document and invalidates the pending clear"
+        );
+
+        state.page_load_started();
+        assert!(
+            state.is_tainted(),
+            "a failed or unfinished navigation stays tainted"
+        );
+        state.page_load_finished();
+        assert!(
+            !state.is_tainted(),
+            "the later confirmed document clears taint"
+        );
     }
 }
