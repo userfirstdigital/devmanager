@@ -2045,6 +2045,10 @@ pub fn run_hook_relay_subcommand<R: Read>(args: &[String], reader: R) -> Option<
 }
 
 pub fn is_valid_loopback_relay_url(endpoint: &str) -> bool {
+    is_valid_loopback_relay_url_for(endpoint, "/internal/claude-hook")
+}
+
+pub fn is_valid_loopback_relay_url_for(endpoint: &str, expected_path: &str) -> bool {
     // `http::Uri` intentionally discards a URI fragment because fragments are
     // not part of an HTTP request target. Reject it before parsing so the
     // accepted relay spelling remains exact and unambiguous.
@@ -2069,7 +2073,7 @@ pub fn is_valid_loopback_relay_url(endpoint: &str) -> bool {
     let Some(path_and_query) = uri.path_and_query() else {
         return false;
     };
-    path_and_query.path() == "/internal/claude-hook" && path_and_query.query().is_none()
+    path_and_query.path() == expected_path && path_and_query.query().is_none()
 }
 
 const CLAUDE_HOOK_EVENTS: &[&str] = &[

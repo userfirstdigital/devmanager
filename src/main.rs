@@ -10,6 +10,11 @@ fn main() -> std::process::ExitCode {
     {
         return exit_code;
     }
+    if let Some(exit_code) =
+        devmanager::ai::codex_hooks::run_codex_hook_relay_subcommand(&args, std::io::stdin().lock())
+    {
+        return exit_code;
+    }
     devmanager::app::run();
     std::process::ExitCode::SUCCESS
 }
