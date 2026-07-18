@@ -14,7 +14,7 @@
 - No `browser_workflow` MCP schema, provider lifecycle bridge, or whole-PC work.
 - No selector, page text, path, input value, secret, or arbitrary callback message in repair projections/errors/journals.
 - One active repair per active replay; exact opaque instance fencing on every read or mutation.
-- Evidence is owner-scoped and retained atomically by one exact repair lease; a process-global per-canonical-root runtime prevents cleanup races and reconciles crash-stale repair pins.
+- Evidence is owner-scoped and retained atomically by one exact runtime lease; on-disk metadata stays unpinned so a crash cannot strand retention.
 - Cancellation and apply share one coordinator linearization gate: cancellation wins before any write, or apply commits file+override+`applied` state coherently before cancellation proceeds.
 - Resume is phase-aware and must not repeat a successful mutating action after a later wait or assertion failure.
 - Every task starts with a focused failing test and ends in a coherent commit.
@@ -30,6 +30,7 @@
 - Modify: `src/browser/model.rs`
 - Modify: `src/browser/host/initialization.rs`
 - Modify: `src/browser/host/windows.rs`
+- Modify: `src/browser/host/unsupported.rs`
 - Modify: `src/browser/mcp.rs`
 - Modify: `tests/browser_host.rs`
 
@@ -44,16 +45,18 @@
 **Files:**
 
 - Create: `src/browser/replay_repair.rs`
+- Modify: `src/browser/model.rs`
 - Modify: `src/browser/replay.rs`
 - Modify: `src/browser/commands.rs`
 - Modify: `src/browser/resources.rs`
 - Modify: `src/browser/host/windows.rs`
+- Modify: `src/browser/host/unsupported.rs`
 - Modify: `src/browser/mod.rs`
 - Create: `tests/browser_replay_repair.rs`
 - Modify: `tests/browser_replay.rs`
 
 1. Write failing trait/identity/state tests for `BrowserReplayLocatorSlot`, opaque `BrowserReplayRepairInstance`, safe projection phases, one repair per replay, stale/cross-workspace/cross-coordinator calls, checked IDs, and terminal immutability.
-2. Write failing real-store tests for a shared process-global canonical-root gate/runtime, exact lease/owner/kind validation, write+retain before cleanup, second-capture rollback, release retry, retention while paused, unpin on cancel/replace/terminal/drop, and next-process reconciliation of stale dedicated repair pins.
+2. Write failing real-store tests for a shared process-global canonical-root gate/runtime, Windows OS-backed root exclusivity across a child process, same-process runtime reuse, terminal-safe unavailable fallback on contention, exact lease/owner/kind validation, write+retain before cleanup with unpinned disk metadata/effectively pinned handles, second-capture rollback, bounded cleanup retry, retention while paused, release on cancel/replace/terminal/drop, and crash simulation proving no persistent repair pin remains.
 3. Add a private repair-retention sidecar to controller envelopes. Only exact Agent replay snapshot/screenshot captures may use it, and the Windows host must store them as dedicated repair kinds through `put_repair_retained`; ordinary MCP captures cannot mint or retain repair evidence.
 4. Add one private repair state to `ActiveBrowserReplay`, one non-clone evidence retention lease, one private override map, one phase-aware resume cursor, and a value-free Tokio watch generation shared with the execution handle. Remove the unrestricted placeholder resume transition; only a confirmed apply may resume.
 5. Keep repair values, leases, and sidecars non-Debug/non-serde; projection contains only IDs, slot, revision, phase, tab ID, and handles.
@@ -70,7 +73,7 @@
 1. Write failing fake-controller tests where an action returns each typed missing-target kind and where eligible element waits/assertions reach page-condition timeout.
 2. Require this exact sequence after failure: create exact retention lease, semantic snapshot retained before cleanup, validate, viewport screenshot retained before cleanup, validate, exact coordinator pause. No later recipe command may be issued while paused.
 3. Implement locator-slot mapping and resume cursors for primary/optional/source/destination/action-wait/step-wait/assertion. Preserve absent/hidden semantics that intentionally succeed without an element.
-4. Keep `execute_browser_replay` alive on the watch receiver. Prove cancel, replace, and workspace interruption wake it, return the retained terminal projection, close secrets, ignore late responses, and release evidence. Prove a nested-wait or assertion repair resumes without replaying the already successful action. Capture/retention failure remains `StepFailed` with whole-lease rollback.
+4. Keep `execute_browser_replay` alive on the watch receiver created at replay start. Check state before every wait and after wake/drop; prove early signals, sender drop, cancel, replace, and workspace interruption return the retained terminal projection, close secrets, ignore late responses, and release evidence. Prove a nested-wait or assertion repair resumes without replaying the already successful action. Capture/retention failure remains `StepFailed` with whole-lease rollback.
 5. Run replay executor, repair, secret, host, coordinator, and resource suites; commit `feat(browser): pause replay with locator evidence`.
 
 ### Task 4: Checkpoint-10 evidence and independent review
@@ -118,8 +121,8 @@
 - Modify: `tests/browser_recipes.rs`
 - Modify: `tests/browser_replay_repair.rs`
 
-1. Write failing tests for canonical recipe digest, exact step index+ID+slot+old-locator comparison, every locator slot, changed recipe, invalid candidate, exact-once replay binding to the authenticated canonical root, reparse boundaries, concurrent apply, injected replacement failure, and temp cleanup.
-2. Store the validated canonical digest privately in the replay plan and bind the authenticated canonical root exactly once in the execution handle before the first command. Add locator-at/replace-at helpers and reuse the existing global `RECIPE_WRITE_GATE`; do not add an independent repair gate.
+1. Write failing tests for the named schema-v1 compact-JSON SHA-256 digest, exact step index+ID+slot+old-locator comparison, every locator slot, optional `Some` versus targetless `None`, changed recipe, invalid candidate, exact-once replay binding to the authenticated canonical root, reparse boundaries, cooperating concurrent apply/save, documented external-writer boundary behavior, injected replacement failure, and temp cleanup.
+2. Store the validated canonical digest privately in the replay plan and bind the authenticated canonical root exactly once in the execution handle before the first command. Add locator-at/replace-at helpers and reuse the existing global `RECIPE_WRITE_GATE`; do not add an independent repair gate or claim OS-wide CAS against non-cooperating editors.
 3. Reload and compare, clone and replace only the exact locator, validate the full v1 recipe, recompare at the final boundary, and use the existing atomic sibling replacement. Preserve the old complete file on every failure.
 4. Run recipe/repair tests; commit `feat(browser): atomically save locator repairs`.
 
@@ -138,7 +141,7 @@
 - Modify: `tests/browser_replay_repair.rs`
 
 1. Write failing tests requiring preview plus explicit confirmation, a `Destructive` Agent approval floor, higher-risk preservation, denial/interruption/stale approval fencing, and no repository write before authorization.
-2. Write deterministic race tests proving cancellation/replace/interrupt wins before commit with no write, or apply wins through file+override+`applied` state before terminalization. Add a post-write/pre-resume page-revision change test: preserve the new complete recipe, remain `applied`, and issue no browser action.
+2. Write deterministic race tests proving cancellation/replace/interrupt wins before commit with no write, or apply wins through file+override+`applied` state before terminalization. Add a post-write/pre-resume page-revision change test: preserve the new complete recipe, remain `applied`, and issue no browser action. Prove only a fresh preview converting to the exact already committed locator can revalidate a later no-write resume; a different candidate is rejected.
 3. Write failing executor tests for exact override slot, no progress advance before retry, action/action-wait/step-wait/assertion resume cursors, no duplicate successful mutation, applied-without-resume, later exact resume after a fresh preview, successful phase completion, second repair ID on another failure, and cleanup.
 4. Add one exact `Preparing`/`Committing` apply reservation under the coordinator gate. After the final pre-write host validation, synchronously commit file+override+`applied` state under that gate. Then post-validate page/token/revision before an optional resume. Never mutate the immutable plan or another locator slot.
 5. Run all replay/repair/host/recording/secret suites; commit `feat(browser): resume repaired replay steps`.
