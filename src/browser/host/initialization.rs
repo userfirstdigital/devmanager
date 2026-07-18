@@ -735,6 +735,83 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     if (state.secretTainted) throw new Error("secret_tainted_document");
   };
 
+  let repairHighlightSession = null;
+  const repairHighlightToken = (value) => {
+    if (typeof value !== "string" || value.length < 32 || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) return null;
+    return value;
+  };
+  const repairHighlightOverlay = (target) => {
+    const element = resolveTarget(target);
+    if (!(element instanceof Element) || !isVisible(element)) return null;
+    const bounds = clampedAnnotationBounds(element.getBoundingClientRect());
+    const root = document.createElement("div");
+    const box = document.createElement("div");
+    annotationOwnedNodes.add(root);
+    annotationOwnedNodes.add(box);
+    root.setAttribute("data-devmanager-repair-highlight", "true");
+    box.setAttribute("data-devmanager-repair-highlight-box", "true");
+    Object.assign(root.style, {
+      position: "fixed", inset: "0", zIndex: "2147483646", pointerEvents: "none",
+      userSelect: "none",
+    });
+    Object.assign(box.style, {
+      position: "fixed", left: `${bounds.x}px`, top: `${bounds.y}px`,
+      width: `${bounds.width}px`, height: `${bounds.height}px`,
+      border: "3px solid #8b5cf6", background: "rgba(139, 92, 246, 0.12)",
+      boxShadow: "0 0 0 2px rgba(255, 255, 255, 0.9)", boxSizing: "border-box",
+      borderRadius: "4px", pointerEvents: "none", userSelect: "none",
+    });
+    root.appendChild(box);
+    return root;
+  };
+  const repairHighlightInstall = (target, tokenValue, expectedPreviousValue) => {
+    const token = repairHighlightToken(tokenValue);
+    const expectedPrevious = expectedPreviousValue === null
+      ? null
+      : repairHighlightToken(expectedPreviousValue);
+    if (!token || (expectedPreviousValue !== null && !expectedPrevious)) {
+      return { token: typeof tokenValue === "string" ? tokenValue : "", installed: false };
+    }
+    const current = repairHighlightSession?.token || null;
+    if (current !== expectedPrevious) return { token, installed: false };
+    const root = repairHighlightOverlay(target);
+    if (!root) return { token, installed: false };
+    const previous = repairHighlightSession
+      ? Object.freeze({ token: repairHighlightSession.token, root: repairHighlightSession.root })
+      : null;
+    repairHighlightSession?.root.remove();
+    document.body.appendChild(root);
+    repairHighlightSession = Object.freeze({ token, root, previous });
+    return { token, installed: true };
+  };
+  const repairHighlightClear = (tokenValue, restoreTokenValue = null) => {
+    const token = repairHighlightToken(tokenValue);
+    if (!token) {
+      return { token: typeof tokenValue === "string" ? tokenValue : "", cleared: false, restored: false, predecessorConsumed: false, resultingToken: repairHighlightSession?.token || null };
+    }
+    if (repairHighlightSession?.token !== token) {
+      let predecessorConsumed = false;
+      if (repairHighlightSession?.previous?.token === token) {
+        const current = repairHighlightSession;
+        repairHighlightSession = Object.freeze({ token: current.token, root: current.root, previous: null });
+        predecessorConsumed = true;
+      }
+      return { token, cleared: false, restored: false, predecessorConsumed, resultingToken: repairHighlightSession?.token || null };
+    }
+    const restoreToken = restoreTokenValue === null ? null : repairHighlightToken(restoreTokenValue);
+    if (restoreTokenValue !== null && (!restoreToken || repairHighlightSession.previous?.token !== restoreToken)) {
+      return { token, cleared: false, restored: false, predecessorConsumed: false, resultingToken: repairHighlightSession.token };
+    }
+    const restored = restoreToken ? repairHighlightSession.previous : null;
+    repairHighlightSession.root.remove();
+    repairHighlightSession = null;
+    if (restored && restoreToken) {
+      document.body.appendChild(restored.root);
+      repairHighlightSession = Object.freeze({ token: restoreToken, root: restored.root, previous: null });
+    }
+    return { token, cleared: true, restored: Boolean(repairHighlightSession), predecessorConsumed: false, resultingToken: repairHighlightSession?.token || null };
+  };
+
   const api = {
     snapshot: () => {
       requireContentTelemetry();
@@ -857,6 +934,10 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       },
       cancel: () => annotationCleanup(false),
       active: () => Boolean(annotationSession),
+    }),
+    repairHighlight: Object.freeze({
+      install: repairHighlightInstall,
+      clear: repairHighlightClear,
     }),
     secretTainted: () => state.secretTainted,
   };

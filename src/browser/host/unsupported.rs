@@ -6,12 +6,13 @@ use super::super::{
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
     BrowserBounds, BrowserHostControl, BrowserHostEvent, BrowserPageRecordingIpcError,
     BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
-    BrowserRecordingReview, BrowserRecordingStatus, BrowserWorkflowCoordinator,
-    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
+    BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
+    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
+    BrowserWorkspaceKey,
 };
 use super::super::{
-    validate_direct_secret_command, BrowserCommand, BrowserError, BrowserHostStatus,
-    BrowserResponse,
+    validate_direct_repair_preview_command, validate_direct_secret_command, BrowserCommand,
+    BrowserError, BrowserHostStatus, BrowserResponse,
 };
 #[cfg(not(target_os = "windows"))]
 use super::{BrowserHostState, BrowserWorkspaceSnapshot};
@@ -49,6 +50,7 @@ pub fn unsupported_command_response(
     command: BrowserCommand,
 ) -> Result<BrowserResponse, BrowserError> {
     validate_direct_secret_command(&command)?;
+    validate_direct_repair_preview_command(&command)?;
     unsupported_validated_command_response(platform, command)
 }
 
@@ -73,6 +75,7 @@ pub(crate) fn unsupported_request_response(
 ) -> Result<BrowserResponse, BrowserError> {
     request.validate_secret_sidecar()?;
     request.validate_repair_retention_sidecar()?;
+    request.validate_repair_preview_sidecar()?;
     if !request.cancellation_is_current() {
         return Err(BrowserError::Interrupted);
     }
@@ -252,6 +255,13 @@ impl BrowserWebViewHost {
     }
 
     pub fn handle_control(&mut self, _control: BrowserHostControl) {}
+
+    pub(crate) fn handle_repair_highlight_cleanup(
+        &mut self,
+        _window: &gpui::Window,
+        _cleanup: BrowserReplayRepairCleanupWork,
+    ) {
+    }
 
     pub fn pump_async_completions(&mut self, _window: &gpui::Window) {}
 

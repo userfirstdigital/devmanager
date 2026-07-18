@@ -1330,12 +1330,15 @@ impl NativeShell {
         }
         let open_workspaces = self.open_browser_workspace_keys();
         let browser_host = &mut self.browser_host;
-        let result = self.browser_bridge.with_locked_host_controls_for_command(
+        let result = self.browser_bridge.with_locked_host_work_for_command(
             workspace_key,
             &command,
-            |controls, lifecycle_requests| {
+            |controls, lifecycle_requests, repair_cleanups| {
                 for control in controls {
                     browser_host.handle_control(control);
+                }
+                for cleanup in repair_cleanups {
+                    browser_host.handle_repair_highlight_cleanup(window, cleanup);
                 }
                 for request in lifecycle_requests {
                     if open_workspaces
@@ -1713,25 +1716,31 @@ impl NativeShell {
         let open_workspaces = self.open_browser_workspace_keys();
         let browser_host = &mut self.browser_host;
         self.browser_bridge
-            .with_locked_host_work(|controls, lifecycle_requests| {
-                for control in controls {
-                    browser_host.handle_control(control);
-                }
-                for request in lifecycle_requests {
-                    if open_workspaces
-                        .iter()
-                        .any(|open| open == request.workspace_key())
-                    {
-                        browser_host.handle_request(window, request);
-                    } else {
-                        request.respond(Err(BrowserError::CrashedView {
-                            message: "browser command route does not match an open AI conversation"
-                                .to_string(),
-                        }));
+            .with_locked_host_work_and_repair_cleanups(
+                |controls, lifecycle_requests, repair_cleanups| {
+                    for control in controls {
+                        browser_host.handle_control(control);
                     }
-                }
-                enter_host(browser_host)
-            })
+                    for cleanup in repair_cleanups {
+                        browser_host.handle_repair_highlight_cleanup(window, cleanup);
+                    }
+                    for request in lifecycle_requests {
+                        if open_workspaces
+                            .iter()
+                            .any(|open| open == request.workspace_key())
+                        {
+                            browser_host.handle_request(window, request);
+                        } else {
+                            request.respond(Err(BrowserError::CrashedView {
+                                message:
+                                    "browser command route does not match an open AI conversation"
+                                        .to_string(),
+                            }));
+                        }
+                    }
+                    enter_host(browser_host)
+                },
+            )
     }
 
     fn browser_pane_context(&self) -> BrowserPaneContext {

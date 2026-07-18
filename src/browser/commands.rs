@@ -1,6 +1,11 @@
 use super::replay::BrowserReplayRepairCaptureAuthority;
 #[cfg(test)]
 use super::replay::{BrowserReplayRepairCaptureReceipt, BrowserReplayRepairCapturedEvidence};
+use super::replay_repair::{
+    BrowserReplayRepairHighlightCleanup, BrowserReplayRepairHighlightToken,
+    BrowserReplayRepairPreviewAbortDisposition, BrowserReplayRepairPreviewAuthority,
+    BrowserReplayRepairPreviewReceipt,
+};
 use super::{
     BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserAnnotationCandidate,
     BrowserAnnotationDetails, BrowserAnnotationDraft, BrowserAnnotationMutationResult,
@@ -8,11 +13,12 @@ use super::{
     BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation, BrowserError,
     BrowserNetworkEntry, BrowserNetworkOperation, BrowserPerformanceOperation,
     BrowserPerformanceSnapshot, BrowserRecipeInputKind, BrowserRecordingStatus,
-    BrowserReplayCoordinator, BrowserReplayInstance, BrowserReplayRepairInstance,
-    BrowserReplaySecretLease, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceStore, BrowserRisk, BrowserScreenshotMode, BrowserSnapshotSummary,
-    BrowserTabSnapshot, BrowserUploadResult, BrowserViewport, BrowserWaitCondition,
-    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BrowserReplayCoordinator, BrowserReplayInstance, BrowserReplayRepairCandidate,
+    BrowserReplayRepairInstance, BrowserReplaySecretLease, BrowserResourceHandle,
+    BrowserResourceId, BrowserResourceKind, BrowserResourceStore, BrowserRisk,
+    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult,
+    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey,
+    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -24,7 +30,7 @@ use std::path::{Component, Prefix};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -301,6 +307,14 @@ pub enum BrowserCommand {
         method: String,
         params: serde_json::Value,
     },
+    #[serde(skip)]
+    RepairHighlight {
+        tab_id: String,
+    },
+    #[serde(skip)]
+    RepairClearHighlight {
+        tab_id: String,
+    },
 }
 
 impl BrowserCommand {
@@ -341,6 +355,8 @@ impl BrowserCommand {
             Self::Upload { .. } => "upload",
             Self::Downloads { .. } => "downloads",
             Self::Cdp { .. } => "cdp",
+            Self::RepairHighlight { .. } => "repairHighlight",
+            Self::RepairClearHighlight { .. } => "repairClearHighlight",
         }
     }
 
@@ -366,7 +382,9 @@ impl BrowserCommand {
             | Self::Performance { tab_id, .. }
             | Self::Upload { tab_id, .. }
             | Self::Downloads { tab_id, .. }
-            | Self::Cdp { tab_id, .. } => Some(tab_id),
+            | Self::Cdp { tab_id, .. }
+            | Self::RepairHighlight { tab_id }
+            | Self::RepairClearHighlight { tab_id } => Some(tab_id),
             Self::Stop { tab_id } => tab_id.as_deref(),
             Self::Status
             | Self::WorkspaceState
@@ -763,6 +781,103 @@ struct BrowserReplayRepairRetentionSidecar {
     authority: BrowserReplayRepairCaptureAuthority,
 }
 
+enum BrowserReplayRepairPreviewSidecar {
+    Highlight {
+        authority: BrowserReplayRepairPreviewAuthority,
+    },
+}
+
+const MAX_BROWSER_REPAIR_HIGHLIGHT_CLEANUPS: usize = 64;
+
+#[derive(Clone)]
+pub(crate) struct BrowserReplayRepairCleanupAdmission {
+    _inner: Arc<BrowserReplayRepairCleanupAdmissionInner>,
+}
+
+struct BrowserReplayRepairCleanupAdmissionInner {
+    queue: Weak<HostControlQueue>,
+}
+
+impl Drop for BrowserReplayRepairCleanupAdmissionInner {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.upgrade() {
+            queue.release_repair_cleanup_admission();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserReplayRepairCleanupWork {
+    token: BrowserReplayRepairHighlightToken,
+    restore: Option<BrowserReplayRepairHighlightToken>,
+    context: BrowserInvocationContext,
+    started_at: String,
+    enqueued_at: Instant,
+    _admission: BrowserReplayRepairCleanupAdmission,
+}
+
+impl BrowserReplayRepairCleanupWork {
+    fn new(
+        token: BrowserReplayRepairHighlightToken,
+        restore: Option<BrowserReplayRepairHighlightToken>,
+        actor: BrowserInvocationActor,
+        admission: BrowserReplayRepairCleanupAdmission,
+    ) -> Self {
+        let context = BrowserInvocationContext::for_actor(
+            actor,
+            "clear replay repair preview highlight",
+            BrowserRisk::Normal,
+        )
+        .expect("fixed replay repair cleanup context is valid");
+        Self {
+            token,
+            restore,
+            context,
+            started_at: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            enqueued_at: Instant::now(),
+            _admission: admission,
+        }
+    }
+
+    pub(crate) fn workspace_key(&self) -> &BrowserWorkspaceKey {
+        self.token.repair().workspace_key()
+    }
+
+    pub(crate) fn tab_id(&self) -> &str {
+        self.token.tab_id()
+    }
+
+    pub(crate) fn token(&self) -> &BrowserReplayRepairHighlightToken {
+        &self.token
+    }
+
+    pub(crate) fn restore(&self) -> Option<&BrowserReplayRepairHighlightToken> {
+        self.restore.as_ref()
+    }
+
+    pub(crate) fn context(&self) -> &BrowserInvocationContext {
+        &self.context
+    }
+
+    pub(crate) fn started_at(&self) -> &str {
+        &self.started_at
+    }
+
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn enqueued_at(&self) -> Instant {
+        self.enqueued_at
+    }
+
+    fn clear_exact_only(&mut self) {
+        self.restore = None;
+    }
+}
+
 struct BrowserReplayRepairRequestGuard {
     coordinator: BrowserReplayCoordinator,
     repair: BrowserReplayRepairInstance,
@@ -791,6 +906,61 @@ impl Drop for BrowserReplayRepairRequestGuard {
     }
 }
 
+struct BrowserReplayRepairPreviewRequestGuard {
+    coordinator: BrowserReplayCoordinator,
+    host_controls: Arc<HostControlQueue>,
+    authority: BrowserReplayRepairPreviewAuthority,
+    actor: BrowserInvocationActor,
+    admission: BrowserReplayRepairCleanupAdmission,
+    armed: bool,
+}
+
+impl BrowserReplayRepairPreviewRequestGuard {
+    fn new(
+        coordinator: &BrowserReplayCoordinator,
+        controller: &BrowserController,
+        authority: BrowserReplayRepairPreviewAuthority,
+        actor: BrowserInvocationActor,
+        admission: BrowserReplayRepairCleanupAdmission,
+    ) -> Self {
+        Self {
+            coordinator: coordinator.clone(),
+            host_controls: Arc::clone(&controller.host_controls),
+            authority,
+            actor,
+            admission,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BrowserReplayRepairPreviewRequestGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let restore = match self
+            .coordinator
+            .abort_locator_repair_preview(&self.authority)
+        {
+            BrowserReplayRepairPreviewAbortDisposition::RestorePrevious => {
+                self.authority.expected_previous_token().cloned()
+            }
+            BrowserReplayRepairPreviewAbortDisposition::ClearExactOnly => None,
+        };
+        self.host_controls.enqueue_repair_cleanup(
+            self.authority.token().clone(),
+            self.actor,
+            restore,
+            self.admission.clone(),
+        );
+    }
+}
+
 struct BrowserCommandEnvelope {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
@@ -800,6 +970,7 @@ struct BrowserCommandEnvelope {
     registration_lease: Option<BrowserRegistrationLease>,
     replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
+    replay_repair_preview_sidecar: Option<BrowserReplayRepairPreviewSidecar>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     pending_work: PendingWorkGuard,
 }
@@ -908,6 +1079,34 @@ impl BrowserCommandBridge {
             })
     }
 
+    pub(crate) fn with_locked_host_work_for_command<R>(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        command: &BrowserCommand,
+        apply: impl FnOnce(
+            Vec<BrowserHostControl>,
+            Vec<BrowserCommandRequest>,
+            Vec<BrowserReplayRepairCleanupWork>,
+        ) -> R,
+    ) -> R {
+        self.host_controls
+            .with_drain_all_locked(|controls, lifecycle_requests, repair_cleanups| {
+                if let Some(control) = browser_lifecycle_control(workspace_key, command) {
+                    self.cancellations.interrupt_control(&control);
+                }
+                let lifecycle_requests = lifecycle_requests
+                    .into_iter()
+                    .map(|envelope| {
+                        BrowserCommandRequest::from_envelope(
+                            envelope,
+                            Arc::clone(&self.cancellations),
+                        )
+                    })
+                    .collect();
+                apply(controls, lifecycle_requests, repair_cleanups)
+            })
+    }
+
     pub fn drain_host_controls(&self) -> Vec<BrowserHostControl> {
         self.host_controls.drain()
     }
@@ -935,6 +1134,29 @@ impl BrowserCommandBridge {
                     })
                     .collect();
                 apply(controls, lifecycle_requests)
+            })
+    }
+
+    pub(crate) fn with_locked_host_work_and_repair_cleanups<R>(
+        &self,
+        apply: impl FnOnce(
+            Vec<BrowserHostControl>,
+            Vec<BrowserCommandRequest>,
+            Vec<BrowserReplayRepairCleanupWork>,
+        ) -> R,
+    ) -> R {
+        self.host_controls
+            .with_drain_all_locked(|controls, lifecycle_requests, repair_cleanups| {
+                let lifecycle_requests = lifecycle_requests
+                    .into_iter()
+                    .map(|envelope| {
+                        BrowserCommandRequest::from_envelope(
+                            envelope,
+                            Arc::clone(&self.cancellations),
+                        )
+                    })
+                    .collect();
+                apply(controls, lifecycle_requests, repair_cleanups)
             })
     }
 }
@@ -989,7 +1211,7 @@ impl BrowserController {
         command: BrowserCommand,
         context: BrowserInvocationContext,
     ) -> Result<BrowserResponse, BrowserError> {
-        self.request_with_context_and_local_project_root(command, context, None, None, None)
+        self.request_with_context_and_local_project_root(command, context, None, None, None, None)
             .await
     }
 
@@ -1004,6 +1226,7 @@ impl BrowserController {
             command,
             context,
             Some(canonical),
+            None,
             None,
             None,
         )
@@ -1033,6 +1256,7 @@ impl BrowserController {
                 expected_instance,
                 lease,
             }),
+            None,
             None,
         )
         .await
@@ -1068,6 +1292,7 @@ impl BrowserController {
                 None,
                 None,
                 Some(BrowserReplayRepairRetentionSidecar { authority }),
+                None,
             )
             .await;
         let response = match response {
@@ -1100,6 +1325,77 @@ impl BrowserController {
         Ok(response)
     }
 
+    pub async fn request_replay_repair_preview(
+        &self,
+        coordinator: &BrowserReplayCoordinator,
+        repair: &BrowserReplayRepairInstance,
+        candidate: BrowserReplayRepairCandidate,
+        actor: BrowserInvocationActor,
+    ) -> Result<super::BrowserReplayRepairProjection, BrowserError> {
+        if !matches!(
+            actor,
+            BrowserInvocationActor::User | BrowserInvocationActor::Agent
+        ) || repair.workspace_key() != &self.workspace_key
+        {
+            return Err(invalid_repair_preview_sidecar());
+        }
+        let admission = self
+            .host_controls
+            .try_admit_repair_cleanup()
+            .ok_or(BrowserError::ResourceRootBusy)?;
+        let context = BrowserInvocationContext::for_actor(
+            actor,
+            "preview replay repair locator",
+            BrowserRisk::Normal,
+        )
+        .map_err(|_| invalid_repair_preview_sidecar())?;
+        let (authority, receipt): (
+            BrowserReplayRepairPreviewAuthority,
+            BrowserReplayRepairPreviewReceipt,
+        ) = coordinator
+            .reserve_locator_repair_preview(repair, candidate)
+            .map_err(|_| invalid_repair_preview_sidecar())?;
+        let mut guard = BrowserReplayRepairPreviewRequestGuard::new(
+            coordinator,
+            self,
+            authority.clone(),
+            actor,
+            admission.clone(),
+        );
+        let response = self
+            .request_with_context_and_local_project_root(
+                BrowserCommand::RepairHighlight {
+                    tab_id: authority.tab_id().to_string(),
+                },
+                context,
+                None,
+                None,
+                None,
+                Some(BrowserReplayRepairPreviewSidecar::Highlight {
+                    authority: authority.clone(),
+                }),
+            )
+            .await
+            .map_err(contain_repair_preview_error)?;
+        if response != BrowserResponse::Acknowledged {
+            return Err(invalid_repair_preview_sidecar());
+        }
+        let acknowledgement = receipt
+            .consume_exact(repair)
+            .ok_or_else(invalid_repair_preview_sidecar)?;
+        let cleanup_queue = Arc::clone(&self.host_controls);
+        let cleanup_token = acknowledgement.token.clone();
+        let projection = coordinator
+            .commit_locator_repair_preview(acknowledgement, move || {
+                BrowserReplayRepairHighlightCleanup::new(move || {
+                    cleanup_queue.enqueue_repair_cleanup(cleanup_token, actor, None, admission);
+                })
+            })
+            .map_err(|_| invalid_repair_preview_sidecar())?;
+        guard.disarm();
+        Ok(projection)
+    }
+
     async fn request_with_context_and_local_project_root(
         &self,
         command: BrowserCommand,
@@ -1107,6 +1403,7 @@ impl BrowserController {
         local_project_root: Option<PathBuf>,
         replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
         replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
+        replay_repair_preview_sidecar: Option<BrowserReplayRepairPreviewSidecar>,
     ) -> Result<BrowserResponse, BrowserError> {
         context.validate()?;
         let operation = command.operation_name().to_string();
@@ -1134,6 +1431,7 @@ impl BrowserController {
                 registration_lease: self.registration_lease.clone(),
                 replay_secret_sidecar,
                 replay_repair_sidecar,
+                replay_repair_preview_sidecar,
                 response,
                 pending_work: self.pending_work.track(),
             });
@@ -1209,6 +1507,7 @@ impl BrowserController {
                 registration_lease: self.registration_lease.clone(),
                 replay_secret_sidecar: None,
                 replay_repair_sidecar: None,
+                replay_repair_preview_sidecar: None,
                 response,
                 pending_work: self.pending_work.track(),
             })
@@ -1310,6 +1609,7 @@ impl BrowserController {
                     registration_lease: self.registration_lease.clone(),
                     replay_secret_sidecar: None,
                     replay_repair_sidecar: None,
+                    replay_repair_preview_sidecar: None,
                     response,
                     pending_work: self.pending_work.track(),
                 });
@@ -1361,6 +1661,12 @@ fn invalid_repair_sidecar() -> BrowserError {
     }
 }
 
+fn invalid_repair_preview_sidecar() -> BrowserError {
+    BrowserError::InvalidInvocation {
+        field: "repairPreviewSidecar".to_string(),
+    }
+}
+
 fn contain_repair_capture_error(error: BrowserError) -> BrowserError {
     match error {
         safe @ BrowserError::Interrupted
@@ -1384,9 +1690,39 @@ fn contain_repair_capture_error(error: BrowserError) -> BrowserError {
     }
 }
 
+fn contain_repair_preview_error(error: BrowserError) -> BrowserError {
+    match error {
+        safe @ BrowserError::Interrupted
+        | safe @ BrowserError::StaleReference { .. }
+        | safe @ BrowserError::LocatorNotFound { .. } => safe,
+        BrowserError::Timeout { .. } => BrowserError::Timeout {
+            operation: "repairHighlight".to_string(),
+        },
+        BrowserError::UnavailablePlatform { .. } => BrowserError::UnavailablePlatform {
+            platform: std::env::consts::OS.to_string(),
+        },
+        BrowserError::InvalidInvocation { field } if field == "repairPreviewSidecar" => {
+            BrowserError::InvalidInvocation { field }
+        }
+        _ => invalid_repair_preview_sidecar(),
+    }
+}
+
 pub(crate) fn validate_direct_secret_command(command: &BrowserCommand) -> Result<(), BrowserError> {
     if matches!(command, BrowserCommand::SecretType { .. }) {
         return Err(invalid_secret_sidecar());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_direct_repair_preview_command(
+    command: &BrowserCommand,
+) -> Result<(), BrowserError> {
+    if matches!(
+        command,
+        BrowserCommand::RepairHighlight { .. } | BrowserCommand::RepairClearHighlight { .. }
+    ) {
+        return Err(invalid_repair_preview_sidecar());
     }
     Ok(())
 }
@@ -1530,6 +1866,7 @@ pub struct BrowserCommandRequest {
     registration_lease: Option<BrowserRegistrationLease>,
     replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
+    replay_repair_preview_sidecar: Option<BrowserReplayRepairPreviewSidecar>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     _pending_work: PendingWorkGuard,
     started_at: String,
@@ -1600,8 +1937,49 @@ impl BrowserCommandRequest {
         Ok(Some(authority))
     }
 
+    pub(crate) fn validate_repair_preview_sidecar(&self) -> Result<(), BrowserError> {
+        if self.context.actor == BrowserInvocationActor::Internal {
+            return match (&self.command, &self.replay_repair_preview_sidecar) {
+                (BrowserCommand::RepairHighlight { .. }, _)
+                | (BrowserCommand::RepairClearHighlight { .. }, _)
+                | (_, Some(_)) => Err(invalid_repair_preview_sidecar()),
+                _ => Ok(()),
+            };
+        }
+        match (&self.command, &self.replay_repair_preview_sidecar) {
+            (
+                BrowserCommand::RepairHighlight { tab_id },
+                Some(BrowserReplayRepairPreviewSidecar::Highlight { authority }),
+            ) if matches!(
+                self.context.actor,
+                BrowserInvocationActor::User | BrowserInvocationActor::Agent
+            ) && authority.repair().workspace_key() == &self.workspace_key
+                && authority.tab_id() == tab_id
+                && authority.token().tab_id() == tab_id
+                && authority.is_live() =>
+            {
+                Ok(())
+            }
+            (BrowserCommand::RepairHighlight { .. }, _)
+            | (BrowserCommand::RepairClearHighlight { .. }, _)
+            | (_, Some(_)) => Err(invalid_repair_preview_sidecar()),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn repair_preview_highlight_authority(
+        &self,
+    ) -> Option<&BrowserReplayRepairPreviewAuthority> {
+        match &self.replay_repair_preview_sidecar {
+            Some(BrowserReplayRepairPreviewSidecar::Highlight { authority }) => Some(authority),
+            _ => None,
+        }
+    }
+
     pub(crate) fn records_workflow_recipe_action(&self) -> bool {
-        self.context.actor == BrowserInvocationActor::Agent && self.replay_repair_sidecar.is_none()
+        self.context.actor == BrowserInvocationActor::Agent
+            && self.replay_repair_sidecar.is_none()
+            && self.replay_repair_preview_sidecar.is_none()
     }
 
     pub(crate) fn retain_repair_resource(
@@ -1678,6 +2056,7 @@ impl BrowserCommandRequest {
             registration_lease,
             replay_secret_sidecar,
             replay_repair_sidecar,
+            replay_repair_preview_sidecar,
             response,
             pending_work,
         } = envelope;
@@ -1691,6 +2070,7 @@ impl BrowserCommandRequest {
             registration_lease,
             replay_secret_sidecar,
             replay_repair_sidecar,
+            replay_repair_preview_sidecar,
             response,
             _pending_work: pending_work,
             started_at: OffsetDateTime::now_utc()
@@ -1730,11 +2110,86 @@ struct HostPriorityQueue {
 }
 
 #[derive(Default)]
-struct HostControlQueue {
+pub(crate) struct HostControlQueue {
     queued: Mutex<HostPriorityQueue>,
+    repair_cleanups: Mutex<VecDeque<BrowserReplayRepairCleanupWork>>,
+    repair_cleanup_admissions: AtomicUsize,
 }
 
 impl HostControlQueue {
+    fn try_admit_repair_cleanup(self: &Arc<Self>) -> Option<BrowserReplayRepairCleanupAdmission> {
+        self.repair_cleanup_admissions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_BROWSER_REPAIR_HIGHLIGHT_CLEANUPS).then_some(current + 1)
+            })
+            .ok()?;
+        Some(BrowserReplayRepairCleanupAdmission {
+            _inner: Arc::new(BrowserReplayRepairCleanupAdmissionInner {
+                queue: Arc::downgrade(self),
+            }),
+        })
+    }
+
+    fn release_repair_cleanup_admission(&self) {
+        let previous = self
+            .repair_cleanup_admissions
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "repair cleanup admission underflow");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_repair_cleanup_admission_for_test(
+        self: &Arc<Self>,
+    ) -> Option<BrowserReplayRepairCleanupAdmission> {
+        self.try_admit_repair_cleanup()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repair_cleanup_work_for_test(
+        self: &Arc<Self>,
+        token: BrowserReplayRepairHighlightToken,
+        restore: Option<BrowserReplayRepairHighlightToken>,
+        actor: BrowserInvocationActor,
+    ) -> Option<BrowserReplayRepairCleanupWork> {
+        Some(BrowserReplayRepairCleanupWork::new(
+            token,
+            restore,
+            actor,
+            self.try_admit_repair_cleanup()?,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repair_cleanup_admission_count_for_test(&self) -> usize {
+        self.repair_cleanup_admissions.load(Ordering::Acquire)
+    }
+
+    fn enqueue_repair_cleanup(
+        &self,
+        token: BrowserReplayRepairHighlightToken,
+        actor: BrowserInvocationActor,
+        restore: Option<BrowserReplayRepairHighlightToken>,
+        admission: BrowserReplayRepairCleanupAdmission,
+    ) {
+        debug_assert!(matches!(
+            actor,
+            BrowserInvocationActor::User | BrowserInvocationActor::Agent
+        ));
+        let mut repair_cleanups = lock(&self.repair_cleanups);
+        if let Some(existing) = repair_cleanups
+            .iter_mut()
+            .find(|cleanup| cleanup.token() == &token)
+        {
+            if restore.is_none() {
+                existing.clear_exact_only();
+            }
+            return;
+        }
+        repair_cleanups.push_back(BrowserReplayRepairCleanupWork::new(
+            token, restore, actor, admission,
+        ));
+    }
+
     fn push_and<R>(&self, control: BrowserHostControl, then: impl FnOnce() -> R) -> R {
         let mut queued = lock(&self.queued);
         queued.controls.push_back(control);
@@ -1780,6 +2235,23 @@ impl HostControlQueue {
         let controls = queued.controls.drain(..).collect();
         let lifecycle_requests = queued.lifecycle_requests.drain(..).collect();
         let result = apply(controls, lifecycle_requests);
+        drop(queued);
+        result
+    }
+
+    fn with_drain_all_locked<R>(
+        &self,
+        apply: impl FnOnce(
+            Vec<BrowserHostControl>,
+            Vec<BrowserCommandEnvelope>,
+            Vec<BrowserReplayRepairCleanupWork>,
+        ) -> R,
+    ) -> R {
+        let mut queued = lock(&self.queued);
+        let controls = queued.controls.drain(..).collect();
+        let lifecycle_requests = queued.lifecycle_requests.drain(..).collect();
+        let repair_cleanups = lock(&self.repair_cleanups).drain(..).collect();
+        let result = apply(controls, lifecycle_requests, repair_cleanups);
         drop(queued);
         result
     }
@@ -1942,20 +2414,25 @@ impl CancellationEpochs {
 mod secure_command_tests {
     use super::*;
     use crate::browser::{
-        compile_browser_replay, BrowserActionTarget, BrowserRecipeAction, BrowserRecipeInput,
-        BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
-        BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayInstance,
-        BrowserReplayLocatorSlot, BrowserReplayRepairInstance, BrowserReplayRepairResumeCursor,
-        BrowserReplaySecretLease, BrowserReplaySecretSubmission, BrowserResourceKind,
-        BrowserResourceLimits, BrowserResourceStore, BrowserRevision,
-        BROWSER_RECIPE_SCHEMA_VERSION,
+        compile_browser_replay, BrowserActionTarget, BrowserElementRef, BrowserLocator,
+        BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
+        BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
+        BrowserReplayCoordinator, BrowserReplayInstance, BrowserReplayLocatorSlot,
+        BrowserReplayRepairInstance, BrowserReplayRepairResumeCursor, BrowserReplaySecretLease,
+        BrowserReplaySecretSubmission, BrowserResourceKind, BrowserResourceLimits,
+        BrowserResourceStore, BrowserRevision, BROWSER_RECIPE_SCHEMA_VERSION,
     };
     use static_assertions::assert_not_impl_any;
+    use std::num::NonZeroU64;
 
     assert_not_impl_any!(BrowserReplayRepairRetentionSidecar: Clone, std::fmt::Debug, serde::Serialize);
     assert_not_impl_any!(BrowserReplayRepairCaptureAuthority: Clone, std::fmt::Debug, serde::Serialize);
     assert_not_impl_any!(BrowserReplayRepairCaptureReceipt: Clone, std::fmt::Debug, serde::Serialize);
     assert_not_impl_any!(BrowserReplayRepairCapturedEvidence: Clone, std::fmt::Debug, serde::Serialize);
+    assert_not_impl_any!(BrowserReplayRepairPreviewSidecar: Clone, std::fmt::Debug, serde::Serialize);
+    assert_not_impl_any!(BrowserReplayRepairPreviewAuthority: std::fmt::Debug, serde::Serialize);
+    assert_not_impl_any!(BrowserReplayRepairHighlightToken: std::fmt::Debug, serde::Serialize);
+    assert_not_impl_any!(BrowserReplayRepairCleanupWork: std::fmt::Debug, serde::Serialize);
 
     const SECRET_INPUT: &str = "password";
     const SECRET_VALUE: &str = "value-sentinel-secure-sidecar";
@@ -2038,6 +2515,49 @@ mod secure_command_tests {
             },
         ] {
             assert_eq!(contain_repair_capture_error(safe_error.clone()), safe_error);
+        }
+    }
+
+    #[test]
+    fn repair_preview_error_boundary_normalizes_every_string_bearing_error() {
+        const SENTINEL: &str = "DM_REPAIR_PREVIEW_ERROR_SENTINEL_3A9C";
+
+        let timeout = contain_repair_preview_error(BrowserError::Timeout {
+            operation: SENTINEL.to_string(),
+        });
+        assert_eq!(
+            timeout,
+            BrowserError::Timeout {
+                operation: "repairHighlight".to_string(),
+            }
+        );
+
+        let unavailable = contain_repair_preview_error(BrowserError::UnavailablePlatform {
+            platform: SENTINEL.to_string(),
+        });
+        assert_eq!(
+            unavailable,
+            BrowserError::UnavailablePlatform {
+                platform: std::env::consts::OS.to_string(),
+            }
+        );
+
+        for contained in [
+            timeout,
+            unavailable,
+            contain_repair_preview_error(BrowserError::CrashedView {
+                message: SENTINEL.to_string(),
+            }),
+            contain_repair_preview_error(BrowserError::InvalidInvocation {
+                field: SENTINEL.to_string(),
+            }),
+        ] {
+            for surface in [
+                format!("{contained:?}"),
+                serde_json::to_string(&contained).unwrap(),
+            ] {
+                assert!(!surface.contains(SENTINEL), "{surface}");
+            }
         }
     }
 
@@ -2170,6 +2690,330 @@ mod secure_command_tests {
         (coordinator, started.instance, repair)
     }
 
+    #[cfg(target_os = "windows")]
+    fn publish_repair_for_preview(
+        coordinator: &BrowserReplayCoordinator,
+        repair: &BrowserReplayRepairInstance,
+    ) {
+        let snapshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        let screenshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                repair,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                b"png",
+            )
+            .unwrap();
+        coordinator
+            .publish_locator_repair(repair, &snapshot, &screenshot)
+            .unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn repair_preview_candidate(test_id: &str) -> BrowserReplayRepairCandidate {
+        BrowserReplayRepairCandidate::new(BrowserElementRef {
+            revision: BrowserRevision(9),
+            locator: BrowserLocator {
+                test_id: Some(test_id.to_string()),
+                ..BrowserLocator::default()
+            },
+            backend_node_id: Some(91),
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn repair_preview_uses_fixed_context_and_superseded_install_cannot_block_new_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-repair-preview-command-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let workspace_key = workspace("repair-preview-command", "conversation-a");
+        let (coordinator, instance, repair) = installed_repair(&workspace_key, &store);
+        publish_repair_for_preview(&coordinator, &repair);
+        let (bridge, mut inbox) = browser_command_channel(8);
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(2));
+
+        let user_controller = controller.clone();
+        let user_coordinator = coordinator.clone();
+        let user_repair = repair.clone();
+        let user_task = tokio::spawn(async move {
+            user_controller
+                .request_replay_repair_preview(
+                    &user_coordinator,
+                    &user_repair,
+                    repair_preview_candidate("committed"),
+                    BrowserInvocationActor::User,
+                )
+                .await
+        });
+        let user_request = inbox.recv().await.expect("user preview marker");
+        assert_eq!(user_request.context().actor, BrowserInvocationActor::User);
+        assert_eq!(
+            user_request.context().intent,
+            "preview replay repair locator"
+        );
+        assert!(!user_request.records_workflow_recipe_action());
+        let user_authority = user_request
+            .repair_preview_highlight_authority()
+            .expect("private user preview authority")
+            .clone();
+        assert!(user_authority.acknowledge_for_test());
+        user_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(
+            user_task.await.unwrap().unwrap().phase,
+            crate::browser::BrowserReplayRepairPhase::Previewed
+        );
+
+        let a_controller = controller.clone();
+        let a_coordinator = coordinator.clone();
+        let a_repair = repair.clone();
+        let a_task = tokio::spawn(async move {
+            a_controller
+                .request_replay_repair_preview(
+                    &a_coordinator,
+                    &a_repair,
+                    repair_preview_candidate("superseded-a"),
+                    BrowserInvocationActor::Agent,
+                )
+                .await
+        });
+        let a_request = inbox.recv().await.expect("preview A marker");
+        let a_authority = a_request
+            .repair_preview_highlight_authority()
+            .expect("preview A authority")
+            .clone();
+        assert!(a_authority.is_live());
+        assert_eq!(a_request.context().actor, BrowserInvocationActor::Agent);
+        assert_eq!(a_request.context().intent, "preview replay repair locator");
+
+        let b_controller = controller.clone();
+        let b_coordinator = coordinator.clone();
+        let b_repair = repair.clone();
+        let b_task = tokio::spawn(async move {
+            b_controller
+                .request_replay_repair_preview(
+                    &b_coordinator,
+                    &b_repair,
+                    repair_preview_candidate("current-b"),
+                    BrowserInvocationActor::Agent,
+                )
+                .await
+        });
+        let b_request = inbox.recv().await.expect("preview B marker");
+        let b_authority = b_request
+            .repair_preview_highlight_authority()
+            .expect("preview B authority")
+            .clone();
+        assert!(!a_authority.is_live(), "B reservation closes A authority");
+        assert!(b_authority.is_live());
+        assert!(
+            a_authority.expected_previous_token() == b_authority.expected_previous_token(),
+            "A and B both CAS against the last committed preview"
+        );
+
+        // A's failed request publishes cleanup only to the private host lane; it never
+        // competes with B or any ordinary command envelope.
+        a_request.respond(Err(BrowserError::Interrupted));
+        assert_eq!(a_task.await.unwrap(), Err(BrowserError::Interrupted));
+        assert!(b_authority.acknowledge_for_test());
+        b_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(
+            b_task.await.unwrap().unwrap().phase,
+            crate::browser::BrowserReplayRepairPhase::Previewed
+        );
+
+        let (controls, lifecycle, cleanups) =
+            bridge.with_locked_host_work_and_repair_cleanups(|controls, lifecycle, cleanups| {
+                (controls, lifecycle, cleanups)
+            });
+        assert!(controls.is_empty());
+        assert!(lifecycle.is_empty());
+        assert_eq!(cleanups.len(), 1);
+        let late_a_clear = &cleanups[0];
+        assert!(late_a_clear.token() == a_authority.token());
+        assert!(late_a_clear.token() != b_authority.token());
+        assert!(
+            late_a_clear.restore().is_none(),
+            "a superseded guard must clear only and cannot resurrect its predecessor"
+        );
+        assert_eq!(late_a_clear.context().actor, BrowserInvocationActor::Agent);
+        assert_eq!(
+            late_a_clear.context().intent,
+            "clear replay repair preview highlight"
+        );
+
+        assert!(matches!(
+            controller
+                .request_replay_repair_preview(
+                    &coordinator,
+                    &repair,
+                    repair_preview_candidate("internal-forbidden"),
+                    BrowserInvocationActor::Internal,
+                )
+                .await,
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairPreviewSidecar"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), inbox.recv())
+                .await
+                .is_err()
+        );
+
+        drop(inbox);
+        coordinator.cancel(&instance).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn repair_preview_cleanup_drop_outside_tokio_survives_a_full_bridge_queue() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-repair-preview-full-queue-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let workspace_key = workspace("repair-preview-full-queue", "conversation-a");
+        let (coordinator, instance, repair) = installed_repair(&workspace_key, &store);
+        let token = BrowserReplayRepairHighlightToken::new(
+            repair,
+            NonZeroU64::new(1).unwrap(),
+            "tab-a".to_string(),
+            "dddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        );
+        let (bridge, inbox) = browser_command_channel(1);
+        let registration = BrowserRegistrationLease::new();
+        let controller = bridge.bind_with_registration_lease(
+            workspace_key.clone(),
+            Duration::from_secs(2),
+            Some(registration.clone()),
+        );
+        let filler_controller = controller.clone();
+        let filler = tokio::spawn(async move {
+            filler_controller
+                .request_with_context(
+                    BrowserCommand::Status,
+                    BrowserInvocationContext::user("fill bridge", BrowserRisk::Normal).unwrap(),
+                )
+                .await
+        });
+        wait_for_pending(&bridge).await;
+
+        let admission = controller
+            .host_controls
+            .try_admit_repair_cleanup()
+            .expect("cleanup slot admitted before preview install");
+        let cleanup_queue = Arc::clone(&controller.host_controls);
+        let cleanup_token = token.clone();
+        let cleanup_admission = admission.clone();
+        let cleanup = BrowserReplayRepairHighlightCleanup::new(move || {
+            cleanup_queue.enqueue_repair_cleanup(
+                cleanup_token,
+                BrowserInvocationActor::Agent,
+                None,
+                cleanup_admission,
+            );
+        });
+        bridge.interrupt_tab(&workspace_key, "tab-a");
+        bridge.revoke_registration(&workspace_key, &registration);
+        drop(inbox);
+        std::thread::spawn(move || drop(cleanup))
+            .join()
+            .expect("cleanup drops outside Tokio");
+
+        for _ in 0..1_000 {
+            controller.host_controls.enqueue_repair_cleanup(
+                token.clone(),
+                BrowserInvocationActor::Agent,
+                None,
+                admission.clone(),
+            );
+        }
+        let _ = filler.await.unwrap();
+        assert_eq!(bridge.pending_work_count(), 0);
+        let (controls, lifecycle, cleanups) =
+            bridge.with_locked_host_work_and_repair_cleanups(|controls, lifecycle, cleanups| {
+                (controls, lifecycle, cleanups)
+            });
+        assert!(
+            !controls.is_empty(),
+            "later interruption remains independently queued"
+        );
+        assert!(lifecycle.is_empty());
+        assert_eq!(cleanups.len(), 1, "repeated cleanup requests coalesce");
+        let cleanup_request = &cleanups[0];
+        assert_eq!(
+            cleanup_request.context().intent,
+            "clear replay repair preview highlight"
+        );
+        assert!(cleanup_request.token() == &token);
+        assert!(cleanup_request.restore().is_none());
+        drop(cleanups);
+        drop(admission);
+        assert_eq!(
+            controller
+                .host_controls
+                .repair_cleanup_admissions
+                .load(Ordering::Acquire),
+            0
+        );
+
+        coordinator.cancel(&instance).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repair_preview_cleanup_admission_is_strictly_bounded() {
+        let (bridge, _inbox) = browser_command_channel(1);
+        let admissions: Vec<_> = (0..MAX_BROWSER_REPAIR_HIGHLIGHT_CLEANUPS)
+            .map(|_| {
+                bridge
+                    .host_controls
+                    .try_admit_repair_cleanup()
+                    .expect("bounded slot remains available")
+            })
+            .collect();
+        assert!(bridge.host_controls.try_admit_repair_cleanup().is_none());
+        drop(admissions);
+        assert_eq!(
+            bridge
+                .host_controls
+                .repair_cleanup_admissions
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(bridge.host_controls.try_admit_repair_cleanup().is_some());
+    }
+
     fn forged_request(
         workspace_key: BrowserWorkspaceKey,
         command: BrowserCommand,
@@ -2189,6 +3033,7 @@ mod secure_command_tests {
                 registration_lease: None,
                 replay_secret_sidecar,
                 replay_repair_sidecar: None,
+                replay_repair_preview_sidecar: None,
                 response,
                 pending_work: pending_work.track(),
             },
@@ -2226,6 +3071,7 @@ mod secure_command_tests {
                 registration_lease: None,
                 replay_secret_sidecar: None,
                 replay_repair_sidecar: Some(BrowserReplayRepairRetentionSidecar { authority }),
+                replay_repair_preview_sidecar: None,
                 response,
                 pending_work: pending_work.track(),
             },

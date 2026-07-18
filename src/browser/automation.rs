@@ -1,6 +1,6 @@
 use super::{
-    BrowserBounds, BrowserElementRef, BrowserLocator, BrowserRevision, BrowserRisk,
-    BrowserWorkspaceSnapshot,
+    BrowserBounds, BrowserElementRef, BrowserError, BrowserLocator, BrowserRecipeLocator,
+    BrowserRevision, BrowserRisk, BrowserWorkspaceSnapshot,
 };
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,35 @@ static BARE_CREDENTIAL: LazyLock<regex::Regex> = LazyLock::new(|| {
 pub const MAX_BROWSER_ACTIONS: usize = 32;
 pub const MAX_BROWSER_JOURNAL_ENTRIES: usize = 100;
 pub const REDACTED_VALUE: &str = "[redacted]";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrowserReplayRepairCandidate {
+    element_ref: BrowserElementRef,
+}
+
+impl BrowserReplayRepairCandidate {
+    pub fn new(element_ref: BrowserElementRef) -> Self {
+        Self { element_ref }
+    }
+
+    pub fn element_ref(&self) -> &BrowserElementRef {
+        &self.element_ref
+    }
+
+    pub(crate) fn validated_recipe_locator(&self) -> Result<BrowserRecipeLocator, BrowserError> {
+        let locator = BrowserRecipeLocator::from(self.element_ref.locator.clone());
+        let encoded = serde_json::to_value(locator).map_err(|_| BrowserError::InvalidRecipe {
+            message: "repair candidate locator is invalid".to_string(),
+        })?;
+        serde_json::from_value(encoded).map_err(|_| BrowserError::InvalidRecipe {
+            message: "repair candidate locator is invalid".to_string(),
+        })
+    }
+
+    pub(crate) fn action_target(&self) -> BrowserActionTarget {
+        BrowserActionTarget::from_element_ref(self.element_ref.clone())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, rmcp::schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

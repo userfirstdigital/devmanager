@@ -47,10 +47,10 @@ pub use automation::{
     BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry, BrowserConsoleOperation,
     BrowserDownloadEntry, BrowserDownloadOperation, BrowserLocatorStrategy, BrowserNetworkEntry,
     BrowserNetworkOperation, BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
-    BrowserRawSemanticElement, BrowserRedactedAction, BrowserRuntimeTarget, BrowserScreenshotMode,
-    BrowserSemanticElement, BrowserSemanticSnapshot, BrowserSnapshotSummary,
-    BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition, BrowserWaitResult,
-    MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
+    BrowserRawSemanticElement, BrowserRedactedAction, BrowserReplayRepairCandidate,
+    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSemanticElement, BrowserSemanticSnapshot,
+    BrowserSnapshotSummary, BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition,
+    BrowserWaitResult, MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
 };
 pub use commands::{
     browser_command_channel, browser_lifecycle_control, browser_operation_target_tab_id,
@@ -62,8 +62,9 @@ pub use commands::{
     BrowserRecordingOperation, BrowserRecordingResult, BrowserResponse, BrowserUserInputKind,
 };
 pub(crate) use commands::{
-    validate_direct_secret_command, verified_authenticated_local_project_root,
-    BrowserRegistrationLease,
+    validate_direct_repair_preview_command, validate_direct_secret_command,
+    verified_authenticated_local_project_root, BrowserRegistrationLease,
+    BrowserReplayRepairCleanupWork,
 };
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,

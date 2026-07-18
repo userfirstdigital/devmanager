@@ -6,6 +6,9 @@ use crate::browser::downloads::{
     prepare_verified_storage_layout, verified_app_config_root, verified_unique_download_path,
     verify_prepared_storage_root,
 };
+use crate::browser::replay_repair::{
+    BrowserReplayRepairHighlightToken, BrowserReplayRepairPreviewAuthority,
+};
 use crate::browser::{
     apply_browser_workflow_review_mutation, browser_cdp_method_risk, browser_lifecycle_control,
     browser_operation_target_tab_id, browser_page_origin_from_url, browser_recording_review_result,
@@ -18,27 +21,28 @@ use crate::browser::{
     prepare_verified_download_root, preview_browser_workflow_review,
     recording_resource_unavailable, redact_browser_resource_bytes, redact_browser_text,
     remove_verified_profile, save_browser_recording_review, save_browser_workflow_review,
-    validate_annotation_candidate_context, validate_direct_secret_command, BrowserAction,
-    BrowserActionResult, BrowserActionTarget, BrowserAnnotationCandidate,
-    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationLifecycle,
-    BrowserAnnotationRoute, BrowserApprovalPolicy, BrowserApprovalRequest,
-    BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandRequest,
-    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostStatus,
-    BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry, BrowserLocatorFailureTarget,
-    BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget,
-    BrowserPageIpcMessage, BrowserPageLoadState, BrowserPageRecordingAuthority,
-    BrowserPageRecordingEnvelope, BrowserPageRecordingIngress, BrowserPageRecordingIpc,
-    BrowserPageRecordingIpcError, BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
-    BrowserPageRecordingTransportFailureKind, BrowserPaneSurface, BrowserPerformanceOperation,
-    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
-    BrowserRecordingInstance, BrowserRecordingOperation, BrowserRecordingReview,
-    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision,
-    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout,
-    BrowserUploadResult, BrowserWaitResult, BrowserWorkflowCoordinator,
-    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
+    validate_annotation_candidate_context, validate_direct_repair_preview_command,
+    validate_direct_secret_command, BrowserAction, BrowserActionResult, BrowserActionTarget,
+    BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDraft,
+    BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
+    BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
+    BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
+    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
+    BrowserLocatorFailureTarget, BrowserNetworkEntry, BrowserNetworkOperation,
+    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
+    BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingSubmit,
+    BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind, BrowserPaneSurface,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
+    BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance, BrowserRecordingOperation,
+    BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRuntimeTarget,
+    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
+    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
+    BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -51,7 +55,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
     COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE,
@@ -88,6 +92,10 @@ struct BrowserDocumentSecretInner {
     exposure_generation: u64,
     in_flight_exposures: usize,
     latest_content_loading: Option<BrowserDocumentNavigationCandidate>,
+    document_generation: u64,
+    repair_highlight_token: Option<BrowserReplayRepairHighlightToken>,
+    repair_highlight_previous_token: Option<BrowserReplayRepairHighlightToken>,
+    repair_highlight_previous_consumed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -156,6 +164,10 @@ impl BrowserDocumentSecretState {
 
     fn content_loading(&self, navigation_id: u64, is_error_page: bool) {
         if let Ok(mut inner) = self.inner.lock() {
+            inner.document_generation = inner.document_generation.saturating_add(1);
+            inner.repair_highlight_token = None;
+            inner.repair_highlight_previous_token = None;
+            inner.repair_highlight_previous_consumed = false;
             inner.latest_content_loading = Some(BrowserDocumentNavigationCandidate {
                 navigation_id,
                 exposure_generation: inner.exposure_generation,
@@ -164,8 +176,130 @@ impl BrowserDocumentSecretState {
         }
     }
 
+    fn document_generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .map_or(u64::MAX, |inner| inner.document_generation)
+    }
+
+    fn invalidate_repair_highlight(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.document_generation = inner.document_generation.saturating_add(1);
+            inner.repair_highlight_token = None;
+            inner.repair_highlight_previous_token = None;
+            inner.repair_highlight_previous_consumed = false;
+        }
+    }
+
+    fn install_repair_highlight(
+        &self,
+        document_generation: u64,
+        expected_previous: Option<&BrowserReplayRepairHighlightToken>,
+        token: &BrowserReplayRepairHighlightToken,
+    ) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if inner.document_generation != document_generation
+            || inner.repair_highlight_token.as_ref() != expected_previous
+        {
+            return false;
+        }
+        inner.repair_highlight_previous_token = expected_previous.cloned();
+        inner.repair_highlight_previous_consumed = false;
+        inner.repair_highlight_token = Some(token.clone());
+        true
+    }
+
+    fn repair_highlight_cleanup_restore(
+        &self,
+        document_generation: u64,
+        token: &BrowserReplayRepairHighlightToken,
+        requested: Option<&BrowserReplayRepairHighlightToken>,
+    ) -> Option<Option<BrowserReplayRepairHighlightToken>> {
+        let inner = self.inner.lock().ok()?;
+        if inner.document_generation != document_generation {
+            return None;
+        }
+        if inner.repair_highlight_token.as_ref() != Some(token) {
+            return Some(requested.cloned());
+        }
+        let restore = requested.filter(|restore| {
+            inner.repair_highlight_previous_token.as_ref() == Some(*restore)
+                && !inner.repair_highlight_previous_consumed
+        });
+        Some(restore.cloned())
+    }
+
+    fn acknowledge_repair_highlight_clear(
+        &self,
+        document_generation: u64,
+        token: &BrowserReplayRepairHighlightToken,
+        restore: Option<&BrowserReplayRepairHighlightToken>,
+        page_cleared: bool,
+        page_predecessor_consumed: bool,
+        page_resulting_token: Option<&str>,
+    ) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if inner.document_generation != document_generation {
+            return false;
+        }
+        let desired_wire = restore.map(BrowserReplayRepairHighlightToken::wire);
+        if page_cleared {
+            let restoring_consumed_predecessor = restore.is_some()
+                && inner.repair_highlight_previous_token.as_ref() == restore
+                && inner.repair_highlight_previous_consumed;
+            if page_predecessor_consumed
+                || restoring_consumed_predecessor
+                || page_resulting_token != desired_wire
+            {
+                return false;
+            }
+        } else {
+            let current_wire = inner
+                .repair_highlight_token
+                .as_ref()
+                .map(BrowserReplayRepairHighlightToken::wire);
+            if page_resulting_token != current_wire || page_resulting_token == Some(token.wire()) {
+                return false;
+            }
+            let is_predecessor = inner.repair_highlight_previous_token.as_ref() == Some(token);
+            if page_predecessor_consumed != is_predecessor {
+                return false;
+            }
+            if is_predecessor {
+                inner.repair_highlight_previous_consumed = true;
+            }
+            return true;
+        }
+
+        if page_resulting_token == desired_wire {
+            if inner.repair_highlight_token.as_ref() == Some(token)
+                || inner.repair_highlight_token.as_ref() == restore
+            {
+                inner.repair_highlight_token = restore.cloned();
+                inner.repair_highlight_previous_token = None;
+                inner.repair_highlight_previous_consumed = false;
+                return true;
+            }
+            return false;
+        }
+
+        inner
+            .repair_highlight_token
+            .as_ref()
+            .map(BrowserReplayRepairHighlightToken::wire)
+            == page_resulting_token
+    }
+
     fn navigation_completed(&self, navigation_id: u64, is_success: bool) {
         if let Ok(mut inner) = self.inner.lock() {
+            inner.document_generation = inner.document_generation.saturating_add(1);
+            inner.repair_highlight_token = None;
+            inner.repair_highlight_previous_token = None;
+            inner.repair_highlight_previous_consumed = false;
             let Some(candidate) = inner.latest_content_loading else {
                 return;
             };
@@ -187,6 +321,7 @@ impl BrowserDocumentSecretState {
 const WORKSPACE_OPERATION_TAB: &str = "__workspace__";
 const INLINE_RESULT_LIMIT: usize = 8 * 1024;
 const MAX_BROWSER_PAGE_RECORDING_QUEUE: usize = 256;
+const REPAIR_HIGHLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const SECRET_TYPE_CALLBACK_OK: &str = r#""secret_type_ok""#;
 const SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND: &str = r#""element_not_found""#;
 const SECRET_TYPE_CALLBACK_TARGET_CHANGED: &str = r#""target_changed""#;
@@ -293,6 +428,15 @@ enum BrowserAsyncPhase {
         paths: Vec<PathBuf>,
         token: String,
     },
+    RepairHighlight {
+        document_generation: u64,
+        authority: BrowserReplayRepairPreviewAuthority,
+    },
+    RepairRollbackHighlight {
+        document_generation: u64,
+        authority: BrowserReplayRepairPreviewAuthority,
+        failure: BrowserError,
+    },
     Cdp,
 }
 
@@ -311,10 +455,60 @@ struct ActiveBrowserRequest {
     _started_at: Instant,
 }
 
+enum BrowserQueuedWork {
+    Request(BrowserCommandRequest),
+    RepairCleanup(BrowserReplayRepairCleanupWork),
+}
+
 struct BrowserAsyncCompletion {
     target: BrowserOperationTarget,
     operation_id: String,
     result: Result<String, String>,
+    repair_highlight_authority: Option<BrowserReplayRepairPreviewAuthority>,
+    repair_highlight_document_generation: Option<u64>,
+    repair_highlight_rollback: bool,
+    repair_cleanup: Option<BrowserRepairCleanupCallbackAuthority>,
+}
+
+struct BrowserRepairCleanupCallbackAuthority {
+    document_generation: u64,
+    token: BrowserReplayRepairHighlightToken,
+    restore: Option<BrowserReplayRepairHighlightToken>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairCleanupEvent {
+    ScheduleFailed,
+    Callback { exact: bool },
+    Pump { now: Instant, deadline: Instant },
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairCleanupDisposition {
+    AwaitCallback,
+    FinishExact,
+    Quarantine,
+}
+
+fn repair_cleanup_disposition(event: RepairCleanupEvent) -> RepairCleanupDisposition {
+    match event {
+        RepairCleanupEvent::Callback { exact: true } => RepairCleanupDisposition::FinishExact,
+        RepairCleanupEvent::Pump { now, deadline } if now < deadline => {
+            RepairCleanupDisposition::AwaitCallback
+        }
+        RepairCleanupEvent::ScheduleFailed
+        | RepairCleanupEvent::Callback { exact: false }
+        | RepairCleanupEvent::Pump { .. }
+        | RepairCleanupEvent::Interrupted => RepairCleanupDisposition::Quarantine,
+    }
+}
+
+struct ActiveRepairCleanup {
+    work: BrowserReplayRepairCleanupWork,
+    document_generation: u64,
+    deadline: Instant,
+    in_flight: bool,
 }
 
 struct PendingAnnotationCapture {
@@ -341,6 +535,23 @@ struct BrowserScriptEnvelope {
     error: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RepairClearAcknowledgement {
+    token: String,
+    cleared: bool,
+    restored: bool,
+    #[serde(default, rename = "predecessorConsumed")]
+    predecessor_consumed: bool,
+    #[serde(rename = "resultingToken")]
+    resulting_token: Option<String>,
+}
+
+fn repair_clear_acknowledgement(raw: &str) -> Option<RepairClearAcknowledgement> {
+    script_value(raw)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 struct BrowserProjectRuntime {
     context: WebContext,
 }
@@ -359,8 +570,9 @@ pub struct BrowserWebViewHost {
     recording_ingresses: HashMap<BrowserViewKey, BrowserPageRecordingIngress>,
     workflow_coordinator: BrowserWorkflowCoordinator,
     recording_views: HashMap<BrowserViewKey, BrowserPageRecordingIpc>,
-    operation_queue: BrowserOperationQueue<BrowserCommandRequest>,
+    operation_queue: BrowserOperationQueue<BrowserQueuedWork>,
     active_requests: HashMap<BrowserOperationTarget, ActiveBrowserRequest>,
+    active_repair_cleanups: HashMap<BrowserOperationTarget, ActiveRepairCleanup>,
     async_sender: Sender<BrowserAsyncCompletion>,
     async_receiver: Receiver<BrowserAsyncCompletion>,
     annotation_lifecycle: BrowserAnnotationLifecycle,
@@ -454,6 +666,7 @@ impl BrowserWebViewHost {
             recording_views: HashMap::new(),
             operation_queue: BrowserOperationQueue::default(),
             active_requests: HashMap::new(),
+            active_repair_cleanups: HashMap::new(),
             async_sender,
             async_receiver,
             annotation_lifecycle: BrowserAnnotationLifecycle::default(),
@@ -657,6 +870,7 @@ impl BrowserWebViewHost {
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
         validate_direct_secret_command(&command)?;
+        validate_direct_repair_preview_command(&command)?;
         self.pump_page_recording_ipc();
         self.handle_command_with_user_capture(window, workspace_key, command, true)
     }
@@ -769,6 +983,10 @@ impl BrowserWebViewHost {
             request.respond(Err(error));
             return;
         }
+        if let Err(error) = request.validate_repair_preview_sidecar() {
+            request.respond(Err(error));
+            return;
+        }
         if !request.cancellation_is_current() {
             request.respond(Err(BrowserError::Interrupted));
             return;
@@ -787,7 +1005,11 @@ impl BrowserWebViewHost {
                 return;
             }
         }
-        if request.context().actor != BrowserInvocationActor::Agent
+        let repair_preview_marker = matches!(
+            &command,
+            BrowserCommand::RepairHighlight { .. } | BrowserCommand::RepairClearHighlight { .. }
+        );
+        if (request.context().actor != BrowserInvocationActor::Agent && !repair_preview_marker)
             || browser_request_preempts_operation_queue(&command)
         {
             let capture_user_chrome = request.context().actor == BrowserInvocationActor::User;
@@ -802,11 +1024,32 @@ impl BrowserWebViewHost {
         }
         let target = self.operation_target(&workspace_key, &command);
         let operation_id = request.context().operation_id.clone();
-        if let Some(request) = self
-            .operation_queue
-            .enqueue(target.clone(), operation_id, request)
-        {
-            self.start_queued_request(window, target, request);
+        if let Some(work) = self.operation_queue.enqueue(
+            target.clone(),
+            operation_id,
+            BrowserQueuedWork::Request(request),
+        ) {
+            self.start_queued_work(window, target, work);
+        }
+    }
+
+    pub(crate) fn handle_repair_highlight_cleanup(
+        &mut self,
+        window: &gpui::Window,
+        cleanup: BrowserReplayRepairCleanupWork,
+    ) {
+        let Ok(target) =
+            BrowserOperationTarget::new(cleanup.workspace_key().clone(), cleanup.tab_id())
+        else {
+            return;
+        };
+        let operation_id = cleanup.context().operation_id.clone();
+        if let Some(work) = self.operation_queue.enqueue(
+            target.clone(),
+            operation_id,
+            BrowserQueuedWork::RepairCleanup(cleanup),
+        ) {
+            self.start_queued_work(window, target, work);
         }
     }
 
@@ -819,6 +1062,7 @@ impl BrowserWebViewHost {
         for completion in annotation_completions {
             self.complete_annotation_capture(completion);
         }
+        self.pump_repair_highlight_cleanups(window);
     }
 
     fn operation_target(
@@ -830,6 +1074,22 @@ impl BrowserWebViewHost {
         let tab_id = browser_operation_target_tab_id(command, selected_tab_id.as_deref());
         BrowserOperationTarget::new(workspace_key.clone(), tab_id)
             .expect("host operation target always has a nonblank tab id")
+    }
+
+    fn start_queued_work(
+        &mut self,
+        window: &gpui::Window,
+        target: BrowserOperationTarget,
+        work: BrowserQueuedWork,
+    ) {
+        match work {
+            BrowserQueuedWork::Request(request) => {
+                self.start_queued_request(window, target, request)
+            }
+            BrowserQueuedWork::RepairCleanup(cleanup) => {
+                self.start_repair_highlight_cleanup(target, cleanup)
+            }
+        }
     }
 
     fn start_queued_request(
@@ -854,6 +1114,10 @@ impl BrowserWebViewHost {
             return;
         }
         if let Err(error) = request.validate_repair_retention_sidecar() {
+            self.finish_queued_request(window, target, operation_id, request, Err(error));
+            return;
+        }
+        if let Err(error) = request.validate_repair_preview_sidecar() {
             self.finish_queued_request(window, target, operation_id, request, Err(error));
             return;
         }
@@ -935,7 +1199,7 @@ impl BrowserWebViewHost {
     ) {
         self.respond_request(request, result);
         if let Some(next) = self.operation_queue.complete(&target, &operation_id) {
-            self.start_queued_request(window, target, next);
+            self.start_queued_work(window, target, next);
         }
     }
 
@@ -946,8 +1210,8 @@ impl BrowserWebViewHost {
     ) {
         let workspace_key = request.workspace_key().clone();
         let annotation_command = matches!(request.command(), BrowserCommand::Annotations { .. });
-        let agent_journaled = request.context().actor == BrowserInvocationActor::Agent
-            && browser_command_is_journaled(request.command());
+        let journal_actor =
+            browser_command_journal_actor(request.context().actor, request.command());
         if request.records_workflow_recipe_action() {
             if let Err(error) = self.workflow_coordinator.complete_agent_command(
                 &workspace_key,
@@ -987,7 +1251,7 @@ impl BrowserWebViewHost {
                     });
             }
         }
-        if agent_journaled {
+        if let Some(journal_actor) = journal_actor {
             let tab_id = request
                 .command()
                 .tab_id()
@@ -1008,7 +1272,7 @@ impl BrowserWebViewHost {
             };
             let entry = BrowserJournalEntry {
                 id: request.context().operation_id.clone(),
-                actor: BrowserJournalActor::Agent,
+                actor: journal_actor,
                 intent: request.context().intent.clone(),
                 url,
                 started_at: request.started_at().to_string(),
@@ -1053,7 +1317,7 @@ impl BrowserWebViewHost {
                     );
                 }
             }
-        } else if agent_journaled {
+        } else if journal_actor.is_some() {
             if let Err(error) = self.reconcile_annotation_pins(&workspace_key) {
                 if let Some(tab_id) = self.selected_tab_id(&workspace_key) {
                     self.emit_diagnostic(
@@ -1071,34 +1335,99 @@ impl BrowserWebViewHost {
         let Ok(target) = BrowserOperationTarget::new(workspace_key.clone(), tab_id) else {
             return;
         };
-        let cancellation = self.operation_queue.cancel_tab(&target);
-        if let Some(active) = self.active_requests.remove(&target) {
-            self.respond_request(active.request, Err(BrowserError::Interrupted));
-        }
-        for queued in cancellation.queued {
-            self.respond_request(queued, Err(BrowserError::Interrupted));
-        }
+        self.cancel_target_operations(target);
     }
 
     fn cancel_workspace_operations(&mut self, workspace_key: &BrowserWorkspaceKey) {
-        for (target, cancellation) in self.operation_queue.cancel_workspace(workspace_key) {
-            if let Some(active) = self.active_requests.remove(&target) {
-                self.respond_request(active.request, Err(BrowserError::Interrupted));
-            }
-            for queued in cancellation.queued {
-                self.respond_request(queued, Err(BrowserError::Interrupted));
-            }
+        for target in self.operation_queue.targets_for_workspace(workspace_key) {
+            self.cancel_target_operations(target);
         }
     }
 
     fn cancel_project_operations(&mut self, project_id: &str) {
-        for (target, cancellation) in self.operation_queue.cancel_project(project_id) {
-            if let Some(active) = self.active_requests.remove(&target) {
-                self.respond_request(active.request, Err(BrowserError::Interrupted));
+        for target in self.operation_queue.targets_for_project(project_id) {
+            self.cancel_target_operations(target);
+        }
+    }
+
+    fn cancel_target_operations(&mut self, target: BrowserOperationTarget) {
+        let active_repair_request = self.active_requests.get(&target).is_some_and(|active| {
+            matches!(
+                active.phase,
+                BrowserAsyncPhase::RepairHighlight { .. }
+                    | BrowserAsyncPhase::RepairRollbackHighlight { .. }
+            )
+        });
+        if self.active_repair_cleanups.contains_key(&target) || active_repair_request {
+            if repair_cleanup_disposition(RepairCleanupEvent::Interrupted)
+                == RepairCleanupDisposition::Quarantine
+            {
+                self.quarantine_repair_highlight_cleanup(&target);
             }
-            for queued in cancellation.queued {
-                self.respond_request(queued, Err(BrowserError::Interrupted));
+            return;
+        }
+        let cancellation = self.operation_queue.cancel_tab(&target);
+        if let Some(active) = self.active_requests.remove(&target) {
+            self.respond_request(active.request, Err(BrowserError::Interrupted));
+        }
+        let queued = cancellation.queued;
+
+        let mut repair_cleanups = Vec::new();
+        for queued in queued {
+            match queued {
+                BrowserQueuedWork::Request(request) => {
+                    self.respond_request(request, Err(BrowserError::Interrupted));
+                }
+                BrowserQueuedWork::RepairCleanup(cleanup) => repair_cleanups.push(cleanup),
             }
+        }
+        if !repair_cleanups.is_empty() {
+            self.quarantine_repair_highlight_view(&target);
+            for cleanup in repair_cleanups {
+                self.append_repair_highlight_cleanup_journal(&cleanup);
+            }
+        }
+    }
+
+    fn terminalize_repair_preview_target(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+    ) {
+        let Ok(target) = BrowserOperationTarget::new(workspace_key.clone(), tab_id) else {
+            return;
+        };
+        let cancellation = self.operation_queue.cancel_tab(&target);
+        if let Some(active) = self.active_requests.remove(&target) {
+            self.respond_request(active.request, Err(BrowserError::Interrupted));
+        }
+        if let Some(active) = self.active_repair_cleanups.remove(&target) {
+            self.append_repair_highlight_cleanup_journal(&active.work);
+        }
+        for queued in cancellation.queued {
+            match queued {
+                BrowserQueuedWork::Request(request) => {
+                    self.respond_request(request, Err(BrowserError::Interrupted));
+                }
+                BrowserQueuedWork::RepairCleanup(cleanup) => {
+                    self.append_repair_highlight_cleanup_journal(&cleanup);
+                }
+            }
+        }
+    }
+
+    fn terminalize_repair_preview_workspace(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        let targets = self.operation_queue.targets_for_workspace(workspace_key);
+        for target in targets {
+            self.terminalize_repair_preview_target(workspace_key, &target.tab_id);
+        }
+    }
+
+    fn terminalize_repair_preview_project(&mut self, project_id: &str) {
+        let targets = self.operation_queue.targets_for_project(project_id);
+        for target in targets {
+            let workspace_key = target.workspace_key.clone();
+            self.terminalize_repair_preview_target(&workspace_key, &target.tab_id);
         }
     }
 
@@ -1256,6 +1585,8 @@ impl BrowserWebViewHost {
                 | BrowserCommand::Console { .. }
                 | BrowserCommand::Network { .. }
                 | BrowserCommand::Performance { .. }
+                | BrowserCommand::RepairHighlight { .. }
+                | BrowserCommand::RepairClearHighlight { .. }
                 | BrowserCommand::Cdp { .. }
         ) {
             if let Err(error) = self.ensure_document_content_available(workspace_key, tab_id) {
@@ -1288,6 +1619,70 @@ impl BrowserWebViewHost {
             );
         }
         match command {
+            BrowserCommand::RepairHighlight { .. } => {
+                let authority = match request.repair_preview_highlight_authority() {
+                    Some(authority) if authority.is_live() => authority.clone(),
+                    _ => {
+                        return BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
+                            field: "repairPreviewSidecar".to_string(),
+                        }))
+                    }
+                };
+                let current_revision = self
+                    .state
+                    .workspace(workspace_key)
+                    .map(|snapshot| snapshot.revision)
+                    .unwrap_or(BrowserRevision(0));
+                if current_revision != authority.revision() {
+                    return BrowserStartResult::Complete(Err(BrowserError::StaleReference {
+                        expected: authority.revision(),
+                        actual: current_revision,
+                    }));
+                }
+                let action_target = authority.candidate().action_target();
+                let target_json = match serde_json::to_string(&action_target) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
+                            field: "repairPreviewSidecar".to_string(),
+                        }))
+                    }
+                };
+                let token_json = serde_json::to_string(authority.token().wire())
+                    .expect("opaque repair preview token is serializable");
+                let previous_json = authority
+                    .expected_previous_token()
+                    .map(|token| {
+                        serde_json::to_string(token.wire())
+                            .expect("opaque repair preview token is serializable")
+                    })
+                    .unwrap_or_else(|| "null".to_string());
+                let document_generation = self
+                    .document_secret_states
+                    .get(&view_key(workspace_key, tab_id))
+                    .map(|state| state.document_generation())
+                    .unwrap_or(u64::MAX);
+                start_result(
+                    self.start_repair_highlight_script(
+                        target,
+                        &operation_id,
+                        &format!(
+                            "window.__devmanagerBrowser.repairHighlight.install({target_json}, {token_json}, {previous_json})"
+                        ),
+                        authority.clone(),
+                        document_generation,
+                    ),
+                    BrowserAsyncPhase::RepairHighlight {
+                        document_generation,
+                        authority,
+                    },
+                )
+            }
+            BrowserCommand::RepairClearHighlight { .. } => {
+                BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
+                    field: "repairPreviewSidecar".to_string(),
+                }))
+            }
             BrowserCommand::SecretType {
                 target: action_target,
                 ..
@@ -1703,6 +2098,123 @@ impl BrowserWebViewHost {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
                     result: Ok(result),
+                    repair_highlight_authority: None,
+                    repair_highlight_document_generation: None,
+                    repair_highlight_rollback: false,
+                    repair_cleanup: None,
+                });
+            })
+            .map_err(view_failure)
+    }
+
+    fn start_repair_highlight_script(
+        &self,
+        target: &BrowserOperationTarget,
+        operation_id: &str,
+        expression: &str,
+        authority: BrowserReplayRepairPreviewAuthority,
+        document_generation: u64,
+    ) -> Result<(), BrowserError> {
+        let sender = self.async_sender.clone();
+        let callback_target = target.clone();
+        let callback_operation_id = operation_id.to_string();
+        let callback_authority = authority.clone();
+        let script = format!(
+            r#"(async () => {{
+              try {{
+                const value = await ({expression});
+                return {{ ok: true, value }};
+              }} catch (_) {{
+                return {{ ok: false, error: "automation_failed" }};
+              }}
+            }})()"#
+        );
+        self.view(&target.workspace_key, &target.tab_id)?
+            .evaluate_script_with_callback(&script, move |result| {
+                let _ = sender.send(BrowserAsyncCompletion {
+                    target: callback_target.clone(),
+                    operation_id: callback_operation_id.clone(),
+                    result: Ok(result),
+                    repair_highlight_authority: Some(callback_authority.clone()),
+                    repair_highlight_document_generation: Some(document_generation),
+                    repair_highlight_rollback: false,
+                    repair_cleanup: None,
+                });
+            })
+            .map_err(view_failure)
+    }
+
+    fn start_repair_highlight_rollback_script(
+        &self,
+        target: &BrowserOperationTarget,
+        operation_id: &str,
+        expression: &str,
+        authority: BrowserReplayRepairPreviewAuthority,
+        document_generation: u64,
+    ) -> Result<(), BrowserError> {
+        let sender = self.async_sender.clone();
+        let callback_target = target.clone();
+        let callback_operation_id = operation_id.to_string();
+        let callback_authority = authority.clone();
+        let script = format!(
+            r#"(async () => {{
+              try {{
+                const value = await ({expression});
+                return {{ ok: true, value }};
+              }} catch (_) {{
+                return {{ ok: false, error: "automation_failed" }};
+              }}
+            }})()"#
+        );
+        self.view(&target.workspace_key, &target.tab_id)?
+            .evaluate_script_with_callback(&script, move |result| {
+                let _ = sender.send(BrowserAsyncCompletion {
+                    target: callback_target.clone(),
+                    operation_id: callback_operation_id.clone(),
+                    result: Ok(result),
+                    repair_highlight_authority: Some(callback_authority.clone()),
+                    repair_highlight_document_generation: Some(document_generation),
+                    repair_highlight_rollback: true,
+                    repair_cleanup: None,
+                });
+            })
+            .map_err(view_failure)
+    }
+
+    fn start_repair_cleanup_script(
+        &self,
+        target: &BrowserOperationTarget,
+        operation_id: &str,
+        expression: &str,
+        authority: BrowserRepairCleanupCallbackAuthority,
+    ) -> Result<(), BrowserError> {
+        let sender = self.async_sender.clone();
+        let callback_target = target.clone();
+        let callback_operation_id = operation_id.to_string();
+        let script = format!(
+            r#"(async () => {{
+              try {{
+                const value = await ({expression});
+                return {{ ok: true, value }};
+              }} catch (_) {{
+                return {{ ok: false, error: "automation_failed" }};
+              }}
+            }})()"#
+        );
+        self.view(&target.workspace_key, &target.tab_id)?
+            .evaluate_script_with_callback(&script, move |result| {
+                let _ = sender.send(BrowserAsyncCompletion {
+                    target: callback_target.clone(),
+                    operation_id: callback_operation_id.clone(),
+                    result: Ok(result),
+                    repair_highlight_authority: None,
+                    repair_highlight_document_generation: None,
+                    repair_highlight_rollback: false,
+                    repair_cleanup: Some(BrowserRepairCleanupCallbackAuthority {
+                        document_generation: authority.document_generation,
+                        token: authority.token.clone(),
+                        restore: authority.restore.clone(),
+                    }),
                 });
             })
             .map_err(view_failure)
@@ -1728,6 +2240,10 @@ impl BrowserWebViewHost {
                     target: callback_target.clone(),
                     operation_id: callback_operation_id.clone(),
                     result,
+                    repair_highlight_authority: None,
+                    repair_highlight_document_generation: None,
+                    repair_highlight_rollback: false,
+                    repair_cleanup: None,
                 });
                 Ok(())
             }));
@@ -1892,8 +2408,33 @@ impl BrowserWebViewHost {
     fn complete_async_operation(
         &mut self,
         window: &gpui::Window,
-        completion: BrowserAsyncCompletion,
+        mut completion: BrowserAsyncCompletion,
     ) {
+        if let (Some(authority), Some(document_generation)) = (
+            completion.repair_highlight_authority.clone(),
+            completion.repair_highlight_document_generation,
+        ) {
+            if completion.repair_highlight_rollback {
+                self.complete_repair_highlight_rollback(
+                    window,
+                    completion,
+                    authority,
+                    document_generation,
+                );
+            } else {
+                self.complete_repair_highlight_operation(
+                    window,
+                    completion,
+                    authority,
+                    document_generation,
+                );
+            }
+            return;
+        }
+        if let Some(authority) = completion.repair_cleanup.take() {
+            self.complete_repair_cleanup_operation(window, completion, authority);
+            return;
+        }
         if self.operation_queue.active_operation_id(&completion.target)
             != Some(completion.operation_id.as_str())
         {
@@ -2193,6 +2734,12 @@ impl BrowserWebViewHost {
                 paths,
                 token: _token,
             } => self.complete_upload(&active.request, &raw, paths),
+            BrowserAsyncPhase::RepairHighlight { .. }
+            | BrowserAsyncPhase::RepairRollbackHighlight { .. } => {
+                Err(BrowserError::InvalidInvocation {
+                    field: "repairPreviewSidecar".to_string(),
+                })
+            }
             BrowserAsyncPhase::Cdp => self.complete_cdp(&active.request, &raw),
         };
         self.finish_queued_request(
@@ -2202,6 +2749,572 @@ impl BrowserWebViewHost {
             active.request,
             result,
         );
+    }
+
+    fn complete_repair_highlight_operation(
+        &mut self,
+        window: &gpui::Window,
+        completion: BrowserAsyncCompletion,
+        authority: BrowserReplayRepairPreviewAuthority,
+        document_generation: u64,
+    ) {
+        #[derive(Deserialize)]
+        struct HighlightAcknowledgement {
+            token: String,
+            installed: bool,
+        }
+
+        if self.operation_queue.active_operation_id(&completion.target)
+            != Some(completion.operation_id.as_str())
+        {
+            return;
+        }
+        let Some(mut active) = self.active_requests.remove(&completion.target) else {
+            return;
+        };
+        let operation_id = completion.operation_id;
+        let exact_phase = matches!(
+            &active.phase,
+            BrowserAsyncPhase::RepairHighlight {
+                document_generation: phase_generation,
+                authority: phase_authority,
+            } if *phase_generation == document_generation
+                && phase_authority.token() == authority.token()
+        );
+        if !exact_phase {
+            self.finish_queued_request(
+                window,
+                completion.target,
+                operation_id,
+                active.request,
+                Err(BrowserError::InvalidInvocation {
+                    field: "repairPreviewSidecar".to_string(),
+                }),
+            );
+            return;
+        }
+
+        // The page acknowledgement is authenticated before any mutable native state is touched.
+        let page_acknowledged = completion
+            .result
+            .as_ref()
+            .ok()
+            .and_then(|raw| script_value(raw).ok())
+            .and_then(|value| serde_json::from_value::<HighlightAcknowledgement>(value).ok())
+            .is_some_and(|ack| ack.installed && ack.token == authority.token().wire());
+        let cancellation_current = active.request.cancellation_is_current();
+        let sidecar_valid = active.request.validate_repair_preview_sidecar().is_ok()
+            && active
+                .request
+                .repair_preview_highlight_authority()
+                .is_some_and(|request_authority| {
+                    request_authority.token() == authority.token() && request_authority.is_live()
+                });
+        let actual_revision = self
+            .state
+            .workspace(active.request.workspace_key())
+            .map(|snapshot| snapshot.revision)
+            .unwrap_or(BrowserRevision(0));
+        let revision_current = actual_revision == authority.revision();
+        let document_state = self
+            .document_secret_states
+            .get(&view_key(
+                active.request.workspace_key(),
+                &completion.target.tab_id,
+            ))
+            .cloned();
+        let document_current = document_state
+            .as_ref()
+            .is_some_and(|state| state.document_generation() == document_generation);
+        let native_installed = page_acknowledged
+            && cancellation_current
+            && sidecar_valid
+            && exact_phase
+            && revision_current
+            && document_current
+            && document_state.as_ref().is_some_and(|state| {
+                state.install_repair_highlight(
+                    document_generation,
+                    authority.expected_previous_token(),
+                    authority.token(),
+                )
+            });
+        let receipt_acknowledged =
+            native_installed && authority.acknowledge_exact(authority.token().wire());
+        if receipt_acknowledged {
+            self.finish_queued_request(
+                window,
+                completion.target,
+                operation_id,
+                active.request,
+                Ok(BrowserResponse::Acknowledged),
+            );
+            return;
+        }
+
+        let failure = repair_highlight_failure(
+            cancellation_current,
+            revision_current,
+            document_current,
+            authority.revision(),
+            actual_revision,
+        );
+        active.phase = BrowserAsyncPhase::RepairRollbackHighlight {
+            document_generation,
+            authority: authority.clone(),
+            failure: failure.clone(),
+        };
+        self.active_requests
+            .insert(completion.target.clone(), active);
+        if self
+            .start_repair_highlight_rollback(
+                &completion.target,
+                &operation_id,
+                document_generation,
+                &authority,
+            )
+            .is_err()
+        {
+            let active = self
+                .active_requests
+                .remove(&completion.target)
+                .expect("rollback request was retained above");
+            self.finish_queued_request(
+                window,
+                completion.target,
+                operation_id,
+                active.request,
+                Err(failure),
+            );
+        }
+    }
+
+    fn complete_repair_highlight_rollback(
+        &mut self,
+        window: &gpui::Window,
+        completion: BrowserAsyncCompletion,
+        authority: BrowserReplayRepairPreviewAuthority,
+        document_generation: u64,
+    ) {
+        if self.operation_queue.active_operation_id(&completion.target)
+            != Some(completion.operation_id.as_str())
+        {
+            return;
+        }
+        let Some(active) = self.active_requests.remove(&completion.target) else {
+            return;
+        };
+        let exact_phase = matches!(
+            &active.phase,
+            BrowserAsyncPhase::RepairRollbackHighlight {
+                document_generation: phase_generation,
+                authority: phase_authority,
+                ..
+            } if *phase_generation == document_generation
+                && phase_authority.token() == authority.token()
+        );
+        let failure = match &active.phase {
+            BrowserAsyncPhase::RepairRollbackHighlight { failure, .. } => failure.clone(),
+            _ => BrowserError::InvalidInvocation {
+                field: "repairPreviewSidecar".to_string(),
+            },
+        };
+        let expected_result = authority
+            .expected_previous_token()
+            .map(BrowserReplayRepairHighlightToken::wire);
+        let acknowledgement = completion
+            .result
+            .as_deref()
+            .ok()
+            .and_then(repair_clear_acknowledgement);
+        let page_acknowledged = exact_phase
+            && acknowledgement.as_ref().is_some_and(|ack| {
+                ack.token == authority.token().wire()
+                    && ack.cleared
+                    && ack.restored == authority.expected_previous_token().is_some()
+                    && !ack.predecessor_consumed
+                    && ack.resulting_token.as_deref() == expected_result
+            });
+        if page_acknowledged {
+            if let Some(state) = self.document_secret_states.get(&view_key(
+                &completion.target.workspace_key,
+                &completion.target.tab_id,
+            )) {
+                if state.document_generation() == document_generation {
+                    let _ = state.acknowledge_repair_highlight_clear(
+                        document_generation,
+                        authority.token(),
+                        authority.expected_previous_token(),
+                        true,
+                        false,
+                        expected_result,
+                    );
+                }
+            }
+        }
+        self.finish_queued_request(
+            window,
+            completion.target,
+            completion.operation_id,
+            active.request,
+            Err(failure),
+        );
+    }
+
+    fn complete_repair_cleanup_operation(
+        &mut self,
+        window: &gpui::Window,
+        completion: BrowserAsyncCompletion,
+        authority: BrowserRepairCleanupCallbackAuthority,
+    ) {
+        if self.operation_queue.active_operation_id(&completion.target)
+            != Some(completion.operation_id.as_str())
+        {
+            return;
+        }
+        let exact_active = self
+            .active_repair_cleanups
+            .get(&completion.target)
+            .is_some_and(|active| {
+                active.document_generation == authority.document_generation
+                    && active.work.token() == &authority.token
+                    && active.in_flight
+            });
+        if !exact_active {
+            return;
+        }
+        if self
+            .active_repair_cleanups
+            .get(&completion.target)
+            .is_some_and(|active| Instant::now() >= active.deadline)
+        {
+            self.quarantine_repair_highlight_cleanup(&completion.target);
+            return;
+        }
+        if let Some(active) = self.active_repair_cleanups.get_mut(&completion.target) {
+            active.in_flight = false;
+        }
+
+        let document_state = self
+            .document_secret_states
+            .get(&view_key(
+                &completion.target.workspace_key,
+                &completion.target.tab_id,
+            ))
+            .cloned();
+        if document_state
+            .as_ref()
+            .is_none_or(|state| state.document_generation() != authority.document_generation)
+        {
+            self.finish_repair_highlight_cleanup(
+                window,
+                completion.target,
+                completion.operation_id,
+            );
+            return;
+        }
+
+        let acknowledgement = completion
+            .result
+            .as_deref()
+            .ok()
+            .and_then(repair_clear_acknowledgement);
+        let desired = authority
+            .restore
+            .as_ref()
+            .map(BrowserReplayRepairHighlightToken::wire);
+        let callback_exact = acknowledgement
+            .filter(|ack| {
+                ack.token == authority.token.wire()
+                    && ack.restored == (ack.cleared && authority.restore.is_some())
+                    && if ack.cleared {
+                        !ack.predecessor_consumed && ack.resulting_token.as_deref() == desired
+                    } else {
+                        ack.resulting_token.as_deref() != Some(authority.token.wire())
+                    }
+            })
+            .is_some_and(|ack| {
+                document_state.as_ref().is_some_and(|state| {
+                    state.acknowledge_repair_highlight_clear(
+                        authority.document_generation,
+                        &authority.token,
+                        authority.restore.as_ref(),
+                        ack.cleared,
+                        ack.predecessor_consumed,
+                        ack.resulting_token.as_deref(),
+                    )
+                })
+            });
+        match repair_cleanup_disposition(RepairCleanupEvent::Callback {
+            exact: callback_exact,
+        }) {
+            RepairCleanupDisposition::FinishExact => self.finish_repair_highlight_cleanup(
+                window,
+                completion.target,
+                completion.operation_id,
+            ),
+            RepairCleanupDisposition::Quarantine => {
+                self.quarantine_repair_highlight_cleanup(&completion.target)
+            }
+            RepairCleanupDisposition::AwaitCallback => unreachable!("callback is terminal"),
+        }
+    }
+
+    fn start_repair_highlight_rollback(
+        &self,
+        target: &BrowserOperationTarget,
+        operation_id: &str,
+        document_generation: u64,
+        authority: &BrowserReplayRepairPreviewAuthority,
+    ) -> Result<(), BrowserError> {
+        let token_json = serde_json::to_string(authority.token().wire())
+            .expect("opaque repair preview token is serializable");
+        let restore_json = authority
+            .expected_previous_token()
+            .map(|previous| {
+                serde_json::to_string(previous.wire())
+                    .expect("opaque repair preview token is serializable")
+            })
+            .unwrap_or_else(|| "null".to_string());
+        self.start_repair_highlight_rollback_script(
+            target,
+            operation_id,
+            &format!(
+                "window.__devmanagerBrowser.repairHighlight.clear({token_json}, {restore_json})"
+            ),
+            authority.clone(),
+            document_generation,
+        )
+    }
+
+    fn start_repair_highlight_cleanup(
+        &mut self,
+        target: BrowserOperationTarget,
+        cleanup: BrowserReplayRepairCleanupWork,
+    ) {
+        let document_generation = self
+            .document_secret_states
+            .get(&view_key(&target.workspace_key, &target.tab_id))
+            .map(|state| state.document_generation())
+            .unwrap_or(u64::MAX);
+        let enqueued_at = cleanup.enqueued_at();
+        let deadline = enqueued_at
+            .checked_add(REPAIR_HIGHLIGHT_CLEANUP_TIMEOUT)
+            .unwrap_or(enqueued_at);
+        self.active_repair_cleanups.insert(
+            target,
+            ActiveRepairCleanup {
+                work: cleanup,
+                document_generation,
+                deadline,
+                in_flight: false,
+            },
+        );
+    }
+
+    fn pump_repair_highlight_cleanups(&mut self, window: &gpui::Window) {
+        self.quarantine_expired_repair_highlight_cleanups(Instant::now());
+        let targets: Vec<_> = self
+            .active_repair_cleanups
+            .iter()
+            .filter_map(|(target, active)| (!active.in_flight).then_some(target.clone()))
+            .collect();
+        for target in targets {
+            let operation_id = self
+                .operation_queue
+                .active_operation_id(&target)
+                .map(ToOwned::to_owned);
+            let Some(operation_id) = operation_id else {
+                self.active_repair_cleanups.remove(&target);
+                continue;
+            };
+            let view_exists = self
+                .views
+                .contains_key(&view_key(&target.workspace_key, &target.tab_id));
+            let document_current = self
+                .active_repair_cleanups
+                .get(&target)
+                .and_then(|active| {
+                    self.document_secret_states
+                        .get(&view_key(&target.workspace_key, &target.tab_id))
+                        .map(|state| state.document_generation() == active.document_generation)
+                })
+                .unwrap_or(false);
+            if !view_exists || !document_current {
+                self.finish_repair_highlight_cleanup(window, target, operation_id);
+                continue;
+            }
+            let Some(active) = self.active_repair_cleanups.get(&target) else {
+                continue;
+            };
+            let Some(document_state) = self
+                .document_secret_states
+                .get(&view_key(&target.workspace_key, &target.tab_id))
+                .cloned()
+            else {
+                self.finish_repair_highlight_cleanup(window, target, operation_id);
+                continue;
+            };
+            let Some(restore) = document_state.repair_highlight_cleanup_restore(
+                active.document_generation,
+                active.work.token(),
+                active.work.restore(),
+            ) else {
+                self.quarantine_repair_highlight_cleanup(&target);
+                continue;
+            };
+            let token_json = serde_json::to_string(active.work.token().wire())
+                .expect("opaque repair preview token is serializable");
+            let restore_json = restore
+                .as_ref()
+                .map(|restore| {
+                    serde_json::to_string(restore.wire())
+                        .expect("opaque repair preview token is serializable")
+                })
+                .unwrap_or_else(|| "null".to_string());
+            let expression = format!(
+                "window.__devmanagerBrowser.repairHighlight.clear({token_json}, {restore_json})"
+            );
+            let generation = active.document_generation;
+            let token = active.work.token().clone();
+            if let Some(active) = self.active_repair_cleanups.get_mut(&target) {
+                active.in_flight = true;
+            }
+            if self
+                .start_repair_cleanup_script(
+                    &target,
+                    &operation_id,
+                    &expression,
+                    BrowserRepairCleanupCallbackAuthority {
+                        document_generation: generation,
+                        token,
+                        restore,
+                    },
+                )
+                .is_err()
+            {
+                if repair_cleanup_disposition(RepairCleanupEvent::ScheduleFailed)
+                    == RepairCleanupDisposition::Quarantine
+                {
+                    self.quarantine_repair_highlight_cleanup(&target);
+                }
+            }
+        }
+    }
+
+    fn quarantine_expired_repair_highlight_cleanups(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .active_repair_cleanups
+            .iter()
+            .filter_map(|(target, active)| {
+                (repair_cleanup_disposition(RepairCleanupEvent::Pump {
+                    now,
+                    deadline: active.deadline,
+                }) == RepairCleanupDisposition::Quarantine)
+                    .then_some(target.clone())
+            })
+            .collect();
+        for target in expired {
+            self.quarantine_repair_highlight_cleanup(&target);
+        }
+    }
+
+    fn finish_repair_highlight_cleanup(
+        &mut self,
+        window: &gpui::Window,
+        target: BrowserOperationTarget,
+        operation_id: String,
+    ) {
+        let Some(active) = self.active_repair_cleanups.remove(&target) else {
+            return;
+        };
+        self.append_repair_highlight_cleanup_journal(&active.work);
+        if let Some(next) = self.operation_queue.complete(&target, &operation_id) {
+            self.start_queued_work(window, target, next);
+        }
+    }
+
+    fn quarantine_repair_highlight_view(&mut self, target: &BrowserOperationTarget) {
+        let route =
+            BrowserAnnotationRoute::new(target.workspace_key.clone(), target.tab_id.clone());
+        if let Ok(route) = route {
+            self.cancel_annotation_route(&route);
+        }
+        let _ = self.remove_page_recording_view(&target.workspace_key, &target.tab_id);
+        let key = view_key(&target.workspace_key, &target.tab_id);
+        self.views.remove(&key);
+        self.recording_ingresses.remove(&key);
+        self.document_secret_states.remove(&key);
+    }
+
+    fn quarantine_repair_highlight_cleanup(&mut self, target: &BrowserOperationTarget) {
+        self.quarantine_repair_highlight_view(target);
+        let cancellation = self.operation_queue.cancel_tab(target);
+        if let Some(active) = self.active_repair_cleanups.remove(target) {
+            self.append_repair_highlight_cleanup_journal(&active.work);
+        }
+        if let Some(active) = self.active_requests.remove(target) {
+            self.respond_request(active.request, Err(BrowserError::Interrupted));
+        }
+        for queued in cancellation.queued {
+            match queued {
+                BrowserQueuedWork::Request(request) => {
+                    self.respond_request(request, Err(BrowserError::Interrupted));
+                }
+                BrowserQueuedWork::RepairCleanup(cleanup) => {
+                    self.append_repair_highlight_cleanup_journal(&cleanup);
+                }
+            }
+        }
+    }
+
+    fn append_repair_highlight_cleanup_journal(
+        &mut self,
+        cleanup: &BrowserReplayRepairCleanupWork,
+    ) {
+        let actor = match cleanup.context().actor {
+            BrowserInvocationActor::User => BrowserJournalActor::User,
+            BrowserInvocationActor::Agent => BrowserJournalActor::Agent,
+            BrowserInvocationActor::Internal => return,
+        };
+        let workspace_key = cleanup.workspace_key().clone();
+        let url = self
+            .state
+            .workspace(&workspace_key)
+            .and_then(|snapshot| snapshot.tabs.iter().find(|tab| tab.id == cleanup.tab_id()))
+            .map(|tab| tab.url.clone())
+            .unwrap_or_else(|| "about:blank".to_string());
+        let entry = BrowserJournalEntry {
+            id: cleanup.context().operation_id.clone(),
+            actor,
+            intent: cleanup.context().intent.clone(),
+            url,
+            started_at: cleanup.started_at().to_string(),
+            duration_ms: cleanup.elapsed_ms(),
+            result: "ok".to_string(),
+            resource_ids: Vec::new(),
+        };
+        if self
+            .state
+            .append_journal_entry(&workspace_key, entry)
+            .is_ok()
+        {
+            let _ = self
+                .event_sender
+                .send(BrowserHostEvent::AutomationStateChanged {
+                    workspace_key: workspace_key.clone(),
+                    tab_id: cleanup.tab_id().to_string(),
+                });
+        }
+        if let Err(error) = self.reconcile_annotation_pins(&workspace_key) {
+            if let Some(tab_id) = self.selected_tab_id(&workspace_key) {
+                self.emit_diagnostic(
+                    &workspace_key,
+                    &tab_id,
+                    format!("annotation resource pin reconciliation will retry: {error}"),
+                );
+            }
+        }
     }
 
     pub fn is_pending_approval(
@@ -2527,6 +3640,10 @@ impl BrowserWebViewHost {
                         target: callback_target.clone(),
                         operation_id: callback_operation_id.clone(),
                         result: Ok(result),
+                        repair_highlight_authority: None,
+                        repair_highlight_document_generation: None,
+                        repair_highlight_rollback: false,
+                        repair_cleanup: None,
                     });
                 });
             script.zeroize();
@@ -4033,6 +5150,7 @@ impl BrowserWebViewHost {
                 self.views.remove(&key);
                 self.recording_ingresses.remove(&key);
                 self.document_secret_states.remove(&key);
+                self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 let mutation = self.state.close_tab(workspace_key, &tab_id)?;
                 self.ensure_selected_view(window, workspace_key)?;
                 self.apply_visibility_plan()?;
@@ -4045,6 +5163,13 @@ impl BrowserWebViewHost {
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
                 let url = validate_browser_url(&url)?;
                 self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                if let Some(state) = self
+                    .document_secret_states
+                    .get(&view_key(workspace_key, &tab_id))
+                {
+                    state.invalidate_repair_highlight();
+                }
+                self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.view(workspace_key, &tab_id)?
                     .load_url(&url)
                     .map_err(|error| BrowserError::NavigationFailure {
@@ -4059,6 +5184,13 @@ impl BrowserWebViewHost {
                     self.cancel_annotation_route(&route);
                 }
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
+                if let Some(state) = self
+                    .document_secret_states
+                    .get(&view_key(workspace_key, &tab_id))
+                {
+                    state.invalidate_repair_highlight();
+                }
+                self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.evaluate_history(window, workspace_key, &tab_id, "history.back()")?;
                 Ok(BrowserResponse::Acknowledged)
             }
@@ -4067,6 +5199,13 @@ impl BrowserWebViewHost {
                     self.cancel_annotation_route(&route);
                 }
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
+                if let Some(state) = self
+                    .document_secret_states
+                    .get(&view_key(workspace_key, &tab_id))
+                {
+                    state.invalidate_repair_highlight();
+                }
+                self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.evaluate_history(window, workspace_key, &tab_id, "history.forward()")?;
                 Ok(BrowserResponse::Acknowledged)
             }
@@ -4076,6 +5215,13 @@ impl BrowserWebViewHost {
                 }
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
                 self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                if let Some(state) = self
+                    .document_secret_states
+                    .get(&view_key(workspace_key, &tab_id))
+                {
+                    state.invalidate_repair_highlight();
+                }
+                self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 self.view(workspace_key, &tab_id)?
                     .reload()
                     .map_err(view_failure)?;
@@ -4120,6 +5266,7 @@ impl BrowserWebViewHost {
             }
             BrowserCommand::ResetWorkspace => {
                 self.discard_workflow_state(workspace_key);
+                self.terminalize_repair_preview_workspace(workspace_key);
                 self.views
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.recording_ingresses
@@ -4143,6 +5290,8 @@ impl BrowserWebViewHost {
             | BrowserCommand::Performance { .. }
             | BrowserCommand::Upload { .. }
             | BrowserCommand::Downloads { .. }
+            | BrowserCommand::RepairHighlight { .. }
+            | BrowserCommand::RepairClearHighlight { .. }
             | BrowserCommand::Cdp { .. } => Err(BrowserError::CrashedView {
                 message: "browser automation command requires the asynchronous request path"
                     .to_string(),
@@ -4433,6 +5582,7 @@ impl BrowserWebViewHost {
             .profile_clear_plan(workspace_key, &layout.profile_dir)?;
 
         self.discard_project_page_recordings(&workspace_key.project_id);
+        self.terminalize_repair_preview_project(&workspace_key.project_id);
         self.views
             .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
         self.recording_ingresses
@@ -5078,6 +6228,8 @@ fn browser_command_is_automation(command: &BrowserCommand) -> bool {
             | BrowserCommand::Performance { .. }
             | BrowserCommand::Upload { .. }
             | BrowserCommand::Downloads { .. }
+            | BrowserCommand::RepairHighlight { .. }
+            | BrowserCommand::RepairClearHighlight { .. }
             | BrowserCommand::Cdp { .. }
     )
 }
@@ -5097,6 +6249,47 @@ fn browser_command_is_journaled(command: &BrowserCommand) -> bool {
             | BrowserCommand::SetPaneOpen { .. }
             | BrowserCommand::WorkspaceState
     )
+}
+
+fn browser_command_journal_actor(
+    actor: BrowserInvocationActor,
+    command: &BrowserCommand,
+) -> Option<BrowserJournalActor> {
+    match actor {
+        BrowserInvocationActor::Agent if browser_command_is_journaled(command) => {
+            Some(BrowserJournalActor::Agent)
+        }
+        BrowserInvocationActor::User
+            if matches!(
+                command,
+                BrowserCommand::RepairHighlight { .. }
+                    | BrowserCommand::RepairClearHighlight { .. }
+            ) =>
+        {
+            Some(BrowserJournalActor::User)
+        }
+        BrowserInvocationActor::User
+        | BrowserInvocationActor::Agent
+        | BrowserInvocationActor::Internal => None,
+    }
+}
+
+fn repair_highlight_failure(
+    cancellation_current: bool,
+    revision_current: bool,
+    document_current: bool,
+    expected: BrowserRevision,
+    actual: BrowserRevision,
+) -> BrowserError {
+    if !cancellation_current {
+        BrowserError::Interrupted
+    } else if !revision_current || !document_current {
+        BrowserError::StaleReference { expected, actual }
+    } else {
+        BrowserError::InvalidInvocation {
+            field: "repairPreviewSidecar".to_string(),
+        }
+    }
 }
 
 fn browser_error_code(error: &BrowserError) -> &'static str {
@@ -5198,6 +6391,10 @@ fn browser_command_summary(command: &BrowserCommand) -> String {
         BrowserCommand::Upload { paths, .. } => format!("upload {} file(s)", paths.len()),
         BrowserCommand::Downloads { operation, .. } => {
             format!("browser downloads {operation:?}").to_ascii_lowercase()
+        }
+        BrowserCommand::RepairHighlight { .. } => "preview replay repair locator".to_string(),
+        BrowserCommand::RepairClearHighlight { .. } => {
+            "clear replay repair preview highlight".to_string()
         }
         BrowserCommand::Cdp { method, .. } => {
             format!("call browser CDP method {}", redact_browser_text(method))
@@ -5315,23 +6512,336 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod secret_document_state_tests {
     use super::{
-        browser_capture_storage_plan, conservative_tainted_document_risk,
-        contain_queued_host_event, finish_secret_exposure_on_error,
-        fixed_secret_type_callback_result, view_key, BrowserCaptureStoragePlan,
-        BrowserDocumentSecretState, BrowserWebViewHost, WORKSPACE_OPERATION_TAB,
+        browser_capture_storage_plan, browser_command_journal_actor,
+        conservative_tainted_document_risk, contain_queued_host_event,
+        finish_secret_exposure_on_error, fixed_secret_type_callback_result,
+        repair_cleanup_disposition, repair_clear_acknowledgement, repair_highlight_failure,
+        view_key, BrowserCaptureStoragePlan, BrowserDocumentSecretState, BrowserWebViewHost,
+        RepairCleanupDisposition, RepairCleanupEvent, WORKSPACE_OPERATION_TAB,
     };
+    use crate::browser::commands::HostControlQueue;
     use crate::browser::{
-        BrowserApprovalPolicy, BrowserCommand, BrowserDiagnosticLevel, BrowserDownloadState,
-        BrowserError, BrowserHostEvent, BrowserPageLoadState, BrowserResourceKind, BrowserRevision,
-        BrowserRisk, BrowserScreenshotMode, BrowserUserInputKind, BrowserWorkspaceKey,
+        compile_browser_replay, BrowserApprovalPolicy, BrowserCommand, BrowserDiagnosticLevel,
+        BrowserDownloadState, BrowserError, BrowserHostControl, BrowserHostEvent,
+        BrowserInvocationActor, BrowserJournalActor, BrowserOperationTarget, BrowserPageLoadState,
+        BrowserRecipeAction, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+        BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayLocatorSlot,
+        BrowserReplayRepairResumeCursor, BrowserResourceKind, BrowserResourceLimits,
+        BrowserResourceStore, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
+        BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport, BrowserWorkspaceKey,
+        BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
     };
-    use std::{path::PathBuf, sync::Arc};
+    use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
 
     #[derive(Clone, Copy)]
     enum DocumentStateRemoval {
         CloseTab,
         ResetWorkspace,
         ClearProjectProfile,
+    }
+
+    #[test]
+    fn repair_cleanup_terminal_triggers_are_bounded_and_fail_closed() {
+        let started = std::time::Instant::now();
+        let deadline = started + super::REPAIR_HIGHLIGHT_CLEANUP_TIMEOUT;
+        assert_eq!(
+            repair_cleanup_disposition(RepairCleanupEvent::ScheduleFailed),
+            RepairCleanupDisposition::Quarantine
+        );
+        assert_eq!(
+            repair_cleanup_disposition(RepairCleanupEvent::Callback { exact: false }),
+            RepairCleanupDisposition::Quarantine
+        );
+        assert_eq!(
+            repair_cleanup_disposition(RepairCleanupEvent::Callback { exact: true }),
+            RepairCleanupDisposition::FinishExact
+        );
+        assert_eq!(
+            repair_cleanup_disposition(RepairCleanupEvent::Pump {
+                now: deadline - std::time::Duration::from_nanos(1),
+                deadline,
+            }),
+            RepairCleanupDisposition::AwaitCallback
+        );
+        assert_eq!(
+            repair_cleanup_disposition(RepairCleanupEvent::Pump {
+                now: deadline,
+                deadline,
+            }),
+            RepairCleanupDisposition::Quarantine
+        );
+        assert_eq!(
+            repair_cleanup_disposition(RepairCleanupEvent::Interrupted),
+            RepairCleanupDisposition::Quarantine
+        );
+    }
+
+    #[test]
+    fn repair_preview_journal_actor_preserves_user_and_agent_without_recording_internal_work() {
+        let marker = BrowserCommand::RepairHighlight {
+            tab_id: "tab-a".to_string(),
+        };
+        assert_eq!(
+            browser_command_journal_actor(BrowserInvocationActor::User, &marker),
+            Some(BrowserJournalActor::User)
+        );
+        assert_eq!(
+            browser_command_journal_actor(BrowserInvocationActor::Agent, &marker),
+            Some(BrowserJournalActor::Agent)
+        );
+        assert_eq!(
+            browser_command_journal_actor(BrowserInvocationActor::Internal, &marker),
+            None
+        );
+        assert_eq!(
+            browser_command_journal_actor(BrowserInvocationActor::User, &BrowserCommand::Status),
+            None
+        );
+    }
+
+    #[test]
+    fn repair_preview_stale_typing_keeps_cancellation_interrupted_and_types_document_drift() {
+        let expected = BrowserRevision(9);
+        let actual = BrowserRevision(10);
+        assert_eq!(
+            repair_highlight_failure(false, false, false, expected, actual),
+            BrowserError::Interrupted
+        );
+        assert_eq!(
+            repair_highlight_failure(true, false, true, expected, actual),
+            BrowserError::StaleReference { expected, actual }
+        );
+        assert_eq!(
+            repair_highlight_failure(true, true, false, expected, expected),
+            BrowserError::StaleReference {
+                expected,
+                actual: expected,
+            }
+        );
+    }
+
+    #[test]
+    fn repair_clear_acknowledgement_mutates_native_state_only_after_exact_page_cas() {
+        assert!(repair_clear_acknowledgement("not-json").is_none());
+        assert!(repair_clear_acknowledgement(r#"{"ok":true,"value":{"cleared":true}}"#).is_none());
+        let false_ack = repair_clear_acknowledgement(
+            r#"{"ok":true,"value":{"token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cleared":false,"restored":false,"resultingToken":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+        )
+        .expect("well-formed false acknowledgement remains inspectable");
+        assert!(!false_ack.cleared);
+
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-repair-native-cas-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let workspace_key =
+            BrowserWorkspaceKey::new("repair-native-cas", "conversation-a").unwrap();
+        let coordinator = BrowserReplayCoordinator::default();
+        let plan = compile_browser_replay(
+            &BrowserRecipeV1 {
+                schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                id: "repair-native-cas".to_string(),
+                name: "Repair native CAS".to_string(),
+                description: "Native/page repair highlight coherence".to_string(),
+                start_url: "https://example.test".to_string(),
+                viewport: BrowserRecipeViewport {
+                    width: 1280,
+                    height: 720,
+                    scale_percent: 100,
+                },
+                inputs: Vec::new(),
+                steps: vec![BrowserRecipeStep {
+                    id: "click-target".to_string(),
+                    action: BrowserRecipeAction::Click {
+                        locator: BrowserRecipeLocator {
+                            test_id: Some("target".to_string()),
+                            ..BrowserRecipeLocator::default()
+                        },
+                    },
+                    wait: None,
+                    assertions: Vec::new(),
+                }],
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let started = coordinator.start(workspace_key, plan).unwrap();
+        coordinator.begin(&started.instance).unwrap();
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "tab-a",
+                BrowserRevision(9),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let token = |id, wire: &str| {
+            super::BrowserReplayRepairHighlightToken::new(
+                repair.clone(),
+                NonZeroU64::new(id).unwrap(),
+                "tab-a".to_string(),
+                wire.to_string(),
+            )
+        };
+        let predecessor = token(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let preview = token(2, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let superseding = token(3, "cccccccccccccccccccccccccccccccccccccccccccccccc");
+        let state = BrowserDocumentSecretState::default();
+        assert!(state.install_repair_highlight(0, None, &predecessor));
+        assert!(state.install_repair_highlight(0, Some(&predecessor), &preview));
+
+        let fifo_state = BrowserDocumentSecretState::default();
+        assert!(fifo_state.install_repair_highlight(0, None, &predecessor));
+        assert!(fifo_state.install_repair_highlight(0, Some(&predecessor), &preview));
+        assert!(fifo_state.acknowledge_repair_highlight_clear(
+            0,
+            &predecessor,
+            None,
+            false,
+            true,
+            Some(preview.wire()),
+        ));
+        assert!(
+            !fifo_state.acknowledge_repair_highlight_clear(
+                0,
+                &preview,
+                Some(&predecessor),
+                true,
+                false,
+                Some(predecessor.wire()),
+            ),
+            "FIFO A cleanup consumes the predecessor and B cannot resurrect it"
+        );
+        assert!(matches!(
+            fifo_state.repair_highlight_cleanup_restore(0, &preview, Some(&predecessor),),
+            Some(None)
+        ));
+        assert!(
+            fifo_state.acknowledge_repair_highlight_clear(0, &preview, None, true, false, None,)
+        );
+        assert!(fifo_state.install_repair_highlight(0, None, &superseding));
+
+        let controls = Arc::new(HostControlQueue::default());
+        let cleanup = controls
+            .repair_cleanup_work_for_test(
+                preview.clone(),
+                Some(predecessor.clone()),
+                BrowserInvocationActor::Agent,
+            )
+            .unwrap();
+        let held = (0..63)
+            .map(|_| controls.hold_repair_cleanup_admission_for_test().unwrap())
+            .collect::<Vec<_>>();
+        assert!(controls.hold_repair_cleanup_admission_for_test().is_none());
+
+        let workspace_key =
+            BrowserWorkspaceKey::new("repair-native-cas", "conversation-a").unwrap();
+        let mut host = BrowserWebViewHost::unavailable("repair cleanup quarantine test");
+        host.state
+            .ensure_workspace(
+                workspace_key.clone(),
+                BrowserWorkspaceSnapshot {
+                    tabs: vec![BrowserTabSnapshot {
+                        id: "tab-a".to_string(),
+                        title: "Fixture".to_string(),
+                        url: "https://example.test".to_string(),
+                        viewport: BrowserViewport::default(),
+                    }],
+                    selected_tab_id: Some("tab-a".to_string()),
+                    ..BrowserWorkspaceSnapshot::default()
+                },
+            )
+            .unwrap();
+        let target = BrowserOperationTarget::new(workspace_key, "tab-a").unwrap();
+        let key = view_key(&target.workspace_key, &target.tab_id);
+        let native = Arc::new(BrowserDocumentSecretState::default());
+        assert!(native.install_repair_highlight(0, None, &predecessor));
+        assert!(native.install_repair_highlight(0, Some(&predecessor), &preview));
+        host.document_secret_states.insert(key.clone(), native);
+        let operation_id = cleanup.context().operation_id.clone();
+        let active = host
+            .operation_queue
+            .enqueue(
+                target.clone(),
+                operation_id,
+                super::BrowserQueuedWork::RepairCleanup(cleanup),
+            )
+            .unwrap();
+        let super::BrowserQueuedWork::RepairCleanup(active) = active else {
+            unreachable!()
+        };
+        host.start_repair_highlight_cleanup(target.clone(), active);
+        host.handle_control(BrowserHostControl::InterruptTab {
+            workspace_key: target.workspace_key.clone(),
+            tab_id: target.tab_id.clone(),
+        });
+        assert!(host.active_repair_cleanups.is_empty());
+        assert!(host.operation_queue.is_empty());
+        assert!(!host.document_secret_states.contains_key(&key));
+        assert_eq!(controls.repair_cleanup_admission_count_for_test(), 63);
+
+        let later = controls
+            .repair_cleanup_work_for_test(superseding.clone(), None, BrowserInvocationActor::Agent)
+            .expect("the blocked 65th preview is admitted after quarantine");
+        let later_id = later.context().operation_id.clone();
+        let later = host
+            .operation_queue
+            .enqueue(
+                target.clone(),
+                later_id.clone(),
+                super::BrowserQueuedWork::RepairCleanup(later),
+            )
+            .expect("later per-tab work proceeds");
+        drop(later);
+        assert!(host.operation_queue.complete(&target, &later_id).is_none());
+        assert!(host.operation_queue.is_empty());
+        drop(held);
+        assert_eq!(controls.repair_cleanup_admission_count_for_test(), 0);
+
+        assert!(
+            !state.acknowledge_repair_highlight_clear(
+                0,
+                &preview,
+                Some(&predecessor),
+                false,
+                false,
+                Some(preview.wire()),
+            ),
+            "a false page acknowledgement cannot mutate native ownership"
+        );
+        assert!(state.acknowledge_repair_highlight_clear(
+            0,
+            &preview,
+            Some(&predecessor),
+            true,
+            false,
+            Some(predecessor.wire()),
+        ));
+        assert!(state.install_repair_highlight(0, Some(&predecessor), &superseding));
+
+        state.invalidate_repair_highlight();
+        assert!(
+            !state.acknowledge_repair_highlight_clear(0, &superseding, None, true, false, None,),
+            "an old document callback cannot mutate the new document"
+        );
+        assert!(state.install_repair_highlight(1, None, &predecessor));
+
+        coordinator.cancel(&started.instance).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

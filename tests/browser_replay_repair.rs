@@ -1,6 +1,7 @@
 use devmanager::browser::{
-    BrowserError, BrowserReplayLocatorSlot, BrowserReplayRepairInstance, BrowserReplayRepairPhase,
-    BrowserReplayRepairProjection, BrowserResourceLimits, BrowserResourceStore,
+    BrowserElementRef, BrowserError, BrowserLocator, BrowserReplayLocatorSlot,
+    BrowserReplayRepairCandidate, BrowserReplayRepairInstance, BrowserReplayRepairPhase,
+    BrowserReplayRepairProjection, BrowserResourceLimits, BrowserResourceStore, BrowserRevision,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 #[cfg(target_os = "windows")]
@@ -14,8 +15,132 @@ assert_impl_all!(BrowserResourceStore: Clone, Send, Sync);
 assert_impl_all!(BrowserReplayLocatorSlot: Clone, Send, Sync, Eq, std::fmt::Debug, serde::Serialize);
 assert_impl_all!(BrowserReplayRepairInstance: Clone, Send, Sync, Eq);
 assert_not_impl_any!(BrowserReplayRepairInstance: std::fmt::Debug, serde::Serialize);
+assert_impl_all!(BrowserReplayRepairCandidate: Clone, Send, Sync, Eq);
+assert_not_impl_any!(BrowserReplayRepairCandidate: std::fmt::Debug, serde::Serialize);
 assert_impl_all!(BrowserReplayRepairPhase: Clone, Send, Sync, Eq, std::fmt::Debug, serde::Serialize);
 assert_impl_all!(BrowserReplayRepairProjection: Clone, Send, Sync, Eq, std::fmt::Debug, serde::Serialize);
+
+#[test]
+fn repair_candidate_carries_an_exact_element_reference_without_a_public_locator_projection() {
+    let element_ref = BrowserElementRef {
+        revision: BrowserRevision(17),
+        locator: BrowserLocator {
+            accessibility_role: Some("button".to_string()),
+            accessibility_name: Some("Submit".to_string()),
+            test_id: Some("submit".to_string()),
+            css_selectors: vec!["button[type=submit]".to_string()],
+        },
+        backend_node_id: Some(42),
+    };
+    let candidate = BrowserReplayRepairCandidate::new(element_ref.clone());
+    assert_eq!(candidate.element_ref(), &element_ref);
+
+    let replay = include_str!("../src/browser/replay.rs");
+    let repair = include_str!("../src/browser/replay_repair.rs");
+    for source in [replay, repair] {
+        assert!(!source
+            .contains("derive(Debug, Clone, Serialize)\npub struct BrowserReplayRepairCandidate"));
+        assert!(!source.contains("candidate_locator: BrowserRecipeLocator\n    pub"));
+    }
+}
+
+#[test]
+fn repair_preview_private_authority_uses_checked_generation_receipts_and_value_free_state() {
+    let commands = include_str!("../src/browser/commands.rs");
+    let replay = include_str!("../src/browser/replay.rs");
+    let repair = include_str!("../src/browser/replay_repair.rs");
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+
+    assert!(replay.contains("next_preview_id"));
+    assert!(replay.contains("checked_add(1)"));
+    assert!(replay.contains("NonZeroU64::new"));
+    assert!(replay.contains("reserve_locator_repair_preview"));
+    assert!(replay.contains("commit_locator_repair_preview"));
+    assert!(replay.contains("BrowserReplayPrivateRepairPhase::Previewing"));
+    assert!(replay.contains("BrowserReplayRepairPhase::Previewed"));
+    assert!(commands.contains("BrowserReplayRepairPreviewReceipt"));
+    assert!(commands.contains("request_replay_repair_preview"));
+    assert!(commands.contains("replay_repair_preview_sidecar"));
+    assert!(commands.contains("self.replay_repair_preview_sidecar.is_none()"));
+    assert!(windows.contains("BrowserCommand::RepairHighlight"));
+    assert!(windows.contains("BrowserCommand::RepairClearHighlight"));
+    assert!(windows.contains("BrowserAsyncPhase::RepairHighlight"));
+    assert!(windows.contains("validate_repair_preview_sidecar"));
+    assert!(windows.contains("cancellation_is_current"));
+    assert!(windows.contains("document_generation"));
+    assert!(windows.contains("acknowledge_repair_highlight_clear"));
+    assert!(unsupported.contains("validate_repair_preview_sidecar"));
+
+    for forbidden in ["candidate", "element_ref", "wire_token", "preview_token"] {
+        let projection_start = repair
+            .find("pub struct BrowserReplayRepairProjection")
+            .unwrap();
+        let projection_end = repair[projection_start..].find("}\n\n").unwrap() + projection_start;
+        assert!(!repair[projection_start..projection_end].contains(forbidden));
+    }
+}
+
+#[test]
+fn repair_preview_cleanup_uses_a_bounded_route_independent_host_lane() {
+    let commands = include_str!("../src/browser/commands.rs");
+    let app = include_str!("../src/app/mod.rs");
+    let windows = include_str!("../src/browser/host/windows.rs");
+
+    assert!(commands.contains("MAX_BROWSER_REPAIR_HIGHLIGHT_CLEANUPS: usize = 64"));
+    assert!(commands.contains("repair_cleanups: Mutex<VecDeque<BrowserReplayRepairCleanupWork>>"));
+    assert!(commands.contains("try_admit_repair_cleanup"));
+    assert!(commands.contains("with_locked_host_work_and_repair_cleanups"));
+    assert!(!commands.contains("tokio::runtime::Handle"));
+    assert!(!commands.contains("runtime.spawn"));
+    assert!(!commands.contains("enqueue_repair_highlight_clear"));
+    assert!(!commands.contains("BrowserReplayRepairPreviewSidecar::Clear"));
+
+    let barrier = &app[app.find("fn with_browser_host_control_barrier").unwrap()..];
+    let controls = barrier.find("browser_host.handle_control").unwrap();
+    let cleanup = barrier
+        .find("browser_host.handle_repair_highlight_cleanup")
+        .unwrap();
+    let route_filtered = barrier.find("for request in lifecycle_requests").unwrap();
+    assert!(controls < cleanup && cleanup < route_filtered);
+
+    assert!(windows.contains("enum BrowserQueuedWork"));
+    assert!(windows.contains("RepairCleanup(BrowserReplayRepairCleanupWork)"));
+    assert!(windows.contains("active_repair_cleanups"));
+    assert!(windows.contains("repair_highlight_rollback: true"));
+    assert!(windows.contains("acknowledge_repair_highlight_clear"));
+    assert!(windows.contains("REPAIR_HIGHLIGHT_CLEANUP_TIMEOUT"));
+    assert!(windows.contains("quarantine_repair_highlight_cleanup"));
+
+    let completion_start = windows.find("struct BrowserAsyncCompletion").unwrap();
+    let completion_end = windows[completion_start..]
+        .find("struct ActiveRepairCleanup")
+        .unwrap()
+        + completion_start;
+    assert!(
+        !windows[completion_start..completion_end].contains("BrowserReplayRepairCleanupWork"),
+        "an async callback must not retain the cleanup admission lease"
+    );
+
+    let pump_start = windows.find("fn pump_repair_highlight_cleanups").unwrap();
+    let pump_end = windows[pump_start..]
+        .find("fn finish_repair_highlight_cleanup")
+        .unwrap()
+        + pump_start;
+    let pump = &windows[pump_start..pump_end];
+    assert!(windows.contains("cleanup.enqueued_at()"));
+    assert!(pump.contains("active.deadline"));
+    assert!(pump.contains("quarantine_repair_highlight_cleanup"));
+
+    let journal_start = windows
+        .find("fn append_repair_highlight_cleanup_journal")
+        .unwrap();
+    let journal_end = windows[journal_start..]
+        .find("pub fn is_pending_approval")
+        .unwrap()
+        + journal_start;
+    assert!(windows[journal_start..journal_end].contains("reconcile_annotation_pins"));
+}
 
 #[cfg(target_os = "windows")]
 struct TestDir(PathBuf);

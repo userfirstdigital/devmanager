@@ -118,10 +118,19 @@ impl<T> BrowserOperationQueue<T> {
         }
     }
 
-    pub fn cancel_workspace(
-        &mut self,
+    pub fn cancel_queued(&mut self, target: &BrowserOperationTarget) -> Vec<T> {
+        self.queued
+            .remove(target)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|operation| operation.value)
+            .collect()
+    }
+
+    pub fn targets_for_workspace(
+        &self,
         workspace_key: &BrowserWorkspaceKey,
-    ) -> Vec<(BrowserOperationTarget, BrowserQueueCancellation<T>)> {
+    ) -> Vec<BrowserOperationTarget> {
         let mut targets: Vec<_> = self
             .active
             .keys()
@@ -132,18 +141,9 @@ impl<T> BrowserOperationQueue<T> {
         targets.sort_by(|left, right| left.tab_id.cmp(&right.tab_id));
         targets.dedup();
         targets
-            .into_iter()
-            .map(|target| {
-                let cancellation = self.cancel_tab(&target);
-                (target, cancellation)
-            })
-            .collect()
     }
 
-    pub fn cancel_project(
-        &mut self,
-        project_id: &str,
-    ) -> Vec<(BrowserOperationTarget, BrowserQueueCancellation<T>)> {
+    pub fn targets_for_project(&self, project_id: &str) -> Vec<BrowserOperationTarget> {
         let mut targets: Vec<_> = self
             .active
             .keys()
@@ -159,6 +159,26 @@ impl<T> BrowserOperationQueue<T> {
         });
         targets.dedup();
         targets
+    }
+
+    pub fn cancel_workspace(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Vec<(BrowserOperationTarget, BrowserQueueCancellation<T>)> {
+        self.targets_for_workspace(workspace_key)
+            .into_iter()
+            .map(|target| {
+                let cancellation = self.cancel_tab(&target);
+                (target, cancellation)
+            })
+            .collect()
+    }
+
+    pub fn cancel_project(
+        &mut self,
+        project_id: &str,
+    ) -> Vec<(BrowserOperationTarget, BrowserQueueCancellation<T>)> {
+        self.targets_for_project(project_id)
             .into_iter()
             .map(|target| {
                 let cancellation = self.cancel_tab(&target);

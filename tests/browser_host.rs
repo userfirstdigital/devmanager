@@ -1586,11 +1586,12 @@ fn annotation_delete_enters_destructive_approval_before_mutation_and_resumes_dis
         .unwrap()
         + response_start;
     let response = &source[response_start..response_end];
-    assert!(response.contains("browser_command_is_journaled"));
+    assert!(response.contains("browser_command_journal_actor"));
+    assert!(source.contains("BrowserInvocationActor::Agent if browser_command_is_journaled"));
     assert!(response.contains("append_journal_entry"));
     assert!(response.contains("reconcile_annotation_pins"));
     assert!(response.contains("if annotation_command"));
-    assert!(response.contains("else if agent_journaled"));
+    assert!(response.contains("else if journal_actor.is_some()"));
     assert!(
         response.find("append_journal_entry").unwrap()
             < response
@@ -2235,6 +2236,37 @@ fn secure_command_real_host_ingress_rejects_missing_or_stale_sidecar_before_work
 }
 
 #[test]
+fn repair_preview_markers_are_rejected_on_the_direct_host_boundary() {
+    for marker in [
+        BrowserCommand::RepairHighlight {
+            tab_id: "tab-a".to_string(),
+        },
+        BrowserCommand::RepairClearHighlight {
+            tab_id: "tab-a".to_string(),
+        },
+    ] {
+        assert!(matches!(
+            unsupported_command_response("fixture", marker),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairPreviewSidecar"
+        ));
+    }
+
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let direct_start = windows.find("pub fn handle_command(").unwrap();
+    let direct_end = windows[direct_start..]
+        .find("pub fn handle_request(")
+        .unwrap()
+        + direct_start;
+    let direct = &windows[direct_start..direct_end];
+    assert!(
+        direct
+            .find("validate_direct_repair_preview_command")
+            .unwrap()
+            < direct.find("pump_page_recording_ipc").unwrap()
+    );
+}
+
+#[test]
 fn repair_capture_host_bridge_validates_before_dedicated_or_ordinary_storage() {
     let windows = include_str!("../src/browser/host/windows.rs");
     let snapshot_start = windows.find("fn complete_snapshot(").unwrap();
@@ -2328,12 +2360,15 @@ fn repair_capture_host_bridge_validates_before_dedicated_or_ordinary_storage() {
         respond.find("records_workflow_recipe_action").unwrap()
             < respond.find("complete_agent_command").unwrap()
     );
-    let journal = &respond[respond.find("let agent_journaled").unwrap()..];
+    let journal = &respond[respond.find("let journal_actor").unwrap()..];
     let journal_gate = &journal[..journal
         .find("if request.records_workflow_recipe_action()")
         .unwrap()];
-    assert!(journal_gate.contains("request.context().actor == BrowserInvocationActor::Agent"));
-    assert!(journal_gate.contains("browser_command_is_journaled(request.command())"));
+    assert!(journal_gate.contains("browser_command_journal_actor"));
+    let actor_gate = &windows[windows.find("fn browser_command_journal_actor").unwrap()..];
+    assert!(actor_gate.contains("BrowserInvocationActor::Agent if browser_command_is_journaled"));
+    assert!(actor_gate.contains("BrowserInvocationActor::User"));
+    assert!(actor_gate.contains("BrowserCommand::RepairHighlight"));
 }
 
 #[test]
@@ -2655,6 +2690,166 @@ fn initialization_script_has_self_cleaning_element_and_region_annotation_overlay
     assert!(script.contains("computedStyle"));
     assert!(script.contains("fontSize"));
     assert!(script.contains("borderRadius"));
+}
+
+#[test]
+fn repair_highlight_overlay_is_owned_pointer_transparent_event_free_and_exact_cas() {
+    let harness = [
+        r#"
+const messages = [];
+let activeObserver = null;
+class FakeMutationObserver {
+  constructor(callback) { this.callback = callback; this.records = []; activeObserver = this; }
+  observe() {}
+  record(record) { this.records.push(record); }
+  flush() { const records = this.records.splice(0); if (records.length) this.callback(records); }
+}
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase(); this.children = []; this.parentElement = null;
+    const style = {};
+    this.style = new Proxy(style, { set: (target, key, value) => { target[key] = value; activeObserver?.record({ target: this, attributeName: "style" }); return true; } });
+    this.attributes = new Map(); this.listeners = new Map(); this.id = ""; this.innerText = "";
+    this.focusCalls = 0; this.clickCalls = 0; this.dispatched = [];
+  }
+  setAttribute(key, value) { this.attributes.set(key, String(value)); activeObserver?.record({ target: this, attributeName: key }); }
+  getAttribute(key) { return this.attributes.has(key) ? this.attributes.get(key) : null; }
+  hasAttribute(key) { return this.attributes.has(key); }
+  addEventListener(type, handler) { this.listeners.set(type, handler); }
+  removeEventListener(type, handler) { if (this.listeners.get(type) === handler) this.listeners.delete(type); }
+  appendChild(child) { child.parentElement = this; this.children.push(child); activeObserver?.record({ target: this, addedNodes: [child], removedNodes: [] }); return child; }
+  remove() { if (!this.parentElement) return; const parent = this.parentElement; parent.children = parent.children.filter((child) => child !== this); this.parentElement = null; activeObserver?.record({ target: parent, addedNodes: [], removedNodes: [this] }); }
+  getBoundingClientRect() { return this.bounds || { x: 8, y: 10, width: 80, height: 24 }; }
+  matches() { return false; }
+  closest() { return null; }
+  focus() { this.focusCalls += 1; }
+  click() { this.clickCalls += 1; }
+  dispatchEvent(event) { this.dispatched.push(event.type); return true; }
+}
+globalThis.Element = FakeElement;
+globalThis.MutationObserver = FakeMutationObserver;
+globalThis.PerformanceObserver = class { observe() {} };
+globalThis.XMLHttpRequest = class {};
+XMLHttpRequest.prototype.open = function() {};
+XMLHttpRequest.prototype.send = function() {};
+globalThis.CSS = { escape: (value) => String(value) };
+globalThis.location = new URL("https://example.test/form");
+globalThis.performance = { now: () => 0, getEntriesByType: () => [] };
+globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible", opacity: "1", position: "static" });
+const body = new FakeElement("body");
+const documentElement = new FakeElement("html");
+const target = new FakeElement("button"); target.setAttribute("data-testid", "save");
+globalThis.document = {
+  body, documentElement, readyState: "complete", title: "Fixture",
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (selector) => selector === '[data-testid="save"]' ? target : null,
+  querySelectorAll: () => [],
+  elementFromPoint: () => target,
+  activeElement: target,
+};
+const windowListeners = new Map();
+globalThis.window = {
+  innerWidth: 200, innerHeight: 100, devicePixelRatio: 1,
+  ipc: { postMessage: (message) => messages.push(JSON.parse(message)) },
+  addEventListener(type, handler) { const values = windowListeners.get(type) || []; values.push(handler); windowListeners.set(type, values); },
+  removeEventListener(type, handler) { windowListeners.set(type, (windowListeners.get(type) || []).filter((value) => value !== handler)); },
+};
+"#,
+        browser_user_input_initialization_script(),
+        r#"
+(async () => {
+const highlight = window.__devmanagerBrowser.repairHighlight;
+const candidate = { locator: { testId: "save", accessibilityRole: null, accessibilityName: null, cssSelectors: [] } };
+const tokenA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const tokenB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const tokenOld = "cccccccccccccccccccccccccccccccc";
+const first = highlight.install(candidate, tokenA, null);
+if (!first || first.token !== tokenA || first.installed !== true) throw new Error("first exact token was not acknowledged");
+if (body.children.length !== 1 || body.children[0].children.length !== 1) throw new Error("owned overlay shape missing");
+const firstRoot = body.children[0];
+if (firstRoot.style.pointerEvents !== "none" || firstRoot.children[0].style.pointerEvents !== "none") throw new Error("overlay can intercept pointers");
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.some((message) => message.type === "domMutation")) throw new Error("owned install changed DOM revision");
+
+const second = highlight.install(candidate, tokenB, tokenA);
+if (!second || second.token !== tokenB || second.installed !== true) throw new Error("new exact token was not acknowledged");
+const secondRoot = body.children[0];
+const lateInstall = highlight.install(candidate, tokenOld, tokenA);
+if (!lateInstall || lateInstall.token !== tokenOld || lateInstall.installed !== false || body.children[0] !== secondRoot) throw new Error("old completion overwrote the newer overlay");
+const oldClear = highlight.clear(tokenA);
+if (!oldClear || oldClear.token !== tokenA || oldClear.cleared !== false || body.children[0] !== secondRoot) throw new Error("old clear removed the newer overlay");
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.some((message) => message.type === "domMutation")) throw new Error("owned replace changed DOM revision");
+
+activeObserver.record({ target, attributeName: "data-real-page-change" });
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.filter((message) => message.type === "domMutation").length !== 1) throw new Error("real page mutation was suppressed");
+const exactClear = highlight.clear(tokenB);
+if (!exactClear || exactClear.token !== tokenB || exactClear.cleared !== true || body.children.length !== 0) throw new Error("exact clear failed");
+
+// A may reach the page before its authority is superseded. Host completion first rolls A
+// back to the committed predecessor, then queued B can CAS against that predecessor. A's
+// later guard cleanup remains exact and cannot remove B.
+const committedToken = "dddddddddddddddddddddddddddddddd";
+const supersededToken = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const currentToken = "ffffffffffffffffffffffffffffffff";
+if (!highlight.install(candidate, committedToken, null).installed) throw new Error("committed predecessor install failed");
+const committedRoot = body.children[0];
+if (!highlight.install(candidate, supersededToken, committedToken).installed) throw new Error("superseded A install failed");
+const supersededRoot = body.children[0];
+const failedRollbackA = highlight.clear(supersededToken, tokenOld);
+if (failedRollbackA.cleared || failedRollbackA.resultingToken !== supersededToken || body.children[0] !== supersededRoot) throw new Error("failed restore authorization mutated the current preview");
+target.bounds = { x: 8, y: 10, width: 0, height: 0 };
+const rollbackA = highlight.clear(supersededToken, committedToken);
+if (!rollbackA.cleared || !rollbackA.restored || rollbackA.resultingToken !== committedToken || body.children[0] !== committedRoot) throw new Error("superseded A did not restore the exact committed predecessor after its target became invisible");
+target.bounds = { x: 8, y: 10, width: 80, height: 24 };
+const installB = highlight.install(candidate, currentToken, committedToken);
+if (!installB.installed || installB.token !== currentToken) throw new Error("current B could not replace restored predecessor");
+const lateClearA = highlight.clear(supersededToken, committedToken);
+if (lateClearA.cleared || lateClearA.resultingToken !== currentToken || body.children.length !== 1) throw new Error("late A cleanup removed current B");
+const clearB = highlight.clear(currentToken);
+if (!clearB.cleared || body.children.length !== 0) throw new Error("current B exact cleanup failed");
+
+// FIFO cleanup is A-before-B. A is retained as B's predecessor, so consuming A
+// while B is current must release A's detached root and prevent B from restoring it.
+const fifoTokenA = "11111111111111111111111111111111";
+const fifoTokenB = "22222222222222222222222222222222";
+if (!highlight.install(candidate, fifoTokenA, null).installed) throw new Error("FIFO predecessor A install failed");
+if (!highlight.install(candidate, fifoTokenB, fifoTokenA).installed) throw new Error("FIFO current B install failed");
+const fifoClearA = highlight.clear(fifoTokenA);
+if (fifoClearA.cleared || fifoClearA.resultingToken !== fifoTokenB || fifoClearA.predecessorConsumed !== true) throw new Error("FIFO A cleanup did not consume B's predecessor");
+const fifoClearB = highlight.clear(fifoTokenB);
+if (!fifoClearB.cleared || fifoClearB.restored || fifoClearB.resultingToken !== null || body.children.length !== 0) throw new Error("terminal B cleanup did not converge to no token");
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.filter((message) => message.type === "domMutation").length !== 1) throw new Error("owned clear changed DOM revision");
+if (target.focusCalls !== 0 || target.clickCalls !== 0 || target.dispatched.length !== 0) throw new Error("preview dispatched page interaction");
+if (firstRoot.listeners.size !== 0 || secondRoot.listeners.size !== 0) throw new Error("preview installed event listeners");
+if (messages.some((message) => ["userInput", "annotationCandidate"].includes(message.type))) throw new Error("preview emitted page events");
+process.stdout.write(JSON.stringify({ mutations: 1, children: body.children.length }));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"#,
+    ]
+    .concat();
+    let temp = TestDir::new("repair-highlight-overlay-node");
+    let harness_path = temp.path().join("harness.js");
+    std::fs::write(&harness_path, harness).expect("write repair highlight harness");
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("execute repair highlight harness in Node");
+    assert!(
+        output.status.success(),
+        "Node harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        r#"{"mutations":1,"children":0}"#
+    );
 }
 
 #[test]
