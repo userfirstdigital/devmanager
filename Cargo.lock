@@ -1957,6 +1957,7 @@ dependencies = [
  "windows 0.61.3",
  "winresource",
  "wry",
+ "zeroize",
 ]
 
 [[package]]

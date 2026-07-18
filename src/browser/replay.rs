@@ -1,6 +1,7 @@
 use super::{
     BrowserRecipeAction, BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserRecipeValue, BrowserRecipeViewport, BrowserWorkspaceKey,
+    BrowserRecipeValue, BrowserRecipeViewport, BrowserReplaySecretError, BrowserReplaySecretLease,
+    BrowserReplaySecretStore, BrowserReplaySecretSubmission, BrowserWorkspaceKey,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -259,6 +260,7 @@ pub struct BrowserReplayExecutionHandle {
     instance: BrowserReplayInstance,
     plan: Arc<BrowserReplayPlan>,
     lease: BrowserReplayCancellationLease,
+    secret_store: BrowserReplaySecretStore,
 }
 
 impl BrowserReplayExecutionHandle {
@@ -274,6 +276,18 @@ impl BrowserReplayExecutionHandle {
         self.lease.is_cancelled()
     }
 
+    pub fn secret_lease(
+        &self,
+        input_name: &str,
+    ) -> Result<BrowserReplaySecretLease, BrowserReplaySecretError> {
+        self.secret_store.lease(input_name)
+    }
+
+    #[cfg(test)]
+    fn observe_memory_clear_for_test(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.secret_store.observe_memory_clear_for_test()
+    }
+
     pub(crate) fn plan(&self) -> &BrowserReplayPlan {
         &self.plan
     }
@@ -284,6 +298,7 @@ struct ActiveBrowserReplay {
     plan: Arc<BrowserReplayPlan>,
     projection: BrowserReplayProjection,
     lease: BrowserReplayCancellationLease,
+    secret_store: BrowserReplaySecretStore,
 }
 
 struct TerminalBrowserReplay {
@@ -297,6 +312,14 @@ struct BrowserReplayCoordinatorState {
     active: HashMap<BrowserWorkspaceKey, ActiveBrowserReplay>,
     terminal: VecDeque<TerminalBrowserReplay>,
     terminal_capacity: usize,
+}
+
+impl Drop for BrowserReplayCoordinatorState {
+    fn drop(&mut self) {
+        for active in self.active.values() {
+            active.secret_store.close();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -380,19 +403,24 @@ impl BrowserReplayCoordinator {
         })
     }
 
-    #[allow(dead_code)] // Reserved as the value-free checkpoint-9 secret-store seam.
-    pub(crate) fn secrets_ready(
+    pub fn submit_secrets(
         &self,
         instance: &BrowserReplayInstance,
-    ) -> Result<BrowserReplayProjection, BrowserReplayError> {
-        self.transition_nonterminal(instance, |active| {
-            if active.projection.status != BrowserReplayStatus::NeedsUserSecret {
-                return Err(BrowserReplayError::InvalidTransition);
-            }
-            active.projection.status = BrowserReplayStatus::Running;
-            active.projection.unresolved_secret_inputs.clear();
-            Ok(active.projection.clone())
-        })
+        submission: BrowserReplaySecretSubmission,
+    ) -> Result<BrowserReplayProjection, BrowserReplaySecretError> {
+        let mut state = self.lock();
+        let active = Self::exact_active_mut(&mut state, instance)
+            .map_err(|_| BrowserReplaySecretError::StaleAuthority)?;
+        if active.projection.status != BrowserReplayStatus::NeedsUserSecret {
+            return Err(active.secret_store.submission_error());
+        }
+
+        active
+            .secret_store
+            .install(&active.projection.unresolved_secret_inputs, submission)?;
+        active.projection.status = BrowserReplayStatus::Running;
+        active.projection.unresolved_secret_inputs.clear();
+        Ok(active.projection.clone())
     }
 
     pub fn advance_step(
@@ -552,10 +580,12 @@ impl BrowserReplayCoordinator {
                 cancelled: AtomicBool::new(false),
             }),
         };
+        let secret_store = BrowserReplaySecretStore::new();
         let execution = BrowserReplayExecutionHandle {
             instance: instance.clone(),
             plan: Arc::clone(&plan),
             lease: lease.clone(),
+            secret_store: secret_store.share_authority(),
         };
         let projection = BrowserReplayProjection {
             workspace_key: workspace_key.clone(),
@@ -579,6 +609,7 @@ impl BrowserReplayCoordinator {
                 plan,
                 projection: projection.clone(),
                 lease: lease.clone(),
+                secret_store,
             },
         );
         Ok(BrowserReplayStart {
@@ -631,6 +662,9 @@ impl BrowserReplayCoordinator {
         failure: Option<BrowserReplayFailureCode>,
     ) -> Result<BrowserReplayProjection, BrowserReplayError> {
         Self::exact_active_mut(state, instance)?;
+        if let Some(active) = state.active.get(instance.workspace_key()) {
+            active.secret_store.close();
+        }
         let Some(mut active) = state.active.remove(instance.workspace_key()) else {
             return Err(BrowserReplayError::StaleInstance);
         };
@@ -843,6 +877,13 @@ fn validate_public_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::{
+        MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES,
+        MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES,
+    };
+    use std::sync::atomic::AtomicUsize;
+
+    const SECRET_SENTINEL: &str = "value-sentinel-secret-store";
 
     fn internal_plan(unresolved_secret_inputs: Vec<String>) -> BrowserReplayPlan {
         BrowserReplayPlan {
@@ -859,25 +900,276 @@ mod tests {
         }
     }
 
+    fn secret_submission(values: Vec<(&str, String)>) -> BrowserReplaySecretSubmission {
+        BrowserReplaySecretSubmission::from_user_prompt(
+            values
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+        )
+    }
+
+    fn one_secret_submission() -> BrowserReplaySecretSubmission {
+        secret_submission(vec![("password", SECRET_SENTINEL.to_string())])
+    }
+
+    fn started_secret_replay(
+        coordinator: &BrowserReplayCoordinator,
+        workspace_key: BrowserWorkspaceKey,
+    ) -> BrowserReplayStart {
+        coordinator
+            .start(workspace_key, internal_plan(vec!["password".to_string()]))
+            .unwrap()
+    }
+
     #[test]
-    fn replay_secret_readiness_is_an_internal_value_free_transition() {
+    fn replay_secret_submission_is_exact_complete_and_one_shot() {
         let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
         let workspace_key = BrowserWorkspaceKey::new("project", "conversation").unwrap();
-        let plan = internal_plan(vec!["password".to_string()]);
-        let started = coordinator.start(workspace_key, plan).unwrap();
+        let started = started_secret_replay(&coordinator, workspace_key);
 
         assert_eq!(
             started.projection.status,
             BrowserReplayStatus::NeedsUserSecret
         );
+        let projection = coordinator
+            .submit_secrets(&started.instance, one_secret_submission())
+            .unwrap();
+        assert_eq!(projection.status, BrowserReplayStatus::Running);
+        assert!(projection.unresolved_secret_inputs.is_empty());
+        assert!(!format!("{projection:?}").contains(SECRET_SENTINEL));
+        assert!(!serde_json::to_string(&projection)
+            .unwrap()
+            .contains(SECRET_SENTINEL));
+
+        let lease = started.execution.secret_lease("password").unwrap();
         assert_eq!(
-            coordinator.secrets_ready(&started.instance).unwrap().status,
+            lease.expose(|value| value == SECRET_SENTINEL).unwrap(),
+            true
+        );
+        assert_eq!(
+            coordinator.submit_secrets(&started.instance, one_secret_submission()),
+            Err(BrowserReplaySecretError::AlreadySubmitted)
+        );
+    }
+
+    #[test]
+    fn replay_secret_submission_rejects_invalid_sets_without_mutating_the_store() {
+        let invalid = vec![
+            secret_submission(vec![("", SECRET_SENTINEL.to_string())]),
+            secret_submission(vec![(
+                &"n".repeat(MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES + 1),
+                SECRET_SENTINEL.to_string(),
+            )]),
+            secret_submission(vec![("password", String::new())]),
+            secret_submission(vec![(
+                "password",
+                "x".repeat(MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES + 1),
+            )]),
+            secret_submission(vec![
+                ("password", SECRET_SENTINEL.to_string()),
+                ("password", "other-value".to_string()),
+            ]),
+            secret_submission(Vec::new()),
+            secret_submission(vec![
+                ("password", SECRET_SENTINEL.to_string()),
+                ("extra", "other-value".to_string()),
+            ]),
+        ];
+
+        for (index, submission) in invalid.into_iter().enumerate() {
+            let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+            let workspace_key =
+                BrowserWorkspaceKey::new("project", format!("invalid-{index}")).unwrap();
+            let started = started_secret_replay(&coordinator, workspace_key);
+
+            assert_eq!(
+                coordinator.submit_secrets(&started.instance, submission),
+                Err(BrowserReplaySecretError::InvalidSubmission)
+            );
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                BrowserReplayStatus::NeedsUserSecret
+            );
+            assert!(started.execution.secret_lease("password").is_err());
+
+            coordinator
+                .submit_secrets(&started.instance, one_secret_submission())
+                .unwrap();
+            assert!(started.execution.secret_lease("password").is_ok());
+        }
+    }
+
+    #[test]
+    fn replay_secret_submission_rejects_stale_and_foreign_authority_without_mutation() {
+        let left = BrowserReplayCoordinator::with_terminal_capacity(4);
+        let right = BrowserReplayCoordinator::with_terminal_capacity(4);
+        let workspace_key = BrowserWorkspaceKey::new("project", "shared-name").unwrap();
+        let left_started = started_secret_replay(&left, workspace_key.clone());
+        let right_started = started_secret_replay(&right, workspace_key.clone());
+
+        assert_eq!(
+            left.submit_secrets(&right_started.instance, one_secret_submission()),
+            Err(BrowserReplaySecretError::StaleAuthority)
+        );
+        assert_eq!(
+            left.status(&left_started.instance).unwrap().status,
+            BrowserReplayStatus::NeedsUserSecret
+        );
+
+        let replacement = left
+            .replace(workspace_key, internal_plan(vec!["password".to_string()]))
+            .unwrap();
+        assert_eq!(
+            left.submit_secrets(&left_started.instance, one_secret_submission()),
+            Err(BrowserReplaySecretError::StaleAuthority)
+        );
+        assert_eq!(
+            left.status(&replacement.instance).unwrap().status,
+            BrowserReplayStatus::NeedsUserSecret
+        );
+        left.submit_secrets(&replacement.instance, one_secret_submission())
+            .unwrap();
+    }
+
+    #[test]
+    fn replay_secret_submission_enforces_the_exact_input_count_limit() {
+        let names = |count: usize| {
+            (0..count)
+                .map(|index| format!("secret_{index}"))
+                .collect::<Vec<_>>()
+        };
+        let submission = |count: usize| {
+            BrowserReplaySecretSubmission::from_user_prompt(
+                (0..count)
+                    .map(|index| (format!("secret_{index}"), format!("value-{index}")))
+                    .collect(),
+            )
+        };
+
+        let coordinator = BrowserReplayCoordinator::with_terminal_capacity(4);
+        let accepted = coordinator
+            .start(
+                BrowserWorkspaceKey::new("project", "thirty-two-secrets").unwrap(),
+                internal_plan(names(MAX_BROWSER_REPLAY_SECRET_INPUTS)),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .submit_secrets(
+                    &accepted.instance,
+                    submission(MAX_BROWSER_REPLAY_SECRET_INPUTS),
+                )
+                .unwrap()
+                .status,
             BrowserReplayStatus::Running
         );
+
+        let rejected = coordinator
+            .start(
+                BrowserWorkspaceKey::new("project", "thirty-three-secrets").unwrap(),
+                internal_plan(names(MAX_BROWSER_REPLAY_SECRET_INPUTS + 1)),
+            )
+            .unwrap();
         assert_eq!(
-            coordinator.complete(&started.instance).unwrap().status,
-            BrowserReplayStatus::Completed
+            coordinator.submit_secrets(
+                &rejected.instance,
+                submission(MAX_BROWSER_REPLAY_SECRET_INPUTS + 1),
+            ),
+            Err(BrowserReplaySecretError::InvalidSubmission)
         );
+        assert_eq!(
+            coordinator.status(&rejected.instance).unwrap().status,
+            BrowserReplayStatus::NeedsUserSecret
+        );
+    }
+
+    #[test]
+    fn replay_secret_submission_rejects_credential_shaped_input_names() {
+        let credential_name = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+        let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+        let started = coordinator
+            .start(
+                BrowserWorkspaceKey::new("project", "unsafe-secret-name").unwrap(),
+                internal_plan(vec![credential_name.to_string()]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            coordinator.submit_secrets(
+                &started.instance,
+                secret_submission(vec![(credential_name, SECRET_SENTINEL.to_string())]),
+            ),
+            Err(BrowserReplaySecretError::InvalidSubmission)
+        );
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::NeedsUserSecret
+        );
+    }
+
+    #[test]
+    fn retained_secret_leases_close_and_owned_bytes_clear_on_every_terminal_path() {
+        enum TerminalPath {
+            Complete,
+            Fail,
+            Cancel,
+            Replace,
+            Interrupt,
+            CoordinatorDrop,
+        }
+
+        for (index, terminal_path) in [
+            TerminalPath::Complete,
+            TerminalPath::Fail,
+            TerminalPath::Cancel,
+            TerminalPath::Replace,
+            TerminalPath::Interrupt,
+            TerminalPath::CoordinatorDrop,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let coordinator = BrowserReplayCoordinator::with_terminal_capacity(4);
+            let workspace_key =
+                BrowserWorkspaceKey::new("project", format!("terminal-{index}")).unwrap();
+            let started = started_secret_replay(&coordinator, workspace_key.clone());
+            coordinator
+                .submit_secrets(&started.instance, one_secret_submission())
+                .unwrap();
+            let cleared: Arc<AtomicUsize> = started.execution.observe_memory_clear_for_test();
+            let lease = started.execution.secret_lease("password").unwrap();
+            assert!(lease.expose(|value| value == SECRET_SENTINEL).unwrap());
+
+            match terminal_path {
+                TerminalPath::Complete => {
+                    coordinator.complete(&started.instance).unwrap();
+                }
+                TerminalPath::Fail => {
+                    coordinator
+                        .fail(&started.instance, BrowserReplayFailureCode::StepFailed)
+                        .unwrap();
+                }
+                TerminalPath::Cancel => {
+                    coordinator.cancel(&started.instance).unwrap();
+                }
+                TerminalPath::Replace => {
+                    coordinator
+                        .replace(workspace_key, internal_plan(Vec::new()))
+                        .unwrap();
+                }
+                TerminalPath::Interrupt => {
+                    coordinator.interrupt_workspace(&workspace_key).unwrap();
+                }
+                TerminalPath::CoordinatorDrop => drop(coordinator),
+            }
+
+            assert_eq!(
+                lease.expose(|_| ()),
+                Err(BrowserReplaySecretError::ClosedStore)
+            );
+            assert_eq!(cleared.load(Ordering::Acquire), 1);
+        }
     }
 
     #[test]
