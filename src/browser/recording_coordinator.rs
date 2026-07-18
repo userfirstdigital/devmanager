@@ -327,16 +327,16 @@ impl BrowserWorkflowCoordinator {
                 }
             }
         }
-        if let BrowserCommand::Upload { target, .. } = command {
-            let prepared = match BrowserRecordingAction::upload(recipe_locator(target)) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    for reservation in reservations {
-                        let _ = state.recorder.cancel(reservation);
-                    }
-                    return Err(error);
+        let source_order_input = match source_order_input_action(command) {
+            Ok(source_order_input) => source_order_input,
+            Err(error) => {
+                for reservation in reservations {
+                    let _ = state.recorder.cancel(reservation);
                 }
-            };
+                return Err(error);
+            }
+        };
+        if let Some(prepared) = source_order_input {
             if let Err(error) = state.recorder.prepare(&reservations[0], prepared) {
                 for reservation in reservations {
                     let _ = state.recorder.cancel(reservation);
@@ -841,6 +841,22 @@ fn invalidate_exact_recording(
 fn cancel_pending_agent(recorder: &mut BrowserWorkflowRecorder, pending: PendingAgentRecording) {
     for reservation in pending.reservations {
         let _ = recorder.cancel(reservation);
+    }
+}
+
+fn source_order_input_action(
+    command: &BrowserCommand,
+) -> Result<Option<BrowserRecordingAction>, BrowserRecordingError> {
+    match command {
+        BrowserCommand::Upload { target, .. } => {
+            BrowserRecordingAction::upload(recipe_locator(target)).map(Some)
+        }
+        BrowserCommand::SecretType {
+            target, input_name, ..
+        } => {
+            BrowserRecordingAction::type_secret_input(recipe_locator(target), input_name).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 
