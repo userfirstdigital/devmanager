@@ -637,9 +637,22 @@ fn windows_host_taint_gates_content_capture_ipc_recording_and_post_exposure_succ
     assert!(secret.contains("typeSecret({}, {})"));
     assert!(!secret.contains("serde_json::to_string(action_target)"));
     assert!(
-        secret.find("mark_secret_document_tainted").unwrap()
+        secret.find("begin_secret_document_exposure").unwrap()
             < secret.find(".with_exposed").unwrap(),
-        "host taint and recorder teardown precede secret exposure"
+        "host exposure containment and recorder teardown precede secret exposure"
+    );
+    let exposure_start = windows
+        .find("fn begin_secret_document_exposure(")
+        .expect("exposure boundary");
+    let exposure_end = windows[exposure_start..]
+        .find("fn selected_tab_id(")
+        .map(|offset| exposure_start + offset)
+        .expect("exposure boundary end");
+    let exposure = &windows[exposure_start..exposure_end];
+    assert!(
+        exposure.find("state.begin_exposure()").unwrap()
+            < exposure.find("remove_page_recording_view").unwrap(),
+        "in-flight containment must be active before recording teardown"
     );
 
     let automation_start = windows.find("fn begin_automation_request(").unwrap();
@@ -736,25 +749,70 @@ fn windows_secret_callback_uses_only_sealed_api_and_fixed_primitive_codes() {
         .map(|offset| start + offset)
         .unwrap();
     let secret = &windows[start..end];
-    let host_taint = secret
-        .find("self.mark_secret_document_tainted")
-        .expect("host taint transition");
+    let host_exposure = secret
+        .find("self.begin_secret_document_exposure")
+        .expect("host exposure transition");
     let exposure = secret
         .find(".with_exposed")
         .expect("secret exposure closure");
     assert!(
-        host_taint < exposure,
+        host_exposure < exposure,
         "native callback containment must be active before secret exposure"
     );
     assert!(secret.contains("window.__devmanagerBrowser.typeSecret({}, {});"));
     assert!(secret.contains("return \"secret_type_ok\";"));
     assert!(!secret.contains("const value = await"));
+    assert!(secret.contains("callback_exposure.finish()"));
     assert!(secret.contains("fixed_secret_type_callback_result(&result)"));
+    assert!(
+        secret.find("callback_exposure.finish()").unwrap()
+            < secret
+                .find("fixed_secret_type_callback_result(&result)")
+                .unwrap()
+    );
     assert!(
         secret
             .find("fixed_secret_type_callback_result(&result)")
             .unwrap()
             < secret.find("sender.send(BrowserAsyncCompletion").unwrap()
+    );
+}
+
+#[test]
+fn windows_secret_exposure_lease_spans_schedule_through_fixed_callback() {
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let start = windows.find("fn start_secret_type(").unwrap();
+    let end = windows[start..]
+        .find("fn complete_snapshot(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let secret = &windows[start..end];
+
+    let begin = secret
+        .find("self.begin_secret_document_exposure")
+        .expect("begin native exposure");
+    let exposed = secret.find(".with_exposed").expect("sidecar exposure");
+    assert!(
+        begin < exposed,
+        "native in-flight state must precede decryption"
+    );
+    assert!(secret.contains("let callback_exposure = exposure.clone()"));
+    let callback_finish = secret
+        .find("callback_exposure.finish()")
+        .expect("callback finishes exposure");
+    let fixed_mapping = secret
+        .find("fixed_secret_type_callback_result(&result)")
+        .expect("fixed callback mapping");
+    let queued = secret
+        .find("sender.send(BrowserAsyncCompletion")
+        .expect("fixed callback queue");
+    assert!(callback_finish < fixed_mapping && fixed_mapping < queued);
+    assert!(
+        secret
+            .matches("finish_secret_exposure_on_error(&exposure")
+            .count()
+            >= 2,
+        "sidecar and evaluate errors must both finish idempotently"
     );
 }
 

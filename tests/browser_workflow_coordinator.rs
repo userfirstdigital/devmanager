@@ -556,7 +556,7 @@ fn windows_host_routes_page_ipc_and_user_chrome_through_the_shared_coordinator()
 
 #[test]
 fn windows_host_reserves_inspects_and_completes_agent_capture_at_queue_boundaries() {
-    let windows = include_str!("../src/browser/host/windows.rs");
+    let windows = include_str!("../src/browser/host/windows.rs").replace("\r\n", "\n");
     let reserve = windows
         .find(".reserve_agent_command(")
         .expect("agent capture reserves at host ingress");
@@ -939,7 +939,7 @@ fn secret_type_recording_reserves_inspects_and_commits_only_named_unset_secret_r
 }
 
 #[test]
-fn secret_recording_input_collision_is_rejected_during_inspection_before_exposure() {
+fn secret_recording_input_collision_is_rejected_at_begin_before_exposure() {
     let coordinator = BrowserWorkflowCoordinator::with_capacity(4);
     let workspace = workspace();
     let instance = coordinator
@@ -975,27 +975,13 @@ fn secret_recording_input_collision_is_rejected_during_inspection_before_exposur
         },
         input_name: "file".to_string(),
     };
-    coordinator
+    let error = coordinator
         .reserve_agent_command(&workspace, "collision", &command, BrowserRisk::Normal)
-        .expect("reserve before target inspection");
-    assert!(matches!(
-        coordinator.inspect_agent_secret_type(
-            &workspace,
-            "collision",
-            &command,
-            &BrowserRuntimeTarget::default(),
-            BrowserRisk::AccountSecurity,
-        ),
-        Err(devmanager::browser::BrowserRecordingError::InvalidAction)
-    ));
-    coordinator
-        .complete_agent_command(
-            &workspace,
-            "collision",
-            &command,
-            &Err(BrowserError::Interrupted),
-        )
-        .expect("cancel the unexposed reservation");
+        .expect_err("input ownership is validated before target inspection");
+    assert_eq!(
+        error,
+        devmanager::browser::BrowserRecordingError::InvalidAction
+    );
 
     let review = coordinator.stop(&instance).expect("stop recording");
     assert_eq!(review.recipe().steps.len(), 1);
@@ -1003,7 +989,7 @@ fn secret_recording_input_collision_is_rejected_during_inspection_before_exposur
 }
 
 #[test]
-fn secret_recording_input_capacity_is_rejected_during_inspection_before_exposure() {
+fn secret_recording_input_capacity_is_rejected_at_begin_before_exposure() {
     let coordinator = BrowserWorkflowCoordinator::with_capacity(MAX_BROWSER_RECORDING_INPUTS + 2);
     let workspace = workspace();
     let instance = coordinator
@@ -1041,27 +1027,13 @@ fn secret_recording_input_capacity_is_rejected_during_inspection_before_exposure
         },
         input_name: "overflow_secret".to_string(),
     };
-    coordinator
+    let error = coordinator
         .reserve_agent_command(&workspace, "capacity", &command, BrowserRisk::Normal)
-        .expect("step capacity still has room before input preflight");
-    assert!(matches!(
-        coordinator.inspect_agent_secret_type(
-            &workspace,
-            "capacity",
-            &command,
-            &BrowserRuntimeTarget::default(),
-            BrowserRisk::AccountSecurity,
-        ),
-        Err(devmanager::browser::BrowserRecordingError::CapacityExceeded)
-    ));
-    coordinator
-        .complete_agent_command(
-            &workspace,
-            "capacity",
-            &command,
-            &Err(BrowserError::Interrupted),
-        )
-        .expect("cancel the unexposed capacity reservation");
+        .expect_err("input capacity is validated before target inspection");
+    assert_eq!(
+        error,
+        devmanager::browser::BrowserRecordingError::CapacityExceeded
+    );
 
     let review = coordinator.stop(&instance).expect("stop recording");
     assert_eq!(review.recipe().inputs.len(), MAX_BROWSER_RECORDING_INPUTS);
@@ -1069,8 +1041,8 @@ fn secret_recording_input_capacity_is_rejected_during_inspection_before_exposure
 }
 
 #[test]
-fn cross_tab_secret_waits_for_earlier_upload_in_both_completion_orders() {
-    for upload_completes_first in [true, false] {
+fn cross_tab_upload_then_secret_records_without_retry_in_both_completion_orders() {
+    for secret_completes_first in [true, false] {
         let coordinator = BrowserWorkflowCoordinator::with_capacity(4);
         let workspace = workspace();
         let instance = coordinator.start(workspace.clone()).unwrap();
@@ -1082,60 +1054,176 @@ fn cross_tab_secret_waits_for_earlier_upload_in_both_completion_orders() {
         coordinator
             .reserve_agent_command(&workspace, "secret-b", &secret, BrowserRisk::Normal)
             .unwrap();
-
-        assert_eq!(
-            coordinator.inspect_agent_secret_type(
+        coordinator
+            .inspect_agent_secret_type(
                 &workspace,
                 "secret-b",
                 &secret,
                 &BrowserRuntimeTarget::default(),
                 BrowserRisk::AccountSecurity,
-            ),
-            Err(devmanager::browser::BrowserRecordingError::StaleReservation),
-            "SecretType cannot become exposure-eligible behind an unresolved global slot"
-        );
+            )
+            .expect("source-order input ownership is independent of callback order");
 
-        if upload_completes_first {
-            coordinator
-                .complete_agent_command(&workspace, "upload-a", &upload, &Ok(upload_response()))
-                .unwrap();
-            coordinator
-                .inspect_agent_secret_type(
-                    &workspace,
-                    "secret-b",
-                    &secret,
-                    &BrowserRuntimeTarget::default(),
-                    BrowserRisk::AccountSecurity,
-                )
-                .expect("retry becomes exposure-eligible after the earlier slot drains");
+        if secret_completes_first {
             coordinator
                 .complete_agent_command(&workspace, "secret-b", &secret, &Ok(secret_response()))
                 .unwrap();
-            let review = coordinator.stop(&instance).unwrap();
-            assert_eq!(review.recipe().steps.len(), 2);
-            assert_eq!(review.recipe().inputs.len(), 2);
-        } else {
-            coordinator
-                .complete_agent_command(
-                    &workspace,
-                    "secret-b",
-                    &secret,
-                    &Err(BrowserError::Interrupted),
-                )
-                .expect("an unexposed later secret cancels cleanly");
             coordinator
                 .complete_agent_command(&workspace, "upload-a", &upload, &Ok(upload_response()))
                 .unwrap();
-            let review = coordinator.stop(&instance).unwrap();
-            assert_eq!(review.recipe().steps.len(), 1);
-            assert_eq!(review.recipe().inputs.len(), 1);
-            assert_eq!(review.recipe().inputs[0].kind, BrowserRecipeInputKind::File);
+        } else {
+            coordinator
+                .complete_agent_command(&workspace, "upload-a", &upload, &Ok(upload_response()))
+                .unwrap();
+            coordinator
+                .complete_agent_command(&workspace, "secret-b", &secret, &Ok(secret_response()))
+                .unwrap();
         }
+
+        let review = coordinator.stop(&instance).unwrap();
+        assert_eq!(review.recipe().steps.len(), 2);
+        assert_eq!(review.recipe().inputs.len(), 2);
+        assert_eq!(review.recipe().inputs[0].name, "file");
+        assert_eq!(review.recipe().inputs[0].kind, BrowserRecipeInputKind::File);
+        assert_eq!(review.recipe().inputs[1].name, "credential");
+        assert_eq!(
+            review.recipe().inputs[1].kind,
+            BrowserRecipeInputKind::Secret
+        );
+        assert!(matches!(
+            &review.recipe().steps[0].action,
+            BrowserRecipeAction::Upload {
+                file: devmanager::browser::BrowserRecipeValue::Input { name },
+                ..
+            } if name == "file"
+        ));
+        assert!(matches!(
+            &review.recipe().steps[1].action,
+            BrowserRecipeAction::Type {
+                value: devmanager::browser::BrowserRecipeValue::Input { name },
+                ..
+            } if name == "credential"
+        ));
     }
 }
 
 #[test]
-fn cross_tab_pending_upload_owns_file_name_before_secret_exposure() {
+fn cross_tab_secret_then_upload_owns_names_in_source_order_for_both_completion_orders() {
+    for upload_completes_first in [true, false] {
+        let coordinator = BrowserWorkflowCoordinator::with_capacity(4);
+        let workspace = workspace();
+        let instance = coordinator.start(workspace.clone()).unwrap();
+        let secret = secret_command("tab-a", "file");
+        let upload = upload_command("tab-b", "upload-b");
+        coordinator
+            .reserve_agent_command(&workspace, "secret-a", &secret, BrowserRisk::Normal)
+            .unwrap();
+        coordinator
+            .reserve_agent_command(&workspace, "upload-b", &upload, BrowserRisk::Normal)
+            .unwrap();
+        coordinator
+            .inspect_agent_secret_type(
+                &workspace,
+                "secret-a",
+                &secret,
+                &BrowserRuntimeTarget::default(),
+                BrowserRisk::AccountSecurity,
+            )
+            .expect("the earlier explicit secret owns file before upload begins");
+
+        if upload_completes_first {
+            coordinator
+                .complete_agent_command(&workspace, "upload-b", &upload, &Ok(upload_response()))
+                .unwrap();
+            coordinator
+                .complete_agent_command(&workspace, "secret-a", &secret, &Ok(secret_response()))
+                .unwrap();
+        } else {
+            coordinator
+                .complete_agent_command(&workspace, "secret-a", &secret, &Ok(secret_response()))
+                .unwrap();
+            coordinator
+                .complete_agent_command(&workspace, "upload-b", &upload, &Ok(upload_response()))
+                .unwrap();
+        }
+
+        let review = coordinator.stop(&instance).unwrap();
+        assert_eq!(review.recipe().inputs.len(), 2);
+        assert_eq!(review.recipe().inputs[0].name, "file");
+        assert_eq!(
+            review.recipe().inputs[0].kind,
+            BrowserRecipeInputKind::Secret
+        );
+        assert_eq!(review.recipe().inputs[1].name, "file_2");
+        assert_eq!(review.recipe().inputs[1].kind, BrowserRecipeInputKind::File);
+        assert!(matches!(
+            &review.recipe().steps[0].action,
+            BrowserRecipeAction::Type {
+                value: devmanager::browser::BrowserRecipeValue::Input { name },
+                ..
+            } if name == "file"
+        ));
+        assert!(matches!(
+            &review.recipe().steps[1].action,
+            BrowserRecipeAction::Upload {
+                file: devmanager::browser::BrowserRecipeValue::Input { name },
+                ..
+            } if name == "file_2"
+        ));
+    }
+}
+
+#[test]
+fn cancelled_earlier_secret_keeps_the_later_uploads_preclaimed_name() {
+    let coordinator = BrowserWorkflowCoordinator::with_capacity(4);
+    let workspace = workspace();
+    let instance = coordinator.start(workspace.clone()).unwrap();
+    let secret = secret_command("tab-a", "file");
+    let upload = upload_command("tab-b", "upload-b");
+    coordinator
+        .reserve_agent_command(&workspace, "secret-a", &secret, BrowserRisk::Normal)
+        .unwrap();
+    coordinator
+        .reserve_agent_command(&workspace, "upload-b", &upload, BrowserRisk::Normal)
+        .unwrap();
+    coordinator
+        .inspect_agent_secret_type(
+            &workspace,
+            "secret-a",
+            &secret,
+            &BrowserRuntimeTarget::default(),
+            BrowserRisk::AccountSecurity,
+        )
+        .expect("the secret owner was fixed before the later upload began");
+
+    coordinator
+        .complete_agent_command(
+            &workspace,
+            "secret-a",
+            &secret,
+            &Err(BrowserError::Interrupted),
+        )
+        .expect("cancel the earlier secret");
+    coordinator
+        .complete_agent_command(&workspace, "upload-b", &upload, &Ok(upload_response()))
+        .expect("commit the later upload");
+
+    let review = coordinator.stop(&instance).unwrap();
+    assert_eq!(review.recipe().steps.len(), 1);
+    assert_eq!(review.recipe().inputs.len(), 1);
+    assert_eq!(review.recipe().inputs[0].name, "file_2");
+    assert_eq!(review.recipe().inputs[0].kind, BrowserRecipeInputKind::File);
+    assert!(matches!(
+        &review.recipe().steps[0].action,
+        BrowserRecipeAction::Upload {
+            file: devmanager::browser::BrowserRecipeValue::Input { name },
+            ..
+        } if name == "file_2"
+    ));
+}
+
+#[test]
+fn explicit_upload_secret_collision_fails_at_begin_with_value_free_error() {
     let coordinator = BrowserWorkflowCoordinator::with_capacity(4);
     let workspace = workspace();
     let instance = coordinator.start(workspace.clone()).unwrap();
@@ -1144,50 +1232,79 @@ fn cross_tab_pending_upload_owns_file_name_before_secret_exposure() {
     coordinator
         .reserve_agent_command(&workspace, "upload-a", &upload, BrowserRisk::Normal)
         .unwrap();
-    coordinator
+    let error = coordinator
         .reserve_agent_command(&workspace, "secret-b", &secret, BrowserRisk::Normal)
-        .unwrap();
-
+        .expect_err("the later explicit secret cannot steal the earlier File owner");
     assert_eq!(
-        coordinator.inspect_agent_secret_type(
-            &workspace,
-            "secret-b",
-            &secret,
-            &BrowserRuntimeTarget::default(),
-            BrowserRisk::AccountSecurity,
-        ),
-        Err(devmanager::browser::BrowserRecordingError::StaleReservation),
+        error,
+        devmanager::browser::BrowserRecordingError::InvalidAction
     );
+    assert_eq!(format!("{error:?}"), "InvalidAction");
     coordinator
         .complete_agent_command(&workspace, "upload-a", &upload, &Ok(upload_response()))
         .unwrap();
-    assert_eq!(
-        coordinator.inspect_agent_secret_type(
-            &workspace,
-            "secret-b",
-            &secret,
-            &BrowserRuntimeTarget::default(),
-            BrowserRisk::AccountSecurity,
-        ),
-        Err(devmanager::browser::BrowserRecordingError::InvalidAction),
-        "the materialized File owner can never be reinterpreted as Secret"
-    );
-    coordinator
-        .complete_agent_command(
-            &workspace,
-            "secret-b",
-            &secret,
-            &Err(BrowserError::Interrupted),
-        )
-        .unwrap();
     let review = coordinator.stop(&instance).unwrap();
+    assert_eq!(review.recipe().steps.len(), 1);
     assert_eq!(review.recipe().inputs.len(), 1);
     assert_eq!(review.recipe().inputs[0].name, "file");
     assert_eq!(review.recipe().inputs[0].kind, BrowserRecipeInputKind::File);
 }
 
 #[test]
-fn cross_tab_pending_uploads_reserve_near_capacity_before_secret_exposure() {
+fn failed_begin_rolls_back_reservation_and_input_owner_atomically() {
+    let coordinator = BrowserWorkflowCoordinator::with_capacity(5);
+    let workspace = workspace();
+    let instance = coordinator.start(workspace.clone()).unwrap();
+    let upload = upload_command("tab-a", "upload-a");
+    coordinator
+        .reserve_agent_command(&workspace, "upload-a", &upload, BrowserRisk::Normal)
+        .unwrap();
+
+    let collision = secret_command("tab-b", "file");
+    assert_eq!(
+        coordinator
+            .reserve_agent_command(&workspace, "collision", &collision, BrowserRisk::Normal,),
+        Err(devmanager::browser::BrowserRecordingError::InvalidAction)
+    );
+
+    let replacement = secret_command("tab-b", "credential");
+    coordinator
+        .reserve_agent_command(&workspace, "replacement", &replacement, BrowserRisk::Normal)
+        .expect("failed begin released its reservation and input ownership");
+    coordinator
+        .inspect_agent_secret_type(
+            &workspace,
+            "replacement",
+            &replacement,
+            &BrowserRuntimeTarget::default(),
+            BrowserRisk::AccountSecurity,
+        )
+        .unwrap();
+    coordinator
+        .complete_agent_command(
+            &workspace,
+            "replacement",
+            &replacement,
+            &Ok(secret_response()),
+        )
+        .unwrap();
+    coordinator
+        .complete_agent_command(&workspace, "upload-a", &upload, &Ok(upload_response()))
+        .unwrap();
+
+    let review = coordinator.stop(&instance).unwrap();
+    assert_eq!(review.recipe().steps.len(), 2);
+    assert_eq!(review.recipe().inputs[0].name, "file");
+    assert_eq!(review.recipe().inputs[0].kind, BrowserRecipeInputKind::File);
+    assert_eq!(review.recipe().inputs[1].name, "credential");
+    assert_eq!(
+        review.recipe().inputs[1].kind,
+        BrowserRecipeInputKind::Secret
+    );
+}
+
+#[test]
+fn source_order_input_capacity_fails_at_begin_before_secret_exposure() {
     let coordinator = BrowserWorkflowCoordinator::with_capacity(MAX_BROWSER_RECORDING_INPUTS + 2);
     let workspace = workspace();
     let instance = coordinator.start(workspace.clone()).unwrap();
@@ -1201,46 +1318,78 @@ fn cross_tab_pending_uploads_reserve_near_capacity_before_secret_exposure() {
         uploads.push((operation_id, upload));
     }
     let secret = secret_command("tab-b", "overflow_secret");
-    coordinator
+    let error = coordinator
         .reserve_agent_command(&workspace, "secret-b", &secret, BrowserRisk::Normal)
-        .unwrap();
+        .expect_err("all input owners are claimed before asynchronous inspection");
     assert_eq!(
-        coordinator.inspect_agent_secret_type(
-            &workspace,
-            "secret-b",
-            &secret,
-            &BrowserRuntimeTarget::default(),
-            BrowserRisk::AccountSecurity,
-        ),
-        Err(devmanager::browser::BrowserRecordingError::StaleReservation),
+        error,
+        devmanager::browser::BrowserRecordingError::CapacityExceeded
     );
+    assert_eq!(format!("{error:?}"), "CapacityExceeded");
     for (operation_id, upload) in &uploads {
         coordinator
             .complete_agent_command(&workspace, operation_id, upload, &Ok(upload_response()))
             .unwrap();
     }
-    assert_eq!(
-        coordinator.inspect_agent_secret_type(
-            &workspace,
-            "secret-b",
-            &secret,
-            &BrowserRuntimeTarget::default(),
-            BrowserRisk::AccountSecurity,
-        ),
-        Err(devmanager::browser::BrowserRecordingError::CapacityExceeded),
-        "draining earlier slots exposes the real input-capacity gate"
-    );
-    coordinator
-        .complete_agent_command(
-            &workspace,
-            "secret-b",
-            &secret,
-            &Err(BrowserError::Interrupted),
-        )
-        .unwrap();
     let review = coordinator.stop(&instance).unwrap();
     assert_eq!(review.recipe().steps.len(), MAX_BROWSER_RECORDING_INPUTS);
     assert_eq!(review.recipe().inputs.len(), MAX_BROWSER_RECORDING_INPUTS);
+}
+
+#[test]
+fn stop_discard_restart_releases_all_preclaimed_input_owners() {
+    let coordinator = BrowserWorkflowCoordinator::with_capacity(4);
+    let workspace = workspace();
+    let first = coordinator.start(workspace.clone()).unwrap();
+    let pending_secret = secret_command("tab-a", "file");
+    coordinator
+        .reserve_agent_command(
+            &workspace,
+            "pending-secret",
+            &pending_secret,
+            BrowserRisk::Normal,
+        )
+        .unwrap();
+    coordinator
+        .inspect_agent_secret_type(
+            &workspace,
+            "pending-secret",
+            &pending_secret,
+            &BrowserRuntimeTarget::default(),
+            BrowserRisk::AccountSecurity,
+        )
+        .unwrap();
+
+    let first_review = coordinator.stop(&first).unwrap();
+    assert!(first_review.recipe().inputs.is_empty());
+    assert!(first_review.recipe().steps.is_empty());
+    coordinator.discard(&first).unwrap();
+
+    let restarted = coordinator.start(workspace.clone()).unwrap();
+    let upload = upload_command("tab-b", "upload-after-restart");
+    coordinator
+        .reserve_agent_command(
+            &workspace,
+            "upload-after-restart",
+            &upload,
+            BrowserRisk::Normal,
+        )
+        .expect("restart has a fresh input ownership domain");
+    coordinator
+        .complete_agent_command(
+            &workspace,
+            "upload-after-restart",
+            &upload,
+            &Ok(upload_response()),
+        )
+        .unwrap();
+    let restarted_review = coordinator.stop(&restarted).unwrap();
+    assert_eq!(restarted_review.recipe().inputs.len(), 1);
+    assert_eq!(restarted_review.recipe().inputs[0].name, "file");
+    assert_eq!(
+        restarted_review.recipe().inputs[0].kind,
+        BrowserRecipeInputKind::File
+    );
 }
 
 #[test]

@@ -550,11 +550,6 @@ impl BrowserWorkflowRecorder {
             | ReservationState::Ready(_)
             | ReservationState::Cancelled => return Err(BrowserRecordingError::StaleReservation),
         }
-        if matches!(&action.action, PendingRecordingAction::SecretType { .. })
-            && reservation.sequence != active.next_to_drain
-        {
-            return Err(BrowserRecordingError::StaleReservation);
-        }
         let reserved_input = prepare_recording_input(active, &action)?;
         if retained_assertion_count(active).saturating_add(action.assertions.len())
             > MAX_BROWSER_RECORDING_ASSERTIONS

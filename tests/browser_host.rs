@@ -730,9 +730,12 @@ async fn workspace_revoke_interrupts_a_request_blocked_on_full_transport() {
 
 #[test]
 fn cancellation_ticket_and_watch_subscriptions_share_one_ordering_lock() {
-    let source = include_str!("../src/browser/commands.rs");
+    let source = include_str!("../src/browser/commands.rs").replace("\r\n", "\n");
     let start = source.find("fn cancellation_state_for_command(").unwrap();
-    let end = source[start..].find("\n    }\n}").unwrap() + start;
+    let end = source[start..]
+        .find("fn enqueue_lifecycle_command(")
+        .unwrap()
+        + start;
     let state = &source[start..end];
     let lock = state.find("host_controls.with_locked").unwrap();
     let ticket = state.find(".ticket(").unwrap();
@@ -3065,13 +3068,26 @@ fn windows_native_metadata_callbacks_and_event_drain_consult_document_taint() {
         .map(|offset| drain_start + offset)
         .unwrap();
     let drain = &source[drain_start..drain_end];
-    assert!(drain.contains("contain_queued_host_event(event, tainted)"));
+    assert!(drain.contains(".map(|state| state.is_tainted())"));
+    assert!(!drain.contains(".is_some_and("));
+    assert!(drain.contains("let tainted = document_taint.unwrap_or(true);"));
+    assert!(drain.contains("contain_queued_host_event(event, document_taint)"));
     assert!(
         drain
-            .find("contain_queued_host_event(event, tainted)")
+            .find("contain_queued_host_event(event, document_taint)")
             .unwrap()
             < drain.find("match &event").unwrap()
     );
+
+    let containment_start = source.find("fn contain_queued_host_event(").unwrap();
+    let containment_end = source[containment_start..]
+        .find("fn browser_command_is_automation(")
+        .map(|offset| containment_start + offset)
+        .unwrap();
+    let containment = &source[containment_start..containment_end];
+    assert!(containment.contains("document_taint: Option<bool>"));
+    assert!(containment.contains("document_taint == Some(false)"));
+    assert!(containment.contains("document_taint.is_none()"));
 }
 
 #[test]
