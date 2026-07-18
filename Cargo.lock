@@ -1944,6 +1944,7 @@ dependencies = [
  "sha2",
  "static_assertions",
  "sysinfo 0.38.4",
+ "tempfile",
  "time",
  "tokio",
  "tokio-tungstenite",

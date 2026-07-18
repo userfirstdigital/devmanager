@@ -4,6 +4,7 @@ pub mod platform_service;
 pub mod ports_service;
 mod process_manager;
 mod process_ops;
+pub mod pwsh_probe;
 pub mod scanner_service;
 mod session_manager;
 

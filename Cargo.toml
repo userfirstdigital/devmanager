@@ -55,6 +55,7 @@ winresource = "0.1"
 [dev-dependencies]
 rmcp = { version = "=2.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 static_assertions = "1.1.0"
+tempfile = "3"
 
 [package.metadata.packager]
 product-name = "DevManager"
