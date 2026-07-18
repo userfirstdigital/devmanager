@@ -1028,6 +1028,21 @@ mod registry_tests {
 }
 
 #[cfg(test)]
+mod real_codex_tests {
+    use super::*;
+
+    /// Exercises the full real probe path (resolve npx, run `--help` through
+    /// the wrapper, detect the trust flag). Requires network/npx cache; run
+    /// explicitly with `cargo test --lib real_codex -- --ignored`.
+    #[test]
+    #[ignore = "invokes the real npx/codex binary"]
+    fn real_codex_advertises_hook_capabilities() {
+        codex_supports_hooks("npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox")
+            .expect("current Codex must advertise --dangerously-bypass-hook-trust");
+    }
+}
+
+#[cfg(test)]
 mod launch_builder_tests {
     use super::*;
 
