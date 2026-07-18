@@ -258,6 +258,7 @@ fn epoch_millis() -> u64 {
 
 /// Follows one rollout JSONL file on a background thread, feeding complete
 /// lines through a `CodexRolloutReducer` and publishing the resulting drafts.
+#[derive(Debug)]
 pub struct CodexRolloutTailer {
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,

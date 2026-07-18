@@ -2,7 +2,11 @@ use crate::ai::claude_hooks::{
     prepare_claude_launch_overlay, ClaudeHookRegistration, ClaudeHookRegistry,
     ClaudeHookRelayListener, ClaudeRegistryEvent, ClaudeShellKind,
 };
-use crate::ai::codex_bridge::{prepare_codex_adapter, CodexBridgeHandle, PreparedCodexAdapter};
+use crate::ai::codex_hooks::{
+    build_codex_hooks_command, codex_supports_hooks, CodexHookRegistration, CodexHookRegistry,
+    CodexHookRelayListener, CodexRegistryEvent, CodexSessionBinding,
+};
+use crate::ai::codex_rollout::CodexRolloutTailer;
 use crate::browser::{
     browser_input_opens_prompt_boundary, codex_browser_config_overrides,
     prepare_claude_browser_overlay, BrowserAttachmentBroker, BrowserAttachmentSessionBinding,
@@ -117,27 +121,9 @@ pub enum RemoteSessionEvent {
 }
 
 type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
-type CodexAdapterPreparer = Arc<dyn Fn(&str) -> Result<PreparedCodexAdapter, String> + Send + Sync>;
+type CodexHooksSupportProbe = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 #[cfg(test)]
 type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
-
-trait CodexFallbackTerminalOps: Send + Sync {
-    fn terminate_and_reap(
-        &self,
-        inner: &Arc<ProcessManagerInner>,
-        session_id: &str,
-    ) -> Result<(), String>;
-
-    fn spawn_original(
-        &self,
-        inner: &Arc<ProcessManagerInner>,
-        session_id: &str,
-        launch: &AiLaunchSpec,
-        environment: &HashMap<String, String>,
-    ) -> Result<(), String>;
-}
-
-struct NativeCodexFallbackTerminalOps;
 
 pub(crate) struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
@@ -163,9 +149,9 @@ pub(crate) struct ProcessManagerInner {
     browser_gateway_registrar: RwLock<Option<BrowserGatewayRegistrar>>,
     browser_provider_sessions: Mutex<HashMap<String, BrowserProviderSession>>,
     browser_diagnostics: Mutex<HashMap<String, String>>,
-    codex_adapter_preparer: RwLock<CodexAdapterPreparer>,
-    codex_adapter_activation_timeout: RwLock<Duration>,
-    codex_fallback_terminal_ops: RwLock<Arc<dyn CodexFallbackTerminalOps>>,
+    codex_hook_registry: Arc<CodexHookRegistry>,
+    codex_hook_listener: Mutex<Option<CodexHookRelayListener>>,
+    codex_hooks_support_probe: RwLock<CodexHooksSupportProbe>,
     codex_adapter_generation: AtomicU64,
     codex_adapter_registry: Mutex<CodexAdapterRegistry>,
     background_stop: AtomicBool,
@@ -245,52 +231,10 @@ enum CodexAdapterSession {
     Degraded(CodexAdapterIdentity),
     Running {
         identity: CodexAdapterIdentity,
-        _handle: CodexBridgeHandle,
-        lifecycle: CodexAdapterLifecycle,
-        original_launch: AiLaunchSpec,
-        fallback_environment: HashMap<String, String>,
+        registration: CodexHookRegistration,
+        tailer: Option<CodexRolloutTailer>,
+        activated: bool,
     },
-}
-
-#[derive(Debug, Clone)]
-struct CodexAdapterLifecycle {
-    original_startup_command: String,
-    activated: bool,
-    remote_command_injected: bool,
-    fallback_started: bool,
-    provider_turn_observed: bool,
-}
-
-impl CodexAdapterLifecycle {
-    fn new(original_startup_command: String) -> Self {
-        Self {
-            original_startup_command,
-            activated: false,
-            remote_command_injected: false,
-            fallback_started: false,
-            provider_turn_observed: false,
-        }
-    }
-
-    fn mark_activated(&mut self) -> bool {
-        if self.activated {
-            return false;
-        }
-        self.activated = true;
-        true
-    }
-
-    fn claim_preactivation_fallback(&mut self) -> Option<String> {
-        if self.activated || self.fallback_started {
-            return None;
-        }
-        self.fallback_started = true;
-        Some(self.original_startup_command.clone())
-    }
-
-    fn mark_provider_turn_observed(&mut self) {
-        self.provider_turn_observed = true;
-    }
 }
 
 impl CodexAdapterSession {
@@ -459,6 +403,7 @@ impl ProcessManager {
     pub fn new() -> Self {
         let debug_enabled = debug_enabled();
         let claude_hook_registry = Arc::new(ClaudeHookRegistry::default());
+        let codex_hook_registry = Arc::new(CodexHookRegistry::default());
         let claude_hook_temp_root = prepare_claude_overlay_process_root();
         let inner = Arc::new(ProcessManagerInner {
             sessions: Mutex::new(HashMap::new()),
@@ -484,9 +429,9 @@ impl ProcessManager {
             browser_gateway_registrar: RwLock::new(None),
             browser_provider_sessions: Mutex::new(HashMap::new()),
             browser_diagnostics: Mutex::new(HashMap::new()),
-            codex_adapter_preparer: RwLock::new(Arc::new(prepare_codex_adapter)),
-            codex_adapter_activation_timeout: RwLock::new(std::time::Duration::from_secs(30)),
-            codex_fallback_terminal_ops: RwLock::new(Arc::new(NativeCodexFallbackTerminalOps)),
+            codex_hook_registry: codex_hook_registry.clone(),
+            codex_hook_listener: Mutex::new(None),
+            codex_hooks_support_probe: RwLock::new(Arc::new(codex_supports_hooks)),
             codex_adapter_generation: AtomicU64::new(1),
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             background_stop: AtomicBool::new(false),
@@ -500,6 +445,14 @@ impl ProcessManager {
         if let Ok(mut owner) = inner.claude_overlay_owner.lock() {
             *owner = Arc::downgrade(&claude_overlay_owner);
         }
+
+        let codex_registry_inner = Arc::downgrade(&inner);
+        codex_hook_registry.set_event_handler(Some(Arc::new(move |registration, event| {
+            let Some(inner) = codex_registry_inner.upgrade() else {
+                return;
+            };
+            handle_codex_hook_registry_event(&inner, registration, event);
+        })));
 
         let registry_inner = Arc::downgrade(&inner);
         claude_hook_registry.set_event_handler(Some(Arc::new(move |registration, event| {
@@ -1456,30 +1409,12 @@ impl ProcessManager {
     }
 
     #[cfg(test)]
-    fn set_codex_adapter_preparer_for_test(&self, preparer: CodexAdapterPreparer) {
+    fn set_codex_hooks_support_probe_for_test(&self, probe: CodexHooksSupportProbe) {
         *self
             .inner
-            .codex_adapter_preparer
+            .codex_hooks_support_probe
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = preparer;
-    }
-
-    #[cfg(test)]
-    fn set_codex_adapter_activation_timeout_for_test(&self, timeout: Duration) {
-        *self
-            .inner
-            .codex_adapter_activation_timeout
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = timeout;
-    }
-
-    #[cfg(test)]
-    fn set_codex_fallback_terminal_ops_for_test(&self, ops: Arc<dyn CodexFallbackTerminalOps>) {
-        *self
-            .inner
-            .codex_fallback_terminal_ops
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ops;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = probe;
     }
 
     fn prepare_codex_launch_for_session(
@@ -1511,7 +1446,6 @@ impl ProcessManager {
             stable_session_key,
             generation,
         };
-        let original_launch = launch.clone();
         let replaced = {
             let mut registry = self
                 .inner
@@ -1535,16 +1469,53 @@ impl ProcessManager {
             );
         }
 
-        let preparer = self
+        let probe = self
             .inner
-            .codex_adapter_preparer
+            .codex_hooks_support_probe
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let prepared = match preparer(&launch.startup_command) {
+        if let Err(error) = probe(&launch.startup_command) {
+            eprintln!("Codex hooks tap unavailable for {session_id}: {error}");
+            mark_codex_adapter_degraded(&self.inner, session_id, &identity);
+            self.cleanup_browser_provider_session(session_id);
+            self.set_browser_diagnostic(
+                &launch.tab_id,
+                Some(
+                    "Browser tools unavailable because Codex launch preparation failed".to_string(),
+                ),
+            );
+            return HashMap::new();
+        }
+        let prepared = self
+            .codex_hook_endpoint()
+            .and_then(|endpoint| {
+                std::env::current_exe()
+                    .map(|executable| (endpoint, executable))
+                    .map_err(|error| format!("resolve DevManager executable: {error}"))
+            })
+            .and_then(|(endpoint, executable)| {
+                let registration = self
+                    .inner
+                    .codex_hook_registry
+                    .register(identity.stable_session_key.clone())?;
+                build_codex_hooks_command(
+                    &launch.startup_command,
+                    &launch.shell_program,
+                    &executable,
+                    &endpoint,
+                    &registration.nonce,
+                    &browser_config,
+                )
+                .inspect_err(|_| {
+                    self.inner.codex_hook_registry.unregister(&registration.nonce);
+                })
+                .map(|startup_command| (registration, startup_command))
+            });
+        let (registration, startup_command) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                eprintln!("Codex native adapter preparation failed for {session_id}: {error}");
+                eprintln!("Codex hooks launch preparation failed for {session_id}: {error}");
                 mark_codex_adapter_degraded(&self.inner, session_id, &identity);
                 self.cleanup_browser_provider_session(session_id);
                 self.set_browser_diagnostic(
@@ -1557,108 +1528,18 @@ impl ProcessManager {
                 return HashMap::new();
             }
         };
-
-        let semantic_inner = Arc::downgrade(&self.inner);
-        let semantic_identity = identity.clone();
-        let semantic_session_id = session_id.to_string();
-        let activation_inner = Arc::downgrade(&self.inner);
-        let activation_identity = identity.clone();
-        let activation_session_id = session_id.to_string();
-        let exit_inner = Arc::downgrade(&self.inner);
-        let exit_identity = identity.clone();
-        let exit_session_id = session_id.to_string();
-        let activation_timeout = *self
-            .inner
-            .codex_adapter_activation_timeout
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let started = match CodexBridgeHandle::start_with_activation_timeout(
-            prepared.clone(),
-            launch.cwd.clone(),
-            identity.stable_session_key.clone(),
-            move |draft| {
-                if let Some(inner) = semantic_inner.upgrade() {
-                    emit_codex_semantic_if_current(
-                        &inner,
-                        &semantic_session_id,
-                        &semantic_identity,
-                        draft,
-                    );
-                }
-            },
-            move || {
-                if let Some(inner) = activation_inner.upgrade() {
-                    mark_codex_adapter_activated(
-                        &inner,
-                        &activation_session_id,
-                        &activation_identity,
-                    );
-                }
-            },
-            move |error| {
-                eprintln!("Codex native adapter bridge exited for {exit_session_id}: {error}");
-                if let Some(inner) = exit_inner.upgrade() {
-                    handle_codex_bridge_exit(inner, &exit_session_id, &exit_identity);
-                }
-            },
-            activation_timeout,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                eprintln!("Codex native adapter bridge failed for {session_id}: {error}");
-                mark_codex_adapter_degraded(&self.inner, session_id, &identity);
-                self.cleanup_browser_provider_session(session_id);
-                self.set_browser_diagnostic(
-                    &launch.tab_id,
-                    Some(
-                        "Browser tools unavailable because the Codex adapter did not start"
-                            .to_string(),
-                    ),
-                );
-                return HashMap::new();
-            }
-        };
-        let (mut handle, mut terminal_env) = started.into_parts();
-        if !handle.is_running() {
-            eprintln!("Codex native adapter bridge exited before launch for {session_id}");
-            handle.shutdown();
-            mark_codex_adapter_degraded(&self.inner, session_id, &identity);
-            self.cleanup_browser_provider_session(session_id);
-            self.set_browser_diagnostic(
-                &launch.tab_id,
-                Some(
-                    "Browser tools unavailable because the Codex adapter exited early".to_string(),
-                ),
-            );
-            return HashMap::new();
-        }
+        let mut terminal_env = HashMap::new();
         if let Some(access) = browser_access.as_ref() {
             terminal_env.extend(access.environment());
         }
 
-        let mut fallback_launch = original_launch.clone();
-        if !browser_config.is_empty() {
-            fallback_launch.startup_command =
-                prepared.fallback_tui_command_with_config(&launch.shell_program, &browser_config);
-        }
-        let fallback_environment = browser_access
-            .as_ref()
-            .map(BrowserProviderAccess::environment)
-            .unwrap_or_default();
-
-        let endpoint = handle.endpoint().to_string();
         let installed = {
             let mut registry = self
                 .inner
                 .codex_adapter_registry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Recheck liveness while holding the same registry lock used by the
-            // exit callback. If the sidecar died after `start` returned, either
-            // this rejects the install or the queued degraded event is emitted
-            // after the healthy event; a dead bridge can never win the race.
-            let is_current = handle.is_running()
-                && registry.is_current(&identity)
+            let is_current = registry.is_current(&identity)
                 && registry
                     .sessions
                     .get(session_id)
@@ -1668,12 +1549,9 @@ impl ProcessManager {
                     session_id.to_string(),
                     CodexAdapterSession::Running {
                         identity: identity.clone(),
-                        _handle: handle,
-                        lifecycle: CodexAdapterLifecycle::new(
-                            fallback_launch.startup_command.clone(),
-                        ),
-                        original_launch: fallback_launch,
-                        fallback_environment,
+                        registration: registration.clone(),
+                        tailer: None,
+                        activated: false,
                     },
                 );
                 true
@@ -1682,6 +1560,9 @@ impl ProcessManager {
             }
         };
         if !installed {
+            self.inner
+                .codex_hook_registry
+                .unregister(&registration.nonce);
             self.cleanup_browser_provider_session(session_id);
             self.set_browser_diagnostic(
                 &launch.tab_id,
@@ -1698,9 +1579,25 @@ impl ProcessManager {
                 identity: codex_semantic_identity(session_id, &identity),
             },
         );
-        launch.startup_command =
-            prepared.tui_command_with_config(&endpoint, &launch.shell_program, &browser_config);
+        launch.startup_command = startup_command;
         terminal_env
+    }
+
+    fn codex_hook_endpoint(&self) -> Result<String, String> {
+        let mut listener = self
+            .inner
+            .codex_hook_listener
+            .lock()
+            .map_err(|_| "Codex hook listener lock is poisoned".to_string())?;
+        if listener.is_none() {
+            *listener = Some(CodexHookRelayListener::start(
+                self.inner.codex_hook_registry.clone(),
+            )?);
+        }
+        listener
+            .as_ref()
+            .map(|listener| listener.endpoint().to_string())
+            .ok_or_else(|| "Codex hook listener did not start".to_string())
     }
 
     fn prepare_ai_terminal_environment(
@@ -1723,7 +1620,16 @@ impl ProcessManager {
         let removed_identity = removed
             .as_ref()
             .and_then(|session| session.registered_semantic_identity(session_id));
-        drop(removed);
+        // Join the tailer and retire the relay nonce outside the registry lock.
+        if let Some(CodexAdapterSession::Running {
+            registration,
+            tailer,
+            ..
+        }) = removed
+        {
+            drop(tailer);
+            self.inner.codex_hook_registry.unregister(&registration.nonce);
+        }
         if let Some(identity) = removed_identity {
             emit_remote_session_event(
                 &self.inner,
@@ -3548,15 +3454,6 @@ fn unbind_attachment_if_matches(
     binding.is_some_and(|binding| inner.browser_attachment_broker.unbind_if_matches(binding))
 }
 
-fn renew_attachment_binding_for_codex_fallback(
-    inner: &ProcessManagerInner,
-    expected: Option<&BrowserAttachmentSessionBinding>,
-) -> Result<Option<BrowserAttachmentSessionBinding>, crate::browser::BrowserAttachmentError> {
-    expected
-        .map(|expected| inner.browser_attachment_broker.renew_if_matches(expected))
-        .transpose()
-}
-
 fn drain_claude_hook_sessions_inner(inner: &ProcessManagerInner) {
     let sessions = {
         let sessions = inner
@@ -5014,14 +4911,6 @@ fn emit_codex_semantic_if_current(
         return;
     };
     if session.identity() == identity {
-        if matches!(
-            &draft.kind,
-            crate::remote::presentation::SemanticEventKind::UserMessage { .. }
-        ) {
-            if let CodexAdapterSession::Running { lifecycle, .. } = session {
-                lifecycle.mark_provider_turn_observed();
-            }
-        }
         emit_remote_session_event(
             inner,
             RemoteSessionEvent::CodexSemantic {
@@ -5053,30 +4942,92 @@ fn emit_codex_health_if_current(
     }
 }
 
-fn mark_codex_adapter_activated(
-    inner: &ProcessManagerInner,
+fn handle_codex_hook_registry_event(
+    inner: &Arc<ProcessManagerInner>,
+    registration: CodexHookRegistration,
+    event: CodexRegistryEvent,
+) {
+    let located = {
+        let registry = inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry
+            .sessions
+            .iter()
+            .find_map(|(session_id, session)| match session {
+                CodexAdapterSession::Running {
+                    identity,
+                    registration: current,
+                    ..
+                } if current.nonce == registration.nonce => {
+                    Some((session_id.clone(), identity.clone()))
+                }
+                _ => None,
+            })
+    };
+    let Some((session_id, identity)) = located else {
+        return;
+    };
+    match event {
+        CodexRegistryEvent::Semantic(draft) => {
+            emit_codex_semantic_if_current(inner, &session_id, &identity, draft);
+        }
+        CodexRegistryEvent::SessionStarted(binding) => {
+            handle_codex_session_started(inner, &session_id, &identity, binding);
+        }
+    }
+}
+
+fn handle_codex_session_started(
+    inner: &Arc<ProcessManagerInner>,
     session_id: &str,
     identity: &CodexAdapterIdentity,
+    binding: CodexSessionBinding,
 ) {
-    let activated = {
+    let new_tailer = binding.transcript_path.map(|path| {
+        let tail_inner = Arc::downgrade(inner);
+        let tail_session_id = session_id.to_string();
+        let tail_identity = identity.clone();
+        CodexRolloutTailer::start(
+            path,
+            identity.stable_session_key.clone(),
+            move |draft| {
+                if let Some(inner) = tail_inner.upgrade() {
+                    emit_codex_semantic_if_current(&inner, &tail_session_id, &tail_identity, draft);
+                }
+            },
+        )
+    });
+    let (replaced_tailer, newly_activated) = {
         let mut registry = inner
             .codex_adapter_registry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !registry.is_current(identity) {
-            false
+            (new_tailer, false)
         } else {
             match registry.sessions.get_mut(session_id) {
                 Some(CodexAdapterSession::Running {
                     identity: current,
-                    lifecycle,
+                    tailer,
+                    activated,
                     ..
-                }) if current == identity => lifecycle.mark_activated(),
-                _ => false,
+                }) if current == identity => {
+                    // A resumed session re-delivers SessionStart with the
+                    // authoritative transcript path: rebind the tailer.
+                    let replaced = std::mem::replace(tailer, new_tailer);
+                    let newly_activated = !*activated;
+                    *activated = true;
+                    (replaced, newly_activated)
+                }
+                _ => (new_tailer, false),
             }
         }
     };
-    if activated {
+    // Joins the superseded tailer thread outside the registry lock.
+    drop(replaced_tailer);
+    if newly_activated {
         emit_remote_session_event(
             inner,
             RemoteSessionEvent::AdapterHealth {
@@ -5084,256 +5035,6 @@ fn mark_codex_adapter_activated(
                 health: SemanticAdapterHealth::Healthy,
             },
         );
-    }
-}
-
-fn handle_codex_bridge_exit(
-    inner: Arc<ProcessManagerInner>,
-    session_id: &str,
-    identity: &CodexAdapterIdentity,
-) {
-    let fallback_launch = {
-        let mut registry = inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !registry.is_current(identity) {
-            return;
-        }
-        match registry.sessions.get_mut(session_id) {
-            Some(CodexAdapterSession::Running {
-                identity: current,
-                lifecycle,
-                original_launch,
-                fallback_environment,
-                ..
-            }) if current == identity => {
-                lifecycle
-                    .claim_preactivation_fallback()
-                    .map(|original_startup_command| {
-                        let mut launch = original_launch.clone();
-                        launch.startup_command = original_startup_command;
-                        (launch, fallback_environment.clone())
-                    })
-            }
-            _ => None,
-        }
-    };
-
-    emit_remote_session_event(
-        &inner,
-        RemoteSessionEvent::AdapterHealth {
-            stable_session_key: identity.stable_session_key.clone(),
-            health: SemanticAdapterHealth::Degraded,
-        },
-    );
-    if let Some((launch, environment)) = fallback_launch {
-        schedule_codex_original_fallback(
-            inner,
-            session_id.to_string(),
-            identity.clone(),
-            launch,
-            environment,
-        );
-    }
-}
-
-fn mark_codex_remote_command_injected(
-    inner: &ProcessManagerInner,
-    session_id: &str,
-    identity: &CodexAdapterIdentity,
-) -> bool {
-    let mut registry = inner
-        .codex_adapter_registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !registry.is_current(identity) {
-        return false;
-    }
-    match registry.sessions.get_mut(session_id) {
-        Some(CodexAdapterSession::Running {
-            identity: current,
-            lifecycle,
-            ..
-        }) if current == identity => {
-            lifecycle.remote_command_injected = true;
-            true
-        }
-        _ => false,
-    }
-}
-
-fn schedule_codex_original_fallback(
-    inner: Arc<ProcessManagerInner>,
-    session_id: String,
-    identity: CodexAdapterIdentity,
-    launch: AiLaunchSpec,
-    environment: HashMap<String, String>,
-) {
-    let expected_attachment_binding = inner.browser_attachment_broker.binding(&session_id);
-    let terminal_ops = inner
-        .codex_fallback_terminal_ops
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    thread::spawn(move || {
-        let started = Instant::now();
-        loop {
-            let ready = {
-                let registry = inner
-                    .codex_adapter_registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !registry.is_current(&identity) {
-                    return;
-                }
-                matches!(
-                    registry.sessions.get(&session_id),
-                    Some(CodexAdapterSession::Running {
-                        identity: current,
-                        lifecycle,
-                        ..
-                    }) if current == &identity && lifecycle.remote_command_injected
-                )
-            };
-            if ready {
-                break;
-            }
-            if started.elapsed() >= Duration::from_secs(5) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        let removed = {
-            let mut registry = inner
-                .codex_adapter_registry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let matches = registry.is_current(&identity)
-                && registry
-                    .sessions
-                    .get(&session_id)
-                    .is_some_and(|session| session.identity() == &identity);
-            matches
-                .then(|| registry.remove_session(&session_id))
-                .flatten()
-        };
-        let Some(removed) = removed else {
-            return;
-        };
-        let removed_identity = removed
-            .registered_semantic_identity(&session_id)
-            .expect("fallback only removes an installed Codex bridge");
-        // Drop the bridge handle on this worker, never from its own exit callback.
-        drop(removed);
-        emit_remote_session_event(
-            &inner,
-            RemoteSessionEvent::CodexAdapterRemoved {
-                identity: removed_identity,
-            },
-        );
-
-        let Ok(attachment_binding) = renew_attachment_binding_for_codex_fallback(
-            &inner,
-            expected_attachment_binding.as_ref(),
-        ) else {
-            return;
-        };
-        let fallback_result = terminal_ops
-            .terminate_and_reap(&inner, &session_id)
-            .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch, &environment));
-        if fallback_result.is_err() {
-            unbind_attachment_if_matches(&inner, attachment_binding.as_ref());
-            let manager = process_manager_from_inner(inner.clone());
-            manager.cleanup_browser_provider_session(&session_id);
-            manager.set_browser_diagnostic(
-                &launch.tab_id,
-                Some("Browser tools unavailable because Codex fallback launch failed".to_string()),
-            );
-        }
-    });
-}
-
-impl CodexFallbackTerminalOps for NativeCodexFallbackTerminalOps {
-    fn terminate_and_reap(
-        &self,
-        inner: &Arc<ProcessManagerInner>,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let old_session = inner
-            .sessions
-            .lock()
-            .map_err(|_| "Session store poisoned".to_string())?
-            .remove(session_id);
-        if let Some(session) = old_session.as_ref() {
-            session.close(false)?;
-        }
-        let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(5));
-        let still_live = live_runtime_root_running(inner, session_id)
-            || !pid_file::active_tracked_pids_for_session(session_id).is_empty();
-        drop(old_session);
-        if still_live {
-            return Err(format!(
-                "Cannot relaunch Codex fallback before session `{session_id}` is reaped"
-            ));
-        }
-        Ok(())
-    }
-
-    fn spawn_original(
-        &self,
-        inner: &Arc<ProcessManagerInner>,
-        session_id: &str,
-        launch: &AiLaunchSpec,
-        environment: &HashMap<String, String>,
-    ) -> Result<(), String> {
-        let dimensions = inner
-            .runtime_state
-            .read()
-            .ok()
-            .and_then(|runtime| {
-                runtime
-                    .sessions
-                    .get(session_id)
-                    .map(|session| session.dimensions)
-            })
-            .unwrap_or_default();
-        let session = Arc::new(TerminalSession::spawn_command(
-            session_id.to_string(),
-            launch.cwd.clone(),
-            dimensions,
-            launch.shell_program.clone(),
-            launch.shell_args.clone(),
-            environment.clone(),
-            inner
-                .scrollback_lines
-                .read()
-                .map(|lines| *lines)
-                .unwrap_or(10_000),
-            None,
-            inner.runtime_state.clone(),
-            inner.debug_enabled,
-            Some(session_change_notifier(
-                inner.clone(),
-                session_id.to_string(),
-            )),
-            Some(session_output_notifier(
-                inner.clone(),
-                session_id.to_string(),
-            )),
-        )?);
-        inner
-            .sessions
-            .lock()
-            .map_err(|_| "Session store poisoned".to_string())?
-            .insert(session_id.to_string(), session.clone());
-        process_manager_from_inner(inner.clone()).update_session_state(session_id, |state| {
-            state.shell_program = launch.shell_program.clone();
-            state.configure_ai(launch.clone());
-        });
-        thread::sleep(Duration::from_millis(AI_COMMAND_INJECTION_DELAY_MS));
-        session.write_text(&(launch.startup_command.clone() + "\r\n"))
     }
 }
 
@@ -6266,16 +5967,6 @@ where
     let _ = force_reap_session_processes_until_clear(inner, session_id, Duration::from_secs(2));
     let mut effective_launch = launch.clone();
     let terminal_env = manager.prepare_ai_terminal_environment(&mut effective_launch, session_id);
-    let codex_identity = inner
-        .codex_adapter_registry
-        .lock()
-        .ok()
-        .and_then(|registry| {
-            registry
-                .sessions
-                .get(session_id)
-                .map(|session| session.identity().clone())
-        });
     manager.update_session_state(session_id, |state| {
         state.shell_program = effective_launch.shell_program.clone();
         state.configure_ai(effective_launch.clone());
@@ -6351,9 +6042,6 @@ where
             state.mark_dirty();
         });
         return Err(error);
-    }
-    if let Some(identity) = codex_identity.as_ref() {
-        mark_codex_remote_command_injected(inner, session_id, identity);
     }
     Ok(())
 }
@@ -6458,21 +6146,9 @@ mod tests {
         assert_eq!(program, "powershell.exe");
     }
     use crate::services::pid_file;
-    use futures_util::SinkExt;
     use std::fs;
     use std::sync::Condvar;
     use std::thread;
-    use tokio_tungstenite::{
-        connect_async,
-        tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
-    };
-
-    #[derive(Default)]
-    struct RecordingCodexFallbackTerminalOps {
-        steps: Arc<Mutex<Vec<String>>>,
-        environments: Arc<Mutex<Vec<HashMap<String, String>>>>,
-        fail_spawn: AtomicBool,
-    }
 
     fn browser_test_launch(tool: SessionKind, command: &str) -> AiLaunchSpec {
         AiLaunchSpec {
@@ -6524,8 +6200,8 @@ mod tests {
     #[test]
     fn attachment_binding_precedes_gateway_and_survives_provider_setup_failure() {
         let manager = ProcessManager::new();
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Err("fixture preparer failed".to_string())
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| {
+            Err("fixture probe failed".to_string())
         }));
         let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
         let binding = manager
@@ -6636,22 +6312,6 @@ mod tests {
             Some(replacement)
         );
         assert!(!manager.browser_attachment_broker().unbind_if_matches(&old));
-
-        let current = manager
-            .browser_attachment_broker()
-            .binding("attachment-replacement")
-            .expect("current attachment binding");
-        let renewed = renew_attachment_binding_for_codex_fallback(&manager.inner, Some(&current))
-            .expect("current binding renews")
-            .expect("same-ID fallback has an attachment binding");
-        assert!(renewed.generation > old.generation);
-        assert!(!manager.browser_attachment_broker().unbind_if_matches(&old));
-        assert_eq!(
-            manager
-                .browser_attachment_broker()
-                .binding("attachment-replacement"),
-            Some(renewed)
-        );
     }
 
     #[test]
@@ -7048,141 +6708,184 @@ mod tests {
         assert!(!replacement_overlay.exists());
     }
 
-    #[tokio::test]
-    async fn codex_browser_config_and_token_survive_native_adapter_fallback() {
+    #[test]
+    fn codex_hooks_launch_carries_browser_config_and_no_remote() {
         let (bridge, _inbox) = crate::browser::browser_command_channel(8);
         let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
         let manager = ProcessManager::new();
         manager.set_browser_gateway_registrar(Some(gateway.registrar()));
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
-        }));
-        manager.set_codex_adapter_activation_timeout_for_test(Duration::from_millis(100));
-        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
-        let steps = terminal_ops.steps.clone();
-        let fallback_environments = terminal_ops.environments.clone();
-        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
         let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
         manager.prepare_browser_launch_for_session(
             &mut launch,
-            "codex-browser-fallback",
+            "codex-hooks-browser",
             crate::browser::BrowserWorkspaceSnapshot::default(),
         );
-        let original_attachment_binding = manager
-            .browser_attachment_broker()
-            .binding("codex-browser-fallback")
-            .expect("initial attachment binding");
-        let token = manager.browser_environment("codex-browser-fallback")
+        let token = manager.browser_environment("codex-hooks-browser")
             [crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV]
             .clone();
 
         let terminal_environment =
-            manager.prepare_codex_launch_for_session(&mut launch, "codex-browser-fallback");
+            manager.prepare_codex_launch_for_session(&mut launch, "codex-hooks-browser");
         assert_eq!(
             terminal_environment.get(crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV),
             Some(&token)
         );
-        assert!(
-            terminal_environment.contains_key(crate::ai::codex_bridge::CODEX_BRIDGE_AUTH_TOKEN_ENV)
-        );
         assert!(launch.startup_command.contains(
             "mcp_servers.devmanager_browser.bearer_token_env_var=\"DEVMANAGER_BROWSER_TOKEN\""
         ));
-        assert!(launch.startup_command.contains("--remote"));
-
-        let identity = manager
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap()
-            .sessions
-            .get("codex-browser-fallback")
-            .unwrap()
-            .identity()
-            .clone();
-        assert!(mark_codex_remote_command_injected(
-            &manager.inner,
-            "codex-browser-fallback",
-            &identity,
-        ));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if steps.lock().unwrap().len() == 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("native adapter fallback");
-        let steps = steps.lock().unwrap();
-        assert!(steps[1].contains("mcp_servers.devmanager_browser.url="));
-        assert!(!steps[1].contains("--remote"));
-        drop(steps);
-        assert_eq!(
-            fallback_environments.lock().unwrap()[0]
-                .get(crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV),
-            Some(&token)
-        );
-        assert!(!fallback_environments.lock().unwrap()[0]
-            .contains_key(crate::ai::codex_bridge::CODEX_BRIDGE_AUTH_TOKEN_ENV));
-        let fallback_attachment_binding = manager
-            .browser_attachment_broker()
-            .binding("codex-browser-fallback")
-            .expect("fallback attachment binding");
-        assert!(fallback_attachment_binding.generation > original_attachment_binding.generation);
+        assert!(launch.startup_command.contains("codex --full-auto")
+            || launch.startup_command.contains("'codex' '--full-auto'"));
+        assert!(!launch.startup_command.contains("--remote"));
+        assert!(launch.startup_command.contains("codex-hook-relay"));
+        assert!(launch
+            .startup_command
+            .contains("--dangerously-bypass-hook-trust"));
+        for event in crate::ai::codex_hooks::CODEX_HOOK_EVENTS {
+            assert!(
+                launch.startup_command.contains(&format!("hooks.{event}=")),
+                "missing {event} in {}",
+                launch.startup_command
+            );
+        }
     }
 
-    #[tokio::test]
-    async fn codex_fallback_spawn_failure_revokes_browser_registration() {
-        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
-        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+    #[test]
+    fn codex_session_start_binds_tailer_and_reports_healthy() {
         let manager = ProcessManager::new();
-        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
-        }));
-        manager.set_codex_adapter_activation_timeout_for_test(Duration::from_millis(100));
-        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
-        terminal_ops.fail_spawn.store(true, Ordering::Release);
-        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
+        let events: Arc<Mutex<Vec<RemoteSessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
         let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
-        manager.prepare_browser_launch_for_session(
-            &mut launch,
-            "codex-browser-fallback-spawn-failure",
-            crate::browser::BrowserWorkspaceSnapshot::default(),
-        );
-        let environment = manager
-            .prepare_ai_terminal_environment(&mut launch, "codex-browser-fallback-spawn-failure");
-        assert!(environment.contains_key(crate::browser::DEVMANAGER_BROWSER_TOKEN_ENV));
-
-        let identity = manager
+        let session_id = "codex-hooks-session-start";
+        manager.prepare_codex_launch_for_session(&mut launch, session_id);
+        let registration = match manager
             .inner
             .codex_adapter_registry
             .lock()
             .unwrap()
             .sessions
-            .get("codex-browser-fallback-spawn-failure")
-            .unwrap()
-            .identity()
-            .clone();
-        assert!(mark_codex_remote_command_injected(
-            &manager.inner,
-            "codex-browser-fallback-spawn-failure",
-            &identity,
-        ));
+            .get(session_id)
+            .expect("session installed")
+        {
+            CodexAdapterSession::Running { registration, .. } => registration.clone(),
+            other => panic!("expected running codex session, got {other:?}"),
+        };
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while gateway.registrar().active_registration_count() != 0 {
-                tokio::task::yield_now().await;
-            }
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &rollout,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"from-rollout\"}}\n",
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "session_id": "prov-1",
+            "cwd": "C:\\proj",
+            "transcript_path": rollout.to_string_lossy(),
+            "hook_event_name": "SessionStart"
         })
-        .await
-        .expect("failed fallback spawn must revoke browser access");
-        assert!(manager
-            .browser_attachment_broker()
-            .binding("codex-browser-fallback-spawn-failure")
-            .is_none());
+        .to_string();
+        let status = manager.inner.codex_hook_registry.ingest(
+            "127.0.0.1:9999".parse().unwrap(),
+            &registration.nonce,
+            body.as_bytes(),
+            1,
+        );
+        assert_eq!(
+            status,
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Accepted
+        );
+
+        assert!(matches!(
+            manager
+                .inner
+                .codex_adapter_registry
+                .lock()
+                .unwrap()
+                .sessions
+                .get(session_id),
+            Some(CodexAdapterSession::Running {
+                tailer: Some(_),
+                activated: true,
+                ..
+            })
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let events = events.lock().unwrap();
+                let healthy = events.iter().any(|event| {
+                    matches!(
+                        event,
+                        RemoteSessionEvent::AdapterHealth {
+                            health: SemanticAdapterHealth::Healthy,
+                            ..
+                        }
+                    )
+                });
+                let tailed = events.iter().any(|event| {
+                    matches!(
+                        event,
+                        RemoteSessionEvent::CodexSemantic { draft, .. }
+                            if matches!(
+                                &draft.kind,
+                                crate::remote::presentation::SemanticEventKind::AssistantMessage { text, .. }
+                                    if text == "from-rollout"
+                            )
+                    )
+                });
+                if healthy && tailed {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "healthy + tailed rollout events never arrived"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn codex_close_unregisters_relay_nonce_and_stops_tailer() {
+        let manager = ProcessManager::new();
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        let session_id = "codex-hooks-close";
+        manager.prepare_codex_launch_for_session(&mut launch, session_id);
+        let registration = match manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .get(session_id)
+            .expect("session installed")
+        {
+            CodexAdapterSession::Running { registration, .. } => registration.clone(),
+            other => panic!("expected running codex session, got {other:?}"),
+        };
+
+        manager.cleanup_codex_adapter_session(session_id);
+
+        let body = serde_json::json!({
+            "session_id": "prov-1", "cwd": "C:\\proj", "transcript_path": null,
+            "hook_event_name": "Stop"
+        })
+        .to_string();
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &registration.nonce,
+                body.as_bytes(),
+                1,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Rejected
+        );
     }
 
     #[test]
@@ -7191,8 +6894,8 @@ mod tests {
         let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
         let manager = ProcessManager::new();
         manager.set_browser_gateway_registrar(Some(gateway.registrar()));
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Err("fixture preparer failed".to_string())
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| {
+            Err("fixture probe failed".to_string())
         }));
         let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
         let original = launch.clone();
@@ -7220,8 +6923,8 @@ mod tests {
         let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
         let manager = ProcessManager::new();
         manager.set_browser_gateway_registrar(Some(gateway.registrar()));
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Err("fixture preparer failed".to_string())
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| {
+            Err("fixture probe failed".to_string())
         }));
         let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
         manager.prepare_browser_launch_for_session(
@@ -7327,49 +7030,6 @@ mod tests {
             .is_none());
     }
 
-    impl CodexFallbackTerminalOps for RecordingCodexFallbackTerminalOps {
-        fn terminate_and_reap(
-            &self,
-            _inner: &Arc<ProcessManagerInner>,
-            session_id: &str,
-        ) -> Result<(), String> {
-            self.steps
-                .lock()
-                .unwrap()
-                .push(format!("terminate-and-reap:{session_id}"));
-            Ok(())
-        }
-
-        fn spawn_original(
-            &self,
-            _inner: &Arc<ProcessManagerInner>,
-            session_id: &str,
-            launch: &AiLaunchSpec,
-            environment: &HashMap<String, String>,
-        ) -> Result<(), String> {
-            self.steps.lock().unwrap().push(format!(
-                "spawn-original:{session_id}:{}",
-                launch.startup_command
-            ));
-            self.environments.lock().unwrap().push(environment.clone());
-            if self.fail_spawn.load(Ordering::Acquire) {
-                return Err("fixture fallback spawn failed".to_string());
-            }
-            Ok(())
-        }
-    }
-
-    fn websocket_endpoint_from_command(command: &str) -> String {
-        let start = command
-            .find("ws://")
-            .expect("remote command must contain endpoint");
-        command[start..]
-            .split(|character: char| character.is_whitespace() || matches!(character, '\'' | '"'))
-            .next()
-            .unwrap()
-            .to_string()
-    }
-
     #[test]
     fn output_notifier_forwards_the_native_terminal_mode() {
         let manager = ProcessManager::new();
@@ -7415,7 +7075,7 @@ mod tests {
     #[test]
     fn codex_preparation_failure_is_fail_open_and_marks_adapter_degraded() {
         let manager = ProcessManager::new();
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| {
             Err("capability unavailable".to_string())
         }));
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -7472,9 +7132,9 @@ mod tests {
             .store(u64::MAX, Ordering::Relaxed);
         let prepare_calls = Arc::new(AtomicU64::new(0));
         let observed_calls = prepare_calls.clone();
-        manager.set_codex_adapter_preparer_for_test(Arc::new(move |_| {
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(move |_| {
             observed_calls.fetch_add(1, Ordering::Relaxed);
-            Err("must not prepare after generation exhaustion".to_string())
+            Err("must not probe after generation exhaustion".to_string())
         }));
         let events = Arc::new(Mutex::new(Vec::new()));
         let observed = events.clone();
@@ -7516,302 +7176,6 @@ mod tests {
                 health: SemanticAdapterHealth::Degraded,
             } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
         )));
-    }
-
-    #[test]
-    fn codex_preactivation_fallback_claim_is_exact_once_and_disabled_after_activation() {
-        let original = "codex --full-auto --model o3";
-        let mut pending = CodexAdapterLifecycle::new(original.to_string());
-
-        assert_eq!(
-            pending.claim_preactivation_fallback().as_deref(),
-            Some(original)
-        );
-        assert_eq!(pending.claim_preactivation_fallback(), None);
-
-        let mut activated = CodexAdapterLifecycle::new(original.to_string());
-        assert!(activated.mark_activated());
-        assert!(!activated.mark_activated());
-        assert_eq!(activated.claim_preactivation_fallback(), None);
-    }
-
-    #[test]
-    fn codex_lifecycle_records_provider_turn_observation() {
-        let mut lifecycle = CodexAdapterLifecycle::new("codex".to_string());
-
-        assert!(!lifecycle.provider_turn_observed);
-        lifecycle.mark_provider_turn_observed();
-        assert!(lifecycle.provider_turn_observed);
-    }
-
-    #[tokio::test]
-    async fn codex_preparation_activates_only_after_initialize_negotiation() {
-        let manager = ProcessManager::new();
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Ok(PreparedCodexAdapter::echo_sidecar_for_test(vec![
-                "--full-auto".to_string(),
-            ]))
-        }));
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let observed = events.clone();
-        manager.set_remote_session_handler(Some(Arc::new(move |event| {
-            observed.lock().unwrap().push(event);
-        })));
-        let mut launch = AiLaunchSpec {
-            tab_id: "codex-tab".to_string(),
-            project_id: "project".to_string(),
-            tool: SessionKind::Codex,
-            cwd: std::env::current_dir().unwrap(),
-            shell_program: if cfg!(windows) {
-                "powershell.exe".to_string()
-            } else {
-                "/bin/bash".to_string()
-            },
-            shell_args: Vec::new(),
-            startup_command: "codex --full-auto".to_string(),
-        };
-
-        let terminal_env = manager.prepare_codex_launch_for_session(&mut launch, "codex-session");
-
-        assert!(launch.startup_command.contains("--full-auto"));
-        assert!(launch.startup_command.contains("--remote"));
-        assert!(launch.startup_command.contains("ws://127.0.0.1:"));
-        assert!(launch.startup_command.contains("--remote-auth-token-env"));
-        let token = terminal_env
-            .get("DEVMANAGER_CODEX_BRIDGE_TOKEN")
-            .expect("bridge bearer token must be scoped to this terminal");
-        assert_eq!(token.len(), 64, "bridge token must contain 256 random bits");
-        assert!(!launch.startup_command.contains(token));
-        let endpoint = websocket_endpoint_from_command(&launch.startup_command);
-        let parsed = endpoint
-            .parse::<tokio_tungstenite::tungstenite::http::Uri>()
-            .unwrap();
-        assert_eq!(parsed.path(), "/", "Codex accepts only host:port URLs");
-        {
-            let registry = manager.inner.codex_adapter_registry.lock().unwrap();
-            assert!(matches!(
-                registry.sessions.get("codex-session"),
-                Some(CodexAdapterSession::Running { _handle, .. }) if _handle.is_running()
-            ));
-        }
-        let registered_identity = {
-            let registry = manager.inner.codex_adapter_registry.lock().unwrap();
-            codex_semantic_identity(
-                "codex-session",
-                registry
-                    .sessions
-                    .get("codex-session")
-                    .expect("installed Codex adapter")
-                    .identity(),
-            )
-        };
-        assert!(events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            RemoteSessionEvent::CodexAdapterRegistered { identity }
-                if identity == &registered_identity
-        )));
-        assert!(!events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            RemoteSessionEvent::AdapterHealth {
-                stable_session_key,
-                health: SemanticAdapterHealth::Healthy,
-            } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
-        )));
-
-        let mut request = endpoint.into_client_request().unwrap();
-        request.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        let (mut tui, _) = connect_async(request).await.unwrap();
-        tui.send(Message::Text(
-            r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","version":"test"}}}"#
-                .to_string(),
-        ))
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if events.lock().unwrap().iter().any(|event| {
-                    matches!(
-                        event,
-                        RemoteSessionEvent::AdapterHealth {
-                            stable_session_key,
-                            health: SemanticAdapterHealth::Healthy,
-                        } if stable_session_key == &StableSessionKey::from_tab("codex-tab")
-                    )
-                }) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successful initialize negotiation must activate the adapter");
-
-        manager.cleanup_codex_adapter_session("codex-session");
-        assert!(events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            RemoteSessionEvent::CodexAdapterRemoved { identity }
-                if identity == &registered_identity
-        )));
-        assert!(manager
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap()
-            .sessions
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn codex_activation_timeout_reaps_then_spawns_exact_original_once() {
-        let manager = ProcessManager::new();
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
-        }));
-        manager.set_codex_adapter_activation_timeout_for_test(Duration::from_millis(100));
-        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
-        let steps = terminal_ops.steps.clone();
-        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
-        let original = "codex --model 'o3 exact' --full-auto";
-        let mut launch = AiLaunchSpec {
-            tab_id: "codex-fallback-tab".to_string(),
-            project_id: "project".to_string(),
-            tool: SessionKind::Codex,
-            cwd: std::env::current_dir().unwrap(),
-            shell_program: "powershell.exe".to_string(),
-            shell_args: Vec::new(),
-            startup_command: original.to_string(),
-        };
-
-        manager.prepare_codex_launch_for_session(&mut launch, "fallback-session");
-        let identity = manager
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap()
-            .sessions
-            .get("fallback-session")
-            .unwrap()
-            .identity()
-            .clone();
-        assert!(mark_codex_remote_command_injected(
-            &manager.inner,
-            "fallback-session",
-            &identity,
-        ));
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if steps.lock().unwrap().len() == 2 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("timed-out negotiation must execute fallback");
-        assert_eq!(
-            steps.lock().unwrap().as_slice(),
-            [
-                "terminate-and-reap:fallback-session",
-                &format!("spawn-original:fallback-session:{original}"),
-            ]
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(steps.lock().unwrap().len(), 2, "fallback must be one-shot");
-    }
-
-    #[tokio::test]
-    async fn codex_activated_and_stale_generations_never_fallback() {
-        let manager = ProcessManager::new();
-        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
-            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
-        }));
-        manager.set_codex_adapter_activation_timeout_for_test(Duration::from_secs(1));
-        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
-        let steps = terminal_ops.steps.clone();
-        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
-        let launch_spec = |session: &str| AiLaunchSpec {
-            tab_id: "shared-codex-tab".to_string(),
-            project_id: "project".to_string(),
-            tool: SessionKind::Codex,
-            cwd: std::env::current_dir().unwrap(),
-            shell_program: if cfg!(windows) {
-                "powershell.exe".to_string()
-            } else {
-                "/bin/bash".to_string()
-            },
-            shell_args: Vec::new(),
-            startup_command: format!("codex --session {session}"),
-        };
-        let mut stale = launch_spec("stale");
-        manager.prepare_codex_launch_for_session(&mut stale, "stale-session");
-        let mut current = launch_spec("current");
-        let current_env = manager.prepare_codex_launch_for_session(&mut current, "current-session");
-
-        let current_identity = manager
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap()
-            .sessions
-            .get("current-session")
-            .unwrap()
-            .identity()
-            .clone();
-        assert!(mark_codex_remote_command_injected(
-            &manager.inner,
-            "current-session",
-            &current_identity,
-        ));
-        let endpoint = websocket_endpoint_from_command(&current.startup_command);
-        let token = current_env
-            .get("DEVMANAGER_CODEX_BRIDGE_TOKEN")
-            .expect("current Codex bridge token");
-        let mut request = endpoint.into_client_request().unwrap();
-        request.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        let (mut tui, _) = connect_async(request).await.unwrap();
-        tui.send(Message::Text(
-            r#"{"id":1,"method":"initialize","params":{}}"#.to_string(),
-        ))
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let activated = manager
-                    .inner
-                    .codex_adapter_registry
-                    .lock()
-                    .unwrap()
-                    .sessions
-                    .get("current-session")
-                    .is_some_and(|session| {
-                        matches!(
-                            session,
-                            CodexAdapterSession::Running { lifecycle, .. } if lifecycle.activated
-                        )
-                    });
-                if activated {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("current generation must activate");
-        tui.close(None).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1_250)).await;
-        assert!(
-            steps.lock().unwrap().is_empty(),
-            "activated current and timed-out stale generations must never fall back"
-        );
-        manager.cleanup_codex_adapter_session("stale-session");
-        manager.cleanup_codex_adapter_session("current-session");
     }
 
     #[test]

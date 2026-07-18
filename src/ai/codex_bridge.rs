@@ -1373,7 +1373,7 @@ impl CodexConfigOverride {
         &self.toml_value
     }
 
-    fn argument(&self) -> String {
+    pub(crate) fn argument(&self) -> String {
         format!("{}={}", self.key, self.toml_value)
     }
 }

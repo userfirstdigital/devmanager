@@ -635,6 +635,7 @@ pub fn build_codex_hooks_command(
     devmanager_executable: &std::path::Path,
     endpoint: &str,
     nonce: &str,
+    config: &[crate::ai::codex_bridge::CodexConfigOverride],
 ) -> Result<String, String> {
     if !is_valid_loopback_relay_url_for(endpoint, CODEX_HOOK_RELAY_PATH) {
         return Err("Codex hook relay endpoint is not an exact loopback URL".to_string());
@@ -652,6 +653,10 @@ pub fn build_codex_hooks_command(
         "\"{}\" codex-hook-relay --url {endpoint} --nonce {nonce}",
         devmanager_executable.to_string_lossy()
     );
+    for override_value in config {
+        tokens.push("--config".to_string());
+        tokens.push(override_value.argument());
+    }
     for event in CODEX_HOOK_EVENTS {
         let override_value = format!(
             "hooks.{event}=[{{hooks=[{{type=\"command\",command={},async=true}}]}}]",
@@ -1033,6 +1038,7 @@ mod launch_builder_tests {
             std::path::Path::new(r"C:\Apps\devmanager.exe"),
             "http://127.0.0.1:4321/internal/codex-hook",
             "abc123",
+            &[],
         )
         .unwrap();
         assert!(
@@ -1064,6 +1070,7 @@ mod launch_builder_tests {
             std::path::Path::new("d.exe"),
             "http://127.0.0.1:1/internal/codex-hook",
             "ff",
+            &[],
         )
         .is_err());
     }
@@ -1076,6 +1083,7 @@ mod launch_builder_tests {
             std::path::Path::new("d.exe"),
             "http://evil.example:1/internal/codex-hook",
             "ff",
+            &[],
         )
         .is_err());
         assert!(build_codex_hooks_command(
@@ -1084,6 +1092,7 @@ mod launch_builder_tests {
             std::path::Path::new("d.exe"),
             "http://127.0.0.1:1/internal/codex-hook",
             "not hex!",
+            &[],
         )
         .is_err());
     }
@@ -1096,6 +1105,7 @@ mod launch_builder_tests {
             std::path::Path::new(r"C:\Apps\dev manager.exe"),
             "http://127.0.0.1:4321/internal/codex-hook",
             "ff00",
+            &[],
         )
         .unwrap();
         // Extract one -c value back out of the bash-quoted command line and
