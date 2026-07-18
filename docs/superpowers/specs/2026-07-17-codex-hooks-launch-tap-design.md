@@ -83,15 +83,16 @@ process.
 
 ### Trust
 
-Codex gates unmanaged hooks behind a persisted trust hash. Preference order,
-resolved by probing during implementation:
-
-1. Pre-register the trust hash for DevManager's hook the same way Codex's own
-   trust flow records it, scoped to only that hook.
-2. Fall back to appending `--dangerously-bypass-hook-trust`. Caveat: this also
-   unblocks the user's own untrusted project hooks for that launch; acceptable
-   only if (1) proves infeasible, and must be called out in the settings UI if
-   used.
+Codex gates unmanaged hooks behind a persisted trust hash. Resolution
+(investigated 2026-07-17): pre-registering the trust hash would require
+replicating Codex's internal hash computation and writing into the user's
+global `CODEX_HOME` state — a private interface and exactly the kind of
+global-config mutation this design rejects. Therefore DevManager appends
+`--dangerously-bypass-hook-trust` (verified present in 0.144.5, probed via
+`--help` before injection). Caveat, documented in the settings UI help text:
+this also unblocks the user's own untrusted project hooks for DevManager
+launches. Also verified: the `hooks` feature is stable and enabled by default
+in 0.144.5, and `-c hooks.<Event>=[...]` is the accepted override key path.
 
 ### Capture
 
@@ -137,8 +138,10 @@ keystroke reply path, companion pane.
 
 A failed tap never blocks or alters the user's launch:
 
-- Probe finds no hooks support (older Codex) → launch verbatim; degrade to
-  rollout tailing via best-effort cwd match, else raw-terminal remote view.
+- Probe finds no hooks support (older Codex) → launch verbatim; remote view
+  degrades to the raw-terminal fallback. (Best-effort cwd-matched tailing was
+  considered and dropped as YAGNI — without the SessionStart hook there is no
+  reliable session↔file binding, and the supported path is current Codex.)
 - Relay registration or overlay preparation fails → launch verbatim, adapter
   reports Degraded (existing health surface).
 - Rollout file missing/rotated/unparseable → keep hook-driven events; surface
