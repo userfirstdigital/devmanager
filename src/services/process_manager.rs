@@ -4530,20 +4530,34 @@ fn build_ai_launch_spec(
     Ok(launch)
 }
 
+fn windows_shell_for(
+    terminal: &crate::models::DefaultTerminal,
+    shell_integration: bool,
+    pwsh: Option<std::path::PathBuf>,
+) -> (String, Vec<String>) {
+    match terminal {
+        crate::models::DefaultTerminal::Powershell => ("powershell.exe".to_string(), Vec::new()),
+        crate::models::DefaultTerminal::Pwsh => match pwsh {
+            Some(path) => (path.to_string_lossy().into_owned(), Vec::new()),
+            // Selected pwsh but it is gone (uninstalled, hand-edited config):
+            // degrade to Windows PowerShell rather than failing the launch.
+            None => ("powershell.exe".to_string(), Vec::new()),
+        },
+        crate::models::DefaultTerminal::Cmd => ("cmd.exe".to_string(), Vec::new()),
+        crate::models::DefaultTerminal::Bash => (
+            preferred_windows_bash_program(),
+            bash_shell_args(shell_integration),
+        ),
+    }
+}
+
 fn build_interactive_shell_command(settings: &Settings) -> (String, Vec<String>) {
     if cfg!(target_os = "windows") {
-        return match settings.default_terminal.clone() {
-            crate::models::DefaultTerminal::Powershell => {
-                ("powershell.exe".to_string(), Vec::new())
-            }
-            // Temporary until the pwsh launch mapping lands: behave like PowerShell.
-            crate::models::DefaultTerminal::Pwsh => ("powershell.exe".to_string(), Vec::new()),
-            crate::models::DefaultTerminal::Cmd => ("cmd.exe".to_string(), Vec::new()),
-            crate::models::DefaultTerminal::Bash => (
-                preferred_windows_bash_program(),
-                bash_shell_args(settings.shell_integration_enabled),
-            ),
-        };
+        return windows_shell_for(
+            &settings.default_terminal,
+            settings.shell_integration_enabled,
+            crate::services::pwsh_probe::pwsh_program(),
+        );
     }
 
     if cfg!(target_os = "macos") {
@@ -6424,6 +6438,25 @@ mod tests {
     use crate::models::{
         AppConfig, Project, ProjectFolder, RunCommand, SessionTab, Settings, TabType,
     };
+
+    #[test]
+    fn pwsh_maps_to_resolved_path() {
+        let (program, args) = windows_shell_for(
+            &crate::models::DefaultTerminal::Pwsh,
+            false,
+            Some(std::path::PathBuf::from(
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+            )),
+        );
+        assert_eq!(program, r"C:\Program Files\PowerShell\7\pwsh.exe");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn pwsh_missing_falls_back_to_windows_powershell() {
+        let (program, _) = windows_shell_for(&crate::models::DefaultTerminal::Pwsh, false, None);
+        assert_eq!(program, "powershell.exe");
+    }
     use crate::services::pid_file;
     use futures_util::SinkExt;
     use std::fs;
