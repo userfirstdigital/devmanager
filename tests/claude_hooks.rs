@@ -775,6 +775,35 @@ fn recognized_commands_generate_exec_form_hooks_and_cleanup_with_registration() 
 }
 
 #[test]
+fn resume_and_continue_flags_pass_through_the_overlay_untouched() {
+    let temp = TempDir::new("passthrough");
+    let registry = ClaudeHookRegistry::default();
+    for flag in ["--resume", "--continue"] {
+        let command = format!(
+            "npx -y @anthropic-ai/claude-code@latest {flag} --dangerously-skip-permissions"
+        );
+        let overlay = prepare_claude_launch_overlay(
+            &registry,
+            StableSessionKey::from_tab("claude-tab"),
+            &command,
+            ClaudeShellKind::PowerShell,
+            Path::new("C:/DevManager/devmanager.exe"),
+            "http://127.0.0.1:43873/internal/claude-hook",
+            temp.path(),
+            Instant::now(),
+        );
+        let registration = overlay.registration.expect("registration");
+        assert!(
+            overlay.startup_command.starts_with(&command),
+            "user command must lead unchanged: {}",
+            overlay.startup_command
+        );
+        assert_eq!(overlay.startup_command.matches("--settings").count(), 1);
+        assert!(registry.unregister(&registration.nonce).is_some());
+    }
+}
+
+#[test]
 fn registry_capacity_eviction_removes_ephemeral_settings_and_reports_the_nonce() {
     let temp = TempDir::new("eviction");
     let registry = Arc::new(ClaudeHookRegistry::with_limits(ClaudeRegistryLimits {

@@ -1948,7 +1948,7 @@ fn render_settings_panel(
             FormField::custom(
                 render_settings_text_input(
                     "Claude command",
-                    "Command used for Claude terminals.",
+                    "Command used for Claude terminals. DevManager appends --settings <temp file> to relay conversation events.",
                     draft.claude_command.as_str(),
                     EditorField::Settings(SettingsField::ClaudeCommand),
                     model,
@@ -1961,7 +1961,7 @@ fn render_settings_panel(
             FormField::custom(
                 render_settings_text_input(
                     "Codex command",
-                    "Command used for Codex terminals.",
+                    "Command used for Codex terminals. DevManager appends -c hook overrides and --dangerously-bypass-hook-trust to relay conversation events.",
                     draft.codex_command.as_str(),
                     EditorField::Settings(SettingsField::CodexCommand),
                     model,
