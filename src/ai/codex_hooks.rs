@@ -244,6 +244,331 @@ impl CodexHookReducer {
     }
 }
 
+const CODEX_NONCE_BYTES: usize = 16;
+const MAX_CODEX_REGISTRATIONS: usize = 128;
+
+fn random_codex_nonce() -> Result<String, String> {
+    let mut bytes = [0_u8; CODEX_NONCE_BYTES];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("generate Codex hook nonce: {error}"))?;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    Ok(encoded)
+}
+
+fn unix_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexHookRegistration {
+    pub nonce: String,
+    pub stable_session_key: StableSessionKey,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum CodexRegistryEvent {
+    Semantic(SemanticEventDraft),
+    SessionStarted(CodexSessionBinding),
+}
+
+pub type CodexRegistryEventHandler =
+    std::sync::Arc<dyn Fn(CodexHookRegistration, CodexRegistryEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexRelayIngestStatus {
+    Accepted,
+    Rejected,
+    BodyTooLarge,
+    Malformed,
+}
+
+struct RegisteredCodexSession {
+    stable_session_key: StableSessionKey,
+    generation: u64,
+    reducer: CodexHookReducer,
+}
+
+struct CodexRegistryState {
+    registrations: HashMap<String, RegisteredCodexSession>,
+    order: std::collections::VecDeque<String>,
+    next_generation: u64,
+    latest_generation_by_key: HashMap<StableSessionKey, u64>,
+}
+
+/// Nonce- and generation-fenced ingest for Codex hook relay payloads.
+/// Superseded registrations (an older launch of the same session key) are
+/// rejected so a stale relaunch can never publish into the newer session.
+///
+/// The registered event handler is invoked while a publication read-guard is
+/// held: it must not call back into the registry.
+pub struct CodexHookRegistry {
+    publication_gate: std::sync::RwLock<()>,
+    state: std::sync::Mutex<CodexRegistryState>,
+    event_handler: std::sync::RwLock<Option<CodexRegistryEventHandler>>,
+}
+
+impl Default for CodexHookRegistry {
+    fn default() -> Self {
+        Self {
+            publication_gate: std::sync::RwLock::new(()),
+            state: std::sync::Mutex::new(CodexRegistryState {
+                registrations: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                next_generation: 0,
+                latest_generation_by_key: HashMap::new(),
+            }),
+            event_handler: std::sync::RwLock::new(None),
+        }
+    }
+}
+
+impl CodexHookRegistry {
+    pub fn set_event_handler(&self, handler: Option<CodexRegistryEventHandler>) {
+        if let Ok(mut slot) = self.event_handler.write() {
+            *slot = handler;
+        }
+    }
+
+    pub fn register(
+        &self,
+        stable_session_key: StableSessionKey,
+    ) -> Result<CodexHookRegistration, String> {
+        let _publication = self
+            .publication_gate
+            .write()
+            .map_err(|_| "Codex hook publication gate is poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Codex hook registry lock is poisoned".to_string())?;
+        while state.registrations.len() >= MAX_CODEX_REGISTRATIONS {
+            let Some(oldest) = state.order.pop_front() else {
+                break;
+            };
+            state.registrations.remove(&oldest);
+        }
+        let nonce = loop {
+            let candidate = random_codex_nonce()?;
+            if !state.registrations.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| "Codex hook registration generation exhausted".to_string())?;
+        state.next_generation = generation;
+        state
+            .latest_generation_by_key
+            .insert(stable_session_key.clone(), generation);
+        state.order.push_back(nonce.clone());
+        state.registrations.insert(
+            nonce.clone(),
+            RegisteredCodexSession {
+                stable_session_key: stable_session_key.clone(),
+                generation,
+                reducer: CodexHookReducer::new(stable_session_key.clone()),
+            },
+        );
+        Ok(CodexHookRegistration {
+            nonce,
+            stable_session_key,
+            generation,
+        })
+    }
+
+    pub fn unregister(&self, nonce: &str) -> Option<StableSessionKey> {
+        let _publication = self.publication_gate.write().ok()?;
+        let mut state = self.state.lock().ok()?;
+        let removed = state.registrations.remove(nonce)?;
+        state.order.retain(|candidate| candidate != nonce);
+        if state
+            .latest_generation_by_key
+            .get(&removed.stable_session_key)
+            == Some(&removed.generation)
+        {
+            state
+                .latest_generation_by_key
+                .remove(&removed.stable_session_key);
+        }
+        Some(removed.stable_session_key)
+    }
+
+    pub fn ingest(
+        &self,
+        peer: std::net::SocketAddr,
+        nonce: &str,
+        body: &[u8],
+        occurred_at_epoch_ms: u64,
+    ) -> CodexRelayIngestStatus {
+        if !peer.ip().is_loopback() {
+            return CodexRelayIngestStatus::Rejected;
+        }
+        if body.len() > MAX_CODEX_HOOK_BODY_BYTES {
+            return CodexRelayIngestStatus::BodyTooLarge;
+        }
+        let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+            return CodexRelayIngestStatus::Malformed;
+        };
+        let Ok(_publication) = self.publication_gate.read() else {
+            return CodexRelayIngestStatus::Rejected;
+        };
+        let (registration, reduction) = {
+            let Ok(mut state) = self.state.lock() else {
+                return CodexRelayIngestStatus::Rejected;
+            };
+            let latest = {
+                let Some(session) = state.registrations.get(nonce) else {
+                    return CodexRelayIngestStatus::Rejected;
+                };
+                state
+                    .latest_generation_by_key
+                    .get(&session.stable_session_key)
+                    == Some(&session.generation)
+            };
+            if !latest {
+                state.registrations.remove(nonce);
+                state.order.retain(|candidate| candidate != nonce);
+                return CodexRelayIngestStatus::Rejected;
+            }
+            let Some(session) = state.registrations.get_mut(nonce) else {
+                return CodexRelayIngestStatus::Rejected;
+            };
+            let registration = CodexHookRegistration {
+                nonce: nonce.to_string(),
+                stable_session_key: session.stable_session_key.clone(),
+                generation: session.generation,
+            };
+            (
+                registration,
+                session.reducer.apply_json(&payload, occurred_at_epoch_ms),
+            )
+        };
+        let handler = self
+            .event_handler
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(handler) = handler {
+            if let Some(binding) = reduction.session_binding {
+                handler(
+                    registration.clone(),
+                    CodexRegistryEvent::SessionStarted(binding),
+                );
+            }
+            for draft in reduction.drafts {
+                handler(registration.clone(), CodexRegistryEvent::Semantic(draft));
+            }
+        }
+        CodexRelayIngestStatus::Accepted
+    }
+}
+
+/// Loopback HTTP listener for `codex-hook-relay` POSTs. One per process,
+/// started lazily by the process manager; sessions are multiplexed by nonce.
+pub struct CodexHookRelayListener {
+    endpoint: String,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CodexHookRelayListener {
+    pub fn start(registry: std::sync::Arc<CodexHookRegistry>) -> Result<Self, String> {
+        use axum::routing::post;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| format!("bind Codex hook relay: {error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("configure Codex hook relay: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read Codex hook relay address: {error}"))?;
+        let endpoint = format!(
+            "http://127.0.0.1:{}{CODEX_HOOK_RELAY_PATH}",
+            address.port()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("start Codex hook relay runtime: {error}"))?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::Builder::new()
+            .name("codex-hook-relay".to_string())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                        return;
+                    };
+                    let app = axum::Router::new()
+                        .route(CODEX_HOOK_RELAY_PATH, post(handle_codex_hook))
+                        .layer(axum::extract::DefaultBodyLimit::max(
+                            MAX_CODEX_HOOK_BODY_BYTES,
+                        ))
+                        .with_state(registry);
+                    let _ = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
+                });
+            })
+            .map_err(|error| format!("spawn Codex hook relay: {error}"))?;
+        Ok(Self {
+            endpoint,
+            shutdown_tx: Some(shutdown_tx),
+            server_thread: Some(server_thread),
+        })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl Drop for CodexHookRelayListener {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        if let Some(thread) = self.server_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+async fn handle_codex_hook(
+    axum::extract::State(registry): axum::extract::State<std::sync::Arc<CodexHookRegistry>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::http::StatusCode {
+    let Some(nonce) = headers
+        .get("x-devmanager-codex-nonce")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return axum::http::StatusCode::UNAUTHORIZED;
+    };
+    match registry.ingest(peer, nonce, &body, unix_epoch_ms()) {
+        CodexRelayIngestStatus::Accepted | CodexRelayIngestStatus::Malformed => {
+            axum::http::StatusCode::NO_CONTENT
+        }
+        CodexRelayIngestStatus::Rejected => axum::http::StatusCode::UNAUTHORIZED,
+        CodexRelayIngestStatus::BodyTooLarge => axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+    }
+}
+
 pub const CODEX_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -549,6 +874,150 @@ mod reducer_tests {
             }
             other => panic!("expected tool, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn loopback_peer() -> std::net::SocketAddr {
+        "127.0.0.1:5555".parse().unwrap()
+    }
+
+    fn session_start_body(session_id: &str) -> Vec<u8> {
+        serde_json::json!({
+            "session_id": session_id,
+            "cwd": "C:\\proj",
+            "transcript_path": "C:\\sessions\\rollout-a.jsonl",
+            "hook_event_name": "SessionStart"
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn collecting_handler(
+        registry: &CodexHookRegistry,
+    ) -> Arc<Mutex<Vec<(CodexHookRegistration, CodexRegistryEvent)>>> {
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = collected.clone();
+        registry.set_event_handler(Some(Arc::new(move |registration, event| {
+            sink.lock().unwrap().push((registration, event));
+        })));
+        collected
+    }
+
+    #[test]
+    fn ingest_with_wrong_nonce_is_rejected() {
+        let registry = CodexHookRegistry::default();
+        let _events = collecting_handler(&registry);
+        let _registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        assert_eq!(
+            registry.ingest(loopback_peer(), "deadbeef", &session_start_body("s"), 1),
+            CodexRelayIngestStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn ingest_after_unregister_is_rejected() {
+        let registry = CodexHookRegistry::default();
+        let _events = collecting_handler(&registry);
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        registry.unregister(&registration.nonce);
+        assert_eq!(
+            registry.ingest(
+                loopback_peer(),
+                &registration.nonce,
+                &session_start_body("s"),
+                1
+            ),
+            CodexRelayIngestStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn stale_generation_cannot_publish() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let first = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        let second = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        assert_eq!(
+            registry.ingest(loopback_peer(), &first.nonce, &session_start_body("old"), 1),
+            CodexRelayIngestStatus::Rejected
+        );
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(
+            registry.ingest(loopback_peer(), &second.nonce, &session_start_body("new"), 2),
+            CodexRelayIngestStatus::Accepted
+        );
+        let published = events.lock().unwrap();
+        assert!(published
+            .iter()
+            .all(|(registration, _)| registration.generation == second.generation));
+    }
+
+    #[test]
+    fn session_start_ingest_emits_binding_event() {
+        let registry = CodexHookRegistry::default();
+        let events = collecting_handler(&registry);
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        assert_eq!(
+            registry.ingest(
+                loopback_peer(),
+                &registration.nonce,
+                &session_start_body("s-9"),
+                1
+            ),
+            CodexRelayIngestStatus::Accepted
+        );
+        let published = events.lock().unwrap();
+        assert!(published.iter().any(|(_, event)| matches!(
+            event,
+            CodexRegistryEvent::SessionStarted(binding)
+                if binding.session_id == "s-9"
+                    && binding.transcript_path.as_deref()
+                        == Some(std::path::Path::new("C:\\sessions\\rollout-a.jsonl"))
+        )));
+    }
+
+    #[test]
+    fn non_loopback_peer_is_rejected() {
+        let registry = CodexHookRegistry::default();
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        let remote_peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
+        assert_eq!(
+            registry.ingest(remote_peer, &registration.nonce, &session_start_body("s"), 1),
+            CodexRelayIngestStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn listener_round_trip_delivers_hook_payload() {
+        let registry = Arc::new(CodexHookRegistry::default());
+        let events = collecting_handler(&registry);
+        let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
+        let listener = CodexHookRelayListener::start(registry.clone()).unwrap();
+        let status = run_codex_hook_relay(
+            listener.endpoint(),
+            &registration.nonce,
+            &session_start_body("live"),
+        );
+        assert_eq!(status, std::process::ExitCode::SUCCESS);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if events.lock().unwrap().iter().any(|(_, event)| {
+                matches!(event, CodexRegistryEvent::SessionStarted(binding) if binding.session_id == "live")
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hook payload never arrived through the listener"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        drop(listener);
     }
 }
 
