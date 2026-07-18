@@ -244,6 +244,148 @@ impl CodexRolloutReducer {
     }
 }
 
+const TAILER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_TAILER_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Follows one rollout JSONL file on a background thread, feeding complete
+/// lines through a `CodexRolloutReducer` and publishing the resulting drafts.
+pub struct CodexRolloutTailer {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CodexRolloutTailer {
+    pub fn start<F>(
+        path: std::path::PathBuf,
+        stable_session_key: StableSessionKey,
+        on_event: F,
+    ) -> Self
+    where
+        F: Fn(SemanticEventDraft) + Send + Sync + 'static,
+    {
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread = std::thread::Builder::new()
+            .name("codex-rollout-tailer".to_string())
+            .spawn(move || {
+                tail_rollout_file(&path, stable_session_key, &on_event, &thread_shutdown);
+            })
+            .ok();
+        Self {
+            shutdown,
+            thread,
+        }
+    }
+
+    pub fn stop(mut self) {
+        self.signal_stop_and_join();
+    }
+
+    fn signal_stop_and_join(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for CodexRolloutTailer {
+    fn drop(&mut self) {
+        self.signal_stop_and_join();
+    }
+}
+
+fn tail_rollout_file<F>(
+    path: &std::path::Path,
+    stable_session_key: StableSessionKey,
+    on_event: &F,
+    shutdown: &std::sync::atomic::AtomicBool,
+) where
+    F: Fn(SemanticEventDraft),
+{
+    use std::io::{Read as _, Seek as _};
+
+    let mut reducer = CodexRolloutReducer::new(stable_session_key.clone());
+    let mut offset: u64 = 0;
+    let mut pending = Vec::new();
+    let mut skipping_oversized_line = false;
+
+    while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            std::thread::sleep(TAILER_POLL_INTERVAL);
+            continue;
+        };
+        let length = metadata.len();
+        if length < offset {
+            // The file shrank: rotated or replaced. Start over with fresh state
+            // so dedup keys line up with a fresh read of the new content.
+            reducer = CodexRolloutReducer::new(stable_session_key.clone());
+            offset = 0;
+            pending.clear();
+            skipping_oversized_line = false;
+        }
+        if length == offset {
+            std::thread::sleep(TAILER_POLL_INTERVAL);
+            continue;
+        }
+        let Ok(mut file) = std::fs::File::open(path) else {
+            std::thread::sleep(TAILER_POLL_INTERVAL);
+            continue;
+        };
+        if file.seek(std::io::SeekFrom::Start(offset)).is_err() {
+            std::thread::sleep(TAILER_POLL_INTERVAL);
+            continue;
+        }
+        let mut chunk = Vec::new();
+        let read = file
+            .take(length - offset)
+            .read_to_end(&mut chunk)
+            .unwrap_or(0);
+        if read == 0 {
+            std::thread::sleep(TAILER_POLL_INTERVAL);
+            continue;
+        }
+        offset += read as u64;
+
+        let mut start = 0;
+        while let Some(newline) = chunk[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + newline;
+            pending.extend_from_slice(&chunk[start..end]);
+            start = end + 1;
+            if skipping_oversized_line {
+                // This newline terminates the line we were skipping; resync.
+                skipping_oversized_line = false;
+                pending.clear();
+                continue;
+            }
+            if pending.last() == Some(&b'\r') {
+                pending.pop();
+            }
+            if let Ok(line) = std::str::from_utf8(&pending) {
+                for draft in reducer.observe_line(line, epoch_millis()) {
+                    on_event(draft);
+                }
+            }
+            pending.clear();
+        }
+        pending.extend_from_slice(&chunk[start..]);
+        if pending.len() > MAX_TAILER_LINE_BYTES {
+            pending.clear();
+            skipping_oversized_line = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +514,96 @@ mod tests {
         assert!(reducer
             .observe_line(r#"{"type":"world_state","payload":{"full":true}}"#, 1)
             .is_empty());
+    }
+
+    #[test]
+    fn tailer_emits_events_for_appended_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tailer =
+            CodexRolloutTailer::start(path.clone(), StableSessionKey::from_tab("t"), move |draft| {
+                let _ = tx.send(draft);
+            });
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(
+            file,
+            r#"{{"timestamp":"t","type":"event_msg","payload":{{"type":"agent_message","message":"hello"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let draft = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("tailer should emit for the appended line");
+        assert!(matches!(draft.kind, SemanticEventKind::AssistantMessage { .. }));
+        tailer.stop();
+    }
+
+    #[test]
+    fn partial_line_is_not_emitted_until_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tailer =
+            CodexRolloutTailer::start(path.clone(), StableSessionKey::from_tab("t"), move |draft| {
+                let _ = tx.send(draft);
+            });
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        write!(
+            file,
+            r#"{{"type":"event_msg","payload":{{"type":"agent_message","#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(600))
+            .is_err());
+        writeln!(file, r#""message":"finished"}}}}"#).unwrap();
+        file.flush().unwrap();
+        let draft = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("completed line should emit");
+        assert!(matches!(
+            draft.kind,
+            SemanticEventKind::AssistantMessage { ref text, .. } if text == "finished"
+        ));
+        tailer.stop();
+    }
+
+    #[test]
+    fn missing_file_retries_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.jsonl");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tailer =
+            CodexRolloutTailer::start(path.clone(), StableSessionKey::from_tab("t"), move |draft| {
+                let _ = tx.send(draft);
+            });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::fs::write(
+            &path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"late\"}}\n",
+        )
+        .unwrap();
+        let draft = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("file created after start should be tailed");
+        assert!(matches!(draft.kind, SemanticEventKind::AssistantMessage { .. }));
+        tailer.stop();
+    }
+
+    #[test]
+    fn stop_joins_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let tailer =
+            CodexRolloutTailer::start(path, StableSessionKey::from_tab("t"), |_draft| {});
+        tailer.stop();
     }
 
     #[test]
