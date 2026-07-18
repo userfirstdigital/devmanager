@@ -47,9 +47,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
@@ -59,9 +58,10 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_STATE_DENY,
 };
 use webview2_com::{
-    take_pwstr, CallDevToolsProtocolMethodCompletedHandler, PermissionRequestedEventHandler,
+    CallDevToolsProtocolMethodCompletedHandler, ContentLoadingEventHandler,
+    NavigationCompletedEventHandler, PermissionRequestedEventHandler,
 };
-use windows::core::{BOOL, HSTRING, PWSTR};
+use windows::core::{BOOL, HSTRING};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{
     MemoryUsageLevel, NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder,
@@ -77,27 +77,61 @@ struct BrowserViewKey {
 
 #[derive(Default)]
 struct BrowserDocumentSecretState {
-    tainted: AtomicBool,
-    new_document_loading: AtomicBool,
+    inner: Mutex<BrowserDocumentSecretInner>,
+}
+
+#[derive(Default)]
+struct BrowserDocumentSecretInner {
+    tainted: bool,
+    exposure_generation: u64,
+    latest_content_loading: Option<BrowserDocumentNavigationCandidate>,
+}
+
+#[derive(Clone, Copy)]
+struct BrowserDocumentNavigationCandidate {
+    navigation_id: u64,
+    exposure_generation: u64,
+    is_error_page: bool,
 }
 
 impl BrowserDocumentSecretState {
     fn mark_tainted(&self) {
-        self.new_document_loading.store(false, Ordering::Release);
-        self.tainted.store(true, Ordering::Release);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.tainted = true;
+            inner.exposure_generation = inner.exposure_generation.saturating_add(1);
+            inner.latest_content_loading = None;
+        }
     }
 
     fn is_tainted(&self) -> bool {
-        self.tainted.load(Ordering::Acquire)
+        self.inner.lock().map_or(true, |inner| inner.tainted)
     }
 
-    fn page_load_started(&self) {
-        self.new_document_loading.store(true, Ordering::Release);
+    fn content_loading(&self, navigation_id: u64, is_error_page: bool) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.latest_content_loading = Some(BrowserDocumentNavigationCandidate {
+                navigation_id,
+                exposure_generation: inner.exposure_generation,
+                is_error_page,
+            });
+        }
     }
 
-    fn page_load_finished(&self) {
-        if self.new_document_loading.swap(false, Ordering::AcqRel) {
-            self.tainted.store(false, Ordering::Release);
+    fn navigation_completed(&self, navigation_id: u64, is_success: bool) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let Some(candidate) = inner.latest_content_loading else {
+                return;
+            };
+            if candidate.navigation_id != navigation_id {
+                return;
+            }
+            inner.latest_content_loading = None;
+            if is_success
+                && !candidate.is_error_page
+                && candidate.exposure_generation == inner.exposure_generation
+            {
+                inner.tainted = false;
+            }
         }
     }
 }
@@ -105,6 +139,11 @@ impl BrowserDocumentSecretState {
 const WORKSPACE_OPERATION_TAB: &str = "__workspace__";
 const INLINE_RESULT_LIMIT: usize = 8 * 1024;
 const MAX_BROWSER_PAGE_RECORDING_QUEUE: usize = 256;
+const SECRET_TYPE_CALLBACK_OK: &str = r#""secret_type_ok""#;
+const SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND: &str = r#""element_not_found""#;
+const SECRET_TYPE_CALLBACK_TARGET_CHANGED: &str = r#""target_changed""#;
+const SECRET_TYPE_CALLBACK_AUTOMATION_FAILED: &str = r#""automation_failed""#;
+const FIXED_SECRET_ACTION_ENVELOPE: &str = r#"{"ok":true,"value":{"completedActions":1}}"#;
 
 enum BrowserAsyncPhase {
     Approval {
@@ -1803,6 +1842,13 @@ impl BrowserWebViewHost {
                 return;
             }
         }
+        let document_tainted = self
+            .document_secret_states
+            .get(&view_key(
+                active.request.workspace_key(),
+                &completion.target.tab_id,
+            ))
+            .is_some_and(|document_secret_state| document_secret_state.is_tainted());
         let phase = std::mem::replace(&mut active.phase, BrowserAsyncPhase::Cdp);
         let result = match phase {
             BrowserAsyncPhase::Snapshot => self.complete_snapshot(&active.request, &raw),
@@ -1839,10 +1885,13 @@ impl BrowserWebViewHost {
                         return;
                     }
                 };
-                let effective_risk = effective_browser_risk_for_targets(
-                    active.request.context().declared_risk,
-                    &runtime_targets,
-                    None,
+                let effective_risk = conservative_tainted_document_risk(
+                    effective_browser_risk_for_targets(
+                        active.request.context().declared_risk,
+                        &runtime_targets,
+                        None,
+                    ),
+                    document_tainted,
                 );
                 if let Err(error) = self.workflow_coordinator.inspect_agent_actions(
                     active.request.workspace_key(),
@@ -1928,10 +1977,13 @@ impl BrowserWebViewHost {
                             return;
                         }
                     };
-                let effective_risk = effective_browser_risk_for_targets(
-                    active.request.context().declared_risk,
-                    std::slice::from_ref(&runtime_target),
-                    None,
+                let effective_risk = conservative_tainted_document_risk(
+                    effective_browser_risk_for_targets(
+                        active.request.context().declared_risk,
+                        std::slice::from_ref(&runtime_target),
+                        None,
+                    ),
+                    document_tainted,
                 );
                 if let Err(error) = self.workflow_coordinator.inspect_agent_secret_type(
                     active.request.workspace_key(),
@@ -2268,10 +2320,8 @@ impl BrowserWebViewHost {
             });
         };
         self.validate_action_target_reference(request.workspace_key(), action_target)?;
-        let document_secret_state = self
-            .document_secret_states
+        self.document_secret_states
             .get(&view_key(&target.workspace_key, &target.tab_id))
-            .cloned()
             .ok_or_else(|| BrowserError::CrashedView {
                 message: "browser secret containment state is unavailable".to_string(),
             })?;
@@ -2285,6 +2335,7 @@ impl BrowserWebViewHost {
                     field: "secretSidecar".to_string(),
                 })?;
 
+        self.mark_secret_document_tainted(&target.workspace_key, &target.tab_id);
         let sender = self.async_sender.clone();
         let callback_target = target.clone();
         let callback_operation_id = operation_id.to_string();
@@ -2302,14 +2353,15 @@ impl BrowserWebViewHost {
                         }
                     })?);
                 let mut script: Zeroizing<String> = Zeroizing::new(format!(
-                    r#"(async () => {{
+                    r#"(() => {{
                       try {{
-                        const value = await (window.__devmanagerBrowser.typeSecret({}, {}));
-                        return {{ ok: true, value }};
+                        window.__devmanagerBrowser.typeSecret({}, {});
+                        return "secret_type_ok";
                       }} catch (error) {{
-                        const candidate = String(error && error.message || "automation_failed");
-                        const known = ["element_not_found", "target_changed"];
-                        return {{ ok: false, error: known.includes(candidate) ? candidate : "automation_failed" }};
+                        const candidate = error && error.message;
+                        if (candidate === "element_not_found") return "element_not_found";
+                        if (candidate === "target_changed") return "target_changed";
+                        return "automation_failed";
                       }}
                     }})()"#,
                     ticket_json,
@@ -2318,12 +2370,13 @@ impl BrowserWebViewHost {
                 let accepted = self
                     .view(&target.workspace_key, &target.tab_id)?
                     .evaluate_script_with_callback(&script, move |result| {
-                    let _ = sender.send(BrowserAsyncCompletion {
-                        target: callback_target.clone(),
-                        operation_id: callback_operation_id.clone(),
-                        result: Ok(result),
+                        let result = fixed_secret_type_callback_result(&result).to_string();
+                        let _ = sender.send(BrowserAsyncCompletion {
+                            target: callback_target.clone(),
+                            operation_id: callback_operation_id.clone(),
+                            result: Ok(result),
+                        });
                     });
-                });
                 script.zeroize();
                 value_json.zeroize();
                 accepted.map_err(view_failure)
@@ -2332,8 +2385,6 @@ impl BrowserWebViewHost {
                 field: "secretSidecar".to_string(),
             })?;
         accepted?;
-        document_secret_state.mark_tainted();
-        self.mark_secret_document_tainted(&target.workspace_key, &target.tab_id);
         Ok(())
     }
 
@@ -2491,21 +2542,20 @@ impl BrowserWebViewHost {
         request: &BrowserCommandRequest,
         raw: &str,
     ) -> Result<BrowserResponse, BrowserError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SecretActionProbe {
-            completed_actions: usize,
+        match raw {
+            SECRET_TYPE_CALLBACK_OK => {
+                self.complete_action(request, FIXED_SECRET_ACTION_ENVELOPE, true)
+            }
+            SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND => Err(BrowserError::CrashedView {
+                message: "element_not_found".to_string(),
+            }),
+            SECRET_TYPE_CALLBACK_TARGET_CHANGED => Err(BrowserError::CrashedView {
+                message: "target_changed".to_string(),
+            }),
+            _ => Err(BrowserError::CrashedView {
+                message: "automation_failed".to_string(),
+            }),
         }
-        let result: SecretActionProbe =
-            serde_json::from_value(script_value(raw)?).map_err(|_| BrowserError::CrashedView {
-                message: "browser secret action callback returned invalid data".to_string(),
-            })?;
-        if result.completed_actions != 1 {
-            return Err(BrowserError::CrashedView {
-                message: "browser secret action callback returned an invalid count".to_string(),
-            });
-        }
-        self.complete_action(request, raw, true)
     }
 
     fn complete_console(
@@ -3114,6 +3164,14 @@ impl BrowserWebViewHost {
         let incoming: Vec<_> = self.event_receiver.try_iter().collect();
         let mut events = Vec::with_capacity(incoming.len());
         for event in incoming {
+            let (workspace_key, tab_id) = browser_host_event_target(&event);
+            let tainted = self
+                .document_secret_states
+                .get(&view_key(workspace_key, tab_id))
+                .is_some_and(|state| state.is_tainted());
+            let Some(event) = contain_queued_host_event(event, tainted) else {
+                continue;
+            };
             match &event {
                 BrowserHostEvent::UrlChanged {
                     workspace_key,
@@ -3146,11 +3204,16 @@ impl BrowserWebViewHost {
                         self.cancel_annotation_route(&route);
                     }
                     if *state == BrowserPageLoadState::Finished {
-                        let _ = self.state.apply_page_load(workspace_key, tab_id, url);
-                        if self
-                            .workflow_coordinator
-                            .active_instance(workspace_key)
-                            .is_some()
+                        if url.is_empty() {
+                            let _ = self.state.apply_dom_mutation(workspace_key, tab_id);
+                        } else {
+                            let _ = self.state.apply_page_load(workspace_key, tab_id, url);
+                        }
+                        if !tainted
+                            && self
+                                .workflow_coordinator
+                                .active_instance(workspace_key)
+                                .is_some()
                             && self
                                 .install_page_recording_view(workspace_key, tab_id)
                                 .is_err()
@@ -3996,9 +4059,11 @@ impl BrowserWebViewHost {
                 }
             }
         };
+        attach_document_lifecycle_handlers(&webview, document_secret_state.clone())?;
         attach_permission_handler(
             &webview,
             self.event_sender.clone(),
+            document_secret_state.clone(),
             workspace_key.clone(),
             tab_id.to_string(),
         )?;
@@ -4223,9 +4288,55 @@ fn random_secret_target_ticket() -> Result<String, BrowserError> {
     Ok(ticket)
 }
 
+fn attach_document_lifecycle_handlers(
+    webview: &WebView,
+    document_secret_state: Arc<BrowserDocumentSecretState>,
+) -> Result<(), BrowserError> {
+    let core_webview = webview.webview();
+    let content_document_secret_state = document_secret_state.clone();
+    let content_loading = ContentLoadingEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut navigation_id = 0_u64;
+        let mut is_error_page: BOOL = false.into();
+        unsafe {
+            args.NavigationId(&mut navigation_id)?;
+            args.IsErrorPage(&mut is_error_page)?;
+        }
+        content_document_secret_state.content_loading(navigation_id, is_error_page.as_bool());
+        Ok(())
+    }));
+    let navigation_completed = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut navigation_id = 0_u64;
+        let mut is_success: BOOL = false.into();
+        unsafe {
+            args.NavigationId(&mut navigation_id)?;
+            args.IsSuccess(&mut is_success)?;
+        }
+        document_secret_state.navigation_completed(navigation_id, is_success.as_bool());
+        Ok(())
+    }));
+    let mut content_token = 0_i64;
+    let mut completion_token = 0_i64;
+    unsafe {
+        core_webview
+            .add_ContentLoading(&content_loading, &mut content_token)
+            .map_err(view_failure)?;
+        core_webview
+            .add_NavigationCompleted(&navigation_completed, &mut completion_token)
+            .map_err(view_failure)?;
+    }
+    Ok(())
+}
+
 fn attach_permission_handler(
     webview: &WebView,
     event_sender: Sender<BrowserHostEvent>,
+    document_secret_state: Arc<BrowserDocumentSecretState>,
     workspace_key: BrowserWorkspaceKey,
     tab_id: String,
 ) -> Result<(), BrowserError> {
@@ -4236,20 +4347,20 @@ fn attach_permission_handler(
             return Ok(());
         };
         let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
-        let mut uri = PWSTR::null();
         unsafe {
             args.PermissionKind(&mut kind)?;
-            args.Uri(&mut uri)?;
         }
-        let origin = redact_browser_text(&take_pwstr(uri));
         let permission = permission_name(kind);
+        if document_secret_state.is_tainted() {
+            return unsafe { args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY) };
+        }
         let mut was_visible: BOOL = false.into();
         unsafe {
             let _ = controller.IsVisible(&mut was_visible);
             let _ = controller.SetIsVisible(false);
         }
         let description = format!(
-            "Actor: User\nIntent: allow website permission\nRisk: OsPermission\nAction: allow {permission}\nOrigin: {origin}"
+            "Actor: User\nIntent: allow website permission\nRisk: OsPermission\nAction: allow {permission}\nOrigin: omitted by secure browser host"
         );
         let approved = MessageDialog::new()
             .set_level(MessageLevel::Warning)
@@ -4313,9 +4424,11 @@ fn configured_builder<'a>(
     let navigation_sender = event_sender.clone();
     let navigation_workspace = workspace_key.clone();
     let navigation_tab = tab_id.clone();
+    let navigation_document_secret_state = document_secret_state.clone();
     let title_sender = event_sender.clone();
     let title_workspace = workspace_key.clone();
     let title_tab = tab_id.clone();
+    let title_document_secret_state = document_secret_state.clone();
     let load_sender = event_sender.clone();
     let load_workspace = workspace_key.clone();
     let load_tab = tab_id.clone();
@@ -4323,18 +4436,21 @@ fn configured_builder<'a>(
     let ipc_sender = event_sender.clone();
     let ipc_failure_sender = event_sender.clone();
     let ipc_recording_ingress = recording_ingress;
-    let ipc_document_secret_state = document_secret_state;
+    let ipc_document_secret_state = document_secret_state.clone();
     let ipc_workspace = workspace_key.clone();
     let ipc_tab = tab_id.clone();
     let window_sender = event_sender.clone();
     let window_workspace = workspace_key.clone();
     let window_tab = tab_id.clone();
+    let window_document_secret_state = document_secret_state.clone();
     let download_sender = event_sender.clone();
     let download_workspace = workspace_key.clone();
     let download_tab = tab_id.clone();
+    let download_document_secret_state = document_secret_state.clone();
     let completion_workspace = workspace_key;
     let completion_tab = tab_id;
     let completion_downloads_dir = downloads_dir.clone();
+    let completion_document_secret_state = document_secret_state;
 
     WebViewBuilder::new_with_web_context(context)
         .with_url(url)
@@ -4343,7 +4459,11 @@ fn configured_builder<'a>(
         .with_focused(false)
         .with_clipboard(true)
         .with_initialization_script(browser_user_input_initialization_script())
-        .with_navigation_handler(move |url| match validate_browser_url(&url) {
+        .with_navigation_handler(move |url| {
+            if navigation_document_secret_state.is_tainted() {
+                return browser_url_allowed_without_projection(&url);
+            }
+            match validate_browser_url(&url) {
             Ok(_) => {
                 let _ = navigation_sender.send(BrowserHostEvent::UrlChanged {
                     workspace_key: navigation_workspace.clone(),
@@ -4361,8 +4481,12 @@ fn configured_builder<'a>(
                 });
                 false
             }
+            }
         })
         .with_document_title_changed_handler(move |title| {
+            if title_document_secret_state.is_tainted() {
+                return;
+            }
             let _ = title_sender.send(BrowserHostEvent::TitleChanged {
                 workspace_key: title_workspace.clone(),
                 tab_id: title_tab.clone(),
@@ -4371,14 +4495,13 @@ fn configured_builder<'a>(
         })
         .with_on_page_load_handler(move |state, url| {
             let state = match state {
-                PageLoadEvent::Started => {
-                    load_document_secret_state.page_load_started();
-                    BrowserPageLoadState::Started
-                }
-                PageLoadEvent::Finished => {
-                    load_document_secret_state.page_load_finished();
-                    BrowserPageLoadState::Finished
-                }
+                PageLoadEvent::Started => BrowserPageLoadState::Started,
+                PageLoadEvent::Finished => BrowserPageLoadState::Finished,
+            };
+            let url = if load_document_secret_state.is_tainted() {
+                String::new()
+            } else {
+                url
             };
             let _ = load_sender.send(BrowserHostEvent::PageLoad {
                 workspace_key: load_workspace.clone(),
@@ -4471,6 +4594,9 @@ fn configured_builder<'a>(
             let _ = ipc_sender.send(event);
         })
         .with_new_window_req_handler(move |url, _features| {
+            if window_document_secret_state.is_tainted() {
+                return NewWindowResponse::Deny;
+            }
             let _ = window_sender.send(BrowserHostEvent::NewWindow {
                 workspace_key: window_workspace.clone(),
                 tab_id: window_tab.clone(),
@@ -4479,6 +4605,9 @@ fn configured_builder<'a>(
             NewWindowResponse::Deny
         })
         .with_download_started_handler(move |url, suggested_path| {
+            if download_document_secret_state.is_tainted() {
+                return false;
+            }
             match verified_unique_download_path(
                 &trusted_app_config_dir,
                 &downloads_dir,
@@ -4507,6 +4636,9 @@ fn configured_builder<'a>(
             }
         })
         .with_download_completed_handler(move |url, path, successful| {
+            if completion_document_secret_state.is_tainted() {
+                return;
+            }
             let _ = event_sender.send(BrowserHostEvent::Download {
                 workspace_key: completion_workspace.clone(),
                 tab_id: completion_tab.clone(),
@@ -4521,6 +4653,140 @@ fn view_key(workspace_key: &BrowserWorkspaceKey, tab_id: &str) -> BrowserViewKey
     BrowserViewKey {
         workspace_key: workspace_key.clone(),
         tab_id: tab_id.to_string(),
+    }
+}
+
+fn browser_url_allowed_without_projection(url: &str) -> bool {
+    if url.is_empty() || url.trim() != url || url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if url.eq_ignore_ascii_case("about:blank") {
+        return true;
+    }
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('\\')
+}
+
+fn fixed_secret_type_callback_result(raw: &str) -> &'static str {
+    match raw {
+        SECRET_TYPE_CALLBACK_OK => SECRET_TYPE_CALLBACK_OK,
+        SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND => SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND,
+        SECRET_TYPE_CALLBACK_TARGET_CHANGED => SECRET_TYPE_CALLBACK_TARGET_CHANGED,
+        _ => SECRET_TYPE_CALLBACK_AUTOMATION_FAILED,
+    }
+}
+
+fn conservative_tainted_document_risk(
+    risk: crate::browser::BrowserRisk,
+    tainted: bool,
+) -> crate::browser::BrowserRisk {
+    if tainted && risk == crate::browser::BrowserRisk::Normal {
+        crate::browser::BrowserRisk::AccountSecurity
+    } else {
+        risk
+    }
+}
+
+fn browser_host_event_target(event: &BrowserHostEvent) -> (&BrowserWorkspaceKey, &str) {
+    match event {
+        BrowserHostEvent::UrlChanged {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::TitleChanged {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::PageLoad {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::UserInput {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::DomMutation {
+            workspace_key,
+            tab_id,
+        }
+        | BrowserHostEvent::AnnotationCandidate {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::AnnotationCanceled {
+            workspace_key,
+            tab_id,
+        }
+        | BrowserHostEvent::AnnotationDraftReady {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::AnnotationModeChanged {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::AutomationStateChanged {
+            workspace_key,
+            tab_id,
+        }
+        | BrowserHostEvent::ApprovalRequested {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::NewWindow {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::Download {
+            workspace_key,
+            tab_id,
+            ..
+        }
+        | BrowserHostEvent::Diagnostic {
+            workspace_key,
+            tab_id,
+            ..
+        } => (workspace_key, tab_id),
+    }
+}
+
+fn contain_queued_host_event(event: BrowserHostEvent, tainted: bool) -> Option<BrowserHostEvent> {
+    if !tainted {
+        return Some(event);
+    }
+    match event {
+        BrowserHostEvent::PageLoad {
+            workspace_key,
+            tab_id,
+            state,
+            ..
+        } => Some(BrowserHostEvent::PageLoad {
+            workspace_key,
+            tab_id,
+            state,
+            url: String::new(),
+        }),
+        BrowserHostEvent::UrlChanged { .. }
+        | BrowserHostEvent::TitleChanged { .. }
+        | BrowserHostEvent::NewWindow { .. }
+        | BrowserHostEvent::Download { .. }
+        | BrowserHostEvent::Diagnostic { .. } => None,
+        event => Some(event),
     }
 }
 
@@ -4770,40 +5036,191 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod secret_document_state_tests {
-    use super::BrowserDocumentSecretState;
+    use super::{
+        conservative_tainted_document_risk, contain_queued_host_event,
+        fixed_secret_type_callback_result, BrowserDocumentSecretState,
+    };
+    use crate::browser::{
+        BrowserApprovalPolicy, BrowserDiagnosticLevel, BrowserDownloadState, BrowserHostEvent,
+        BrowserPageLoadState, BrowserRisk, BrowserWorkspaceKey,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn taint_clears_only_after_a_later_confirmed_new_document_boundary() {
         let state = BrowserDocumentSecretState::default();
         state.mark_tainted();
 
-        state.page_load_finished();
+        state.navigation_completed(1, true);
         assert!(
             state.is_tainted(),
             "same-document Finished cannot clear taint"
         );
 
-        state.page_load_started();
+        state.content_loading(2, false);
         assert!(
             state.is_tainted(),
             "Started retains old-document protection"
         );
         state.mark_tainted();
-        state.page_load_finished();
+        state.navigation_completed(2, true);
         assert!(
             state.is_tainted(),
             "typing after ContentLoading belongs to that document and invalidates the pending clear"
         );
 
-        state.page_load_started();
+        state.content_loading(3, false);
         assert!(
             state.is_tainted(),
             "a failed or unfinished navigation stays tainted"
         );
-        state.page_load_finished();
+        state.navigation_completed(3, true);
         assert!(
             !state.is_tainted(),
             "the later confirmed document clears taint"
+        );
+    }
+
+    #[test]
+    fn taint_requires_the_latest_matching_successful_non_error_navigation() {
+        let state = BrowserDocumentSecretState::default();
+        state.mark_tainted();
+
+        state.content_loading(10, false);
+        state.content_loading(20, false);
+        state.navigation_completed(10, true);
+        assert!(
+            state.is_tainted(),
+            "stale A completion cannot clear latest B"
+        );
+
+        state.navigation_completed(20, false);
+        assert!(state.is_tainted(), "failed B completion cannot clear taint");
+
+        state.content_loading(30, true);
+        state.navigation_completed(30, true);
+        assert!(state.is_tainted(), "an error-page load cannot clear taint");
+
+        state.content_loading(40, false);
+        state.mark_tainted();
+        state.navigation_completed(40, true);
+        assert!(
+            state.is_tainted(),
+            "secret exposure after ContentLoading invalidates that navigation"
+        );
+
+        state.navigation_completed(50, true);
+        assert!(
+            state.is_tainted(),
+            "same-document completion without ContentLoading cannot clear taint"
+        );
+
+        state.content_loading(60, false);
+        state.navigation_completed(60, true);
+        assert!(!state.is_tainted(), "matching successful C clears taint");
+    }
+
+    #[test]
+    fn tainted_native_metadata_events_cannot_reach_safe_projections() {
+        const SENTINEL: &str = "DMNATIVESECRET7F3A91";
+        let workspace_key = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+        let tab_id = "tab-a".to_string();
+        let events = vec![
+            BrowserHostEvent::UrlChanged {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                url: format!("https://example.test/{SENTINEL}"),
+            },
+            BrowserHostEvent::TitleChanged {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                title: SENTINEL.to_string(),
+            },
+            BrowserHostEvent::PageLoad {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                state: BrowserPageLoadState::Started,
+                url: format!("https://example.test/?q={SENTINEL}"),
+            },
+            BrowserHostEvent::PageLoad {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                state: BrowserPageLoadState::Finished,
+                url: format!("https://example.test/%44%4d{SENTINEL}"),
+            },
+            BrowserHostEvent::NewWindow {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                url: format!("https://example.test/new/{SENTINEL}"),
+            },
+            BrowserHostEvent::Download {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                state: BrowserDownloadState::Started,
+                url: format!("https://example.test/download/{SENTINEL}"),
+                path: PathBuf::from(format!("C:/downloads/{SENTINEL}.txt")),
+            },
+            BrowserHostEvent::Download {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                state: BrowserDownloadState::Completed { successful: true },
+                url: format!("https://example.test/done/{SENTINEL}"),
+                path: PathBuf::from(format!("C:/downloads/{SENTINEL}.txt")),
+            },
+            BrowserHostEvent::Diagnostic {
+                workspace_key,
+                tab_id,
+                level: BrowserDiagnosticLevel::Warning,
+                message: format!("invalid navigation {SENTINEL}"),
+            },
+        ];
+
+        let safe: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| contain_queued_host_event(event, true))
+            .collect();
+        assert_eq!(safe.len(), 2, "only value-free page-load lifecycle remains");
+        assert!(safe.iter().all(|event| matches!(
+            event,
+            BrowserHostEvent::PageLoad { url, .. } if url.is_empty()
+        )));
+        let projection = serde_json::to_string(&safe).unwrap();
+        assert!(!projection.contains(SENTINEL), "{projection}");
+    }
+
+    #[test]
+    fn secret_callback_mapping_never_enqueues_page_controlled_text() {
+        const SENTINEL: &str = "DMCALLBACKSECRET4C8E27";
+        let hostile = format!(r#"{{"ok":true,"value":"{SENTINEL}"}}"#);
+        let mapped = fixed_secret_type_callback_result(&hostile);
+        assert_eq!(mapped, r#""automation_failed""#);
+        assert!(!mapped.contains(SENTINEL));
+        assert_eq!(
+            fixed_secret_type_callback_result(r#""secret_type_ok""#),
+            r#""secret_type_ok""#
+        );
+        assert_eq!(
+            fixed_secret_type_callback_result(r#""element_not_found""#),
+            r#""element_not_found""#
+        );
+        assert_eq!(
+            fixed_secret_type_callback_result(r#""target_changed""#),
+            r#""target_changed""#
+        );
+    }
+
+    #[test]
+    fn tainted_document_actions_cannot_downgrade_to_no_confirmation() {
+        let risk = conservative_tainted_document_risk(BrowserRisk::Normal, true);
+        assert_eq!(risk, BrowserRisk::AccountSecurity);
+        assert!(BrowserApprovalPolicy::trust_project().requires_confirmation(risk));
+        assert_eq!(
+            conservative_tainted_document_risk(BrowserRisk::Financial, true),
+            BrowserRisk::Financial
+        );
+        assert_eq!(
+            conservative_tainted_document_risk(BrowserRisk::Normal, false),
+            BrowserRisk::Normal
         );
     }
 }

@@ -2273,7 +2273,7 @@ fn initialization_script_has_self_cleaning_element_and_region_annotation_overlay
     let script = browser_user_input_initialization_script();
 
     assert!(script.contains("annotationCandidate"));
-    assert!(script.contains("annotation: {"));
+    assert!(script.contains("annotation: Object.freeze({"));
     assert!(script.contains("setPointerCapture"));
     assert!(script.contains("elementFromPoint"));
     assert!(script.contains("kind: \"element\""));
@@ -3020,6 +3020,58 @@ fn windows_permission_requests_use_devmanager_confirmation_and_never_default_gra
     assert!(source.contains("COREWEBVIEW2_PERMISSION_STATE_ALLOW"));
     assert!(source.contains("COREWEBVIEW2_PERMISSION_STATE_DENY"));
     assert!(!source.contains("COREWEBVIEW2_PERMISSION_STATE_DEFAULT"));
+}
+
+#[test]
+fn windows_secret_lifecycle_uses_native_navigation_identity_and_success_args() {
+    let source = include_str!("../src/browser/host/windows.rs");
+
+    assert!(source.contains("ContentLoadingEventHandler"));
+    assert!(source.contains("NavigationCompletedEventHandler"));
+    assert!(source.contains("fn attach_document_lifecycle_handlers("));
+    assert!(source.contains("add_ContentLoading"));
+    assert!(source.contains("args.NavigationId(&mut navigation_id)"));
+    assert!(source.contains("args.IsErrorPage(&mut is_error_page)"));
+    assert!(source.contains("add_NavigationCompleted"));
+    assert!(source.contains("args.IsSuccess(&mut is_success)"));
+    assert!(source.contains("document_secret_state.content_loading("));
+    assert!(source.contains("document_secret_state.navigation_completed("));
+}
+
+#[test]
+fn windows_native_metadata_callbacks_and_event_drain_consult_document_taint() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let builder_start = source.find("fn configured_builder").unwrap();
+    let builder = &source[builder_start..];
+    assert!(
+        builder.matches("document_secret_state.is_tainted()").count() >= 7,
+        "navigation, title, page-load, IPC, new-window, and both download callbacks need the exact authority"
+    );
+
+    let permission_start = source.find("fn attach_permission_handler(").unwrap();
+    let permission_end = source[permission_start..]
+        .find("fn permission_name(")
+        .map(|offset| permission_start + offset)
+        .unwrap();
+    let permission = &source[permission_start..permission_end];
+    assert!(permission.contains("Arc<BrowserDocumentSecretState>"));
+    assert!(permission.contains("document_secret_state.is_tainted()"));
+    assert!(!permission.contains("args.Uri("));
+    assert!(!permission.contains("take_pwstr"));
+
+    let drain_start = source.find("pub fn drain_events(").unwrap();
+    let drain_end = source[drain_start..]
+        .find("fn pump_page_recording_ipc(")
+        .map(|offset| drain_start + offset)
+        .unwrap();
+    let drain = &source[drain_start..drain_end];
+    assert!(drain.contains("contain_queued_host_event(event, tainted)"));
+    assert!(
+        drain
+            .find("contain_queued_host_event(event, tainted)")
+            .unwrap()
+            < drain.find("match &event").unwrap()
+    );
 }
 
 #[test]

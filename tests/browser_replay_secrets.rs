@@ -175,7 +175,7 @@ class FakeElement {{
   dispatchEvent(event) {{ for (const listener of this.listeners[event.type] || []) listener(event); return true; }}
   focus() {{}}
   matches() {{ return true; }}
-  closest() {{ return null; }}
+  closest(selector) {{ return selector === "form" ? (this.form || null) : null; }}
   hasAttribute(name) {{ return Object.hasOwn(this.attributes, name) || name === "value"; }}
   getAttribute(name) {{
     if (name === "value") return this.value;
@@ -219,6 +219,19 @@ globalThis.window = {{
   }}),
 }};
 {}
+const originalApi = window.__devmanagerBrowser;
+const originalTypeSecret = originalApi.typeSecret;
+try {{ window.__devmanagerBrowser = {{ typeSecret: () => {sentinel:?} }}; }} catch (_) {{}}
+try {{ originalApi.typeSecret = () => {sentinel:?}; }} catch (_) {{}}
+const apiDescriptor = Object.getOwnPropertyDescriptor(window, "__devmanagerBrowser");
+const apiSealed =
+  window.__devmanagerBrowser === originalApi &&
+  originalApi.typeSecret === originalTypeSecret &&
+  Object.isFrozen(originalApi) &&
+  apiDescriptor?.writable === false &&
+  apiDescriptor?.configurable === false;
+if (window.__devmanagerBrowser !== originalApi) window.__devmanagerBrowser = originalApi;
+if (originalApi.typeSecret !== originalTypeSecret) originalApi.typeSecret = originalTypeSecret;
 let inputEvents = 0;
 let changeEvents = 0;
 inspectedInput.addEventListener("input", () => {{
@@ -252,7 +265,8 @@ const maskPersistent =
   inspectedInput.style.getPropertyPriority("-webkit-text-security") === "important";
 
 resolvedInput = retargetedInput;
-window.__devmanagerBrowser.inspectSecretTarget(target, "ticket-b");
+retargetedInput.form = {{ action: "https://{marker}.example.test/submit" }};
+const taintedInspection = window.__devmanagerBrowser.inspectSecretTarget(target, "ticket-b");
 retargetedInput.attributes.autocomplete = "off";
 let changedError = null;
 try {{ window.__devmanagerBrowser.typeSecret("ticket-b", "must-not-be-assigned"); }}
@@ -290,6 +304,8 @@ setImmediate(() => {{
     changedError,
     maskPersistent,
     allMasksPersistent,
+    apiSealed,
+    taintedInspection,
     tainted: window.__devmanagerBrowser.secretTainted(),
     blocked,
     ipcMessages,
@@ -300,6 +316,7 @@ setImmediate(() => {{
         browser_user_input_initialization_script(),
         sentinel = SENTINEL,
         second = SECOND_MARKER,
+        marker = MARKER,
     );
     let harness_path = std::env::temp_dir().join(format!(
         "devmanager-browser-secret-harness-{}.js",
@@ -318,12 +335,14 @@ setImmediate(() => {{
     );
     let output = String::from_utf8(output.stdout).expect("Node output is UTF-8");
     let json_sentinel = serde_json::to_string(SENTINEL).expect("JSON escaped sentinel");
+    let lowercase_marker = MARKER.to_ascii_lowercase();
     assert!(
         !output.contains(SENTINEL),
         "secret escaped safe output: {output}"
     );
     assert!(
         !output.contains(MARKER)
+            && !output.contains(&lowercase_marker)
             && !output.contains(SECOND_MARKER)
             && !output.contains(&json_sentinel)
             && !output.contains(URI_SENTINEL)
@@ -338,6 +357,19 @@ setImmediate(() => {{
     assert_eq!(safe["changedError"], "target_changed");
     assert_eq!(safe["maskPersistent"], true);
     assert_eq!(safe["allMasksPersistent"], true);
+    assert_eq!(safe["apiSealed"], true);
+    assert_eq!(
+        safe["taintedInspection"],
+        serde_json::json!({
+            "originUrl": "https://example.test",
+            "role": "textbox",
+            "name": null,
+            "inputType": "text",
+            "autocomplete": "current-password",
+            "formAction": null,
+            "permission": null,
+        })
+    );
     assert_eq!(safe["tainted"], true);
     assert_eq!(
         safe["blocked"],
@@ -536,7 +568,19 @@ fn windows_secure_host_lane_revalidates_before_inspect_approval_exposure_and_cal
     assert!(windows.contains("Zeroizing<String>"));
     assert!(windows.contains("BrowserAsyncPhase::SecretType"));
     assert!(windows.contains("fn complete_secret_type("));
-    assert!(windows.contains("result.completed_actions != 1"));
+    let completion_start = windows.find("fn complete_secret_type(").unwrap();
+    let completion_end = windows[completion_start..]
+        .find("fn complete_console(")
+        .map(|offset| completion_start + offset)
+        .unwrap();
+    let completion = &windows[completion_start..completion_end];
+    assert!(completion.contains("match raw"));
+    assert!(completion.contains("SECRET_TYPE_CALLBACK_OK =>"));
+    assert!(
+        completion.contains("self.complete_action(request, FIXED_SECRET_ACTION_ENVELOPE, true)")
+    );
+    assert!(completion.contains("FIXED_SECRET_ACTION_ENVELOPE"));
+    assert!(!completion.contains("script_value(raw)"));
     assert!(windows.contains("self.view(&target.workspace_key, &target.tab_id)?"));
     let inspect_phase = windows
         .find("BrowserAsyncPhase::InspectSecretType { ticket } =>")
@@ -593,8 +637,9 @@ fn windows_host_taint_gates_content_capture_ipc_recording_and_post_exposure_succ
     assert!(secret.contains("typeSecret({}, {})"));
     assert!(!secret.contains("serde_json::to_string(action_target)"));
     assert!(
-        secret.find("accepted?;").unwrap() < secret.find("mark_secret_document_tainted").unwrap(),
-        "host taint is set immediately after WebView accepts the secret script"
+        secret.find("mark_secret_document_tainted").unwrap()
+            < secret.find(".with_exposed").unwrap(),
+        "host taint and recorder teardown precede secret exposure"
     );
 
     let automation_start = windows.find("fn begin_automation_request(").unwrap();
@@ -650,8 +695,20 @@ fn windows_host_taint_gates_content_capture_ipc_recording_and_post_exposure_succ
     assert!(
         builder.contains("Ok(BrowserPageIpcMessage::AnnotationCandidate { .. }) | Err(_) => None")
     );
-    assert!(windows.contains("new_document_loading.swap(false"));
-    assert!(windows.contains("self.new_document_loading.store(false"));
+    let lifecycle_start = windows
+        .find("fn attach_document_lifecycle_handlers(")
+        .unwrap();
+    let lifecycle_end = windows[lifecycle_start..]
+        .find("fn attach_permission_handler(")
+        .map(|offset| lifecycle_start + offset)
+        .unwrap();
+    let lifecycle = &windows[lifecycle_start..lifecycle_end];
+    assert!(lifecycle.contains("args.NavigationId(&mut navigation_id)?"));
+    assert!(lifecycle.contains("args.IsErrorPage(&mut is_error_page)?"));
+    assert!(lifecycle.contains("args.IsSuccess(&mut is_success)?"));
+    assert!(lifecycle.contains("content_loading(navigation_id, is_error_page.as_bool())"));
+    assert!(lifecycle.contains("navigation_completed(navigation_id, is_success.as_bool())"));
+    assert!(!windows.contains("new_document_loading"));
     assert!(windows.contains("install_page_recording_view"));
 
     let response_start = windows.find("fn respond_request(").unwrap();
@@ -662,4 +719,60 @@ fn windows_host_taint_gates_content_capture_ipc_recording_and_post_exposure_succ
     let response = &windows[response_start..response_end];
     assert!(response.contains("matches!(request.command(), BrowserCommand::SecretType"));
     assert!(response.contains("result = Err(map_agent_recording_error(error))"));
+}
+
+#[test]
+fn windows_secret_callback_uses_only_sealed_api_and_fixed_primitive_codes() {
+    let initialization = browser_user_input_initialization_script();
+    assert!(initialization.contains("Object.defineProperty(window, marker"));
+    assert!(initialization.contains("writable: false"));
+    assert!(initialization.contains("configurable: false"));
+    assert!(initialization.contains("Object.freeze(api)"));
+
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let start = windows.find("fn start_secret_type(").unwrap();
+    let end = windows[start..]
+        .find("fn complete_snapshot(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let secret = &windows[start..end];
+    let host_taint = secret
+        .find("self.mark_secret_document_tainted")
+        .expect("host taint transition");
+    let exposure = secret
+        .find(".with_exposed")
+        .expect("secret exposure closure");
+    assert!(
+        host_taint < exposure,
+        "native callback containment must be active before secret exposure"
+    );
+    assert!(secret.contains("window.__devmanagerBrowser.typeSecret({}, {});"));
+    assert!(secret.contains("return \"secret_type_ok\";"));
+    assert!(!secret.contains("const value = await"));
+    assert!(secret.contains("fixed_secret_type_callback_result(&result)"));
+    assert!(
+        secret
+            .find("fixed_secret_type_callback_result(&result)")
+            .unwrap()
+            < secret.find("sender.send(BrowserAsyncCompletion").unwrap()
+    );
+}
+
+#[test]
+fn tainted_action_and_secret_inspection_risk_is_conservatively_confirmed() {
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let start = windows.find("fn complete_async_operation(").unwrap();
+    let end = windows[start..]
+        .find("fn continue_actions(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let completion = &windows[start..end];
+    assert!(
+        completion
+            .matches("conservative_tainted_document_risk(")
+            .count()
+            >= 2,
+        "both ordinary actions and SecretType need fail-closed tainted risk"
+    );
+    assert!(completion.contains("document_secret_state.is_tainted()"));
 }

@@ -327,6 +327,23 @@ impl BrowserWorkflowCoordinator {
                 }
             }
         }
+        if let BrowserCommand::Upload { target, .. } = command {
+            let prepared = match BrowserRecordingAction::upload(recipe_locator(target)) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    for reservation in reservations {
+                        let _ = state.recorder.cancel(reservation);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = state.recorder.prepare(&reservations[0], prepared) {
+                for reservation in reservations {
+                    let _ = state.recorder.cancel(reservation);
+                }
+                return Err(error);
+            }
+        }
         state.agent_commands.insert(
             key,
             PendingAgentRecording {

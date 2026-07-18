@@ -321,6 +321,14 @@ enum ReservationState {
 struct ReservationSlot {
     context: ReservationContext,
     state: ReservationState,
+    reserved_input: Option<PreparedRecordingInput>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PreparedRecordingInput {
+    name: String,
+    kind: BrowserRecipeInputKind,
+    generated: bool,
 }
 
 struct RecordedStep {
@@ -489,6 +497,7 @@ impl BrowserWorkflowRecorder {
                     risk,
                 },
                 state: ReservationState::Pending,
+                reserved_input: None,
             },
         );
         Ok(BrowserRecordingReservation {
@@ -541,18 +550,22 @@ impl BrowserWorkflowRecorder {
             | ReservationState::Ready(_)
             | ReservationState::Cancelled => return Err(BrowserRecordingError::StaleReservation),
         }
-        let projected_inputs = projected_generated_input_count(active, &action)?;
-        let exceeds_capacity = retained_assertion_count(active)
-            .saturating_add(action.assertions.len())
+        if matches!(&action.action, PendingRecordingAction::SecretType { .. })
+            && reservation.sequence != active.next_to_drain
+        {
+            return Err(BrowserRecordingError::StaleReservation);
+        }
+        let reserved_input = prepare_recording_input(active, &action)?;
+        if retained_assertion_count(active).saturating_add(action.assertions.len())
             > MAX_BROWSER_RECORDING_ASSERTIONS
-            || projected_inputs > MAX_BROWSER_RECORDING_INPUTS;
-        if exceeds_capacity {
+        {
             return Err(BrowserRecordingError::CapacityExceeded);
         }
         let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
             return Err(BrowserRecordingError::StaleReservation);
         };
         slot.state = ReservationState::Prepared(action);
+        slot.reserved_input = reserved_input;
         Ok(())
     }
 
@@ -577,7 +590,7 @@ impl BrowserWorkflowRecorder {
         };
         slot.state = ReservationState::Ready(action);
         let previous_next = active.next_to_drain;
-        drain_ready(active);
+        drain_ready(active)?;
         Ok(commit_result(previous_next, active.next_to_drain))
     }
 
@@ -603,8 +616,9 @@ impl BrowserWorkflowRecorder {
             return Err(BrowserRecordingError::StaleReservation);
         }
         slot.state = ReservationState::Cancelled;
+        slot.reserved_input = None;
         let previous_next = active.next_to_drain;
-        drain_ready(active);
+        drain_ready(active)?;
         Ok(commit_result(previous_next, active.next_to_drain))
     }
 
@@ -672,9 +686,16 @@ impl BrowserWorkflowRecorder {
                 ReservationState::Pending | ReservationState::Prepared(_)
             ) {
                 slot.state = ReservationState::Cancelled;
+                slot.reserved_input = None;
             }
         }
-        drain_ready(&mut active);
+        if let Err(error) = drain_ready(&mut active) {
+            self.workspaces.insert(
+                instance.workspace_key.clone(),
+                WorkspaceRecordingState::Recording(active),
+            );
+            return Err(error);
+        }
         let step_actors = active
             .steps
             .iter()
@@ -1116,46 +1137,96 @@ fn retained_assertion_count(active: &ActiveRecording) -> usize {
     })
 }
 
-fn projected_generated_input_count(
+fn prepared_input_owners(
     active: &ActiveRecording,
-    next: &BrowserRecordingAction,
-) -> Result<usize, BrowserRecordingError> {
-    let mut named = active
-        .inputs
-        .iter()
-        .map(|input| (input.name.clone(), input.kind))
-        .collect::<HashMap<_, _>>();
-    let mut unnamed = 0_usize;
-    let mut project = |action: &BrowserRecordingAction| -> Result<(), BrowserRecordingError> {
-        match &action.action {
-            PendingRecordingAction::SecretType {
-                input_name: Some(input_name),
-                ..
-            } => match named.get(input_name) {
-                Some(BrowserRecipeInputKind::Secret) => {}
-                Some(_) => return Err(BrowserRecordingError::InvalidAction),
-                None => {
-                    named.insert(input_name.clone(), BrowserRecipeInputKind::Secret);
-                }
-            },
-            PendingRecordingAction::SecretType {
-                input_name: None, ..
+) -> Result<HashMap<String, BrowserRecipeInputKind>, BrowserRecordingError> {
+    let mut owners = HashMap::new();
+    for input in &active.inputs {
+        match owners.insert(input.name.clone(), input.kind) {
+            Some(existing) if existing != input.kind => {
+                return Err(BrowserRecordingError::InvalidAction)
             }
-            | PendingRecordingAction::FileUpload(_) => unnamed = unnamed.saturating_add(1),
-            PendingRecordingAction::Recipe(_) => {}
-        }
-        Ok(())
-    };
-    for slot in active.reservations.values() {
-        if let ReservationState::Prepared(action) | ReservationState::Ready(action) = &slot.state {
-            project(action)?;
+            _ => {}
         }
     }
-    project(next)?;
-    Ok(named.len().saturating_add(unnamed))
+    for slot in active.reservations.values() {
+        if !matches!(
+            &slot.state,
+            ReservationState::Prepared(_) | ReservationState::Ready(_)
+        ) {
+            continue;
+        }
+        let Some(input) = &slot.reserved_input else {
+            continue;
+        };
+        match owners.insert(input.name.clone(), input.kind) {
+            Some(existing) if existing != input.kind => {
+                return Err(BrowserRecordingError::InvalidAction)
+            }
+            _ => {}
+        }
+    }
+    Ok(owners)
 }
 
-fn drain_ready(active: &mut ActiveRecording) {
+fn prepare_recording_input(
+    active: &ActiveRecording,
+    action: &BrowserRecordingAction,
+) -> Result<Option<PreparedRecordingInput>, BrowserRecordingError> {
+    let mut owners = prepared_input_owners(active)?;
+    let (name, kind) = match &action.action {
+        PendingRecordingAction::Recipe(_) => return Ok(None),
+        PendingRecordingAction::SecretType {
+            input_name: Some(name),
+            ..
+        } => (name.clone(), BrowserRecipeInputKind::Secret),
+        PendingRecordingAction::SecretType {
+            input_name: None, ..
+        } => (
+            next_reserved_input_name("secret", &owners),
+            BrowserRecipeInputKind::Secret,
+        ),
+        PendingRecordingAction::FileUpload(_) => (
+            next_reserved_input_name("file", &owners),
+            BrowserRecipeInputKind::File,
+        ),
+    };
+    let generated = match owners.get(&name) {
+        Some(existing) if *existing != kind => return Err(BrowserRecordingError::InvalidAction),
+        Some(_) => false,
+        None => {
+            if owners.len() >= MAX_BROWSER_RECORDING_INPUTS {
+                return Err(BrowserRecordingError::CapacityExceeded);
+            }
+            owners.insert(name.clone(), kind);
+            true
+        }
+    };
+    Ok(Some(PreparedRecordingInput {
+        name,
+        kind,
+        generated,
+    }))
+}
+
+fn next_reserved_input_name(
+    base: &str,
+    owners: &HashMap<String, BrowserRecipeInputKind>,
+) -> String {
+    if !owners.contains_key(base) {
+        return base.to_string();
+    }
+    let mut suffix = 2_u64;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if !owners.contains_key(&candidate) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn drain_ready(active: &mut ActiveRecording) -> Result<(), BrowserRecordingError> {
     loop {
         let Some(slot) = active.reservations.remove(&active.next_to_drain) else {
             break;
@@ -1168,13 +1239,20 @@ fn drain_ready(active: &mut ActiveRecording) {
                     active.next_to_drain = active.next_to_drain.saturating_add(1);
                     continue;
                 }
-                let recorded = materialize_action(
+                let recorded = match materialize_action(
                     action,
                     slot.context,
                     sequence,
+                    slot.reserved_input,
                     &mut active.inputs,
                     &mut active.generated_inputs,
-                );
+                ) {
+                    Ok(recorded) => recorded,
+                    Err(error) => {
+                        active.next_to_drain = active.next_to_drain.saturating_add(1);
+                        return Err(error);
+                    }
+                };
                 if !coalesce_step(&mut active.steps, &recorded) {
                     active.steps.push(recorded);
                 }
@@ -1189,6 +1267,7 @@ fn drain_ready(active: &mut ActiveRecording) {
             }
         }
     }
+    Ok(())
 }
 
 fn coalesce_pending_sensitive(
@@ -1237,49 +1316,51 @@ fn materialize_action(
     action: BrowserRecordingAction,
     context: ReservationContext,
     sequence: u64,
+    reserved_input: Option<PreparedRecordingInput>,
     inputs: &mut Vec<BrowserRecipeInput>,
     generated_inputs: &mut BTreeSet<String>,
-) -> RecordedStep {
+) -> Result<RecordedStep, BrowserRecordingError> {
     let BrowserRecordingAction {
         action,
         wait,
         assertions,
     } = action;
     let action = match action {
-        PendingRecordingAction::Recipe(action) => action,
+        PendingRecordingAction::Recipe(action) => {
+            if reserved_input.is_some() {
+                return Err(BrowserRecordingError::InvalidAction);
+            }
+            action
+        }
         PendingRecordingAction::SecretType {
             locator,
-            input_name,
+            input_name: _,
         } => {
-            let name = input_name.unwrap_or_else(|| next_input_name("secret", inputs));
-            if !inputs.iter().any(|input| input.name == name) {
-                inputs.push(BrowserRecipeInput {
-                    name: name.clone(),
-                    kind: BrowserRecipeInputKind::Secret,
-                    default_value: None,
-                });
-                generated_inputs.insert(name.clone());
-            }
+            let input = materialize_reserved_input(
+                reserved_input,
+                BrowserRecipeInputKind::Secret,
+                inputs,
+                generated_inputs,
+            )?;
             BrowserRecipeAction::Type {
                 locator,
-                value: BrowserRecipeValue::Input { name },
+                value: BrowserRecipeValue::Input { name: input },
             }
         }
         PendingRecordingAction::FileUpload(locator) => {
-            let name = next_input_name("file", inputs);
-            inputs.push(BrowserRecipeInput {
-                name: name.clone(),
-                kind: BrowserRecipeInputKind::File,
-                default_value: None,
-            });
-            generated_inputs.insert(name.clone());
+            let name = materialize_reserved_input(
+                reserved_input,
+                BrowserRecipeInputKind::File,
+                inputs,
+                generated_inputs,
+            )?;
             BrowserRecipeAction::Upload {
                 locator,
                 file: BrowserRecipeValue::Input { name },
             }
         }
     };
-    RecordedStep {
+    Ok(RecordedStep {
         actor: context.actor,
         tab_id: context.tab_id,
         risk: context.risk,
@@ -1289,21 +1370,39 @@ fn materialize_action(
             wait,
             assertions,
         },
-    }
+    })
 }
 
-fn next_input_name(base: &str, inputs: &[BrowserRecipeInput]) -> String {
-    if !inputs.iter().any(|input| input.name == base) {
-        return base.to_string();
+fn materialize_reserved_input(
+    reserved_input: Option<PreparedRecordingInput>,
+    expected_kind: BrowserRecipeInputKind,
+    inputs: &mut Vec<BrowserRecipeInput>,
+    generated_inputs: &mut BTreeSet<String>,
+) -> Result<String, BrowserRecordingError> {
+    let input = reserved_input.ok_or(BrowserRecordingError::InvalidAction)?;
+    if input.kind != expected_kind {
+        return Err(BrowserRecordingError::InvalidAction);
     }
-    let mut suffix = 2_u64;
-    loop {
-        let candidate = format!("{base}_{suffix}");
-        if !inputs.iter().any(|input| input.name == candidate) {
-            return candidate;
+    match inputs.iter().find(|existing| existing.name == input.name) {
+        Some(existing) if existing.kind != input.kind => {
+            return Err(BrowserRecordingError::InvalidAction)
         }
-        suffix = suffix.saturating_add(1);
+        Some(_) => {}
+        None => {
+            if inputs.len() >= MAX_BROWSER_RECORDING_INPUTS {
+                return Err(BrowserRecordingError::CapacityExceeded);
+            }
+            inputs.push(BrowserRecipeInput {
+                name: input.name.clone(),
+                kind: input.kind,
+                default_value: None,
+            });
+            if input.generated {
+                generated_inputs.insert(input.name.clone());
+            }
+        }
     }
+    Ok(input.name)
 }
 
 fn coalesce_step(steps: &mut [RecordedStep], next: &RecordedStep) -> bool {

@@ -2,6 +2,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
 (() => {
   const marker = "__devmanagerBrowser";
   if (window[marker]) return;
+  const NativeError = Error;
 
   const MAX_CONSOLE = 200;
   const MAX_NETWORK = 300;
@@ -661,16 +662,13 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       const inputType = String(element?.getAttribute?.("type") || "").toLowerCase();
       const autocomplete = String(element?.getAttribute?.("autocomplete") || "")
         .toLowerCase().split(/\s+/).at(-1);
-      let formAction = null;
-      try { formAction = form?.action ? new URL(form.action, location.href).origin : null; }
-      catch (_) {}
       return {
         originUrl: location.origin,
         role: element ? implicitRole(element) : null,
         name: null,
         inputType: ["text", "password", "email", "tel", "url", "number", "search"].includes(inputType) ? inputType : null,
         autocomplete: ["current-password", "new-password", "one-time-code", "username", "email", "off"].includes(autocomplete) ? autocomplete : null,
-        formAction,
+        formAction: null,
         permission: null,
       };
     }
@@ -703,7 +701,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     if (state.secretTainted) throw new Error("secret_tainted_document");
   };
 
-  window[marker] = {
+  const api = {
     snapshot: () => {
       requireContentTelemetry();
       const useful = "a,button,input,select,textarea,[role],[data-testid],h1,h2,h3,h4,h5,h6,p,li,summary";
@@ -755,20 +753,20 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       pendingSecretTicket = null;
       if (!ticket || ticket.token !== String(token ?? "")) {
         markSecretTainted();
-        throw new Error("element_not_found");
+        throw new NativeError("element_not_found");
       }
       const element = ticket.element.deref();
       if (!element) {
         markSecretTainted();
-        throw new Error("element_not_found");
+        throw new NativeError("element_not_found");
       }
       const connected = element.isConnected === true;
       const currentSignature = secretRiskSignature(element);
       markSecretTainted();
       if (!connected || ticket.signature !== currentSignature) {
-        throw new Error("target_changed");
+        throw new NativeError("target_changed");
       }
-      if (!registerMaskedSecretElement(element)) throw new Error("target_changed");
+      if (!registerMaskedSecretElement(element)) throw new NativeError("target_changed");
       element.style?.setProperty?.("-webkit-text-security", "disc", "important");
       element.focus();
       element.value = String(value ?? "");
@@ -817,16 +815,23 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       element.setAttribute("data-devmanager-upload", token);
       return true;
     },
-    annotation: {
+    annotation: Object.freeze({
       start: (context) => {
         requireContentTelemetry();
         return annotationStart(context);
       },
       cancel: () => annotationCleanup(false),
       active: () => Boolean(annotationSession),
-    },
+    }),
     secretTainted: () => state.secretTainted,
   };
+  Object.freeze(api);
+  Object.defineProperty(window, marker, {
+    value: api,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
 })();
 "#;
 
