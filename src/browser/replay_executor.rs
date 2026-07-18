@@ -24,6 +24,7 @@ pub async fn execute_browser_replay(
     actor: BrowserInvocationActor,
     authenticated_local_project_root: &Path,
 ) -> Result<BrowserReplayProjection, BrowserReplayError> {
+    let _secret_store_close = BrowserReplaySecretStoreCloseGuard(&execution);
     if !execution.same_instance(instance) {
         return Err(BrowserReplayError::StaleInstance);
     }
@@ -38,8 +39,24 @@ pub async fn execute_browser_replay(
     if let Some(cancelled) = cancelled_projection(&execution, coordinator, instance)? {
         return Ok(cancelled);
     }
-    if let Err(error) = coordinator.begin(instance) {
-        return retained_terminal_after_transition_error(coordinator, instance, error);
+    match coordinator.status(instance)? {
+        projection if projection.status == BrowserReplayStatus::Pending => {
+            if let Err(error) = coordinator.begin(instance) {
+                return retained_terminal_after_transition_error(coordinator, instance, error);
+            }
+        }
+        projection if projection.status == BrowserReplayStatus::Running => {}
+        projection
+            if matches!(
+                projection.status,
+                BrowserReplayStatus::Completed
+                    | BrowserReplayStatus::Failed
+                    | BrowserReplayStatus::Cancelled
+            ) =>
+        {
+            return Ok(projection);
+        }
+        _ => return Err(BrowserReplayError::InvalidTransition),
     }
     let plan = execution.plan();
     let create = match checked_request(
@@ -524,6 +541,21 @@ async fn execute_action(
             .await
         }
         BrowserRecipeAction::Type { locator, value } => {
+            if let BrowserRecipeValue::Input { name } = value {
+                if plan.input_kind(name) == Some(BrowserRecipeInputKind::Secret) {
+                    return secret_semantic_action(
+                        controller,
+                        coordinator,
+                        instance,
+                        execution,
+                        actor,
+                        tabs,
+                        locator,
+                        name,
+                    )
+                    .await;
+                }
+            }
             let text = resolve_value(plan, value)
                 .map(str::to_string)
                 .ok_or(ReplayActionFailure::StepFailed)?;
@@ -729,6 +761,14 @@ async fn execute_action(
     }
 }
 
+struct BrowserReplaySecretStoreCloseGuard<'a>(&'a BrowserReplayExecutionHandle);
+
+impl Drop for BrowserReplaySecretStoreCloseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.close_secret_store();
+    }
+}
+
 async fn acknowledged_command(
     controller: &BrowserController,
     coordinator: &BrowserReplayCoordinator,
@@ -892,6 +932,62 @@ async fn semantic_action(
         },
     )
     .await?;
+    match response {
+        BrowserResponse::Action { result } if result.completed_actions == 1 => Ok(()),
+        _ => Err(ReplayActionFailure::StepFailed),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn secret_semantic_action(
+    controller: &BrowserController,
+    coordinator: &BrowserReplayCoordinator,
+    instance: &BrowserReplayInstance,
+    execution: &BrowserReplayExecutionHandle,
+    actor: BrowserInvocationActor,
+    tabs: &ReplayTabState,
+    locator: &BrowserRecipeLocator,
+    input_name: &str,
+) -> Result<(), ReplayActionFailure> {
+    if let Some(projection) = terminal_projection(execution, coordinator, instance)? {
+        return Err(ReplayActionFailure::Terminal(projection));
+    }
+    let lease = execution
+        .secret_lease(input_name)
+        .map_err(|_| ReplayActionFailure::StepFailed)?;
+    let context =
+        BrowserInvocationContext::for_actor(actor, "replay step secret type", BrowserRisk::Normal)
+            .map_err(|_| ReplayActionFailure::StepFailed)?;
+    let response = controller
+        .request_replay_secret_type(
+            BrowserCommand::SecretType {
+                tab_id: tabs.current.clone(),
+                target: action_target(locator),
+                input_name: input_name.to_string(),
+            },
+            context,
+            instance.clone(),
+            lease,
+        )
+        .await;
+    if let Some(projection) = terminal_projection(execution, coordinator, instance)? {
+        return Err(ReplayActionFailure::Terminal(projection));
+    }
+    let response = match response {
+        Ok(response) => response,
+        Err(BrowserError::Interrupted) => {
+            return match coordinator.cancel(instance) {
+                Ok(projection) => Err(ReplayActionFailure::Terminal(projection)),
+                Err(error) => {
+                    match retained_terminal_after_transition_error(coordinator, instance, error) {
+                        Ok(projection) => Err(ReplayActionFailure::Terminal(projection)),
+                        Err(error) => Err(ReplayActionFailure::Replay(error)),
+                    }
+                }
+            };
+        }
+        Err(_) => return Err(ReplayActionFailure::StepFailed),
+    };
     match response {
         BrowserResponse::Action { result } if result.completed_actions == 1 => Ok(()),
         _ => Err(ReplayActionFailure::StepFailed),

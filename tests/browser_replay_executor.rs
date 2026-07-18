@@ -5,11 +5,11 @@ use devmanager::browser::{
     BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
     BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
     BrowserRecipeWait, BrowserReplayCoordinator, BrowserReplayFailureCode, BrowserReplayProjection,
-    BrowserReplayPublicInput, BrowserReplayStatus, BrowserResourceHandle, BrowserResourceId,
-    BrowserResourceKind, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
-    BrowserTabSnapshot, BrowserUploadResult, BrowserViewport, BrowserWaitCondition,
-    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
-    BROWSER_RECIPE_SCHEMA_VERSION,
+    BrowserReplayPublicInput, BrowserReplaySecretPromptVault, BrowserReplayStatus,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResponse,
+    BrowserRevision, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserUploadResult,
+    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey,
+    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
@@ -200,6 +200,62 @@ fn upload_recipe() -> BrowserRecipeV1 {
             wait: None,
             assertions: Vec::new(),
         }],
+    }
+}
+
+fn secret_type_recipe() -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "executor-secret-type".to_string(),
+        name: "Executor secret type".to_string(),
+        description: "Ordinary and private Type routing fixture".to_string(),
+        start_url: "https://example.test/sign-in".to_string(),
+        viewport: BrowserRecipeViewport::default(),
+        inputs: vec![
+            BrowserRecipeInput {
+                name: "display-name".to_string(),
+                kind: BrowserRecipeInputKind::Text,
+                default_value: None,
+            },
+            BrowserRecipeInput {
+                name: "credential".to_string(),
+                kind: BrowserRecipeInputKind::Secret,
+                default_value: None,
+            },
+        ],
+        steps: vec![
+            BrowserRecipeStep {
+                id: "type-display-name".to_string(),
+                action: BrowserRecipeAction::Type {
+                    locator: recipe_locator("display-name"),
+                    value: BrowserRecipeValue::Input {
+                        name: "display-name".to_string(),
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            },
+            BrowserRecipeStep {
+                id: "type-credential".to_string(),
+                action: BrowserRecipeAction::Type {
+                    locator: recipe_locator("credential"),
+                    value: BrowserRecipeValue::Input {
+                        name: "credential".to_string(),
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            },
+        ],
+    }
+}
+
+fn secret_type_action_response(completed_actions: usize) -> BrowserResponse {
+    BrowserResponse::Action {
+        result: BrowserActionResult {
+            completed_actions,
+            revision: BrowserRevision(7),
+        },
     }
 }
 
@@ -732,7 +788,7 @@ async fn cancellation_while_setup_is_awaiting_discards_the_late_response() {
 
 #[test]
 fn cancellation_status_fence_checks_both_sides_of_the_running_projection_read() {
-    let source = include_str!("../src/browser/replay_executor.rs");
+    let source = include_str!("../src/browser/replay_executor.rs").replace("\r\n", "\n");
     let start = source.find("fn terminal_projection(").unwrap();
     let end = source[start..].find("fn resolve_value").unwrap() + start;
     let fence = &source[start..end];
@@ -753,6 +809,228 @@ fn cancellation_status_fence_checks_both_sides_of_the_running_projection_read() 
         cancellation_checks[0] < status && status < cancellation_checks[1],
         "a cancellation racing the status/lease split can return stale Running"
     );
+}
+
+#[tokio::test]
+async fn secret_type_uses_the_private_sidecar_while_text_type_stays_an_ordinary_action() {
+    const SECRET_SENTINEL: &str = "DM_EXECUTOR_SECRET_SENTINEL_74A9";
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .expect("compile secret Type replay");
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(workspace("secret-routing"), plan)
+        .expect("start secret Type replay");
+    assert_eq!(
+        started.projection.status,
+        BrowserReplayStatus::NeedsUserSecret
+    );
+    let instance = started.instance.clone();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        started.projection.unresolved_secret_inputs.clone(),
+    )
+    .expect("install exact secret prompt");
+    prompt
+        .edit(&instance, "credential", SECRET_SENTINEL)
+        .expect("edit exact secret input");
+    let (submission, _) = prompt.submit(&instance).expect("consume secret prompt");
+    coordinator
+        .submit_secrets(&instance, submission)
+        .expect("install replay secrets");
+
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                &root,
+            )
+            .await
+        }
+    });
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+
+    let ordinary = next_request(&mut inbox, "ordinary text Type").await;
+    assert_eq!(
+        ordinary.command(),
+        &BrowserCommand::Act {
+            tab_id: "runtime-setup".to_string(),
+            actions: vec![BrowserAction::Type {
+                target: action_target("display-name"),
+                text: "ordinary user".to_string(),
+            }],
+        }
+    );
+    assert!(matches!(ordinary.validate_secret_sidecar(), Ok(None)));
+    ordinary.respond(Ok(secret_type_action_response(1)));
+
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert_eq!(
+        secret.command(),
+        &BrowserCommand::SecretType {
+            tab_id: "runtime-setup".to_string(),
+            target: action_target("credential"),
+            input_name: "credential".to_string(),
+        }
+    );
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+    let safe_surfaces = format!(
+        "{}\n{:?}\n{:?}\n{:?}",
+        serde_json::to_string(secret.command()).unwrap(),
+        secret.command(),
+        secret.context(),
+        coordinator.status(&instance).unwrap(),
+    );
+    assert!(!safe_surfaces.contains(SECRET_SENTINEL));
+    assert!(!safe_surfaces.contains("ordinary user"));
+    secret.respond(Ok(secret_type_action_response(1)));
+
+    let outcome = run
+        .await
+        .expect("secret executor task")
+        .expect("secret replay projection");
+    assert_eq!(outcome.status, BrowserReplayStatus::Completed);
+    assert_eq!(outcome.current_step_index, 2);
+    assert_no_request(&mut inbox).await;
+}
+
+#[tokio::test]
+async fn secret_type_requires_the_standard_exactly_one_action_response() {
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .unwrap();
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(workspace("secret-response"), plan)
+        .unwrap();
+    let instance = started.instance.clone();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        started.projection.unresolved_secret_inputs.clone(),
+    )
+    .unwrap();
+    prompt
+        .edit(&instance, "credential", "private value")
+        .unwrap();
+    let (submission, _) = prompt.submit(&instance).unwrap();
+    coordinator.submit_secrets(&instance, submission).unwrap();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                &root,
+            )
+            .await
+        }
+    });
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+    next_request(&mut inbox, "ordinary text Type")
+        .await
+        .respond(Ok(secret_type_action_response(1)));
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+    secret.respond(Ok(secret_type_action_response(2)));
+
+    let outcome = run.await.unwrap().unwrap();
+    assert_eq!(outcome.status, BrowserReplayStatus::Failed);
+    assert_eq!(outcome.failure, Some(BrowserReplayFailureCode::StepFailed));
+    assert_eq!(outcome.current_step_index, 1);
+    assert_no_request(&mut inbox).await;
+}
+
+#[tokio::test]
+async fn secret_type_cancellation_closes_the_exact_sidecar_and_fences_the_late_response() {
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .unwrap();
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator.start(workspace("secret-cancel"), plan).unwrap();
+    let instance = started.instance.clone();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        started.projection.unresolved_secret_inputs.clone(),
+    )
+    .unwrap();
+    prompt
+        .edit(&instance, "credential", "private value")
+        .unwrap();
+    let (submission, _) = prompt.submit(&instance).unwrap();
+    coordinator.submit_secrets(&instance, submission).unwrap();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                &root,
+            )
+            .await
+        }
+    });
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+    next_request(&mut inbox, "ordinary text Type")
+        .await
+        .respond(Ok(secret_type_action_response(1)));
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+
+    let cancelled = coordinator
+        .interrupt_workspace(instance.workspace_key())
+        .expect("cancel exact replay during secure host request");
+    assert_eq!(cancelled.status, BrowserReplayStatus::Cancelled);
+    assert!(matches!(
+        secret.validate_secret_sidecar(),
+        Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
+    ));
+    secret.respond(Ok(secret_type_action_response(1)));
+
+    let outcome = run.await.unwrap().unwrap();
+    assert_eq!(outcome.status, BrowserReplayStatus::Cancelled);
+    assert_eq!(outcome.current_step_index, 1);
+    assert_no_request(&mut inbox).await;
 }
 
 #[tokio::test]

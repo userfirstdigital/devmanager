@@ -140,6 +140,12 @@ impl BrowserReplayPlan {
             .iter()
             .find(|binding| binding.name == name)
             .map(|binding| binding.kind)
+            .or_else(|| {
+                self.unresolved_secret_inputs
+                    .iter()
+                    .any(|input_name| input_name == name)
+                    .then_some(BrowserRecipeInputKind::Secret)
+            })
     }
 
     pub fn bound_input_names(&self) -> impl ExactSizeIterator<Item = &str> {
@@ -291,6 +297,10 @@ impl BrowserReplayExecutionHandle {
 
     pub(crate) fn plan(&self) -> &BrowserReplayPlan {
         &self.plan
+    }
+
+    pub(crate) fn close_secret_store(&self) {
+        self.secret_store.close();
     }
 }
 

@@ -11,9 +11,10 @@ use crate::browser::{
     BrowserBounds, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
     BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
     BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
-    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse,
-    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserReplayInstance,
+    BrowserReplaySecretError, BrowserReplaySecretPromptEvent, BrowserReplaySecretPromptVault,
+    BrowserReplaySecretSubmission, BrowserResponse, BrowserSettingsAction, BrowserWebViewHost,
+    BrowserWorkflowReviewEditor, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -188,7 +189,10 @@ struct NativeShell {
     browser_tasks_started: bool,
     browser_ui: HashMap<BrowserWorkspaceKey, BrowserWorkspaceUiState>,
     browser_workflow_route: Option<BrowserWorkspaceKey>,
+    browser_replay_secret_prompt: Option<BrowserReplaySecretPromptVault>,
+    browser_replay_secret_submitter: Option<BrowserReplaySecretSubmitter>,
     browser_address_focus: FocusHandle,
+    browser_replay_secret_focus: FocusHandle,
     browser_annotation_focus: FocusHandle,
     browser_workflow_focus: FocusHandle,
     browser_split_bounds: Option<BrowserBounds>,
@@ -248,6 +252,9 @@ struct NativeShell {
     pending_install_update: Option<String>,
     window_subscriptions: Vec<Subscription>,
 }
+
+type BrowserReplaySecretSubmitter =
+    Box<dyn FnOnce(BrowserReplaySecretSubmission) -> Result<(), BrowserReplaySecretError> + Send>;
 
 struct NativeDialogPauseGuard {
     blockers: Arc<AtomicUsize>,
@@ -1147,7 +1154,10 @@ impl NativeShell {
             browser_tasks_started: false,
             browser_ui: HashMap::new(),
             browser_workflow_route: None,
+            browser_replay_secret_prompt: None,
+            browser_replay_secret_submitter: None,
             browser_address_focus: cx.focus_handle(),
+            browser_replay_secret_focus: cx.focus_handle(),
             browser_annotation_focus: cx.focus_handle(),
             browser_workflow_focus: cx.focus_handle(),
             browser_split_bounds: None,
@@ -1739,6 +1749,163 @@ impl NativeShell {
         }
     }
 
+    #[allow(dead_code)] // Installed by the replay launch boundary once workflow replay is surfaced.
+    fn install_browser_replay_secret_prompt(
+        &mut self,
+        instance: BrowserReplayInstance,
+        input_names: Vec<String>,
+        submitter: BrowserReplaySecretSubmitter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        if let Some(previous) = self.browser_replay_secret_prompt.take() {
+            let previous_instance = previous.instance().clone();
+            let _ = previous.replay_replaced(&previous_instance);
+        }
+        self.browser_replay_secret_submitter = None;
+        let (vault, event) = BrowserReplaySecretPromptVault::install(instance, input_names)?;
+        self.browser_replay_secret_prompt = Some(vault);
+        self.browser_replay_secret_submitter = Some(submitter);
+        window.focus(&self.browser_replay_secret_focus);
+        cx.notify();
+        Ok(event)
+    }
+
+    fn focus_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        input_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let vault = self
+            .browser_replay_secret_prompt
+            .as_mut()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let event = vault.focus(&instance, input_name)?;
+        window.focus(&self.browser_replay_secret_focus);
+        cx.notify();
+        Ok(event)
+    }
+
+    fn edit_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        input_name: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let vault = self
+            .browser_replay_secret_prompt
+            .as_mut()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let event = vault.edit(&instance, input_name, text)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn backspace_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        input_name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let vault = self
+            .browser_replay_secret_prompt
+            .as_mut()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let event = vault.backspace(&instance, input_name)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn submit_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let exact = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        if exact.projection().is_set.iter().any(|is_set| !is_set) {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        let vault = self
+            .browser_replay_secret_prompt
+            .take()
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let (submission, event) = vault.submit(&instance)?;
+        let submitter = self
+            .browser_replay_secret_submitter
+            .take()
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        submitter(submission)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn cancel_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let exact = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = exact.instance().clone();
+        let vault = self
+            .browser_replay_secret_prompt
+            .take()
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        self.browser_replay_secret_submitter = None;
+        let event = vault.cancel(&instance)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn close_browser_replay_secret_prompt_for_route(
+        &mut self,
+        route: Option<&BrowserWorkspaceKey>,
+    ) -> Option<BrowserReplaySecretPromptEvent> {
+        let close = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| route != Some(vault.workspace_key()));
+        if !close {
+            return None;
+        }
+        let vault = self.browser_replay_secret_prompt.take()?;
+        let instance = vault.instance().clone();
+        self.browser_replay_secret_submitter = None;
+        vault.route_switch(&instance).ok()
+    }
+
     fn sync_browser_host_visibility(&mut self, window: Option<&Window>) {
         let workflow_route = if self.remote_mode.is_none()
             && self.state.settings().browser_enabled
@@ -1752,6 +1919,7 @@ impl NativeShell {
         } else {
             None
         };
+        self.close_browser_replay_secret_prompt_for_route(workflow_route.as_ref());
         if self.browser_workflow_route != workflow_route {
             if let Some(previous) = self.browser_workflow_route.take() {
                 self.browser_host.discard_workflow_state(&previous);
@@ -1784,6 +1952,13 @@ impl NativeShell {
             self.browser_host.page_recording_status(workspace_key)
                 == crate::browser::BrowserRecordingStatus::Review
         }) {
+            active_workspace = None;
+        }
+        if self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| Some(vault.workspace_key()) == active_workspace.as_ref())
+        {
             active_workspace = None;
         }
         if let Some(snapshot) = plan.and_then(|plan| plan.ensure_snapshot) {
@@ -1843,6 +2018,11 @@ impl NativeShell {
         } else {
             None
         };
+        let replay_secret_prompt = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .filter(|vault| vault.workspace_key() == &workspace_key)
+            .map(BrowserReplaySecretPromptVault::projection);
         Some(BrowserPaneModel::new(
             workspace_key,
             &self.browser_pane_context(),
@@ -1863,6 +2043,7 @@ impl NativeShell {
                 workflow_review,
                 workflow_preview: ui.workflow_preview,
                 workflow_editor: ui.workflow_editor,
+                replay_secret_prompt,
             },
         ))
     }
@@ -2171,7 +2352,92 @@ impl NativeShell {
             }
         };
 
+        if self.browser_replay_secret_prompt.is_some()
+            && matches!(
+                &action,
+                BrowserPaneAction::Collapse
+                    | BrowserPaneAction::CreateTab
+                    | BrowserPaneAction::SelectTab(_)
+                    | BrowserPaneAction::CloseTab(_)
+                    | BrowserPaneAction::Back
+                    | BrowserPaneAction::Forward
+                    | BrowserPaneAction::Reload
+                    | BrowserPaneAction::FocusAddress
+                    | BrowserPaneAction::SubmitAddress
+                    | BrowserPaneAction::ToggleAnnotation
+                    | BrowserPaneAction::StartRecording
+                    | BrowserPaneAction::Stop
+                    | BrowserPaneAction::ResetWorkspace
+                    | BrowserPaneAction::ClearProjectProfile
+            )
+        {
+            self.close_browser_replay_secret_prompt_for_route(None);
+        }
+
         match action {
+            BrowserPaneAction::FocusReplaySecret {
+                workspace_key: action_workspace,
+                instance_id,
+                input_name,
+            } => {
+                let result = if action_workspace == workspace_key {
+                    self.focus_browser_replay_secret_prompt(
+                        &action_workspace,
+                        instance_id,
+                        &input_name,
+                        window,
+                        cx,
+                    )
+                } else {
+                    Err(BrowserReplaySecretError::StaleAuthority)
+                };
+                if let Err(error) = result {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                        Some(error.to_string());
+                    cx.notify();
+                }
+                return;
+            }
+            BrowserPaneAction::SubmitReplaySecrets {
+                workspace_key: action_workspace,
+                instance_id,
+            } => {
+                let result = if action_workspace == workspace_key {
+                    self.submit_browser_replay_secret_prompt(&action_workspace, instance_id, cx)
+                } else {
+                    Err(BrowserReplaySecretError::StaleAuthority)
+                };
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Submitted replay secrets".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::CancelReplaySecrets {
+                workspace_key: action_workspace,
+                instance_id,
+            } => {
+                let result = if action_workspace == workspace_key {
+                    self.cancel_browser_replay_secret_prompt(&action_workspace, instance_id, cx)
+                } else {
+                    Err(BrowserReplaySecretError::StaleAuthority)
+                };
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Cancelled replay secret prompt".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                cx.notify();
+                return;
+            }
             BrowserPaneAction::DividerBegin { .. } => {
                 self.browser_divider_drag = Some(BrowserDividerDrag { workspace_key });
                 self.sync_browser_host_visibility(Some(window));
@@ -2645,6 +2911,94 @@ impl NativeShell {
         }
         self.sync_browser_host_visibility(Some(window));
         cx.notify();
+    }
+
+    fn handle_browser_replay_secret_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(projection) = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .map(BrowserReplaySecretPromptVault::projection)
+        else {
+            return;
+        };
+        let workspace_key = projection.workspace_key;
+        let instance_id = projection.instance_id;
+        let Some(input_name) = projection.focused_input else {
+            window.prevent_default();
+            return;
+        };
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let result = match key.as_str() {
+            "escape" => self.cancel_browser_replay_secret_prompt(&workspace_key, instance_id, cx),
+            "enter" => self.submit_browser_replay_secret_prompt(&workspace_key, instance_id, cx),
+            "backspace" => self.backspace_browser_replay_secret_prompt(
+                &workspace_key,
+                instance_id,
+                &input_name,
+                cx,
+            ),
+            "tab" => {
+                let current = projection
+                    .input_names
+                    .iter()
+                    .position(|name| name == &input_name)
+                    .unwrap_or_default();
+                let next = if event.keystroke.modifiers.shift {
+                    current
+                        .checked_sub(1)
+                        .unwrap_or_else(|| projection.input_names.len().saturating_sub(1))
+                } else {
+                    (current + 1) % projection.input_names.len()
+                };
+                self.focus_browser_replay_secret_prompt(
+                    &workspace_key,
+                    instance_id,
+                    &projection.input_names[next],
+                    window,
+                    cx,
+                )
+            }
+            _ if event.keystroke.modifiers.control
+                || event.keystroke.modifiers.platform
+                || event.keystroke.modifiers.alt =>
+            {
+                Ok(BrowserReplaySecretPromptEvent {
+                    workspace_key: workspace_key.clone(),
+                    instance_id,
+                    operation: crate::browser::BrowserReplaySecretPromptOperation::Focused,
+                    input_name: Some(input_name.clone()),
+                    focused_input: Some(input_name.clone()),
+                    is_set: None,
+                })
+            }
+            _ => match event.keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => self.edit_browser_replay_secret_prompt(
+                    &workspace_key,
+                    instance_id,
+                    &input_name,
+                    text,
+                    cx,
+                ),
+                _ => Ok(BrowserReplaySecretPromptEvent {
+                    workspace_key: workspace_key.clone(),
+                    instance_id,
+                    operation: crate::browser::BrowserReplaySecretPromptOperation::Focused,
+                    input_name: Some(input_name.clone()),
+                    focused_input: Some(input_name),
+                    is_set: None,
+                }),
+            },
+        };
+        if let Err(error) = result {
+            self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(error.to_string());
+            cx.notify();
+        }
+        window.prevent_default();
     }
 
     fn handle_browser_address_key(
@@ -5857,6 +6211,7 @@ impl NativeShell {
     }
 
     fn handle_window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.close_browser_replay_secret_prompt_for_route(None);
         self.sync_terminal_focus(None);
         self.capture_window_bounds(window);
 
@@ -6254,6 +6609,7 @@ impl NativeShell {
     }
 
     fn open_editor(&mut self, panel: EditorPanel, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         self.editor_panel = Some(panel);
         self.editor_active_field = None;
         self.editor_cursor = 0;
@@ -6557,11 +6913,13 @@ impl NativeShell {
     }
 
     fn open_add_project_action(&mut self, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         self.add_project_wizard = Some(workspace::AddProjectWizard::default());
         cx.notify();
     }
 
     fn open_process_monitor_action(&mut self, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         self.process_monitor = Some(process_monitor::ProcessMonitorState::default());
         self.process_monitor_revision = self.process_manager.runtime_revision();
         cx.notify();
@@ -9033,6 +9391,10 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_replay_secret_prompt.is_some() {
+            window.prevent_default();
+            return;
+        }
         if self.handle_wizard_key(event, window, cx) {
             return;
         }
@@ -11047,6 +11409,7 @@ impl NativeShell {
     }
 
     fn select_server_tab_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         if self.remote_mode.is_some() {
             let lookup = self.state.find_command(command_id).map(|lookup| {
                 (
@@ -11136,6 +11499,7 @@ impl NativeShell {
     }
 
     fn select_ai_tab_action(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         if self.remote_mode.is_some() {
             if let Some(tab) = self.state.find_ai_tab(tab_id).cloned() {
                 self.state.select_tab(tab_id);
@@ -11210,6 +11574,7 @@ impl NativeShell {
     }
 
     fn restart_ai_tab_action(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -11244,6 +11609,7 @@ impl NativeShell {
     }
 
     fn close_ai_tab_action(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -11270,6 +11636,7 @@ impl NativeShell {
     }
 
     fn open_ssh_tab_action(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         if self.remote_mode.is_some() {
             if let Some(tab) = self
                 .state
@@ -11906,6 +12273,10 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_replay_secret_prompt.is_some() {
+            window.prevent_default();
+            return;
+        }
         if self.handle_wizard_key(event, window, cx) {
             return;
         }
@@ -13489,6 +13860,9 @@ impl Render for NativeShell {
                                 on_address_key: Box::new(
                                     cx.listener(Self::handle_browser_address_key),
                                 ),
+                                on_replay_secret_key: Box::new(
+                                    cx.listener(Self::handle_browser_replay_secret_key),
+                                ),
                                 on_annotation_key: Box::new(
                                     cx.listener(Self::handle_browser_annotation_key),
                                 ),
@@ -13601,6 +13975,7 @@ impl Render for NativeShell {
                                         .child(render_browser_pane(
                                             browser,
                                             self.browser_address_focus.clone(),
+                                            self.browser_replay_secret_focus.clone(),
                                             self.browser_annotation_focus.clone(),
                                             self.browser_workflow_focus.clone(),
                                             browser_actions,
