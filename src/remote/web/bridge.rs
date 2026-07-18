@@ -54,7 +54,7 @@ use super::wire::{
     WsOutbound,
 };
 use super::{authenticate_request, record_browser_connection, request_is_same_origin, WebState};
-use crate::ai::codex_bridge::canonical_codex_composer_prompt;
+use crate::ai::codex_cli::canonical_codex_composer_prompt;
 use crate::state::{SessionDimensions, SessionKind};
 
 /// Frame type byte prefixed to binary WS frames carrying terminal output.

@@ -1,5 +1,5 @@
 use devmanager::ai::claude_hooks::ClaudeShellKind;
-use devmanager::ai::codex_bridge::CodexConfigOverride;
+use devmanager::ai::codex_cli::CodexConfigOverride;
 use devmanager::browser::{
     codex_browser_config_overrides, prepare_claude_browser_overlay, BrowserProviderAccess,
     DEVMANAGER_BROWSER_TOKEN_ENV,

@@ -1,7 +1,7 @@
 use crate::ai::claude_hooks::{
     append_claude_cli_arguments, is_safe_cmd_settings_root, ClaudeShellKind,
 };
-use crate::ai::codex_bridge::CodexConfigOverride;
+use crate::ai::codex_cli::CodexConfigOverride;
 use axum::http::Uri;
 use serde_json::json;
 use std::collections::HashMap;

@@ -62,13 +62,14 @@ pub struct CodexHookReduction {
 }
 
 fn should_advance_tool_state(current: SemanticToolState, requested: SemanticToolState) -> bool {
-    match (current, requested) {
-        (SemanticToolState::Pending, _) => true,
-        (SemanticToolState::Running, SemanticToolState::Completed | SemanticToolState::Failed) => {
-            true
-        }
-        _ => false,
-    }
+    matches!(
+        (current, requested),
+        (SemanticToolState::Pending, _)
+            | (
+                SemanticToolState::Running,
+                SemanticToolState::Completed | SemanticToolState::Failed,
+            )
+    )
 }
 
 /// Tolerant projection of Codex hook stdin payloads. Codex remains the schema
@@ -610,15 +611,15 @@ pub fn toml_basic_string(value: &str) -> String {
 /// configured command verbatim and report the adapter Degraded — an older
 /// Codex would hard-fail on the unknown flag if we injected it anyway.
 pub fn codex_supports_hooks(startup_command: &str) -> Result<(), String> {
-    let tokens = crate::ai::codex_bridge::split_command_line(startup_command)?;
+    let tokens = crate::ai::codex_cli::split_command_line(startup_command)?;
     let Some(first) = tokens.first() else {
         return Err("Codex command is empty".to_string());
     };
-    let executable = crate::ai::codex_bridge::resolve_executable(first)?;
+    let executable = crate::ai::codex_cli::resolve_executable(first)?;
     let mut probe_args = tokens[1..].to_vec();
     probe_args.push("--help".to_string());
-    let help = crate::ai::codex_bridge::run_probe(&executable, &probe_args)?;
-    if !crate::ai::codex_bridge::help_advertises_flag(&help, CODEX_HOOK_TRUST_FLAG) {
+    let help = crate::ai::codex_cli::run_probe(&executable, &probe_args)?;
+    if !crate::ai::codex_cli::help_advertises_flag(&help, CODEX_HOOK_TRUST_FLAG) {
         return Err(format!(
             "Codex does not advertise the required {CODEX_HOOK_TRUST_FLAG} capability"
         ));
@@ -635,7 +636,7 @@ pub fn build_codex_hooks_command(
     devmanager_executable: &std::path::Path,
     endpoint: &str,
     nonce: &str,
-    config: &[crate::ai::codex_bridge::CodexConfigOverride],
+    config: &[crate::ai::codex_cli::CodexConfigOverride],
 ) -> Result<String, String> {
     if !is_valid_loopback_relay_url_for(endpoint, CODEX_HOOK_RELAY_PATH) {
         return Err("Codex hook relay endpoint is not an exact loopback URL".to_string());
@@ -643,7 +644,7 @@ pub fn build_codex_hooks_command(
     if nonce.is_empty() || !nonce.chars().all(|character| character.is_ascii_hexdigit()) {
         return Err("Codex hook relay nonce must be non-empty hex".to_string());
     }
-    let mut tokens = crate::ai::codex_bridge::split_command_line(startup_command)?;
+    let mut tokens = crate::ai::codex_cli::split_command_line(startup_command)?;
     if tokens.is_empty() {
         return Err("Codex command is empty".to_string());
     }
@@ -666,7 +667,7 @@ pub fn build_codex_hooks_command(
         tokens.push(override_value);
     }
     tokens.push(CODEX_HOOK_TRUST_FLAG.to_string());
-    Ok(crate::ai::codex_bridge::quote_command_for_shell(
+    Ok(crate::ai::codex_cli::quote_command_for_shell(
         &tokens,
         shell_program,
     ))
