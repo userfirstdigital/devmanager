@@ -208,6 +208,8 @@ pub enum BrowserError {
         byte_size: u64,
         limit: u64,
     },
+    ResourceRootBusy,
+    ResourceRootUnavailable,
     OutsideWorkspace {
         path: PathBuf,
     },
@@ -289,6 +291,10 @@ impl fmt::Display for BrowserError {
                 formatter,
                 "browser resource size {byte_size} exceeds limit {limit}"
             ),
+            Self::ResourceRootBusy => formatter.write_str("browser resource root is busy"),
+            Self::ResourceRootUnavailable => {
+                formatter.write_str("browser resource root is unavailable")
+            }
             Self::OutsideWorkspace { path } => write!(
                 formatter,
                 "browser file is outside the project workspace: {}",

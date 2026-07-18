@@ -1181,6 +1181,8 @@ impl From<BrowserError> for ToolFailure {
             BrowserError::MissingFile { .. } => "missing_file",
             BrowserError::MissingResource { .. } => "missing_resource",
             BrowserError::ResourceTooLarge { .. } => "resource_too_large",
+            BrowserError::ResourceRootBusy => "resource_root_busy",
+            BrowserError::ResourceRootUnavailable => "resource_root_unavailable",
             BrowserError::OutsideWorkspace { .. } => "outside_workspace_file",
             BrowserError::InvalidRecipe { .. } | BrowserError::UnsupportedRecipeVersion { .. } => {
                 "invalid_recipe"

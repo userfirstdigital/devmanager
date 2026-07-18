@@ -157,6 +157,7 @@ fn recording_status_and_review_resource_use_one_exact_coordinator_and_value_safe
         }
     }
 
+    drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -294,13 +295,18 @@ fn recording_save_escalates_overwrite_and_only_retires_after_atomic_success() {
 #[test]
 fn recording_review_resource_failure_is_fixed_path_free_and_retains_review() {
     let root = temporary_root("recording-resource-path-sentinel");
-    let store = BrowserResourceStore::open(&root, BrowserResourceLimits::default()).unwrap();
+    let store = BrowserResourceStore::open(
+        &root,
+        BrowserResourceLimits {
+            max_resource_bytes: 0,
+            ..BrowserResourceLimits::default()
+        },
+    )
+    .unwrap();
     let owner = workspace("project-a", "conversation-a");
     let coordinator = BrowserWorkflowCoordinator::default();
     let instance_id = reviewed_navigation(&coordinator, &owner, "https://example.test/review");
 
-    std::fs::remove_dir_all(store.root()).unwrap();
-    std::fs::write(store.root(), b"force resource persistence failure").unwrap();
     let error = browser_recording_review_result(
         &coordinator,
         &owner,
@@ -324,5 +330,6 @@ fn recording_review_resource_failure_is_fixed_path_free_and_retains_review() {
     );
     assert_eq!(coordinator.status(&owner), BrowserRecordingStatus::Review);
 
-    std::fs::remove_file(root).unwrap();
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -3678,7 +3678,7 @@ fn verified_resource_store_rejects_an_intermediate_resources_reparse() {
 }
 
 #[test]
-fn verified_resource_store_revalidates_after_open_before_each_write() {
+fn verified_resource_store_root_lock_blocks_post_open_swap_and_store_remains_usable() {
     let temp = TestDir::new("resource-root-swap");
     let trusted = temp.path().join("trusted-config");
     let outside = temp.path().join("outside-resources");
@@ -3689,22 +3689,20 @@ fn verified_resource_store_revalidates_after_open_before_each_write() {
     )
     .unwrap();
     let resources = trusted.join("browser").join("resources");
-    std::fs::remove_dir_all(&resources).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    create_directory_redirect(&outside, &resources).expect("swap resource root for redirect");
-
-    assert!(matches!(
-        store.put(
+    assert!(std::fs::remove_dir_all(&resources).is_err());
+    assert!(resources.is_dir());
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(store
+        .put(
             &workspace("project-a", "conversation-a"),
             BrowserResourceKind::ConsoleLog,
             "text/plain",
-            b"must stay inside",
+            b"stays inside",
             false,
-        ),
-        Err(BrowserError::OutsideWorkspace { .. })
-    ));
+        )
+        .is_ok());
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-    remove_directory_redirect(&resources);
 }
 
 #[test]
@@ -4041,6 +4039,7 @@ fn annotation_details_failure_restores_pin_and_forged_same_owner_resources_are_m
         assert!(state.workspace(&key).unwrap().annotation(id).is_ok());
     }
 
+    drop(store);
     let failing_store = BrowserResourceStore::open(
         temp.path(),
         BrowserResourceLimits {
@@ -4054,7 +4053,7 @@ fn annotation_details_failure_restores_pin_and_forged_same_owner_resources_are_m
         state.annotation_details(&key, "ann-valid", &failing_store),
         Err(BrowserError::ResourceTooLarge { .. })
     ));
-    assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
+    assert!(!failing_store.handle(&key, &screenshot.id).unwrap().pinned);
     assert!(state.workspace(&key).unwrap().journal_entries.is_empty());
 }
 

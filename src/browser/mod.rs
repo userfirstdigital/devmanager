@@ -18,6 +18,9 @@ mod recording_ipc;
 mod recording_mcp;
 mod replay;
 mod replay_executor;
+// Task 2's domain slice will consume this private authority seam and remove the allowance.
+#[cfg_attr(not(test), allow(dead_code))]
+mod replay_repair;
 mod replay_secrets;
 mod resources;
 mod storage;

@@ -1923,12 +1923,12 @@ async fn browser_recording_resource_failure_is_typed_path_free_and_retains_revie
     coordinator.stop(&instance).unwrap();
 
     let resource_root = unique_gateway_config_dir("recording-resource-path-sentinel");
-    let resources =
-        BrowserResourceStore::open(&resource_root, BrowserResourceLimits::default()).unwrap();
-    std::fs::remove_dir_all(resources.root()).unwrap();
-    std::fs::write(
-        resources.root(),
-        b"recording-resource-underlying-error-detail-sentinel",
+    let resources = BrowserResourceStore::open(
+        &resource_root,
+        BrowserResourceLimits {
+            max_resource_bytes: 0,
+            ..BrowserResourceLimits::default()
+        },
     )
     .unwrap();
 
@@ -2014,7 +2014,9 @@ async fn browser_recording_resource_failure_is_typed_path_free_and_retains_revie
         coordinator.current_instance(&owner).unwrap().id(),
         instance.id()
     );
-    std::fs::remove_file(resource_root).unwrap();
+    assert!(resource_root.is_dir());
+    drop(resources);
+    std::fs::remove_dir_all(resource_root).unwrap();
     std::fs::remove_dir_all(project_root).unwrap();
 }
 
