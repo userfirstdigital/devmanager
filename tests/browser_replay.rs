@@ -4,7 +4,8 @@ use devmanager::browser::{
     BrowserRecipeViewport, BrowserReplayCancellationLease, BrowserReplayCoordinator,
     BrowserReplayError, BrowserReplayExecutionHandle, BrowserReplayFailureCode, BrowserReplayPlan,
     BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplayStatus, BrowserWorkspaceKey,
-    BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
+    BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_TEXT_BYTES,
+    MAX_BROWSER_REPLAY_URL_BYTES,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -105,6 +106,35 @@ fn replay_recipe() -> BrowserRecipeV1 {
                 assertions: Vec::new(),
             },
         ],
+    }
+}
+
+fn replay_recipe_with_secret_count(secret_count: usize) -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: format!("secret-capacity-{secret_count}"),
+        name: "Secret capacity fixture".to_string(),
+        description: "Public compiled-recipe boundary fixture".to_string(),
+        start_url: "https://example.test/start".to_string(),
+        viewport: BrowserRecipeViewport::default(),
+        inputs: (0..secret_count)
+            .map(|index| BrowserRecipeInput {
+                name: format!("secret_{index}"),
+                kind: BrowserRecipeInputKind::Secret,
+                default_value: None,
+            })
+            .collect(),
+        steps: vec![BrowserRecipeStep {
+            id: "type-secret".to_string(),
+            action: BrowserRecipeAction::Type {
+                locator: locator("password"),
+                value: BrowserRecipeValue::Input {
+                    name: "secret_0".to_string(),
+                },
+            },
+            wait: None,
+            assertions: Vec::new(),
+        }],
     }
 }
 
@@ -445,6 +475,35 @@ fn replay_compiler_rejects_every_public_secret_submission_without_echoing_values
         assert!(!format!("{error:?}").contains(secret));
         assert!(!error.to_string().contains(secret));
     }
+}
+
+#[test]
+fn replay_compiler_rejects_secret_input_count_above_store_capacity_before_start() {
+    let accepted = compile_browser_replay(
+        &replay_recipe_with_secret_count(MAX_BROWSER_REPLAY_SECRET_INPUTS),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        accepted.unresolved_secret_input_names().len(),
+        MAX_BROWSER_REPLAY_SECRET_INPUTS
+    );
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(workspace("secret-capacity", "accepted"), accepted)
+        .unwrap();
+    assert_eq!(
+        started.projection.status,
+        BrowserReplayStatus::NeedsUserSecret
+    );
+
+    assert_eq!(
+        compile_error(compile_browser_replay(
+            &replay_recipe_with_secret_count(MAX_BROWSER_REPLAY_SECRET_INPUTS + 1),
+            Vec::new(),
+        )),
+        BrowserReplayError::CapacityExceeded
+    );
 }
 
 #[test]

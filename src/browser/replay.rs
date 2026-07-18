@@ -2,6 +2,7 @@ use super::{
     BrowserRecipeAction, BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1,
     BrowserRecipeValue, BrowserRecipeViewport, BrowserReplaySecretError, BrowserReplaySecretLease,
     BrowserReplaySecretStore, BrowserReplaySecretSubmission, BrowserWorkspaceKey,
+    MAX_BROWSER_REPLAY_SECRET_INPUTS,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -699,6 +700,12 @@ pub fn compile_browser_replay(
     if recipe.inputs.len() > MAX_BROWSER_REPLAY_INPUTS
         || public_inputs.len() > MAX_BROWSER_REPLAY_INPUTS
         || recipe.steps.len() > MAX_BROWSER_REPLAY_STEPS
+        || recipe
+            .inputs
+            .iter()
+            .filter(|input| input.kind == BrowserRecipeInputKind::Secret)
+            .count()
+            > MAX_BROWSER_REPLAY_SECRET_INPUTS
     {
         return Err(BrowserReplayError::CapacityExceeded);
     }
