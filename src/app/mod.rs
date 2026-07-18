@@ -6380,6 +6380,7 @@ impl NativeShell {
                 browser_enabled: settings.browser_enabled,
                 browser_available: browser_status.available,
                 browser_diagnostic: browser_status.diagnostic,
+                pwsh_available: crate::services::pwsh_probe::pwsh_program().is_some(),
                 remote_host_enabled: self.remote_machine_state.host.enabled,
                 remote_bind_address: self.remote_machine_state.host.bind_address.clone(),
                 remote_port: self.remote_machine_state.host.port.to_string(),
@@ -8507,8 +8508,10 @@ impl NativeShell {
             EditorAction::OpenUiPreview => self.open_ui_preview_action(cx),
             EditorAction::CycleDefaultTerminal => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
-                    draft.default_terminal =
-                        workspace::next_default_terminal(draft.default_terminal.clone());
+                    draft.default_terminal = workspace::next_default_terminal_with_availability(
+                        draft.default_terminal.clone(),
+                        draft.pwsh_available,
+                    );
                     self.apply_settings_draft(cx);
                 }
             }
@@ -8540,6 +8543,11 @@ impl NativeShell {
             }
             EditorAction::SelectDefaultTerminal(terminal) => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+                    // The picker renders unavailable options disabled; guard here
+                    // as well so a stale click can never select a missing shell.
+                    if terminal == crate::models::DefaultTerminal::Pwsh && !draft.pwsh_available {
+                        return;
+                    }
                     draft.default_terminal = terminal;
                     draft.open_picker = None;
                     self.apply_settings_draft(cx);

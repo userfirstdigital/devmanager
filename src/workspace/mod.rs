@@ -1214,6 +1214,7 @@ pub struct SettingsDraft {
     pub browser_enabled: bool,
     pub browser_available: bool,
     pub browser_diagnostic: Option<String>,
+    pub pwsh_available: bool,
     pub remote_host_enabled: bool,
     pub remote_bind_address: String,
     pub remote_port: String,
@@ -1591,12 +1592,20 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions) ->
         .into_any_element()
 }
 
-pub fn next_default_terminal(current: DefaultTerminal) -> DefaultTerminal {
-    match current {
+pub fn next_default_terminal_with_availability(
+    current: DefaultTerminal,
+    pwsh_available: bool,
+) -> DefaultTerminal {
+    let next = match current {
         DefaultTerminal::Bash => DefaultTerminal::Powershell,
         DefaultTerminal::Powershell => DefaultTerminal::Pwsh,
         DefaultTerminal::Pwsh => DefaultTerminal::Cmd,
         DefaultTerminal::Cmd => DefaultTerminal::Bash,
+    };
+    if next == DefaultTerminal::Pwsh && !pwsh_available {
+        DefaultTerminal::Cmd
+    } else {
+        next
     }
 }
 
@@ -1757,16 +1766,25 @@ fn render_settings_panel(
         [
             DefaultTerminal::Bash,
             DefaultTerminal::Powershell,
+            DefaultTerminal::Pwsh,
             DefaultTerminal::Cmd,
         ]
         .into_iter()
         .map(|terminal| {
-            render_settings_dropdown_option(
-                default_terminal_label(&terminal).to_string(),
-                draft.default_terminal == terminal,
-                (actions.on_action)(EditorAction::SelectDefaultTerminal(terminal)),
-            )
-            .into_any_element()
+            if terminal == DefaultTerminal::Pwsh && !draft.pwsh_available {
+                render_settings_dropdown_option_disabled(
+                    default_terminal_label(&terminal).to_string(),
+                    "PowerShell 7 is not installed".to_string(),
+                )
+                .into_any_element()
+            } else {
+                render_settings_dropdown_option(
+                    default_terminal_label(&terminal).to_string(),
+                    draft.default_terminal == terminal,
+                    (actions.on_action)(EditorAction::SelectDefaultTerminal(terminal)),
+                )
+                .into_any_element()
+            }
         })
         .collect()
     };
@@ -3161,6 +3179,33 @@ fn render_settings_dropdown_option(
         )
 }
 
+fn render_settings_dropdown_option_disabled(label: String, warning: String) -> impl IntoElement {
+    div()
+        .px(px(10.0))
+        .py(px(5.0))
+        .rounded_sm()
+        .bg(rgb(theme::PANEL_HEADER_BG))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SUBTLE))
+                        .child(SharedString::from(warning)),
+                ),
+        )
+}
+
 fn render_settings_font_size_row(
     draft: &SettingsDraft,
     actions: &EditorActions,
@@ -3868,6 +3913,7 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         browser_enabled: true,
         browser_available: true,
         browser_diagnostic: None,
+        pwsh_available: true,
         remote_host_enabled: false,
         remote_bind_address: "0.0.0.0".to_string(),
         remote_port: "43871".to_string(),
@@ -4077,6 +4123,34 @@ fn format_saved_host_hint(host: &KnownRemoteHost) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_includes_pwsh_when_available() {
+        assert_eq!(
+            next_default_terminal_with_availability(DefaultTerminal::Powershell, true),
+            DefaultTerminal::Pwsh
+        );
+        assert_eq!(
+            next_default_terminal_with_availability(DefaultTerminal::Pwsh, true),
+            DefaultTerminal::Cmd
+        );
+    }
+
+    #[test]
+    fn cycle_skips_pwsh_when_unavailable() {
+        assert_eq!(
+            next_default_terminal_with_availability(DefaultTerminal::Powershell, false),
+            DefaultTerminal::Cmd
+        );
+    }
+
+    #[test]
+    fn pwsh_label() {
+        assert_eq!(
+            default_terminal_label(&DefaultTerminal::Pwsh),
+            "PowerShell 7 (pwsh)"
+        );
+    }
 
     #[test]
     fn remote_preview_story_uses_connect_and_host_states() {
