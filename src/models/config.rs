@@ -91,6 +91,7 @@ pub struct SSHConnection {
 pub enum DefaultTerminal {
     Bash,
     Powershell,
+    Pwsh,
     Cmd,
 }
 
@@ -342,4 +343,29 @@ pub struct EnvEntry {
     pub key: Option<String>,
     pub value: Option<String>,
     pub raw: String,
+}
+
+#[cfg(test)]
+mod default_terminal_tests {
+    use super::DefaultTerminal;
+
+    #[test]
+    fn pwsh_round_trips_as_lowercase() {
+        let json = serde_json::to_string(&DefaultTerminal::Pwsh).unwrap();
+        assert_eq!(json, "\"pwsh\"");
+        let back: DefaultTerminal = serde_json::from_str("\"pwsh\"").unwrap();
+        assert_eq!(back, DefaultTerminal::Pwsh);
+    }
+
+    #[test]
+    fn legacy_values_still_deserialize() {
+        for (raw, expected) in [
+            ("\"bash\"", DefaultTerminal::Bash),
+            ("\"powershell\"", DefaultTerminal::Powershell),
+            ("\"cmd\"", DefaultTerminal::Cmd),
+        ] {
+            let parsed: DefaultTerminal = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
 }

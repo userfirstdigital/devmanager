@@ -1095,7 +1095,7 @@ fn shell_candidates(
                     args: vec!["-NoLogo".to_string()],
                 },
             ],
-            DefaultTerminal::Powershell => vec![
+            DefaultTerminal::Powershell | DefaultTerminal::Pwsh => vec![
                 ShellCandidate {
                     program: "pwsh".to_string(),
                     args: vec!["-NoLogo".to_string()],

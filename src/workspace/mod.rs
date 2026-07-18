@@ -1594,7 +1594,8 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions) ->
 pub fn next_default_terminal(current: DefaultTerminal) -> DefaultTerminal {
     match current {
         DefaultTerminal::Bash => DefaultTerminal::Powershell,
-        DefaultTerminal::Powershell => DefaultTerminal::Cmd,
+        DefaultTerminal::Powershell => DefaultTerminal::Pwsh,
+        DefaultTerminal::Pwsh => DefaultTerminal::Cmd,
         DefaultTerminal::Cmd => DefaultTerminal::Bash,
     }
 }
@@ -1603,6 +1604,7 @@ pub fn default_terminal_label(value: &DefaultTerminal) -> &'static str {
     match value {
         DefaultTerminal::Bash => "Bash (Git Bash)",
         DefaultTerminal::Powershell => "PowerShell",
+        DefaultTerminal::Pwsh => "PowerShell 7 (pwsh)",
         DefaultTerminal::Cmd => "CMD",
     }
 }

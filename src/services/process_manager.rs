@@ -4536,6 +4536,8 @@ fn build_interactive_shell_command(settings: &Settings) -> (String, Vec<String>)
             crate::models::DefaultTerminal::Powershell => {
                 ("powershell.exe".to_string(), Vec::new())
             }
+            // Temporary until the pwsh launch mapping lands: behave like PowerShell.
+            crate::models::DefaultTerminal::Pwsh => ("powershell.exe".to_string(), Vec::new()),
             crate::models::DefaultTerminal::Cmd => ("cmd.exe".to_string(), Vec::new()),
             crate::models::DefaultTerminal::Bash => (
                 preferred_windows_bash_program(),
