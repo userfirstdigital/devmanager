@@ -196,8 +196,7 @@ impl BrowserReplaySecretLease {
             && state.values.contains_key(input_name)
     }
 
-    #[allow(dead_code)] // Plaintext exposure remains crate-private for the secure host lane.
-    pub(crate) fn expose<T>(
+    pub(crate) fn with_exposed<T>(
         &self,
         expose: impl FnOnce(&str) -> T,
     ) -> Result<T, BrowserReplaySecretError> {
@@ -213,6 +212,14 @@ impl BrowserReplaySecretLease {
             .get(&self.input_name)
             .ok_or(BrowserReplaySecretError::SecretUnavailable)?;
         Ok(expose(value.as_str()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expose<T>(
+        &self,
+        expose: impl FnOnce(&str) -> T,
+    ) -> Result<T, BrowserReplaySecretError> {
+        self.with_exposed(expose)
     }
 }
 

@@ -775,6 +775,124 @@ fn queued_agent_capture_inspects_before_retaining_values_and_commits_success_onl
 }
 
 #[test]
+fn secret_type_recording_reserves_inspects_and_commits_only_named_unset_secret_reference() {
+    let coordinator = BrowserWorkflowCoordinator::default();
+    let workspace = workspace();
+    let instance = coordinator
+        .start(workspace.clone())
+        .expect("start recording");
+    let target = BrowserActionTarget {
+        locator: devmanager::browser::BrowserLocator {
+            accessibility_role: Some("textbox".to_string()),
+            accessibility_name: Some("Account credential".to_string()),
+            test_id: Some("credential".to_string()),
+            css_selectors: vec!["#credential".to_string()],
+        },
+        ..BrowserActionTarget::default()
+    };
+    let command = BrowserCommand::SecretType {
+        tab_id: "tab-a".to_string(),
+        target: target.clone(),
+        input_name: "account_credential".to_string(),
+    };
+
+    coordinator
+        .reserve_agent_command(&workspace, "secret-type", &command, BrowserRisk::Normal)
+        .expect("reserve value-free marker");
+    coordinator
+        .inspect_agent_secret_type(
+            &workspace,
+            "secret-type",
+            &command,
+            &BrowserRuntimeTarget {
+                role: Some("textbox".to_string()),
+                input_type: Some("text".to_string()),
+                autocomplete: Some("current-password".to_string()),
+                ..BrowserRuntimeTarget::default()
+            },
+            BrowserRisk::AccountSecurity,
+        )
+        .expect("inspect before preparing named secret marker");
+    coordinator
+        .complete_agent_command(
+            &workspace,
+            "secret-type",
+            &command,
+            &Ok(devmanager::browser::BrowserResponse::Action {
+                result: devmanager::browser::BrowserActionResult {
+                    completed_actions: 1,
+                    revision: devmanager::browser::BrowserRevision(11),
+                },
+            }),
+        )
+        .expect("commit safe marker");
+
+    let second = BrowserCommand::SecretType {
+        tab_id: "tab-a".to_string(),
+        target,
+        input_name: "one_time_code".to_string(),
+    };
+    coordinator
+        .reserve_agent_command(
+            &workspace,
+            "secret-type-second",
+            &second,
+            BrowserRisk::Normal,
+        )
+        .expect("reserve second named secret at same locator");
+    coordinator
+        .inspect_agent_secret_type(
+            &workspace,
+            "secret-type-second",
+            &second,
+            &BrowserRuntimeTarget {
+                role: Some("textbox".to_string()),
+                input_type: Some("text".to_string()),
+                ..BrowserRuntimeTarget::default()
+            },
+            BrowserRisk::AccountSecurity,
+        )
+        .expect("inspect second named secret");
+    coordinator
+        .complete_agent_command(
+            &workspace,
+            "secret-type-second",
+            &second,
+            &Ok(devmanager::browser::BrowserResponse::Action {
+                result: devmanager::browser::BrowserActionResult {
+                    completed_actions: 1,
+                    revision: devmanager::browser::BrowserRevision(12),
+                },
+            }),
+        )
+        .expect("commit distinct named secret");
+
+    let review = coordinator.stop(&instance).expect("stop recording");
+    assert_eq!(review.recipe().steps.len(), 2);
+    assert!(matches!(
+        &review.recipe().steps[0].action,
+        BrowserRecipeAction::Type {
+            value: devmanager::browser::BrowserRecipeValue::Input { name },
+            ..
+        } if name == "account_credential"
+    ));
+    assert!(review.recipe().inputs.iter().any(|input| {
+        input.name == "account_credential"
+            && input.kind == BrowserRecipeInputKind::Secret
+            && input.default_value.is_none()
+    }));
+    assert!(matches!(
+        &review.recipe().steps[1].action,
+        BrowserRecipeAction::Type {
+            value: devmanager::browser::BrowserRecipeValue::Input { name },
+            ..
+        } if name == "one_time_code"
+    ));
+    let json = serde_json::to_string(review.recipe()).expect("serialize safe recording");
+    assert!(!json.contains("sentinel"));
+}
+
+#[test]
 fn stop_restart_and_workspace_lifecycle_fence_late_agent_completions() {
     let coordinator = BrowserWorkflowCoordinator::default();
     let workspace_a = workspace();

@@ -18,17 +18,17 @@ use crate::browser::{
     preview_browser_workflow_review, recording_resource_unavailable, redact_browser_resource_bytes,
     redact_browser_text, remove_verified_profile, save_browser_recording_review,
     save_browser_workflow_review, validate_annotation_candidate_context,
-    validate_direct_secret_command, BrowserAction, BrowserActionResult, BrowserAnnotationCandidate,
-    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationLifecycle,
-    BrowserAnnotationRoute, BrowserApprovalPolicy, BrowserApprovalRequest,
-    BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandRequest,
-    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadState,
-    BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostStatus,
-    BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry,
-    BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage,
-    BrowserPageLoadState, BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope,
-    BrowserPageRecordingIngress, BrowserPageRecordingIpc, BrowserPageRecordingIpcError,
-    BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
+    validate_direct_secret_command, BrowserAction, BrowserActionResult, BrowserActionTarget,
+    BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDraft,
+    BrowserAnnotationLifecycle, BrowserAnnotationRoute, BrowserApprovalPolicy,
+    BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
+    BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserDownloadState, BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent,
+    BrowserHostStatus, BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry,
+    BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget,
+    BrowserPageIpcMessage, BrowserPageLoadState, BrowserPageRecordingAuthority,
+    BrowserPageRecordingEnvelope, BrowserPageRecordingIngress, BrowserPageRecordingIpc,
+    BrowserPageRecordingIpcError, BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
     BrowserPageRecordingTransportFailureKind, BrowserPaneSurface, BrowserPerformanceOperation,
     BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
     BrowserRecordingInstance, BrowserRecordingOperation, BrowserRecordingReview,
@@ -65,6 +65,7 @@ use wry::{
     MemoryUsageLevel, NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder,
     WebViewExtWindows,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BrowserViewKey {
@@ -87,9 +88,11 @@ enum BrowserAsyncPhase {
     InspectActions {
         actions: Vec<BrowserAction>,
     },
+    InspectSecretType,
     Act {
         mutating: bool,
     },
+    SecretType,
     Console,
     Network,
     Performance,
@@ -117,6 +120,7 @@ enum BrowserApprovalResume {
     Annotation,
     Recording { instance_id: u64 },
     Actions(Vec<BrowserAction>),
+    SecretType,
 }
 
 struct ActiveBrowserRequest {
@@ -1061,8 +1065,10 @@ impl BrowserWebViewHost {
         };
         let initial_risk =
             effective_browser_risk(request.context().declared_risk, None, Some(command_risk));
-        if !matches!(command, BrowserCommand::Act { .. })
-            && BrowserApprovalPolicy::trust_project().requires_confirmation(initial_risk)
+        if !matches!(
+            command,
+            BrowserCommand::Act { .. } | BrowserCommand::SecretType { .. }
+        ) && BrowserApprovalPolicy::trust_project().requires_confirmation(initial_risk)
             && approved_risk != Some(initial_risk)
         {
             return self.await_approval(
@@ -1074,6 +1080,32 @@ impl BrowserWebViewHost {
             );
         }
         match command {
+            BrowserCommand::SecretType {
+                target: action_target,
+                ..
+            } => {
+                if let Err(error) =
+                    self.validate_action_target_reference(workspace_key, action_target)
+                {
+                    return BrowserStartResult::Complete(Err(error));
+                }
+                let encoded = match serde_json::to_string(action_target) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        return BrowserStartResult::Complete(Err(BrowserError::CrashedView {
+                            message: format!("could not encode browser secret target: {error}"),
+                        }))
+                    }
+                };
+                start_result(
+                    self.start_script(
+                        target,
+                        &operation_id,
+                        &format!("window.__devmanagerBrowser.inspectSecretTarget({encoded})"),
+                    ),
+                    BrowserAsyncPhase::InspectSecretType,
+                )
+            }
             BrowserCommand::Snapshot { .. } => start_result(
                 self.start_script(
                     target,
@@ -1653,6 +1685,16 @@ impl BrowserWebViewHost {
             );
             return;
         }
+        if let Err(error) = active.request.validate_secret_sidecar() {
+            self.finish_queued_request(
+                window,
+                completion.target,
+                operation_id,
+                active.request,
+                Err(error),
+            );
+            return;
+        }
         let raw = match completion.result {
             Ok(raw) => raw,
             Err(_) => {
@@ -1749,10 +1791,95 @@ impl BrowserWebViewHost {
                 self.continue_actions(window, completion.target, operation_id, active, actions);
                 return;
             }
+            BrowserAsyncPhase::InspectSecretType => {
+                let value = match script_value(&raw) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.finish_queued_request(
+                            window,
+                            completion.target,
+                            operation_id,
+                            active.request,
+                            Err(error),
+                        );
+                        return;
+                    }
+                };
+                let runtime_target: BrowserRuntimeTarget =
+                    match serde_json::from_value::<Option<BrowserRuntimeTarget>>(value) {
+                        Ok(Some(target)) => target,
+                        Ok(None) => {
+                            self.finish_queued_request(
+                                window,
+                                completion.target,
+                                operation_id,
+                                active.request,
+                                Err(BrowserError::CrashedView {
+                                    message: "element_not_found".to_string(),
+                                }),
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            self.finish_queued_request(
+                            window,
+                            completion.target,
+                            operation_id,
+                            active.request,
+                            Err(BrowserError::CrashedView {
+                                message:
+                                    "browser runtime secret target inspection returned invalid data"
+                                        .to_string(),
+                            }),
+                        );
+                            return;
+                        }
+                    };
+                let effective_risk = effective_browser_risk_for_targets(
+                    active.request.context().declared_risk,
+                    std::slice::from_ref(&runtime_target),
+                    None,
+                );
+                if let Err(error) = self.workflow_coordinator.inspect_agent_secret_type(
+                    active.request.workspace_key(),
+                    &operation_id,
+                    active.request.command(),
+                    &runtime_target,
+                    effective_risk,
+                ) {
+                    self.finish_queued_request(
+                        window,
+                        completion.target,
+                        operation_id,
+                        active.request,
+                        Err(map_agent_recording_error(error)),
+                    );
+                    return;
+                }
+                if BrowserApprovalPolicy::trust_project().requires_confirmation(effective_risk)
+                    && active.approved_risk != Some(effective_risk)
+                {
+                    let BrowserStartResult::Pending(phase) = self.await_approval(
+                        &completion.target,
+                        &active.request,
+                        effective_risk,
+                        browser_command_summary(active.request.command()),
+                        BrowserApprovalResume::SecretType,
+                    ) else {
+                        unreachable!("approval requests always remain pending")
+                    };
+                    active.phase = phase;
+                    self.active_requests.insert(completion.target, active);
+                    return;
+                }
+                self.continue_secret_type(window, completion.target, operation_id, active);
+                return;
+            }
             BrowserAsyncPhase::Approval { .. } => return,
             BrowserAsyncPhase::Act { mutating } => {
                 self.complete_action(&active.request, &raw, mutating)
             }
+            BrowserAsyncPhase::SecretType => self.complete_secret_type(&active.request, &raw),
             BrowserAsyncPhase::Console => self.complete_console(&active.request, &raw),
             BrowserAsyncPhase::Network => self.complete_network(&active.request, &raw),
             BrowserAsyncPhase::Performance => self.complete_performance(&active.request, &raw),
@@ -1941,6 +2068,21 @@ impl BrowserWebViewHost {
             BrowserApprovalResume::Actions(actions) => {
                 self.continue_actions(window, target, operation_id.to_string(), active, actions)
             }
+            BrowserApprovalResume::SecretType => {
+                match self.begin_automation_request(window, &target, &active.request, Some(risk)) {
+                    BrowserStartResult::Pending(phase) => {
+                        active.phase = phase;
+                        self.active_requests.insert(target, active);
+                    }
+                    BrowserStartResult::Complete(result) => self.finish_queued_request(
+                        window,
+                        target,
+                        operation_id.to_string(),
+                        active.request,
+                        result,
+                    ),
+                }
+            }
         }
         self.apply_visibility_plan()?;
         Ok(())
@@ -1980,6 +2122,116 @@ impl BrowserWebViewHost {
         } else {
             self.active_requests.insert(target, active);
         }
+    }
+
+    fn continue_secret_type(
+        &mut self,
+        window: &gpui::Window,
+        target: BrowserOperationTarget,
+        operation_id: String,
+        mut active: ActiveBrowserRequest,
+    ) {
+        if !active.request.cancellation_is_current() {
+            self.finish_queued_request(
+                window,
+                target,
+                operation_id,
+                active.request,
+                Err(BrowserError::Interrupted),
+            );
+            return;
+        }
+        if let Err(error) = active.request.validate_secret_sidecar() {
+            self.finish_queued_request(window, target, operation_id, active.request, Err(error));
+            return;
+        }
+        active.phase = BrowserAsyncPhase::SecretType;
+        if let Err(error) = self.start_secret_type(&target, &operation_id, &active.request) {
+            self.finish_queued_request(window, target, operation_id, active.request, Err(error));
+        } else {
+            self.active_requests.insert(target, active);
+        }
+    }
+
+    fn start_secret_type(
+        &self,
+        target: &BrowserOperationTarget,
+        operation_id: &str,
+        request: &BrowserCommandRequest,
+    ) -> Result<(), BrowserError> {
+        if !request.cancellation_is_current() {
+            return Err(BrowserError::Interrupted);
+        }
+        let BrowserCommand::SecretType {
+            target: action_target,
+            ..
+        } = request.command()
+        else {
+            return Err(BrowserError::InvalidInvocation {
+                field: "secretSidecar".to_string(),
+            });
+        };
+        self.validate_action_target_reference(request.workspace_key(), action_target)?;
+        let view = self.view(&target.workspace_key, &target.tab_id)?;
+        if !request.cancellation_is_current() {
+            return Err(BrowserError::Interrupted);
+        }
+        let lease =
+            request
+                .validate_secret_sidecar()?
+                .ok_or_else(|| BrowserError::InvalidInvocation {
+                    field: "secretSidecar".to_string(),
+                })?;
+
+        let sender = self.async_sender.clone();
+        let callback_target = target.clone();
+        let callback_operation_id = operation_id.to_string();
+        lease
+            .with_exposed(|value| {
+                if !request.cancellation_is_current() {
+                    return Err(BrowserError::Interrupted);
+                }
+                let mut target_json: Zeroizing<String> = Zeroizing::new(
+                    serde_json::to_string(action_target).map_err(|_| {
+                        BrowserError::CrashedView {
+                            message: "could not encode browser secret target".to_string(),
+                        }
+                    })?,
+                );
+                let mut value_json: Zeroizing<String> =
+                    Zeroizing::new(serde_json::to_string(value).map_err(|_| {
+                        BrowserError::CrashedView {
+                            message: "could not encode browser secret value".to_string(),
+                        }
+                    })?);
+                let mut script: Zeroizing<String> = Zeroizing::new(format!(
+                    r#"(async () => {{
+                      try {{
+                        const value = await (window.__devmanagerBrowser.typeSecret({}, {}));
+                        return {{ ok: true, value }};
+                      }} catch (error) {{
+                        const candidate = String(error && error.message || "automation_failed");
+                        return {{ ok: false, error: candidate === "element_not_found" ? candidate : "automation_failed" }};
+                      }}
+                    }})()"#,
+                    target_json.as_str(),
+                    value_json.as_str(),
+                ));
+                let accepted = view.evaluate_script_with_callback(&script, move |result| {
+                    let _ = sender.send(BrowserAsyncCompletion {
+                        target: callback_target.clone(),
+                        operation_id: callback_operation_id.clone(),
+                        result: Ok(result),
+                    });
+                });
+                script.zeroize();
+                value_json.zeroize();
+                target_json.zeroize();
+                accepted.map_err(view_failure)
+            })
+            .map_err(|_| BrowserError::InvalidInvocation {
+                field: "secretSidecar".to_string(),
+            })?
     }
 
     fn complete_snapshot(
@@ -2129,6 +2381,28 @@ impl BrowserWebViewHost {
                 revision,
             },
         })
+    }
+
+    fn complete_secret_type(
+        &mut self,
+        request: &BrowserCommandRequest,
+        raw: &str,
+    ) -> Result<BrowserResponse, BrowserError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SecretActionProbe {
+            completed_actions: usize,
+        }
+        let result: SecretActionProbe =
+            serde_json::from_value(script_value(raw)?).map_err(|_| BrowserError::CrashedView {
+                message: "browser secret action callback returned invalid data".to_string(),
+            })?;
+        if result.completed_actions != 1 {
+            return Err(BrowserError::CrashedView {
+                message: "browser secret action callback returned an invalid count".to_string(),
+            });
+        }
+        self.complete_action(request, raw, true)
     }
 
     fn complete_console(
@@ -2588,6 +2862,20 @@ impl BrowserWebViewHost {
                     snapshot.validate_element_ref(element)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_action_target_reference(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        target: &BrowserActionTarget,
+    ) -> Result<(), BrowserError> {
+        if let Some(element) = target.element_ref.as_ref() {
+            self.state
+                .workspace(workspace_key)
+                .ok_or_else(missing_workspace)?
+                .validate_element_ref(element)?;
         }
         Ok(())
     }

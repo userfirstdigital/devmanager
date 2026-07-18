@@ -170,7 +170,10 @@ pub struct BrowserRecordingAction {
 
 enum PendingRecordingAction {
     Recipe(BrowserRecipeAction),
-    SecretType(BrowserRecipeLocator),
+    SecretType {
+        locator: BrowserRecipeLocator,
+        input_name: Option<String>,
+    },
     FileUpload(BrowserRecipeLocator),
 }
 
@@ -189,7 +192,10 @@ impl BrowserRecordingAction {
         validate_locator(&locator)?;
         if redact_browser_text(text) != text {
             return Ok(Self {
-                action: PendingRecordingAction::SecretType(locator),
+                action: PendingRecordingAction::SecretType {
+                    locator,
+                    input_name: None,
+                },
                 wait: None,
                 assertions: Vec::new(),
             });
@@ -210,7 +216,30 @@ impl BrowserRecordingAction {
     pub fn type_password(locator: BrowserRecipeLocator) -> Result<Self, BrowserRecordingError> {
         validate_locator(&locator)?;
         Ok(Self {
-            action: PendingRecordingAction::SecretType(locator),
+            action: PendingRecordingAction::SecretType {
+                locator,
+                input_name: None,
+            },
+            wait: None,
+            assertions: Vec::new(),
+        })
+    }
+
+    pub(crate) fn type_secret_input(
+        locator: BrowserRecipeLocator,
+        input_name: &str,
+    ) -> Result<Self, BrowserRecordingError> {
+        validate_locator(&locator)?;
+        validate_wire_node(&BrowserRecipeInput {
+            name: input_name.to_string(),
+            kind: BrowserRecipeInputKind::Secret,
+            default_value: None,
+        })?;
+        Ok(Self {
+            action: PendingRecordingAction::SecretType {
+                locator,
+                input_name: Some(input_name.to_string()),
+            },
             wait: None,
             assertions: Vec::new(),
         })
@@ -485,12 +514,21 @@ impl BrowserWorkflowRecorder {
         if !matches!(slot.state, ReservationState::Pending) {
             return Err(BrowserRecordingError::StaleReservation);
         }
+        let projected_inputs = match projected_generated_input_count(active, &action) {
+            Ok(projected) => projected,
+            Err(error) => {
+                let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
+                    return Err(BrowserRecordingError::StaleReservation);
+                };
+                slot.state = ReservationState::Cancelled;
+                drain_ready(active);
+                return Err(error);
+            }
+        };
         let exceeds_capacity = retained_assertion_count(active)
             .saturating_add(action.assertions.len())
             > MAX_BROWSER_RECORDING_ASSERTIONS
-            || projected_generated_input_count(active)
-                .saturating_add(action_generated_input_count(&action))
-                > MAX_BROWSER_RECORDING_INPUTS;
+            || projected_inputs > MAX_BROWSER_RECORDING_INPUTS;
         if exceeds_capacity {
             let Some(slot) = active.reservations.get_mut(&reservation.sequence) else {
                 return Err(BrowserRecordingError::StaleReservation);
@@ -1032,23 +1070,43 @@ fn retained_assertion_count(active: &ActiveRecording) -> usize {
     })
 }
 
-fn projected_generated_input_count(active: &ActiveRecording) -> usize {
-    active
-        .reservations
-        .values()
-        .fold(active.inputs.len(), |count, slot| {
-            count.saturating_add(match &slot.state {
-                ReservationState::Ready(action) => action_generated_input_count(action),
-                ReservationState::Pending | ReservationState::Cancelled => 0,
-            })
-        })
-}
-
-fn action_generated_input_count(action: &BrowserRecordingAction) -> usize {
-    usize::from(matches!(
-        &action.action,
-        PendingRecordingAction::SecretType(_) | PendingRecordingAction::FileUpload(_)
-    ))
+fn projected_generated_input_count(
+    active: &ActiveRecording,
+    next: &BrowserRecordingAction,
+) -> Result<usize, BrowserRecordingError> {
+    let mut named = active
+        .inputs
+        .iter()
+        .map(|input| (input.name.clone(), input.kind))
+        .collect::<HashMap<_, _>>();
+    let mut unnamed = 0_usize;
+    let mut project = |action: &BrowserRecordingAction| -> Result<(), BrowserRecordingError> {
+        match &action.action {
+            PendingRecordingAction::SecretType {
+                input_name: Some(input_name),
+                ..
+            } => match named.get(input_name) {
+                Some(BrowserRecipeInputKind::Secret) => {}
+                Some(_) => return Err(BrowserRecordingError::InvalidAction),
+                None => {
+                    named.insert(input_name.clone(), BrowserRecipeInputKind::Secret);
+                }
+            },
+            PendingRecordingAction::SecretType {
+                input_name: None, ..
+            }
+            | PendingRecordingAction::FileUpload(_) => unnamed = unnamed.saturating_add(1),
+            PendingRecordingAction::Recipe(_) => {}
+        }
+        Ok(())
+    };
+    for slot in active.reservations.values() {
+        if let ReservationState::Ready(action) = &slot.state {
+            project(action)?;
+        }
+    }
+    project(next)?;
+    Ok(named.len().saturating_add(unnamed))
 }
 
 fn drain_ready(active: &mut ActiveRecording) {
@@ -1106,7 +1164,11 @@ fn coalesce_pending_sensitive(
     {
         return false;
     }
-    let PendingRecordingAction::SecretType(next_locator) = &next.action else {
+    let PendingRecordingAction::SecretType {
+        locator: next_locator,
+        input_name: next_input_name,
+    } = &next.action
+    else {
         return false;
     };
     let BrowserRecipeAction::Type {
@@ -1117,6 +1179,9 @@ fn coalesce_pending_sensitive(
         return false;
     };
     previous_locator == next_locator
+        && next_input_name
+            .as_ref()
+            .map_or(true, |next_name| next_name == name)
         && inputs
             .iter()
             .any(|input| input.name == *name && input.kind == BrowserRecipeInputKind::Secret)
@@ -1136,14 +1201,19 @@ fn materialize_action(
     } = action;
     let action = match action {
         PendingRecordingAction::Recipe(action) => action,
-        PendingRecordingAction::SecretType(locator) => {
-            let name = next_input_name("secret", inputs);
-            inputs.push(BrowserRecipeInput {
-                name: name.clone(),
-                kind: BrowserRecipeInputKind::Secret,
-                default_value: None,
-            });
-            generated_inputs.insert(name.clone());
+        PendingRecordingAction::SecretType {
+            locator,
+            input_name,
+        } => {
+            let name = input_name.unwrap_or_else(|| next_input_name("secret", inputs));
+            if !inputs.iter().any(|input| input.name == name) {
+                inputs.push(BrowserRecipeInput {
+                    name: name.clone(),
+                    kind: BrowserRecipeInputKind::Secret,
+                    default_value: None,
+                });
+                generated_inputs.insert(name.clone());
+            }
             BrowserRecipeAction::Type {
                 locator,
                 value: BrowserRecipeValue::Input { name },
@@ -1541,14 +1611,20 @@ fn sanitize_recipe_action(
             value: BrowserRecipeValue::Literal { value },
         } if redact_browser_text(&value) != value => {
             validate_locator(&locator)?;
-            Ok(PendingRecordingAction::SecretType(locator))
+            Ok(PendingRecordingAction::SecretType {
+                locator,
+                input_name: None,
+            })
         }
         BrowserRecipeAction::Type {
             locator,
             value: BrowserRecipeValue::Literal { .. },
         } if locator_looks_sensitive(&locator) => {
             validate_locator(&locator)?;
-            Ok(PendingRecordingAction::SecretType(locator))
+            Ok(PendingRecordingAction::SecretType {
+                locator,
+                input_name: None,
+            })
         }
         BrowserRecipeAction::Upload { locator, .. } => {
             validate_locator(&locator)?;
@@ -1787,4 +1863,60 @@ fn fragment_has_sensitive_key(fragment: &str) -> bool {
             .split_once(['=', ':'])
             .is_some_and(|(key, _)| sensitive_name(key))
     })
+}
+
+#[cfg(test)]
+mod secret_recording_tests {
+    use super::*;
+
+    fn workspace() -> BrowserWorkspaceKey {
+        BrowserWorkspaceKey::new("secret-recording-project", "secret-recording-conversation")
+            .unwrap()
+    }
+
+    fn locator() -> BrowserRecipeLocator {
+        BrowserRecipeLocator {
+            test_id: Some("credential".to_string()),
+            ..BrowserRecipeLocator::default()
+        }
+    }
+
+    #[test]
+    fn named_secret_recording_counts_one_input_and_rejects_incompatible_collision() {
+        let mut recorder = BrowserWorkflowRecorder::default();
+        let instance = recorder.start(workspace()).unwrap();
+        for _ in 0..=MAX_BROWSER_RECORDING_INPUTS {
+            let reservation = recorder
+                .reserve(&instance, BrowserRecordingActor::Agent)
+                .unwrap();
+            recorder
+                .commit(
+                    reservation,
+                    BrowserRecordingAction::type_secret_input(locator(), "shared_credential")
+                        .unwrap(),
+                )
+                .expect("repeated named references consume one input slot");
+        }
+        let review = recorder.stop(&instance).unwrap();
+        assert_eq!(review.recipe().inputs.len(), 1);
+
+        recorder.discard(&instance).unwrap();
+        let collision = recorder.start(workspace()).unwrap();
+        let upload = recorder
+            .reserve(&collision, BrowserRecordingActor::Agent)
+            .unwrap();
+        recorder
+            .commit(upload, BrowserRecordingAction::upload(locator()).unwrap())
+            .unwrap();
+        let secret = recorder
+            .reserve(&collision, BrowserRecordingActor::Agent)
+            .unwrap();
+        assert_eq!(
+            recorder.commit(
+                secret,
+                BrowserRecordingAction::type_secret_input(locator(), "file",).unwrap(),
+            ),
+            Err(BrowserRecordingError::InvalidAction)
+        );
+    }
 }

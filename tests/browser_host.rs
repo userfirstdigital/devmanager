@@ -1968,6 +1968,27 @@ fn secure_command_real_host_ingress_rejects_missing_or_stale_sidecar_before_work
 }
 
 #[test]
+fn secure_command_host_phases_never_route_plaintext_through_actions_or_retained_phase_state() {
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let phases_start = windows.find("enum BrowserAsyncPhase").unwrap();
+    let phases_end = windows[phases_start..]
+        .find("enum BrowserApprovalResume")
+        .unwrap()
+        + phases_start;
+    let phases = &windows[phases_start..phases_end];
+    assert!(phases.contains("InspectSecretType,"));
+    assert!(phases.contains("SecretType,"));
+    assert!(!phases.contains("InspectSecretType {"));
+    assert!(!phases.contains("SecretType {"));
+
+    let initialization = browser_user_input_initialization_script();
+    assert!(initialization.contains("typeSecret:"));
+    assert!(initialization.contains("secretOwnedElements"));
+    assert!(initialization.contains("activeSecretValue"));
+    assert!(initialization.contains("finally"));
+}
+
+#[test]
 fn windows_host_elevates_cdp_method_risk_before_existing_approval_gate() {
     let source = include_str!("../src/browser/host/windows.rs");
     let start = source.find("fn begin_automation_request(").unwrap();
@@ -2879,10 +2900,16 @@ process.stdout.write(JSON.stringify(messages));
 "#,
         browser_user_input_initialization_script()
     );
+    let harness_path = std::env::temp_dir().join(format!(
+        "devmanager-browser-console-harness-{}.js",
+        std::process::id()
+    ));
+    std::fs::write(&harness_path, harness).expect("write console redaction Node harness");
     let output = Command::new("node")
-        .args(["-e", &harness])
+        .arg(&harness_path)
         .output()
         .expect("execute initialization script in Node");
+    let _ = std::fs::remove_file(&harness_path);
     assert!(
         output.status.success(),
         "Node harness failed: {}",

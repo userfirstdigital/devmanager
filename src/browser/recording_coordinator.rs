@@ -302,7 +302,8 @@ impl BrowserWorkflowCoordinator {
             | BrowserCommand::Wait { .. }
             | BrowserCommand::Screenshot { .. }
             | BrowserCommand::Upload { .. }
-            | BrowserCommand::Cdp { .. } => 1,
+            | BrowserCommand::Cdp { .. }
+            | BrowserCommand::SecretType { .. } => 1,
             _ => return Ok(()),
         };
         let key = (workspace_key.clone(), operation_id.to_string());
@@ -376,6 +377,49 @@ impl BrowserWorkflowCoordinator {
         Ok(())
     }
 
+    pub fn inspect_agent_secret_type(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        operation_id: &str,
+        command: &BrowserCommand,
+        _runtime_target: &BrowserRuntimeTarget,
+        effective_risk: BrowserRisk,
+    ) -> Result<(), BrowserRecordingError> {
+        let BrowserCommand::SecretType {
+            target, input_name, ..
+        } = command
+        else {
+            return Err(BrowserRecordingError::InvalidAction);
+        };
+        let key = (workspace_key.clone(), operation_id.to_string());
+        let mut state = self.lock();
+        let Some(mut pending) = state.agent_commands.remove(&key) else {
+            return Ok(());
+        };
+        if pending.reservations.len() != 1 || pending.prepared_actions.len() != 1 {
+            state.agent_commands.insert(key, pending);
+            return Err(BrowserRecordingError::StaleReservation);
+        }
+        let prepared =
+            match BrowserRecordingAction::type_secret_input(recipe_locator(target), input_name) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    state.agent_commands.insert(key, pending);
+                    return Err(error);
+                }
+            };
+        if let Err(error) = state
+            .recorder
+            .set_reservation_risk(&pending.reservations[0], effective_risk)
+        {
+            state.agent_commands.insert(key, pending);
+            return Err(error);
+        }
+        pending.prepared_actions[0] = Some(prepared);
+        state.agent_commands.insert(key, pending);
+        Ok(())
+    }
+
     pub fn complete_agent_command(
         &self,
         workspace_key: &BrowserWorkspaceKey,
@@ -394,7 +438,7 @@ impl BrowserWorkflowCoordinator {
         }
 
         match command {
-            BrowserCommand::Act { .. } => {
+            BrowserCommand::Act { .. } | BrowserCommand::SecretType { .. } => {
                 let completed = match result {
                     Ok(BrowserResponse::Action { result }) => result.completed_actions,
                     _ => 0,

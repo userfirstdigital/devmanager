@@ -8,6 +8,26 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   const MAX_PERFORMANCE = 500;
   const MAX_BODY_BYTES = 64 * 1024;
   const REDACTED = "[redacted]";
+  const secretOwnedElements = new WeakSet();
+  const secretOwnedElementRefs = [];
+  const registerSecretOwnedElement = (element) => {
+    if (secretOwnedElements.has(element)) return;
+    secretOwnedElements.add(element);
+    secretOwnedElementRefs.push(new WeakRef(element));
+  };
+  const secretOwnedValues = () => {
+    const values = [];
+    let retained = 0;
+    for (const reference of secretOwnedElementRefs) {
+      const element = reference.deref();
+      if (!element) continue;
+      secretOwnedElementRefs[retained++] = reference;
+      values.push(String(element.value ?? ""));
+    }
+    secretOwnedElementRefs.length = retained;
+    return values;
+  };
+  let activeSecretValue = null;
   const state = {
     console: [],
     network: [],
@@ -50,7 +70,18 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       return text;
     }
   };
-  const redact = (value) => redactStructured(value)
+  const redactActiveSecret = (value) => {
+    let text = String(value ?? "");
+    for (const secret of [activeSecretValue, ...secretOwnedValues()]) {
+      if (!secret) continue;
+      const encoded = encodeURIComponent(secret);
+      for (const candidate of [secret, encoded, encoded.replace(/%20/g, "+")]) {
+        if (candidate) text = text.split(candidate).join(REDACTED);
+      }
+    }
+    return text;
+  };
+  const redact = (value) => redactStructured(redactActiveSecret(value))
     .replace(/\bBasic\s+[A-Za-z0-9._~+\/=\-]+/gi, `Basic ${REDACTED}`)
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/=\-]+/gi, `Bearer ${REDACTED}`)
     .replace(/("([^"\\]*(?:\\.[^"\\]*)*)"\s*:\s*")((?:\\.|[^"\\])*)(")/g,
@@ -67,12 +98,14 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       }
       parsed.username = "";
       parsed.password = "";
-      return parsed.toString().slice(0, 4000);
+      return redact(parsed.toString()).slice(0, 4000);
     } catch (_) {
       return redact(value);
     }
   };
   const now = () => Math.max(0, Math.round(performance.now()));
+  const rawPostMessage = window.ipc.postMessage.bind(window.ipc);
+  window.ipc.postMessage = (body) => rawPostMessage(redact(body));
 
   const reportInput = (kind) => (event) => {
     if (!event.isTrusted || state.annotationActive) return;
@@ -278,6 +311,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     return redact(explicit?.innerText || element.closest?.("label")?.innerText || "").slice(0, 1000) || null;
   };
   const isPasswordElement = (element) =>
+    secretOwnedElements.has(element) ||
     String(element?.getAttribute?.("type") || "").toLowerCase() === "password";
   const nameOf = (element) => {
     const valueFallback = isPasswordElement(element) ? "" : element.getAttribute?.("value");
@@ -620,6 +654,34 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       };
       });
     }),
+    inspectSecretTarget: (target) => {
+      const element = resolveTarget(target);
+      if (!element) return null;
+      const form = element?.closest?.("form");
+      return {
+        originUrl: location.origin,
+        role: element ? roleOf(element) : null,
+        name: element ? nameOf(element) : null,
+        inputType: element?.getAttribute?.("type") || null,
+        autocomplete: element?.getAttribute?.("autocomplete") || null,
+        formAction: form?.action ? safeUrl(form.action) : null,
+        permission: null,
+      };
+    },
+    typeSecret: (target, value) => {
+      const element = resolveTarget(target);
+      if (!element) throw new Error("element_not_found");
+      registerSecretOwnedElement(element);
+      activeSecretValue = String(value ?? "");
+      try {
+        element.focus();
+        element.value = activeSecretValue;
+        dispatchValueEvents(element);
+        return { completedActions: 1 };
+      } finally {
+        activeSecretValue = null;
+      }
+    },
     act: (actions) => {
       let completedActions = 0;
       for (const action of actions) {
