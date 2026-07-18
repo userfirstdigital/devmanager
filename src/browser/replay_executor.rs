@@ -955,9 +955,12 @@ async fn secret_semantic_action(
     let lease = execution
         .secret_lease(input_name)
         .map_err(|_| ReplayActionFailure::StepFailed)?;
-    let context =
-        BrowserInvocationContext::for_actor(actor, "replay step secret type", BrowserRisk::Normal)
-            .map_err(|_| ReplayActionFailure::StepFailed)?;
+    let context = BrowserInvocationContext::for_actor(
+        actor,
+        "replay step secret type",
+        BrowserRisk::AccountSecurity,
+    )
+    .map_err(|_| ReplayActionFailure::StepFailed)?;
     let response = controller
         .request_replay_secret_type(
             BrowserCommand::SecretType {

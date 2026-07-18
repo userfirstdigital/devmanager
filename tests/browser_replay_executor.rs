@@ -888,6 +888,7 @@ async fn secret_type_uses_the_private_sidecar_while_text_type_stays_an_ordinary_
             input_name: "credential".to_string(),
         }
     );
+    assert_eq!(secret.context().declared_risk, BrowserRisk::AccountSecurity);
     assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
     let safe_surfaces = format!(
         "{}\n{:?}\n{:?}\n{:?}",

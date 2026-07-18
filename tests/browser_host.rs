@@ -3,26 +3,26 @@ use devmanager::browser::{
     browser_lifecycle_control, browser_operation_target_tab_id,
     browser_request_preempts_operation_queue, browser_response_resource_ids,
     browser_user_input_initialization_script, crop_annotation_png,
-    effective_browser_annotation_risk, parse_browser_annotation_ipc_message,
-    parse_browser_page_ipc_message, prepare_verified_download_root, prepare_verified_profile_root,
-    remove_verified_profile, route_browser_request, unique_download_path,
-    unsupported_command_response, unsupported_host_status, unsupported_platform_error,
-    validate_annotation_candidate_context, validate_browser_url, BrowserAction,
-    BrowserActionTarget, BrowserAnnotation, BrowserAnnotationCandidate,
-    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationKind,
-    BrowserAnnotationLifecycle, BrowserAnnotationOperation, BrowserAnnotationRoute,
-    BrowserAttachmentBroker, BrowserAttachmentRevision, BrowserBounds, BrowserCommand,
-    BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
-    BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
-    BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
+    effective_browser_annotation_risk, effective_browser_secret_type_risk,
+    parse_browser_annotation_ipc_message, parse_browser_page_ipc_message,
+    prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
+    route_browser_request, unique_download_path, unsupported_command_response,
+    unsupported_host_status, unsupported_platform_error, validate_annotation_candidate_context,
+    validate_browser_url, BrowserAction, BrowserActionTarget, BrowserAnnotation,
+    BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDraft,
+    BrowserAnnotationKind, BrowserAnnotationLifecycle, BrowserAnnotationOperation,
+    BrowserAnnotationRoute, BrowserAttachmentBroker, BrowserAttachmentRevision, BrowserBounds,
+    BrowserCommand, BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation,
+    BrowserDiagnosticLevel, BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef,
+    BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserMemoryTarget, BrowserNetworkOperation, BrowserOperationQueue,
     BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
     BrowserPerformanceOperation, BrowserRecordingOperation, BrowserResourceId, BrowserResourceKind,
     BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
-    BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind,
-    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost,
-    BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserUserInputKind, BrowserViewport, BrowserWaitCondition, BrowserWaitResult,
+    BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
     MAX_BROWSER_JOURNAL_ENTRIES,
 };
 
@@ -3088,6 +3088,56 @@ fn windows_native_metadata_callbacks_and_event_drain_consult_document_taint() {
     assert!(containment.contains("document_taint: Option<bool>"));
     assert!(containment.contains("document_taint == Some(false)"));
     assert!(containment.contains("document_taint.is_none()"));
+}
+
+#[test]
+fn windows_host_applies_an_account_security_floor_to_every_secret_type() {
+    let ordinary = BrowserRuntimeTarget {
+        origin_url: "https://example.test".to_string(),
+        role: Some("textbox".to_string()),
+        input_type: Some("text".to_string()),
+        ..BrowserRuntimeTarget::default()
+    };
+    let one_time_code = BrowserRuntimeTarget {
+        autocomplete: Some("one-time-code".to_string()),
+        ..ordinary.clone()
+    };
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::Normal, &ordinary),
+        BrowserRisk::AccountSecurity
+    );
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::Normal, &one_time_code),
+        BrowserRisk::AccountSecurity
+    );
+
+    let permission = BrowserRuntimeTarget {
+        permission: Some("camera".to_string()),
+        ..ordinary.clone()
+    };
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::Normal, &permission),
+        BrowserRisk::PermissionChange,
+        "a higher runtime risk must win over the secret floor"
+    );
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::OsPermission, &ordinary),
+        BrowserRisk::OsPermission,
+        "a higher declared risk must win over the secret floor"
+    );
+
+    let source = include_str!("../src/browser/host/windows.rs");
+    let inspect = source
+        .find("BrowserAsyncPhase::InspectSecretType { ticket } =>")
+        .expect("secret target inspection branch");
+    let approval = source[inspect..]
+        .find("requires_confirmation(effective_risk)")
+        .map(|offset| inspect + offset)
+        .expect("secret approval gate");
+    assert!(
+        source[inspect..approval].contains("effective_browser_secret_type_risk"),
+        "the real host must apply the shared secret risk floor before approval"
+    );
 }
 
 #[test]

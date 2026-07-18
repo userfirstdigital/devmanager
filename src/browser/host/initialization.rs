@@ -656,22 +656,43 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     }
   };
 
+  const SECRET_INPUT_TYPES = Object.freeze(["text", "password", "email", "tel", "url", "number", "search"]);
+  const SECRET_AUTOCOMPLETE_VALUES = Object.freeze(["current-password", "new-password", "one-time-code", "username", "email", "off"]);
+  const secretTargetInputType = (element) => {
+    const inputType = String(element?.getAttribute?.("type") || "").toLowerCase();
+    return SECRET_INPUT_TYPES.includes(inputType) ? inputType : null;
+  };
+  const secretTargetAutocomplete = (element) => {
+    const autocomplete = String(element?.getAttribute?.("autocomplete") || "")
+      .toLowerCase().split(/\s+/).at(-1);
+    return SECRET_AUTOCOMPLETE_VALUES.includes(autocomplete) ? autocomplete : null;
+  };
+  const secretTargetImplicitRole = (element) => {
+    const tag = element?.tagName?.toLowerCase();
+    if (tag === "button") return "button";
+    if (tag === "a") return "link";
+    if (tag === "textarea") return "textbox";
+    if (tag === "select") return "combobox";
+    if (["h1", "h2", "h3", "h4", "h5", "h6"].includes(tag)) return "heading";
+    if (tag !== "input") return null;
+    const inputType = String(element?.getAttribute?.("type") || "text").toLowerCase();
+    if (inputType === "checkbox") return "checkbox";
+    if (inputType === "radio") return "radio";
+    if (["button", "submit", "reset"].includes(inputType)) return "button";
+    return "textbox";
+  };
+  const contentFreeSecretTarget = (element) => ({
+    originUrl: location.origin,
+    role: secretTargetImplicitRole(element),
+    name: null,
+    inputType: secretTargetInputType(element),
+    autocomplete: secretTargetAutocomplete(element),
+    formAction: null,
+    permission: null,
+  });
   const runtimeTarget = (element) => {
+    if (state.secretTainted) return contentFreeSecretTarget(element);
     const form = element?.closest?.("form");
-    if (state.secretTainted) {
-      const inputType = String(element?.getAttribute?.("type") || "").toLowerCase();
-      const autocomplete = String(element?.getAttribute?.("autocomplete") || "")
-        .toLowerCase().split(/\s+/).at(-1);
-      return {
-        originUrl: location.origin,
-        role: element ? implicitRole(element) : null,
-        name: null,
-        inputType: ["text", "password", "email", "tel", "url", "number", "search"].includes(inputType) ? inputType : null,
-        autocomplete: ["current-password", "new-password", "one-time-code", "username", "email", "off"].includes(autocomplete) ? autocomplete : null,
-        formAction: null,
-        permission: null,
-      };
-    }
     return {
       originUrl: location.origin,
       role: element ? roleOf(element) : null,
@@ -682,7 +703,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       permission: null,
     };
   };
-  const secretRiskSignature = (element) => JSON.stringify(runtimeTarget(element));
+  const secretRiskSignature = (element) => JSON.stringify(contentFreeSecretTarget(element));
   const clearContentTelemetry = () => {
     state.console.length = 0;
     state.network.length = 0;
@@ -740,11 +761,11 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       if (typeof WeakRef !== "function" || !normalizedToken || normalizedToken.length > 256 || /[\u0000-\u001f\u007f]/.test(normalizedToken)) return null;
       const element = resolveTarget(target);
       if (!element) return null;
-      const inspectedTarget = runtimeTarget(element);
+      const inspectedTarget = contentFreeSecretTarget(element);
       pendingSecretTicket = Object.freeze({
         token: normalizedToken,
         element: new WeakRef(element),
-        signature: JSON.stringify(inspectedTarget),
+        signature: secretRiskSignature(element),
       });
       return inspectedTarget;
     },

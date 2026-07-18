@@ -4,7 +4,8 @@ use devmanager::browser::{
     BrowserInvocationContext, BrowserPageRecordingEnvelope, BrowserReplayCoordinator,
     BrowserReplayExecutionHandle, BrowserReplayInstance, BrowserReplayProjection,
     BrowserReplaySecretError, BrowserReplaySecretLease, BrowserReplaySecretStore,
-    BrowserReplaySecretSubmission, BrowserReplayStatus, BrowserRisk, BrowserWorkspaceKey,
+    BrowserReplaySecretSubmission, BrowserReplayStatus, BrowserRisk, BrowserRuntimeTarget,
+    BrowserWorkspaceKey,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::process::Command;
@@ -140,6 +141,7 @@ fn secure_command_public_wire_and_debug_surfaces_have_only_marker_metadata() {
 fn windows_secure_injected_typing_owns_ordinary_textbox_and_leaks_no_telemetry() {
     const MARKER: &str = "DM_SECRET_ESCAPE_MARKER_7F3A91";
     const SECOND_MARKER: &str = "DM_SECOND_SECRET_MARKER_2B8C44";
+    const PAGE_CONTENT_SENTINEL: &str = "DM_PREEXISTING_PAGE_CONTENT_91D84C";
     const SENTINEL: &str =
         "ordinary \"textbox\\secret\n +/% DM_SECRET_ESCAPE_MARKER_7F3A91 sentinel";
     const URI_SENTINEL: &str =
@@ -185,6 +187,11 @@ class FakeElement {{
 }}
 const inspectedInput = new FakeElement("credential");
 const retargetedInput = new FakeElement("credential");
+inspectedInput.value = {page_content:?};
+inspectedInput.innerText = {page_content:?};
+inspectedInput.attributes["aria-label"] = {page_content:?};
+inspectedInput.attributes.role = {page_content:?};
+inspectedInput.form = {{ action: `https://example.test/submit?prefill=${{encodeURIComponent({page_content:?})}}` }};
 let resolvedInput = inspectedInput;
 let mutationCallback = null;
 globalThis.Element = FakeElement;
@@ -297,6 +304,7 @@ for (const access of [
 }}
 setImmediate(() => {{
   const safe = {{
+    inspected,
     result,
     inputEvents,
     changeEvents,
@@ -317,6 +325,7 @@ setImmediate(() => {{
         sentinel = SENTINEL,
         second = SECOND_MARKER,
         marker = MARKER,
+        page_content = PAGE_CONTENT_SENTINEL,
     );
     let harness_path = std::env::temp_dir().join(format!(
         "devmanager-browser-secret-harness-{}.js",
@@ -346,10 +355,29 @@ setImmediate(() => {{
             && !output.contains(SECOND_MARKER)
             && !output.contains(&json_sentinel)
             && !output.contains(URI_SENTINEL)
-            && !output.contains(FORM_SENTINEL),
+            && !output.contains(FORM_SENTINEL)
+            && !output.contains(PAGE_CONTENT_SENTINEL),
         "encoded secret escaped safe output: {output}"
     );
     let safe: serde_json::Value = serde_json::from_str(&output).expect("safe harness output");
+    assert_eq!(
+        safe["inspected"],
+        serde_json::json!({
+            "originUrl": "https://example.test",
+            "role": "textbox",
+            "name": null,
+            "inputType": "text",
+            "autocomplete": "current-password",
+            "formAction": null,
+            "permission": null,
+        })
+    );
+    let inspected: BrowserRuntimeTarget =
+        serde_json::from_value(safe["inspected"].clone()).expect("content-free target");
+    assert!(!format!("{inspected:?}").contains(PAGE_CONTENT_SENTINEL));
+    assert!(!serde_json::to_string(&inspected)
+        .unwrap()
+        .contains(PAGE_CONTENT_SENTINEL));
     assert_eq!(safe["result"], serde_json::json!({"completedActions": 1}));
     assert_eq!(safe["inputEvents"], 1);
     assert_eq!(safe["changeEvents"], 1);

@@ -39,11 +39,11 @@ pub use attachments::{
 pub(crate) use attachments::{compact_browser_attachment_text, compact_browser_attachment_url};
 pub use automation::{
     browser_cdp_method_risk, build_semantic_snapshot, effective_browser_risk,
-    effective_browser_risk_for_targets, redact_browser_resource_bytes, redact_browser_text,
-    runtime_target_risk, BrowserAction, BrowserActionResult, BrowserActionTarget,
-    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation,
-    BrowserLocatorStrategy, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
+    effective_browser_risk_for_targets, effective_browser_secret_type_risk,
+    redact_browser_resource_bytes, redact_browser_text, runtime_target_risk, BrowserAction,
+    BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry, BrowserConsoleOperation,
+    BrowserDownloadEntry, BrowserDownloadOperation, BrowserLocatorStrategy, BrowserNetworkEntry,
+    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
     BrowserRawSemanticElement, BrowserRedactedAction, BrowserRuntimeTarget, BrowserScreenshotMode,
     BrowserSemanticElement, BrowserSemanticSnapshot, BrowserSnapshotSummary,
     BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition, BrowserWaitResult,

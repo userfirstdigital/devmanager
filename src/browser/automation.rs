@@ -543,6 +543,17 @@ pub fn effective_browser_risk_for_targets(
     )
 }
 
+pub fn effective_browser_secret_type_risk(
+    declared: BrowserRisk,
+    runtime_target: &BrowserRuntimeTarget,
+) -> BrowserRisk {
+    effective_browser_risk(
+        declared,
+        Some(runtime_target),
+        Some(BrowserRisk::AccountSecurity),
+    )
+}
+
 pub fn browser_cdp_method_risk(method: &str) -> BrowserRisk {
     match method {
         "Browser.getVersion"

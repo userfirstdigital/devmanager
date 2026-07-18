@@ -91,4 +91,3 @@ Strict RED-to-GREEN tests must prove:
 7. executor never places a sentinel in `BrowserAction`, command JSON, context, status, or Debug output;
 8. prompt events and pane models expose names/set flags only and render a fixed mask;
 9. existing replay, recording, host, gateway, unsupported-platform, and release gates remain green.
-
