@@ -1190,6 +1190,7 @@ impl From<BrowserError> for ToolFailure {
             BrowserError::Timeout { .. } => "timeout",
             BrowserError::NavigationFailure { .. } => "navigation_failure",
             BrowserError::CrashedView { .. } => "crashed_view",
+            BrowserError::LocatorNotFound { .. } => "locator_not_found",
             BrowserError::BlockedPermission { .. } => "blocked_permission",
             BrowserError::UnavailablePlatform { .. } => "unavailable_platform",
             BrowserError::Io { .. } => "io_error",

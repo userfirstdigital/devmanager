@@ -25,11 +25,11 @@ use crate::browser::{
     BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandRequest,
     BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadState,
     BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostStatus,
-    BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry,
-    BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage,
-    BrowserPageLoadState, BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope,
-    BrowserPageRecordingIngress, BrowserPageRecordingIpc, BrowserPageRecordingIpcError,
-    BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
+    BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry, BrowserLocatorFailureTarget,
+    BrowserNetworkEntry, BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget,
+    BrowserPageIpcMessage, BrowserPageLoadState, BrowserPageRecordingAuthority,
+    BrowserPageRecordingEnvelope, BrowserPageRecordingIngress, BrowserPageRecordingIpc,
+    BrowserPageRecordingIpcError, BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
     BrowserPageRecordingTransportFailureKind, BrowserPaneSurface, BrowserPerformanceOperation,
     BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
     BrowserRecordingInstance, BrowserRecordingOperation, BrowserRecordingReview,
@@ -192,6 +192,10 @@ const SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND: &str = r#""element_not_found""#;
 const SECRET_TYPE_CALLBACK_TARGET_CHANGED: &str = r#""target_changed""#;
 const SECRET_TYPE_CALLBACK_AUTOMATION_FAILED: &str = r#""automation_failed""#;
 const FIXED_SECRET_ACTION_ENVELOPE: &str = r#"{"ok":true,"value":{"completedActions":1}}"#;
+const ACTION_CALLBACK_LOCATOR_PRIMARY_NOT_FOUND: &str = r#""locator_primary_not_found""#;
+const ACTION_CALLBACK_LOCATOR_SOURCE_NOT_FOUND: &str = r#""locator_source_not_found""#;
+const ACTION_CALLBACK_LOCATOR_DESTINATION_NOT_FOUND: &str = r#""locator_destination_not_found""#;
+const ACTION_CALLBACK_AUTOMATION_FAILED: &str = r#""automation_failed""#;
 
 enum BrowserAsyncPhase {
     Approval {
@@ -2308,7 +2312,18 @@ impl BrowserWebViewHost {
         if let Err(error) = self.start_script(
             &target,
             &operation_id,
-            &format!("window.__devmanagerBrowser.act({encoded})"),
+            &format!(
+                r#"(() => {{
+                    try {{ return window.__devmanagerBrowser.act({encoded}); }}
+                    catch (error) {{
+                        const candidate = error && error.message;
+                        if (candidate === "locator_primary_not_found") return "locator_primary_not_found";
+                        if (candidate === "locator_source_not_found") return "locator_source_not_found";
+                        if (candidate === "locator_destination_not_found") return "locator_destination_not_found";
+                        return "automation_failed";
+                    }}
+                }})()"#
+            ),
         ) {
             self.finish_queued_request(window, target, operation_id, active.request, Err(error));
         } else {
@@ -2554,6 +2569,29 @@ impl BrowserWebViewHost {
         struct ActionProbe {
             completed_actions: usize,
         }
+        match raw {
+            ACTION_CALLBACK_LOCATOR_PRIMARY_NOT_FOUND => {
+                return Err(BrowserError::LocatorNotFound {
+                    target: BrowserLocatorFailureTarget::Primary,
+                });
+            }
+            ACTION_CALLBACK_LOCATOR_SOURCE_NOT_FOUND => {
+                return Err(BrowserError::LocatorNotFound {
+                    target: BrowserLocatorFailureTarget::Source,
+                });
+            }
+            ACTION_CALLBACK_LOCATOR_DESTINATION_NOT_FOUND => {
+                return Err(BrowserError::LocatorNotFound {
+                    target: BrowserLocatorFailureTarget::Destination,
+                });
+            }
+            ACTION_CALLBACK_AUTOMATION_FAILED => {
+                return Err(BrowserError::CrashedView {
+                    message: "automation_failed".to_string(),
+                });
+            }
+            _ => {}
+        }
         let probe: ActionProbe =
             serde_json::from_value(script_value(raw)?).map_err(|_| BrowserError::CrashedView {
                 message: "browser action callback returned invalid data".to_string(),
@@ -2592,12 +2630,11 @@ impl BrowserWebViewHost {
             SECRET_TYPE_CALLBACK_OK => {
                 self.complete_action(request, FIXED_SECRET_ACTION_ENVELOPE, true)
             }
-            SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND => Err(BrowserError::CrashedView {
-                message: "element_not_found".to_string(),
-            }),
-            SECRET_TYPE_CALLBACK_TARGET_CHANGED => Err(BrowserError::CrashedView {
-                message: "target_changed".to_string(),
-            }),
+            SECRET_TYPE_CALLBACK_ELEMENT_NOT_FOUND | SECRET_TYPE_CALLBACK_TARGET_CHANGED => {
+                Err(BrowserError::LocatorNotFound {
+                    target: BrowserLocatorFailureTarget::Primary,
+                })
+            }
             _ => Err(BrowserError::CrashedView {
                 message: "automation_failed".to_string(),
             }),
@@ -4924,6 +4961,7 @@ fn browser_error_code(error: &BrowserError) -> &'static str {
         BrowserError::Timeout { .. } => "timeout",
         BrowserError::NavigationFailure { .. } => "navigation_failure",
         BrowserError::CrashedView { .. } => "crashed_view",
+        BrowserError::LocatorNotFound { .. } => "locator_not_found",
         BrowserError::BlockedPermission { .. } => "blocked_permission",
         BrowserError::UnavailablePlatform { .. } => "unavailable_platform",
         BrowserError::Io { .. } => "io_error",

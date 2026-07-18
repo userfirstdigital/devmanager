@@ -229,6 +229,9 @@ pub enum BrowserError {
     CrashedView {
         message: String,
     },
+    LocatorNotFound {
+        target: BrowserLocatorFailureTarget,
+    },
     BlockedPermission {
         permission: String,
     },
@@ -240,6 +243,14 @@ pub enum BrowserError {
         path: PathBuf,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserLocatorFailureTarget {
+    Primary,
+    Source,
+    Destination,
 }
 
 impl fmt::Display for BrowserError {
@@ -304,6 +315,9 @@ impl fmt::Display for BrowserError {
             }
             Self::CrashedView { message } => {
                 write!(formatter, "browser view crashed: {message}")
+            }
+            Self::LocatorNotFound { target } => {
+                write!(formatter, "browser {target:?} locator target was not found")
             }
             Self::BlockedPermission { permission } => {
                 write!(formatter, "browser permission was blocked: {permission}")

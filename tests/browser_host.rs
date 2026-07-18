@@ -16,8 +16,8 @@ use devmanager::browser::{
     BrowserDiagnosticLevel, BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef,
     BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
-    BrowserLocator, BrowserMemoryTarget, BrowserNetworkOperation, BrowserOperationQueue,
-    BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserLocator, BrowserLocatorFailureTarget, BrowserMemoryTarget, BrowserNetworkOperation,
+    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
     BrowserPerformanceOperation, BrowserRecordingOperation, BrowserResourceId, BrowserResourceKind,
     BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
     BrowserRuntimeTarget, BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot,
@@ -137,6 +137,170 @@ fn unsupported_macos_rejects_every_recording_operation_with_the_typed_platform_e
             }),
         );
     }
+}
+
+#[test]
+fn locator_failure_errors_are_typed_value_free_and_distinct_from_crashes() {
+    const LOCATOR_SENTINEL: &str = "DM_LOCATOR_SENTINEL_5A24D";
+    const PAGE_SENTINEL: &str = "DM_PAGE_SENTINEL_9C71E";
+
+    for target in [
+        BrowserLocatorFailureTarget::Primary,
+        BrowserLocatorFailureTarget::Source,
+        BrowserLocatorFailureTarget::Destination,
+    ] {
+        let error = BrowserError::LocatorNotFound { target };
+        let serialized = serde_json::to_string(&error).expect("serialize fixed locator failure");
+        let debug = format!("{error:?}");
+        assert!(serialized.contains("locatorNotFound"));
+        assert!(!serialized.contains(LOCATOR_SENTINEL));
+        assert!(!serialized.contains(PAGE_SENTINEL));
+        assert!(!debug.contains(LOCATOR_SENTINEL));
+        assert!(!debug.contains(PAGE_SENTINEL));
+    }
+
+    let crash = BrowserError::CrashedView {
+        message: "automation_failed".to_string(),
+    };
+    assert_ne!(
+        crash,
+        BrowserError::LocatorNotFound {
+            target: BrowserLocatorFailureTarget::Primary,
+        }
+    );
+}
+
+#[test]
+fn windows_injected_actions_return_only_fixed_missing_target_codes() {
+    let initialization = browser_user_input_initialization_script();
+    for code in [
+        "locator_primary_not_found",
+        "locator_source_not_found",
+        "locator_destination_not_found",
+    ] {
+        assert!(
+            initialization.contains(code),
+            "missing fixed injected locator code: {code}"
+        );
+    }
+
+    let windows = include_str!("../src/browser/host/windows.rs");
+    for contract in [
+        "BrowserLocatorFailureTarget::Primary",
+        "BrowserLocatorFailureTarget::Source",
+        "BrowserLocatorFailureTarget::Destination",
+        "ACTION_CALLBACK_LOCATOR_PRIMARY_NOT_FOUND",
+        "ACTION_CALLBACK_LOCATOR_SOURCE_NOT_FOUND",
+        "ACTION_CALLBACK_LOCATOR_DESTINATION_NOT_FOUND",
+    ] {
+        assert!(
+            windows.contains(contract),
+            "missing host mapping: {contract}"
+        );
+    }
+    assert!(windows.contains("ACTION_CALLBACK_AUTOMATION_FAILED"));
+    assert!(windows.contains("return \"automation_failed\";"));
+    assert!(
+        !windows.contains("return candidate;"),
+        "page-controlled exception text must never cross the action callback boundary"
+    );
+
+    let secret_start = windows
+        .find("fn complete_secret_type(")
+        .expect("secret completion");
+    let secret_end = windows[secret_start..]
+        .find("fn complete_console(")
+        .map(|offset| secret_start + offset)
+        .expect("next completion method");
+    let secret_completion = &windows[secret_start..secret_end];
+    assert!(secret_completion.contains("BrowserLocatorFailureTarget::Primary"));
+
+    let mcp = include_str!("../src/browser/mcp.rs");
+    assert!(mcp.contains("BrowserError::LocatorNotFound { .. } => \"locator_not_found\""));
+
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+    assert!(unsupported.contains("BrowserError::UnavailablePlatform"));
+}
+
+#[test]
+fn node_injected_actions_classify_primary_source_and_destination_without_locator_values() {
+    let harness = format!(
+        r##"
+const write = process.stdout.write.bind(process.stdout);
+class FakeElement {{
+  constructor(id) {{ this.id = id; this.isConnected = true; }}
+  dispatchEvent() {{ return true; }}
+}}
+globalThis.Element = FakeElement;
+globalThis.CSS = {{ escape: (value) => String(value) }};
+globalThis.location = new URL("https://example.test/");
+globalThis.performance = {{ now: () => 0, getEntriesByType: () => [] }};
+globalThis.MutationObserver = class {{ constructor() {{}} observe() {{}} }};
+globalThis.PerformanceObserver = class {{ constructor() {{}} observe() {{}} }};
+globalThis.XMLHttpRequest = class {{ addEventListener() {{}} getResponseHeader() {{ return ""; }} }};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+globalThis.console = {{ debug() {{}}, info() {{}}, log() {{}}, warn() {{}}, error() {{}} }};
+const source = new FakeElement("source");
+globalThis.document = {{
+  activeElement: null,
+  body: {{}},
+  querySelector(selector) {{ return selector === "#source" ? source : null; }},
+  querySelectorAll() {{ return []; }},
+  elementFromPoint() {{ return null; }},
+}};
+globalThis.window = {{
+  addEventListener() {{}}, removeEventListener() {{}},
+  ipc: {{ postMessage() {{}} }},
+  fetch: async () => ({{ headers: {{ get() {{ return ""; }} }}, clone() {{ return this; }}, text: async () => "" }}),
+}};
+{}
+const locator = (selector) => ({{ locator: {{ cssSelectors: [selector] }} }});
+const result = (action) => {{
+  try {{ window.__devmanagerBrowser.act([action]); return "completed"; }}
+  catch (error) {{ return error.message; }}
+}};
+const hostBoundary = (action) => {{
+  try {{ return window.__devmanagerBrowser.act([action]); }}
+  catch (error) {{
+    const candidate = error && error.message;
+    if (["locator_primary_not_found", "locator_source_not_found", "locator_destination_not_found"].includes(candidate)) return candidate;
+    return "automation_failed";
+  }}
+}};
+write(JSON.stringify({{
+  primary: result({{ operation: "click", target: locator("#missing-primary") }}),
+  source: result({{ operation: "dragDrop", source: locator("#missing-source"), destination: locator("#destination") }}),
+  destination: result({{ operation: "dragDrop", source: locator("#source"), destination: locator("#missing-destination") }}),
+  arbitrary: hostBoundary({{ operation: "click", target: locator("#source") }}),
+}}));
+"##,
+        browser_user_input_initialization_script(),
+    );
+    let harness_path = std::env::temp_dir().join(format!(
+        "devmanager-browser-locator-harness-{}.js",
+        std::process::id()
+    ));
+    std::fs::write(&harness_path, harness).expect("write locator Node harness");
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("execute locator Node harness");
+    let _ = std::fs::remove_file(&harness_path);
+    assert!(
+        output.status.success(),
+        "Node harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("Node JSON output"),
+        serde_json::json!({
+            "primary": "locator_primary_not_found",
+            "source": "locator_source_not_found",
+            "destination": "locator_destination_not_found",
+            "arbitrary": "automation_failed",
+        })
+    );
 }
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::{BTreeMap, BTreeSet};

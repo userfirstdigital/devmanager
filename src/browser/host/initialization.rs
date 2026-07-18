@@ -591,7 +591,8 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   };
   const applyAction = (action) => {
     const element = resolveTarget(action.target || action.source);
-    if (!element && action.operation !== "scroll" && action.operation !== "keypress") throw new Error("element_not_found");
+    if (!element && action.operation === "dragDrop") throw new NativeError("locator_source_not_found");
+    if (!element && (action.operation !== "scroll" && action.operation !== "keypress" || action.target)) throw new NativeError("locator_primary_not_found");
     switch (action.operation) {
       case "click": element.click(); break;
       case "hover": element.dispatchEvent(new MouseEvent("mousemove", { bubbles: true })); break;
@@ -617,7 +618,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       }
       case "dragDrop": {
         const destination = resolveTarget(action.destination);
-        if (!destination) throw new Error("element_not_found");
+        if (!destination) throw new NativeError("locator_destination_not_found");
         const transfer = new DataTransfer();
         element.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
         destination.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));

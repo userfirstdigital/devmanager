@@ -78,8 +78,8 @@ pub use host::{
 pub use model::{
     BrowserAnnotation, BrowserAnnotationKind, BrowserAttachmentRevision, BrowserBounds,
     BrowserElementRef, BrowserError, BrowserJournalActor, BrowserJournalEntry, BrowserLocator,
-    BrowserResourceId, BrowserRevision, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserLocatorFailureTarget, BrowserResourceId, BrowserRevision, BrowserTabSnapshot,
+    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,

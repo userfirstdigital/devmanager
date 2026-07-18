@@ -36,6 +36,8 @@ pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus
 }
 
 pub fn unsupported_platform_error(platform: impl Into<String>) -> BrowserError {
+    // Locator failures can only be produced by the Windows host action boundary.
+    // Unsupported hosts must remain unavailable without attempting locator resolution.
     BrowserError::UnavailablePlatform {
         platform: platform.into(),
     }
