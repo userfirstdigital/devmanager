@@ -266,6 +266,8 @@ const collisionDestination = new FakeElement("collision-destination");
 collisionDestination.dispatchEvent = () => {{ throw new Error("locator_destination_not_found"); }};
 const collisionSecret = new FakeElement("collision-secret");
 collisionSecret.focus = () => {{ throw new Error("element_not_found"); }};
+const collisionCaptured = new FakeElement("collision-captured");
+const collisionCapturedSecret = new FakeElement("collision-captured-secret");
 const arbitrary = new FakeElement("arbitrary");
 arbitrary.click = () => {{ throw new Error("page-controlled arbitrary error"); }};
 globalThis.document = {{
@@ -278,6 +280,8 @@ globalThis.document = {{
       "#collision-source": collisionSource,
       "#collision-destination": collisionDestination,
       "#collision-secret": collisionSecret,
+      "#collision-captured": collisionCaptured,
+      "#collision-captured-secret": collisionCapturedSecret,
       "#arbitrary": arbitrary,
     }}[selector] || null;
   }},
@@ -291,6 +295,10 @@ globalThis.window = {{
 }};
 {}
 const locator = (selector) => ({{ locator: {{ cssSelectors: [selector] }} }});
+let capturedActionFailure = null;
+try {{ window.__devmanagerBrowser.act([{{ operation: "click", target: locator("#missing-primary") }}]); }}
+catch (error) {{ capturedActionFailure = error; }}
+collisionCaptured.click = () => {{ throw capturedActionFailure; }};
 const result = (action) => {{
   try {{
     const value = window.__devmanagerBrowser.act([action]);
@@ -299,33 +307,64 @@ const result = (action) => {{
   catch (error) {{ return error.message; }}
 }};
 const hostBoundary = (action) => {{
-  try {{ return window.__devmanagerBrowser.act([action]); }}
+  const ticket = "host-action-ticket";
+  try {{ return window.__devmanagerBrowser.act([action], ticket); }}
   catch (error) {{
-    const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error, ticket);
     if (["locator_primary_not_found", "locator_source_not_found", "locator_destination_not_found"].includes(candidate)) return candidate;
     return "automation_failed";
   }}
 }};
 const secretHostBoundary = () => {{
+  const ticket = "host-secret-ticket";
   window.__devmanagerBrowser.inspectSecretTarget(locator("#collision-secret"), "ticket");
   try {{
     window.__devmanagerBrowser.typeSecret("ticket", "not-a-secret");
     return "secret_type_ok";
   }} catch (error) {{
-    const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error, ticket);
     if (["element_not_found", "target_changed"].includes(candidate)) return candidate;
     return "automation_failed";
+  }}
+}};
+let capturedSecretFailure = null;
+try {{ window.__devmanagerBrowser.typeSecret("missing-ticket", "not-a-secret"); }}
+catch (error) {{ capturedSecretFailure = error; }}
+collisionCapturedSecret.focus = () => {{ throw capturedSecretFailure; }};
+const capturedSecretHostBoundary = () => {{
+  const ticket = "host-captured-secret-ticket";
+  window.__devmanagerBrowser.inspectSecretTarget(locator("#collision-captured-secret"), "ticket-captured");
+  try {{
+    window.__devmanagerBrowser.typeSecret("ticket-captured", "not-a-secret");
+    return "secret_type_ok";
+  }} catch (error) {{
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error, ticket);
+    if (["element_not_found", "target_changed"].includes(candidate)) return candidate;
+    return "automation_failed";
+  }}
+}};
+const missingSecretHostBoundary = () => {{
+  const ticket = "host-missing-secret-ticket";
+  try {{
+    window.__devmanagerBrowser.typeSecret(ticket, "not-a-secret");
+    return "secret_type_ok";
+  }} catch (error) {{
+    return window.__devmanagerBrowser.nativeFailureCode(error, ticket) || "automation_failed";
   }}
 }};
 write(JSON.stringify({{
   primary: result({{ operation: "click", target: locator("#missing-primary") }}),
   source: result({{ operation: "dragDrop", source: locator("#missing-source"), destination: locator("#destination") }}),
   destination: result({{ operation: "dragDrop", source: locator("#source"), destination: locator("#missing-destination") }}),
+  hostPrimary: hostBoundary({{ operation: "click", target: locator("#missing-primary") }}),
   arbitrary: hostBoundary({{ operation: "click", target: locator("#arbitrary") }}),
   collisionPrimary: hostBoundary({{ operation: "click", target: locator("#collision-primary") }}),
   collisionSource: hostBoundary({{ operation: "dragDrop", source: locator("#collision-source"), destination: locator("#source") }}),
   collisionDestination: hostBoundary({{ operation: "dragDrop", source: locator("#source"), destination: locator("#collision-destination") }}),
+  collisionCaptured: hostBoundary({{ operation: "click", target: locator("#collision-captured") }}),
   collisionSecret: secretHostBoundary(),
+  collisionCapturedSecret: capturedSecretHostBoundary(),
+  hostMissingSecret: missingSecretHostBoundary(),
 }}));
 "##,
         browser_user_input_initialization_script(),
@@ -351,11 +390,15 @@ write(JSON.stringify({{
             "primary": "locator_primary_not_found",
             "source": "locator_source_not_found",
             "destination": "locator_destination_not_found",
+            "hostPrimary": "locator_primary_not_found",
             "arbitrary": "automation_failed",
             "collisionPrimary": "automation_failed",
             "collisionSource": "automation_failed",
             "collisionDestination": "automation_failed",
+            "collisionCaptured": "automation_failed",
             "collisionSecret": "automation_failed",
+            "collisionCapturedSecret": "automation_failed",
+            "hostMissingSecret": "element_not_found",
         })
     );
 }

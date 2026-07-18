@@ -2309,14 +2309,29 @@ impl BrowserWebViewHost {
             }
         };
         active.phase = BrowserAsyncPhase::Act { mutating };
+        let failure_ticket = match random_locator_failure_ticket() {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.finish_queued_request(
+                    window,
+                    target,
+                    operation_id,
+                    active.request,
+                    Err(error),
+                );
+                return;
+            }
+        };
+        let failure_ticket_json =
+            serde_json::to_string(&failure_ticket).expect("locator failure ticket is serializable");
         if let Err(error) = self.start_script(
             &target,
             &operation_id,
             &format!(
                 r#"(() => {{
-                    try {{ return window.__devmanagerBrowser.act({encoded}); }}
+                    try {{ return window.__devmanagerBrowser.act({encoded}, {failure_ticket_json}); }}
                     catch (error) {{
-                        const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
+                        const candidate = window.__devmanagerBrowser.nativeFailureCode(error, {failure_ticket_json});
                         if (candidate === "locator_primary_not_found") return "locator_primary_not_found";
                         if (candidate === "locator_source_not_found") return "locator_source_not_found";
                         if (candidate === "locator_destination_not_found") return "locator_destination_not_found";
@@ -2416,7 +2431,7 @@ impl BrowserWebViewHost {
                         window.__devmanagerBrowser.typeSecret({}, {});
                         return "secret_type_ok";
                       }} catch (error) {{
-                        const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
+                        const candidate = window.__devmanagerBrowser.nativeFailureCode(error, {});
                         if (candidate === "element_not_found") return "element_not_found";
                         if (candidate === "target_changed") return "target_changed";
                         return "automation_failed";
@@ -2424,6 +2439,7 @@ impl BrowserWebViewHost {
                     }})()"#,
                 ticket_json,
                 value_json.as_str(),
+                ticket_json,
             ));
             let accepted = self
                 .view(&target.workspace_key, &target.tab_id)?
@@ -4375,6 +4391,20 @@ fn random_secret_target_ticket() -> Result<String, BrowserError> {
     })?;
     let mut ticket = String::with_capacity(39);
     ticket.push_str("secret-");
+    use std::fmt::Write as _;
+    for byte in bytes {
+        let _ = write!(ticket, "{byte:02x}");
+    }
+    Ok(ticket)
+}
+
+fn random_locator_failure_ticket() -> Result<String, BrowserError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| BrowserError::CrashedView {
+        message: "could not generate browser locator failure ticket".to_string(),
+    })?;
+    let mut ticket = String::with_capacity(40);
+    ticket.push_str("locator-");
     use std::fmt::Write as _;
     for byte in bytes {
         let _ = write!(ticket, "{byte:02x}");
