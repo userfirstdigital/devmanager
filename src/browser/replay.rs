@@ -375,6 +375,13 @@ impl BrowserReplayRepairLeaseSlot {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
     }
+
+    fn is_live(&self) -> bool {
+        self.lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
 }
 
 enum BrowserReplayPrivateRepairPhase {
@@ -394,12 +401,148 @@ struct BrowserReplayPrivateRepairState {
     resume_cursor: BrowserReplayRepairResumeCursor,
     snapshot: Option<BrowserResourceHandle>,
     screenshot: Option<BrowserResourceHandle>,
+    snapshot_reserved: bool,
+    screenshot_reserved: bool,
     phase: BrowserReplayPrivateRepairPhase,
 }
 
 impl Drop for BrowserReplayPrivateRepairState {
     fn drop(&mut self) {
         self.lease.close();
+    }
+}
+
+pub(crate) struct BrowserReplayRepairCaptureAuthority {
+    repair: BrowserReplayRepairInstance,
+    resource_store: BrowserResourceStore,
+    lease: Arc<BrowserReplayRepairLeaseSlot>,
+    receipt: Arc<Mutex<BrowserReplayRepairCaptureReceiptState>>,
+    kind: BrowserResourceKind,
+    tab_id: String,
+    revision: BrowserRevision,
+}
+
+struct BrowserReplayRepairCaptureReceiptState {
+    repair: BrowserReplayRepairInstance,
+    kind: BrowserResourceKind,
+    handle: Option<BrowserResourceHandle>,
+    consumed: bool,
+}
+
+pub(crate) struct BrowserReplayRepairCaptureReceipt {
+    lease: Arc<BrowserReplayRepairLeaseSlot>,
+    state: Arc<Mutex<BrowserReplayRepairCaptureReceiptState>>,
+}
+
+pub(crate) struct BrowserReplayRepairCapturedEvidence {
+    repair: BrowserReplayRepairInstance,
+    kind: BrowserResourceKind,
+    handle: BrowserResourceHandle,
+}
+
+impl BrowserReplayRepairCaptureReceipt {
+    pub(crate) fn consume_exact(
+        &self,
+        repair: &BrowserReplayRepairInstance,
+        kind: BrowserResourceKind,
+        handle: &BrowserResourceHandle,
+    ) -> Option<BrowserReplayRepairCapturedEvidence> {
+        let live = self.lease.is_live();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.consumed {
+            return None;
+        }
+        state.consumed = true;
+        let exact = live
+            && state.repair == *repair
+            && state.kind == kind
+            && state.handle.take().as_ref() == Some(handle);
+        exact.then(|| BrowserReplayRepairCapturedEvidence {
+            repair: repair.clone(),
+            kind,
+            handle: handle.clone(),
+        })
+    }
+}
+
+impl BrowserReplayRepairCaptureAuthority {
+    pub(crate) fn repair(&self) -> &BrowserReplayRepairInstance {
+        &self.repair
+    }
+
+    pub(crate) fn kind(&self) -> BrowserResourceKind {
+        self.kind
+    }
+
+    pub(crate) fn tab_id(&self) -> &str {
+        &self.tab_id
+    }
+
+    pub(crate) fn revision(&self) -> BrowserRevision {
+        self.revision
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.lease.is_live()
+    }
+
+    pub(crate) fn retain(
+        &self,
+        store: &BrowserResourceStore,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+        kind: BrowserResourceKind,
+        mime_type: &str,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<BrowserResourceHandle, BrowserError> {
+        let expected_mime =
+            repair_resource_mime(self.kind).ok_or_else(invalid_repair_retention_sidecar)?;
+        if workspace_key != self.repair.workspace_key()
+            || tab_id != self.tab_id
+            || kind != self.kind
+            || mime_type != expected_mime
+            || !self.resource_store.same_runtime(store)
+        {
+            return Err(invalid_repair_retention_sidecar());
+        }
+        let mut receipt = self
+            .receipt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if receipt.repair != self.repair
+            || receipt.kind != self.kind
+            || receipt.consumed
+            || receipt.handle.is_some()
+        {
+            return Err(invalid_repair_retention_sidecar());
+        }
+        let handle = self
+            .lease
+            .with_lease(|lease| store.put_repair_retained(lease, kind, mime_type, bytes))
+            .map_err(|error| match error {
+                BrowserError::ResourceTooLarge { .. } => error,
+                BrowserError::BlockedPermission { .. } => invalid_repair_retention_sidecar(),
+                _ => BrowserError::ResourceRootUnavailable,
+            })?;
+        receipt.handle = Some(handle.clone());
+        Ok(handle)
+    }
+}
+
+fn invalid_repair_retention_sidecar() -> BrowserError {
+    BrowserError::InvalidInvocation {
+        field: "repairSidecar".to_string(),
+    }
+}
+
+fn repair_resource_mime(kind: BrowserResourceKind) -> Option<&'static str> {
+    match kind {
+        BrowserResourceKind::ReplayRepairSnapshot => Some("application/json"),
+        BrowserResourceKind::ReplayRepairScreenshot => Some("image/png"),
+        _ => None,
     }
 }
 
@@ -639,10 +782,154 @@ impl BrowserReplayCoordinator {
             resume_cursor,
             snapshot: None,
             screenshot: None,
+            snapshot_reserved: false,
+            screenshot_reserved: false,
             phase: BrowserReplayPrivateRepairPhase::Capturing,
         });
         state.next_repair_id = repair_id.get();
         Ok(repair)
+    }
+
+    pub(crate) fn issue_locator_repair_capture_authority(
+        &self,
+        repair: &BrowserReplayRepairInstance,
+        kind: BrowserResourceKind,
+    ) -> Result<
+        (
+            BrowserReplayRepairCaptureAuthority,
+            BrowserReplayRepairCaptureReceipt,
+        ),
+        BrowserReplayError,
+    > {
+        if repair_resource_mime(kind).is_none() {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+        let mut state = self.lock();
+        let active = Self::exact_active_mut(&mut state, repair.replay())?;
+        let repair_state = active
+            .repair
+            .as_mut()
+            .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+        if active.projection.status != BrowserReplayStatus::Running
+            || repair_state.instance != *repair
+            || !matches!(
+                repair_state.phase,
+                BrowserReplayPrivateRepairPhase::Capturing
+            )
+        {
+            return Err(BrowserReplayError::InvalidTransition);
+        }
+        let reserved = match kind {
+            BrowserResourceKind::ReplayRepairSnapshot => &mut repair_state.snapshot_reserved,
+            BrowserResourceKind::ReplayRepairScreenshot => &mut repair_state.screenshot_reserved,
+            _ => unreachable!("dedicated repair kind was checked"),
+        };
+        let captured = match kind {
+            BrowserResourceKind::ReplayRepairSnapshot => repair_state.snapshot.is_some(),
+            BrowserResourceKind::ReplayRepairScreenshot => repair_state.screenshot.is_some(),
+            _ => unreachable!("dedicated repair kind was checked"),
+        };
+        if *reserved
+            || captured
+            || (kind == BrowserResourceKind::ReplayRepairScreenshot
+                && repair_state.snapshot.is_none())
+        {
+            return Err(BrowserReplayError::InvalidTransition);
+        }
+        *reserved = true;
+        let receipt = Arc::new(Mutex::new(BrowserReplayRepairCaptureReceiptState {
+            repair: repair.clone(),
+            kind,
+            handle: None,
+            consumed: false,
+        }));
+        Ok((
+            BrowserReplayRepairCaptureAuthority {
+                repair: repair.clone(),
+                resource_store: repair_state.resource_store.clone(),
+                lease: Arc::clone(&repair_state.lease),
+                receipt: Arc::clone(&receipt),
+                kind,
+                tab_id: repair_state.tab_id.clone(),
+                revision: repair_state.revision,
+            },
+            BrowserReplayRepairCaptureReceipt {
+                lease: Arc::clone(&repair_state.lease),
+                state: receipt,
+            },
+        ))
+    }
+
+    pub(crate) fn record_locator_repair_evidence(
+        &self,
+        evidence: BrowserReplayRepairCapturedEvidence,
+    ) -> Result<(), BrowserReplayError> {
+        let BrowserReplayRepairCapturedEvidence {
+            repair,
+            kind,
+            handle,
+        } = evidence;
+        let mut state = self.lock();
+        let active = Self::exact_active_mut(&mut state, repair.replay())?;
+        let repair_state = active
+            .repair
+            .as_mut()
+            .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+        if active.projection.status != BrowserReplayStatus::Running
+            || repair_state.instance != repair
+            || !matches!(
+                repair_state.phase,
+                BrowserReplayPrivateRepairPhase::Capturing
+            )
+            || handle.kind != kind
+            || handle.mime_type != repair_resource_mime(kind).unwrap_or_default()
+            || !handle.pinned
+        {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+        let exact = repair_state
+            .resource_store
+            .handle(repair.workspace_key(), &handle.id)
+            .map_err(|_| BrowserReplayError::RepairEvidenceUnavailable)?;
+        if exact != handle {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+        match kind {
+            BrowserResourceKind::ReplayRepairSnapshot
+                if repair_state.snapshot_reserved && repair_state.snapshot.is_none() =>
+            {
+                repair_state.snapshot = Some(handle);
+                repair_state.snapshot_reserved = false;
+            }
+            BrowserResourceKind::ReplayRepairScreenshot
+                if repair_state.screenshot_reserved && repair_state.screenshot.is_none() =>
+            {
+                repair_state.screenshot = Some(handle);
+                repair_state.screenshot_reserved = false;
+            }
+            _ => return Err(BrowserReplayError::InvalidRepairEvidence),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort_locator_repair_capture(&self, repair: &BrowserReplayRepairInstance) {
+        let removed = {
+            let mut state = self.lock();
+            let Ok(active) = Self::exact_active_mut(&mut state, repair.replay()) else {
+                return;
+            };
+            if active
+                .repair
+                .as_ref()
+                .is_some_and(|candidate| candidate.instance == *repair)
+                && active.projection.status == BrowserReplayStatus::Running
+            {
+                active.repair.take()
+            } else {
+                None
+            }
+        };
+        drop(removed);
     }
 
     #[cfg(test)]
@@ -1421,6 +1708,110 @@ mod tests {
         )
         .unwrap();
         (root, store)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repair_capture_receipt_is_exact_one_shot_and_rejects_late_use() {
+        let (root, store) = repair_store("capture-receipt", 1024 * 1024);
+        let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+        let owner = BrowserWorkspaceKey::new("repair-receipt", "repair-tab").unwrap();
+        let started = coordinator
+            .start(
+                owner.clone(),
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        coordinator.begin(&started.instance).unwrap();
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(7),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let (authority, receipt) = coordinator
+            .issue_locator_repair_capture_authority(
+                &repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+            )
+            .unwrap();
+        let handle = authority
+            .retain(
+                &store,
+                &owner,
+                "runtime-tab-1",
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        assert!(receipt
+            .consume_exact(&repair, BrowserResourceKind::ReplayRepairSnapshot, &handle,)
+            .is_some());
+        assert!(receipt
+            .consume_exact(&repair, BrowserResourceKind::ReplayRepairSnapshot, &handle,)
+            .is_none());
+        coordinator.cancel(&started.instance).unwrap();
+
+        let late_started = coordinator
+            .start(
+                owner.clone(),
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        coordinator.begin(&late_started.instance).unwrap();
+        let late_repair = coordinator
+            .reserve_locator_repair_capture(
+                &late_started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(8),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let (late_authority, late_receipt) = coordinator
+            .issue_locator_repair_capture_authority(
+                &late_repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+            )
+            .unwrap();
+        let late_handle = late_authority
+            .retain(
+                &store,
+                &owner,
+                "runtime-tab-1",
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"late",
+            )
+            .unwrap();
+        coordinator.cancel(&late_started.instance).unwrap();
+        assert!(late_receipt
+            .consume_exact(
+                &late_repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                &late_handle,
+            )
+            .is_none());
+        assert!(matches!(
+            store.handle(&owner, &late_handle.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+
+        drop(late_authority);
+        drop(late_receipt);
+        drop(authority);
+        drop(receipt);
+        drop(coordinator);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "windows")]

@@ -34,11 +34,11 @@ use crate::browser::{
     BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
     BrowserRecordingInstance, BrowserRecordingOperation, BrowserRecordingReview,
     BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget,
-    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
-    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
-    BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
-    MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision,
+    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout,
+    BrowserUploadResult, BrowserWaitResult, BrowserWorkflowCoordinator,
+    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -196,6 +196,65 @@ const ACTION_CALLBACK_LOCATOR_PRIMARY_NOT_FOUND: &str = r#""locator_primary_not_
 const ACTION_CALLBACK_LOCATOR_SOURCE_NOT_FOUND: &str = r#""locator_source_not_found""#;
 const ACTION_CALLBACK_LOCATOR_DESTINATION_NOT_FOUND: &str = r#""locator_destination_not_found""#;
 const ACTION_CALLBACK_AUTOMATION_FAILED: &str = r#""automation_failed""#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrowserCaptureStoragePlan {
+    repair: bool,
+    kind: BrowserResourceKind,
+    mime_type: &'static str,
+}
+
+fn browser_capture_storage_plan(
+    command: &BrowserCommand,
+    repair_expectation: Option<(&str, BrowserRevision)>,
+    observed_tab_id: &str,
+    observed_revision: BrowserRevision,
+    observed_tab_exists: bool,
+) -> Result<BrowserCaptureStoragePlan, BrowserError> {
+    let (ordinary_kind, repair_kind, mime_type) = match command {
+        BrowserCommand::Snapshot { .. } => (
+            BrowserResourceKind::DomSnapshot,
+            Some(BrowserResourceKind::ReplayRepairSnapshot),
+            "application/json",
+        ),
+        BrowserCommand::Screenshot { mode, .. } => (
+            BrowserResourceKind::Screenshot,
+            (*mode == BrowserScreenshotMode::Viewport)
+                .then_some(BrowserResourceKind::ReplayRepairScreenshot),
+            "image/png",
+        ),
+        _ => {
+            return Err(BrowserError::InvalidInvocation {
+                field: "repairSidecar".to_string(),
+            });
+        }
+    };
+    let Some((expected_tab_id, expected_revision)) = repair_expectation else {
+        return Ok(BrowserCaptureStoragePlan {
+            repair: false,
+            kind: ordinary_kind,
+            mime_type,
+        });
+    };
+    let Some(kind) = repair_kind else {
+        return Err(BrowserError::InvalidInvocation {
+            field: "repairSidecar".to_string(),
+        });
+    };
+    if expected_tab_id != observed_tab_id
+        || expected_revision != observed_revision
+        || !observed_tab_exists
+    {
+        return Err(BrowserError::InvalidInvocation {
+            field: "repairSidecar".to_string(),
+        });
+    }
+    Ok(BrowserCaptureStoragePlan {
+        repair: true,
+        kind,
+        mime_type,
+    })
+}
 
 enum BrowserAsyncPhase {
     Approval {
@@ -706,6 +765,10 @@ impl BrowserWebViewHost {
             request.respond(Err(error));
             return;
         }
+        if let Err(error) = request.validate_repair_retention_sidecar() {
+            request.respond(Err(error));
+            return;
+        }
         if !request.cancellation_is_current() {
             request.respond(Err(BrowserError::Interrupted));
             return;
@@ -713,7 +776,7 @@ impl BrowserWebViewHost {
         self.pump_page_recording_ipc();
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
-        if request.context().actor == BrowserInvocationActor::Agent {
+        if request.records_workflow_recipe_action() {
             if let Err(error) = self.workflow_coordinator.reserve_agent_command(
                 &workspace_key,
                 &request.context().operation_id,
@@ -787,6 +850,10 @@ impl BrowserWebViewHost {
             return;
         }
         if let Err(error) = request.validate_secret_sidecar() {
+            self.finish_queued_request(window, target, operation_id, request, Err(error));
+            return;
+        }
+        if let Err(error) = request.validate_repair_retention_sidecar() {
             self.finish_queued_request(window, target, operation_id, request, Err(error));
             return;
         }
@@ -881,7 +948,7 @@ impl BrowserWebViewHost {
         let annotation_command = matches!(request.command(), BrowserCommand::Annotations { .. });
         let agent_journaled = request.context().actor == BrowserInvocationActor::Agent
             && browser_command_is_journaled(request.command());
-        if request.context().actor == BrowserInvocationActor::Agent {
+        if request.records_workflow_recipe_action() {
             if let Err(error) = self.workflow_coordinator.complete_agent_command(
                 &workspace_key,
                 &request.context().operation_id,
@@ -1856,6 +1923,16 @@ impl BrowserWebViewHost {
             );
             return;
         }
+        if let Err(error) = active.request.validate_repair_retention_sidecar() {
+            self.finish_queued_request(
+                window,
+                completion.target,
+                operation_id,
+                active.request,
+                Err(error),
+            );
+            return;
+        }
         let raw = match completion.result {
             Ok(raw) => raw,
             Err(_) => {
@@ -2476,10 +2553,18 @@ impl BrowserWebViewHost {
                 message: "browser semantic snapshot returned invalid data".to_string(),
             })?;
         let tab_id = request.command().tab_id().expect("snapshot tab id");
-        let workspace = self
-            .state
-            .workspace(request.workspace_key())
-            .ok_or_else(missing_workspace)?;
+        let repair_expectation = request
+            .validate_repair_retention_sidecar()?
+            .map(|authority| (authority.tab_id(), authority.revision()));
+        let workspace = self.state.workspace(request.workspace_key());
+        let storage = browser_capture_storage_plan(
+            request.command(),
+            repair_expectation,
+            tab_id,
+            workspace.map_or(BrowserRevision(0), |workspace| workspace.revision),
+            workspace.is_some_and(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id)),
+        )?;
+        let workspace = workspace.ok_or_else(missing_workspace)?;
         let tab = workspace
             .tabs
             .iter()
@@ -2494,12 +2579,18 @@ impl BrowserWebViewHost {
         let encoded = serde_json::to_vec(&snapshot).map_err(|error| BrowserError::CrashedView {
             message: format!("could not encode browser semantic snapshot: {error}"),
         })?;
-        let resource = self.store_resource(
-            request.workspace_key(),
-            BrowserResourceKind::DomSnapshot,
-            "application/json",
-            encoded,
-        )?;
+        let resource = if storage.repair {
+            let encoded = redact_browser_resource_bytes("application/json", &encoded);
+            let store = self.repair_capture_resource_store(request.workspace_key())?;
+            request.retain_repair_resource(&store, storage.kind, storage.mime_type, encoded)?
+        } else {
+            self.store_resource(
+                request.workspace_key(),
+                storage.kind,
+                storage.mime_type,
+                encoded,
+            )?
+        };
         Ok(BrowserResponse::Snapshot {
             summary: BrowserSnapshotSummary {
                 tab_id: tab_id.to_string(),
@@ -2531,12 +2622,33 @@ impl BrowserWebViewHost {
             .map_err(|_| BrowserError::CrashedView {
                 message: "browser screenshot callback returned invalid PNG data".to_string(),
             })?;
-        let resource = self.store_resource(
-            request.workspace_key(),
-            BrowserResourceKind::Screenshot,
-            "image/png",
-            bytes,
+        let repair_expectation = request
+            .validate_repair_retention_sidecar()?
+            .map(|authority| (authority.tab_id(), authority.revision()));
+        let workspace = repair_expectation
+            .is_some()
+            .then(|| self.state.workspace(request.workspace_key()))
+            .flatten();
+        let tab_id = request.command().tab_id().expect("screenshot tab id");
+        let storage = browser_capture_storage_plan(
+            request.command(),
+            repair_expectation,
+            tab_id,
+            workspace.map_or(BrowserRevision(0), |workspace| workspace.revision),
+            workspace.is_some_and(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id)),
         )?;
+        let resource = if storage.repair {
+            let bytes = redact_browser_resource_bytes("image/png", &bytes);
+            let store = self.repair_capture_resource_store(request.workspace_key())?;
+            request.retain_repair_resource(&store, storage.kind, storage.mime_type, bytes)?
+        } else {
+            self.store_resource(
+                request.workspace_key(),
+                storage.kind,
+                storage.mime_type,
+                bytes,
+            )?
+        };
         Ok(BrowserResponse::Screenshot { resource })
     }
 
@@ -2991,6 +3103,21 @@ impl BrowserWebViewHost {
                 revision,
             },
         })
+    }
+
+    fn repair_capture_resource_store(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) -> Result<BrowserResourceStore, BrowserError> {
+        let trusted_root = self
+            .verified_trusted_app_config_dir()
+            .map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        BrowserResourceStore::open_verified(
+            trusted_root,
+            &workspace_key.project_id,
+            BrowserResourceLimits::default(),
+        )
+        .map_err(|_| BrowserError::ResourceRootUnavailable)
     }
 
     fn store_resource(
@@ -5188,13 +5315,15 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod secret_document_state_tests {
     use super::{
-        conservative_tainted_document_risk, contain_queued_host_event,
-        finish_secret_exposure_on_error, fixed_secret_type_callback_result, view_key,
+        browser_capture_storage_plan, conservative_tainted_document_risk,
+        contain_queued_host_event, finish_secret_exposure_on_error,
+        fixed_secret_type_callback_result, view_key, BrowserCaptureStoragePlan,
         BrowserDocumentSecretState, BrowserWebViewHost, WORKSPACE_OPERATION_TAB,
     };
     use crate::browser::{
-        BrowserApprovalPolicy, BrowserDiagnosticLevel, BrowserDownloadState, BrowserHostEvent,
-        BrowserPageLoadState, BrowserRisk, BrowserUserInputKind, BrowserWorkspaceKey,
+        BrowserApprovalPolicy, BrowserCommand, BrowserDiagnosticLevel, BrowserDownloadState,
+        BrowserError, BrowserHostEvent, BrowserPageLoadState, BrowserResourceKind, BrowserRevision,
+        BrowserRisk, BrowserScreenshotMode, BrowserUserInputKind, BrowserWorkspaceKey,
     };
     use std::{path::PathBuf, sync::Arc};
 
@@ -5203,6 +5332,112 @@ mod secret_document_state_tests {
         CloseTab,
         ResetWorkspace,
         ClearProjectProfile,
+    }
+
+    #[test]
+    fn repair_capture_storage_plan_requires_exact_snapshot_and_viewport_screenshot_state() {
+        let snapshot = BrowserCommand::Snapshot {
+            tab_id: "tab-a".to_string(),
+        };
+        let viewport = BrowserCommand::Screenshot {
+            tab_id: "tab-a".to_string(),
+            mode: BrowserScreenshotMode::Viewport,
+        };
+        let full_page = BrowserCommand::Screenshot {
+            tab_id: "tab-a".to_string(),
+            mode: BrowserScreenshotMode::FullPage,
+        };
+        let revision = BrowserRevision(9);
+
+        assert_eq!(
+            browser_capture_storage_plan(&snapshot, None, "tab-a", revision, true).unwrap(),
+            BrowserCaptureStoragePlan {
+                repair: false,
+                kind: BrowserResourceKind::DomSnapshot,
+                mime_type: "application/json",
+            }
+        );
+        assert_eq!(
+            browser_capture_storage_plan(&viewport, None, "tab-a", revision, true).unwrap(),
+            BrowserCaptureStoragePlan {
+                repair: false,
+                kind: BrowserResourceKind::Screenshot,
+                mime_type: "image/png",
+            }
+        );
+        assert_eq!(
+            browser_capture_storage_plan(
+                &snapshot,
+                Some(("tab-a", revision)),
+                "tab-a",
+                revision,
+                true,
+            )
+            .unwrap(),
+            BrowserCaptureStoragePlan {
+                repair: true,
+                kind: BrowserResourceKind::ReplayRepairSnapshot,
+                mime_type: "application/json",
+            }
+        );
+        assert_eq!(
+            browser_capture_storage_plan(
+                &viewport,
+                Some(("tab-a", revision)),
+                "tab-a",
+                revision,
+                true,
+            )
+            .unwrap(),
+            BrowserCaptureStoragePlan {
+                repair: true,
+                kind: BrowserResourceKind::ReplayRepairScreenshot,
+                mime_type: "image/png",
+            }
+        );
+
+        for result in [
+            browser_capture_storage_plan(
+                &snapshot,
+                Some(("tab-b", revision)),
+                "tab-a",
+                revision,
+                true,
+            ),
+            browser_capture_storage_plan(
+                &snapshot,
+                Some(("tab-a", BrowserRevision(8))),
+                "tab-a",
+                revision,
+                true,
+            ),
+            browser_capture_storage_plan(
+                &viewport,
+                Some(("tab-a", revision)),
+                "tab-a",
+                revision,
+                false,
+            ),
+            browser_capture_storage_plan(
+                &snapshot,
+                Some(("tab-a", revision)),
+                "tab-a",
+                revision,
+                false,
+            ),
+            browser_capture_storage_plan(
+                &full_page,
+                Some(("tab-a", revision)),
+                "tab-a",
+                revision,
+                true,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+            ));
+        }
     }
 
     fn assert_missing_state_contains_queued_values(removal: DocumentStateRemoval) {

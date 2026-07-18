@@ -2230,8 +2230,110 @@ fn secure_command_real_host_ingress_rejects_missing_or_stale_sidecar_before_work
 
     let unsupported = include_str!("../src/browser/host/unsupported.rs");
     let unsupported_request = &unsupported[unsupported.find("pub fn handle_request(").unwrap()..];
-    assert!(unsupported_request.contains("unsupported_validated_command_response"));
+    assert!(unsupported_request.contains("unsupported_request_response"));
     assert!(!unsupported_request.contains("self.handle_command(window"));
+}
+
+#[test]
+fn repair_capture_host_bridge_validates_before_dedicated_or_ordinary_storage() {
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let snapshot_start = windows.find("fn complete_snapshot(").unwrap();
+    let screenshot_start = windows[snapshot_start..]
+        .find("fn complete_screenshot(")
+        .map(|offset| snapshot_start + offset)
+        .unwrap();
+    let wait_start = windows[screenshot_start..]
+        .find("fn complete_wait(")
+        .map(|offset| screenshot_start + offset)
+        .unwrap();
+
+    for completion in [
+        &windows[snapshot_start..screenshot_start],
+        &windows[screenshot_start..wait_start],
+    ] {
+        let sidecar = completion
+            .find("validate_repair_retention_sidecar")
+            .expect("host completion validates the private sidecar");
+        let plan = completion
+            .find("browser_capture_storage_plan")
+            .expect("host completion checks exact tab and revision through the pure plan");
+        let retain = completion
+            .find("retain_repair_resource")
+            .expect("repair branch uses retained repair storage");
+        assert!(sidecar < plan && plan < retain);
+        assert!(completion.contains("if storage.repair"));
+        assert!(completion.contains("request.retain_repair_resource"));
+        assert!(completion.contains("self.store_resource"));
+        assert!(completion.contains("storage.kind"));
+        assert!(completion.contains("storage.mime_type"));
+        assert!(completion.contains("self.repair_capture_resource_store"));
+        assert!(!completion.contains("BrowserResourceStore::open_verified"));
+    }
+    let snapshot = &windows[snapshot_start..screenshot_start];
+    let snapshot_plan = snapshot.find("browser_capture_storage_plan").unwrap();
+    assert!(snapshot_plan < snapshot.find("ok_or_else(missing_workspace)").unwrap());
+    assert!(snapshot_plan < snapshot.find("ok_or_else(|| missing_tab(tab_id))").unwrap());
+
+    let store_start = windows
+        .find("fn repair_capture_resource_store(")
+        .expect("repair store opener collapses every root/open failure");
+    let store_end = windows[store_start..]
+        .find("fn store_resource(")
+        .map(|offset| store_start + offset)
+        .unwrap();
+    let store = &windows[store_start..store_end];
+    assert!(store.contains("verified_trusted_app_config_dir()"));
+    assert!(store.contains("BrowserResourceStore::open_verified"));
+    assert_eq!(
+        store
+            .matches("BrowserError::ResourceRootUnavailable")
+            .count(),
+        2,
+        "both trusted-root revalidation and store open must collapse to one fixed error"
+    );
+
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+    let request_start = unsupported
+        .find("pub(crate) fn unsupported_request_response(")
+        .unwrap();
+    let request_end = unsupported[request_start..]
+        .find("pub struct BrowserWebViewHost")
+        .map(|offset| request_start + offset)
+        .unwrap();
+    let request = &unsupported[request_start..request_end];
+    let secret = request.find("validate_secret_sidecar").unwrap();
+    let repair = request.find("validate_repair_retention_sidecar").unwrap();
+    let platform = request
+        .find("unsupported_validated_command_response")
+        .unwrap();
+    assert!(secret < platform && repair < platform);
+
+    let ingress_start = windows.find("pub fn handle_request(").unwrap();
+    let ingress_end = windows[ingress_start..]
+        .find("pub fn pump_async_completions(")
+        .map(|offset| ingress_start + offset)
+        .unwrap();
+    let ingress = &windows[ingress_start..ingress_end];
+    assert!(
+        ingress.find("records_workflow_recipe_action").unwrap()
+            < ingress.find("reserve_agent_command").unwrap()
+    );
+    let respond_start = windows.find("fn respond_request(").unwrap();
+    let respond_end = windows[respond_start..]
+        .find("fn cancel_tab_operations(")
+        .map(|offset| respond_start + offset)
+        .unwrap();
+    let respond = &windows[respond_start..respond_end];
+    assert!(
+        respond.find("records_workflow_recipe_action").unwrap()
+            < respond.find("complete_agent_command").unwrap()
+    );
+    let journal = &respond[respond.find("let agent_journaled").unwrap()..];
+    let journal_gate = &journal[..journal
+        .find("if request.records_workflow_recipe_action()")
+        .unwrap()];
+    assert!(journal_gate.contains("request.context().actor == BrowserInvocationActor::Agent"));
+    assert!(journal_gate.contains("browser_command_is_journaled(request.command())"));
 }
 
 #[test]

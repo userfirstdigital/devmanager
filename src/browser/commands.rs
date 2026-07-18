@@ -1,3 +1,6 @@
+use super::replay::BrowserReplayRepairCaptureAuthority;
+#[cfg(test)]
+use super::replay::{BrowserReplayRepairCaptureReceipt, BrowserReplayRepairCapturedEvidence};
 use super::{
     BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserAnnotationCandidate,
     BrowserAnnotationDetails, BrowserAnnotationDraft, BrowserAnnotationMutationResult,
@@ -5,10 +8,11 @@ use super::{
     BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation, BrowserError,
     BrowserNetworkEntry, BrowserNetworkOperation, BrowserPerformanceOperation,
     BrowserPerformanceSnapshot, BrowserRecipeInputKind, BrowserRecordingStatus,
-    BrowserReplayInstance, BrowserReplaySecretLease, BrowserResourceHandle, BrowserResourceId,
-    BrowserRisk, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserTabSnapshot,
-    BrowserUploadResult, BrowserViewport, BrowserWaitCondition, BrowserWaitResult,
-    BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BrowserReplayCoordinator, BrowserReplayInstance, BrowserReplayRepairInstance,
+    BrowserReplaySecretLease, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceStore, BrowserRisk, BrowserScreenshotMode, BrowserSnapshotSummary,
+    BrowserTabSnapshot, BrowserUploadResult, BrowserViewport, BrowserWaitCondition,
+    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -755,6 +759,38 @@ struct BrowserReplaySecretSidecar {
     lease: BrowserReplaySecretLease,
 }
 
+struct BrowserReplayRepairRetentionSidecar {
+    authority: BrowserReplayRepairCaptureAuthority,
+}
+
+struct BrowserReplayRepairRequestGuard {
+    coordinator: BrowserReplayCoordinator,
+    repair: BrowserReplayRepairInstance,
+    armed: bool,
+}
+
+impl BrowserReplayRepairRequestGuard {
+    fn new(coordinator: &BrowserReplayCoordinator, repair: &BrowserReplayRepairInstance) -> Self {
+        Self {
+            coordinator: coordinator.clone(),
+            repair: repair.clone(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BrowserReplayRepairRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.coordinator.abort_locator_repair_capture(&self.repair);
+        }
+    }
+}
+
 struct BrowserCommandEnvelope {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
@@ -763,6 +799,7 @@ struct BrowserCommandEnvelope {
     cancellation_ticket: CancellationTicket,
     registration_lease: Option<BrowserRegistrationLease>,
     replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
+    replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     pending_work: PendingWorkGuard,
 }
@@ -952,7 +989,7 @@ impl BrowserController {
         command: BrowserCommand,
         context: BrowserInvocationContext,
     ) -> Result<BrowserResponse, BrowserError> {
-        self.request_with_context_and_local_project_root(command, context, None, None)
+        self.request_with_context_and_local_project_root(command, context, None, None, None)
             .await
     }
 
@@ -963,8 +1000,14 @@ impl BrowserController {
         local_project_root: &std::path::Path,
     ) -> Result<BrowserResponse, BrowserError> {
         let canonical = verified_authenticated_local_project_root(local_project_root)?;
-        self.request_with_context_and_local_project_root(command, context, Some(canonical), None)
-            .await
+        self.request_with_context_and_local_project_root(
+            command,
+            context,
+            Some(canonical),
+            None,
+            None,
+        )
+        .await
     }
 
     #[allow(dead_code)] // The checkpoint-9 replay executor consumes this secure lane in Task 4.
@@ -990,8 +1033,71 @@ impl BrowserController {
                 expected_instance,
                 lease,
             }),
+            None,
         )
         .await
+    }
+
+    pub(crate) async fn request_replay_repair_capture(
+        &self,
+        coordinator: &BrowserReplayCoordinator,
+        repair: &BrowserReplayRepairInstance,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+    ) -> Result<BrowserResponse, BrowserError> {
+        let kind = repair_capture_kind(&command).ok_or_else(invalid_repair_sidecar)?;
+        if context.actor != BrowserInvocationActor::Agent
+            || repair.workspace_key() != &self.workspace_key
+            || command.tab_id().is_none()
+        {
+            return Err(invalid_repair_sidecar());
+        }
+        let (authority, receipt) = coordinator
+            .issue_locator_repair_capture_authority(repair, kind)
+            .map_err(|_| invalid_repair_sidecar())?;
+        let mut guard = BrowserReplayRepairRequestGuard::new(coordinator, repair);
+        if command.tab_id() != Some(authority.tab_id()) {
+            return Err(invalid_repair_sidecar());
+        }
+        let expected_tab_id = authority.tab_id().to_string();
+        let expected_revision = authority.revision();
+        let response = self
+            .request_with_context_and_local_project_root(
+                command,
+                context,
+                None,
+                None,
+                Some(BrowserReplayRepairRetentionSidecar { authority }),
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return Err(contain_repair_capture_error(error)),
+        };
+        let handle = match (&response, kind) {
+            (
+                BrowserResponse::Snapshot { summary, resource },
+                BrowserResourceKind::ReplayRepairSnapshot,
+            ) if summary.tab_id == expected_tab_id && summary.revision == expected_revision => {
+                resource
+            }
+            (
+                BrowserResponse::Screenshot { resource },
+                BrowserResourceKind::ReplayRepairScreenshot,
+            ) => resource,
+            _ => return Err(invalid_repair_sidecar()),
+        };
+        let evidence = receipt
+            .consume_exact(repair, kind, handle)
+            .ok_or_else(invalid_repair_sidecar)?;
+        if coordinator
+            .record_locator_repair_evidence(evidence)
+            .is_err()
+        {
+            return Err(invalid_repair_sidecar());
+        }
+        guard.disarm();
+        Ok(response)
     }
 
     async fn request_with_context_and_local_project_root(
@@ -1000,6 +1106,7 @@ impl BrowserController {
         context: BrowserInvocationContext,
         local_project_root: Option<PathBuf>,
         replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
+        replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
     ) -> Result<BrowserResponse, BrowserError> {
         context.validate()?;
         let operation = command.operation_name().to_string();
@@ -1026,6 +1133,7 @@ impl BrowserController {
                 cancellation_ticket,
                 registration_lease: self.registration_lease.clone(),
                 replay_secret_sidecar,
+                replay_repair_sidecar,
                 response,
                 pending_work: self.pending_work.track(),
             });
@@ -1100,6 +1208,7 @@ impl BrowserController {
                 cancellation_ticket,
                 registration_lease: self.registration_lease.clone(),
                 replay_secret_sidecar: None,
+                replay_repair_sidecar: None,
                 response,
                 pending_work: self.pending_work.track(),
             })
@@ -1200,6 +1309,7 @@ impl BrowserController {
                     cancellation_ticket,
                     registration_lease: self.registration_lease.clone(),
                     replay_secret_sidecar: None,
+                    replay_repair_sidecar: None,
                     response,
                     pending_work: self.pending_work.track(),
                 });
@@ -1231,6 +1341,46 @@ fn validate_secret_command_authority(
 fn invalid_secret_sidecar() -> BrowserError {
     BrowserError::InvalidInvocation {
         field: "secretSidecar".to_string(),
+    }
+}
+
+fn repair_capture_kind(command: &BrowserCommand) -> Option<BrowserResourceKind> {
+    match command {
+        BrowserCommand::Snapshot { .. } => Some(BrowserResourceKind::ReplayRepairSnapshot),
+        BrowserCommand::Screenshot {
+            mode: BrowserScreenshotMode::Viewport,
+            ..
+        } => Some(BrowserResourceKind::ReplayRepairScreenshot),
+        _ => None,
+    }
+}
+
+fn invalid_repair_sidecar() -> BrowserError {
+    BrowserError::InvalidInvocation {
+        field: "repairSidecar".to_string(),
+    }
+}
+
+fn contain_repair_capture_error(error: BrowserError) -> BrowserError {
+    match error {
+        safe @ BrowserError::Interrupted
+        | safe @ BrowserError::ResourceTooLarge { .. }
+        | safe @ BrowserError::StaleReference { .. }
+        | safe @ BrowserError::LocatorNotFound { .. }
+        | safe @ BrowserError::ResourceRootBusy
+        | safe @ BrowserError::ResourceRootUnavailable => safe,
+        BrowserError::Timeout { operation }
+            if matches!(operation.as_str(), "snapshot" | "screenshot") =>
+        {
+            BrowserError::Timeout { operation }
+        }
+        BrowserError::InvalidInvocation { field } if field == "repairSidecar" => {
+            BrowserError::InvalidInvocation { field }
+        }
+        BrowserError::UnavailablePlatform { .. } => BrowserError::UnavailablePlatform {
+            platform: std::env::consts::OS.to_string(),
+        },
+        _ => BrowserError::ResourceRootUnavailable,
     }
 }
 
@@ -1379,6 +1529,7 @@ pub struct BrowserCommandRequest {
     cancellations: Arc<CancellationEpochs>,
     registration_lease: Option<BrowserRegistrationLease>,
     replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
+    replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     _pending_work: PendingWorkGuard,
     started_at: String,
@@ -1431,6 +1582,59 @@ impl BrowserCommandRequest {
         }
     }
 
+    pub(crate) fn validate_repair_retention_sidecar(
+        &self,
+    ) -> Result<Option<&BrowserReplayRepairCaptureAuthority>, BrowserError> {
+        let Some(sidecar) = &self.replay_repair_sidecar else {
+            return Ok(None);
+        };
+        let authority = &sidecar.authority;
+        if self.context.actor != BrowserInvocationActor::Agent
+            || authority.repair().workspace_key() != &self.workspace_key
+            || self.command.tab_id() != Some(authority.tab_id())
+            || repair_capture_kind(&self.command) != Some(authority.kind())
+            || !authority.is_live()
+        {
+            return Err(invalid_repair_sidecar());
+        }
+        Ok(Some(authority))
+    }
+
+    pub(crate) fn records_workflow_recipe_action(&self) -> bool {
+        self.context.actor == BrowserInvocationActor::Agent && self.replay_repair_sidecar.is_none()
+    }
+
+    pub(crate) fn retain_repair_resource(
+        &self,
+        store: &BrowserResourceStore,
+        kind: BrowserResourceKind,
+        mime_type: &str,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<BrowserResourceHandle, BrowserError> {
+        let authority = self
+            .validate_repair_retention_sidecar()?
+            .ok_or_else(invalid_repair_sidecar)?;
+        authority.retain(
+            store,
+            &self.workspace_key,
+            self.command.tab_id().ok_or_else(invalid_repair_sidecar)?,
+            kind,
+            mime_type,
+            bytes,
+        )
+    }
+
+    #[cfg(test)]
+    fn retain_repair_resource_for_test(
+        &self,
+        store: &BrowserResourceStore,
+        kind: BrowserResourceKind,
+        mime_type: &str,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<BrowserResourceHandle, BrowserError> {
+        self.retain_repair_resource(store, kind, mime_type, bytes)
+    }
+
     pub(crate) fn started_at(&self) -> &str {
         &self.started_at
     }
@@ -1473,6 +1677,7 @@ impl BrowserCommandRequest {
             cancellation_ticket,
             registration_lease,
             replay_secret_sidecar,
+            replay_repair_sidecar,
             response,
             pending_work,
         } = envelope;
@@ -1485,6 +1690,7 @@ impl BrowserCommandRequest {
             cancellations,
             registration_lease,
             replay_secret_sidecar,
+            replay_repair_sidecar,
             response,
             _pending_work: pending_work,
             started_at: OffsetDateTime::now_utc()
@@ -1739,11 +1945,101 @@ mod secure_command_tests {
         compile_browser_replay, BrowserActionTarget, BrowserRecipeAction, BrowserRecipeInput,
         BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
         BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayInstance,
-        BrowserReplaySecretLease, BrowserReplaySecretSubmission, BROWSER_RECIPE_SCHEMA_VERSION,
+        BrowserReplayLocatorSlot, BrowserReplayRepairInstance, BrowserReplayRepairResumeCursor,
+        BrowserReplaySecretLease, BrowserReplaySecretSubmission, BrowserResourceKind,
+        BrowserResourceLimits, BrowserResourceStore, BrowserRevision,
+        BROWSER_RECIPE_SCHEMA_VERSION,
     };
+    use static_assertions::assert_not_impl_any;
+
+    assert_not_impl_any!(BrowserReplayRepairRetentionSidecar: Clone, std::fmt::Debug, serde::Serialize);
+    assert_not_impl_any!(BrowserReplayRepairCaptureAuthority: Clone, std::fmt::Debug, serde::Serialize);
+    assert_not_impl_any!(BrowserReplayRepairCaptureReceipt: Clone, std::fmt::Debug, serde::Serialize);
+    assert_not_impl_any!(BrowserReplayRepairCapturedEvidence: Clone, std::fmt::Debug, serde::Serialize);
 
     const SECRET_INPUT: &str = "password";
     const SECRET_VALUE: &str = "value-sentinel-secure-sidecar";
+
+    #[test]
+    fn repair_capture_error_boundary_is_a_closed_value_free_allowlist() {
+        const SENTINEL: &str = "DM_REPAIR_ERROR_SENTINEL_6E2A";
+        for unsafe_error in [
+            BrowserError::CrashedView {
+                message: SENTINEL.to_string(),
+            },
+            BrowserError::NavigationFailure {
+                url: SENTINEL.to_string(),
+                message: SENTINEL.to_string(),
+            },
+            BrowserError::InvalidAnnotation {
+                field: SENTINEL.to_string(),
+                message: SENTINEL.to_string(),
+            },
+            BrowserError::InvalidRecipe {
+                message: SENTINEL.to_string(),
+            },
+            BrowserError::MissingResource {
+                id: BrowserResourceId(SENTINEL.to_string()),
+            },
+            BrowserError::BlockedPermission {
+                permission: SENTINEL.to_string(),
+            },
+            BrowserError::Timeout {
+                operation: SENTINEL.to_string(),
+            },
+            BrowserError::InvalidInvocation {
+                field: SENTINEL.to_string(),
+            },
+        ] {
+            let contained = contain_repair_capture_error(unsafe_error);
+            assert_eq!(contained, BrowserError::ResourceRootUnavailable);
+            for surface in [
+                format!("{contained:?}"),
+                serde_json::to_string(&contained).unwrap(),
+            ] {
+                assert!(!surface.contains(SENTINEL), "{surface}");
+            }
+        }
+
+        let platform = contain_repair_capture_error(BrowserError::UnavailablePlatform {
+            platform: SENTINEL.to_string(),
+        });
+        assert_eq!(
+            platform,
+            BrowserError::UnavailablePlatform {
+                platform: std::env::consts::OS.to_string(),
+            }
+        );
+        assert!(!format!("{platform:?}").contains(SENTINEL));
+
+        for safe_error in [
+            BrowserError::Interrupted,
+            BrowserError::Timeout {
+                operation: "snapshot".to_string(),
+            },
+            BrowserError::Timeout {
+                operation: "screenshot".to_string(),
+            },
+            BrowserError::ResourceTooLarge {
+                byte_size: 8,
+                limit: 4,
+            },
+            BrowserError::StaleReference {
+                expected: BrowserRevision(9),
+                actual: BrowserRevision(10),
+            },
+            BrowserError::LocatorNotFound {
+                target: crate::browser::BrowserLocatorFailureTarget::Primary,
+            },
+            BrowserError::ResourceRootBusy,
+            BrowserError::ResourceRootUnavailable,
+            BrowserError::InvalidInvocation {
+                field: "repairSidecar".to_string(),
+            },
+        ] {
+            assert_eq!(contain_repair_capture_error(safe_error.clone()), safe_error);
+        }
+    }
 
     fn workspace(project_id: &str, ai_tab_id: &str) -> BrowserWorkspaceKey {
         BrowserWorkspaceKey::new(project_id, ai_tab_id).unwrap()
@@ -1820,6 +2116,60 @@ mod secure_command_tests {
         (coordinator, instance, lease)
     }
 
+    #[cfg(target_os = "windows")]
+    fn installed_repair(
+        workspace_key: &BrowserWorkspaceKey,
+        store: &BrowserResourceStore,
+    ) -> (
+        BrowserReplayCoordinator,
+        BrowserReplayInstance,
+        BrowserReplayRepairInstance,
+    ) {
+        let coordinator = BrowserReplayCoordinator::default();
+        let plan = compile_browser_replay(
+            &BrowserRecipeV1 {
+                schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                id: "repair-command-recipe".to_string(),
+                name: "Repair command recipe".to_string(),
+                description: "Repair command authority fixture".to_string(),
+                start_url: "https://example.test".to_string(),
+                viewport: BrowserRecipeViewport {
+                    width: 1280,
+                    height: 720,
+                    scale_percent: 100,
+                },
+                inputs: Vec::new(),
+                steps: vec![BrowserRecipeStep {
+                    id: "click-target".to_string(),
+                    action: BrowserRecipeAction::Click {
+                        locator: BrowserRecipeLocator {
+                            test_id: Some("target".to_string()),
+                            ..BrowserRecipeLocator::default()
+                        },
+                    },
+                    wait: None,
+                    assertions: Vec::new(),
+                }],
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let started = coordinator.start(workspace_key.clone(), plan).unwrap();
+        coordinator.begin(&started.instance).unwrap();
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &started.instance,
+                store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "tab-a",
+                BrowserRevision(9),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        (coordinator, started.instance, repair)
+    }
+
     fn forged_request(
         workspace_key: BrowserWorkspaceKey,
         command: BrowserCommand,
@@ -1838,6 +2188,7 @@ mod secure_command_tests {
                 cancellation_ticket,
                 registration_lease: None,
                 replay_secret_sidecar,
+                replay_repair_sidecar: None,
                 response,
                 pending_work: pending_work.track(),
             },
@@ -1853,6 +2204,643 @@ mod secure_command_tests {
         })
         .await
         .expect("secure request becomes pending");
+    }
+
+    fn forged_repair_request(
+        workspace_key: BrowserWorkspaceKey,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+        authority: BrowserReplayRepairCaptureAuthority,
+    ) -> BrowserCommandRequest {
+        let cancellations = Arc::new(CancellationEpochs::default());
+        let cancellation_ticket = cancellations.ticket(&workspace_key, command.tab_id());
+        let pending_work = Arc::new(PendingWork::default());
+        let (response, _receiver) = oneshot::channel();
+        BrowserCommandRequest::from_envelope(
+            BrowserCommandEnvelope {
+                workspace_key,
+                command,
+                context,
+                local_project_root: None,
+                cancellation_ticket,
+                registration_lease: None,
+                replay_secret_sidecar: None,
+                replay_repair_sidecar: Some(BrowserReplayRepairRetentionSidecar { authority }),
+                response,
+                pending_work: pending_work.track(),
+            },
+            cancellations,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn repair_capture_sidecar_retains_and_records_exact_snapshot_then_screenshot() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-repair-command-sidecar-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let workspace_key = workspace("repair-command", "conversation-a");
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let (coordinator, instance, repair) = installed_repair(&workspace_key, &store);
+        let task_controller = controller.clone();
+        let task_coordinator = coordinator.clone();
+        let task_repair = repair.clone();
+        let task = tokio::spawn(async move {
+            task_controller
+                .request_replay_repair_capture(
+                    &task_coordinator,
+                    &task_repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("repair snapshot", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await
+        });
+
+        let request = inbox.recv().await.expect("repair snapshot reaches host");
+        assert!(request
+            .validate_repair_retention_sidecar()
+            .expect("exact private sidecar")
+            .is_some());
+        assert!(!request.records_workflow_recipe_action());
+        assert_eq!(
+            crate::browser::host::unsupported_request_response("fixture", &request),
+            Err(BrowserError::UnavailablePlatform {
+                platform: "fixture".to_string(),
+            })
+        );
+        let resource = request
+            .retain_repair_resource_for_test(
+                &store,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        request.respond(Ok(BrowserResponse::Snapshot {
+            summary: BrowserSnapshotSummary {
+                tab_id: "tab-a".to_string(),
+                url: "https://example.test".to_string(),
+                revision: BrowserRevision(9),
+                element_count: 0,
+            },
+            resource: resource.clone(),
+        }));
+        assert!(matches!(
+            task.await.unwrap(),
+            Ok(BrowserResponse::Snapshot { resource: returned, .. }) if returned == resource
+        ));
+        assert_eq!(
+            coordinator.status(&instance).unwrap().status,
+            crate::browser::BrowserReplayStatus::Running
+        );
+        assert!(store.handle(&workspace_key, &resource.id).unwrap().pinned);
+
+        let screenshot_controller = controller.clone();
+        let screenshot_coordinator = coordinator.clone();
+        let screenshot_repair = repair.clone();
+        let screenshot_task = tokio::spawn(async move {
+            screenshot_controller
+                .request_replay_repair_capture(
+                    &screenshot_coordinator,
+                    &screenshot_repair,
+                    BrowserCommand::Screenshot {
+                        tab_id: "tab-a".to_string(),
+                        mode: BrowserScreenshotMode::Viewport,
+                    },
+                    BrowserInvocationContext::agent("repair screenshot", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await
+        });
+        let screenshot_request = inbox.recv().await.expect("repair screenshot reaches host");
+        assert!(screenshot_request
+            .validate_repair_retention_sidecar()
+            .expect("exact screenshot sidecar")
+            .is_some());
+        for (kind, mime_type) in [
+            (BrowserResourceKind::ReplayRepairSnapshot, "image/png"),
+            (
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "application/octet-stream",
+            ),
+        ] {
+            assert!(matches!(
+                screenshot_request.retain_repair_resource_for_test(
+                    &store,
+                    kind,
+                    mime_type,
+                    b"png",
+                ),
+                Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+            ));
+        }
+        let screenshot = screenshot_request
+            .retain_repair_resource_for_test(
+                &store,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                b"png",
+            )
+            .unwrap();
+        screenshot_request.respond(Ok(BrowserResponse::Screenshot {
+            resource: screenshot.clone(),
+        }));
+        assert!(matches!(
+            screenshot_task.await.unwrap(),
+            Ok(BrowserResponse::Screenshot { resource: returned }) if returned == screenshot
+        ));
+        let projection = coordinator
+            .publish_locator_repair(&repair, &resource, &screenshot)
+            .unwrap();
+        assert_eq!(projection.snapshot, resource);
+        assert_eq!(projection.screenshot, screenshot);
+        assert_eq!(
+            coordinator.status(&instance).unwrap().status,
+            crate::browser::BrowserReplayStatus::PausedLocatorRepair
+        );
+
+        coordinator.cancel(&instance).unwrap();
+        assert!(matches!(
+            store.handle(&workspace_key, &resource.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        assert!(matches!(
+            store.handle(&workspace_key, &screenshot.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn repair_capture_rejects_same_root_cross_coordinator_handle_substitution() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-repair-command-receipt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let workspace_key = workspace("repair-receipt", "conversation-a");
+        let (left_coordinator, left_instance, left_repair) =
+            installed_repair(&workspace_key, &store);
+        let (right_coordinator, right_instance, right_repair) =
+            installed_repair(&workspace_key, &store);
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(2));
+
+        let left_controller = controller.clone();
+        let task_coordinator = left_coordinator.clone();
+        let task_repair = left_repair.clone();
+        let left_task = tokio::spawn(async move {
+            left_controller
+                .request_replay_repair_capture(
+                    &task_coordinator,
+                    &task_repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("left repair", BrowserRisk::Normal).unwrap(),
+                )
+                .await
+        });
+        let left_request = inbox.recv().await.unwrap();
+        let left_handle = left_request
+            .retain_repair_resource_for_test(
+                &store,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"left",
+            )
+            .unwrap();
+
+        let right_controller = controller.clone();
+        let task_coordinator = right_coordinator.clone();
+        let task_repair = right_repair.clone();
+        let right_task = tokio::spawn(async move {
+            right_controller
+                .request_replay_repair_capture(
+                    &task_coordinator,
+                    &task_repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("right repair", BrowserRisk::Normal).unwrap(),
+                )
+                .await
+        });
+        let right_request = inbox.recv().await.unwrap();
+        let right_handle = right_request
+            .retain_repair_resource_for_test(
+                &store,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"right",
+            )
+            .unwrap();
+
+        left_request.respond(Ok(BrowserResponse::Snapshot {
+            summary: BrowserSnapshotSummary {
+                tab_id: "tab-a".to_string(),
+                url: "https://example.test".to_string(),
+                revision: BrowserRevision(9),
+                element_count: 0,
+            },
+            resource: right_handle.clone(),
+        }));
+        right_request.respond(Ok(BrowserResponse::Snapshot {
+            summary: BrowserSnapshotSummary {
+                tab_id: "tab-a".to_string(),
+                url: "https://example.test".to_string(),
+                revision: BrowserRevision(9),
+                element_count: 0,
+            },
+            resource: left_handle.clone(),
+        }));
+        assert!(matches!(
+            left_task.await.unwrap(),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        assert!(matches!(
+            right_task.await.unwrap(),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        assert!(matches!(
+            store.handle(&workspace_key, &left_handle.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        assert!(matches!(
+            store.handle(&workspace_key, &right_handle.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+
+        left_coordinator.cancel(&left_instance).unwrap();
+        right_coordinator.cancel(&right_instance).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn repair_sidecar_rejects_wrong_sequence_root_command_and_late_cancelled_use() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-repair-sidecar-edge-{}",
+            std::process::id()
+        ));
+        let other_root = std::env::temp_dir().join(format!(
+            "devmanager-repair-sidecar-other-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other_root);
+        let limits = BrowserResourceLimits {
+            max_temporary_count: 0,
+            max_temporary_bytes: 1024 * 1024,
+            max_resource_bytes: 1024 * 1024,
+        };
+        let store = BrowserResourceStore::open(&root, limits).unwrap();
+        let other_store = BrowserResourceStore::open(&other_root, limits).unwrap();
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let workspace_key = workspace("repair-edge", "conversation-a");
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(2));
+        let (coordinator, instance, repair) = installed_repair(&workspace_key, &store);
+
+        let ordinary_controller = controller.clone();
+        let ordinary = tokio::spawn(async move {
+            ordinary_controller
+                .request_with_context(
+                    BrowserCommand::Screenshot {
+                        tab_id: "tab-a".to_string(),
+                        mode: BrowserScreenshotMode::Viewport,
+                    },
+                    BrowserInvocationContext::agent("ordinary screenshot", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await
+        });
+        let ordinary_request = inbox.recv().await.unwrap();
+        assert!(matches!(
+            ordinary_request.validate_repair_retention_sidecar(),
+            Ok(None)
+        ));
+        assert!(ordinary_request.records_workflow_recipe_action());
+        ordinary_request.respond(Err(BrowserError::Interrupted));
+        assert_eq!(ordinary.await.unwrap(), Err(BrowserError::Interrupted));
+
+        assert!(matches!(
+            controller
+                .request_replay_repair_capture(
+                    &coordinator,
+                    &repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::user("forged user repair", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await,
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        assert!(matches!(
+            controller
+                .request_replay_repair_capture(
+                    &BrowserReplayCoordinator::default(),
+                    &repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("foreign coordinator", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await,
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        let foreign_controller = bridge.bind(
+            workspace("repair-edge-other", "conversation-a"),
+            Duration::from_secs(1),
+        );
+        assert!(matches!(
+            foreign_controller
+                .request_replay_repair_capture(
+                    &coordinator,
+                    &repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("foreign workspace", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await,
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+
+        assert!(matches!(
+            controller
+                .request_replay_repair_capture(
+                    &coordinator,
+                    &repair,
+                    BrowserCommand::Screenshot {
+                        tab_id: "tab-a".to_string(),
+                        mode: BrowserScreenshotMode::Viewport,
+                    },
+                    BrowserInvocationContext::agent("early screenshot", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await,
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), inbox.recv())
+                .await
+                .is_err()
+        );
+
+        let (wrong_authority, _wrong_receipt) = coordinator
+            .issue_locator_repair_capture_authority(
+                &repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+            )
+            .unwrap();
+        let wrong_command = forged_repair_request(
+            workspace_key.clone(),
+            BrowserCommand::Screenshot {
+                tab_id: "tab-a".to_string(),
+                mode: BrowserScreenshotMode::Viewport,
+            },
+            BrowserInvocationContext::agent("wrong command", BrowserRisk::Normal).unwrap(),
+            wrong_authority,
+        );
+        assert!(matches!(
+            wrong_command.validate_repair_retention_sidecar(),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        assert!(matches!(
+            crate::browser::host::unsupported_request_response("fixture", &wrong_command),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        coordinator.abort_locator_repair_capture(&repair);
+        drop(wrong_command);
+
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "tab-a",
+                BrowserRevision(9),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let cancelled_controller = controller.clone();
+        let task_coordinator = coordinator.clone();
+        let task_repair = repair.clone();
+        let task = tokio::spawn(async move {
+            cancelled_controller
+                .request_replay_repair_capture(
+                    &task_coordinator,
+                    &task_repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("cancelled snapshot", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await
+        });
+        let request = inbox.recv().await.expect("sidecar request reaches host");
+        assert!(matches!(
+            request.retain_repair_resource_for_test(
+                &other_store,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            ),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        task.abort();
+        let _ = task.await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            request.retain_repair_resource_for_test(
+                &store,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            ),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        assert_eq!(
+            coordinator.status(&instance).unwrap().status,
+            crate::browser::BrowserReplayStatus::Running
+        );
+
+        drop(request);
+
+        let swapped_repair = coordinator
+            .reserve_locator_repair_capture(
+                &instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "tab-a",
+                BrowserRevision(9),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let swapped_controller = controller.clone();
+        let swapped_coordinator = coordinator.clone();
+        let task_repair = swapped_repair.clone();
+        let swapped_task = tokio::spawn(async move {
+            swapped_controller
+                .request_replay_repair_capture(
+                    &swapped_coordinator,
+                    &task_repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("swapped response", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await
+        });
+        let swapped_request = inbox.recv().await.expect("swapped request reaches host");
+        let swapped_resource = swapped_request
+            .retain_repair_resource_for_test(
+                &store,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        swapped_request.respond(Ok(BrowserResponse::Screenshot {
+            resource: swapped_resource.clone(),
+        }));
+        assert!(matches!(
+            swapped_task.await.unwrap(),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        assert!(matches!(
+            store.handle(&workspace_key, &swapped_resource.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+
+        const PATH_SENTINEL: &str = "DM_REPAIR_PATH_SENTINEL_5D8C";
+        let io_repair = coordinator
+            .reserve_locator_repair_capture(
+                &instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "tab-a",
+                BrowserRevision(9),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let io_controller = controller.clone();
+        let io_coordinator = coordinator.clone();
+        let task_repair = io_repair.clone();
+        let io_task = tokio::spawn(async move {
+            io_controller
+                .request_replay_repair_capture(
+                    &io_coordinator,
+                    &task_repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "path-bearing host failure",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let io_request = inbox.recv().await.expect("io request reaches host");
+        io_request.respond(Err(BrowserError::Io {
+            operation: PATH_SENTINEL.to_string(),
+            path: PathBuf::from(PATH_SENTINEL),
+            message: PATH_SENTINEL.to_string(),
+        }));
+        let error = io_task.await.unwrap().unwrap_err();
+        assert_eq!(error, BrowserError::ResourceRootUnavailable);
+        for surface in [format!("{error:?}"), serde_json::to_string(&error).unwrap()] {
+            assert!(!surface.contains(PATH_SENTINEL), "{surface}");
+        }
+
+        let terminal_repair = coordinator
+            .reserve_locator_repair_capture(
+                &instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "tab-a",
+                BrowserRevision(9),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let terminal_controller = controller.clone();
+        let terminal_coordinator = coordinator.clone();
+        let task_repair = terminal_repair.clone();
+        let terminal_task = tokio::spawn(async move {
+            terminal_controller
+                .request_replay_repair_capture(
+                    &terminal_coordinator,
+                    &task_repair,
+                    BrowserCommand::Snapshot {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent("terminal cancellation", BrowserRisk::Normal)
+                        .unwrap(),
+                )
+                .await
+        });
+        let terminal_request = inbox.recv().await.expect("terminal request reaches host");
+        coordinator.cancel(&instance).unwrap();
+        assert!(matches!(
+            terminal_request.retain_repair_resource_for_test(
+                &store,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            ),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairSidecar"
+        ));
+        terminal_request.respond(Err(BrowserError::Interrupted));
+        assert_eq!(terminal_task.await.unwrap(), Err(BrowserError::Interrupted));
+        assert_eq!(
+            coordinator.status(&instance).unwrap().status,
+            crate::browser::BrowserReplayStatus::Cancelled
+        );
+
+        drop(coordinator);
+        drop(other_store);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
     }
 
     #[tokio::test]

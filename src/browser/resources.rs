@@ -204,6 +204,11 @@ impl BrowserResourceStore {
         &self.inner.root
     }
 
+    pub(crate) fn same_runtime(&self, other: &Self) -> bool {
+        self.inner.root == other.inner.root
+            && Arc::ptr_eq(&self.inner.runtime, &other.inner.runtime)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn begin_repair_retention(
         &self,

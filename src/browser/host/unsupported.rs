@@ -1,12 +1,13 @@
+#[cfg(any(not(target_os = "windows"), test))]
+use super::super::BrowserCommandRequest;
 #[cfg(not(target_os = "windows"))]
 use super::super::{
     apply_browser_workflow_review_mutation, browser_workflow_review_projection,
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
-    BrowserBounds, BrowserCommandRequest, BrowserHostControl, BrowserHostEvent,
-    BrowserPageRecordingIpcError, BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError,
-    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus,
-    BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
-    BrowserWorkspaceKey,
+    BrowserBounds, BrowserHostControl, BrowserHostEvent, BrowserPageRecordingIpcError,
+    BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
+    BrowserRecordingReview, BrowserRecordingStatus, BrowserWorkflowCoordinator,
+    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
 };
 use super::super::{
     validate_direct_secret_command, BrowserCommand, BrowserError, BrowserHostStatus,
@@ -63,6 +64,19 @@ pub(crate) fn unsupported_validated_command_response(
     } else {
         Err(unsupported_platform_error(platform))
     }
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+pub(crate) fn unsupported_request_response(
+    platform: impl Into<String>,
+    request: &BrowserCommandRequest,
+) -> Result<BrowserResponse, BrowserError> {
+    request.validate_secret_sidecar()?;
+    request.validate_repair_retention_sidecar()?;
+    if !request.cancellation_is_current() {
+        return Err(BrowserError::Interrupted);
+    }
+    unsupported_validated_command_response(platform, request.command().clone())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -233,16 +247,7 @@ impl BrowserWebViewHost {
     }
 
     pub fn handle_request(&mut self, _window: &gpui::Window, request: BrowserCommandRequest) {
-        if let Err(error) = request.validate_secret_sidecar() {
-            request.respond(Err(error));
-            return;
-        }
-        if !request.cancellation_is_current() {
-            request.respond(Err(BrowserError::Interrupted));
-            return;
-        }
-        let result =
-            unsupported_validated_command_response(std::env::consts::OS, request.command().clone());
+        let result = unsupported_request_response(std::env::consts::OS, &request);
         request.respond(result);
     }
 
