@@ -102,8 +102,7 @@ async fn secure_command_generic_request_has_no_sidecar_and_is_rejected_by_host_v
 }
 
 #[test]
-fn secure_command_public_wire_and_debug_surfaces_are_value_free() {
-    const SENTINEL: &str = "value-sentinel-secure-command";
+fn secure_command_public_wire_and_debug_surfaces_have_only_marker_metadata() {
     let command = BrowserCommand::SecretType {
         tab_id: "tab-a".to_string(),
         target: BrowserActionTarget::default(),
@@ -128,14 +127,9 @@ fn secure_command_public_wire_and_debug_surfaces_are_value_free() {
         command
     );
 
-    for safe_surface in [
-        format!("{command:?}"),
-        serde_json::to_string(&command_json).unwrap(),
-        format!("{context:?}"),
-        serde_json::to_string(&context).unwrap(),
-        format!("{status:?}"),
-        serde_json::to_string(&status).unwrap(),
-    ] {
-        assert!(!safe_surface.contains(SENTINEL));
-    }
+    assert_eq!(serde_json::to_value(&context).unwrap()["actor"], "agent");
+    assert_eq!(serde_json::to_string(&status).unwrap(), "\"running\"");
+    assert!(format!("{command:?}").contains("input_name: \"password\""));
+    assert!(format!("{context:?}").contains("type replay secret"));
+    assert_eq!(format!("{status:?}"), "Running");
 }

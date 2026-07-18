@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::BrowserWorkspaceKey;
+use super::BrowserReplayInstance;
 
 pub const MAX_BROWSER_REPLAY_SECRET_INPUTS: usize = 32;
 pub const MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES: usize = 128;
@@ -55,8 +55,7 @@ enum BrowserReplaySecretStoreStatus {
 }
 
 struct BrowserReplaySecretStoreState {
-    workspace_key: BrowserWorkspaceKey,
-    instance_id: u64,
+    instance: BrowserReplayInstance,
     status: BrowserReplaySecretStoreStatus,
     values: HashMap<String, Zeroizing<String>>,
     #[cfg(test)]
@@ -68,11 +67,10 @@ pub struct BrowserReplaySecretStore {
 }
 
 impl BrowserReplaySecretStore {
-    pub(crate) fn new(workspace_key: BrowserWorkspaceKey, instance_id: u64) -> Self {
+    pub(crate) fn new(instance: BrowserReplayInstance) -> Self {
         Self {
             authority: Arc::new(Mutex::new(BrowserReplaySecretStoreState {
-                workspace_key,
-                instance_id,
+                instance,
                 status: BrowserReplaySecretStoreStatus::Open,
                 values: HashMap::new(),
                 #[cfg(test)]
@@ -139,8 +137,6 @@ impl BrowserReplaySecretStore {
         }
         Ok(BrowserReplaySecretLease {
             authority: Arc::clone(&self.authority),
-            workspace_key: state.workspace_key.clone(),
-            instance_id: state.instance_id,
             input_name: input_name.to_string(),
         })
     }
@@ -181,20 +177,20 @@ impl BrowserReplaySecretStore {
 
 pub struct BrowserReplaySecretLease {
     authority: Arc<Mutex<BrowserReplaySecretStoreState>>,
-    workspace_key: BrowserWorkspaceKey,
-    instance_id: u64,
     input_name: String,
 }
 
 impl BrowserReplaySecretLease {
-    pub(crate) fn authorizes(&self, workspace_key: &BrowserWorkspaceKey, input_name: &str) -> bool {
+    pub(crate) fn authorizes(
+        &self,
+        expected_instance: &BrowserReplayInstance,
+        input_name: &str,
+    ) -> bool {
         let state = self
             .authority
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.workspace_key == *workspace_key
-            && self.instance_id == state.instance_id
-            && self.workspace_key == state.workspace_key
+        state.instance == *expected_instance
             && self.input_name == input_name
             && matches!(state.status, BrowserReplaySecretStoreStatus::Installed)
             && state.values.contains_key(input_name)

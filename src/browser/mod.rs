@@ -58,7 +58,10 @@ pub use commands::{
     BrowserInvocationContext, BrowserPageLoadState, BrowserRecordingInputSummary,
     BrowserRecordingOperation, BrowserRecordingResult, BrowserResponse, BrowserUserInputKind,
 };
-pub(crate) use commands::{verified_authenticated_local_project_root, BrowserRegistrationLease};
+pub(crate) use commands::{
+    validate_direct_secret_command, verified_authenticated_local_project_root,
+    BrowserRegistrationLease,
+};
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
     BrowserDownloadStore,

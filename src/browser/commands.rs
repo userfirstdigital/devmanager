@@ -5,10 +5,10 @@ use super::{
     BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation, BrowserError,
     BrowserNetworkEntry, BrowserNetworkOperation, BrowserPerformanceOperation,
     BrowserPerformanceSnapshot, BrowserRecipeInputKind, BrowserRecordingStatus,
-    BrowserReplaySecretLease, BrowserResourceHandle, BrowserResourceId, BrowserRisk,
-    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserTabSnapshot, BrowserUploadResult,
-    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey,
-    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BrowserReplayInstance, BrowserReplaySecretLease, BrowserResourceHandle, BrowserResourceId,
+    BrowserRisk, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserTabSnapshot,
+    BrowserUploadResult, BrowserViewport, BrowserWaitCondition, BrowserWaitResult,
+    BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
 };
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -750,6 +750,11 @@ fn registration_ticket_is_current(
     }
 }
 
+struct BrowserReplaySecretSidecar {
+    expected_instance: BrowserReplayInstance,
+    lease: BrowserReplaySecretLease,
+}
+
 struct BrowserCommandEnvelope {
     workspace_key: BrowserWorkspaceKey,
     command: BrowserCommand,
@@ -757,7 +762,7 @@ struct BrowserCommandEnvelope {
     local_project_root: Option<PathBuf>,
     cancellation_ticket: CancellationTicket,
     registration_lease: Option<BrowserRegistrationLease>,
-    replay_secret_lease: Option<BrowserReplaySecretLease>,
+    replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     pending_work: PendingWorkGuard,
 }
@@ -967,11 +972,26 @@ impl BrowserController {
         &self,
         command: BrowserCommand,
         context: BrowserInvocationContext,
+        expected_instance: BrowserReplayInstance,
         lease: BrowserReplaySecretLease,
     ) -> Result<BrowserResponse, BrowserError> {
-        validate_secret_command_authority(&self.workspace_key, &command, &context, &lease)?;
-        self.request_with_context_and_local_project_root(command, context, None, Some(lease))
-            .await
+        validate_secret_command_authority(
+            &self.workspace_key,
+            &command,
+            &context,
+            &expected_instance,
+            &lease,
+        )?;
+        self.request_with_context_and_local_project_root(
+            command,
+            context,
+            None,
+            Some(BrowserReplaySecretSidecar {
+                expected_instance,
+                lease,
+            }),
+        )
+        .await
     }
 
     async fn request_with_context_and_local_project_root(
@@ -979,7 +999,7 @@ impl BrowserController {
         command: BrowserCommand,
         context: BrowserInvocationContext,
         local_project_root: Option<PathBuf>,
-        replay_secret_lease: Option<BrowserReplaySecretLease>,
+        replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     ) -> Result<BrowserResponse, BrowserError> {
         context.validate()?;
         let operation = command.operation_name().to_string();
@@ -1005,7 +1025,7 @@ impl BrowserController {
                 local_project_root,
                 cancellation_ticket,
                 registration_lease: self.registration_lease.clone(),
-                replay_secret_lease,
+                replay_secret_sidecar,
                 response,
                 pending_work: self.pending_work.track(),
             });
@@ -1079,7 +1099,7 @@ impl BrowserController {
                 local_project_root: None,
                 cancellation_ticket,
                 registration_lease: self.registration_lease.clone(),
-                replay_secret_lease: None,
+                replay_secret_sidecar: None,
                 response,
                 pending_work: self.pending_work.track(),
             })
@@ -1179,7 +1199,7 @@ impl BrowserController {
                     local_project_root,
                     cancellation_ticket,
                     registration_lease: self.registration_lease.clone(),
-                    replay_secret_lease: None,
+                    replay_secret_sidecar: None,
                     response,
                     pending_work: self.pending_work.track(),
                 });
@@ -1193,13 +1213,15 @@ fn validate_secret_command_authority(
     workspace_key: &BrowserWorkspaceKey,
     command: &BrowserCommand,
     context: &BrowserInvocationContext,
+    expected_instance: &BrowserReplayInstance,
     lease: &BrowserReplaySecretLease,
 ) -> Result<(), BrowserError> {
     let BrowserCommand::SecretType { input_name, .. } = command else {
         return Err(invalid_secret_sidecar());
     };
     if context.actor != BrowserInvocationActor::Agent
-        || !lease.authorizes(workspace_key, input_name)
+        || expected_instance.workspace_key() != workspace_key
+        || !lease.authorizes(expected_instance, input_name)
     {
         return Err(invalid_secret_sidecar());
     }
@@ -1210,6 +1232,13 @@ fn invalid_secret_sidecar() -> BrowserError {
     BrowserError::InvalidInvocation {
         field: "secretSidecar".to_string(),
     }
+}
+
+pub(crate) fn validate_direct_secret_command(command: &BrowserCommand) -> Result<(), BrowserError> {
+    if matches!(command, BrowserCommand::SecretType { .. }) {
+        return Err(invalid_secret_sidecar());
+    }
+    Ok(())
 }
 
 pub(crate) fn verified_authenticated_local_project_root(
@@ -1349,7 +1378,7 @@ pub struct BrowserCommandRequest {
     cancellation_ticket: CancellationTicket,
     cancellations: Arc<CancellationEpochs>,
     registration_lease: Option<BrowserRegistrationLease>,
-    replay_secret_lease: Option<BrowserReplaySecretLease>,
+    replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     response: oneshot::Sender<Result<BrowserResponse, BrowserError>>,
     _pending_work: PendingWorkGuard,
     started_at: String,
@@ -1387,12 +1416,15 @@ impl BrowserCommandRequest {
     pub fn validate_secret_sidecar(
         &self,
     ) -> Result<Option<&BrowserReplaySecretLease>, BrowserError> {
-        match (&self.command, &self.replay_secret_lease) {
-            (BrowserCommand::SecretType { input_name, .. }, Some(lease))
+        match (&self.command, &self.replay_secret_sidecar) {
+            (BrowserCommand::SecretType { input_name, .. }, Some(sidecar))
                 if self.context.actor == BrowserInvocationActor::Agent
-                    && lease.authorizes(&self.workspace_key, input_name) =>
+                    && sidecar.expected_instance.workspace_key() == &self.workspace_key
+                    && sidecar
+                        .lease
+                        .authorizes(&sidecar.expected_instance, input_name) =>
             {
-                Ok(Some(lease))
+                Ok(Some(&sidecar.lease))
             }
             (BrowserCommand::SecretType { .. }, _) | (_, Some(_)) => Err(invalid_secret_sidecar()),
             (_, None) => Ok(None),
@@ -1440,7 +1472,7 @@ impl BrowserCommandRequest {
             local_project_root,
             cancellation_ticket,
             registration_lease,
-            replay_secret_lease,
+            replay_secret_sidecar,
             response,
             pending_work,
         } = envelope;
@@ -1452,7 +1484,7 @@ impl BrowserCommandRequest {
             cancellation_ticket,
             cancellations,
             registration_lease,
-            replay_secret_lease,
+            replay_secret_sidecar,
             response,
             _pending_work: pending_work,
             started_at: OffsetDateTime::now_utc()
@@ -1704,8 +1736,10 @@ impl CancellationEpochs {
 mod secure_command_tests {
     use super::*;
     use crate::browser::{
-        BrowserActionTarget, BrowserReplaySecretLease, BrowserReplaySecretStore,
-        BrowserReplaySecretSubmission,
+        compile_browser_replay, BrowserActionTarget, BrowserRecipeAction, BrowserRecipeInput,
+        BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+        BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayInstance,
+        BrowserReplaySecretLease, BrowserReplaySecretSubmission, BROWSER_RECIPE_SCHEMA_VERSION,
     };
 
     const SECRET_INPUT: &str = "password";
@@ -1729,27 +1763,67 @@ mod secure_command_tests {
 
     fn installed_secret(
         workspace_key: &BrowserWorkspaceKey,
-        instance_id: u64,
         input_name: &str,
-    ) -> (BrowserReplaySecretStore, BrowserReplaySecretLease) {
-        let store = BrowserReplaySecretStore::new(workspace_key.clone(), instance_id);
-        store
-            .install(
-                &[input_name.to_string()],
+    ) -> (
+        BrowserReplayCoordinator,
+        BrowserReplayInstance,
+        BrowserReplaySecretLease,
+    ) {
+        let coordinator = BrowserReplayCoordinator::default();
+        let plan = compile_browser_replay(
+            &BrowserRecipeV1 {
+                schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                id: "secure-command-recipe".to_string(),
+                name: "Secure command recipe".to_string(),
+                description: "Secure command authority fixture".to_string(),
+                start_url: "https://example.test".to_string(),
+                viewport: BrowserRecipeViewport {
+                    width: 1280,
+                    height: 720,
+                    scale_percent: 100,
+                },
+                inputs: vec![BrowserRecipeInput {
+                    name: input_name.to_string(),
+                    kind: BrowserRecipeInputKind::Secret,
+                    default_value: None,
+                }],
+                steps: vec![BrowserRecipeStep {
+                    id: "type-secure-input".to_string(),
+                    action: BrowserRecipeAction::Type {
+                        locator: BrowserRecipeLocator {
+                            test_id: Some("secret-input".to_string()),
+                            ..BrowserRecipeLocator::default()
+                        },
+                        value: BrowserRecipeValue::Input {
+                            name: input_name.to_string(),
+                        },
+                    },
+                    wait: None,
+                    assertions: Vec::new(),
+                }],
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let started = coordinator.start(workspace_key.clone(), plan).unwrap();
+        let instance = started.instance.clone();
+        coordinator
+            .submit_secrets(
+                &instance,
                 BrowserReplaySecretSubmission::from_user_prompt(vec![(
                     input_name.to_string(),
                     SECRET_VALUE.to_string(),
                 )]),
             )
             .unwrap();
-        let lease = store.lease(input_name).unwrap();
-        (store, lease)
+        let lease = started.execution.secret_lease(input_name).unwrap();
+        (coordinator, instance, lease)
     }
 
     fn forged_request(
         workspace_key: BrowserWorkspaceKey,
         command: BrowserCommand,
-        replay_secret_lease: Option<BrowserReplaySecretLease>,
+        replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     ) -> BrowserCommandRequest {
         let cancellations = Arc::new(CancellationEpochs::default());
         let cancellation_ticket = cancellations.ticket(&workspace_key, command.tab_id());
@@ -1763,7 +1837,7 @@ mod secure_command_tests {
                 local_project_root: None,
                 cancellation_ticket,
                 registration_lease: None,
-                replay_secret_lease,
+                replay_secret_sidecar,
                 response,
                 pending_work: pending_work.track(),
             },
@@ -1786,10 +1860,10 @@ mod secure_command_tests {
         let (bridge, mut inbox) = browser_command_channel(2);
         let workspace_key = workspace("project-a", "conversation-a");
         let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
-        let (_store, lease) = installed_secret(&workspace_key, 1, SECRET_INPUT);
+        let (_coordinator, instance, lease) = installed_secret(&workspace_key, SECRET_INPUT);
         let task = tokio::spawn(async move {
             controller
-                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), lease)
+                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), instance, lease)
                 .await
         });
 
@@ -1806,43 +1880,201 @@ mod secure_command_tests {
     }
 
     #[tokio::test]
+    async fn secure_command_rejects_colliding_live_foreign_replay_scope_at_controller_and_host() {
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let workspace_key = workspace("project-a", "conversation-a");
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_millis(100));
+        let (_left_coordinator, left_instance, left_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
+        let (_right_coordinator, right_instance, right_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
+
+        assert_eq!(
+            left_instance.workspace_key(),
+            right_instance.workspace_key()
+        );
+        assert_eq!(left_instance.id(), right_instance.id());
+        assert_ne!(left_instance, right_instance, "opaque scopes must differ");
+        assert!(matches!(
+            controller
+                .request_replay_secret_type(
+                    marker(SECRET_INPUT),
+                    agent_context(),
+                    left_instance.clone(),
+                    right_lease,
+                )
+                .await,
+            Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), inbox.recv())
+                .await
+                .is_err()
+        );
+
+        let forged = forged_request(
+            workspace_key,
+            marker(SECRET_INPUT),
+            Some(BrowserReplaySecretSidecar {
+                expected_instance: right_instance,
+                lease: left_lease,
+            }),
+        );
+        assert!(matches!(
+            forged.validate_secret_sidecar(),
+            Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
+        ));
+    }
+
+    #[tokio::test]
+    async fn secure_command_real_installed_authority_never_leaks_value_to_safe_surfaces() {
+        let (bridge, mut inbox) = browser_command_channel(1);
+        let workspace_key = workspace("project-a", "conversation-a");
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let (coordinator, instance, lease) = installed_secret(&workspace_key, SECRET_INPUT);
+        let request_controller = controller.clone();
+        let request_instance = instance.clone();
+        let task = tokio::spawn(async move {
+            request_controller
+                .request_replay_secret_type(
+                    marker(SECRET_INPUT),
+                    agent_context(),
+                    request_instance,
+                    lease,
+                )
+                .await
+        });
+
+        let request = inbox.recv().await.expect("secure request");
+        request
+            .validate_secret_sidecar()
+            .expect("installed exact authority");
+        for surface in [
+            format!("{:?}", request.command()),
+            serde_json::to_string(request.command()).unwrap(),
+            format!("{:?}", request.context()),
+            serde_json::to_string(request.context()).unwrap(),
+        ] {
+            assert!(!surface.contains(SECRET_VALUE));
+        }
+
+        coordinator.cancel(&instance).unwrap();
+        assert!(request.cancellation_is_current());
+        let error = match request.validate_secret_sidecar() {
+            Err(error) => error,
+            Ok(_) => panic!("closed replay authority must be rejected"),
+        };
+        for surface in [
+            error.to_string(),
+            format!("{error:?}"),
+            serde_json::to_string(&error).unwrap(),
+        ] {
+            assert!(!surface.contains(SECRET_VALUE));
+        }
+        request.respond(Err(error));
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
+        ));
+    }
+
+    #[tokio::test]
+    async fn secure_command_validated_unsupported_ingress_preserves_platform_error() {
+        let (bridge, mut inbox) = browser_command_channel(1);
+        let workspace_key = workspace("project-a", "conversation-a");
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let (_coordinator, instance, lease) = installed_secret(&workspace_key, SECRET_INPUT);
+        let task = tokio::spawn(async move {
+            controller
+                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), instance, lease)
+                .await
+        });
+
+        let request = inbox.recv().await.expect("secure request");
+        request
+            .validate_secret_sidecar()
+            .expect("exact sidecar validates at ingress");
+        let result = crate::browser::host::unsupported_validated_command_response(
+            "fixture",
+            request.command().clone(),
+        );
+        assert_eq!(
+            result,
+            Err(BrowserError::UnavailablePlatform {
+                platform: "fixture".to_string(),
+            })
+        );
+        request.respond(result);
+        assert_eq!(
+            task.await.unwrap(),
+            Err(BrowserError::UnavailablePlatform {
+                platform: "fixture".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn secure_command_method_rejects_wrong_actor_workspace_input_and_stale_store() {
         let (bridge, mut inbox) = browser_command_channel(4);
         let workspace_key = workspace("project-a", "conversation-a");
         let controller = bridge.bind(workspace_key.clone(), Duration::from_millis(100));
 
-        let (_actor_store, actor_lease) = installed_secret(&workspace_key, 1, SECRET_INPUT);
+        let (_actor_coordinator, actor_instance, actor_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
         let user_context =
             BrowserInvocationContext::user("type replay secret", BrowserRisk::Normal).unwrap();
         assert!(matches!(
             controller
-                .request_replay_secret_type(marker(SECRET_INPUT), user_context, actor_lease)
+                .request_replay_secret_type(
+                    marker(SECRET_INPUT),
+                    user_context,
+                    actor_instance,
+                    actor_lease,
+                )
                 .await,
             Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
         ));
 
         let foreign_workspace = workspace("project-b", "conversation-b");
-        let (_foreign_store, foreign_lease) = installed_secret(&foreign_workspace, 2, SECRET_INPUT);
+        let (_foreign_coordinator, foreign_instance, foreign_lease) =
+            installed_secret(&foreign_workspace, SECRET_INPUT);
         assert!(matches!(
             controller
-                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), foreign_lease)
+                .request_replay_secret_type(
+                    marker(SECRET_INPUT),
+                    agent_context(),
+                    foreign_instance,
+                    foreign_lease,
+                )
                 .await,
             Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
         ));
 
-        let (_input_store, input_lease) = installed_secret(&workspace_key, 3, SECRET_INPUT);
+        let (_input_coordinator, input_instance, input_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
         assert!(matches!(
             controller
-                .request_replay_secret_type(marker("other-input"), agent_context(), input_lease)
+                .request_replay_secret_type(
+                    marker("other-input"),
+                    agent_context(),
+                    input_instance,
+                    input_lease,
+                )
                 .await,
             Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
         ));
 
-        let (stale_store, stale_lease) = installed_secret(&workspace_key, 4, SECRET_INPUT);
-        stale_store.close();
+        let (stale_coordinator, stale_instance, stale_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
+        stale_coordinator.cancel(&stale_instance).unwrap();
         assert!(matches!(
             controller
-                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), stale_lease)
+                .request_replay_secret_type(
+                    marker(SECRET_INPUT),
+                    agent_context(),
+                    stale_instance,
+                    stale_lease,
+                )
                 .await,
             Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
         ));
@@ -1858,22 +2090,30 @@ mod secure_command_tests {
     fn secure_command_host_validation_rejects_sidecar_command_input_workspace_and_stale_mismatch() {
         let workspace_key = workspace("project-a", "conversation-a");
 
-        let (_command_store, command_lease) = installed_secret(&workspace_key, 1, SECRET_INPUT);
+        let (_command_coordinator, command_instance, command_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
         let wrong_command = forged_request(
             workspace_key.clone(),
             BrowserCommand::Status,
-            Some(command_lease),
+            Some(BrowserReplaySecretSidecar {
+                expected_instance: command_instance,
+                lease: command_lease,
+            }),
         );
         assert!(matches!(
             wrong_command.validate_secret_sidecar(),
             Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
         ));
 
-        let (_input_store, input_lease) = installed_secret(&workspace_key, 2, SECRET_INPUT);
+        let (_input_coordinator, input_instance, input_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
         let wrong_input = forged_request(
             workspace_key.clone(),
             marker("other-input"),
-            Some(input_lease),
+            Some(BrowserReplaySecretSidecar {
+                expected_instance: input_instance,
+                lease: input_lease,
+            }),
         );
         assert!(matches!(
             wrong_input.validate_secret_sidecar(),
@@ -1881,21 +2121,32 @@ mod secure_command_tests {
         ));
 
         let foreign_workspace = workspace("project-b", "conversation-b");
-        let (_workspace_store, workspace_lease) =
-            installed_secret(&foreign_workspace, 3, SECRET_INPUT);
+        let (_workspace_coordinator, workspace_instance, workspace_lease) =
+            installed_secret(&foreign_workspace, SECRET_INPUT);
         let wrong_workspace = forged_request(
             workspace_key.clone(),
             marker(SECRET_INPUT),
-            Some(workspace_lease),
+            Some(BrowserReplaySecretSidecar {
+                expected_instance: workspace_instance,
+                lease: workspace_lease,
+            }),
         );
         assert!(matches!(
             wrong_workspace.validate_secret_sidecar(),
             Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
         ));
 
-        let (stale_store, stale_lease) = installed_secret(&workspace_key, 4, SECRET_INPUT);
-        stale_store.close();
-        let stale = forged_request(workspace_key, marker(SECRET_INPUT), Some(stale_lease));
+        let (stale_coordinator, stale_instance, stale_lease) =
+            installed_secret(&workspace_key, SECRET_INPUT);
+        stale_coordinator.cancel(&stale_instance).unwrap();
+        let stale = forged_request(
+            workspace_key,
+            marker(SECRET_INPUT),
+            Some(BrowserReplaySecretSidecar {
+                expected_instance: stale_instance,
+                lease: stale_lease,
+            }),
+        );
         assert!(matches!(
             stale.validate_secret_sidecar(),
             Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
@@ -1908,10 +2159,10 @@ mod secure_command_tests {
         let workspace_key = workspace("project-a", "conversation-a");
         let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
         let request_controller = controller.clone();
-        let (_store, lease) = installed_secret(&workspace_key, 1, SECRET_INPUT);
+        let (_coordinator, instance, lease) = installed_secret(&workspace_key, SECRET_INPUT);
         let task = tokio::spawn(async move {
             request_controller
-                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), lease)
+                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), instance, lease)
                 .await
         });
         wait_for_pending(&bridge).await;
@@ -1935,10 +2186,10 @@ mod secure_command_tests {
             Some(registration.clone()),
         );
         let request_controller = controller.clone();
-        let (_store, lease) = installed_secret(&workspace_key, 1, SECRET_INPUT);
+        let (_coordinator, instance, lease) = installed_secret(&workspace_key, SECRET_INPUT);
         let task = tokio::spawn(async move {
             request_controller
-                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), lease)
+                .request_replay_secret_type(marker(SECRET_INPUT), agent_context(), instance, lease)
                 .await
         });
         wait_for_pending(&bridge).await;

@@ -1914,6 +1914,60 @@ fn secure_command_is_tab_scoped_automation_without_lifecycle_preemption() {
 }
 
 #[test]
+fn secure_command_real_host_ingress_rejects_missing_or_stale_sidecar_before_work() {
+    let marker = BrowserCommand::SecretType {
+        tab_id: "tab-a".to_string(),
+        target: BrowserActionTarget::default(),
+        input_name: "password".to_string(),
+    };
+    assert!(matches!(
+        unsupported_command_response("fixture", marker),
+        Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
+    ));
+
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let direct_start = windows.find("pub fn handle_command(").unwrap();
+    let direct_end = windows[direct_start..]
+        .find("pub fn handle_request(")
+        .unwrap()
+        + direct_start;
+    let direct = &windows[direct_start..direct_end];
+    assert!(
+        direct.find("validate_direct_secret_command").unwrap()
+            < direct.find("pump_page_recording_ipc").unwrap()
+    );
+
+    let request_start = windows.find("pub fn handle_request(").unwrap();
+    let request_end = windows[request_start..]
+        .find("pub fn pump_async_completions(")
+        .unwrap()
+        + request_start;
+    let request = &windows[request_start..request_end];
+    let validate = request.find("validate_secret_sidecar").unwrap();
+    assert!(validate < request.find("pump_page_recording_ipc").unwrap());
+    assert!(validate < request.find("reserve_agent_command").unwrap());
+    assert!(validate < request.find("operation_queue").unwrap());
+
+    let approval_start = windows.find("pub fn resolve_approval(").unwrap();
+    let approval_end = windows[approval_start..]
+        .find("fn continue_actions(")
+        .unwrap()
+        + approval_start;
+    let approval = &windows[approval_start..approval_end];
+    let denied = approval.find("if !approved").unwrap();
+    let revalidate = approval[denied..]
+        .find("validate_secret_sidecar")
+        .map(|offset| denied + offset)
+        .expect("approval resume must revalidate the exact secret sidecar");
+    assert!(revalidate < approval.find("match resume").unwrap());
+
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+    let unsupported_request = &unsupported[unsupported.find("pub fn handle_request(").unwrap()..];
+    assert!(unsupported_request.contains("unsupported_validated_command_response"));
+    assert!(!unsupported_request.contains("self.handle_command(window"));
+}
+
+#[test]
 fn windows_host_elevates_cdp_method_risk_before_existing_approval_gate() {
     let source = include_str!("../src/browser/host/windows.rs");
     let start = source.find("fn begin_automation_request(").unwrap();

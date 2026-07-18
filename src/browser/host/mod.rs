@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+pub(crate) use unsupported::unsupported_validated_command_response;
 #[cfg(not(target_os = "windows"))]
 pub use unsupported::BrowserWebViewHost;
 pub use unsupported::{

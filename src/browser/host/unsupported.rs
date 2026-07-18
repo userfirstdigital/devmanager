@@ -8,7 +8,10 @@ use super::super::{
     BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
     BrowserWorkspaceKey,
 };
-use super::super::{BrowserCommand, BrowserError, BrowserHostStatus, BrowserResponse};
+use super::super::{
+    validate_direct_secret_command, BrowserCommand, BrowserError, BrowserHostStatus,
+    BrowserResponse,
+};
 #[cfg(not(target_os = "windows"))]
 use super::{BrowserHostState, BrowserWorkspaceSnapshot};
 #[cfg(not(target_os = "windows"))]
@@ -39,6 +42,14 @@ pub fn unsupported_platform_error(platform: impl Into<String>) -> BrowserError {
 }
 
 pub fn unsupported_command_response(
+    platform: impl Into<String>,
+    command: BrowserCommand,
+) -> Result<BrowserResponse, BrowserError> {
+    validate_direct_secret_command(&command)?;
+    unsupported_validated_command_response(platform, command)
+}
+
+pub(crate) fn unsupported_validated_command_response(
     platform: impl Into<String>,
     command: BrowserCommand,
 ) -> Result<BrowserResponse, BrowserError> {
@@ -219,17 +230,17 @@ impl BrowserWebViewHost {
         unsupported_command_response(std::env::consts::OS, command)
     }
 
-    pub fn handle_request(&mut self, window: &gpui::Window, request: BrowserCommandRequest) {
-        if !request.cancellation_is_current() {
-            request.respond(Err(BrowserError::Interrupted));
-            return;
-        }
+    pub fn handle_request(&mut self, _window: &gpui::Window, request: BrowserCommandRequest) {
         if let Err(error) = request.validate_secret_sidecar() {
             request.respond(Err(error));
             return;
         }
+        if !request.cancellation_is_current() {
+            request.respond(Err(BrowserError::Interrupted));
+            return;
+        }
         let result =
-            self.handle_command(window, request.workspace_key(), request.command().clone());
+            unsupported_validated_command_response(std::env::consts::OS, request.command().clone());
         request.respond(result);
     }
 

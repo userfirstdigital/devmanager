@@ -17,26 +17,27 @@ use crate::browser::{
     parse_browser_page_ipc_message, prepare_verified_download_root,
     preview_browser_workflow_review, recording_resource_unavailable, redact_browser_resource_bytes,
     redact_browser_text, remove_verified_profile, save_browser_recording_review,
-    save_browser_workflow_review, validate_annotation_candidate_context, BrowserAction,
-    BrowserActionResult, BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger,
-    BrowserAnnotationDraft, BrowserAnnotationLifecycle, BrowserAnnotationRoute,
-    BrowserApprovalPolicy, BrowserApprovalRequest, BrowserAttachmentProjection, BrowserBounds,
-    BrowserCommand, BrowserCommandRequest, BrowserConsoleEntry, BrowserConsoleOperation,
-    BrowserDiagnosticLevel, BrowserDownloadState, BrowserDownloadStore, BrowserError,
-    BrowserHostControl, BrowserHostEvent, BrowserHostStatus, BrowserInvocationActor,
-    BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
-    BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope, BrowserPageRecordingIngress,
-    BrowserPageRecordingIpc, BrowserPageRecordingIpcError, BrowserPageRecordingSubmit,
-    BrowserPageRecordingTransport, BrowserPageRecordingTransportFailureKind, BrowserPaneSurface,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserRawSemanticElement,
-    BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance, BrowserRecordingOperation,
-    BrowserRecordingReview, BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId,
-    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
-    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout,
-    BrowserUploadResult, BrowserWaitResult, BrowserWorkflowCoordinator,
-    BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
+    save_browser_workflow_review, validate_annotation_candidate_context,
+    validate_direct_secret_command, BrowserAction, BrowserActionResult, BrowserAnnotationCandidate,
+    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationLifecycle,
+    BrowserAnnotationRoute, BrowserApprovalPolicy, BrowserApprovalRequest,
+    BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandRequest,
+    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDiagnosticLevel, BrowserDownloadState,
+    BrowserDownloadStore, BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostStatus,
+    BrowserInvocationActor, BrowserJournalActor, BrowserJournalEntry, BrowserNetworkEntry,
+    BrowserNetworkOperation, BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage,
+    BrowserPageLoadState, BrowserPageRecordingAuthority, BrowserPageRecordingEnvelope,
+    BrowserPageRecordingIngress, BrowserPageRecordingIpc, BrowserPageRecordingIpcError,
+    BrowserPageRecordingSubmit, BrowserPageRecordingTransport,
+    BrowserPageRecordingTransportFailureKind, BrowserPaneSurface, BrowserPerformanceOperation,
+    BrowserPerformanceSnapshot, BrowserRawSemanticElement, BrowserRecipeV1, BrowserRecordingError,
+    BrowserRecordingInstance, BrowserRecordingOperation, BrowserRecordingReview,
+    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRuntimeTarget,
+    BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout, BrowserUploadResult,
+    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation,
+    BrowserWorkflowReviewProjection, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -468,6 +469,7 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
+        validate_direct_secret_command(&command)?;
         self.pump_page_recording_ipc();
         self.handle_command_with_user_capture(window, workspace_key, command, true)
     }
@@ -572,6 +574,10 @@ impl BrowserWebViewHost {
     }
 
     pub fn handle_request(&mut self, window: &gpui::Window, request: BrowserCommandRequest) {
+        if let Err(error) = request.validate_secret_sidecar() {
+            request.respond(Err(error));
+            return;
+        }
         if !request.cancellation_is_current() {
             request.respond(Err(BrowserError::Interrupted));
             return;
@@ -1864,6 +1870,19 @@ impl BrowserWebViewHost {
             );
             self.apply_visibility_plan()?;
             return Ok(());
+        }
+
+        if let Err(error) = active.request.validate_secret_sidecar() {
+            let returned = error.clone();
+            self.finish_queued_request(
+                window,
+                target,
+                operation_id.to_string(),
+                active.request,
+                Err(error),
+            );
+            self.apply_visibility_plan()?;
+            return Err(returned);
         }
 
         active.approved_risk = Some(risk);
