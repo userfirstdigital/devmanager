@@ -1,5 +1,75 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 8: Replay through the existing controller/queue/approval/journal
+
+### Status
+
+Checkpoint 8 started from the approved checkpoint-7 hardening head `c57cfd6f0c1c80caf00f2439550a15655ea7c12e`. Implementation and the public runbook are frozen at `29291e6`; the final evidence-only commit containing this report is the independent-review head recorded in the checkpoint handoff. It adds only replay execution through the existing `BrowserController`, the typed host waits required by strict recipes, portable initial-tab recording/alias validation, public architecture documentation, and focused evidence.
+
+Checkpoints 9 through 12 are not implemented. There is no memory-only secret-value carrier or prompt, locator failure/repair state, repair preview/apply, `browser_workflow` MCP group, workflow lifecycle UI, or new browser transport/operation queue/approval/journal.
+
+### Contract decisions
+
+- `BrowserReplayExecutionHandle` is a distinct non-`Clone`, non-`Debug`, non-`Serialize` exact-instance carrier for the one shared immutable plan and cancellation lease. The public cloneable cancellation lease retains authority only, not the plan; terminalization plus dropping the execution handle releases value-bearing plan state.
+- Recording start seeds the selected runtime tab as logical `tab-1`. Compilation validates the full bounded alias lifecycle before any browser work. Normal recipes bind the fresh setup tab to `tab-1`; legacy recipes that explicitly `CreateTab tab-1` leave the setup tab implicit until the exact successful create response. Ambient tabs are never inferred as aliases, closed aliases are removed, and aliases are never reused.
+- Execution receives the exact coordinator, instance, execution handle, actor, and authenticated canonical local project root. Root verification runs before the first browser command. Setup then awaits exact `CreateTab(None)`, viewport update, and start-URL navigation responses on one fresh tab.
+- Every setup operation, recipe action, optional wait, and assertion uses a fresh invocation context with the caller actor, unique operation ID, fixed value-free intent, and `Normal` risk except classified upload. The executor calls only existing controller request methods, so the established operation queue, runtime target inspection, approvals, cancellation epochs, resources, and agent journal remain authoritative.
+- Every strict action maps to one existing typed command and exact response family. Semantic download is one `Act::Click`; `CdpMarker` uses its validated method, an empty object, fixed rationale, and exact `Cdp` response. There is no arbitrary JavaScript or direct download-filesystem path.
+- Step waits cover Duration, URL exact/contains, Load, NetworkIdle, Element present/visible/hidden, and Text present/absent. Assertions compile to short typed URL, Title, Text present/absent, Element present/absent/visible/hidden, or exact ElementValue waits. Action, optional wait, and assertions run strictly in order; the coordinator advances only after all succeed and stops on the first failure.
+- Ordinary `matched: false` is `StepFailed`; assertion `matched: false` is `AssertionFailed`; transport, host, response-shape, value-resolution, alias, and snapshot-proof failures collapse to `StepFailed`. Raw values, canonical paths, and host errors never enter new Debug/Serialize status/error surfaces.
+- Upload File inputs resolve at execution time. Relative paths join the verified root; the existing classifier canonicalizes candidates, follows symlinks/reparse redirects, verifies a regular file, and returns exact `Normal` or `OutsideWorkspaceFile` risk. The existing authenticated-root upload request/approval path receives the canonical file.
+- Cancellation authority and exact coordinator status are checked around every awaited response and before transitions. Cancellation, replacement, workspace interruption, and `BrowserError::Interrupted` return the retained old `Cancelled` projection. Late responses cannot mutate aliases, advance/fail/complete the old instance, or affect a replacement. Begin/advance/fail/complete races fall back only to the exact retained terminal projection.
+
+### RED-to-GREEN evidence
+
+1. Alias portability: the compiler initially accepted select/close-before-create and alias reuse, while recording did not seed the selected tab. Focused compiler/coordinator tests drove lifecycle validation and deterministic `tab-1` recording to green.
+2. Execution ownership: the first shared-plan slice incorrectly made the public cloneable cancellation lease retain the plan. A failing weak-plan-retention regression led to the distinct authority-only lease plus single execution handle; replay tests finished 20/20 green.
+3. Typed waits: strict replay conditions were not representable in the host. Focused serialization/injection tests drove NetworkIdle, Title, ElementAbsent, and ElementValue support without a JavaScript-predicate wire.
+4. Setup: the executor initially handled only Reload. A real controller-channel test drove canonical-root preflight, fresh-tab setup, viewport/start navigation, exact workspace proofs, one awaited request at a time, unique contexts, and late setup-response cancellation fencing.
+5. Actions and uploads: a table covering every non-upload action drove exact command/response mapping. Upload tests drove execution-time relative/absolute resolution, canonical in-root `Normal`, outside-root and Windows junction escape `OutsideWorkspaceFile`, missing-file failure, authenticated-root propagation, and path-free output.
+6. Wait/assertion ordering: failing tests drove action -> optional wait -> all assertions -> advance, every wait variant, every assertion variant, ordinary/assertion false-result distinction, wrong response variants, first-failure stop, and no later work.
+7. Adversarial audit: cancellation/replacement across in-flight action, wait, and assertion responses exposed transition-race handling gaps. Checked setup requests and retained-terminal fallbacks made all six race cases green. Additional regressions cover host interruption, hostile path/value-bearing host errors, exact create/select/close snapshot mismatches, and legacy `CreateTab tab-1` runtime mapping.
+
+### Verification
+
+- Focused checkpoint targets: `browser_automation` 12, `browser_host` 87, `browser_recipes` 16, `browser_recording` 10, `browser_replay` 20, and `browser_replay_executor` 14: 159 passed, 0 failed.
+- Aggregate `cargo test browser`: 122 matching tests passed across library/integration targets, 0 failed.
+- ProcessManager surrounding protocol gate: 70 passed, 0 failed.
+- `cargo check --locked --all-targets`: passed.
+- Native Windows `cargo build --release --locked`: passed.
+- `cargo fmt --all -- --check` and exact-range `git diff --check`: passed.
+- `cargo check --lib --target aarch64-apple-darwin` was attempted from Windows and reached third-party `aws-lc-sys`, then stopped because no Apple-target C compiler (`cc`) is installed. The shared unsupported-host module and typed macOS-unavailable behavior compile and pass on the native Windows all-target/host-test surface; native Apple compilation remains environment-limited.
+- Strict `cargo clippy --test browser_replay_executor -- -D warnings` is not a clean repository gate: it stopped on broad pre-existing unrelated lint debt beginning in `src/app/mod.rs` and `src/ai`. No checkpoint-8-specific lint failure was observed before that baseline stopped the command.
+
+### Commits
+
+- `b12edeb` design specification
+- `eb75b96` implementation plan
+- `552c14a` portable tab-alias validation and recording seed
+- `8560fad`, corrected by `a0cad2e`, shared plan/execution authority
+- `52e5374` typed replay waits
+- `73b879f` sequential setup/root preflight
+- `63b2713` complete executor, containment, assertions, and adversarial tests
+- `29291e6` public architecture/runbook documentation
+
+### Files
+
+- `docs/browser-automation.md`
+- `docs/superpowers/plans/2026-07-17-browser-replay-executor.md`
+- `docs/superpowers/specs/2026-07-17-browser-replay-executor-design.md`
+- `src/browser/automation.rs`
+- `src/browser/commands.rs`
+- `src/browser/host/initialization.rs`
+- `src/browser/host/windows.rs`
+- `src/browser/mod.rs`
+- `src/browser/recording_coordinator.rs`
+- `src/browser/replay.rs`
+- `src/browser/replay_executor.rs`
+- `tests/browser_host.rs`
+- `tests/browser_replay.rs`
+- `tests/browser_replay_executor.rs`
+- `tests/browser_workflow_coordinator.rs`
+
 ## Checkpoint 7: Replay compiler/status/cancellation lease
 
 ### Status
