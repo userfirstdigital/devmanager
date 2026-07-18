@@ -1063,6 +1063,66 @@ impl BrowserReplayCoordinator {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_locator_repair_capture_for_test(
+        &self,
+        instance: &BrowserReplayInstance,
+    ) -> Result<
+        (
+            BrowserReplayRepairInstance,
+            BrowserReplayLocatorSlot,
+            BrowserReplayRepairResumeCursor,
+        ),
+        BrowserReplayError,
+    > {
+        let mut state = self.lock();
+        let active = Self::exact_active_mut(&mut state, instance)?;
+        let repair = active
+            .repair
+            .as_ref()
+            .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+        Ok((
+            repair.instance.clone(),
+            repair.locator_slot,
+            repair.resume_cursor,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_locator_repair_for_executor_test(
+        &self,
+        repair: &BrowserReplayRepairInstance,
+    ) -> Result<BrowserReplayProjection, BrowserReplayError> {
+        let (removed, projection) = {
+            let mut state = self.lock();
+            let active = Self::exact_active_mut(&mut state, repair.replay())?;
+            if active.projection.status != BrowserReplayStatus::PausedLocatorRepair {
+                return Err(BrowserReplayError::InvalidTransition);
+            }
+            let active_repair = active
+                .repair
+                .as_ref()
+                .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+            if active_repair.instance != *repair
+                || !matches!(
+                    &active_repair.phase,
+                    BrowserReplayPrivateRepairPhase::Paused(_)
+                )
+            {
+                return Err(BrowserReplayError::InvalidRepairEvidence);
+            }
+            let removed = active
+                .repair
+                .take()
+                .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+            active.projection.status = BrowserReplayStatus::Running;
+            signal_repair_state(active);
+            (removed, active.projection.clone())
+        };
+        drop(removed);
+        Ok(projection)
+    }
+
     pub(crate) fn publish_locator_repair(
         &self,
         repair: &BrowserReplayRepairInstance,
@@ -1708,6 +1768,85 @@ mod tests {
         )
         .unwrap();
         (root, store)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn executor_test_resume_rejects_a_stale_repair_generation() {
+        fn reserve_and_publish(
+            coordinator: &BrowserReplayCoordinator,
+            instance: &BrowserReplayInstance,
+            store: &BrowserResourceStore,
+            revision: u64,
+        ) -> BrowserReplayRepairInstance {
+            let repair = coordinator
+                .reserve_locator_repair_capture(
+                    instance,
+                    store,
+                    0,
+                    BrowserReplayLocatorSlot::PrimaryAction,
+                    "runtime-tab-1",
+                    BrowserRevision(revision),
+                    BrowserReplayRepairResumeCursor::Action,
+                )
+                .unwrap();
+            let snapshot = coordinator
+                .retain_locator_repair_evidence_for_test(
+                    &repair,
+                    BrowserResourceKind::ReplayRepairSnapshot,
+                    "application/json",
+                    b"{}",
+                )
+                .unwrap();
+            let screenshot = coordinator
+                .retain_locator_repair_evidence_for_test(
+                    &repair,
+                    BrowserResourceKind::ReplayRepairScreenshot,
+                    "image/png",
+                    b"png",
+                )
+                .unwrap();
+            coordinator
+                .publish_locator_repair(&repair, &snapshot, &screenshot)
+                .unwrap();
+            repair
+        }
+
+        let (root, store) = repair_store("stale-executor-resume", 1024 * 1024);
+        let coordinator = BrowserReplayCoordinator::default();
+        let owner = BrowserWorkspaceKey::new("repair-resume", "stale-generation").unwrap();
+        let started = coordinator
+            .start(owner, click_repair_plan(BrowserRecipeLocator::default()))
+            .unwrap();
+        coordinator.begin(&started.instance).unwrap();
+
+        let stale_repair = reserve_and_publish(&coordinator, &started.instance, &store, 7);
+        coordinator
+            .resume_locator_repair_for_executor_test(&stale_repair)
+            .unwrap();
+        let active_repair = reserve_and_publish(&coordinator, &started.instance, &store, 8);
+
+        let stale_resume = coordinator.resume_locator_repair_for_executor_test(&stale_repair);
+        assert!(matches!(
+            stale_resume,
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        ));
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::PausedLocatorRepair
+        );
+        assert_eq!(
+            coordinator
+                .locator_repair_status(&active_repair)
+                .unwrap()
+                .repair_id,
+            active_repair.repair_id()
+        );
+        assert_ne!(stale_repair.repair_id(), active_repair.repair_id());
+
+        coordinator.cancel(&started.instance).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "windows")]

@@ -6,18 +6,33 @@ use devmanager::browser::{
     BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
     BrowserRecipeWait, BrowserReplayCoordinator, BrowserReplayFailureCode, BrowserReplayProjection,
     BrowserReplayPublicInput, BrowserReplaySecretPromptVault, BrowserReplayStatus,
-    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResponse,
-    BrowserRevision, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserUploadResult,
-    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey,
-    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
+    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
+    BrowserTabSnapshot, BrowserUploadResult, BrowserViewport, BrowserWaitCondition,
+    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
+static REPLAY_RESOURCE_STORE: OnceLock<BrowserResourceStore> = OnceLock::new();
+
+fn replay_resource_store() -> &'static BrowserResourceStore {
+    REPLAY_RESOURCE_STORE.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-replay-executor-resources-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        BrowserResourceStore::open(root, BrowserResourceLimits::default())
+            .expect("open replay executor resource store")
+    })
+}
 
 #[cfg(target_os = "windows")]
 fn create_directory_redirect(target: &Path, link: &Path) -> std::io::Result<()> {
@@ -471,6 +486,7 @@ async fn setup_uses_fresh_tab_and_awaits_each_exact_response() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -591,6 +607,7 @@ async fn setup_uses_fresh_tab_and_awaits_each_exact_response() {
                 &invalid_instance,
                 invalid.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &invalid_root,
             )
             .await
@@ -672,6 +689,7 @@ async fn replay_preflight_rejects_untrusted_authority_without_state_or_browser_s
             &instance,
             started.execution,
             case.actor,
+            replay_resource_store(),
             &case.root,
         )
         .await;
@@ -721,6 +739,7 @@ async fn replay_preflight_rejects_a_foreign_execution_handle_without_side_effect
         &expected_instance,
         foreign.execution,
         BrowserInvocationActor::Agent,
+        replay_resource_store(),
         &canonical_project_root(),
     )
     .await
@@ -759,6 +778,7 @@ async fn cancellation_while_setup_is_awaiting_discards_the_late_response() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -858,6 +878,7 @@ async fn secret_type_uses_the_private_sidecar_while_text_type_stays_an_ordinary_
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -949,6 +970,7 @@ async fn secret_type_requires_the_standard_exactly_one_action_response() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1006,6 +1028,7 @@ async fn secret_type_cancellation_closes_the_exact_sidecar_and_fences_the_late_r
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1143,6 +1166,7 @@ async fn every_recipe_action_maps_to_one_existing_command() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1496,6 +1520,7 @@ async fn replay_cdp_declares_shared_conservative_method_risk() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1552,6 +1577,7 @@ async fn every_recipe_step_wait_maps_to_the_typed_host_wait() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1702,6 +1728,7 @@ async fn replay_forwards_the_maximum_valid_recipe_wait_without_truncation() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1754,6 +1781,7 @@ async fn unmatched_step_wait_fails_without_advancing_or_running_later_work() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1852,6 +1880,7 @@ async fn page_condition_timeout_is_assertion_failure_but_transport_timeout_is_st
                     &instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -1933,6 +1962,7 @@ async fn wrong_response_variant_fails_setup_action_wait_and_assertion() {
                     &instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -2028,6 +2058,7 @@ async fn host_error_details_collapse_to_a_value_free_failure_projection() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2106,6 +2137,7 @@ async fn cancellation_and_replacement_fence_late_action_wait_and_assertion_respo
                     &old_instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -2216,6 +2248,7 @@ async fn interrupted_host_command_terminalizes_the_exact_replay_as_cancelled() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2282,6 +2315,7 @@ async fn tab_aliases_advance_only_on_exact_create_select_and_close_snapshots() {
                     &instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -2424,6 +2458,7 @@ async fn legacy_create_tab_one_binds_the_recipe_alias_to_the_created_runtime_tab
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2513,6 +2548,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2579,6 +2615,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &outside_instance,
                 outside.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2651,6 +2688,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &escaping_instance,
                 escaping.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2710,6 +2748,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &missing_instance,
                 missing.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2761,6 +2800,7 @@ async fn replay_runs_action_wait_assertions_and_advances_only_after_success() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2916,6 +2956,7 @@ async fn assertion_failure_stops_before_advance_or_later_assertions() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
