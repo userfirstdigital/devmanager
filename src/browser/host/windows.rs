@@ -652,6 +652,10 @@ impl BrowserWebViewHost {
             );
             return;
         }
+        if let Err(error) = request.validate_secret_sidecar() {
+            self.finish_queued_request(window, target, operation_id, request, Err(error));
+            return;
+        }
         if browser_command_is_automation(request.command()) {
             match self.begin_automation_request(window, &target, &request, None) {
                 BrowserStartResult::Pending(phase) => {
@@ -3416,6 +3420,7 @@ impl BrowserWebViewHost {
             | BrowserCommand::DownloadDirectory
             | BrowserCommand::ClearProjectProfile => unreachable!("handled before availability"),
             BrowserCommand::Snapshot { .. }
+            | BrowserCommand::SecretType { .. }
             | BrowserCommand::Screenshot { .. }
             | BrowserCommand::Wait { .. }
             | BrowserCommand::Act { .. }
@@ -4018,6 +4023,7 @@ fn browser_command_is_automation(command: &BrowserCommand) -> bool {
     matches!(
         command,
         BrowserCommand::Snapshot { .. }
+            | BrowserCommand::SecretType { .. }
             | BrowserCommand::Screenshot { .. }
             | BrowserCommand::Wait { .. }
             | BrowserCommand::Act { .. }
@@ -4122,6 +4128,7 @@ fn browser_command_summary(command: &BrowserCommand) -> String {
         BrowserCommand::ResetWorkspace => "reset browser workspace".to_string(),
         BrowserCommand::ClearProjectProfile => "clear browser profile".to_string(),
         BrowserCommand::DownloadDirectory => "open browser downloads".to_string(),
+        BrowserCommand::SecretType { .. } => "type secret input".to_string(),
         BrowserCommand::Snapshot { .. } => "capture semantic snapshot".to_string(),
         BrowserCommand::Screenshot { .. } => "capture page screenshot".to_string(),
         BrowserCommand::Wait { .. } => "wait for page condition".to_string(),

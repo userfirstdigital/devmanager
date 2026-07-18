@@ -1694,6 +1694,14 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
         (BrowserCommand::ResetWorkspace, "resetWorkspace"),
         (BrowserCommand::ClearProjectProfile, "clearProjectProfile"),
         (BrowserCommand::DownloadDirectory, "downloadDirectory"),
+        (
+            BrowserCommand::SecretType {
+                tab_id: "tab-a".to_string(),
+                target: BrowserActionTarget::default(),
+                input_name: "password".to_string(),
+            },
+            "secretType",
+        ),
     ];
     for (command, expected_type) in commands {
         let value = serde_json::to_value(&command).expect("serialize command");
@@ -1792,6 +1800,14 @@ fn automation_commands_are_typed_and_use_stable_group_names() {
     let target = BrowserActionTarget::default();
     let commands = vec![
         (
+            BrowserCommand::SecretType {
+                tab_id: "tab-a".into(),
+                target: target.clone(),
+                input_name: "password".into(),
+            },
+            "secretType",
+        ),
+        (
             BrowserCommand::Snapshot {
                 tab_id: "tab-a".into(),
             },
@@ -1878,6 +1894,23 @@ fn automation_commands_are_typed_and_use_stable_group_names() {
             command
         );
     }
+}
+
+#[test]
+fn secure_command_is_tab_scoped_automation_without_lifecycle_preemption() {
+    let key = workspace("project-a", "conversation-a");
+    let command = BrowserCommand::SecretType {
+        tab_id: "tab-a".to_string(),
+        target: BrowserActionTarget::default(),
+        input_name: "password".to_string(),
+    };
+
+    assert_eq!(
+        browser_operation_target_tab_id(&command, Some("selected-tab")),
+        "tab-a"
+    );
+    assert_eq!(browser_lifecycle_control(&key, &command), None);
+    assert!(!browser_request_preempts_operation_queue(&command));
 }
 
 #[test]

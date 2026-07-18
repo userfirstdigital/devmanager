@@ -581,7 +581,7 @@ impl BrowserReplayCoordinator {
                 cancelled: AtomicBool::new(false),
             }),
         };
-        let secret_store = BrowserReplaySecretStore::new();
+        let secret_store = BrowserReplaySecretStore::new(workspace_key.clone(), instance_id);
         let execution = BrowserReplayExecutionHandle {
             instance: instance.clone(),
             plan: Arc::clone(&plan),

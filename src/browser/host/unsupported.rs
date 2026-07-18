@@ -224,6 +224,10 @@ impl BrowserWebViewHost {
             request.respond(Err(BrowserError::Interrupted));
             return;
         }
+        if let Err(error) = request.validate_secret_sidecar() {
+            request.respond(Err(error));
+            return;
+        }
         let result =
             self.handle_command(window, request.workspace_key(), request.command().clone());
         request.respond(result);
