@@ -54,9 +54,13 @@ All direct MCP browser actions also receive the typed host error, but only recip
 
 The failed locator and candidate locator stay private. They are validated recipe metadata, but do not need to be copied into status, errors, journals, or inline MCP results.
 
-On a typed failure the executor captures, in order, a fresh semantic snapshot and viewport screenshot through the existing controller queue. It verifies exact response kinds, tab ID, owner, resource kinds, and snapshot revision. It pins each resource immediately; a failure rolls back earlier pins. The coordinator owns a non-serializable pin lease and unpins on cancel, replacement, successful resume, terminalization, or drop. The resource bodies remain available only through their existing owner-scoped handles.
+On a typed failure the executor first creates a private repair-evidence retention lease, then captures, in order, a fresh semantic snapshot and viewport screenshot through the existing controller queue. Repair capture requests carry a private, non-serde sidecar derived from that exact lease. The Windows host validates the sidecar against the command, owner, replay, repair, project resource root, and dedicated `ReplayRepairSnapshot` or `ReplayRepairScreenshot` resource kind.
 
-If either capture or pin step fails, replay terminates with the existing fixed `StepFailed` code rather than exposing a partial repair instance.
+All `BrowserResourceStore` instances opened for one canonical project-resource root share one process-global root runtime and gate. A repair resource is written with `pinned: true`, registered to its live lease, and made visible to cleanup in one critical section; cleanup can therefore never evict it between creation and retention. Dedicated repair resources have exactly one retention owner and cannot collide with annotation or manual pin ownership. Releasing the non-clone lease marks only its owned resources unpinned and queues any failed metadata cleanup for retry on the next root operation. The lease retains the shared root runtime until release. The first root-runtime open in a new process reconciles stale dedicated repair pins left by a crash before normal cleanup, so a process exit cannot strand them forever.
+
+The executor verifies exact response kinds, tab ID, owner, dedicated resource kinds, and snapshot revision before publishing repair state. A failure releases the whole lease, including any earlier capture. The coordinator owns the lease and releases it on cancel, replacement, successful resume, terminalization, or drop. The resource bodies remain available only through their existing owner-scoped handles.
+
+If either capture or retention step fails, replay terminates with the existing fixed `StepFailed` code rather than exposing a partial repair instance.
 
 ## Waiting and interruption
 
@@ -68,15 +72,15 @@ While paused, Stop, direct user input, route loss, registration revocation, proc
 
 `BrowserReplayRepairCandidate` contains an exact `BrowserElementRef`; its revision must equal both the captured repair revision and the host's current workspace revision. The locator must convert to a valid `BrowserRecipeLocator` and must not be coordinates-only.
 
-A dedicated internal repair-highlight command resolves the candidate and draws one DevManager-owned, pointer-transparent overlay. Its DOM nodes are excluded from mutation revision tracking. Preview does not focus or dispatch page events and is never sent to the recipe recorder. Navigation, another preview, cancel, or apply clears the prior overlay.
+A dedicated internal repair-highlight command resolves the candidate and draws one DevManager-owned, pointer-transparent overlay. Every preview has a checked generation token bound to the exact repair. The host and injected JavaScript both compare that token: installation replaces only the prior acknowledged token, and clear is an exact compare-and-swap that cannot remove a newer overlay. Its DOM nodes are excluded from mutation revision tracking. Preview does not focus or dispatch page events and is never sent to the recipe recorder. Navigation invalidates the host token; another preview, cancel, or apply clears only the exact prior token.
 
-Preview first validates the exact repair instance, then asks the real host to validate and highlight the element reference. Only an exact acknowledged response stores the candidate. A late callback after page, workspace, replay, or repair replacement is ignored and cleared.
+Preview first reserves its generation against the exact repair instance, then asks the real host to validate and highlight the element reference. Only an exact token-bearing acknowledgement followed by a coordinator compare-and-swap stores the candidate. A late callback after page, workspace, replay, repair replacement, or a newer preview clears only its own token and cannot install or remove the newer candidate. The host rechecks cancellation and native revision after the script callback; a changed page clears that token and returns a fixed stale-reference result.
 
 The same preview API accepts `User` or `Agent`; checkpoint 12 exposes the Agent path through MCP and connects the native user surface.
 
 ## Atomic recipe apply
 
-The compiled replay plan stores a private SHA-256 digest of the validated canonical recipe JSON. Repair state also stores the exact original step ID, index, locator slot, and locator.
+The compiled replay plan stores a private SHA-256 digest of the validated canonical recipe JSON. Before the first browser command, the execution handle binds exactly once to the authenticated canonical local project root supplied by the executor; later execution, repair, and repository operations must match that bound root. Repair state also stores the exact original step ID, index, locator slot, and locator.
 
 Apply requires:
 
@@ -87,15 +91,19 @@ Apply requires:
 5. existing approval authorization for an Agent repository overwrite, with a `Destructive` risk floor; and
 6. the canonical authenticated project root.
 
-Under one process-local recipe-write gate, the repository helper reloads the strict v1 recipe, compares its canonical digest, exact step ID/index, locator slot, and old locator, clones it, replaces only that locator, validates the complete recipe, and uses the existing hardened sibling-temp atomic replacement. The destination is re-read and compared again at the final boundary. Failure leaves the old complete file and paused repair intact; no partial JSON is accepted.
+Apply has a private reservation with `Preparing` and `Committing` phases. Approval and host validation happen while `Preparing`. Immediately before repository mutation, apply reacquires the coordinator, verifies the exact live repair/candidate/cancellation generation, and enters `Committing`. Cancellation, replacement, and interruption use that same coordinator gate. If they win before `Committing`, the reservation is revoked and no write occurs. If apply wins, the synchronous file write, override installation, and transition to `applied` complete while the coordinator gate is held; a terminal path waits and can act only after that coherent commit. A failed write returns the reservation to `previewed` without an override.
+
+The commit uses the existing process-global `RECIPE_WRITE_GATE`, not a repair-specific gate. The repository helper uses the replay-bound canonical root, reloads the strict v1 recipe, compares its canonical digest, exact step ID/index, locator slot, and old locator, clones it, replaces only that locator, validates the complete recipe, and uses the existing hardened sibling-temp atomic replacement. The destination is re-read and compared again at the final boundary. Failure leaves the old complete file and paused repair intact; no partial JSON is accepted.
+
+The last host revision validation immediately before `Committing` is the page-side precondition for the filesystem commit; the DOM and filesystem cannot form one atomic transaction. After the rename and `applied` state commit, apply validates the same token, element reference, tab, and native revision again before resume. If the page changed during the synchronous write, the new complete recipe remains committed and the repair remains paused in `applied`, with no browser action retried. A fresh current-page preview is required before an exact resume. This returns a fixed applied-without-resume outcome rather than pretending the recipe write was rolled back.
 
 Apply is idempotent only for the same active repair and same already-applied candidate. A changed recipe, page revision, workspace, replay, repair, step, slot, old locator, or candidate returns a fixed typed repair error and performs no write.
 
 ## Same-step resume
 
-After a successful write, the replacement is installed into the execution handle's private override map under `(step_index, locator_slot)`. If `resume` is true, the coordinator clears the highlight, removes the repair pin lease, changes the replay back to `Running`, advances the watch generation, and the existing executor retries the same step without advancing progress first.
+After a successful write, the replacement is installed into the execution handle's private override map under `(step_index, locator_slot)`. Repair state also retains a private resume cursor identifying `Action`, `ActionWait`, `StepWait`, or `Assertion(index)`. If `resume` is true and post-write page validation succeeds, the coordinator clears the exact highlight token, removes the repair pin lease, changes the replay back to `Running`, advances the watch generation, and the existing executor retries from that cursor without advancing progress first.
 
-Every action, wait, and assertion obtains its effective locator from the override map immediately before constructing a command. A repaired drag source does not replace its destination; an assertion repair does not affect another assertion. The original immutable plan is never mutated in memory.
+Every action, wait, and assertion obtains its effective locator from the override map immediately before constructing a command. A locator failure in the action retries that action because the host guarantees the missing-target failure occurred before dispatch. A failure in an action's nested wait, the step wait, or assertion `n` resumes at that exact phase and never replays an already successful click, type, upload, CDP call, or earlier assertion. A repaired drag source does not replace its destination; an assertion repair does not affect another assertion. The original immutable plan is never mutated in memory.
 
 If `resume` is false, the repair remains paused and reports `applied`; a later exact apply call may request resume without writing again. A second locator failure at the same step creates a new repair ID and fresh evidence.
 
@@ -111,6 +119,6 @@ If `resume` is false, the repair remains paused and reports `applied`; a later e
 
 ## Test strategy
 
-Checkpoint 10 covers typed Windows callback mapping, target-kind safety, exact repair identity, pin rollback/release, fresh evidence validation, pause/wait/cancel/replace races, and absence of repair payloads from safe replay surfaces.
+Checkpoint 10 covers typed Windows callback mapping, target-kind safety, exact repair identity, shared-root atomic retention, crash-stale reconciliation, release retry, fresh evidence validation, phase-aware pause/wait/cancel/replace races, and absence of repair payloads from safe replay surfaces.
 
-Checkpoint 11 covers current-revision preview, overlay mutation exclusion, User/Agent authority, explicit confirmation, approval risk, strict recipe compare-and-replace, atomic failure preservation, concurrent/stale apply rejection, exact locator-slot mutation, applied-without-resume, same-step retry, second failure, and all terminal cleanup paths.
+Checkpoint 11 covers current-revision tokenized preview, old/new/late overlay compare-and-swap, overlay mutation exclusion, User/Agent authority, explicit confirmation, approval risk, strict recipe compare-and-replace, apply-versus-cancel linearization, atomic failure preservation, deterministic page-change-during-write handling, concurrent/stale apply rejection, exact locator-slot mutation, applied-without-resume, phase-aware retry without duplicate actions, second failure, and all terminal cleanup paths.
