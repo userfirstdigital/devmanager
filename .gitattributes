@@ -1,2 +1,5 @@
 # Generated PWA artifacts are embedded and fingerprinted byte-for-byte.
 web/bundle/** -text
+
+# Browser fixture payloads are asserted byte-for-byte on every platform.
+tests/fixtures/browser-site/** text eol=lf
