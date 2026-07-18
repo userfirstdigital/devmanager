@@ -1,5 +1,139 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 9: Memory-only replay secrets
+
+### Status and scope
+
+Checkpoint 9 started from the independently approved checkpoint-8 head `7f4afb3637b6e23435ccf6146bc901eb8d79c192`. Its implementation is complete through `4d6123b464f6be2ba0977144852ebff2dd601fad`; the evidence-only commit that contains this report is the frozen checkpoint-9 review head recorded in the handoff.
+
+This checkpoint adds only memory-only replay secrets and the masked pane contract. It does not add locator-failure/repair state, recipe repair or repository mutation, the exact `browser_workflow` MCP group, replay lifecycle UI wiring, a second replay owner, whole-PC control, Playwright, Node sidecars, or external Chrome mode. The NativeShell prompt installation seam remains intentionally dormant until checkpoint 12 owns the final workflow lifecycle.
+
+### Contract delivered
+
+- Each replay owns one exact workspace/coordinator-scope/instance `BrowserReplaySecretStore`. The non-Clone, non-Debug, non-serde submission and lease authority retain bounded `Zeroizing<String>` values only; terminalization, replacement, interruption, cancellation, coordinator drop, and executor teardown synchronously close the store.
+- Public browser state sees only `BrowserCommand::SecretType { tab_id, target, input_name }`. Plaintext crosses a private non-Debug/non-serde sidecar as an exact replay lease. Ordinary controller calls cannot forge the sidecar; the secure controller method accepts only Agent execution and exact workspace/replay/input authority.
+- Windows sends the marker through the existing per-tab Agent queue, runtime target inspection, approval, cancellation, recording, and journal paths. Exposure begins before the plaintext callback and remains in-flight until the fixed callback boundary. Document taint, native navigation identity, and fail-closed missing state prevent page-controlled values from re-entering safe projections during or after secret execution.
+- Recording reserves Secret and File input name/kind ownership transactionally in global source order before asynchronous inspection. It retains only an unset Secret declaration and recipe `Type` input reference; password text, upload paths, CDP params/results, and callback output never enter recorder state.
+- The executor sends ordinary Text through `BrowserAction::Type` and only Secret-kind recipe `Type` through the private secure request. It accepts the exact already-Running instance produced by prompt submission, requires the standard exactly-one-action response, fences status around every await, and closes the store on every return.
+- NativeShell owns the volatile prompt vault directly, outside `BrowserPaneTransient`, `BrowserPaneModel`, `AppState`, persistence, remote snapshots, resources, and journals. Values are preallocated to the 16-KiB bound and never reallocate while filling; rendering receives only safe names/focus/`is_set` and always displays exactly eight bullets. Submit consumes the vault once; cancellation, replacement, route/tab/conversation changes, destructive browser actions, pane collapse, modal/editor entry, and window close zeroize it.
+- Prompt key routing consumes printable keys, Backspace, navigation, Enter, Escape, and modified clipboard gestures before terminal/composer/annotation/remote paths. While the prompt is active, the annotation editor remains preserved but non-visible, non-focused, and unable to read the clipboard or mutate its draft.
+- There is no MCP operation or argument that can submit a replay secret. The existing tool schemas/resources expose no `SecretType`, prompt, secret-value, or replay-secret wire seam.
+
+### Strict RED-to-GREEN chronology
+
+#### Task 1: exact-instance zeroizing store
+
+- RED: `cargo test --locked --test browser_replay_secrets -- --test-threads=1` failed to compile because the secret submission/store/lease/error and coordinator APIs did not exist.
+- GREEN implementation: `e7367498799ece57fbc9a5873cd31785741dd755` (`feat(browser): add memory-only replay secret store`).
+- Independent review exposed a missing source-order input-capacity fence. The focused RED accepted an over-capacity unresolved Secret set; `11937fbf7db7ea570ffb9320edc686111bef2ab7` moved the fixed 32-input limit to replay compilation/start before a store can be installed. Final replay-secret and replay suites include the exact-capacity, invalid-set atomicity, one-shot, stale/foreign, terminal-close, and retained-lease zeroization cases.
+
+#### Task 2: private controller sidecar
+
+- RED: `cargo test --locked --test browser_replay_secrets secure_command -- --test-threads=1` failed to compile because `SecretType` and the secure request method did not exist.
+- GREEN implementation: `df43754454352ade18516429b49f28bfa85956d8` (`feat(browser): add private secret command lane`).
+- Independent review reproduced same numeric replay IDs from different coordinator scopes reaching the sidecar boundary. `aba7ea121c31023e13684afc9b4fbdc299b9aca3` bound the sidecar to the exact opaque replay scope and made generic, wrong-command, wrong-input, wrong-workspace, stale, cancelled, revoked, and unsupported routes fail closed. Public marker/context/status serialization and Debug assertions remain value-free.
+
+#### Task 3: Windows queue, approval, recording, and injected typing
+
+- RED began at `deea001cc4ba002111c2f0e730623371d64f32d6` with absent queue phases, injected `typeSecret`, approval/recording mapping, and Node harness behavior. The initial GREEN typed through the existing Agent lane, then three strict review-remediation rounds landed at `7a482f2487f9cf8fca147b28ce7fb01241e48568`, `2d7fe4d3ed2b379e65ed4f4f077a6894a2e98e65`, and `27e9c2a2df58fdba39f43dd1240bf569546f7543`.
+- The final remediation's missing-state REDs were three exact 0/1 failures (close tab, workspace reset, and profile clear) in which queued URL/title/download/diagnostic values survived state removal. GREEN retains tri-state document authority and treats missing as contained before any projection or recorder installation.
+- Exposure REDs were exact 0/1 failures for navigation completion before callback, callback invalidation of an earlier navigation candidate, duplicate finish, immediate schedule error, and the production source lease boundary. GREEN begins one idempotent exposure lease before `with_exposed`, blocks navigation clearing while in flight, finishes before fixed result mapping/queueing, and deliberately remains fail closed when an accepted evaluation never calls back.
+- Recorder source-order REDs were five exact 0/1 failures: upload-then-secret completion order, secret-then-upload ownership, explicit collision, capacity before exposure, and cancelled-earlier-secret/later-upload naming. GREEN preclaims both kinds under one source-order lock, rolls back failed begin atomically, and releases ownership on cancellation/stop/discard/restart.
+- Final Task-3 verification was 142/142 across host 96, recording 10, replay secrets 12, and coordinator 24; 32/32 adjacent integrations; 14/14 focused native state tests; one exact post-success coordinator regression; locked all-target check; format; and diff checks. Independent review approved with 0 Critical and 0 Important findings. The theoretical `u64` exposure-generation/in-flight counter saturation after approximately `2^64` transitions remains one Minor final-review note.
+
+#### Task 4: executor and masked prompt
+
+- A pre-existing CRLF-sensitive executor source assertion was normalized in test code before feature work; its exact repaired baseline was 1/1. Strict executor and prompt RED commands failed to compile for the absent prompt vault/event/projection and secure executor route; the exact NativeShell ownership and pane-obscuring lifecycle tests then failed 0/1 before their seams existed. No failed command was a zero-test filter.
+- The first executor GREEN attempt timed out because prompt submission correctly transitions `NeedsUserSecret` to `Running` while the executor accepted only `Pending`. Exact-instance acceptance of the submitted Running replay made the three secret executor tests pass. `3dd7a9f811ded698a229f9c1f0e6ba4641721a19` delivered the contract; final implementation suites were executor 23/23, prompt 3/3, pane 32/32, replay secrets 12/12, replay 21/21, workflow coordinator 24/24, host 96/96, recording 10/10, workflow review UI 14/14, attachment lifecycle 3/3, and terminal annotations 6/6.
+- Independent review rejected two Important boundaries. Allocation RED failed to compile before a dedicated preallocated value owner existed; GREEN fills 16 KiB in 257-byte increments with unchanged pointer/capacity and rejects a one-byte overflow without allocation movement. Annotation ownership RED first lacked pure visibility/action seams, then failed the source-order guard and behavioral `annotation_focused` assertion; GREEN removes the editor/key handlers while preserving its draft and consumes stale annotation actions before mutation or clipboard access.
+- `4d6123b464f6be2ba0977144852ebff2dd601fad` is the independently approved remediation. Its final gates were allocation invariant 1/1, prompt 3/3, pane 32/32, executor 23/23, review UI 14/14, annotations 5/5, locked all-target check, format, diff, and secret/logging scans. Fresh re-review reported 0 Critical, 0 Important, and 0 Minor findings.
+
+### Checkpoint-9 verification
+
+All Cargo commands used `CARGO_BUILD_JOBS=1` where compilation was involved.
+
+- `cargo test --locked --test browser_replay_secrets -- --test-threads=1`: 12 passed, 0 failed.
+- `cargo test --locked --test browser_secret_prompt -- --test-threads=1`: 3 passed, 0 failed.
+- `cargo test --locked --test browser_replay_executor -- --test-threads=1`: 23 passed, 0 failed.
+- `cargo test --locked --test browser_host -- --test-threads=1`: 96 passed, 0 failed.
+- `cargo test --locked --test browser_workflow_coordinator -- --test-threads=1`: 24 passed, 0 failed.
+- `cargo test --locked --test browser_recording -- --test-threads=1`: 10 passed, 0 failed.
+- Focused total: 168 passed, 0 failed.
+- `cargo test --locked browser -- --test-threads=1`: 153 matching tests passed across library and integration targets, 0 failed.
+- `cargo check --locked --all-targets`: passed in 29.21 seconds.
+- `cargo build --release --locked`: passed natively on Windows in 8 minutes 24 seconds with `GPUI_FXC_PATH=C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe` and one Cargo job.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed; Git emitted only an informational Windows autocrlf warning before the fixture prerequisite normalized its payload.
+
+The first aggregate attempt was not green: it reached 101/101 matching library tests and 17/17 `browser_core` tests, then `browser_fixture` failed 0/1 because the tracked LF payload had been checked out as CRLF under system `core.autocrlf=true`. Raw-byte diagnosis showed the index ended in `0A` (37 bytes), the worktree ended in `0D 0A` (38 bytes), and the test directly used `read_to_string`; an exact rerun repeated the failure. The separate strict-TDD and independently approved prerequisite `429dbc86dbd5a8b89ee9daa0c7220a7d64dfb9d5` adds only `.gitattributes` byte-stability for browser fixture payloads. After it, `git ls-files --eol` reported `i/lf w/lf`, the exact fixture test passed 1/1, and the required aggregate rerun passed 153/153. This prerequisite is not checkpoint-9 implementation and is excluded from its artifact.
+
+The first release attempt was also not green: after 783.3 seconds, third-party `gpui 0.2.2` stopped because `fxc.exe` was not on PATH. The installed Windows 10 SDK contained the x64 compiler at the path above, GPUI's build script explicitly supports `GPUI_FXC_PATH`, and the source/configuration remained unchanged. The environment-only retry is the release evidence.
+
+### Leakage audit
+
+- The sentinel-bearing focused suites exercise command/event/status serialization, Debug projections, pane/persisted/remote snapshots, journal/resource source ownership, recorder JSON, injected-page console/network/IPC/snapshot/performance output, callback mapping, executor requests, and the controlled DOM value. Their 168/168 result permits the plaintext only inside test source and the controlled DOM assertion.
+- An exact tracked-source scan for the eight checkpoint sentinel/private-value patterns found 11 occurrences and 0 unexpected production occurrences: every hit is in an integration test or after the `#[cfg(test)]` module boundary in `commands.rs`, `replay.rs`, or `host/windows.rs`.
+- MCP and resource production sources contain 0 checkpoint sentinel hits and 0 `SecretType`, replay-secret, or secret-prompt wire seams. Compile-time negative trait assertions prove submissions, leases, exposure authorities, editor values, and vaults are not Debug/serde/Clone as required; safe event/projection types contain only names, focus, and booleans.
+- Added-line logging/input-sink scans found only three test assertions proving secret key handling precedes and never calls clipboard access. There are no added production `println!`, `eprintln!`, `dbg!`, tracing/logging, terminal write, composer write, or clipboard-read sinks for plaintext.
+- The native release outputs `target/release/devmanager.exe`, `.pdb`, and `.d` contain 0 hits for all eight checkpoint sentinel/private-value patterns.
+- Public `SecretType` JSON has only `type`, `tabId`, semantic `target`, and validated `inputName`; no `text` or `value`. Recording JSON has only an unset Secret input and value reference. Error messages, approvals, resources, journals, callback results, and safe projections use fixed codes/summaries and contain no caller data.
+
+### Platform and acceptance limits
+
+- Windows is the functional platform for this checkpoint. The native Windows all-target check, host/unsupported behavior tests, and release build pass.
+- The unsupported/macOS adapter rejects the validated secure ingress with the typed platform error before exposure. A Windows-hosted `aarch64-apple-darwin` cross-check cannot reach project typechecking because third-party `ring`/`aws-lc-sys` requires an Apple-target C compiler unavailable in this environment; native macOS CI remains the authoritative compile gate.
+- No interactive real WebView2 session was run during checkpoint 9. Evidence is executable state-machine/unit/integration/Node tests, release compilation, source and binary leakage scans, and independent immutable review. Real-provider/interactive acceptance remains Task 6.
+
+### Commits and immutable-review scope
+
+Checkpoint implementation history, excluding the unrelated Codex/Pwsh documentation commits interleaved on master:
+
+- `cac4ae8` design and `e736749` implementation of the store;
+- `11937fb` capacity hardening;
+- `df43754` private lane and `aba7ea1` exact replay binding;
+- `deea001` Windows typing plus `7a482f2`, `2d7fe4d`, and `27e9c2a` containment hardening;
+- `3dd7a9f` executor/prompt plus `4d6123b` memory/focus hardening;
+- the evidence-only commit containing this section.
+
+Prior immutable artifact identities retained for audit:
+
+- Task-3 third remediation `41224333884bb5fdfaedceaf766618763e28bc11..27e9c2a2df58fdba39f43dd1240bf569546f7543`: 53,459 bytes; SHA-256 `9c76a4fa1f76b84ab2170ff6413904476255e496268a342f7000b8fc437f6d5f`; raw-byte stable patch ID `8803139e48c1678111b0db1d3c03ef2424fe5b62`; independent regeneration byte-identical.
+- Task-4 original `27e9c2a2df58fdba39f43dd1240bf569546f7543..3dd7a9f811ded698a229f9c1f0e6ba4641721a19`: 84,972 bytes; SHA-256 `1605c431cdc4bef641e4d6464a1e1ab0fe61d3b7b271b9ff2d04c69639ebc96a`; authoritative raw-byte stable patch ID `4c18c2346bc105b03082e2dc0585c30c618fa76a`; independent regeneration byte-identical. The previously reported `a01e4fa5bf4d958a9de9251d4bbb524afc174ee7` was produced by PowerShell text transcoding; the frozen artifact itself never changed.
+- Task-4 remediation `3dd7a9f811ded698a229f9c1f0e6ba4641721a19..4d6123b464f6be2ba0977144852ebff2dd601fad`: 14,087 bytes; SHA-256 `48e83409abe60fd985780385e49ef34106fe3b40095bb6a8f108085c9aff751f`; raw-byte stable patch ID `c4923954cdf5882f572e90e904e9f5d1f20f863d`; independent regeneration byte-identical.
+
+The final ignored artifact is `.superpowers/sdd/browser-checkpoint9-review.diff`, generated deterministically from base `7f4afb3637b6e23435ccf6146bc901eb8d79c192` through the evidence commit using exactly these 26 pathspecs:
+
+1. `Cargo.lock`
+2. `Cargo.toml`
+3. `docs/superpowers/plans/2026-07-17-browser-replay-secrets.md`
+4. `docs/superpowers/specs/2026-07-17-browser-replay-secrets-design.md`
+5. `src/app/mod.rs`
+6. `src/browser/commands.rs`
+7. `src/browser/host/initialization.rs`
+8. `src/browser/host/mod.rs`
+9. `src/browser/host/unsupported.rs`
+10. `src/browser/host/windows.rs`
+11. `src/browser/mod.rs`
+12. `src/browser/pane.rs`
+13. `src/browser/recording.rs`
+14. `src/browser/recording_coordinator.rs`
+15. `src/browser/replay.rs`
+16. `src/browser/replay_executor.rs`
+17. `src/browser/replay_secrets.rs`
+18. `tests/browser_host.rs`
+19. `tests/browser_replay.rs`
+20. `tests/browser_replay_executor.rs`
+21. `tests/browser_replay_secrets.rs`
+22. `tests/browser_secret_prompt.rs`
+23. `tests/browser_workflow_coordinator.rs`
+24. `.superpowers/sdd/browser-task-5c-checkpoints.md`
+25. `.superpowers/sdd/browser-task-5c-report.md`
+26. `.superpowers/sdd/progress.md`
+
+This path scope deliberately excludes unrelated commits `c2f0626` and `4122433` and their Codex-hooks/Pwsh plan/design files, plus prerequisite `429dbc8` and `.gitattributes`. The final head, byte count, SHA-256, raw-byte stable patch ID, and byte-identical independent regeneration are reported in the immutable handoff after the evidence commit exists; embedding the artifact's own identity in this included report would make the package self-referential.
+
+Checkpoint 9 stops here for independent review. Checkpoints 10 through 12 remain pending and no locator-repair or `browser_workflow` MCP/lifecycle work has started.
+
 ## Checkpoint 8: Replay through the existing controller/queue/approval/journal
 
 ### Status
