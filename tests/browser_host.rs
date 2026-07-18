@@ -228,7 +228,21 @@ fn node_injected_actions_classify_primary_source_and_destination_without_locator
         r##"
 const write = process.stdout.write.bind(process.stdout);
 class FakeElement {{
-  constructor(id) {{ this.id = id; this.isConnected = true; }}
+  constructor(id) {{
+    this.id = id;
+    this.tagName = "INPUT";
+    this.isConnected = true;
+    this.attributes = {{ type: "text", autocomplete: "current-password" }};
+    const values = new Map();
+    this.style = {{
+      setProperty(name, value) {{ values.set(name, value); }},
+      getPropertyValue(name) {{ return values.get(name) || ""; }},
+      getPropertyPriority() {{ return ""; }},
+    }};
+  }}
+  getAttribute(name) {{ return this.attributes[name] || null; }}
+  click() {{}}
+  focus() {{}}
   dispatchEvent() {{ return true; }}
 }}
 globalThis.Element = FakeElement;
@@ -241,11 +255,32 @@ globalThis.XMLHttpRequest = class {{ addEventListener() {{}} getResponseHeader()
 XMLHttpRequest.prototype.open = function() {{}};
 XMLHttpRequest.prototype.send = function() {{}};
 globalThis.console = {{ debug() {{}}, info() {{}}, log() {{}}, warn() {{}}, error() {{}} }};
+globalThis.DataTransfer = class {{}};
+globalThis.DragEvent = class {{ constructor(type) {{ this.type = type; }} }};
 const source = new FakeElement("source");
+const collisionPrimary = new FakeElement("collision-primary");
+collisionPrimary.click = () => {{ throw new Error("locator_primary_not_found"); }};
+const collisionSource = new FakeElement("collision-source");
+collisionSource.dispatchEvent = () => {{ throw new Error("locator_source_not_found"); }};
+const collisionDestination = new FakeElement("collision-destination");
+collisionDestination.dispatchEvent = () => {{ throw new Error("locator_destination_not_found"); }};
+const collisionSecret = new FakeElement("collision-secret");
+collisionSecret.focus = () => {{ throw new Error("element_not_found"); }};
+const arbitrary = new FakeElement("arbitrary");
+arbitrary.click = () => {{ throw new Error("page-controlled arbitrary error"); }};
 globalThis.document = {{
   activeElement: null,
   body: {{}},
-  querySelector(selector) {{ return selector === "#source" ? source : null; }},
+  querySelector(selector) {{
+    return {{
+      "#source": source,
+      "#collision-primary": collisionPrimary,
+      "#collision-source": collisionSource,
+      "#collision-destination": collisionDestination,
+      "#collision-secret": collisionSecret,
+      "#arbitrary": arbitrary,
+    }}[selector] || null;
+  }},
   querySelectorAll() {{ return []; }},
   elementFromPoint() {{ return null; }},
 }};
@@ -257,14 +292,28 @@ globalThis.window = {{
 {}
 const locator = (selector) => ({{ locator: {{ cssSelectors: [selector] }} }});
 const result = (action) => {{
-  try {{ window.__devmanagerBrowser.act([action]); return "completed"; }}
+  try {{
+    const value = window.__devmanagerBrowser.act([action]);
+    return typeof value === "string" ? value : "completed";
+  }}
   catch (error) {{ return error.message; }}
 }};
 const hostBoundary = (action) => {{
   try {{ return window.__devmanagerBrowser.act([action]); }}
   catch (error) {{
-    const candidate = error && error.message;
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
     if (["locator_primary_not_found", "locator_source_not_found", "locator_destination_not_found"].includes(candidate)) return candidate;
+    return "automation_failed";
+  }}
+}};
+const secretHostBoundary = () => {{
+  window.__devmanagerBrowser.inspectSecretTarget(locator("#collision-secret"), "ticket");
+  try {{
+    window.__devmanagerBrowser.typeSecret("ticket", "not-a-secret");
+    return "secret_type_ok";
+  }} catch (error) {{
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
+    if (["element_not_found", "target_changed"].includes(candidate)) return candidate;
     return "automation_failed";
   }}
 }};
@@ -272,7 +321,11 @@ write(JSON.stringify({{
   primary: result({{ operation: "click", target: locator("#missing-primary") }}),
   source: result({{ operation: "dragDrop", source: locator("#missing-source"), destination: locator("#destination") }}),
   destination: result({{ operation: "dragDrop", source: locator("#source"), destination: locator("#missing-destination") }}),
-  arbitrary: hostBoundary({{ operation: "click", target: locator("#source") }}),
+  arbitrary: hostBoundary({{ operation: "click", target: locator("#arbitrary") }}),
+  collisionPrimary: hostBoundary({{ operation: "click", target: locator("#collision-primary") }}),
+  collisionSource: hostBoundary({{ operation: "dragDrop", source: locator("#collision-source"), destination: locator("#source") }}),
+  collisionDestination: hostBoundary({{ operation: "dragDrop", source: locator("#source"), destination: locator("#collision-destination") }}),
+  collisionSecret: secretHostBoundary(),
 }}));
 "##,
         browser_user_input_initialization_script(),
@@ -299,6 +352,10 @@ write(JSON.stringify({{
             "source": "locator_source_not_found",
             "destination": "locator_destination_not_found",
             "arbitrary": "automation_failed",
+            "collisionPrimary": "automation_failed",
+            "collisionSource": "automation_failed",
+            "collisionDestination": "automation_failed",
+            "collisionSecret": "automation_failed",
         })
     );
 }

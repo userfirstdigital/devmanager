@@ -2316,7 +2316,7 @@ impl BrowserWebViewHost {
                 r#"(() => {{
                     try {{ return window.__devmanagerBrowser.act({encoded}); }}
                     catch (error) {{
-                        const candidate = error && error.message;
+                        const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
                         if (candidate === "locator_primary_not_found") return "locator_primary_not_found";
                         if (candidate === "locator_source_not_found") return "locator_source_not_found";
                         if (candidate === "locator_destination_not_found") return "locator_destination_not_found";
@@ -2412,11 +2412,11 @@ impl BrowserWebViewHost {
                 })?);
             let mut script: Zeroizing<String> = Zeroizing::new(format!(
                 r#"(() => {{
-                      try {{
+                    try {{
                         window.__devmanagerBrowser.typeSecret({}, {});
                         return "secret_type_ok";
                       }} catch (error) {{
-                        const candidate = error && error.message;
+                        const candidate = window.__devmanagerBrowser.nativeFailureCode(error);
                         if (candidate === "element_not_found") return "element_not_found";
                         if (candidate === "target_changed") return "target_changed";
                         return "automation_failed";

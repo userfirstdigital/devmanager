@@ -2,7 +2,14 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
 (() => {
   const marker = "__devmanagerBrowser";
   if (window[marker]) return;
-  const NativeError = Error;
+  class NativeFailure extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+    }
+  }
+  const nativeFailureCode = (failure) =>
+    failure instanceof NativeFailure ? failure.code : null;
 
   const MAX_CONSOLE = 200;
   const MAX_NETWORK = 300;
@@ -591,8 +598,8 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   };
   const applyAction = (action) => {
     const element = resolveTarget(action.target || action.source);
-    if (!element && action.operation === "dragDrop") throw new NativeError("locator_source_not_found");
-    if (!element && (action.operation !== "scroll" && action.operation !== "keypress" || action.target)) throw new NativeError("locator_primary_not_found");
+    if (!element && action.operation === "dragDrop") throw new NativeFailure("locator_source_not_found");
+    if (!element && (action.operation !== "scroll" && action.operation !== "keypress" || action.target)) throw new NativeFailure("locator_primary_not_found");
     switch (action.operation) {
       case "click": element.click(); break;
       case "hover": element.dispatchEvent(new MouseEvent("mousemove", { bubbles: true })); break;
@@ -618,7 +625,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       }
       case "dragDrop": {
         const destination = resolveTarget(action.destination);
-        if (!destination) throw new NativeError("locator_destination_not_found");
+        if (!destination) throw new NativeFailure("locator_destination_not_found");
         const transfer = new DataTransfer();
         element.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
         destination.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
@@ -775,20 +782,20 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       pendingSecretTicket = null;
       if (!ticket || ticket.token !== String(token ?? "")) {
         markSecretTainted();
-        throw new NativeError("element_not_found");
+        throw new NativeFailure("element_not_found");
       }
       const element = ticket.element.deref();
       if (!element) {
         markSecretTainted();
-        throw new NativeError("element_not_found");
+        throw new NativeFailure("element_not_found");
       }
       const connected = element.isConnected === true;
       const currentSignature = secretRiskSignature(element);
       markSecretTainted();
       if (!connected || ticket.signature !== currentSignature) {
-        throw new NativeError("target_changed");
+        throw new NativeFailure("target_changed");
       }
-      if (!registerMaskedSecretElement(element)) throw new NativeError("target_changed");
+      if (!registerMaskedSecretElement(element)) throw new NativeFailure("target_changed");
       element.style?.setProperty?.("-webkit-text-security", "disc", "important");
       element.focus();
       element.value = String(value ?? "");
@@ -804,6 +811,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       }
       return { completedActions };
     },
+    nativeFailureCode,
     wait: async (condition, timeoutMs) => {
       const started = now();
       for (;;) {
