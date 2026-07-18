@@ -4,7 +4,7 @@
 
 ### Status and scope
 
-Checkpoint 10 started from the approved checkpoint-9 evidence head `f9f1657b04cff4153c0402dbfb38a7d57a632e34`. The design and implementation lineage is complete through independently approved Task 3 head `0be24d9ba2453d9a4076ffcc23f366e9de35791c`; this Task-4 evidence update is intentionally uncommitted for controller inspection, commit, and immutable freeze. The `0be24d9` approval covers Task 3 implementation, not the full checkpoint evidence package; full checkpoint-10 approval remains pending the documentation commit and frozen-artifact review.
+Checkpoint 10 started from the approved checkpoint-9 evidence head `f9f1657b04cff4153c0402dbfb38a7d57a632e34`. The design and implementation lineage is complete through independently approved Task 3 head `0be24d9ba2453d9a4076ffcc23f366e9de35791c`, and Task-4 evidence was committed at `e541996c03ee133ceebe3d941faef8976260354a`. The `0be24d9` approval covers Task 3 implementation, not the full checkpoint evidence package. The controller freezes the clean current `f9f1657b04cff4153c0402dbfb38a7d57a632e34..HEAD` artifact for final independent review; full checkpoint-10 approval remains pending that re-review.
 
 This checkpoint adds only typed locator-failure classification, exact live-runtime evidence retention, private repair state and host capture authority, and an executor that remains alive in a stable pause. It does not add repair preview, highlight overlays, candidate selection, confirmation, recipe mutation, locator overrides in use, repository approval/write behavior, the exact `browser_workflow` MCP group, native repair controls, provider lifecycle wiring, a second replay owner, whole-PC control, Playwright, Node sidecars, or external Chrome mode. Checkpoints 11 and 12 remain pending and untouched.
 
@@ -83,7 +83,7 @@ Every Cargo command ran one at a time with one Cargo build job and one test thre
 
 ### Commits and immutable-review scope
 
-Exact approved-base-through-implementation lineage:
+Exact approved-base-through-evidence lineage:
 
 1. `f9f1657b04cff4153c0402dbfb38a7d57a632e34` — approved base.
 2. `3afcb722b2ef74742e566725e9208f3a5519154a` — locator-repair design.
@@ -97,8 +97,9 @@ Exact approved-base-through-implementation lineage:
 10. `f49a4f017391b0cd4bc3ffac56419d0e1ba57b15` — exact repair coordinator state.
 11. `96733e2de90240cd931416362913287b82c3b02a` — exact host evidence sidecar.
 12. `0be24d9ba2453d9a4076ffcc23f366e9de35791c` — executor evidence capture, stable pause, and stale-generation fix.
+13. `e541996c03ee133ceebe3d941faef8976260354a` — checkpoint-10 Task-4 evidence.
 
-The final Task-4 documentation changes remain uncommitted so the controller can inspect and commit them, then freeze the complete path-scoped `f9f1657b04cff4153c0402dbfb38a7d57a632e34..HEAD` artifact and record its byte count, SHA-256, raw stable patch ID, and byte-identical regeneration. No checkpoint-11 or checkpoint-12 implementation or evidence file has been started.
+Task-4 evidence was committed at `e541996c03ee133ceebe3d941faef8976260354a`. The controller freezes the clean current path-scoped `f9f1657b04cff4153c0402dbfb38a7d57a632e34..HEAD` artifact for final independent review. Raw-byte freeze metadata—byte count, SHA-256, raw stable patch ID, and byte-identical regeneration—is recorded by the controller/reviewer outside this artifact so the artifact does not self-reference. Full checkpoint-10 approval remains pending re-review. No checkpoint-11 or checkpoint-12 implementation or evidence file has been started.
 
 ## Checkpoint 9: Memory-only replay secrets
 
