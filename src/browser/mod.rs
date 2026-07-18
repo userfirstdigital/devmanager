@@ -37,11 +37,12 @@ pub use attachments::{
 };
 pub(crate) use attachments::{compact_browser_attachment_text, compact_browser_attachment_url};
 pub use automation::{
-    build_semantic_snapshot, effective_browser_risk, effective_browser_risk_for_targets,
-    redact_browser_resource_bytes, redact_browser_text, runtime_target_risk, BrowserAction,
-    BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry, BrowserConsoleOperation,
-    BrowserDownloadEntry, BrowserDownloadOperation, BrowserLocatorStrategy, BrowserNetworkEntry,
-    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
+    browser_cdp_method_risk, build_semantic_snapshot, effective_browser_risk,
+    effective_browser_risk_for_targets, redact_browser_resource_bytes, redact_browser_text,
+    runtime_target_risk, BrowserAction, BrowserActionResult, BrowserActionTarget,
+    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation,
+    BrowserLocatorStrategy, BrowserNetworkEntry, BrowserNetworkOperation,
+    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
     BrowserRawSemanticElement, BrowserRedactedAction, BrowserRuntimeTarget, BrowserScreenshotMode,
     BrowserSemanticElement, BrowserSemanticSnapshot, BrowserSnapshotSummary,
     BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition, BrowserWaitResult,
@@ -107,6 +108,7 @@ pub use recipes::{
     BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind,
     BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
     BrowserRecipeViewport, BrowserRecipeWait, BROWSER_RECIPE_SCHEMA_VERSION,
+    MAX_BROWSER_RECIPE_WAIT_MS,
 };
 pub use recording::{
     BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingCommit, BrowserRecordingError,

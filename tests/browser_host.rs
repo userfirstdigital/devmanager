@@ -1881,6 +1881,31 @@ fn automation_commands_are_typed_and_use_stable_group_names() {
 }
 
 #[test]
+fn windows_host_elevates_cdp_method_risk_before_existing_approval_gate() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let start = source.find("fn begin_automation_request(").unwrap();
+    let end = source[start..]
+        .find("fn begin_annotation_request(")
+        .unwrap()
+        + start;
+    let automation = &source[start..end];
+    let classify = automation
+        .find("browser_cdp_method_risk")
+        .expect("Windows host must classify CDP methods independently");
+    let combine = automation
+        .find("effective_browser_risk")
+        .expect("Windows host must combine declared and runtime risks");
+    let approval = automation
+        .find("requires_confirmation(initial_risk)")
+        .expect("Windows host must retain the existing approval gate");
+    let dispatch = automation
+        .find("self.start_cdp(target, &operation_id, method, params)")
+        .expect("Windows host CDP dispatch");
+
+    assert!(classify < combine && combine < approval && approval < dispatch);
+}
+
+#[test]
 fn unsupported_adapter_helpers_return_the_typed_platform_error() {
     let status = unsupported_host_status("macos");
     assert_eq!(
@@ -2008,6 +2033,126 @@ fn typed_replay_waits_are_injected_without_javascript_predicates() {
         assert!(
             script.contains(required),
             "missing injected wait: {required}"
+        );
+    }
+}
+
+#[test]
+fn windows_unmatched_page_condition_stays_a_typed_distinct_timeout() {
+    let source = include_str!("../src/browser/host/windows.rs");
+    let start = source.find("fn complete_wait(").unwrap();
+    let end = source[start..].find("fn complete_action(").unwrap() + start;
+    let completion = &source[start..end];
+
+    assert!(completion.contains("BrowserError::Timeout"));
+    assert!(
+        completion.contains("operation: \"pageCondition\".to_string()"),
+        "page-condition timeout must remain distinguishable from controller transport timeout"
+    );
+}
+
+#[test]
+fn windows_host_allows_recipe_wait_ceiling_while_direct_mcp_keeps_its_shorter_cap() {
+    let host = include_str!("../src/browser/host/windows.rs");
+    let start = host.find("BrowserCommand::Wait {").unwrap();
+    let end = host[start..].find("BrowserCommand::Act {").unwrap() + start;
+    let wait = &host[start..end];
+    assert!(
+        wait.contains("clamp(1, MAX_BROWSER_RECIPE_WAIT_MS)"),
+        "Windows host must not truncate a valid 300000ms recipe wait"
+    );
+
+    let mcp = include_str!("../src/browser/mcp.rs");
+    let start = mcp.find("async fn browser_wait(").unwrap();
+    let end = mcp[start..].find("async fn browser_act(").unwrap() + start;
+    let direct_wait = &mcp[start..end];
+    assert!(direct_wait.contains("1..=60_000"));
+    assert!(direct_wait.contains("timeoutMs must be between 1 and 60000"));
+}
+
+#[test]
+fn xhr_network_idle_tracking_balances_only_requests_that_are_actually_sent() {
+    let prelude = r#"
+let clock = 1000;
+globalThis.performance = { now: () => { clock += 100; return clock; }, getEntriesByType: () => [] };
+globalThis.location = new URL("https://example.test/xhr");
+globalThis.Element = class {};
+globalThis.MutationObserver = class { constructor(callback) { this.callback = callback; } observe() {} };
+globalThis.PerformanceObserver = class { observe() {} };
+globalThis.CSS = { escape: (value) => String(value) };
+globalThis.document = {
+  readyState: "complete", title: "XHR", activeElement: null,
+  body: { innerText: "" }, querySelector: () => null, querySelectorAll: () => [],
+};
+globalThis.window = { ipc: { postMessage() {} }, addEventListener() {}, fetch: undefined };
+globalThis.XMLHttpRequest = class {
+  constructor() {
+    this.listeners = new Map(); this.status = 200; this.responseText = "";
+    this.throwOnSend = false;
+  }
+  addEventListener(type, handler, options = {}) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push({ handler, once: Boolean(options.once) });
+    this.listeners.set(type, listeners);
+  }
+  getResponseHeader() { return ""; }
+};
+XMLHttpRequest.prototype.open = function() {};
+XMLHttpRequest.prototype.send = function() {
+  if (this.throwOnSend) throw new Error("send failed");
+  const listeners = [...(this.listeners.get("loadend") || [])];
+  this.listeners.set("loadend", listeners.filter((listener) => !listener.once));
+  for (const listener of listeners) listener.handler.call(this);
+};
+"#;
+    let scenarios = [
+        (
+            "unsent",
+            r#"const xhr = new XMLHttpRequest(); xhr.open("GET", "/unsent");"#,
+        ),
+        (
+            "reopen-before-send",
+            r#"const xhr = new XMLHttpRequest(); xhr.open("GET", "/first"); xhr.open("POST", "/second");"#,
+        ),
+        (
+            "send-throw",
+            r#"const xhr = new XMLHttpRequest(); xhr.open("GET", "/throw"); xhr.throwOnSend = true; try { xhr.send(); } catch (_) {}"#,
+        ),
+        (
+            "reuse",
+            r#"
+const xhr = new XMLHttpRequest();
+xhr.open("GET", "/one"); xhr.send();
+xhr.open("GET", "/two"); xhr.send();
+if (window.__devmanagerBrowser.network("list").length !== 2) throw new Error("XHR reuse telemetry was not exactly balanced");
+"#,
+        ),
+    ];
+
+    for (label, scenario) in scenarios {
+        let harness = [
+            prelude,
+            browser_user_input_initialization_script(),
+            "\n(async () => {\n",
+            scenario,
+            r#"
+const idle = await window.__devmanagerBrowser.wait({ type: "networkIdle" }, 2000);
+if (!idle.matched) throw new Error("network idle remained blocked");
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"#,
+        ]
+        .concat();
+        let temp = TestDir::new(&format!("xhr-network-idle-{label}"));
+        let harness_path = temp.path().join("harness.js");
+        std::fs::write(&harness_path, harness).expect("write XHR harness");
+        let output = Command::new("node")
+            .arg(&harness_path)
+            .output()
+            .expect("execute XHR harness in Node");
+        assert!(
+            output.status.success(),
+            "XHR {label} harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

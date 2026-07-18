@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub const BROWSER_RECIPE_SCHEMA_VERSION: u32 = 1;
-const MAX_RECIPE_WAIT_MS: u64 = 300_000;
+pub const MAX_BROWSER_RECIPE_WAIT_MS: u64 = 300_000;
 const RECIPE_TEMP_PREFIX: &str = ".devmanager-browser-recipe.";
 const MAX_RECIPE_TEMP_ENTRIES_TO_SCAN: usize = 1_024;
 const MAX_RECIPE_TEMPS_TO_SCAVENGE: usize = 64;
@@ -1529,9 +1529,9 @@ fn validate_value(
 }
 
 fn validate_wait_ms(value: u64, label: &str) -> Result<(), BrowserError> {
-    if value == 0 || value > MAX_RECIPE_WAIT_MS {
+    if value == 0 || value > MAX_BROWSER_RECIPE_WAIT_MS {
         return Err(invalid_recipe(format!(
-            "recipe {label} must be between 1 and {MAX_RECIPE_WAIT_MS} milliseconds"
+            "recipe {label} must be between 1 and {MAX_BROWSER_RECIPE_WAIT_MS} milliseconds"
         )));
     }
     Ok(())

@@ -7,7 +7,7 @@ use crate::browser::downloads::{
     verify_prepared_storage_root,
 };
 use crate::browser::{
-    apply_browser_workflow_review_mutation, browser_lifecycle_control,
+    apply_browser_workflow_review_mutation, browser_cdp_method_risk, browser_lifecycle_control,
     browser_operation_target_tab_id, browser_page_origin_from_url, browser_recording_review_result,
     browser_recording_save_would_overwrite, browser_recording_status_result,
     browser_request_preempts_operation_queue, browser_response_resource_ids,
@@ -36,7 +36,7 @@ use crate::browser::{
     BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSnapshotSummary, BrowserStorageLayout,
     BrowserUploadResult, BrowserWaitResult, BrowserWorkflowCoordinator,
     BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS,
+    BrowserWorkspaceSnapshot, MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
@@ -1041,15 +1041,16 @@ impl BrowserWebViewHost {
             return BrowserStartResult::Complete(Err(error));
         }
         let operation_id = request.context().operation_id.clone();
-        let path_risk = matches!(
-            command,
+        let command_risk = match command {
             BrowserCommand::Downloads {
                 operation: crate::browser::BrowserDownloadOperation::Delete,
                 ..
-            }
-        )
-        .then_some(crate::browser::BrowserRisk::Destructive);
-        let initial_risk = effective_browser_risk(request.context().declared_risk, None, path_risk);
+            } => crate::browser::BrowserRisk::Destructive,
+            BrowserCommand::Cdp { method, .. } => browser_cdp_method_risk(method),
+            _ => crate::browser::BrowserRisk::Normal,
+        };
+        let initial_risk =
+            effective_browser_risk(request.context().declared_risk, None, Some(command_risk));
         if !matches!(command, BrowserCommand::Act { .. })
             && BrowserApprovalPolicy::trust_project().requires_confirmation(initial_risk)
             && approved_risk != Some(initial_risk)
@@ -1095,7 +1096,7 @@ impl BrowserWebViewHost {
                 if let Err(error) = self.validate_wait_reference(workspace_key, condition) {
                     return BrowserStartResult::Complete(Err(error));
                 }
-                let timeout_ms = (*timeout_ms).clamp(1, 60_000);
+                let timeout_ms = (*timeout_ms).clamp(1, MAX_BROWSER_RECIPE_WAIT_MS);
                 let condition = match serde_json::to_string(condition) {
                     Ok(condition) => condition,
                     Err(error) => {
@@ -2050,7 +2051,7 @@ impl BrowserWebViewHost {
             })?;
         if !probe.matched {
             return Err(BrowserError::Timeout {
-                operation: "wait".to_string(),
+                operation: "pageCondition".to_string(),
             });
         }
         let revision = self

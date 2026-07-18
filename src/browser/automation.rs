@@ -543,6 +543,30 @@ pub fn effective_browser_risk_for_targets(
     )
 }
 
+pub fn browser_cdp_method_risk(method: &str) -> BrowserRisk {
+    match method {
+        "Browser.getVersion"
+        | "DOM.describeNode"
+        | "DOM.getAttributes"
+        | "DOM.getBoxModel"
+        | "DOM.getDocument"
+        | "DOM.getNodeForLocation"
+        | "DOM.querySelector"
+        | "DOM.querySelectorAll"
+        | "DOM.enable"
+        | "Network.enable"
+        | "Page.enable"
+        | "Page.getFrameTree"
+        | "Page.getLayoutMetrics"
+        | "Page.getNavigationHistory"
+        | "Performance.enable"
+        | "Performance.getMetrics"
+        | "Runtime.enable"
+        | "Runtime.getIsolateId" => BrowserRisk::Normal,
+        _ => BrowserRisk::Destructive,
+    }
+}
+
 pub fn runtime_target_risk(target: &BrowserRuntimeTarget) -> BrowserRisk {
     if target
         .permission

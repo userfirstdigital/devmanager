@@ -520,6 +520,7 @@ async fn setup_uses_fresh_tab_and_awaits_each_exact_response() {
         .start(workspace("invalid-root"), invalid_plan)
         .expect("start invalid-root replay");
     let invalid_instance = invalid.instance.clone();
+    let observed_invalid_instance = invalid_instance.clone();
     let invalid_root = canonical_project_root().join("missing-replay-root");
     let invalid_controller = bridge.bind(
         invalid.instance.workspace_key().clone(),
@@ -543,9 +544,142 @@ async fn setup_uses_fresh_tab_and_awaits_each_exact_response() {
     let failed = invalid_run
         .await
         .expect("invalid-root executor task")
-        .expect("safe failed projection");
-    assert_eq!(failed.status, BrowserReplayStatus::Failed);
-    assert_eq!(failed.failure, Some(BrowserReplayFailureCode::StepFailed));
+        .expect_err("invalid root must fail before execution begins");
+    assert_eq!(
+        format!("{failed:?}"),
+        "InvalidExecutionAuthority".to_string()
+    );
+    assert_eq!(
+        coordinator
+            .status(&observed_invalid_instance)
+            .unwrap()
+            .status,
+        BrowserReplayStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn replay_preflight_rejects_untrusted_authority_without_state_or_browser_side_effects() {
+    struct Case {
+        label: &'static str,
+        actor: BrowserInvocationActor,
+        controller_workspace: &'static str,
+        root: PathBuf,
+    }
+
+    let canonical_root = canonical_project_root();
+    let cases = [
+        Case {
+            label: "workspace-mismatch",
+            actor: BrowserInvocationActor::Agent,
+            controller_workspace: "different-workspace",
+            root: canonical_root.clone(),
+        },
+        Case {
+            label: "user-actor",
+            actor: BrowserInvocationActor::User,
+            controller_workspace: "user-actor",
+            root: canonical_root.clone(),
+        },
+        Case {
+            label: "internal-actor",
+            actor: BrowserInvocationActor::Internal,
+            controller_workspace: "internal-actor",
+            root: canonical_root.clone(),
+        },
+        Case {
+            label: "invalid-root",
+            actor: BrowserInvocationActor::Agent,
+            controller_workspace: "invalid-root-preflight",
+            root: canonical_root.join("missing-replay-root-preflight"),
+        },
+    ];
+
+    for case in cases {
+        let coordinator = BrowserReplayCoordinator::default();
+        let started = coordinator
+            .start(
+                workspace(case.label),
+                compile_browser_replay(&setup_recipe(), Vec::new()).unwrap(),
+            )
+            .expect("start authority replay");
+        let instance = started.instance.clone();
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let controller = bridge.bind(
+            workspace(case.controller_workspace),
+            Duration::from_millis(5),
+        );
+
+        let result = execute_browser_replay(
+            &controller,
+            &coordinator,
+            &instance,
+            started.execution,
+            case.actor,
+            &case.root,
+        )
+        .await;
+
+        assert_eq!(
+            result.map_err(|error| format!("{error:?}")),
+            Err("InvalidExecutionAuthority".to_string()),
+            "{} must fail closed with a value-free authority error",
+            case.label
+        );
+        assert_eq!(
+            coordinator.status(&instance).unwrap().status,
+            BrowserReplayStatus::Pending,
+            "{} mutated replay state before authority validation",
+            case.label
+        );
+        assert_no_request(&mut inbox).await;
+    }
+}
+
+#[tokio::test]
+async fn replay_preflight_rejects_a_foreign_execution_handle_without_side_effects() {
+    let coordinator = BrowserReplayCoordinator::default();
+    let foreign = coordinator
+        .start(
+            workspace("foreign-handle"),
+            compile_browser_replay(&setup_recipe(), Vec::new()).unwrap(),
+        )
+        .expect("start foreign replay");
+    let expected = coordinator
+        .start(
+            workspace("expected-handle"),
+            compile_browser_replay(&setup_recipe(), Vec::new()).unwrap(),
+        )
+        .expect("start expected replay");
+    let expected_instance = expected.instance.clone();
+    let foreign_instance = foreign.instance.clone();
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let controller = bridge.bind(
+        expected_instance.workspace_key().clone(),
+        Duration::from_secs(1),
+    );
+
+    let error = execute_browser_replay(
+        &controller,
+        &coordinator,
+        &expected_instance,
+        foreign.execution,
+        BrowserInvocationActor::Agent,
+        &canonical_project_root(),
+    )
+    .await
+    .expect_err("foreign execution handle must be rejected");
+
+    assert_eq!(format!("{error:?}"), "StaleInstance");
+    assert_eq!(
+        coordinator.status(&expected_instance).unwrap().status,
+        BrowserReplayStatus::Pending
+    );
+    assert_eq!(
+        coordinator.status(&foreign_instance).unwrap().status,
+        BrowserReplayStatus::Pending
+    );
+    assert_no_request(&mut inbox).await;
 }
 
 #[tokio::test]
@@ -594,6 +728,31 @@ async fn cancellation_while_setup_is_awaiting_discards_the_late_response() {
         .expect("cancelled projection remains observable");
     assert_eq!(outcome.status, BrowserReplayStatus::Cancelled);
     assert_eq!(outcome.current_step_index, 0);
+}
+
+#[test]
+fn cancellation_status_fence_checks_both_sides_of_the_running_projection_read() {
+    let source = include_str!("../src/browser/replay_executor.rs");
+    let start = source.find("fn terminal_projection(").unwrap();
+    let end = source[start..].find("fn resolve_value").unwrap() + start;
+    let fence = &source[start..end];
+    let status = fence
+        .find("coordinator\n        .status(instance)")
+        .unwrap();
+    let cancellation_checks = fence
+        .match_indices("execution.is_cancelled()")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        cancellation_checks.len(),
+        2,
+        "the Running projection must be fenced before and after its status read"
+    );
+    assert!(
+        cancellation_checks[0] < status && status < cancellation_checks[1],
+        "a cancellation racing the status/lease split can return stale Running"
+    );
 }
 
 #[tokio::test]
@@ -1024,6 +1183,74 @@ async fn every_recipe_action_maps_to_one_existing_command() {
 }
 
 #[tokio::test]
+async fn replay_cdp_declares_shared_conservative_method_risk() {
+    let methods = [
+        ("Browser.getVersion", BrowserRisk::Normal),
+        ("Browser.close", BrowserRisk::Destructive),
+        ("Experimental.unknownMutation", BrowserRisk::Destructive),
+    ];
+    let recipe = action_recipe(
+        methods
+            .iter()
+            .map(|(method, _)| BrowserRecipeAction::CdpMarker {
+                method: (*method).to_string(),
+            })
+            .collect(),
+    );
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(
+            workspace("cdp-method-risk"),
+            compile_browser_replay(&recipe, Vec::new()).unwrap(),
+        )
+        .expect("start CDP risk replay");
+    let instance = started.instance.clone();
+    let root = canonical_project_root();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                &root,
+            )
+            .await
+        }
+    });
+
+    respond_default_setup(&mut inbox, "https://example.test/action-start").await;
+    for (method, expected_risk) in methods {
+        let request = next_request(&mut inbox, "CDP method risk").await;
+        assert!(matches!(
+            request.command(),
+            BrowserCommand::Cdp {
+                method: actual_method,
+                ..
+            } if actual_method == method
+        ));
+        assert_eq!(
+            request.context().declared_risk,
+            expected_risk,
+            "CDP risk for {method}"
+        );
+        request.respond(Ok(BrowserResponse::Cdp {
+            inline_result: None,
+            resource: None,
+        }));
+    }
+
+    assert_eq!(
+        run.await.unwrap().unwrap().status,
+        BrowserReplayStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn every_recipe_step_wait_maps_to_the_typed_host_wait() {
     let recipe = every_step_wait_recipe();
     let total_steps = recipe.steps.len();
@@ -1158,6 +1385,77 @@ async fn every_recipe_step_wait_maps_to_the_typed_host_wait() {
 }
 
 #[tokio::test]
+async fn replay_forwards_the_maximum_valid_recipe_wait_without_truncation() {
+    let recipe = BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "maximum-replay-wait".to_string(),
+        name: "Maximum replay wait".to_string(),
+        description: "Exercises the recipe wait ceiling".to_string(),
+        start_url: "https://example.test/maximum-wait".to_string(),
+        viewport: BrowserRecipeViewport::default(),
+        inputs: Vec::new(),
+        steps: vec![BrowserRecipeStep {
+            id: "wait".to_string(),
+            action: BrowserRecipeAction::Reload,
+            wait: Some(BrowserRecipeWait::NetworkIdle {
+                timeout_ms: 300_000,
+            }),
+            assertions: Vec::new(),
+        }],
+    };
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(
+            workspace("maximum-replay-wait"),
+            compile_browser_replay(&recipe, Vec::new()).unwrap(),
+        )
+        .expect("start maximum wait replay");
+    let instance = started.instance.clone();
+    let root = canonical_project_root();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                &root,
+            )
+            .await
+        }
+    });
+
+    respond_default_setup(&mut inbox, "https://example.test/maximum-wait").await;
+    next_request(&mut inbox, "maximum wait action")
+        .await
+        .respond(Ok(BrowserResponse::Acknowledged));
+    let wait = next_request(&mut inbox, "maximum recipe wait").await;
+    assert!(matches!(
+        wait.command(),
+        BrowserCommand::Wait {
+            condition: BrowserWaitCondition::NetworkIdle,
+            timeout_ms: 300_000,
+            ..
+        }
+    ));
+    wait.respond(Ok(BrowserResponse::Wait {
+        result: BrowserWaitResult {
+            matched: true,
+            elapsed_ms: 300_000,
+            revision: BrowserRevision(1),
+        },
+    }));
+    assert_eq!(
+        run.await.unwrap().unwrap().status,
+        BrowserReplayStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn unmatched_step_wait_fails_without_advancing_or_running_later_work() {
     let plan = compile_browser_replay(&every_step_wait_recipe(), Vec::new()).unwrap();
     let coordinator = BrowserReplayCoordinator::default();
@@ -1211,6 +1509,107 @@ async fn unmatched_step_wait_fails_without_advancing_or_running_later_work() {
     assert_eq!(failed.status, BrowserReplayStatus::Failed);
     assert_eq!(failed.current_step_index, 0);
     assert_eq!(failed.failure, Some(BrowserReplayFailureCode::StepFailed));
+}
+
+#[tokio::test]
+async fn page_condition_timeout_is_assertion_failure_but_transport_timeout_is_step_failure() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        OrdinaryPageCondition,
+        AssertionPageCondition,
+        AssertionTransport,
+    }
+
+    for (index, case) in [
+        Case::OrdinaryPageCondition,
+        Case::AssertionPageCondition,
+        Case::AssertionTransport,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let assertion = matches!(
+            case,
+            Case::AssertionPageCondition | Case::AssertionTransport
+        );
+        let recipe = BrowserRecipeV1 {
+            schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+            id: format!("timeout-case-{index}"),
+            name: "Timeout case".to_string(),
+            description: "Distinguishes page-condition and transport timeouts".to_string(),
+            start_url: "https://example.test/timeout-case".to_string(),
+            viewport: BrowserRecipeViewport::default(),
+            inputs: Vec::new(),
+            steps: vec![BrowserRecipeStep {
+                id: "timeout-step".to_string(),
+                action: BrowserRecipeAction::Reload,
+                wait: (!assertion).then_some(BrowserRecipeWait::Duration { duration_ms: 7 }),
+                assertions: assertion
+                    .then(|| BrowserRecipeAssertion::Url {
+                        value: literal("https://example.test/timeout-case"),
+                        exact: true,
+                    })
+                    .into_iter()
+                    .collect(),
+            }],
+        };
+        let coordinator = BrowserReplayCoordinator::default();
+        let started = coordinator
+            .start(
+                workspace(&format!("timeout-case-{index}")),
+                compile_browser_replay(&recipe, Vec::new()).unwrap(),
+            )
+            .expect("start timeout replay");
+        let instance = started.instance.clone();
+        let root = canonical_project_root();
+        let (bridge, mut inbox) = browser_command_channel(8);
+        let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+        let run = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                execute_browser_replay(
+                    &controller,
+                    &coordinator,
+                    &instance,
+                    started.execution,
+                    BrowserInvocationActor::Agent,
+                    &root,
+                )
+                .await
+            }
+        });
+
+        respond_default_setup(&mut inbox, "https://example.test/timeout-case").await;
+        next_request(&mut inbox, "timeout case action")
+            .await
+            .respond(Ok(BrowserResponse::Acknowledged));
+        let wait = next_request(&mut inbox, "timeout case wait").await;
+        assert!(matches!(wait.command(), BrowserCommand::Wait { .. }));
+        wait.respond(Err(BrowserError::Timeout {
+            operation: match case {
+                Case::OrdinaryPageCondition | Case::AssertionPageCondition => {
+                    "pageCondition".to_string()
+                }
+                Case::AssertionTransport => "wait".to_string(),
+            },
+        }));
+
+        let failed = run
+            .await
+            .expect("timeout executor task")
+            .expect("timeout has a safe failure projection");
+        assert_eq!(failed.status, BrowserReplayStatus::Failed);
+        assert_eq!(
+            failed.failure,
+            Some(match case {
+                Case::AssertionPageCondition => BrowserReplayFailureCode::AssertionFailed,
+                Case::OrdinaryPageCondition | Case::AssertionTransport => {
+                    BrowserReplayFailureCode::StepFailed
+                }
+            }),
+            "timeout case {index} mapped to the wrong replay failure"
+        );
+    }
 }
 
 #[tokio::test]

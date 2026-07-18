@@ -1,13 +1,13 @@
 use super::commands::verified_authenticated_local_project_root;
 use super::{
-    classify_upload_path, BrowserAction, BrowserActionTarget, BrowserCommand, BrowserController,
-    BrowserError, BrowserInvocationActor, BrowserInvocationContext, BrowserLocator,
-    BrowserRecipeAction, BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInputKind,
-    BrowserRecipeLocator, BrowserRecipeValue, BrowserRecipeWait, BrowserReplayCoordinator,
-    BrowserReplayError, BrowserReplayExecutionHandle, BrowserReplayFailureCode,
-    BrowserReplayInstance, BrowserReplayPlan, BrowserReplayProjection, BrowserReplayStatus,
-    BrowserResponse, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserViewport,
-    BrowserWaitCondition, BrowserWorkspaceSnapshot,
+    browser_cdp_method_risk, classify_upload_path, BrowserAction, BrowserActionTarget,
+    BrowserCommand, BrowserController, BrowserError, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserLocator, BrowserRecipeAction, BrowserRecipeAssertion,
+    BrowserRecipeElementState, BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeValue,
+    BrowserRecipeWait, BrowserReplayCoordinator, BrowserReplayError, BrowserReplayExecutionHandle,
+    BrowserReplayFailureCode, BrowserReplayInstance, BrowserReplayPlan, BrowserReplayProjection,
+    BrowserReplayStatus, BrowserResponse, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot,
+    BrowserViewport, BrowserWaitCondition, BrowserWorkspaceSnapshot,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,18 +27,20 @@ pub async fn execute_browser_replay(
     if !execution.same_instance(instance) {
         return Err(BrowserReplayError::StaleInstance);
     }
+    if controller.workspace_key() != instance.workspace_key()
+        || actor != BrowserInvocationActor::Agent
+    {
+        return Err(BrowserReplayError::InvalidExecutionAuthority);
+    }
+    let local_project_root =
+        verified_authenticated_local_project_root(authenticated_local_project_root)
+            .map_err(|_| BrowserReplayError::InvalidExecutionAuthority)?;
     if let Some(cancelled) = cancelled_projection(&execution, coordinator, instance)? {
         return Ok(cancelled);
     }
     if let Err(error) = coordinator.begin(instance) {
         return retained_terminal_after_transition_error(coordinator, instance, error);
     }
-    let local_project_root =
-        match verified_authenticated_local_project_root(authenticated_local_project_root) {
-            Ok(root) => root,
-            Err(_) => return fail_step(coordinator, instance),
-        };
-
     let plan = execution.plan();
     let create = match checked_request(
         controller,
@@ -192,6 +194,7 @@ pub async fn execute_browser_replay(
 enum ReplayActionFailure {
     StepFailed,
     AssertionFailed,
+    PageConditionTimeout,
     Terminal(BrowserReplayProjection),
     Replay(BrowserReplayError),
 }
@@ -431,13 +434,15 @@ async fn execute_action(
             Ok(())
         }
         BrowserRecipeAction::CdpMarker { method } => {
-            let response = checked_request(
+            let response = checked_request_with_options(
                 controller,
                 coordinator,
                 instance,
                 execution,
                 actor,
                 "replay reviewed CDP marker",
+                browser_cdp_method_risk(method),
+                None,
                 BrowserCommand::Cdp {
                     tab_id: tabs.current.clone(),
                     method: method.clone(),
@@ -838,7 +843,7 @@ async fn execute_assertion(
                 .ok_or(ReplayActionFailure::StepFailed)?,
         },
     };
-    let response = checked_request(
+    let response = match checked_request(
         controller,
         coordinator,
         instance,
@@ -851,7 +856,13 @@ async fn execute_assertion(
             timeout_ms: ASSERTION_TIMEOUT_MS,
         },
     )
-    .await?;
+    .await
+    {
+        Err(ReplayActionFailure::PageConditionTimeout) => {
+            return Err(ReplayActionFailure::AssertionFailed)
+        }
+        result => result?,
+    };
     match response {
         BrowserResponse::Wait { result } if result.matched => Ok(()),
         BrowserResponse::Wait { .. } => Err(ReplayActionFailure::AssertionFailed),
@@ -941,6 +952,9 @@ async fn checked_request_with_options(
                 }
             }
         },
+        Err(BrowserError::Timeout { operation }) if operation == "pageCondition" => {
+            Err(ReplayActionFailure::PageConditionTimeout)
+        }
         Err(_) => Err(ReplayActionFailure::StepFailed),
     }
 }
@@ -950,14 +964,25 @@ fn terminal_projection(
     coordinator: &BrowserReplayCoordinator,
     instance: &BrowserReplayInstance,
 ) -> Result<Option<BrowserReplayProjection>, ReplayActionFailure> {
+    if execution.is_cancelled() {
+        return coordinator
+            .status(instance)
+            .map(Some)
+            .map_err(ReplayActionFailure::Replay);
+    }
     let projection = coordinator
         .status(instance)
         .map_err(ReplayActionFailure::Replay)?;
-    if execution.is_cancelled() || projection.status != BrowserReplayStatus::Running {
-        Ok(Some(projection))
-    } else {
-        Ok(None)
+    if projection.status != BrowserReplayStatus::Running {
+        return Ok(Some(projection));
     }
+    if execution.is_cancelled() {
+        return coordinator
+            .status(instance)
+            .map(Some)
+            .map_err(ReplayActionFailure::Replay);
+    }
+    Ok(None)
 }
 
 fn resolve_value<'a>(
@@ -1143,6 +1168,7 @@ fn finish_failure(
     match failure {
         ReplayActionFailure::StepFailed => fail_step(coordinator, instance),
         ReplayActionFailure::AssertionFailed => fail_assertion(coordinator, instance),
+        ReplayActionFailure::PageConditionTimeout => fail_step(coordinator, instance),
         ReplayActionFailure::Terminal(projection) => Ok(projection),
         ReplayActionFailure::Replay(error) => Err(error),
     }

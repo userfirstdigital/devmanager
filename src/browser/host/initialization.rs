@@ -206,12 +206,17 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   const xhrOpen = XMLHttpRequest.prototype.open;
   const xhrSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    this.__devmanagerRequest = beginRequest(url, method);
-    return xhrOpen.call(this, method, url, ...rest);
+    const result = xhrOpen.call(this, method, url, ...rest);
+    this.__devmanagerRequestMetadata = { url, method };
+    return result;
   };
   XMLHttpRequest.prototype.send = function(...args) {
-    const entry = this.__devmanagerRequest || beginRequest(location.href, "GET");
-    this.addEventListener("loadend", () => {
+    const metadata = this.__devmanagerRequestMetadata || { url: location.href, method: "GET" };
+    const entry = beginRequest(metadata.url, metadata.method);
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
       try {
         const contentType = this.getResponseHeader("content-type") || "";
         if (new URL(entry.url).origin === location.origin && /json|text|javascript|xml|form/i.test(contentType)) {
@@ -223,8 +228,17 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
         }
       } catch (_) {}
       finishRequest(entry, this.status || null, this.status === 0 || this.status >= 400);
-    }, { once: true });
-    return xhrSend.apply(this, args);
+    };
+    try {
+      this.addEventListener("loadend", finish, { once: true });
+      return xhrSend.apply(this, args);
+    } catch (error) {
+      if (!finished) {
+        finished = true;
+        finishRequest(entry, null, true);
+      }
+      throw error;
+    }
   };
 
   try {
