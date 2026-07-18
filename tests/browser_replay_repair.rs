@@ -1,5 +1,8 @@
-use devmanager::browser::{BrowserError, BrowserResourceLimits, BrowserResourceStore};
-use static_assertions::assert_impl_all;
+use devmanager::browser::{
+    BrowserError, BrowserReplayLocatorSlot, BrowserReplayRepairInstance, BrowserReplayRepairPhase,
+    BrowserReplayRepairProjection, BrowserResourceLimits, BrowserResourceStore,
+};
+use static_assertions::{assert_impl_all, assert_not_impl_any};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 #[cfg(target_os = "windows")]
@@ -8,6 +11,11 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 assert_impl_all!(BrowserResourceStore: Clone, Send, Sync);
+assert_impl_all!(BrowserReplayLocatorSlot: Clone, Send, Sync, Eq, std::fmt::Debug, serde::Serialize);
+assert_impl_all!(BrowserReplayRepairInstance: Clone, Send, Sync, Eq);
+assert_not_impl_any!(BrowserReplayRepairInstance: std::fmt::Debug, serde::Serialize);
+assert_impl_all!(BrowserReplayRepairPhase: Clone, Send, Sync, Eq, std::fmt::Debug, serde::Serialize);
+assert_impl_all!(BrowserReplayRepairProjection: Clone, Send, Sync, Eq, std::fmt::Debug, serde::Serialize);
 
 #[cfg(target_os = "windows")]
 struct TestDir(PathBuf);

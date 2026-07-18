@@ -1,14 +1,24 @@
+use super::replay_repair::{
+    BrowserReplayRepairAuthorityScope, BrowserReplayRepairResumeCursor,
+    BrowserReplayRepairRetentionAuthority,
+};
+use super::resources::BrowserReplayRepairRetentionLease;
 use super::{
-    BrowserRecipeAction, BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserRecipeValue, BrowserRecipeViewport, BrowserReplaySecretError, BrowserReplaySecretLease,
-    BrowserReplaySecretStore, BrowserReplaySecretSubmission, BrowserWorkspaceKey,
-    MAX_BROWSER_REPLAY_SECRET_INPUTS,
+    BrowserError, BrowserRecipeAction, BrowserRecipeAssertion, BrowserRecipeElementState,
+    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+    BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait, BrowserReplayLocatorSlot,
+    BrowserReplayRepairInstance, BrowserReplayRepairPhase, BrowserReplayRepairProjection,
+    BrowserReplaySecretError, BrowserReplaySecretLease, BrowserReplaySecretStore,
+    BrowserReplaySecretSubmission, BrowserResourceHandle, BrowserResourceKind,
+    BrowserResourceStore, BrowserRevision, BrowserWorkspaceKey, MAX_BROWSER_REPLAY_SECRET_INPUTS,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::watch;
 
 pub const MAX_BROWSER_REPLAY_INPUTS: usize = 64;
 pub const MAX_BROWSER_REPLAY_STEPS: usize = 256;
@@ -16,6 +26,7 @@ pub const MAX_BROWSER_REPLAY_INPUT_NAME_BYTES: usize = 128;
 pub const MAX_BROWSER_REPLAY_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_BROWSER_REPLAY_URL_BYTES: usize = 8 * 1024;
 pub const MAX_BROWSER_REPLAY_FILE_BYTES: usize = 32 * 1024;
+const MAX_BROWSER_REPLAY_REPAIR_TAB_ID_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserReplayError {
@@ -38,6 +49,10 @@ pub enum BrowserReplayError {
     IncompleteReplay,
     TerminalState,
     InstanceIdExhausted,
+    RepairInstanceIdExhausted,
+    InvalidRepairSlot,
+    InvalidRepairEvidence,
+    RepairEvidenceUnavailable,
 }
 
 impl fmt::Display for BrowserReplayError {
@@ -62,6 +77,10 @@ impl fmt::Display for BrowserReplayError {
             Self::IncompleteReplay => "browser replay has incomplete steps",
             Self::TerminalState => "browser replay instance is terminal",
             Self::InstanceIdExhausted => "browser replay instance identity is exhausted",
+            Self::RepairInstanceIdExhausted => "browser replay repair identity is exhausted",
+            Self::InvalidRepairSlot => "browser replay repair locator slot is invalid",
+            Self::InvalidRepairEvidence => "browser replay repair evidence is invalid",
+            Self::RepairEvidenceUnavailable => "browser replay repair evidence is unavailable",
         })
     }
 }
@@ -268,6 +287,8 @@ pub struct BrowserReplayExecutionHandle {
     plan: Arc<BrowserReplayPlan>,
     lease: BrowserReplayCancellationLease,
     secret_store: BrowserReplaySecretStore,
+    repair_watch: watch::Receiver<u64>,
+    locator_overrides: Arc<Mutex<HashMap<(usize, BrowserReplayLocatorSlot), BrowserRecipeLocator>>>,
 }
 
 impl BrowserReplayExecutionHandle {
@@ -302,6 +323,84 @@ impl BrowserReplayExecutionHandle {
     pub(crate) fn close_secret_store(&self) {
         self.secret_store.close();
     }
+
+    pub(crate) fn repair_watch(&self) -> watch::Receiver<u64> {
+        self.repair_watch.clone()
+    }
+
+    pub(crate) fn locator_override(
+        &self,
+        step_index: usize,
+        locator_slot: BrowserReplayLocatorSlot,
+    ) -> Option<BrowserRecipeLocator> {
+        self.locator_overrides
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(step_index, locator_slot))
+            .cloned()
+    }
+}
+
+struct BrowserReplayRepairLeaseSlot {
+    lease: Mutex<Option<BrowserReplayRepairRetentionLease>>,
+}
+
+impl BrowserReplayRepairLeaseSlot {
+    fn new(lease: BrowserReplayRepairRetentionLease) -> Self {
+        Self {
+            lease: Mutex::new(Some(lease)),
+        }
+    }
+
+    fn with_lease<T>(
+        &self,
+        operation: impl FnOnce(&mut BrowserReplayRepairRetentionLease) -> Result<T, BrowserError>,
+    ) -> Result<T, BrowserError> {
+        let mut lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation(
+            lease
+                .as_mut()
+                .ok_or_else(|| BrowserError::BlockedPermission {
+                    permission: "repair retention".to_string(),
+                })?,
+        )
+    }
+
+    fn close(&self) {
+        self.lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+}
+
+enum BrowserReplayPrivateRepairPhase {
+    Capturing,
+    Paused(BrowserReplayRepairProjection),
+}
+
+struct BrowserReplayPrivateRepairState {
+    instance: BrowserReplayRepairInstance,
+    resource_store: BrowserResourceStore,
+    lease: Arc<BrowserReplayRepairLeaseSlot>,
+    step_index: usize,
+    locator_slot: BrowserReplayLocatorSlot,
+    tab_id: String,
+    revision: BrowserRevision,
+    old_locator: BrowserRecipeLocator,
+    resume_cursor: BrowserReplayRepairResumeCursor,
+    snapshot: Option<BrowserResourceHandle>,
+    screenshot: Option<BrowserResourceHandle>,
+    phase: BrowserReplayPrivateRepairPhase,
+}
+
+impl Drop for BrowserReplayPrivateRepairState {
+    fn drop(&mut self) {
+        self.lease.close();
+    }
 }
 
 struct ActiveBrowserReplay {
@@ -310,6 +409,11 @@ struct ActiveBrowserReplay {
     projection: BrowserReplayProjection,
     lease: BrowserReplayCancellationLease,
     secret_store: BrowserReplaySecretStore,
+    repair: Option<BrowserReplayPrivateRepairState>,
+    repair_signal: watch::Sender<u64>,
+    repair_generation: u64,
+    _locator_overrides:
+        Arc<Mutex<HashMap<(usize, BrowserReplayLocatorSlot), BrowserRecipeLocator>>>,
 }
 
 struct TerminalBrowserReplay {
@@ -317,9 +421,16 @@ struct TerminalBrowserReplay {
     projection: BrowserReplayProjection,
 }
 
+fn signal_repair_state(active: &mut ActiveBrowserReplay) {
+    active.repair_generation = active.repair_generation.wrapping_add(1);
+    active.repair_signal.send_replace(active.repair_generation);
+}
+
 struct BrowserReplayCoordinatorState {
     scope: Arc<BrowserReplayCoordinatorScope>,
+    repair_scope: Arc<BrowserReplayRepairAuthorityScope>,
     next_instance_id: u64,
+    next_repair_id: u64,
     active: HashMap<BrowserWorkspaceKey, ActiveBrowserReplay>,
     terminal: VecDeque<TerminalBrowserReplay>,
     terminal_capacity: usize,
@@ -327,8 +438,14 @@ struct BrowserReplayCoordinatorState {
 
 impl Drop for BrowserReplayCoordinatorState {
     fn drop(&mut self) {
-        for active in self.active.values() {
+        for active in self.active.values_mut() {
+            active
+                .lease
+                .authority
+                .cancelled
+                .store(true, Ordering::Release);
             active.secret_store.close();
+            signal_repair_state(active);
         }
     }
 }
@@ -349,7 +466,9 @@ impl BrowserReplayCoordinator {
         Self {
             inner: Arc::new(Mutex::new(BrowserReplayCoordinatorState {
                 scope: Arc::new(BrowserReplayCoordinatorScope),
+                repair_scope: Arc::new(BrowserReplayRepairAuthorityScope),
                 next_instance_id: 0,
+                next_repair_id: 0,
                 active: HashMap::new(),
                 terminal: VecDeque::new(),
                 terminal_capacity: terminal_capacity.max(1),
@@ -440,7 +559,7 @@ impl BrowserReplayCoordinator {
         step_index: usize,
     ) -> Result<BrowserReplayProjection, BrowserReplayError> {
         self.transition_nonterminal(instance, |active| {
-            if active.projection.status != BrowserReplayStatus::Running {
+            if active.projection.status != BrowserReplayStatus::Running || active.repair.is_some() {
                 return Err(BrowserReplayError::InvalidTransition);
             }
             if step_index != active.projection.current_step_index
@@ -458,30 +577,282 @@ impl BrowserReplayCoordinator {
         })
     }
 
-    pub fn pause_locator_repair(
+    pub(crate) fn reserve_locator_repair_capture(
         &self,
         instance: &BrowserReplayInstance,
-    ) -> Result<BrowserReplayProjection, BrowserReplayError> {
-        self.transition_nonterminal(instance, |active| {
-            if active.projection.status != BrowserReplayStatus::Running {
+        resource_store: &BrowserResourceStore,
+        step_index: usize,
+        locator_slot: BrowserReplayLocatorSlot,
+        tab_id: impl Into<String>,
+        revision: BrowserRevision,
+        resume_cursor: BrowserReplayRepairResumeCursor,
+    ) -> Result<BrowserReplayRepairInstance, BrowserReplayError> {
+        let tab_id = tab_id.into();
+        if tab_id.trim().is_empty()
+            || tab_id.len() > MAX_BROWSER_REPLAY_REPAIR_TAB_ID_BYTES
+            || tab_id.chars().any(char::is_control)
+        {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+
+        let mut state = self.lock();
+        let old_locator = {
+            let active = Self::exact_active_mut(&mut state, instance)?;
+            if active.projection.status != BrowserReplayStatus::Running
+                || active.repair.is_some()
+                || active.projection.current_step_index != step_index
+            {
                 return Err(BrowserReplayError::InvalidTransition);
             }
-            active.projection.status = BrowserReplayStatus::PausedLocatorRepair;
-            Ok(active.projection.clone())
-        })
+            let step = active
+                .plan
+                .steps
+                .get(step_index)
+                .ok_or(BrowserReplayError::InvalidRepairSlot)?;
+            validate_repair_cursor(locator_slot, resume_cursor)?;
+            locator_for_repair_slot(step, locator_slot)?.clone()
+        };
+        let repair_id = state
+            .next_repair_id
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(BrowserReplayError::RepairInstanceIdExhausted)?;
+        let repair = BrowserReplayRepairInstance::new(
+            instance.clone(),
+            repair_id,
+            Arc::clone(&state.repair_scope),
+        );
+        let authority = BrowserReplayRepairRetentionAuthority::for_repair(&repair);
+        let lease = resource_store
+            .begin_repair_retention(&authority)
+            .map_err(|_| BrowserReplayError::RepairEvidenceUnavailable)?;
+        let active = Self::exact_active_mut(&mut state, instance)?;
+        active.repair = Some(BrowserReplayPrivateRepairState {
+            instance: repair.clone(),
+            resource_store: resource_store.clone(),
+            lease: Arc::new(BrowserReplayRepairLeaseSlot::new(lease)),
+            step_index,
+            locator_slot,
+            tab_id,
+            revision,
+            old_locator,
+            resume_cursor,
+            snapshot: None,
+            screenshot: None,
+            phase: BrowserReplayPrivateRepairPhase::Capturing,
+        });
+        state.next_repair_id = repair_id.get();
+        Ok(repair)
     }
 
-    pub fn resume_locator_repair(
+    #[cfg(test)]
+    fn retain_locator_repair_evidence_for_test(
         &self,
-        instance: &BrowserReplayInstance,
-    ) -> Result<BrowserReplayProjection, BrowserReplayError> {
-        self.transition_nonterminal(instance, |active| {
-            if active.projection.status != BrowserReplayStatus::PausedLocatorRepair {
-                return Err(BrowserReplayError::InvalidTransition);
+        repair: &BrowserReplayRepairInstance,
+        kind: BrowserResourceKind,
+        mime_type: impl Into<String>,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<BrowserResourceHandle, BrowserError> {
+        let mut state = self.lock();
+        let mime_type = mime_type.into();
+        let expected_mime_type = match kind {
+            BrowserResourceKind::ReplayRepairSnapshot => "application/json",
+            BrowserResourceKind::ReplayRepairScreenshot => "image/png",
+            _ => {
+                return Err(BrowserError::InvalidInvocation {
+                    field: "resourceKind".to_string(),
+                });
             }
-            active.projection.status = BrowserReplayStatus::Running;
-            Ok(active.projection.clone())
-        })
+        };
+        if mime_type != expected_mime_type {
+            if let Ok(active) = Self::exact_active_mut(&mut state, repair.replay()) {
+                if active
+                    .repair
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.instance == *repair)
+                {
+                    active.repair.take();
+                }
+            }
+            return Err(BrowserError::InvalidInvocation {
+                field: "mimeType".to_string(),
+            });
+        }
+        let (resource_store, lease) = {
+            let active = Self::exact_active_mut(&mut state, repair.replay()).map_err(|_| {
+                BrowserError::BlockedPermission {
+                    permission: "repair retention".to_string(),
+                }
+            })?;
+            let repair_state =
+                active
+                    .repair
+                    .as_ref()
+                    .ok_or_else(|| BrowserError::BlockedPermission {
+                        permission: "repair retention".to_string(),
+                    })?;
+            let kind_available = match kind {
+                BrowserResourceKind::ReplayRepairSnapshot => repair_state.snapshot.is_none(),
+                BrowserResourceKind::ReplayRepairScreenshot => repair_state.screenshot.is_none(),
+                _ => false,
+            };
+            if active.projection.status != BrowserReplayStatus::Running
+                || repair_state.instance != *repair
+                || !matches!(
+                    repair_state.phase,
+                    BrowserReplayPrivateRepairPhase::Capturing
+                )
+                || !kind_available
+            {
+                return Err(BrowserError::BlockedPermission {
+                    permission: "repair retention".to_string(),
+                });
+            }
+            (
+                repair_state.resource_store.clone(),
+                Arc::clone(&repair_state.lease),
+            )
+        };
+
+        let retained = lease
+            .with_lease(|lease| resource_store.put_repair_retained(lease, kind, mime_type, bytes));
+        let handle = match retained {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Ok(active) = Self::exact_active_mut(&mut state, repair.replay()) {
+                    if active
+                        .repair
+                        .as_ref()
+                        .is_some_and(|candidate| candidate.instance == *repair)
+                    {
+                        active.repair.take();
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let active = Self::exact_active_mut(&mut state, repair.replay()).map_err(|_| {
+            BrowserError::BlockedPermission {
+                permission: "repair retention".to_string(),
+            }
+        })?;
+        let repair_state =
+            active
+                .repair
+                .as_mut()
+                .ok_or_else(|| BrowserError::BlockedPermission {
+                    permission: "repair retention".to_string(),
+                })?;
+        match kind {
+            BrowserResourceKind::ReplayRepairSnapshot => {
+                repair_state.snapshot = Some(handle.clone());
+            }
+            BrowserResourceKind::ReplayRepairScreenshot => {
+                repair_state.screenshot = Some(handle.clone());
+            }
+            _ => unreachable!("repair resource kind was validated before retention"),
+        }
+        Ok(handle)
+    }
+
+    pub(crate) fn locator_repair_status(
+        &self,
+        repair: &BrowserReplayRepairInstance,
+    ) -> Result<BrowserReplayRepairProjection, BrowserReplayError> {
+        let mut state = self.lock();
+        let active = Self::exact_active_mut(&mut state, repair.replay())?;
+        let repair_state = active
+            .repair
+            .as_ref()
+            .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+        if repair_state.instance != *repair {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+        match &repair_state.phase {
+            BrowserReplayPrivateRepairPhase::Capturing => {
+                Err(BrowserReplayError::InvalidTransition)
+            }
+            BrowserReplayPrivateRepairPhase::Paused(projection) => Ok(projection.clone()),
+        }
+    }
+
+    pub(crate) fn publish_locator_repair(
+        &self,
+        repair: &BrowserReplayRepairInstance,
+        snapshot: &BrowserResourceHandle,
+        screenshot: &BrowserResourceHandle,
+    ) -> Result<BrowserReplayRepairProjection, BrowserReplayError> {
+        let mut state = self.lock();
+        let active = Self::exact_active_mut(&mut state, repair.replay())?;
+        if active.projection.status != BrowserReplayStatus::Running {
+            return Err(BrowserReplayError::InvalidTransition);
+        }
+        let (resource_store, step_index, locator_slot, tab_id, revision) = {
+            let repair_state = active
+                .repair
+                .as_ref()
+                .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+            if repair_state.instance != *repair
+                || !matches!(
+                    repair_state.phase,
+                    BrowserReplayPrivateRepairPhase::Capturing
+                )
+                || repair_state.snapshot.as_ref() != Some(snapshot)
+                || repair_state.screenshot.as_ref() != Some(screenshot)
+                || snapshot.kind != BrowserResourceKind::ReplayRepairSnapshot
+                || screenshot.kind != BrowserResourceKind::ReplayRepairScreenshot
+            {
+                return Err(BrowserReplayError::InvalidRepairEvidence);
+            }
+            (
+                repair_state.resource_store.clone(),
+                repair_state.step_index,
+                repair_state.locator_slot,
+                repair_state.tab_id.clone(),
+                repair_state.revision,
+            )
+        };
+        let exact_snapshot = resource_store
+            .handle(repair.workspace_key(), &snapshot.id)
+            .map_err(|_| BrowserReplayError::RepairEvidenceUnavailable)?;
+        let exact_screenshot = resource_store
+            .handle(repair.workspace_key(), &screenshot.id)
+            .map_err(|_| BrowserReplayError::RepairEvidenceUnavailable)?;
+        if exact_snapshot != *snapshot || exact_screenshot != *screenshot {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+        let step = active
+            .plan
+            .steps
+            .get(step_index)
+            .ok_or(BrowserReplayError::InvalidRepairSlot)?;
+        if active.projection.current_step_index != step_index
+            || active.projection.current_step_id.as_deref() != Some(step.id.as_str())
+        {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+        let projection = BrowserReplayRepairProjection {
+            workspace_key: repair.workspace_key().clone(),
+            replay_instance_id: repair.replay_instance_id(),
+            repair_id: repair.repair_id(),
+            recipe_id: active.plan.recipe_id.clone(),
+            step_id: step.id.clone(),
+            step_index,
+            locator_slot,
+            tab_id,
+            revision,
+            snapshot: snapshot.clone(),
+            screenshot: screenshot.clone(),
+            phase: BrowserReplayRepairPhase::AwaitingPreview,
+        };
+        active
+            .repair
+            .as_mut()
+            .expect("exact capturing repair was checked under the coordinator lock")
+            .phase = BrowserReplayPrivateRepairPhase::Paused(projection.clone());
+        active.projection.status = BrowserReplayStatus::PausedLocatorRepair;
+        signal_repair_state(active);
+        Ok(projection)
     }
 
     pub fn complete(
@@ -491,7 +862,7 @@ impl BrowserReplayCoordinator {
         let mut state = self.lock();
         {
             let active = Self::exact_active_mut(&mut state, instance)?;
-            if active.projection.status != BrowserReplayStatus::Running {
+            if active.projection.status != BrowserReplayStatus::Running || active.repair.is_some() {
                 return Err(BrowserReplayError::InvalidTransition);
             }
             if active.projection.current_step_index != active.projection.total_steps {
@@ -592,11 +963,15 @@ impl BrowserReplayCoordinator {
             }),
         };
         let secret_store = BrowserReplaySecretStore::new(instance.clone());
+        let (repair_signal, repair_watch) = watch::channel(0_u64);
+        let locator_overrides = Arc::new(Mutex::new(HashMap::new()));
         let execution = BrowserReplayExecutionHandle {
             instance: instance.clone(),
             plan: Arc::clone(&plan),
             lease: lease.clone(),
             secret_store: secret_store.share_authority(),
+            repair_watch,
+            locator_overrides: Arc::clone(&locator_overrides),
         };
         let projection = BrowserReplayProjection {
             workspace_key: workspace_key.clone(),
@@ -621,6 +996,10 @@ impl BrowserReplayCoordinator {
                 projection: projection.clone(),
                 lease: lease.clone(),
                 secret_store,
+                repair: None,
+                repair_signal,
+                repair_generation: 0,
+                _locator_overrides: locator_overrides,
             },
         );
         Ok(BrowserReplayStart {
@@ -672,22 +1051,23 @@ impl BrowserReplayCoordinator {
         status: BrowserReplayStatus,
         failure: Option<BrowserReplayFailureCode>,
     ) -> Result<BrowserReplayProjection, BrowserReplayError> {
-        Self::exact_active_mut(state, instance)?;
-        if let Some(active) = state.active.get(instance.workspace_key()) {
+        {
+            let active = Self::exact_active_mut(state, instance)?;
+            if status == BrowserReplayStatus::Cancelled {
+                active
+                    .lease
+                    .authority
+                    .cancelled
+                    .store(true, Ordering::Release);
+            }
+            active.projection.status = status;
+            active.projection.failure = failure;
             active.secret_store.close();
+            signal_repair_state(active);
         }
-        let Some(mut active) = state.active.remove(instance.workspace_key()) else {
+        let Some(active) = state.active.remove(instance.workspace_key()) else {
             return Err(BrowserReplayError::StaleInstance);
         };
-        if status == BrowserReplayStatus::Cancelled {
-            active
-                .lease
-                .authority
-                .cancelled
-                .store(true, Ordering::Release);
-        }
-        active.projection.status = status;
-        active.projection.failure = failure;
         let projection = active.projection;
         state.terminal.push_back(TerminalBrowserReplay {
             instance: active.instance,
@@ -697,6 +1077,97 @@ impl BrowserReplayCoordinator {
             state.terminal.pop_front();
         }
         Ok(projection)
+    }
+}
+
+fn validate_repair_cursor(
+    locator_slot: BrowserReplayLocatorSlot,
+    resume_cursor: BrowserReplayRepairResumeCursor,
+) -> Result<(), BrowserReplayError> {
+    let matches = match locator_slot {
+        BrowserReplayLocatorSlot::PrimaryAction
+        | BrowserReplayLocatorSlot::OptionalAction
+        | BrowserReplayLocatorSlot::DragSource
+        | BrowserReplayLocatorSlot::DragDestination => {
+            resume_cursor == BrowserReplayRepairResumeCursor::Action
+        }
+        BrowserReplayLocatorSlot::ActionWait => {
+            resume_cursor == BrowserReplayRepairResumeCursor::ActionWait
+        }
+        BrowserReplayLocatorSlot::StepWait => {
+            resume_cursor == BrowserReplayRepairResumeCursor::StepWait
+        }
+        BrowserReplayLocatorSlot::Assertion { index } => {
+            resume_cursor == BrowserReplayRepairResumeCursor::Assertion(index)
+        }
+    };
+    matches
+        .then_some(())
+        .ok_or(BrowserReplayError::InvalidRepairSlot)
+}
+
+fn locator_for_repair_slot(
+    step: &BrowserRecipeStep,
+    locator_slot: BrowserReplayLocatorSlot,
+) -> Result<&BrowserRecipeLocator, BrowserReplayError> {
+    match locator_slot {
+        BrowserReplayLocatorSlot::PrimaryAction => match &step.action {
+            BrowserRecipeAction::Click { locator }
+            | BrowserRecipeAction::Hover { locator }
+            | BrowserRecipeAction::Focus { locator }
+            | BrowserRecipeAction::Type { locator, .. }
+            | BrowserRecipeAction::Clear { locator }
+            | BrowserRecipeAction::Select { locator, .. }
+            | BrowserRecipeAction::Upload { locator, .. }
+            | BrowserRecipeAction::Download { locator } => Ok(locator),
+            _ => Err(BrowserReplayError::InvalidRepairSlot),
+        },
+        BrowserReplayLocatorSlot::OptionalAction => match &step.action {
+            BrowserRecipeAction::Keypress {
+                locator: Some(locator),
+                ..
+            }
+            | BrowserRecipeAction::Scroll {
+                locator: Some(locator),
+                ..
+            } => Ok(locator),
+            _ => Err(BrowserReplayError::InvalidRepairSlot),
+        },
+        BrowserReplayLocatorSlot::DragSource => match &step.action {
+            BrowserRecipeAction::DragDrop { source, .. } => Ok(source),
+            _ => Err(BrowserReplayError::InvalidRepairSlot),
+        },
+        BrowserReplayLocatorSlot::DragDestination => match &step.action {
+            BrowserRecipeAction::DragDrop { destination, .. } => Ok(destination),
+            _ => Err(BrowserReplayError::InvalidRepairSlot),
+        },
+        BrowserReplayLocatorSlot::ActionWait => match &step.action {
+            BrowserRecipeAction::Wait { condition } => locator_for_repair_wait(condition),
+            _ => Err(BrowserReplayError::InvalidRepairSlot),
+        },
+        BrowserReplayLocatorSlot::StepWait => step
+            .wait
+            .as_ref()
+            .ok_or(BrowserReplayError::InvalidRepairSlot)
+            .and_then(locator_for_repair_wait),
+        BrowserReplayLocatorSlot::Assertion { index } => match step.assertions.get(index) {
+            Some(BrowserRecipeAssertion::Element {
+                locator,
+                state: BrowserRecipeElementState::Present | BrowserRecipeElementState::Visible,
+            })
+            | Some(BrowserRecipeAssertion::Value { locator, .. }) => Ok(locator),
+            _ => Err(BrowserReplayError::InvalidRepairSlot),
+        },
+    }
+}
+
+fn locator_for_repair_wait(
+    wait: &BrowserRecipeWait,
+) -> Result<&BrowserRecipeLocator, BrowserReplayError> {
+    match wait {
+        BrowserRecipeWait::ElementPresent { locator, .. }
+        | BrowserRecipeWait::ElementVisible { locator, .. } => Ok(locator),
+        _ => Err(BrowserReplayError::InvalidRepairSlot),
     }
 }
 
@@ -895,8 +1366,10 @@ fn validate_public_value(
 mod tests {
     use super::*;
     use crate::browser::{
-        MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES,
-        MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES,
+        BrowserError, BrowserRecipeLocator, BrowserReplayLocatorSlot, BrowserReplayRepairPhase,
+        BrowserReplayRepairResumeCursor, BrowserResourceKind, BrowserResourceLimits,
+        BrowserResourceStore, BrowserRevision, MAX_BROWSER_REPLAY_SECRET_INPUTS,
+        MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES, MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES,
     };
     use std::sync::atomic::AtomicUsize;
 
@@ -915,6 +1388,1111 @@ mod tests {
             bindings: Vec::new(),
             unresolved_secret_inputs,
         }
+    }
+
+    fn click_repair_plan(locator: BrowserRecipeLocator) -> BrowserReplayPlan {
+        let mut plan = internal_plan(Vec::new());
+        plan.steps.push(BrowserRecipeStep {
+            id: "click-submit".to_string(),
+            action: BrowserRecipeAction::Click { locator },
+            wait: None,
+            assertions: Vec::new(),
+        });
+        plan
+    }
+
+    #[cfg(target_os = "windows")]
+    fn repair_store(
+        label: &str,
+        max_resource_bytes: u64,
+    ) -> (std::path::PathBuf, BrowserResourceStore) {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-replay-repair-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes,
+            },
+        )
+        .unwrap();
+        (root, store)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn locator_repair_capture_stays_running_until_exact_evidence_is_atomically_published() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-replay-repair-red-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+        let owner = BrowserWorkspaceKey::new("repair-project", "repair-tab").unwrap();
+        let mut plan = internal_plan(Vec::new());
+        plan.steps.push(BrowserRecipeStep {
+            id: "click-submit".to_string(),
+            action: BrowserRecipeAction::Click {
+                locator: BrowserRecipeLocator {
+                    test_id: Some("submit".to_string()),
+                    ..BrowserRecipeLocator::default()
+                },
+            },
+            wait: None,
+            assertions: Vec::new(),
+        });
+        let started = coordinator.start(owner.clone(), plan).unwrap();
+        let cancellation_lease = started.lease.clone();
+        let cancellation_authority_id = started.lease.authority_id();
+        coordinator.begin(&started.instance).unwrap();
+
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(7),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.advance_step(&started.instance, 0),
+            Err(BrowserReplayError::InvalidTransition)
+        );
+        assert_eq!(
+            coordinator.complete(&started.instance),
+            Err(BrowserReplayError::InvalidTransition)
+        );
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::Running
+        );
+        assert!(matches!(
+            coordinator.reserve_locator_repair_capture(
+                &started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(7),
+                BrowserReplayRepairResumeCursor::Action,
+            ),
+            Err(BrowserReplayError::InvalidTransition)
+        ));
+
+        let snapshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::Running
+        );
+        let screenshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                b"png",
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::Running
+        );
+
+        {
+            let mut state = coordinator.lock();
+            let active = state.active.get_mut(&owner).unwrap();
+            active.projection.current_step_index = 1;
+            active.projection.current_step_id = None;
+        }
+        assert_eq!(
+            coordinator.publish_locator_repair(&repair, &snapshot, &screenshot),
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        );
+        {
+            let mut state = coordinator.lock();
+            let active = state.active.get_mut(&owner).unwrap();
+            active.projection.current_step_index = 0;
+            active.projection.current_step_id = Some("click-submit".to_string());
+        }
+
+        let published = coordinator
+            .publish_locator_repair(&repair, &snapshot, &screenshot)
+            .unwrap();
+        assert_eq!(published.phase, BrowserReplayRepairPhase::AwaitingPreview);
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::PausedLocatorRepair
+        );
+        assert_eq!(started.lease.authority_id(), cancellation_authority_id);
+        assert!(started.lease.same_authority(&cancellation_lease));
+        assert!(!started.lease.is_cancelled());
+
+        coordinator.cancel(&started.instance).unwrap();
+        assert!(started.lease.is_cancelled());
+        assert!(cancellation_lease.is_cancelled());
+        assert!(matches!(
+            store.handle(&owner, &snapshot.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        assert!(matches!(
+            store.handle(&owner, &screenshot.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn every_terminal_path_releases_partial_repair_evidence_while_token_survives() {
+        #[derive(Clone, Copy)]
+        enum TerminalPath {
+            Cancel,
+            Fail,
+            Replace,
+            Interrupt,
+            CoordinatorDrop,
+        }
+
+        fn click_plan() -> BrowserReplayPlan {
+            let mut plan = internal_plan(Vec::new());
+            plan.steps.push(BrowserRecipeStep {
+                id: "click-submit".to_string(),
+                action: BrowserRecipeAction::Click {
+                    locator: BrowserRecipeLocator {
+                        test_id: Some("submit".to_string()),
+                        ..BrowserRecipeLocator::default()
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            });
+            plan
+        }
+
+        for (index, terminal_path) in [
+            TerminalPath::Cancel,
+            TerminalPath::Fail,
+            TerminalPath::Replace,
+            TerminalPath::Interrupt,
+            TerminalPath::CoordinatorDrop,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = std::env::temp_dir().join(format!(
+                "devmanager-replay-repair-terminal-{}-{index}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = BrowserResourceStore::open(
+                &root,
+                BrowserResourceLimits {
+                    max_temporary_count: 0,
+                    max_temporary_bytes: 1024 * 1024,
+                    max_resource_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap();
+            let owner =
+                BrowserWorkspaceKey::new(format!("repair-terminal-{index}"), "repair-tab").unwrap();
+            let mut coordinator = Some(BrowserReplayCoordinator::with_terminal_capacity(2));
+            let started = coordinator
+                .as_ref()
+                .unwrap()
+                .start(owner.clone(), click_plan())
+                .unwrap();
+            let mut repair_watch = started.execution.repair_watch();
+            coordinator
+                .as_ref()
+                .unwrap()
+                .begin(&started.instance)
+                .unwrap();
+            let repair = coordinator
+                .as_ref()
+                .unwrap()
+                .reserve_locator_repair_capture(
+                    &started.instance,
+                    &store,
+                    0,
+                    BrowserReplayLocatorSlot::PrimaryAction,
+                    "runtime-tab-1",
+                    BrowserRevision(7),
+                    BrowserReplayRepairResumeCursor::Action,
+                )
+                .unwrap();
+            let snapshot = coordinator
+                .as_ref()
+                .unwrap()
+                .retain_locator_repair_evidence_for_test(
+                    &repair,
+                    BrowserResourceKind::ReplayRepairSnapshot,
+                    "application/json",
+                    b"{}",
+                )
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .as_ref()
+                    .unwrap()
+                    .status(&started.instance)
+                    .unwrap()
+                    .status,
+                BrowserReplayStatus::Running
+            );
+            assert!(!repair_watch.has_changed().unwrap());
+
+            match terminal_path {
+                TerminalPath::Cancel => {
+                    coordinator
+                        .as_ref()
+                        .unwrap()
+                        .cancel(&started.instance)
+                        .unwrap();
+                }
+                TerminalPath::Fail => {
+                    coordinator
+                        .as_ref()
+                        .unwrap()
+                        .fail(&started.instance, BrowserReplayFailureCode::StepFailed)
+                        .unwrap();
+                }
+                TerminalPath::Replace => {
+                    coordinator
+                        .as_ref()
+                        .unwrap()
+                        .replace(owner.clone(), click_plan())
+                        .unwrap();
+                }
+                TerminalPath::Interrupt => {
+                    coordinator
+                        .as_ref()
+                        .unwrap()
+                        .interrupt_workspace(&owner)
+                        .unwrap();
+                }
+                TerminalPath::CoordinatorDrop => drop(coordinator.take()),
+            }
+
+            assert_eq!(repair.replay_instance_id(), started.instance.id());
+            match terminal_path {
+                TerminalPath::Fail => {
+                    assert_eq!(
+                        coordinator
+                            .as_ref()
+                            .unwrap()
+                            .status(&started.instance)
+                            .unwrap()
+                            .status,
+                        BrowserReplayStatus::Failed
+                    );
+                    assert!(!started.execution.is_cancelled());
+                }
+                TerminalPath::CoordinatorDrop => {
+                    assert!(started.lease.is_cancelled());
+                    assert!(started.execution.is_cancelled());
+                }
+                TerminalPath::Cancel | TerminalPath::Replace | TerminalPath::Interrupt => {
+                    assert_eq!(
+                        coordinator
+                            .as_ref()
+                            .unwrap()
+                            .status(&started.instance)
+                            .unwrap()
+                            .status,
+                        BrowserReplayStatus::Cancelled
+                    );
+                    assert!(started.execution.is_cancelled());
+                }
+            }
+            // The terminal/cancellation state above must be installed before this wake is visible.
+            assert_eq!(*repair_watch.borrow_and_update(), 1);
+            assert!(repair_watch.has_changed().is_err());
+            assert!(matches!(
+                store.handle(&owner, &snapshot.id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+            drop(coordinator);
+            drop(store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repair_transitions_use_one_value_free_watch_and_private_override_map() {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-replay-repair-watch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = BrowserResourceStore::open(
+            &root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+        let owner = BrowserWorkspaceKey::new("repair-watch", "repair-tab").unwrap();
+        let mut plan = internal_plan(Vec::new());
+        plan.steps.push(BrowserRecipeStep {
+            id: "click-submit".to_string(),
+            action: BrowserRecipeAction::Click {
+                locator: BrowserRecipeLocator {
+                    test_id: Some("submit".to_string()),
+                    ..BrowserRecipeLocator::default()
+                },
+            },
+            wait: None,
+            assertions: Vec::new(),
+        });
+        let started = coordinator.start(owner, plan).unwrap();
+        let mut repair_watch: tokio::sync::watch::Receiver<u64> = started.execution.repair_watch();
+        assert_eq!(*repair_watch.borrow(), 0);
+        assert_eq!(
+            started
+                .execution
+                .locator_override(0, BrowserReplayLocatorSlot::PrimaryAction),
+            None
+        );
+        coordinator.begin(&started.instance).unwrap();
+
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(7),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        assert!(!repair_watch.has_changed().unwrap());
+
+        let snapshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        let screenshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                b"png",
+            )
+            .unwrap();
+        assert!(!repair_watch.has_changed().unwrap());
+
+        coordinator
+            .publish_locator_repair(&repair, &snapshot, &screenshot)
+            .unwrap();
+        assert!(repair_watch.has_changed().unwrap());
+        assert_eq!(*repair_watch.borrow_and_update(), 1);
+
+        coordinator.cancel(&started.instance).unwrap();
+        assert_eq!(*repair_watch.borrow_and_update(), 2);
+        assert!(repair_watch.has_changed().is_err());
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn locator_repair_status_is_exact_safe_checked_and_terminal_immutable() {
+        const FORBIDDEN: &str = "locator-value-sentinel-do-not-project";
+        let (root, store) = repair_store("status", 1024 * 1024);
+        let coordinator = BrowserReplayCoordinator::with_terminal_capacity(1);
+        let owner = BrowserWorkspaceKey::new("repair-status", "repair-tab").unwrap();
+        let started = coordinator
+            .start(
+                owner.clone(),
+                click_repair_plan(BrowserRecipeLocator {
+                    test_id: Some(FORBIDDEN.to_string()),
+                    ..BrowserRecipeLocator::default()
+                }),
+            )
+            .unwrap();
+        coordinator.begin(&started.instance).unwrap();
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(11),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.locator_repair_status(&repair),
+            Err(BrowserReplayError::InvalidTransition)
+        );
+
+        let same_workspace_other_coordinator = BrowserReplayCoordinator::with_terminal_capacity(1);
+        let other_started = same_workspace_other_coordinator
+            .start(
+                owner.clone(),
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        same_workspace_other_coordinator
+            .begin(&other_started.instance)
+            .unwrap();
+        assert_eq!(
+            same_workspace_other_coordinator.locator_repair_status(&repair),
+            Err(BrowserReplayError::StaleInstance)
+        );
+        let other_workspace_coordinator = BrowserReplayCoordinator::with_terminal_capacity(1);
+        let other_workspace_started = other_workspace_coordinator
+            .start(
+                BrowserWorkspaceKey::new("repair-other", "repair-tab").unwrap(),
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        other_workspace_coordinator
+            .begin(&other_workspace_started.instance)
+            .unwrap();
+        assert_eq!(
+            other_workspace_coordinator.locator_repair_status(&repair),
+            Err(BrowserReplayError::StaleInstance)
+        );
+
+        let snapshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                FORBIDDEN.as_bytes(),
+            )
+            .unwrap();
+        let screenshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                FORBIDDEN.as_bytes(),
+            )
+            .unwrap();
+        let projection = coordinator
+            .publish_locator_repair(&repair, &snapshot, &screenshot)
+            .unwrap();
+        assert_eq!(
+            coordinator.locator_repair_status(&repair),
+            Ok(projection.clone())
+        );
+        for rendered in [
+            serde_json::to_string(&projection).unwrap(),
+            format!("{projection:?}"),
+        ] {
+            assert!(!rendered.contains(FORBIDDEN));
+        }
+
+        coordinator.cancel(&started.instance).unwrap();
+        assert_eq!(
+            coordinator.locator_repair_status(&repair),
+            Err(BrowserReplayError::TerminalState)
+        );
+        let replacement = coordinator
+            .start(owner, click_repair_plan(BrowserRecipeLocator::default()))
+            .unwrap();
+        coordinator.cancel(&replacement.instance).unwrap();
+        assert_eq!(
+            coordinator.locator_repair_status(&repair),
+            Err(BrowserReplayError::StaleInstance)
+        );
+
+        let exhausted_owner = BrowserWorkspaceKey::new("repair-exhausted", "repair-tab").unwrap();
+        let exhausted = coordinator
+            .start(
+                exhausted_owner.clone(),
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        coordinator.begin(&exhausted.instance).unwrap();
+        coordinator.lock().next_repair_id = u64::MAX;
+        assert!(matches!(
+            coordinator.reserve_locator_repair_capture(
+                &exhausted.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-2",
+                BrowserRevision(12),
+                BrowserReplayRepairResumeCursor::Action,
+            ),
+            Err(BrowserReplayError::RepairInstanceIdExhausted)
+        ));
+        assert_eq!(
+            coordinator.status(&exhausted.instance).unwrap().status,
+            BrowserReplayStatus::Running
+        );
+        assert!(store.list(&exhausted_owner).unwrap().is_empty());
+        coordinator.cancel(&exhausted.instance).unwrap();
+
+        drop(other_workspace_coordinator);
+        drop(same_workspace_other_coordinator);
+        drop(coordinator);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repair_evidence_rejects_mime_handle_substitution_and_rolls_back_second_write() {
+        let (mime_root, mime_store) = repair_store("mime", 1024 * 1024);
+        let mime_coordinator = BrowserReplayCoordinator::with_terminal_capacity(1);
+        let mime_owner = BrowserWorkspaceKey::new("repair-mime", "repair-tab").unwrap();
+        let mime_started = mime_coordinator
+            .start(
+                mime_owner,
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        mime_coordinator.begin(&mime_started.instance).unwrap();
+        let mime_repair = mime_coordinator
+            .reserve_locator_repair_capture(
+                &mime_started.instance,
+                &mime_store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(1),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        assert!(matches!(
+            mime_coordinator.retain_locator_repair_evidence_for_test(
+                &mime_repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "text/plain",
+                b"{}",
+            ),
+            Err(BrowserError::InvalidInvocation { ref field }) if field == "mimeType"
+        ));
+        assert_eq!(
+            mime_coordinator.locator_repair_status(&mime_repair),
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        );
+        drop(mime_coordinator);
+        drop(mime_store);
+        std::fs::remove_dir_all(mime_root).unwrap();
+
+        let (handle_root, handle_store) = repair_store("handles", 1024 * 1024);
+        let handle_coordinator = BrowserReplayCoordinator::with_terminal_capacity(1);
+        let handle_owner = BrowserWorkspaceKey::new("repair-handles", "repair-tab").unwrap();
+        let handle_started = handle_coordinator
+            .start(
+                handle_owner,
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        handle_coordinator.begin(&handle_started.instance).unwrap();
+        let handle_repair = handle_coordinator
+            .reserve_locator_repair_capture(
+                &handle_started.instance,
+                &handle_store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(2),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let snapshot = handle_coordinator
+            .retain_locator_repair_evidence_for_test(
+                &handle_repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        let screenshot = handle_coordinator
+            .retain_locator_repair_evidence_for_test(
+                &handle_repair,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                b"png",
+            )
+            .unwrap();
+        let mut wrong = snapshot.clone();
+        wrong.uri.push_str("-wrong");
+        assert_eq!(
+            handle_coordinator.publish_locator_repair(&handle_repair, &wrong, &screenshot),
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        );
+        assert_eq!(
+            handle_coordinator.publish_locator_repair(&handle_repair, &screenshot, &snapshot),
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        );
+        std::fs::remove_file(handle_root.join(format!("{}.bin", screenshot.id.0))).unwrap();
+        assert_eq!(
+            handle_coordinator.publish_locator_repair(&handle_repair, &snapshot, &screenshot),
+            Err(BrowserReplayError::RepairEvidenceUnavailable)
+        );
+        assert_eq!(
+            handle_coordinator
+                .status(&handle_started.instance)
+                .unwrap()
+                .status,
+            BrowserReplayStatus::Running
+        );
+        drop(handle_coordinator);
+        drop(handle_store);
+        std::fs::remove_dir_all(handle_root).unwrap();
+
+        let (rollback_root, rollback_store) = repair_store("rollback", 4);
+        let rollback_coordinator = BrowserReplayCoordinator::with_terminal_capacity(1);
+        let rollback_owner = BrowserWorkspaceKey::new("repair-rollback", "repair-tab").unwrap();
+        let rollback_started = rollback_coordinator
+            .start(
+                rollback_owner.clone(),
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        rollback_coordinator
+            .begin(&rollback_started.instance)
+            .unwrap();
+        let rollback_repair = rollback_coordinator
+            .reserve_locator_repair_capture(
+                &rollback_started.instance,
+                &rollback_store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(3),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let retained_snapshot = rollback_coordinator
+            .retain_locator_repair_evidence_for_test(
+                &rollback_repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        assert!(matches!(
+            rollback_coordinator.retain_locator_repair_evidence_for_test(
+                &rollback_repair,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                b"too-large",
+            ),
+            Err(BrowserError::ResourceTooLarge { .. })
+        ));
+        assert!(matches!(
+            rollback_store.handle(&rollback_owner, &retained_snapshot.id),
+            Err(BrowserError::MissingResource { .. })
+        ));
+        assert_eq!(
+            rollback_coordinator
+                .status(&rollback_started.instance)
+                .unwrap()
+                .status,
+            BrowserReplayStatus::Running
+        );
+        assert_eq!(
+            rollback_coordinator.locator_repair_status(&rollback_repair),
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        );
+        let retry = rollback_coordinator
+            .reserve_locator_repair_capture(
+                &rollback_started.instance,
+                &rollback_store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "runtime-tab-1",
+                BrowserRevision(3),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        assert!(retry.repair_id() > rollback_repair.repair_id());
+        drop(rollback_coordinator);
+        drop(rollback_store);
+        std::fs::remove_dir_all(rollback_root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn locator_slot_cursor_table_is_exact_safe_and_resource_free_on_rejection() {
+        fn literal(value: &str) -> BrowserRecipeValue {
+            BrowserRecipeValue::Literal {
+                value: value.to_string(),
+            }
+        }
+
+        fn step(
+            id: &str,
+            action: BrowserRecipeAction,
+            wait: Option<BrowserRecipeWait>,
+            assertions: Vec<BrowserRecipeAssertion>,
+        ) -> BrowserRecipeStep {
+            BrowserRecipeStep {
+                id: id.to_string(),
+                action,
+                wait,
+                assertions,
+            }
+        }
+
+        let locator = BrowserRecipeLocator {
+            test_id: Some("target".to_string()),
+            ..BrowserRecipeLocator::default()
+        };
+        let cases = vec![
+            (
+                "primary",
+                step(
+                    "primary",
+                    BrowserRecipeAction::Click {
+                        locator: locator.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::PrimaryAction,
+                BrowserReplayRepairResumeCursor::Action,
+                true,
+            ),
+            (
+                "optional-some",
+                step(
+                    "optional-some",
+                    BrowserRecipeAction::Keypress {
+                        locator: Some(locator.clone()),
+                        key: literal("Enter"),
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::OptionalAction,
+                BrowserReplayRepairResumeCursor::Action,
+                true,
+            ),
+            (
+                "optional-none",
+                step(
+                    "optional-none",
+                    BrowserRecipeAction::Keypress {
+                        locator: None,
+                        key: literal("Enter"),
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::OptionalAction,
+                BrowserReplayRepairResumeCursor::Action,
+                false,
+            ),
+            (
+                "drag-source",
+                step(
+                    "drag-source",
+                    BrowserRecipeAction::DragDrop {
+                        source: locator.clone(),
+                        destination: locator.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::DragSource,
+                BrowserReplayRepairResumeCursor::Action,
+                true,
+            ),
+            (
+                "drag-destination",
+                step(
+                    "drag-destination",
+                    BrowserRecipeAction::DragDrop {
+                        source: locator.clone(),
+                        destination: locator.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::DragDestination,
+                BrowserReplayRepairResumeCursor::Action,
+                true,
+            ),
+            (
+                "action-wait",
+                step(
+                    "action-wait",
+                    BrowserRecipeAction::Wait {
+                        condition: BrowserRecipeWait::ElementPresent {
+                            locator: locator.clone(),
+                            timeout_ms: 10,
+                        },
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::ActionWait,
+                BrowserReplayRepairResumeCursor::ActionWait,
+                true,
+            ),
+            (
+                "action-hidden",
+                step(
+                    "action-hidden",
+                    BrowserRecipeAction::Wait {
+                        condition: BrowserRecipeWait::ElementHidden {
+                            locator: locator.clone(),
+                            timeout_ms: 10,
+                        },
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::ActionWait,
+                BrowserReplayRepairResumeCursor::ActionWait,
+                false,
+            ),
+            (
+                "step-wait",
+                step(
+                    "step-wait",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    Some(BrowserRecipeWait::ElementVisible {
+                        locator: locator.clone(),
+                        timeout_ms: 10,
+                    }),
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::StepWait,
+                BrowserReplayRepairResumeCursor::StepWait,
+                true,
+            ),
+            (
+                "step-hidden",
+                step(
+                    "step-hidden",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    Some(BrowserRecipeWait::ElementHidden {
+                        locator: locator.clone(),
+                        timeout_ms: 10,
+                    }),
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::StepWait,
+                BrowserReplayRepairResumeCursor::StepWait,
+                false,
+            ),
+            (
+                "assert-present",
+                step(
+                    "assert-present",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    None,
+                    vec![BrowserRecipeAssertion::Element {
+                        locator: locator.clone(),
+                        state: BrowserRecipeElementState::Present,
+                    }],
+                ),
+                BrowserReplayLocatorSlot::Assertion { index: 0 },
+                BrowserReplayRepairResumeCursor::Assertion(0),
+                true,
+            ),
+            (
+                "assert-visible",
+                step(
+                    "assert-visible",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    None,
+                    vec![BrowserRecipeAssertion::Element {
+                        locator: locator.clone(),
+                        state: BrowserRecipeElementState::Visible,
+                    }],
+                ),
+                BrowserReplayLocatorSlot::Assertion { index: 0 },
+                BrowserReplayRepairResumeCursor::Assertion(0),
+                true,
+            ),
+            (
+                "assert-value",
+                step(
+                    "assert-value",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    None,
+                    vec![BrowserRecipeAssertion::Value {
+                        locator: locator.clone(),
+                        value: literal("expected"),
+                    }],
+                ),
+                BrowserReplayLocatorSlot::Assertion { index: 0 },
+                BrowserReplayRepairResumeCursor::Assertion(0),
+                true,
+            ),
+            (
+                "assert-absent",
+                step(
+                    "assert-absent",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    None,
+                    vec![BrowserRecipeAssertion::Element {
+                        locator: locator.clone(),
+                        state: BrowserRecipeElementState::Absent,
+                    }],
+                ),
+                BrowserReplayLocatorSlot::Assertion { index: 0 },
+                BrowserReplayRepairResumeCursor::Assertion(0),
+                false,
+            ),
+            (
+                "assert-hidden",
+                step(
+                    "assert-hidden",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    None,
+                    vec![BrowserRecipeAssertion::Element {
+                        locator: locator.clone(),
+                        state: BrowserRecipeElementState::Hidden,
+                    }],
+                ),
+                BrowserReplayLocatorSlot::Assertion { index: 0 },
+                BrowserReplayRepairResumeCursor::Assertion(0),
+                false,
+            ),
+            (
+                "cursor-mismatch",
+                step(
+                    "cursor-mismatch",
+                    BrowserRecipeAction::Click {
+                        locator: locator.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                ),
+                BrowserReplayLocatorSlot::PrimaryAction,
+                BrowserReplayRepairResumeCursor::StepWait,
+                false,
+            ),
+            (
+                "assert-index-mismatch",
+                step(
+                    "assert-index-mismatch",
+                    BrowserRecipeAction::Screenshot { full_page: false },
+                    None,
+                    vec![BrowserRecipeAssertion::Value {
+                        locator: locator.clone(),
+                        value: literal("expected"),
+                    }],
+                ),
+                BrowserReplayLocatorSlot::Assertion { index: 0 },
+                BrowserReplayRepairResumeCursor::Assertion(1),
+                false,
+            ),
+        ];
+
+        let (root, store) = repair_store("slot-table", 1024 * 1024);
+        for (label, recipe_step, locator_slot, resume_cursor, accepted) in cases {
+            let coordinator = BrowserReplayCoordinator::with_terminal_capacity(1);
+            let owner = BrowserWorkspaceKey::new(format!("repair-{label}"), "repair-tab").unwrap();
+            let mut plan = internal_plan(Vec::new());
+            plan.steps.push(recipe_step);
+            let started = coordinator.start(owner.clone(), plan).unwrap();
+            coordinator.begin(&started.instance).unwrap();
+            let reserved = coordinator.reserve_locator_repair_capture(
+                &started.instance,
+                &store,
+                0,
+                locator_slot,
+                "runtime-tab-1",
+                BrowserRevision(1),
+                resume_cursor,
+            );
+            if accepted {
+                assert!(reserved.is_ok(), "{label} should be repairable");
+            } else {
+                assert!(matches!(
+                    reserved,
+                    Err(BrowserReplayError::InvalidRepairSlot)
+                ));
+                assert!(store.list(&owner).unwrap().is_empty());
+                assert_eq!(
+                    coordinator.status(&started.instance).unwrap().status,
+                    BrowserReplayStatus::Running
+                );
+            }
+            drop(coordinator);
+            assert!(store.list(&owner).unwrap().is_empty());
+        }
+
+        assert_eq!(
+            serde_json::to_value(BrowserReplayLocatorSlot::PrimaryAction).unwrap(),
+            serde_json::json!("primaryAction")
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserReplayLocatorSlot::Assertion { index: 4 }).unwrap(),
+            serde_json::json!({ "assertion": { "index": 4 } })
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserReplayRepairPhase::AwaitingPreview).unwrap(),
+            serde_json::json!("awaitingPreview")
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserReplayRepairPhase::Previewed).unwrap(),
+            serde_json::json!("previewed")
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserReplayRepairPhase::Applied).unwrap(),
+            serde_json::json!("applied")
+        );
+
+        let bounded = BrowserReplayCoordinator::with_terminal_capacity(1);
+        let bounded_owner = BrowserWorkspaceKey::new("repair-tab-bound", "repair-tab").unwrap();
+        let bounded_started = bounded
+            .start(bounded_owner.clone(), click_repair_plan(locator.clone()))
+            .unwrap();
+        bounded.begin(&bounded_started.instance).unwrap();
+        assert!(matches!(
+            bounded.reserve_locator_repair_capture(
+                &bounded_started.instance,
+                &store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "x".repeat(1_025),
+                BrowserRevision(1),
+                BrowserReplayRepairResumeCursor::Action,
+            ),
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        ));
+        assert!(store.list(&bounded_owner).unwrap().is_empty());
+        drop(bounded);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn secret_submission(values: Vec<(&str, String)>) -> BrowserReplaySecretSubmission {

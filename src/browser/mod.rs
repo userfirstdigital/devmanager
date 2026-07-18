@@ -154,6 +154,11 @@ pub use replay::{
     MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
 pub use replay_executor::execute_browser_replay;
+pub(crate) use replay_repair::BrowserReplayRepairResumeCursor;
+pub use replay_repair::{
+    BrowserReplayLocatorSlot, BrowserReplayRepairInstance, BrowserReplayRepairPhase,
+    BrowserReplayRepairProjection,
+};
 pub use replay_secrets::{
     BrowserReplaySecretError, BrowserReplaySecretLease, BrowserReplaySecretStore,
     BrowserReplaySecretSubmission, MAX_BROWSER_REPLAY_SECRET_INPUTS,

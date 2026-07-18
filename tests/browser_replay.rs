@@ -703,6 +703,10 @@ fn replay_errors_have_only_fixed_value_free_messages() {
         BrowserReplayError::IncompleteReplay,
         BrowserReplayError::TerminalState,
         BrowserReplayError::InstanceIdExhausted,
+        BrowserReplayError::RepairInstanceIdExhausted,
+        BrowserReplayError::InvalidRepairSlot,
+        BrowserReplayError::InvalidRepairEvidence,
+        BrowserReplayError::RepairEvidenceUnavailable,
     ];
     for error in errors {
         let display = error.to_string();
@@ -713,7 +717,7 @@ fn replay_errors_have_only_fixed_value_free_messages() {
 }
 
 #[test]
-fn replay_state_enforces_exact_progress_pause_completion_and_terminal_immutability() {
+fn replay_state_enforces_exact_progress_completion_and_terminal_immutability() {
     let coordinator = BrowserReplayCoordinator::with_terminal_capacity(4);
     let owner = workspace("project-a", "conversation-a");
     let started = coordinator.start(owner, plan_without_secrets()).unwrap();
@@ -742,16 +746,6 @@ fn replay_state_enforces_exact_progress_pause_completion_and_terminal_immutabili
     assert_eq!(
         replay_error(coordinator.advance_step(&instance, 0)),
         BrowserReplayError::StepOutOfOrder
-    );
-    let paused = coordinator.pause_locator_repair(&instance).unwrap();
-    assert_eq!(paused.status, BrowserReplayStatus::PausedLocatorRepair);
-    assert_eq!(
-        replay_error(coordinator.advance_step(&instance, 1)),
-        BrowserReplayError::InvalidTransition
-    );
-    assert_eq!(
-        coordinator.resume_locator_repair(&instance).unwrap().status,
-        BrowserReplayStatus::Running
     );
     coordinator.advance_step(&instance, 1).unwrap();
     coordinator.advance_step(&instance, 2).unwrap();
@@ -962,7 +956,7 @@ fn replay_state_terminal_cleanup_is_bounded_and_evicts_oldest_identity() {
 }
 
 #[test]
-fn replay_cancellation_uses_one_authority_across_running_and_locator_pause_gaps() {
+fn replay_cancellation_uses_one_authority_across_running_progress() {
     let coordinator = BrowserReplayCoordinator::with_terminal_capacity(8);
     let owner = workspace("project-running", "conversation-a");
     let started = coordinator
@@ -976,7 +970,6 @@ fn replay_cancellation_uses_one_authority_across_running_and_locator_pause_gaps(
     coordinator.status(&started.instance).unwrap();
     coordinator.begin(&started.instance).unwrap();
     coordinator.advance_step(&started.instance, 0).unwrap();
-    coordinator.pause_locator_repair(&started.instance).unwrap();
     coordinator.status(&started.instance).unwrap();
     assert_eq!(started.lease.authority_id(), authority_id);
     assert!(started.lease.same_authority(&lease_clone));
@@ -1108,6 +1101,10 @@ fn replay_cancellation_does_not_relabel_completed_or_failed_replays_as_cancelled
 #[test]
 fn replay_scope_has_no_execution_or_platform_coupling() {
     let source = include_str!("../src/browser/replay.rs");
+    let source = source
+        .rsplit_once("mod tests {")
+        .map(|(production, _)| production)
+        .expect("replay source keeps one explicit test-module boundary");
     for forbidden in [
         "std::fs",
         "std::path",
