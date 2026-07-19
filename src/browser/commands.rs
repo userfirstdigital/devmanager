@@ -750,15 +750,35 @@ fn interrupt_replay_for_control(
 }
 
 fn apply_lifecycle_control(
+    response_linearization: &Mutex<()>,
     cancellations: &CancellationEpochs,
     coordinator: &BrowserReplayCoordinator,
     control: &BrowserHostControl,
 ) {
+    apply_lifecycle_control_with_hook(
+        response_linearization,
+        cancellations,
+        coordinator,
+        control,
+        || {},
+    );
+}
+
+fn apply_lifecycle_control_with_hook(
+    response_linearization: &Mutex<()>,
+    cancellations: &CancellationEpochs,
+    coordinator: &BrowserReplayCoordinator,
+    control: &BrowserHostControl,
+    after_lock: impl FnOnce(),
+) {
+    let _response_order = lock(response_linearization);
+    after_lock();
     interrupt_replay_for_control(coordinator, control);
     cancellations.interrupt_control(control);
 }
 
 fn apply_host_event(
+    response_linearization: &Mutex<()>,
     cancellations: &CancellationEpochs,
     coordinator: &BrowserReplayCoordinator,
     event: &BrowserHostEvent,
@@ -770,6 +790,7 @@ fn apply_host_event(
     } = event
     {
         apply_lifecycle_control(
+            response_linearization,
             cancellations,
             coordinator,
             &BrowserHostControl::InterruptTab {
@@ -1072,6 +1093,7 @@ pub struct BrowserCommandBridge {
     sender: mpsc::Sender<BrowserCommandEnvelope>,
     cancellations: Arc<CancellationEpochs>,
     host_controls: Arc<HostControlQueue>,
+    response_linearization: Arc<Mutex<()>>,
     pending_work: Arc<PendingWork>,
     replay_coordinator: BrowserReplayCoordinator,
 }
@@ -1093,6 +1115,7 @@ impl BrowserCommandBridge {
             timeout,
             cancellations: Arc::clone(&self.cancellations),
             host_controls: Arc::clone(&self.host_controls),
+            response_linearization: Arc::clone(&self.response_linearization),
             pending_work: Arc::clone(&self.pending_work),
             registration_lease,
             replay_coordinator: self.replay_coordinator.clone(),
@@ -1108,17 +1131,23 @@ impl BrowserCommandBridge {
     }
 
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
-        self.host_controls
-            .with_locked(|| apply_host_event(&self.cancellations, &self.replay_coordinator, event));
+        self.host_controls.with_locked(|| {
+            apply_host_event(
+                &self.response_linearization,
+                &self.cancellations,
+                &self.replay_coordinator,
+                event,
+            )
+        });
     }
 
     pub fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
-        let control = BrowserHostControl::InterruptWorkspace {
-            workspace_key: workspace_key.clone(),
-        };
-        self.host_controls.push_and(control.clone(), || {
-            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
-        });
+        self.interrupt_control_with_linearization_hook(
+            BrowserHostControl::InterruptWorkspace {
+                workspace_key: workspace_key.clone(),
+            },
+            || {},
+        );
     }
 
     pub(crate) fn revoke_registration(
@@ -1126,10 +1155,21 @@ impl BrowserCommandBridge {
         workspace_key: &BrowserWorkspaceKey,
         registration_lease: &BrowserRegistrationLease,
     ) {
+        self.revoke_registration_with_linearization_hook(workspace_key, registration_lease, || {});
+    }
+
+    fn revoke_registration_with_linearization_hook(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        registration_lease: &BrowserRegistrationLease,
+        after_lock: impl FnOnce(),
+    ) {
         let control = BrowserHostControl::InterruptWorkspace {
             workspace_key: workspace_key.clone(),
         };
         self.host_controls.push_and(control.clone(), || {
+            let _response_order = lock(&self.response_linearization);
+            after_lock();
             interrupt_replay_for_control(&self.replay_coordinator, &control);
             registration_lease.revoke();
             self.cancellations.interrupt_control(&control);
@@ -1137,26 +1177,43 @@ impl BrowserCommandBridge {
     }
 
     pub fn interrupt_project(&self, project_id: &str) {
-        let control = BrowserHostControl::InterruptProject {
-            project_id: project_id.to_string(),
-        };
-        self.host_controls.push_and(control.clone(), || {
-            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
-        });
+        self.interrupt_control_with_linearization_hook(
+            BrowserHostControl::InterruptProject {
+                project_id: project_id.to_string(),
+            },
+            || {},
+        );
     }
 
     pub fn interrupt_tab(&self, workspace_key: &BrowserWorkspaceKey, tab_id: &str) {
-        let control = BrowserHostControl::InterruptTab {
-            workspace_key: workspace_key.clone(),
-            tab_id: tab_id.to_string(),
-        };
+        self.interrupt_control_with_linearization_hook(
+            BrowserHostControl::InterruptTab {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.to_string(),
+            },
+            || {},
+        );
+    }
+
+    fn interrupt_control_with_linearization_hook(
+        &self,
+        control: BrowserHostControl,
+        after_lock: impl FnOnce(),
+    ) {
         self.host_controls.push_and(control.clone(), || {
-            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
+            apply_lifecycle_control_with_hook(
+                &self.response_linearization,
+                &self.cancellations,
+                &self.replay_coordinator,
+                &control,
+                after_lock,
+            )
         });
     }
 
     pub fn interrupt_all(&self) {
         self.host_controls.with_locked(|| {
+            let _response_order = lock(&self.response_linearization);
             self.replay_coordinator.interrupt_all();
             self.cancellations.interrupt_all();
         });
@@ -1172,6 +1229,7 @@ impl BrowserCommandBridge {
             .with_drain_locked(|controls, lifecycle_requests| {
                 if let Some(control) = browser_lifecycle_control(workspace_key, command) {
                     apply_lifecycle_control(
+                        &self.response_linearization,
                         &self.cancellations,
                         &self.replay_coordinator,
                         &control,
@@ -1183,6 +1241,7 @@ impl BrowserCommandBridge {
                         BrowserCommandRequest::from_envelope(
                             envelope,
                             Arc::clone(&self.cancellations),
+                            Arc::clone(&self.response_linearization),
                         )
                     })
                     .collect();
@@ -1204,6 +1263,7 @@ impl BrowserCommandBridge {
             .with_drain_all_locked(|controls, lifecycle_requests, repair_cleanups| {
                 if let Some(control) = browser_lifecycle_control(workspace_key, command) {
                     apply_lifecycle_control(
+                        &self.response_linearization,
                         &self.cancellations,
                         &self.replay_coordinator,
                         &control,
@@ -1215,6 +1275,7 @@ impl BrowserCommandBridge {
                         BrowserCommandRequest::from_envelope(
                             envelope,
                             Arc::clone(&self.cancellations),
+                            Arc::clone(&self.response_linearization),
                         )
                     })
                     .collect();
@@ -1245,6 +1306,7 @@ impl BrowserCommandBridge {
                         BrowserCommandRequest::from_envelope(
                             envelope,
                             Arc::clone(&self.cancellations),
+                            Arc::clone(&self.response_linearization),
                         )
                     })
                     .collect();
@@ -1268,6 +1330,7 @@ impl BrowserCommandBridge {
                         BrowserCommandRequest::from_envelope(
                             envelope,
                             Arc::clone(&self.cancellations),
+                            Arc::clone(&self.response_linearization),
                         )
                     })
                     .collect();
@@ -1283,6 +1346,7 @@ pub struct BrowserController {
     timeout: Duration,
     cancellations: Arc<CancellationEpochs>,
     host_controls: Arc<HostControlQueue>,
+    response_linearization: Arc<Mutex<()>>,
     pending_work: Arc<PendingWork>,
     registration_lease: Option<BrowserRegistrationLease>,
     replay_coordinator: BrowserReplayCoordinator,
@@ -1731,6 +1795,7 @@ impl BrowserController {
         let mut tab_cancellation = cancellations.tab;
         let mut registration_cancellation = cancellations.registration;
         tokio::select! {
+            biased;
             response = receiver => response.unwrap_or_else(|_| {
                 Err(BrowserError::CrashedView {
                     message: "browser command request was dropped without a response".to_string(),
@@ -1787,7 +1852,12 @@ impl BrowserController {
             workspace_key: self.workspace_key.clone(),
         };
         self.host_controls.push_and(control.clone(), || {
-            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
+            apply_lifecycle_control(
+                &self.response_linearization,
+                &self.cancellations,
+                &self.replay_coordinator,
+                &control,
+            )
         });
     }
 
@@ -1797,7 +1867,12 @@ impl BrowserController {
             tab_id: tab_id.to_string(),
         };
         self.host_controls.push_and(control.clone(), || {
-            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
+            apply_lifecycle_control(
+                &self.response_linearization,
+                &self.cancellations,
+                &self.replay_coordinator,
+                &control,
+            )
         });
     }
 
@@ -1854,7 +1929,12 @@ impl BrowserController {
                     .as_ref()
                     .map(BrowserRegistrationLease::capture)
                     .transpose()?;
-                apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control);
+                apply_lifecycle_control(
+                    &self.response_linearization,
+                    &self.cancellations,
+                    &self.replay_coordinator,
+                    &control,
+                );
                 let mut cancellation_ticket = self
                     .cancellations
                     .ticket(&self.workspace_key, command.tab_id());
@@ -2096,6 +2176,7 @@ pub struct BrowserCommandInbox {
     receiver: mpsc::Receiver<BrowserCommandEnvelope>,
     cancellations: Arc<CancellationEpochs>,
     host_controls: Arc<HostControlQueue>,
+    response_linearization: Arc<Mutex<()>>,
     pending_work: Arc<PendingWork>,
     replay_coordinator: BrowserReplayCoordinator,
     _main_thread_only: PhantomData<Rc<()>>,
@@ -2115,6 +2196,7 @@ impl BrowserCommandInbox {
                 return Some(BrowserCommandRequest::from_envelope(
                     envelope,
                     Arc::clone(&self.cancellations),
+                    Arc::clone(&self.response_linearization),
                 ));
             }
             let _ = envelope.response.send(Err(BrowserError::Interrupted));
@@ -2131,7 +2213,12 @@ impl BrowserCommandInbox {
             workspace_key: workspace_key.clone(),
         };
         self.host_controls.push_and(control.clone(), || {
-            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
+            apply_lifecycle_control(
+                &self.response_linearization,
+                &self.cancellations,
+                &self.replay_coordinator,
+                &control,
+            )
         });
     }
 
@@ -2141,7 +2228,12 @@ impl BrowserCommandInbox {
             tab_id: tab_id.to_string(),
         };
         self.host_controls.push_and(control.clone(), || {
-            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
+            apply_lifecycle_control(
+                &self.response_linearization,
+                &self.cancellations,
+                &self.replay_coordinator,
+                &control,
+            )
         });
     }
 
@@ -2161,6 +2253,7 @@ impl BrowserCommandInbox {
                         BrowserCommandRequest::from_envelope(
                             envelope,
                             Arc::clone(&self.cancellations),
+                            Arc::clone(&self.response_linearization),
                         )
                     })
                     .collect();
@@ -2169,8 +2262,14 @@ impl BrowserCommandInbox {
     }
 
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
-        self.host_controls
-            .with_locked(|| apply_host_event(&self.cancellations, &self.replay_coordinator, event));
+        self.host_controls.with_locked(|| {
+            apply_host_event(
+                &self.response_linearization,
+                &self.cancellations,
+                &self.replay_coordinator,
+                event,
+            )
+        });
     }
 }
 
@@ -2181,6 +2280,7 @@ pub struct BrowserCommandRequest {
     local_project_root: Option<PathBuf>,
     cancellation_ticket: CancellationTicket,
     cancellations: Arc<CancellationEpochs>,
+    response_linearization: Arc<Mutex<()>>,
     registration_lease: Option<BrowserRegistrationLease>,
     replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
     replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
@@ -2370,6 +2470,17 @@ impl BrowserCommandRequest {
     }
 
     pub fn respond(self, result: Result<BrowserResponse, BrowserError>) {
+        self.respond_with_linearization_hook(result, || {});
+    }
+
+    fn respond_with_linearization_hook(
+        self,
+        result: Result<BrowserResponse, BrowserError>,
+        after_lock: impl FnOnce(),
+    ) {
+        let response_linearization = Arc::clone(&self.response_linearization);
+        let _response_order = lock(&response_linearization);
+        after_lock();
         let result = if self.cancellation_is_current() {
             result
         } else {
@@ -2399,6 +2510,7 @@ impl BrowserCommandRequest {
     fn from_envelope(
         envelope: BrowserCommandEnvelope,
         cancellations: Arc<CancellationEpochs>,
+        response_linearization: Arc<Mutex<()>>,
     ) -> Self {
         let BrowserCommandEnvelope {
             workspace_key,
@@ -2420,6 +2532,7 @@ impl BrowserCommandRequest {
             local_project_root,
             cancellation_ticket,
             cancellations,
+            response_linearization,
             registration_lease,
             replay_secret_sidecar,
             replay_repair_sidecar,
@@ -2438,6 +2551,7 @@ pub fn browser_command_channel(capacity: usize) -> (BrowserCommandBridge, Browse
     let (sender, receiver) = mpsc::channel(capacity.max(1));
     let cancellations = Arc::new(CancellationEpochs::default());
     let host_controls = Arc::new(HostControlQueue::default());
+    let response_linearization = Arc::new(Mutex::new(()));
     let pending_work = Arc::new(PendingWork::default());
     let replay_coordinator = BrowserReplayCoordinator::default();
     (
@@ -2445,6 +2559,7 @@ pub fn browser_command_channel(capacity: usize) -> (BrowserCommandBridge, Browse
             sender,
             cancellations: Arc::clone(&cancellations),
             host_controls: Arc::clone(&host_controls),
+            response_linearization: Arc::clone(&response_linearization),
             pending_work: Arc::clone(&pending_work),
             replay_coordinator: replay_coordinator.clone(),
         },
@@ -2452,6 +2567,7 @@ pub fn browser_command_channel(capacity: usize) -> (BrowserCommandBridge, Browse
             receiver,
             cancellations,
             host_controls,
+            response_linearization,
             pending_work,
             replay_coordinator,
             _main_thread_only: PhantomData,
@@ -3805,6 +3921,7 @@ mod secure_command_tests {
                 pending_work: pending_work.track(),
             },
             cancellations,
+            Arc::new(Mutex::new(())),
         )
     }
 
@@ -3843,6 +3960,7 @@ mod secure_command_tests {
                 pending_work: pending_work.track(),
             },
             cancellations,
+            Arc::new(Mutex::new(())),
         )
     }
 
@@ -4801,6 +4919,169 @@ mod secure_command_tests {
         drop(bridge);
         assert!(inbox.recv().await.is_none());
         assert_eq!(inbox.pending_work_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_and_tab_cancellation_follow_one_forced_linearization_order() {
+        let workspace_key = workspace("project-a", "conversation-a");
+
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        let request = inbox.recv().await.expect("response-first request");
+        let (response_entered_tx, response_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_response_tx, release_response_rx) = std::sync::mpsc::sync_channel(0);
+        let response = std::thread::spawn(move || {
+            request.respond_with_linearization_hook(Ok(BrowserResponse::Acknowledged), || {
+                response_entered_tx.send(()).unwrap();
+                release_response_rx.recv().unwrap();
+            });
+        });
+        response_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("response holds the linearization gate");
+
+        let cancellation_bridge = bridge.clone();
+        let cancellation_key = workspace_key.clone();
+        let (cancellation_attempted_tx, cancellation_attempted_rx) =
+            std::sync::mpsc::sync_channel(0);
+        let (cancellation_done_tx, cancellation_done_rx) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            cancellation_attempted_tx.send(()).unwrap();
+            cancellation_bridge.interrupt_tab(&cancellation_key, "tab-a");
+            cancellation_done_tx.send(()).unwrap();
+        });
+        cancellation_attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation attempts the occupied gate");
+        assert!(
+            cancellation_done_rx
+                .recv_timeout(Duration::from_millis(25))
+                .is_err(),
+            "cancellation must wait behind the earlier response"
+        );
+        release_response_tx.send(()).unwrap();
+        response.join().unwrap();
+        cancellation.join().unwrap();
+        assert_eq!(pending.await.unwrap(), Ok(BrowserResponse::Acknowledged));
+
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        let request = inbox.recv().await.expect("cancellation-first request");
+        let cancellation_bridge = bridge.clone();
+        let cancellation_key = workspace_key.clone();
+        let (cancellation_entered_tx, cancellation_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_cancellation_tx, release_cancellation_rx) = std::sync::mpsc::sync_channel(0);
+        let cancellation = std::thread::spawn(move || {
+            cancellation_bridge.interrupt_control_with_linearization_hook(
+                BrowserHostControl::InterruptTab {
+                    workspace_key: cancellation_key,
+                    tab_id: "tab-a".to_string(),
+                },
+                || {
+                    cancellation_entered_tx.send(()).unwrap();
+                    release_cancellation_rx.recv().unwrap();
+                },
+            );
+        });
+        cancellation_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation holds the linearization gate");
+
+        let (response_attempted_tx, response_attempted_rx) = std::sync::mpsc::sync_channel(0);
+        let (response_done_tx, response_done_rx) = std::sync::mpsc::channel();
+        let response = std::thread::spawn(move || {
+            response_attempted_tx.send(()).unwrap();
+            request.respond(Ok(BrowserResponse::Acknowledged));
+            response_done_tx.send(()).unwrap();
+        });
+        response_attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("response attempts the occupied gate");
+        assert!(
+            response_done_rx
+                .recv_timeout(Duration::from_millis(25))
+                .is_err(),
+            "response must wait behind the earlier cancellation"
+        );
+        release_cancellation_tx.send(()).unwrap();
+        cancellation.join().unwrap();
+        response.join().unwrap();
+        assert_eq!(pending.await.unwrap(), Err(BrowserError::Interrupted));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_revocation_linearizes_before_a_waiting_response() {
+        let workspace_key = workspace("project-a", "conversation-a");
+        let registration = BrowserRegistrationLease::new();
+        let (bridge, mut inbox) = browser_command_channel(1);
+        let controller = bridge.bind_with_registration_lease(
+            workspace_key.clone(),
+            Duration::from_secs(1),
+            Some(registration.clone()),
+        );
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        let request = inbox.recv().await.expect("registered request");
+
+        let revocation_bridge = bridge.clone();
+        let revocation_key = workspace_key.clone();
+        let revocation_lease = registration.clone();
+        let (revocation_entered_tx, revocation_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_revocation_tx, release_revocation_rx) = std::sync::mpsc::sync_channel(0);
+        let revocation = std::thread::spawn(move || {
+            revocation_bridge.revoke_registration_with_linearization_hook(
+                &revocation_key,
+                &revocation_lease,
+                || {
+                    revocation_entered_tx.send(()).unwrap();
+                    release_revocation_rx.recv().unwrap();
+                },
+            );
+        });
+        revocation_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("revocation holds the linearization gate");
+
+        let (response_attempted_tx, response_attempted_rx) = std::sync::mpsc::sync_channel(0);
+        let (response_done_tx, response_done_rx) = std::sync::mpsc::channel();
+        let response = std::thread::spawn(move || {
+            response_attempted_tx.send(()).unwrap();
+            request.respond(Ok(BrowserResponse::Acknowledged));
+            response_done_tx.send(()).unwrap();
+        });
+        response_attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("response attempts the occupied gate");
+        assert!(
+            response_done_rx
+                .recv_timeout(Duration::from_millis(25))
+                .is_err(),
+            "response must wait behind the earlier registration revocation"
+        );
+        release_revocation_tx.send(()).unwrap();
+        revocation.join().unwrap();
+        response.join().unwrap();
+        assert_eq!(pending.await.unwrap(), Err(BrowserError::Interrupted));
+        assert!(!registration.is_current(BrowserRegistrationLeaseTicket(0)));
     }
 }
 
