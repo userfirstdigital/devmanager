@@ -3,12 +3,12 @@ use super::{
     verified_authenticated_local_project_root, BrowserAction, BrowserActionTarget,
     BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation, BrowserController,
     BrowserDownloadOperation, BrowserElementRef, BrowserError, BrowserInvocationContext,
-    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserRecipeInputKind,
+    BrowserLocator, BrowserNetworkOperation, BrowserPerformanceOperation, BrowserRecipeInputKind,
     BrowserRecordingOperation, BrowserReplayProjection, BrowserReplayPublicInput,
-    BrowserReplayRepairProjection, BrowserResourceStore, BrowserResponse, BrowserRisk,
-    BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition, BrowserWorkflowMcpService,
-    BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus, BrowserWorkflowServiceError,
-    BrowserWorkspaceSnapshot,
+    BrowserReplayRepairProjection, BrowserResourceStore, BrowserResponse, BrowserRevision,
+    BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
+    BrowserWorkflowMcpService, BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus,
+    BrowserWorkflowServiceError, BrowserWorkspaceSnapshot,
 };
 use base64::Engine as _;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -122,7 +122,7 @@ enum BrowserWorkflowPublicInputKind {
     File,
 }
 
-#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BrowserWorkflowPublicInputWire {
     #[schemars(length(max = 128))]
@@ -132,7 +132,39 @@ struct BrowserWorkflowPublicInputWire {
     value: String,
 }
 
-#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[derive(Default, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserWorkflowLocatorWire {
+    accessibility_role: Option<String>,
+    accessibility_name: Option<String>,
+    test_id: Option<String>,
+    css_selectors: Vec<String>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserWorkflowCandidateWire {
+    revision: BrowserRevision,
+    locator: BrowserWorkflowLocatorWire,
+    backend_node_id: Option<u64>,
+}
+
+impl From<BrowserWorkflowCandidateWire> for BrowserElementRef {
+    fn from(value: BrowserWorkflowCandidateWire) -> Self {
+        Self {
+            revision: value.revision,
+            locator: BrowserLocator {
+                accessibility_role: value.locator.accessibility_role,
+                accessibility_name: value.locator.accessibility_name,
+                test_id: value.locator.test_id,
+                css_selectors: value.locator.css_selectors,
+            },
+            backend_node_id: value.backend_node_id,
+        }
+    }
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BrowserWorkflowRequestWire {
     #[schemars(length(max = 1024))]
@@ -147,14 +179,27 @@ struct BrowserWorkflowRequestWire {
     replay_instance_id: Option<u64>,
     #[schemars(range(min = 1))]
     repair_id: Option<u64>,
-    candidate: Option<BrowserElementRef>,
+    candidate: Option<BrowserWorkflowCandidateWire>,
     confirm: Option<bool>,
     resume: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
+enum BrowserWorkflowParseFailure {
+    Invalid,
+}
+
 struct BrowserWorkflowRequest {
-    parsed: Result<BrowserWorkflowRequestWire, String>,
+    parsed: Result<BrowserWorkflowRequestWire, BrowserWorkflowParseFailure>,
+}
+
+impl std::fmt::Debug for BrowserWorkflowRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserWorkflowRequest")
+            .field("valid", &self.parsed.is_ok())
+            .finish()
+    }
 }
 
 impl<'de> Deserialize<'de> for BrowserWorkflowRequest {
@@ -164,7 +209,7 @@ impl<'de> Deserialize<'de> for BrowserWorkflowRequest {
     {
         let value = Value::deserialize(deserializer)?;
         Ok(Self {
-            parsed: serde_json::from_value(value).map_err(|error| error.to_string()),
+            parsed: serde_json::from_value(value).map_err(|_| BrowserWorkflowParseFailure::Invalid),
         })
     }
 }
@@ -850,11 +895,9 @@ impl BrowserMcpServer {
         Parameters(request): Parameters<BrowserWorkflowRequest>,
     ) -> CallToolResult {
         let result = async {
-            let request = request.parsed.map_err(|message| {
-                ToolFailure::invalid_request(format!(
-                    "malformed browser_workflow request: {message}"
-                ))
-            })?;
+            let request = request
+                .parsed
+                .map_err(|_| ToolFailure::invalid_request("malformed browser_workflow request"))?;
             if request.intent.len() > MAX_BROWSER_MCP_INTENT_BYTES {
                 return Err(ToolFailure::invalid_request(
                     "intent must be at most 1024 bytes",
@@ -948,9 +991,10 @@ impl BrowserMcpServer {
                     let repair_id = request
                         .repair_id
                         .expect("repairPreview validation requires repairId");
-                    let candidate = request
+                    let candidate: BrowserElementRef = request
                         .candidate
-                        .expect("repairPreview validation requires candidate");
+                        .expect("repairPreview validation requires candidate")
+                        .into();
                     let status = self
                         .context
                         .workflow
@@ -1721,6 +1765,20 @@ mod tests {
     };
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
+
+    #[test]
+    fn workflow_parse_failure_debug_state_is_value_free() {
+        const SENTINEL: &str = "credential-like-workflow-debug-sentinel";
+        let request: BrowserWorkflowRequest = serde_json::from_value(json!({
+            "intent": "reject a malformed risk",
+            "risk": SENTINEL,
+            "operation": "list"
+        }))
+        .expect("workflow wrapper retains a typed parse failure");
+
+        assert!(request.parsed.is_err());
+        assert!(!format!("{request:?}").contains(SENTINEL));
+    }
 
     #[tokio::test]
     async fn recording_rejects_unc_root_before_all_six_operations_or_lifecycle_effects() {

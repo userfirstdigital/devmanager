@@ -1,9 +1,10 @@
 use devmanager::browser::{
     browser_command_channel, get_browser_workflow_recipe, list_browser_workflow_recipes,
-    save_recipe, BrowserGatewayHandle, BrowserRecipeAction, BrowserRecipeInput,
-    BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
-    BrowserRecipeViewport, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
-    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
+    save_recipe, BrowserCommand, BrowserGatewayHandle, BrowserHostState, BrowserRecipeAction,
+    BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1,
+    BrowserRecipeValue, BrowserRecipeViewport, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo};
 use rmcp::transport::{
@@ -20,6 +21,15 @@ fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
 
 fn arguments(value: Value) -> Map<String, Value> {
     serde_json::from_value(value).expect("tool arguments object")
+}
+
+fn local_schema_ref(schema: &Value) -> &str {
+    schema["$ref"].as_str().unwrap_or_else(|| {
+        schema["anyOf"]
+            .as_array()
+            .and_then(|variants| variants.iter().find_map(|variant| variant["$ref"].as_str()))
+            .expect("local schema reference")
+    })
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -204,6 +214,20 @@ async fn browser_workflow_exposes_one_exact_seven_operation_tool() {
         workflow.input_schema["$defs"][kind_definition]["enum"],
         json!(["text", "url", "file"])
     );
+    let candidate_ref = local_schema_ref(&workflow.input_schema["properties"]["candidate"]);
+    let candidate_definition = candidate_ref
+        .strip_prefix("#/$defs/")
+        .expect("local workflow candidate definition");
+    let candidate_schema = &workflow.input_schema["$defs"][candidate_definition];
+    assert_eq!(candidate_schema["additionalProperties"], false);
+    let locator_ref = local_schema_ref(&candidate_schema["properties"]["locator"]);
+    let locator_definition = locator_ref
+        .strip_prefix("#/$defs/")
+        .expect("local workflow locator definition");
+    assert_eq!(
+        workflow.input_schema["$defs"][locator_definition]["additionalProperties"],
+        false
+    );
     let schema_text = serde_json::to_string(&workflow.input_schema).unwrap();
     for forbidden in [
         "projectId",
@@ -229,7 +253,7 @@ async fn browser_workflow_exposes_one_exact_seven_operation_tool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn browser_workflow_malformed_calls_are_typed_and_keep_the_session_alive() {
-    let (bridge, _inbox) = browser_command_channel(8);
+    let (bridge, mut inbox) = browser_command_channel(8);
     let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
     let registration = gateway
         .registrar()
@@ -250,70 +274,145 @@ async fn browser_workflow_malformed_calls_are_typed_and_keep_the_session_alive()
         .serve(transport)
         .await
         .expect("initialize workflow malformed client");
+    let host = async move {
+        let mut state = BrowserHostState::new(unique_temp_dir("malformed-host"));
+        while let Some(request) = inbox.recv().await {
+            let key = request.workspace_key().clone();
+            let response = match request.command().clone() {
+                BrowserCommand::Ensure { snapshot } => state
+                    .ensure_workspace(key, snapshot)
+                    .map(|mutation| BrowserResponse::Workspace { mutation }),
+                BrowserCommand::SetPaneOpen { open } => state
+                    .set_pane_open(&key, open)
+                    .map(|mutation| BrowserResponse::Workspace { mutation }),
+                BrowserCommand::WorkspaceState => Ok(BrowserResponse::WorkspaceState {
+                    snapshot: state.workspace(&key).expect("malformed workspace").clone(),
+                }),
+                other => panic!("unexpected malformed-workflow host command: {other:?}"),
+            };
+            request.respond(response);
+        }
+    };
 
-    let candidate = json!({
-        "revision": 7,
-        "locator": {"testId": "replacement", "cssSelectors": ["[data-testid=replacement]"]}
-    });
-    let malformed = vec![
-        json!({"risk":"normal","operation":"list"}),
-        json!({"intent":"list workflows","operation":"list"}),
-        json!({"intent":"list workflows","risk":"normal"}),
-        json!({"intent":"   ","risk":"normal","operation":"list"}),
-        json!({"intent":"x".repeat(1025),"risk":"normal","operation":"list"}),
-        json!({"intent":"list workflows","risk":"unknown","operation":"list"}),
-        json!({"intent":"list workflows","risk":"normal","operation":"unknown"}),
-        json!({"intent":"list workflows","risk":"normal","operation":"list","recipeId":"flow"}),
-        json!({"intent":"get workflow","risk":"normal","operation":"get"}),
-        json!({"intent":"get workflow","risk":"normal","operation":"get","recipeId":""}),
-        json!({"intent":"get workflow","risk":"normal","operation":"get","recipeId":"flow","inputs":[]}),
-        json!({"intent":"replay workflow","risk":"normal","operation":"replay"}),
-        json!({"intent":"replay workflow","risk":"normal","operation":"replay","recipeId":"flow","replayInstanceId":1}),
-        json!({"intent":"replay workflow","risk":"normal","operation":"replay","recipeId":"flow","inputs":[{"name":"value","kind":"secret","value":"hidden"}]}),
-        json!({"intent":"replay workflow","risk":"normal","operation":"replay","recipeId":"flow","inputs":[{"name":"x".repeat(129),"kind":"text","value":"value"}]}),
-        json!({"intent":"inspect replay","risk":"normal","operation":"status"}),
-        json!({"intent":"inspect replay","risk":"normal","operation":"status","replayInstanceId":0}),
-        json!({"intent":"inspect replay","risk":"normal","operation":"status","replayInstanceId":1,"repairId":1}),
-        json!({"intent":"cancel replay","risk":"normal","operation":"cancel","replayInstanceId":1,"confirm":true}),
-        json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1}),
-        json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":0,"repairId":1,"candidate":candidate.clone()}),
-        json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":false,"resume":true}),
-        json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":true}),
-        json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":true,"resume":true,"candidate":candidate}),
-        json!({"intent":"route elsewhere","risk":"normal","operation":"list","projectId":"other"}),
-    ];
-    for arguments_value in malformed {
-        let result = client
-            .peer()
-            .call_tool(
-                CallToolRequestParams::new("browser_workflow")
-                    .with_arguments(arguments(arguments_value)),
-            )
-            .await
-            .expect("malformed workflow call returns a tool result");
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.structured_content.unwrap()["error"]["code"],
-            "invalid_request"
-        );
-        assert_eq!(
-            client
+    let scenario = async move {
+        let candidate = json!({
+            "revision": 7,
+            "locator": {"testId": "replacement", "cssSelectors": ["[data-testid=replacement]"]}
+        });
+        let malformed = vec![
+            json!({"risk":"normal","operation":"list"}),
+            json!({"intent":"list workflows","operation":"list"}),
+            json!({"intent":"list workflows","risk":"normal"}),
+            json!({"intent":"   ","risk":"normal","operation":"list"}),
+            json!({"intent":"x".repeat(1025),"risk":"normal","operation":"list"}),
+            json!({"intent":"list workflows","risk":"unknown","operation":"list"}),
+            json!({"intent":"list workflows","risk":"normal","operation":"unknown"}),
+            json!({"intent":"list workflows","risk":"normal","operation":"list","recipeId":"flow"}),
+            json!({"intent":"get workflow","risk":"normal","operation":"get"}),
+            json!({"intent":"get workflow","risk":"normal","operation":"get","recipeId":""}),
+            json!({"intent":"get workflow","risk":"normal","operation":"get","recipeId":"flow","inputs":[]}),
+            json!({"intent":"replay workflow","risk":"normal","operation":"replay"}),
+            json!({"intent":"replay workflow","risk":"normal","operation":"replay","recipeId":"flow","replayInstanceId":1}),
+            json!({"intent":"replay workflow","risk":"normal","operation":"replay","recipeId":"flow","inputs":[{"name":"value","kind":"secret","value":"hidden"}]}),
+            json!({"intent":"replay workflow","risk":"normal","operation":"replay","recipeId":"flow","inputs":[{"name":"x".repeat(129),"kind":"text","value":"value"}]}),
+            json!({"intent":"inspect replay","risk":"normal","operation":"status"}),
+            json!({"intent":"inspect replay","risk":"normal","operation":"status","replayInstanceId":0}),
+            json!({"intent":"inspect replay","risk":"normal","operation":"status","replayInstanceId":1,"repairId":1}),
+            json!({"intent":"cancel replay","risk":"normal","operation":"cancel","replayInstanceId":1,"confirm":true}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":0,"repairId":1,"candidate":candidate.clone()}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"testId":"replacement"},"token":"candidate-token-sentinel"}}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"testId":"replacement","password":"locator-password-sentinel","secret":"locator-secret-sentinel"}}}),
+            json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":false,"resume":true}),
+            json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":true}),
+            json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":true,"resume":true,"candidate":candidate}),
+            json!({"intent":"route elsewhere","risk":"normal","operation":"list","projectId":"other"}),
+        ];
+        for arguments_value in malformed {
+            let result = client
                 .peer()
-                .list_tools(None)
+                .call_tool(
+                    CallToolRequestParams::new("browser_workflow")
+                        .with_arguments(arguments(arguments_value)),
+                )
                 .await
-                .expect("authenticated MCP session remains usable")
-                .tools
-                .iter()
-                .filter(|tool| tool.name == "browser_workflow")
-                .count(),
-            1
-        );
-    }
+                .expect("malformed workflow call returns a tool result");
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content.unwrap()["error"]["code"],
+                "invalid_request"
+            );
+            assert_eq!(
+                client
+                    .peer()
+                    .list_tools(None)
+                    .await
+                    .expect("authenticated MCP session remains usable")
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.name == "browser_workflow")
+                    .count(),
+                1
+            );
+        }
 
-    client
-        .cancel()
-        .await
-        .expect("close workflow malformed client");
+        for (sentinel, arguments_value) in [
+            (
+                "credential-like-invalid-risk-sentinel",
+                json!({
+                    "intent": "reject an invalid workflow risk",
+                    "risk": "credential-like-invalid-risk-sentinel",
+                    "operation": "list"
+                }),
+            ),
+            (
+                "password-like-invalid-type-sentinel",
+                json!({
+                    "intent": "reject an invalid workflow identity type",
+                    "risk": "normal",
+                    "operation": "status",
+                    "replayInstanceId": "password-like-invalid-type-sentinel"
+                }),
+            ),
+        ] {
+            let result = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new("browser_workflow")
+                        .with_arguments(arguments(arguments_value)),
+                )
+                .await
+                .expect("sensitive malformed workflow call returns a tool result");
+            assert_eq!(result.is_error, Some(true));
+            let body = result.structured_content.expect("typed parse failure");
+            assert_eq!(body["error"]["code"], "invalid_request");
+            assert_eq!(
+                body["error"]["message"],
+                "malformed browser_workflow request"
+            );
+            assert!(!serde_json::to_string(&body).unwrap().contains(sentinel));
+            assert_eq!(
+                client
+                    .peer()
+                    .list_tools(None)
+                    .await
+                    .expect("session survives sensitive parse failure")
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.name == "browser_workflow")
+                    .count(),
+                1
+            );
+        }
+
+        client
+            .cancel()
+            .await
+            .expect("close workflow malformed client");
+        drop(registration);
+        drop(gateway);
+    };
+    tokio::join!(host, scenario);
 }
 
 #[test]
