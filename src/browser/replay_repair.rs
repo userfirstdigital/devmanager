@@ -22,6 +22,46 @@ pub enum BrowserReplayLocatorSlot {
     Assertion { index: usize },
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct BrowserReplayRecipeLocatorTarget {
+    step_index: usize,
+    step_id: String,
+    locator_slot: BrowserReplayLocatorSlot,
+    old_locator: BrowserRecipeLocator,
+}
+
+impl BrowserReplayRecipeLocatorTarget {
+    pub(super) fn new(
+        step_index: usize,
+        step_id: String,
+        locator_slot: BrowserReplayLocatorSlot,
+        old_locator: BrowserRecipeLocator,
+    ) -> Self {
+        Self {
+            step_index,
+            step_id,
+            locator_slot,
+            old_locator,
+        }
+    }
+
+    pub(crate) fn step_index(&self) -> usize {
+        self.step_index
+    }
+
+    pub(crate) fn step_id(&self) -> &str {
+        &self.step_id
+    }
+
+    pub(crate) fn locator_slot(&self) -> BrowserReplayLocatorSlot {
+        self.locator_slot
+    }
+
+    pub(crate) fn old_locator(&self) -> &BrowserRecipeLocator {
+        &self.old_locator
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BrowserReplayRepairPhase {

@@ -1,27 +1,33 @@
+use super::commands::verified_authenticated_local_project_root;
+use super::recipes::{
+    canonical_browser_recipe_digest, recipe_step_locator_at, BrowserRecipeDigestV1,
+};
 use super::replay_repair::{
-    BrowserReplayRepairAuthorityScope, BrowserReplayRepairHighlightCleanup,
-    BrowserReplayRepairHighlightToken, BrowserReplayRepairPreviewAbortDisposition,
-    BrowserReplayRepairPreviewAcknowledgement, BrowserReplayRepairPreviewAuthority,
-    BrowserReplayRepairPreviewReceipt, BrowserReplayRepairResumeCursor,
-    BrowserReplayRepairRetentionAuthority,
+    BrowserReplayRecipeLocatorTarget, BrowserReplayRepairAuthorityScope,
+    BrowserReplayRepairHighlightCleanup, BrowserReplayRepairHighlightToken,
+    BrowserReplayRepairPreviewAbortDisposition, BrowserReplayRepairPreviewAcknowledgement,
+    BrowserReplayRepairPreviewAuthority, BrowserReplayRepairPreviewReceipt,
+    BrowserReplayRepairResumeCursor, BrowserReplayRepairRetentionAuthority,
 };
 use super::resources::BrowserReplayRepairRetentionLease;
 use super::{
-    BrowserError, BrowserRecipeAction, BrowserRecipeAssertion, BrowserRecipeElementState,
-    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait, BrowserReplayLocatorSlot,
-    BrowserReplayRepairCandidate, BrowserReplayRepairInstance, BrowserReplayRepairPhase,
-    BrowserReplayRepairProjection, BrowserReplaySecretError, BrowserReplaySecretLease,
-    BrowserReplaySecretStore, BrowserReplaySecretSubmission, BrowserResourceHandle,
-    BrowserResourceKind, BrowserResourceStore, BrowserRevision, BrowserWorkspaceKey,
-    MAX_BROWSER_REPLAY_SECRET_INPUTS,
+    BrowserError, BrowserRecipeAction, BrowserRecipeInputKind, BrowserRecipeLocator,
+    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
+    BrowserReplayLocatorSlot, BrowserReplayRepairCandidate, BrowserReplayRepairInstance,
+    BrowserReplayRepairPhase, BrowserReplayRepairProjection, BrowserReplaySecretError,
+    BrowserReplaySecretLease, BrowserReplaySecretStore, BrowserReplaySecretSubmission,
+    BrowserResourceHandle, BrowserResourceKind, BrowserResourceStore, BrowserRevision,
+    BrowserWorkspaceKey, MAX_BROWSER_REPLAY_SECRET_INPUTS,
 };
+#[cfg(test)]
+use super::{BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeWait};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tokio::sync::watch;
 
 pub const MAX_BROWSER_REPLAY_INPUTS: usize = 64;
@@ -48,6 +54,8 @@ pub enum BrowserReplayError {
     AlreadyActive,
     StaleInstance,
     InvalidExecutionAuthority,
+    RecipeRootUnavailable,
+    RecipeRootAlreadyBound,
     InvalidTransition,
     StepOutOfOrder,
     IncompleteReplay,
@@ -77,6 +85,8 @@ impl fmt::Display for BrowserReplayError {
             Self::AlreadyActive => "browser replay workspace already has an active instance",
             Self::StaleInstance => "browser replay instance is stale",
             Self::InvalidExecutionAuthority => "browser replay execution authority is invalid",
+            Self::RecipeRootUnavailable => "browser replay recipe root is unavailable",
+            Self::RecipeRootAlreadyBound => "browser replay recipe root is already bound",
             Self::InvalidTransition => "browser replay status transition is invalid",
             Self::StepOutOfOrder => "browser replay step is out of order",
             Self::IncompleteReplay => "browser replay has incomplete steps",
@@ -125,6 +135,8 @@ struct BrowserReplayBoundValue {
 
 pub struct BrowserReplayPlan {
     recipe_id: String,
+    #[allow(dead_code)] // Task 7 consumes the private digest during exact repair apply.
+    recipe_digest: BrowserRecipeDigestV1,
     start_url: String,
     viewport: BrowserRecipeViewport,
     steps: Vec<BrowserRecipeStep>,
@@ -295,6 +307,8 @@ pub struct BrowserReplayExecutionHandle {
     secret_store: BrowserReplaySecretStore,
     repair_watch: watch::Receiver<u64>,
     locator_overrides: Arc<Mutex<HashMap<(usize, BrowserReplayLocatorSlot), BrowserRecipeLocator>>>,
+    #[allow(dead_code)] // Task 7 binds this in the executor and reads it during coordinator apply.
+    canonical_recipe_root: Arc<OnceLock<PathBuf>>,
 }
 
 impl BrowserReplayExecutionHandle {
@@ -344,6 +358,31 @@ impl BrowserReplayExecutionHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(step_index, locator_slot))
             .cloned()
+    }
+
+    #[allow(dead_code)] // Wired before the first command by Task 7's executor change.
+    pub(crate) fn bind_canonical_recipe_root(
+        &self,
+        authenticated_canonical_root: &Path,
+    ) -> Result<(), BrowserReplayError> {
+        let canonical = verified_authenticated_local_project_root(authenticated_canonical_root)
+            .map_err(|_| BrowserReplayError::RecipeRootUnavailable)?;
+        self.canonical_recipe_root
+            .set(canonical)
+            .map_err(|_| BrowserReplayError::RecipeRootAlreadyBound)
+    }
+
+    #[allow(dead_code)] // Task 7 consumes the exact shared binding.
+    pub(crate) fn bound_canonical_recipe_root(&self) -> Result<&Path, BrowserReplayError> {
+        self.canonical_recipe_root
+            .get()
+            .map(PathBuf::as_path)
+            .ok_or(BrowserReplayError::RecipeRootUnavailable)
+    }
+
+    #[allow(dead_code)] // Task 7 passes this private digest to the atomic primitive.
+    pub(crate) fn recipe_digest(&self) -> &BrowserRecipeDigestV1 {
+        &self.plan.recipe_digest
     }
 }
 
@@ -417,11 +456,9 @@ struct BrowserReplayPrivateRepairState {
     instance: BrowserReplayRepairInstance,
     resource_store: BrowserResourceStore,
     lease: Arc<BrowserReplayRepairLeaseSlot>,
-    step_index: usize,
-    locator_slot: BrowserReplayLocatorSlot,
+    recipe_target: BrowserReplayRecipeLocatorTarget,
     tab_id: String,
     revision: BrowserRevision,
-    old_locator: BrowserRecipeLocator,
     resume_cursor: BrowserReplayRepairResumeCursor,
     snapshot: Option<BrowserResourceHandle>,
     screenshot: Option<BrowserResourceHandle>,
@@ -584,6 +621,8 @@ struct ActiveBrowserReplay {
     repair_generation: u64,
     _locator_overrides:
         Arc<Mutex<HashMap<(usize, BrowserReplayLocatorSlot), BrowserRecipeLocator>>>,
+    #[allow(dead_code)] // Shared with the execution handle for Task 7 coordinator-side apply.
+    canonical_recipe_root: Arc<OnceLock<PathBuf>>,
 }
 
 struct TerminalBrowserReplay {
@@ -768,7 +807,7 @@ impl BrowserReplayCoordinator {
         }
 
         let mut state = self.lock();
-        let old_locator = {
+        let (step_id, old_locator) = {
             let active = Self::exact_active_mut(&mut state, instance)?;
             if active.projection.status != BrowserReplayStatus::Running
                 || active.repair.is_some()
@@ -782,7 +821,11 @@ impl BrowserReplayCoordinator {
                 .get(step_index)
                 .ok_or(BrowserReplayError::InvalidRepairSlot)?;
             validate_repair_cursor(locator_slot, resume_cursor)?;
-            locator_for_repair_slot(step, locator_slot)?.clone()
+            let old_locator = recipe_step_locator_at(step, locator_slot)
+                .map_err(|_| BrowserReplayError::InvalidRepairSlot)?
+                .ok_or(BrowserReplayError::InvalidRepairSlot)?
+                .clone();
+            (step.id.clone(), old_locator)
         };
         let repair_id = state
             .next_repair_id
@@ -803,11 +846,14 @@ impl BrowserReplayCoordinator {
             instance: repair.clone(),
             resource_store: resource_store.clone(),
             lease: Arc::new(BrowserReplayRepairLeaseSlot::new(lease)),
-            step_index,
-            locator_slot,
+            recipe_target: BrowserReplayRecipeLocatorTarget::new(
+                step_index,
+                step_id,
+                locator_slot,
+                old_locator,
+            ),
             tab_id,
             revision,
-            old_locator,
             resume_cursor,
             snapshot: None,
             screenshot: None,
@@ -1293,7 +1339,7 @@ impl BrowserReplayCoordinator {
             .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
         Ok((
             repair.instance.clone(),
-            repair.locator_slot,
+            repair.recipe_target.locator_slot(),
             repair.resume_cursor,
         ))
     }
@@ -1344,7 +1390,7 @@ impl BrowserReplayCoordinator {
         if active.projection.status != BrowserReplayStatus::Running {
             return Err(BrowserReplayError::InvalidTransition);
         }
-        let (resource_store, step_index, locator_slot, tab_id, revision) = {
+        let (resource_store, recipe_target, tab_id, revision) = {
             let repair_state = active
                 .repair
                 .as_ref()
@@ -1363,8 +1409,7 @@ impl BrowserReplayCoordinator {
             }
             (
                 repair_state.resource_store.clone(),
-                repair_state.step_index,
-                repair_state.locator_slot,
+                repair_state.recipe_target.clone(),
                 repair_state.tab_id.clone(),
                 repair_state.revision,
             )
@@ -1381,10 +1426,14 @@ impl BrowserReplayCoordinator {
         let step = active
             .plan
             .steps
-            .get(step_index)
+            .get(recipe_target.step_index())
             .ok_or(BrowserReplayError::InvalidRepairSlot)?;
-        if active.projection.current_step_index != step_index
-            || active.projection.current_step_id.as_deref() != Some(step.id.as_str())
+        let exact_old_locator = recipe_step_locator_at(step, recipe_target.locator_slot())
+            .map_err(|_| BrowserReplayError::InvalidRepairSlot)?;
+        if active.projection.current_step_index != recipe_target.step_index()
+            || active.projection.current_step_id.as_deref() != Some(recipe_target.step_id())
+            || step.id != recipe_target.step_id()
+            || exact_old_locator != Some(recipe_target.old_locator())
         {
             return Err(BrowserReplayError::InvalidRepairEvidence);
         }
@@ -1393,9 +1442,9 @@ impl BrowserReplayCoordinator {
             replay_instance_id: repair.replay_instance_id(),
             repair_id: repair.repair_id(),
             recipe_id: active.plan.recipe_id.clone(),
-            step_id: step.id.clone(),
-            step_index,
-            locator_slot,
+            step_id: recipe_target.step_id().to_string(),
+            step_index: recipe_target.step_index(),
+            locator_slot: recipe_target.locator_slot(),
             tab_id,
             revision,
             snapshot: snapshot.clone(),
@@ -1527,6 +1576,7 @@ impl BrowserReplayCoordinator {
         let secret_store = BrowserReplaySecretStore::new(instance.clone());
         let (repair_signal, repair_watch) = watch::channel(0_u64);
         let locator_overrides = Arc::new(Mutex::new(HashMap::new()));
+        let canonical_recipe_root = Arc::new(OnceLock::new());
         let execution = BrowserReplayExecutionHandle {
             instance: instance.clone(),
             plan: Arc::clone(&plan),
@@ -1534,6 +1584,7 @@ impl BrowserReplayCoordinator {
             secret_store: secret_store.share_authority(),
             repair_watch,
             locator_overrides: Arc::clone(&locator_overrides),
+            canonical_recipe_root: Arc::clone(&canonical_recipe_root),
         };
         let projection = BrowserReplayProjection {
             workspace_key: workspace_key.clone(),
@@ -1562,6 +1613,7 @@ impl BrowserReplayCoordinator {
                 repair_signal,
                 repair_generation: 0,
                 _locator_overrides: locator_overrides,
+                canonical_recipe_root,
             },
         );
         Ok(BrowserReplayStart {
@@ -1680,71 +1732,6 @@ fn validate_repair_cursor(
         .ok_or(BrowserReplayError::InvalidRepairSlot)
 }
 
-fn locator_for_repair_slot(
-    step: &BrowserRecipeStep,
-    locator_slot: BrowserReplayLocatorSlot,
-) -> Result<&BrowserRecipeLocator, BrowserReplayError> {
-    match locator_slot {
-        BrowserReplayLocatorSlot::PrimaryAction => match &step.action {
-            BrowserRecipeAction::Click { locator }
-            | BrowserRecipeAction::Hover { locator }
-            | BrowserRecipeAction::Focus { locator }
-            | BrowserRecipeAction::Type { locator, .. }
-            | BrowserRecipeAction::Clear { locator }
-            | BrowserRecipeAction::Select { locator, .. }
-            | BrowserRecipeAction::Upload { locator, .. }
-            | BrowserRecipeAction::Download { locator } => Ok(locator),
-            _ => Err(BrowserReplayError::InvalidRepairSlot),
-        },
-        BrowserReplayLocatorSlot::OptionalAction => match &step.action {
-            BrowserRecipeAction::Keypress {
-                locator: Some(locator),
-                ..
-            }
-            | BrowserRecipeAction::Scroll {
-                locator: Some(locator),
-                ..
-            } => Ok(locator),
-            _ => Err(BrowserReplayError::InvalidRepairSlot),
-        },
-        BrowserReplayLocatorSlot::DragSource => match &step.action {
-            BrowserRecipeAction::DragDrop { source, .. } => Ok(source),
-            _ => Err(BrowserReplayError::InvalidRepairSlot),
-        },
-        BrowserReplayLocatorSlot::DragDestination => match &step.action {
-            BrowserRecipeAction::DragDrop { destination, .. } => Ok(destination),
-            _ => Err(BrowserReplayError::InvalidRepairSlot),
-        },
-        BrowserReplayLocatorSlot::ActionWait => match &step.action {
-            BrowserRecipeAction::Wait { condition } => locator_for_repair_wait(condition),
-            _ => Err(BrowserReplayError::InvalidRepairSlot),
-        },
-        BrowserReplayLocatorSlot::StepWait => step
-            .wait
-            .as_ref()
-            .ok_or(BrowserReplayError::InvalidRepairSlot)
-            .and_then(locator_for_repair_wait),
-        BrowserReplayLocatorSlot::Assertion { index } => match step.assertions.get(index) {
-            Some(BrowserRecipeAssertion::Element {
-                locator,
-                state: BrowserRecipeElementState::Present | BrowserRecipeElementState::Visible,
-            })
-            | Some(BrowserRecipeAssertion::Value { locator, .. }) => Ok(locator),
-            _ => Err(BrowserReplayError::InvalidRepairSlot),
-        },
-    }
-}
-
-fn locator_for_repair_wait(
-    wait: &BrowserRecipeWait,
-) -> Result<&BrowserRecipeLocator, BrowserReplayError> {
-    match wait {
-        BrowserRecipeWait::ElementPresent { locator, .. }
-        | BrowserRecipeWait::ElementVisible { locator, .. } => Ok(locator),
-        _ => Err(BrowserReplayError::InvalidRepairSlot),
-    }
-}
-
 pub fn compile_browser_replay(
     recipe: &BrowserRecipeV1,
     public_inputs: Vec<BrowserReplayPublicInput>,
@@ -1752,6 +1739,8 @@ pub fn compile_browser_replay(
     recipe
         .validate()
         .map_err(|_| BrowserReplayError::InvalidRecipe)?;
+    let recipe_digest =
+        canonical_browser_recipe_digest(recipe).map_err(|_| BrowserReplayError::InvalidRecipe)?;
     if recipe.inputs.len() > MAX_BROWSER_REPLAY_INPUTS
         || public_inputs.len() > MAX_BROWSER_REPLAY_INPUTS
         || recipe.steps.len() > MAX_BROWSER_REPLAY_STEPS
@@ -1855,6 +1844,7 @@ pub fn compile_browser_replay(
 
     Ok(BrowserReplayPlan {
         recipe_id: recipe.id.clone(),
+        recipe_digest,
         start_url: recipe.start_url.clone(),
         viewport: recipe.viewport,
         steps: recipe.steps.clone(),
@@ -1953,6 +1943,7 @@ mod tests {
     fn internal_plan(unresolved_secret_inputs: Vec<String>) -> BrowserReplayPlan {
         BrowserReplayPlan {
             recipe_id: "internal-recipe".to_string(),
+            recipe_digest: BrowserRecipeDigestV1::placeholder_for_test(),
             start_url: "https://example.test".to_string(),
             viewport: BrowserRecipeViewport {
                 width: 1280,
@@ -1974,6 +1965,115 @@ mod tests {
             assertions: Vec::new(),
         });
         plan
+    }
+
+    #[test]
+    fn canonical_recipe_root_binding_is_exact_once_and_shared_with_active_replay() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-replay-root-binding-{}-{nonce:x}",
+            std::process::id()
+        ));
+        let other = std::env::temp_dir().join(format!(
+            "devmanager-replay-root-binding-other-{}-{nonce:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let root = root.canonicalize().unwrap();
+        let other = other.canonicalize().unwrap();
+
+        let coordinator = BrowserReplayCoordinator::default();
+        let owner = BrowserWorkspaceKey::new("root-binding", "tab-1").unwrap();
+        let started = coordinator
+            .start(
+                owner.clone(),
+                click_repair_plan(BrowserRecipeLocator::default()),
+            )
+            .unwrap();
+        {
+            let state = coordinator.lock();
+            let active = state.active.get(&owner).unwrap();
+            assert!(Arc::ptr_eq(
+                &active.canonical_recipe_root,
+                &started.execution.canonical_recipe_root
+            ));
+            assert!(active.canonical_recipe_root.get().is_none());
+        }
+
+        let unavailable = root.join("missing-root");
+        assert_eq!(
+            started.execution.bind_canonical_recipe_root(&unavailable),
+            Err(BrowserReplayError::RecipeRootUnavailable)
+        );
+        assert!(started.execution.canonical_recipe_root.get().is_none());
+        started.execution.bind_canonical_recipe_root(&root).unwrap();
+        {
+            let state = coordinator.lock();
+            let active = state.active.get(&owner).unwrap();
+            assert_eq!(active.canonical_recipe_root.get(), Some(&root));
+        }
+        assert_eq!(
+            started.execution.bind_canonical_recipe_root(&root),
+            Err(BrowserReplayError::RecipeRootAlreadyBound)
+        );
+        assert_eq!(
+            started.execution.bind_canonical_recipe_root(&other),
+            Err(BrowserReplayError::RecipeRootAlreadyBound)
+        );
+        assert_eq!(
+            started.execution.bound_canonical_recipe_root().unwrap(),
+            root.as_path()
+        );
+
+        coordinator.cancel(&started.instance).unwrap();
+        assert!(!coordinator.lock().active.contains_key(&owner));
+        drop(started);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn compiled_plan_retains_the_validated_canonical_recipe_digest_privately() {
+        let recipe = BrowserRecipeV1 {
+            schema_version: crate::browser::BROWSER_RECIPE_SCHEMA_VERSION,
+            id: "digest-plan".to_string(),
+            name: "Digest plan".to_string(),
+            description: "Validated canonical digest".to_string(),
+            start_url: "https://example.test/".to_string(),
+            viewport: BrowserRecipeViewport {
+                width: 1280,
+                height: 720,
+                scale_percent: 100,
+            },
+            inputs: Vec::new(),
+            steps: vec![BrowserRecipeStep {
+                id: "click".to_string(),
+                action: BrowserRecipeAction::Click {
+                    locator: BrowserRecipeLocator {
+                        test_id: Some("submit".to_string()),
+                        ..BrowserRecipeLocator::default()
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            }],
+        };
+        let expected = canonical_browser_recipe_digest(&recipe).unwrap();
+        let plan = compile_browser_replay(&recipe, Vec::new()).unwrap();
+        let coordinator = BrowserReplayCoordinator::default();
+        let started = coordinator
+            .start(
+                BrowserWorkspaceKey::new("digest-plan", "tab-1").unwrap(),
+                plan,
+            )
+            .unwrap();
+        assert!(started.execution.recipe_digest() == &expected);
     }
 
     #[cfg(target_os = "windows")]

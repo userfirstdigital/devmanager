@@ -632,3 +632,20 @@ fn browser_recipe_public_nested_wire_rejects_context_free_unsafe_values() {
     )
     .is_err());
 }
+
+#[test]
+fn browser_recipe_repair_uses_one_private_domain_separated_atomic_replace_contract() {
+    let recipes = include_str!("../src/browser/recipes.rs");
+
+    assert!(recipes.contains("b\"devmanager.browser-recipe-v1.sha256\\0\""));
+    assert!(recipes.contains("struct BrowserRecipeDigestV1"));
+    assert!(!recipes
+        .contains("derive(Debug, Clone, Serialize)\npub(crate) struct BrowserRecipeDigestV1"));
+    assert!(recipes.contains("fn canonical_browser_recipe_digest"));
+    assert!(recipes.contains("fn recipe_locator_at"));
+    assert!(recipes.contains("fn replace_recipe_locator_at"));
+    assert!(recipes.contains("fn replace_recipe_locator_atomic"));
+    assert_eq!(recipes.matches("static RECIPE_WRITE_GATE").count(), 1);
+    assert!(!recipes.contains("REPAIR_WRITE_GATE"));
+    assert!(recipes.contains("non-cooperating external writers"));
+}

@@ -82,6 +82,25 @@ fn repair_preview_private_authority_uses_checked_generation_receipts_and_value_f
 }
 
 #[test]
+fn replay_recipe_digest_and_canonical_root_binding_stay_private_and_exact_once() {
+    let replay = include_str!("../src/browser/replay.rs");
+    let repair = include_str!("../src/browser/replay_repair.rs");
+
+    assert!(replay.contains("recipe_digest: BrowserRecipeDigestV1"));
+    assert!(replay.contains("canonical_recipe_root: Arc<OnceLock<PathBuf>>"));
+    assert!(replay.contains("fn bind_canonical_recipe_root"));
+    assert!(replay.contains(".set(canonical)"));
+    assert!(!replay.contains("pub recipe_digest:"));
+    assert!(!replay.contains("pub canonical_recipe_root:"));
+    assert!(replay.contains("recipe_target: BrowserReplayRecipeLocatorTarget"));
+    assert!(repair.contains("step_id: String"));
+    assert!(repair.contains("old_locator: BrowserRecipeLocator"));
+    assert!(!repair.contains(
+        "derive(Debug, Clone, Serialize)\npub(crate) struct BrowserReplayRecipeLocatorTarget"
+    ));
+}
+
+#[test]
 fn repair_preview_cleanup_uses_a_bounded_route_independent_host_lane() {
     let commands = include_str!("../src/browser/commands.rs");
     let app = include_str!("../src/app/mod.rs");
