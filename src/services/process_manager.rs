@@ -66,11 +66,81 @@ pub(crate) fn ai_session_needs_restore(
     !session.status.is_live() || !session_attached
 }
 
-#[derive(Clone)]
 pub struct ProcessManager {
     inner: Arc<ProcessManagerInner>,
     op_queue: Arc<ProcessOpQueue>,
     _claude_overlay_owner: Arc<ClaudeOverlayOwner>,
+    handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
+}
+
+#[derive(Debug)]
+struct ProcessManagerHandleLifecycle {
+    state: Mutex<ProcessManagerHandleLifecycleState>,
+}
+
+#[derive(Debug)]
+struct ProcessManagerHandleLifecycleState {
+    active_handles: usize,
+    shutting_down: bool,
+}
+
+impl ProcessManagerHandleLifecycle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ProcessManagerHandleLifecycleState {
+                active_handles: 1,
+                shutting_down: false,
+            }),
+        }
+    }
+
+    fn acquire(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutting_down {
+            return Err("Process manager is shutting down.".to_string());
+        }
+        state.active_handles = state.active_handles.saturating_add(1);
+        Ok(())
+    }
+
+    fn release(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(state.active_handles > 0);
+        state.active_handles = state.active_handles.saturating_sub(1);
+        if state.active_handles == 0 && !state.shutting_down {
+            state.shutting_down = true;
+            return true;
+        }
+        false
+    }
+}
+
+impl Clone for ProcessManager {
+    fn clone(&self) -> Self {
+        self.handle_lifecycle
+            .acquire()
+            .expect("a live ProcessManager handle must remain cloneable");
+        Self {
+            inner: self.inner.clone(),
+            op_queue: self.op_queue.clone(),
+            _claude_overlay_owner: self._claude_overlay_owner.clone(),
+            handle_lifecycle: self.handle_lifecycle.clone(),
+        }
+    }
+}
+
+impl Drop for ProcessManager {
+    fn drop(&mut self) {
+        if self.handle_lifecycle.release() {
+            shutdown_process_manager_workers(&self.inner);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -120,6 +190,8 @@ type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
 type CodexAdapterPreparer = Arc<dyn Fn(&str) -> Result<PreparedCodexAdapter, String> + Send + Sync>;
 #[cfg(test)]
 type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type ProcessManagerBackgroundTestHook = Arc<dyn Fn() + Send + Sync>;
 
 trait CodexFallbackTerminalOps: Send + Sync {
     fn terminate_and_reap(
@@ -170,7 +242,10 @@ pub(crate) struct ProcessManagerInner {
     codex_adapter_registry: Mutex<CodexAdapterRegistry>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
-    op_queue: Mutex<Option<Arc<ProcessOpQueue>>>,
+    op_queue: Mutex<Weak<ProcessOpQueue>>,
+    handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
+    #[cfg(test)]
+    background_test_hook: RwLock<Option<ProcessManagerBackgroundTestHook>>,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +533,7 @@ impl Default for ProcessManager {
 impl ProcessManager {
     pub fn new() -> Self {
         let debug_enabled = debug_enabled();
+        let handle_lifecycle = Arc::new(ProcessManagerHandleLifecycle::new());
         let claude_hook_registry = Arc::new(ClaudeHookRegistry::default());
         let claude_hook_temp_root = prepare_claude_overlay_process_root();
         let inner = Arc::new(ProcessManagerInner {
@@ -491,7 +567,10 @@ impl ProcessManager {
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
-            op_queue: Mutex::new(None),
+            op_queue: Mutex::new(Weak::new()),
+            handle_lifecycle: handle_lifecycle.clone(),
+            #[cfg(test)]
+            background_test_hook: RwLock::new(None),
         });
         let claude_overlay_owner = Arc::new(ClaudeOverlayOwner {
             inner: Arc::downgrade(&inner),
@@ -605,22 +684,21 @@ impl ProcessManager {
             }
         })));
 
-        let op_queue = Arc::new(ProcessOpQueue::new(inner.clone()));
+        let op_queue = ProcessOpQueue::new(Arc::downgrade(&inner));
         if let Ok(mut slot) = inner.op_queue.lock() {
-            *slot = Some(op_queue.clone());
+            *slot = Arc::downgrade(&op_queue);
         }
 
-        let thread_handle = spawn_background_tasks(inner.clone());
+        let thread_handle = spawn_background_tasks(Arc::downgrade(&inner));
         if let Ok(mut handle_slot) = inner.background_thread.lock() {
             *handle_slot = Some(thread_handle);
         }
-
-        let op_queue = Arc::new(ProcessOpQueue::new(inner.clone()));
 
         Self {
             inner,
             op_queue,
             _claude_overlay_owner: claude_overlay_owner,
+            handle_lifecycle,
         }
     }
 
@@ -3299,23 +3377,48 @@ impl ProcessManager {
 
         #[cfg(not(test))]
         {
-            let manager = self.clone();
+            let inner = Arc::downgrade(&self.inner);
             thread::spawn(move || {
-                let _ =
-                    manager.reap_session_processes_until_clear(&session_id, SESSION_REAPER_TIMEOUT);
-                if pid_file::active_tracked_pids_for_session(&session_id).is_empty()
-                    && !live_runtime_root_running(&manager.inner, &session_id)
+                if force_reap_session_processes_until_clear_weak(
+                    &inner,
+                    &session_id,
+                    SESSION_REAPER_TIMEOUT,
+                )
+                .is_none()
                 {
                     return;
                 }
-                let _ = manager.reap_session_processes_until_clear(
+                let Some(current_inner) = inner.upgrade() else {
+                    return;
+                };
+                let cleared = pid_file::active_tracked_pids_for_session(&session_id).is_empty()
+                    && !live_runtime_root_running(&current_inner, &session_id);
+                if cleared {
+                    mark_session_reaped(&current_inner, &session_id);
+                    return;
+                }
+                drop(current_inner);
+                if force_reap_session_processes_until_clear_weak(
+                    &inner,
                     &session_id,
                     SESSION_REAPER_ESCALATED_TIMEOUT,
-                );
-                if !pid_file::active_tracked_pids_for_session(&session_id).is_empty()
-                    || live_runtime_root_running(&manager.inner, &session_id)
+                )
+                .is_none()
                 {
-                    manager.note_reap_incomplete(&session_id);
+                    return;
+                }
+                let Some(current_inner) = inner.upgrade() else {
+                    return;
+                };
+                let reap_incomplete = !pid_file::active_tracked_pids_for_session(&session_id)
+                    .is_empty()
+                    || live_runtime_root_running(&current_inner, &session_id);
+                if reap_incomplete {
+                    if let Ok(manager) = process_manager_from_inner(current_inner) {
+                        manager.note_reap_incomplete(&session_id);
+                    }
+                } else {
+                    mark_session_reaped(&current_inner, &session_id);
                 }
             });
         }
@@ -3448,6 +3551,7 @@ impl ProcessManager {
         });
     }
 
+    #[cfg(test)]
     fn reap_session_processes_until_clear(&self, session_id: &str, timeout: Duration) -> usize {
         let reaped = force_reap_session_processes_until_clear(&self.inner, session_id, timeout);
         if pid_file::active_tracked_pids_for_session(session_id).is_empty()
@@ -3615,17 +3719,7 @@ fn drain_browser_provider_sessions_inner(inner: &ProcessManagerInner) {
 
 impl Drop for ProcessManagerInner {
     fn drop(&mut self) {
-        self.background_stop.store(true, Ordering::SeqCst);
-        if let Ok(mut handle) = self.background_thread.lock() {
-            if let Some(handle) = handle.take() {
-                let _ = handle.join();
-            }
-        }
-        if let Ok(mut slot) = self.op_queue.lock() {
-            if let Some(queue) = slot.take() {
-                queue.shutdown();
-            }
-        }
+        shutdown_process_manager_workers(self);
         if let Ok(sessions) = self.sessions.lock() {
             for session in sessions.values() {
                 let _ = session.close(false);
@@ -3637,24 +3731,59 @@ impl Drop for ProcessManagerInner {
     }
 }
 
+fn shutdown_process_manager_workers(inner: &ProcessManagerInner) {
+    inner.background_stop.store(true, Ordering::SeqCst);
+    let queue = inner.op_queue.lock().ok().and_then(|queue| queue.upgrade());
+    if let Some(queue) = queue {
+        queue.shutdown();
+    }
+    if let Ok(mut handle) = inner.background_thread.lock() {
+        if let Some(handle) = handle.take() {
+            if handle.thread().id() == thread::current().id() {
+                drop(handle);
+            } else {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 fn debug_enabled() -> bool {
     std::env::var("DEVMANAGER_TERMINAL_DEBUG")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
-fn spawn_background_tasks(inner: Arc<ProcessManagerInner>) -> thread::JoinHandle<()> {
+fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut system = sysinfo::System::new();
         loop {
+            let Some(inner) = inner.upgrade() else {
+                break;
+            };
+            if inner.background_stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            #[cfg(test)]
+            if let Some(hook) = inner
+                .background_test_hook
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                hook();
+            }
             if inner.background_stop.load(Ordering::SeqCst) {
                 break;
             }
 
             refresh_resource_snapshots(&inner, &mut system);
             reconcile_ai_activity(&inner);
-            handle_auto_restart(inner.clone());
+            handle_auto_restart(&inner);
             reconcile_exit_states(&inner);
+
+            drop(inner);
 
             thread::sleep(Duration::from_secs(1));
         }
@@ -3933,6 +4062,27 @@ fn force_reap_session_processes_until_clear(
     reaped
 }
 
+#[cfg(not(test))]
+fn force_reap_session_processes_until_clear_weak(
+    inner: &Weak<ProcessManagerInner>,
+    session_id: &str,
+    timeout: Duration,
+) -> Option<usize> {
+    let started_at = Instant::now();
+    let mut reaped = 0;
+    loop {
+        let current_inner = inner.upgrade()?;
+        reaped += force_reap_session_processes(&current_inner, session_id);
+        let cleared = pid_file::active_tracked_pids_for_session(session_id).is_empty()
+            && !live_runtime_root_running(&current_inner, session_id);
+        drop(current_inner);
+        if cleared || started_at.elapsed() >= timeout {
+            return Some(reaped);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn force_reap_session_processes(inner: &Arc<ProcessManagerInner>, session_id: &str) -> usize {
     let mut forced_kill_pids = 0;
     for pid in collect_session_reap_pids(inner, session_id) {
@@ -4194,7 +4344,7 @@ fn reconcile_ai_activity(inner: &Arc<ProcessManagerInner>) {
     }
 }
 
-fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
+fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
     let mut restart_candidates = Vec::new();
     if let Ok(runtime) = inner.runtime_state.read() {
         for session in runtime.sessions.values() {
@@ -4255,32 +4405,32 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
         }
 
         let launch_clone = launch.clone();
-        let inner_clone = inner.clone();
+        let inner = Arc::downgrade(inner);
         thread::spawn(move || {
             thread::sleep(delay);
-            if inner_clone.background_stop.load(Ordering::SeqCst) {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if inner.background_stop.load(Ordering::SeqCst) {
                 return;
             }
-            if let Ok(queue) = inner_clone.op_queue.lock() {
-                if let Some(queue) = queue.as_ref() {
-                    let op_id = next_op_id();
-                    let _ = queue.submit(ProcessOp::StartServer {
-                        op_id,
-                        launch: launch_clone,
-                        dimensions: SessionDimensions::default(),
-                        activate: false,
-                        response: None,
-                    });
-                    return;
-                }
+            let queue = inner.op_queue.lock().ok().and_then(|queue| queue.upgrade());
+            if let Some(queue) = queue {
+                let op_id = next_op_id();
+                let _ = queue.submit(ProcessOp::StartServer {
+                    op_id,
+                    launch: launch_clone,
+                    dimensions: SessionDimensions::default(),
+                    activate: false,
+                    response: None,
+                });
+                return;
             }
-            if let Err(error) = spawn_server_session_with_inner(
-                &inner_clone,
-                &launch_clone,
-                SessionDimensions::default(),
-            ) {
+            if let Err(error) =
+                spawn_server_session_with_inner(&inner, &launch_clone, SessionDimensions::default())
+            {
                 let mut changed = false;
-                if let Ok(mut runtime) = inner_clone.runtime_state.write() {
+                if let Ok(mut runtime) = inner.runtime_state.write() {
                     if let Some(session) = runtime.sessions.get_mut(&launch_clone.command_id) {
                         let dirty_before = session.dirty_generation;
                         session.status = SessionStatus::Failed;
@@ -4295,8 +4445,8 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
                     }
                 }
                 if changed {
-                    bump_runtime_revision(&inner_clone);
-                    emit_tracked_remote_runtime_snapshot(&inner_clone, &launch_clone.command_id);
+                    bump_runtime_revision(&inner);
+                    emit_tracked_remote_runtime_snapshot(&inner, &launch_clone.command_id);
                 }
             }
         });
@@ -5187,11 +5337,15 @@ fn schedule_codex_original_fallback(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let inner = Arc::downgrade(&inner);
     thread::spawn(move || {
         let started = Instant::now();
         loop {
+            let Some(current_inner) = inner.upgrade() else {
+                return;
+            };
             let ready = {
-                let registry = inner
+                let registry = current_inner
                     .codex_adapter_registry
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5207,6 +5361,7 @@ fn schedule_codex_original_fallback(
                     }) if current == &identity && lifecycle.remote_command_injected
                 )
             };
+            drop(current_inner);
             if ready {
                 break;
             }
@@ -5215,6 +5370,10 @@ fn schedule_codex_original_fallback(
             }
             thread::sleep(Duration::from_millis(10));
         }
+
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
 
         let removed = {
             let mut registry = inner
@@ -5256,12 +5415,16 @@ fn schedule_codex_original_fallback(
             .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch, &environment));
         if fallback_result.is_err() {
             unbind_attachment_if_matches(&inner, attachment_binding.as_ref());
-            let manager = process_manager_from_inner(inner.clone());
-            manager.cleanup_browser_provider_session(&session_id);
-            manager.set_browser_diagnostic(
-                &launch.tab_id,
-                Some("Browser tools unavailable because Codex fallback launch failed".to_string()),
-            );
+            if let Ok(manager) = process_manager_from_inner(inner.clone()) {
+                manager.cleanup_browser_provider_session(&session_id);
+                manager.set_browser_diagnostic(
+                    &launch.tab_id,
+                    Some(
+                        "Browser tools unavailable because Codex fallback launch failed"
+                            .to_string(),
+                    ),
+                );
+            }
         }
     });
 }
@@ -5339,7 +5502,7 @@ impl CodexFallbackTerminalOps for NativeCodexFallbackTerminalOps {
             .lock()
             .map_err(|_| "Session store poisoned".to_string())?
             .insert(session_id.to_string(), session.clone());
-        process_manager_from_inner(inner.clone()).update_session_state(session_id, |state| {
+        process_manager_from_inner(inner.clone())?.update_session_state(session_id, |state| {
             state.shell_program = launch.shell_program.clone();
             state.configure_ai(launch.clone());
         });
@@ -5465,7 +5628,11 @@ fn session_change_notifier_with_attachment_binding(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&session_id)
         .map(|session| session.registration.clone());
+    let inner = Arc::downgrade(&inner);
     Arc::new(move || {
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
         if note_runtime_generation_change(&inner, &session_id) {
             mark_remote_session_dirty(&inner, &session_id);
             emit_remote_runtime_snapshot(&inner, &session_id);
@@ -5500,10 +5667,14 @@ fn session_output_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
 ) -> Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync> {
+    let inner = Arc::downgrade(&inner);
     Arc::new(move |bytes, mode| {
         if bytes.is_empty() {
             return;
         }
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
         emit_remote_session_event(
             &inner,
             RemoteSessionEvent::Output {
@@ -5578,24 +5749,27 @@ fn next_ssh_session_id(connection_id: &str) -> String {
     format!("{connection_id}-{scope}-{millis:x}-{counter:x}")
 }
 
-fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> ProcessManager {
+fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> Result<ProcessManager, String> {
     let op_queue = inner
         .op_queue
         .lock()
         .ok()
-        .and_then(|guard| guard.clone())
-        .expect("process op queue missing");
+        .and_then(|queue| queue.upgrade())
+        .ok_or_else(|| "Process operation queue is unavailable.".to_string())?;
     let claude_overlay_owner = inner
         .claude_overlay_owner
         .lock()
         .ok()
         .and_then(|owner| owner.upgrade())
-        .expect("Claude overlay owner missing");
-    ProcessManager {
+        .ok_or_else(|| "Claude overlay owner is unavailable.".to_string())?;
+    inner.handle_lifecycle.acquire()?;
+    let handle_lifecycle = inner.handle_lifecycle.clone();
+    Ok(ProcessManager {
         inner,
         op_queue,
         _claude_overlay_owner: claude_overlay_owner,
-    }
+        handle_lifecycle,
+    })
 }
 
 pub(crate) fn execute_process_op_inner(
@@ -5604,7 +5778,10 @@ pub(crate) fn execute_process_op_inner(
 ) -> ProcessOpCompletion {
     let op_id = op.op_id();
     let target_id = op.target_id();
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = match process_manager_from_inner(inner.clone()) {
+        Ok(manager) => manager,
+        Err(error) => return op.into_failure_completion(error),
+    };
     let (kind, result, context, remote_response) = match op {
         ProcessOp::StartServer {
             launch,
@@ -6155,7 +6332,7 @@ fn spawn_ssh_session_with_inner(
     session_id: &str,
     dimensions: SessionDimensions,
 ) -> Result<(), String> {
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = process_manager_from_inner(inner.clone())?;
     if manager.session_exists(session_id) {
         return Ok(());
     }
@@ -6270,7 +6447,7 @@ fn spawn_ai_session_with_writer_and_attachment_binding<F>(
 where
     F: FnOnce(&TerminalSession, &str) -> Result<(), String>,
 {
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = process_manager_from_inner(inner.clone())?;
     if manager.session_exists(session_id) {
         return Ok(());
     }
@@ -6373,7 +6550,8 @@ fn shutdown_managed_processes_inner(
     inner: &Arc<ProcessManagerInner>,
     timeout: Duration,
 ) -> ManagedShutdownReport {
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = process_manager_from_inner(inner.clone())
+        .expect("managed shutdown requires an active ProcessManager handle");
     let session_ids = manager.live_session_ids();
     for session_id in &session_ids {
         let _ = manager.request_session_close(session_id, false);
@@ -8858,6 +9036,122 @@ mod tests {
 
         assert!(!settings_path.exists());
         assert!(!process_root.exists());
+    }
+
+    #[test]
+    fn dropping_last_process_manager_releases_inner_and_background_workers() {
+        let manager = ProcessManager::new();
+        let inner = Arc::downgrade(&manager.inner);
+        let change_notifier =
+            session_change_notifier(manager.inner.clone(), "released-session".to_string());
+        let output_notifier =
+            session_output_notifier(manager.inner.clone(), "released-session".to_string());
+
+        drop(manager);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            inner.upgrade().is_none(),
+            "the last manager handle must release its inner state and worker ownership"
+        );
+        change_notifier();
+        output_notifier(Vec::new(), TerminalModeSnapshot::default());
+    }
+
+    #[test]
+    fn dropping_last_process_manager_stops_an_in_progress_background_tick() {
+        let manager = ProcessManager::new();
+        let inner = Arc::downgrade(&manager.inner);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        *manager
+            .inner
+            .background_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            let _ = entered_tx.try_send(());
+            let _ = release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv();
+        }));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("background worker must reach the controlled checkpoint");
+
+        let stop_inner = inner.clone();
+        let (stop_seen_tx, stop_seen_rx) = std::sync::mpsc::sync_channel(1);
+        let stop_observer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let stop_seen = loop {
+                if stop_inner
+                    .upgrade()
+                    .is_some_and(|inner| inner.background_stop.load(Ordering::SeqCst))
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let _ = stop_seen_tx.send(stop_seen);
+            let _ = release_tx.send(());
+        });
+
+        drop(manager);
+
+        assert!(
+            stop_seen_rx.recv().expect("stop observation"),
+            "dropping the last manager handle must signal the live background worker"
+        );
+        stop_observer.join().expect("stop observer");
+        assert!(
+            inner.upgrade().is_none(),
+            "dropping the last manager handle must await background worker release"
+        );
+    }
+
+    #[test]
+    fn internal_process_manager_handle_defers_final_worker_shutdown() {
+        let manager = ProcessManager::new();
+        let inner = Arc::downgrade(&manager.inner);
+        let internal = process_manager_from_inner(manager.inner.clone())
+            .expect("active manager allows an internal handle");
+
+        drop(manager);
+
+        let retained = inner
+            .upgrade()
+            .expect("internal manager must retain the shared state");
+        assert!(!retained.background_stop.load(Ordering::SeqCst));
+        drop(retained);
+
+        drop(internal);
+
+        assert!(
+            inner.upgrade().is_none(),
+            "the final internal manager handle must shut down and release workers"
+        );
+    }
+
+    #[test]
+    fn process_manager_registers_one_shared_operation_queue() {
+        let manager = ProcessManager::new();
+        let inner_queue = manager
+            .inner
+            .op_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+            .expect("inner operation queue");
+
+        assert!(Arc::ptr_eq(&manager.op_queue, &inner_queue));
     }
 
     #[test]

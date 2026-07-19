@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, Weak,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -221,6 +221,39 @@ impl ProcessOp {
             } => format!("kill:{session_id}:{pid}"),
         }
     }
+
+    pub fn into_failure_completion(self, error: String) -> ProcessOpCompletion {
+        let op_id = self.op_id();
+        let target_id = self.target_id();
+        let (kind, remote_response) = match self {
+            ProcessOp::StartServer { response, .. } => (ProcessOpKind::StartServer, response),
+            ProcessOp::StopServer { response, .. } => (ProcessOpKind::StopServer, response),
+            ProcessOp::RestartServer { response, .. } => (ProcessOpKind::RestartServer, response),
+            ProcessOp::KillPortAndRestart { response, .. } => {
+                (ProcessOpKind::KillPortAndRestart, response)
+            }
+            ProcessOp::StartSsh { response, .. } => (ProcessOpKind::StartSsh, response),
+            ProcessOp::RestartSsh { response, .. } => (ProcessOpKind::RestartSsh, response),
+            ProcessOp::CloseSsh { response, .. } => (ProcessOpKind::CloseSsh, response),
+            ProcessOp::SpawnAi { response, .. } => (ProcessOpKind::SpawnAi, response),
+            ProcessOp::RestartAi { response, .. } => (ProcessOpKind::RestartAi, response),
+            ProcessOp::CloseAi { response, .. } => (ProcessOpKind::CloseAi, response),
+            ProcessOp::StopAll { response, .. } => (ProcessOpKind::StopAll, response),
+            ProcessOp::Shutdown { .. } => (ProcessOpKind::Shutdown, None),
+            ProcessOp::KillProcess { response, .. } => (ProcessOpKind::KillProcess, response),
+            ProcessOp::KillProcessTree { response, .. } => {
+                (ProcessOpKind::KillProcessTree, response)
+            }
+        };
+        ProcessOpCompletion {
+            op_id,
+            kind,
+            target_id,
+            result: Err(error),
+            context: ProcessOpContext::default(),
+            remote_response,
+        }
+    }
 }
 
 pub fn next_op_id() -> u64 {
@@ -236,7 +269,7 @@ pub struct ProcessOpQueue {
 }
 
 impl ProcessOpQueue {
-    pub fn new(inner: Arc<ProcessManagerInner>) -> Self {
+    pub fn new(inner: Weak<ProcessManagerInner>) -> Arc<Self> {
         let (submit_tx, submit_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -244,26 +277,30 @@ impl ProcessOpQueue {
         let in_flight: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let in_flight_worker = in_flight.clone();
 
-        let worker = thread::Builder::new()
-            .name("process-op-worker".into())
-            .spawn(move || {
-                run_worker_loop(
-                    inner,
-                    submit_rx,
-                    completion_tx,
-                    stop_worker,
-                    in_flight_worker,
-                );
-            })
-            .expect("spawn process-op worker");
+        Arc::new_cyclic(move |queue: &Weak<ProcessOpQueue>| {
+            let queue = queue.clone();
+            let worker = thread::Builder::new()
+                .name("process-op-worker".into())
+                .spawn(move || {
+                    run_worker_loop(
+                        inner,
+                        queue,
+                        submit_rx,
+                        completion_tx,
+                        stop_worker,
+                        in_flight_worker,
+                    );
+                })
+                .expect("spawn process-op worker");
 
-        Self {
-            submit_tx,
-            completion_rx: Mutex::new(completion_rx),
-            stop,
-            worker: Mutex::new(Some(worker)),
-            in_flight,
-        }
+            Self {
+                submit_tx,
+                completion_rx: Mutex::new(completion_rx),
+                stop,
+                worker: Mutex::new(Some(worker)),
+                in_flight,
+            }
+        })
     }
 
     pub fn submit(&self, op: ProcessOp) -> Result<u64, String> {
@@ -303,14 +340,25 @@ impl ProcessOpQueue {
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(handle) = worker.take() {
-                let _ = handle.join();
+                if handle.thread().id() == thread::current().id() {
+                    drop(handle);
+                } else {
+                    let _ = handle.join();
+                }
             }
         }
     }
 }
 
+impl Drop for ProcessOpQueue {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 fn run_worker_loop(
-    inner: Arc<ProcessManagerInner>,
+    inner: Weak<ProcessManagerInner>,
+    queue: Weak<ProcessOpQueue>,
     submit_rx: Receiver<ProcessOp>,
     completion_tx: Sender<ProcessOpCompletion>,
     stop: Arc<AtomicBool>,
@@ -319,6 +367,12 @@ fn run_worker_loop(
     while !stop.load(Ordering::SeqCst) {
         match submit_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(op) => {
+                let Some(_queue_lease) = queue.upgrade() else {
+                    break;
+                };
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
                 let completion = execute_process_op(&inner, op);
                 if let Ok(mut map) = in_flight.lock() {
                     map.remove(&completion.target_id);
