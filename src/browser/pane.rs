@@ -1,15 +1,16 @@
 use super::{
     model::browser_annotation_urls_equivalent, save_recipe, validate_browser_url,
-    BrowserAnnotation, BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserApprovalRequest,
-    BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserError, BrowserHostEvent,
-    BrowserJournalEntry, BrowserPageLoadState, BrowserRecipeAction, BrowserRecipeAssertion,
-    BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeV1,
-    BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait, BrowserRecordingActor,
-    BrowserRecordingError, BrowserRecordingMetadata, BrowserRecordingReview,
-    BrowserRecordingStatus, BrowserReplayInstance, BrowserReplaySecretError,
-    BrowserReplaySecretSubmission, BrowserResponse, BrowserRevision, BrowserTabSnapshot,
-    BrowserViewport, BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
-    MAX_BROWSER_RECORDING_INPUTS, MAX_BROWSER_REPLAY_SECRET_INPUTS,
+    BrowserAnnotation, BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserAnnotationKind,
+    BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserElementRef,
+    BrowserError, BrowserHostEvent, BrowserJournalEntry, BrowserPageLoadState, BrowserRecipeAction,
+    BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind,
+    BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait,
+    BrowserRecordingActor, BrowserRecordingError, BrowserRecordingMetadata, BrowserRecordingReview,
+    BrowserRecordingStatus, BrowserReplayInstance, BrowserReplayProjection,
+    BrowserReplayRepairCandidate, BrowserReplayRepairPhase, BrowserReplayRepairProjection,
+    BrowserReplaySecretError, BrowserReplaySecretSubmission, BrowserResponse, BrowserRevision,
+    BrowserTabSnapshot, BrowserViewport, BrowserWorkflowCoordinator, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, MAX_BROWSER_RECORDING_INPUTS, MAX_BROWSER_REPLAY_SECRET_INPUTS,
     MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES, MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES,
 };
 use std::collections::HashSet;
@@ -1269,6 +1270,18 @@ pub enum BrowserPaneAction {
         workspace_key: BrowserWorkspaceKey,
         instance_id: u64,
     },
+    CancelReplay {
+        instance_id: u64,
+    },
+    BeginReplayRepairSelection {
+        instance_id: u64,
+        repair_id: u64,
+    },
+    ApplyReplayRepair {
+        instance_id: u64,
+        repair_id: u64,
+        resume: bool,
+    },
     SetViewport(BrowserViewportPreset),
     ToggleAnnotation,
     SaveAnnotation,
@@ -1302,6 +1315,42 @@ pub enum BrowserPaneAction {
     ClearProjectProfile,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrowserReplayPaneProjection {
+    pub replay: BrowserReplayProjection,
+    pub repair: Option<BrowserReplayRepairProjection>,
+    pub selecting_replacement: bool,
+    pub repair_apply_ready: bool,
+}
+
+impl fmt::Debug for BrowserReplayPaneProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let repair = self.repair.as_ref();
+        formatter
+            .debug_struct("BrowserReplayPaneProjection")
+            .field("recipe_id", &self.replay.recipe_id)
+            .field("status", &self.replay.status)
+            .field("current_step_index", &self.replay.current_step_index)
+            .field("total_steps", &self.replay.total_steps)
+            .field(
+                "unresolved_secret_inputs",
+                &self.replay.unresolved_secret_inputs,
+            )
+            .field("repair_step_id", &repair.map(|repair| &repair.step_id))
+            .field("repair_step_index", &repair.map(|repair| repair.step_index))
+            .field(
+                "repair_locator_slot",
+                &repair.map(|repair| repair.locator_slot),
+            )
+            .field("repair_phase", &repair.map(|repair| repair.phase))
+            .field("repair_snapshot_available", &repair.is_some())
+            .field("repair_screenshot_available", &repair.is_some())
+            .field("selecting_replacement", &self.selecting_replacement)
+            .field("repair_apply_ready", &self.repair_apply_ready)
+            .finish()
+    }
+}
+
 impl BrowserPaneAction {
     pub fn is_annotation_editor_action(&self) -> bool {
         matches!(
@@ -1332,6 +1381,7 @@ pub struct BrowserPaneTransient {
     pub workflow_preview: Option<String>,
     pub workflow_editor: Option<BrowserWorkflowReviewEditor>,
     pub replay_secret_prompt: Option<BrowserReplaySecretPromptProjection>,
+    pub replay: Option<BrowserReplayPaneProjection>,
 }
 
 impl fmt::Debug for BrowserPaneTransient {
@@ -1357,6 +1407,7 @@ impl fmt::Debug for BrowserPaneTransient {
             .field("workflow_preview_set", &self.workflow_preview.is_some())
             .field("workflow_editor_set", &self.workflow_editor.is_some())
             .field("replay_secret_prompt", &self.replay_secret_prompt)
+            .field("replay", &self.replay)
             .finish()
     }
 }
@@ -1386,6 +1437,7 @@ pub struct BrowserPaneModel {
     pub workflow_preview: Option<String>,
     pub workflow_editor: Option<BrowserWorkflowReviewEditor>,
     pub replay_secret_prompt: Option<BrowserReplaySecretPromptProjection>,
+    pub replay: Option<BrowserReplayPaneProjection>,
 }
 
 impl fmt::Debug for BrowserPaneModel {
@@ -1418,6 +1470,7 @@ impl fmt::Debug for BrowserPaneModel {
             .field("workflow_preview_set", &self.workflow_preview.is_some())
             .field("workflow_editor_set", &self.workflow_editor.is_some())
             .field("replay_secret_prompt", &self.replay_secret_prompt)
+            .field("replay", &self.replay)
             .finish()
     }
 }
@@ -1564,12 +1617,44 @@ impl BrowserPaneModel {
             workflow_preview: transient.workflow_preview,
             workflow_editor: transient.workflow_editor,
             replay_secret_prompt: transient.replay_secret_prompt,
+            replay: transient.replay,
         }
     }
 
     pub fn annotation_editor_visible(&self) -> bool {
         self.annotation_draft.is_some() && self.replay_secret_prompt.is_none()
     }
+
+    pub fn page_surface_visible(&self) -> bool {
+        !matches!(
+            self.workflow_review.as_ref().map(|review| &review.state),
+            Some(BrowserWorkflowReviewUiState::Review { .. })
+        ) && self.replay_secret_prompt.is_none()
+    }
+}
+
+pub fn browser_replay_repair_candidate_from_annotation(
+    candidate: &BrowserAnnotationCandidate,
+    expected_revision: BrowserRevision,
+) -> Result<BrowserReplayRepairCandidate, BrowserError> {
+    candidate.validate()?;
+    if candidate.kind != BrowserAnnotationKind::Element {
+        return Err(BrowserError::InvalidAnnotation {
+            field: "kind".to_string(),
+            message: "repair replacement must be a semantic element".to_string(),
+        });
+    }
+    if candidate.revision != expected_revision {
+        return Err(BrowserError::StaleReference {
+            expected: expected_revision,
+            actual: candidate.revision,
+        });
+    }
+    Ok(BrowserReplayRepairCandidate::new(BrowserElementRef {
+        revision: candidate.revision,
+        locator: candidate.locator.clone(),
+        backend_node_id: None,
+    }))
 }
 
 pub fn selected_browser_tab_id(snapshot: &BrowserWorkspaceSnapshot) -> Option<&str> {
@@ -1683,7 +1768,10 @@ pub fn browser_action_plan(
         | BrowserPaneAction::CancelRecordingReviewEdit => Vec::new(),
         BrowserPaneAction::FocusReplaySecret { .. }
         | BrowserPaneAction::SubmitReplaySecrets { .. }
-        | BrowserPaneAction::CancelReplaySecrets { .. } => Vec::new(),
+        | BrowserPaneAction::CancelReplaySecrets { .. }
+        | BrowserPaneAction::CancelReplay { .. }
+        | BrowserPaneAction::BeginReplayRepairSelection { .. }
+        | BrowserPaneAction::ApplyReplayRepair { .. } => Vec::new(),
         BrowserPaneAction::SaveAnnotation | BrowserPaneAction::CancelAnnotation => Vec::new(),
         BrowserPaneAction::DividerBegin { .. }
         | BrowserPaneAction::DividerUpdate { .. }
@@ -2141,6 +2229,7 @@ pub fn render_browser_pane(
     actions: BrowserPaneActions,
 ) -> impl IntoElement {
     let action = actions.on_action.clone();
+    let show_page_surface = model.page_surface_visible();
     let selected_viewport = model
         .selected_tab_id
         .as_deref()
@@ -2322,6 +2411,129 @@ pub fn render_browser_pane(
                 )
                 .into_any_element()
         });
+    let replay_panel = model.replay.as_ref().map(|projection| {
+        let instance_id = projection.replay.instance_id;
+        let current_step = if projection.replay.total_steps == 0 {
+            0
+        } else {
+            projection
+                .replay
+                .current_step_index
+                .saturating_add(1)
+                .min(projection.replay.total_steps)
+        };
+        let unresolved = (!projection.replay.unresolved_secret_inputs.is_empty()).then(|| {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::WARNING_TEXT))
+                .child(SharedString::from(format!(
+                    "Secrets needed: {}",
+                    projection.replay.unresolved_secret_inputs.join(", ")
+                )))
+        });
+        let repair_summary = projection.repair.as_ref().map(|repair| {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(SharedString::from(format!(
+                    "Repair step {} ({:?}) - {:?} - snapshot and screenshot ready",
+                    repair.step_index.saturating_add(1),
+                    repair.locator_slot,
+                    repair.phase
+                )))
+        });
+        let repair_controls = projection.repair.as_ref().map(|repair| {
+            let repair_id = repair.repair_id;
+            let mut controls = vec![browser_button(
+                if projection.selecting_replacement {
+                    "Selecting replacement..."
+                } else {
+                    "Select replacement"
+                },
+                projection.selecting_replacement,
+                false,
+                action(BrowserPaneAction::BeginReplayRepairSelection {
+                    instance_id,
+                    repair_id,
+                }),
+            )
+            .into_any_element()];
+            if projection.repair_apply_ready
+                && matches!(
+                    repair.phase,
+                    BrowserReplayRepairPhase::Previewed | BrowserReplayRepairPhase::Applied
+                )
+            {
+                if repair.phase == BrowserReplayRepairPhase::Previewed {
+                    controls.push(
+                        browser_button(
+                            "Save repair",
+                            false,
+                            false,
+                            action(BrowserPaneAction::ApplyReplayRepair {
+                                instance_id,
+                                repair_id,
+                                resume: false,
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                controls.push(
+                    browser_button(
+                        "Save and retry",
+                        false,
+                        false,
+                        action(BrowserPaneAction::ApplyReplayRepair {
+                            instance_id,
+                            repair_id,
+                            resume: true,
+                        }),
+                    )
+                    .into_any_element(),
+                );
+            }
+            div().flex().items_center().gap(px(4.0)).children(controls)
+        });
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .p(px(6.0))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER_PRIMARY))
+            .bg(rgb(theme::PANEL_HEADER_BG))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(SharedString::from(format!(
+                                "Replay {} - {:?} - step {current_step}/{}",
+                                projection.replay.recipe_id,
+                                projection.replay.status,
+                                projection.replay.total_steps
+                            ))),
+                    )
+                    .child(browser_button(
+                        "Cancel replay",
+                        false,
+                        true,
+                        action(BrowserPaneAction::CancelReplay { instance_id }),
+                    )),
+            )
+            .children(unresolved)
+            .children(repair_summary)
+            .children(repair_controls)
+            .into_any_element()
+    });
     let replay_secret_prompt_panel = model.replay_secret_prompt.as_ref().map(|prompt| {
         let workspace_key = prompt.workspace_key.clone();
         let instance_id = prompt.instance_id;
@@ -2972,7 +3184,6 @@ pub fn render_browser_pane(
                 .into_any_element(),
         )
     });
-    let show_page_surface = workflow_review_panel.is_none() && replay_secret_prompt_panel.is_none();
     let page_surface = show_page_surface.then(|| {
         div()
             .flex_1()
@@ -3168,6 +3379,7 @@ pub fn render_browser_pane(
                         .unwrap_or_else(|| "Browser ready".to_string())
                 }))),
         )
+        .children(replay_panel)
         .child(div().flex_none().flex().flex_col().children(journal_rows))
         .children(annotation_editor)
         .children(replay_secret_prompt_panel)

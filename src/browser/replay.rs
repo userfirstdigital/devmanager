@@ -1952,6 +1952,31 @@ impl BrowserReplayCoordinator {
         }
     }
 
+    pub(crate) fn locator_repair_apply_ready(
+        &self,
+        repair: &BrowserReplayRepairInstance,
+    ) -> Result<bool, BrowserReplayError> {
+        let mut state = self.lock();
+        let active = Self::exact_active_mut(&mut state, repair.replay())?;
+        if active.projection.status != BrowserReplayStatus::PausedLocatorRepair {
+            return Ok(false);
+        }
+        let repair_state = active
+            .repair
+            .as_ref()
+            .ok_or(BrowserReplayError::InvalidRepairEvidence)?;
+        if repair_state.instance != *repair {
+            return Err(BrowserReplayError::InvalidRepairEvidence);
+        }
+        Ok(matches!(
+            &repair_state.phase,
+            BrowserReplayPrivateRepairPhase::Paused(paused)
+                if paused.projection.phase == BrowserReplayRepairPhase::Previewed
+                    || (paused.projection.phase == BrowserReplayRepairPhase::Applied
+                        && paused.applied_preview_fresh)
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn active_locator_repair_capture_for_test(
         &self,
@@ -3453,6 +3478,7 @@ mod tests {
     fn applied_repair_requires_fresh_exact_preview_and_resumes_without_rewriting() {
         let (project_root, resource_root, store, coordinator, started, repair) =
             saved_paused_repair("fresh-no-write-resume", BrowserRevision(91));
+        assert!(coordinator.locator_repair_apply_ready(&repair).unwrap());
         let recipe_path =
             crate::browser::recipe_path(&project_root, started.execution.plan().recipe_id())
                 .unwrap();
@@ -3475,6 +3501,7 @@ mod tests {
             coordinator.locator_repair_status(&repair).unwrap().phase,
             BrowserReplayRepairPhase::Applied
         );
+        assert!(!coordinator.locator_repair_apply_ready(&repair).unwrap());
         assert!(matches!(
             coordinator.reserve_locator_repair_apply(&repair, true, &context),
             Err(BrowserReplayError::InvalidTransition)
@@ -3491,6 +3518,7 @@ mod tests {
             coordinator.locator_repair_status(&repair).unwrap().phase,
             BrowserReplayRepairPhase::Applied
         );
+        assert!(!coordinator.locator_repair_apply_ready(&repair).unwrap());
 
         let (preview, receipt) = coordinator
             .reserve_locator_repair_preview(
@@ -3508,6 +3536,7 @@ mod tests {
             coordinator.locator_repair_status(&repair).unwrap().phase,
             BrowserReplayRepairPhase::Applied
         );
+        assert!(coordinator.locator_repair_apply_ready(&repair).unwrap());
 
         let mut permissions = std::fs::metadata(&recipe_path).unwrap().permissions();
         permissions.set_readonly(true);

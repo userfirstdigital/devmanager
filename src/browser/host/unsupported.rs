@@ -121,6 +121,14 @@ impl BrowserWebViewHost {
         self.status.clone()
     }
 
+    pub fn cancel_annotation_selection(
+        &mut self,
+        _workspace_key: &BrowserWorkspaceKey,
+        _tab_id: &str,
+    ) -> Result<(), BrowserError> {
+        Err(unsupported_platform_error(std::env::consts::OS))
+    }
+
     pub fn trusted_app_config_dir(&self) -> Option<&Path> {
         None
     }

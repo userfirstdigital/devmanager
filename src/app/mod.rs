@@ -5,15 +5,17 @@ use crate::assets::AppAssets;
 use crate::browser::{
     browser_action_plan, browser_annotation_preview_plan, browser_command_channel,
     browser_event_plan, browser_host_reconcile_plan, browser_pane_open_fallback,
-    browser_response_sync, browser_settings_plan, browser_workflow_review_editor_for_field,
-    browser_workflow_review_editor_mutation, calculate_browser_split, render_browser_pane,
-    route_browser_request, BrowserAnnotation, BrowserAttachmentBroker, BrowserAttachmentProjection,
-    BrowserBounds, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
-    BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
+    browser_replay_repair_candidate_from_annotation, browser_response_sync, browser_settings_plan,
+    browser_workflow_review_editor_for_field, browser_workflow_review_editor_mutation,
+    calculate_browser_split, render_browser_pane, route_browser_request, BrowserAnnotation,
+    BrowserAttachmentBroker, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
+    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
+    BrowserGatewayHandle, BrowserHostVisibility, BrowserInvocationActor, BrowserInvocationContext,
     BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
     BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserReplayInstance,
-    BrowserReplaySecretError, BrowserReplaySecretPromptEvent, BrowserReplaySecretPromptVault,
-    BrowserReplaySecretSubmission, BrowserResponse, BrowserSettingsAction, BrowserWebViewHost,
+    BrowserReplayPaneProjection, BrowserReplaySecretError, BrowserReplaySecretPromptEvent,
+    BrowserReplaySecretPromptVault, BrowserReplaySecretSubmission, BrowserReplayStatus,
+    BrowserResponse, BrowserRevision, BrowserRisk, BrowserSettingsAction, BrowserWebViewHost,
     BrowserWorkflowReviewEditor, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
@@ -191,6 +193,7 @@ struct NativeShell {
     browser_workflow_route: Option<BrowserWorkspaceKey>,
     browser_replay_secret_prompt: Option<BrowserReplaySecretPromptVault>,
     browser_replay_secret_submitter: Option<BrowserReplaySecretSubmitter>,
+    browser_replay_repair_selection: Option<BrowserReplayRepairSelection>,
     browser_address_focus: FocusHandle,
     browser_replay_secret_focus: FocusHandle,
     browser_annotation_focus: FocusHandle,
@@ -255,6 +258,15 @@ struct NativeShell {
 
 type BrowserReplaySecretSubmitter =
     Box<dyn FnOnce(BrowserReplaySecretSubmission) -> Result<(), BrowserReplaySecretError> + Send>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserReplayRepairSelection {
+    workspace_key: BrowserWorkspaceKey,
+    instance_id: u64,
+    repair_id: u64,
+    tab_id: String,
+    revision: BrowserRevision,
+}
 
 struct NativeDialogPauseGuard {
     blockers: Arc<AtomicUsize>,
@@ -1156,6 +1168,7 @@ impl NativeShell {
             browser_workflow_route: None,
             browser_replay_secret_prompt: None,
             browser_replay_secret_submitter: None,
+            browser_replay_repair_selection: None,
             browser_address_focus: cx.focus_handle(),
             browser_replay_secret_focus: cx.focus_handle(),
             browser_annotation_focus: cx.focus_handle(),
@@ -1522,8 +1535,10 @@ impl NativeShell {
             events
         });
         let projected_attachments = self.reconcile_browser_attachment_projections(window);
+        let replay_changed = self.reconcile_browser_replay_state(window, cx);
         if events.is_empty() {
-            if projected_attachments {
+            if projected_attachments || replay_changed {
+                self.sync_browser_host_visibility(Some(window));
                 cx.notify();
             }
             return;
@@ -1589,6 +1604,123 @@ impl NativeShell {
                     tab_id,
                     candidate,
                 } => {
+                    if let Some(selection) =
+                        self.browser_replay_repair_selection
+                            .clone()
+                            .filter(|selection| {
+                                selection.workspace_key == workspace_key
+                                    && selection.tab_id == tab_id
+                            })
+                    {
+                        let coordinator = self.browser_bridge.replay_coordinator();
+                        let active = coordinator.active_state(&workspace_key);
+                        let exact = active.as_ref().is_some_and(|active| {
+                            active.instance.id() == selection.instance_id
+                                && active.projection.status
+                                    == BrowserReplayStatus::PausedLocatorRepair
+                                && active.repair.as_ref().is_some_and(|repair| {
+                                    repair.repair_id == selection.repair_id
+                                        && repair.tab_id == selection.tab_id
+                                        && repair.revision == selection.revision
+                                        && candidate.revision == selection.revision
+                                })
+                        });
+                        let repair = exact
+                            .then(|| {
+                                coordinator.exact_repair(
+                                    &workspace_key,
+                                    selection.instance_id,
+                                    selection.repair_id,
+                                )
+                            })
+                            .transpose();
+
+                        let cleared =
+                            self.with_browser_host_control_barrier(window, |browser_host| {
+                                browser_host.cancel_annotation_selection(
+                                    &selection.workspace_key,
+                                    &selection.tab_id,
+                                )
+                            });
+                        self.browser_replay_repair_selection = None;
+                        let ui = self.browser_ui.entry(workspace_key.clone()).or_default();
+                        ui.annotation_mode = false;
+                        if let Err(error) = cleared {
+                            ui.diagnostic = Some(error.to_string());
+                            continue;
+                        }
+                        let repair = match repair {
+                            Ok(Some(repair)) => repair,
+                            Ok(None) | Err(_) => {
+                                ui.diagnostic = Some(
+                                    "Replay repair selection is no longer current.".to_string(),
+                                );
+                                continue;
+                            }
+                        };
+                        let replacement = match browser_replay_repair_candidate_from_annotation(
+                            &candidate,
+                            selection.revision,
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(error) => {
+                                ui.diagnostic = Some(error.to_string());
+                                continue;
+                            }
+                        };
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Previewing replacement element...".to_string());
+
+                        let controller = self
+                            .browser_bridge
+                            .bind(workspace_key.clone(), Duration::from_secs(300));
+                        let result_coordinator = coordinator.clone();
+                        let result_workspace = workspace_key.clone();
+                        let instance_id = selection.instance_id;
+                        let repair_id = selection.repair_id;
+                        let this = cx.weak_entity();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let result = controller
+                                    .request_replay_repair_preview(
+                                        &coordinator,
+                                        &repair,
+                                        replacement,
+                                        BrowserInvocationActor::User,
+                                    )
+                                    .await;
+                                let _ = this.update_in(&mut *cx, |shell, _window, cx| {
+                                    let still_exact = result_coordinator
+                                        .active_state(&result_workspace)
+                                        .is_some_and(|active| {
+                                            active.instance.id() == instance_id
+                                                && active.repair.as_ref().is_some_and(|repair| {
+                                                    repair.repair_id == repair_id
+                                                })
+                                        });
+                                    if !still_exact {
+                                        return;
+                                    }
+                                    let ui = shell
+                                        .browser_ui
+                                        .entry(result_workspace.clone())
+                                        .or_default();
+                                    match result {
+                                        Ok(_) => {
+                                            ui.diagnostic = None;
+                                            ui.action_status =
+                                                Some("Replacement preview ready".to_string());
+                                        }
+                                        Err(error) => {
+                                            ui.diagnostic = Some(error.to_string());
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        continue;
+                    }
                     let result = self.dispatch_browser_command(
                         &workspace_key,
                         BrowserCommand::CaptureAnnotation { tab_id, candidate },
@@ -1627,6 +1759,13 @@ impl NativeShell {
                     ui.annotation_mode = enabled;
                 }
                 BrowserPaneEventPlan::ClearAnnotation { workspace_key } => {
+                    if self
+                        .browser_replay_repair_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.workspace_key == workspace_key)
+                    {
+                        self.cancel_browser_replay_repair_selection(Some(window));
+                    }
                     let ui = self.browser_ui.entry(workspace_key).or_default();
                     ui.annotation_mode = false;
                     ui.annotation_draft = None;
@@ -1758,7 +1897,159 @@ impl NativeShell {
         }
     }
 
-    #[allow(dead_code)] // Installed by the replay launch boundary once workflow replay is surfaced.
+    fn reconcile_browser_replay_repair_selection(&mut self, window: &Window) -> bool {
+        let Some(selection) = self.browser_replay_repair_selection.clone() else {
+            return false;
+        };
+        let active_workspace = self
+            .active_browser_workspace()
+            .map(|(workspace_key, _)| workspace_key);
+        if active_workspace.as_ref() != Some(&selection.workspace_key) {
+            return self.cancel_browser_replay_repair_selection(Some(window));
+        }
+        let coordinator = self.browser_bridge.replay_coordinator();
+        let active = coordinator.active_state(&selection.workspace_key);
+        let live_snapshot = self
+            .browser_host
+            .workspace_snapshot(&selection.workspace_key);
+        let exact = active.as_ref().is_some_and(|active| {
+            active.instance.id() == selection.instance_id
+                && active.projection.status == BrowserReplayStatus::PausedLocatorRepair
+                && active.repair.as_ref().is_some_and(|repair| {
+                    repair.repair_id == selection.repair_id
+                        && repair.tab_id == selection.tab_id
+                        && repair.revision == selection.revision
+                })
+        }) && live_snapshot.is_some_and(|snapshot| {
+            snapshot.revision == selection.revision
+                && snapshot.selected_tab_id.as_deref() == Some(selection.tab_id.as_str())
+        });
+        if exact {
+            return false;
+        }
+        self.cancel_browser_replay_repair_selection(Some(window))
+    }
+
+    fn cancel_browser_replay_repair_selection(&mut self, window: Option<&Window>) -> bool {
+        let Some(selection) = self.browser_replay_repair_selection.take() else {
+            return false;
+        };
+        let result = if let Some(window) = window {
+            self.with_browser_host_control_barrier(window, |browser_host| {
+                browser_host
+                    .cancel_annotation_selection(&selection.workspace_key, &selection.tab_id)
+            })
+        } else {
+            self.browser_host
+                .cancel_annotation_selection(&selection.workspace_key, &selection.tab_id)
+        };
+        let ui = self.browser_ui.entry(selection.workspace_key).or_default();
+        ui.annotation_mode = false;
+        if let Err(error) = result {
+            ui.diagnostic = Some(error.to_string());
+        }
+        true
+    }
+
+    fn reconcile_browser_replay_state(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = self.reconcile_browser_replay_repair_selection(window);
+        let Some(workspace_key) = self
+            .active_browser_workspace()
+            .map(|(workspace_key, _)| workspace_key)
+        else {
+            return self
+                .close_browser_replay_secret_prompt_for_route(None)
+                .is_some()
+                || changed;
+        };
+        let active = self
+            .browser_bridge
+            .replay_coordinator()
+            .active_state(&workspace_key);
+        let Some(active) = active else {
+            if self
+                .browser_replay_secret_prompt
+                .as_ref()
+                .is_some_and(|vault| vault.workspace_key() == &workspace_key)
+            {
+                if let Some(vault) = self.browser_replay_secret_prompt.take() {
+                    let instance = vault.instance().clone();
+                    self.browser_replay_secret_submitter = None;
+                    let _ = vault.replay_replaced(&instance);
+                    changed = true;
+                }
+            } else {
+                changed = self
+                    .close_browser_replay_secret_prompt_for_route(Some(&workspace_key))
+                    .is_some()
+                    || changed;
+            }
+            return changed;
+        };
+
+        if active.projection.status != BrowserReplayStatus::NeedsUserSecret {
+            if self
+                .browser_replay_secret_prompt
+                .as_ref()
+                .is_some_and(|vault| vault.workspace_key() == &workspace_key)
+            {
+                if let Some(vault) = self.browser_replay_secret_prompt.take() {
+                    let instance = vault.instance().clone();
+                    self.browser_replay_secret_submitter = None;
+                    let _ = vault.replay_replaced(&instance);
+                    changed = true;
+                }
+            } else {
+                changed = self
+                    .close_browser_replay_secret_prompt_for_route(Some(&workspace_key))
+                    .is_some()
+                    || changed;
+            }
+            return changed;
+        }
+
+        if self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| vault.same_instance(&active.instance))
+        {
+            return changed;
+        }
+        if let Some(vault) = self.browser_replay_secret_prompt.take() {
+            let instance = vault.instance().clone();
+            self.browser_replay_secret_submitter = None;
+            let _ = vault.replay_replaced(&instance);
+        }
+        let prompt_instance = active.instance;
+        let input_names = active.projection.unresolved_secret_inputs;
+        let coordinator = self.browser_bridge.replay_coordinator();
+        let instance = prompt_instance.clone();
+        let submitter: BrowserReplaySecretSubmitter = Box::new(move |submission| {
+            coordinator
+                .submit_secrets(&instance, submission)
+                .map(|_| ())
+        });
+        match self.install_browser_replay_secret_prompt(
+            prompt_instance,
+            input_names,
+            submitter,
+            window,
+            cx,
+        ) {
+            Ok(_) => changed = true,
+            Err(error) => {
+                self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                    Some(error.to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn install_browser_replay_secret_prompt(
         &mut self,
         instance: BrowserReplayInstance,
@@ -1888,6 +2179,10 @@ impl NativeShell {
             })
             .ok_or(BrowserReplaySecretError::StaleAuthority)?;
         let instance = exact.instance().clone();
+        self.browser_bridge
+            .replay_coordinator()
+            .cancel(&instance)
+            .map_err(|_| BrowserReplaySecretError::StaleAuthority)?;
         let vault = self
             .browser_replay_secret_prompt
             .take()
@@ -2032,6 +2327,39 @@ impl NativeShell {
             .as_ref()
             .filter(|vault| vault.workspace_key() == &workspace_key)
             .map(BrowserReplaySecretPromptVault::projection);
+        let replay_coordinator = self.browser_bridge.replay_coordinator();
+        let replay = replay_coordinator
+            .active_state(&workspace_key)
+            .map(|active| {
+                let repair_apply_ready = active
+                    .repair
+                    .as_ref()
+                    .and_then(|repair| {
+                        replay_coordinator
+                            .exact_repair(&workspace_key, active.instance.id(), repair.repair_id)
+                            .ok()
+                    })
+                    .and_then(|repair| replay_coordinator.locator_repair_apply_ready(&repair).ok())
+                    .unwrap_or(false);
+                let selecting_replacement = self
+                    .browser_replay_repair_selection
+                    .as_ref()
+                    .is_some_and(|selection| {
+                        selection.workspace_key == workspace_key
+                            && selection.instance_id == active.instance.id()
+                            && active.repair.as_ref().is_some_and(|repair| {
+                                selection.repair_id == repair.repair_id
+                                    && selection.tab_id == repair.tab_id
+                                    && selection.revision == repair.revision
+                            })
+                    });
+                BrowserReplayPaneProjection {
+                    replay: active.projection,
+                    repair: active.repair,
+                    selecting_replacement,
+                    repair_apply_ready,
+                }
+            });
         Some(BrowserPaneModel::new(
             workspace_key,
             &self.browser_pane_context(),
@@ -2053,6 +2381,7 @@ impl NativeShell {
                 workflow_preview: ui.workflow_preview,
                 workflow_editor: ui.workflow_editor,
                 replay_secret_prompt,
+                replay,
             },
         ))
     }
@@ -2427,6 +2756,7 @@ impl NativeShell {
                     }
                     Err(error) => ui.diagnostic = Some(error.to_string()),
                 }
+                self.sync_browser_host_visibility(Some(window));
                 cx.notify();
                 return;
             }
@@ -2447,6 +2777,197 @@ impl NativeShell {
                     }
                     Err(error) => ui.diagnostic = Some(error.to_string()),
                 }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::CancelReplay { instance_id } => {
+                let coordinator = self.browser_bridge.replay_coordinator();
+                let result = coordinator
+                    .exact_instance(&workspace_key, instance_id)
+                    .and_then(|instance| coordinator.cancel(&instance));
+                let cancelled = result.is_ok();
+                let ui = self.browser_ui.entry(workspace_key.clone()).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Cancelled browser replay".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                if cancelled {
+                    self.reconcile_browser_replay_state(window, cx);
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::BeginReplayRepairSelection {
+                instance_id,
+                repair_id,
+            } => {
+                let coordinator = self.browser_bridge.replay_coordinator();
+                let result = (|| {
+                    let active = coordinator.active_state(&workspace_key).ok_or_else(|| {
+                        BrowserError::InvalidInvocation {
+                            field: "replayInstanceId".to_string(),
+                        }
+                    })?;
+                    if active.instance.id() != instance_id
+                        || active.projection.status != BrowserReplayStatus::PausedLocatorRepair
+                    {
+                        return Err(BrowserError::InvalidInvocation {
+                            field: "replayInstanceId".to_string(),
+                        });
+                    }
+                    let _repair_instance = coordinator
+                        .exact_repair(&workspace_key, instance_id, repair_id)
+                        .map_err(|_| BrowserError::InvalidInvocation {
+                            field: "repairId".to_string(),
+                        })?;
+                    let repair = active
+                        .repair
+                        .ok_or_else(|| BrowserError::InvalidInvocation {
+                            field: "repairId".to_string(),
+                        })?;
+                    if repair.repair_id != repair_id {
+                        return Err(BrowserError::InvalidInvocation {
+                            field: "repairId".to_string(),
+                        });
+                    }
+                    let live = self
+                        .browser_host
+                        .workspace_snapshot(&workspace_key)
+                        .ok_or_else(|| BrowserError::CrashedView {
+                            message: "repair page is unavailable".to_string(),
+                        })?;
+                    if live.revision != repair.revision
+                        || live.selected_tab_id.as_deref() != Some(repair.tab_id.as_str())
+                    {
+                        return Err(BrowserError::StaleReference {
+                            expected: repair.revision,
+                            actual: live.revision,
+                        });
+                    }
+                    self.cancel_browser_replay_repair_selection(Some(window));
+                    self.dispatch_browser_command(
+                        &workspace_key,
+                        BrowserCommand::SetAnnotationMode {
+                            tab_id: repair.tab_id.clone(),
+                            enabled: true,
+                        },
+                        window,
+                    )?;
+                    self.browser_replay_repair_selection = Some(BrowserReplayRepairSelection {
+                        workspace_key: workspace_key.clone(),
+                        instance_id,
+                        repair_id,
+                        tab_id: repair.tab_id,
+                        revision: repair.revision,
+                    });
+                    Ok(())
+                })();
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(()) => {
+                        ui.annotation_mode = true;
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Select a replacement element".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::ApplyReplayRepair {
+                instance_id,
+                repair_id,
+                resume,
+            } => {
+                let coordinator = self.browser_bridge.replay_coordinator();
+                let repair = match coordinator.exact_repair(&workspace_key, instance_id, repair_id)
+                {
+                    Ok(repair) => repair,
+                    Err(error) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+                let context = match BrowserInvocationContext::user(
+                    if resume {
+                        "save replay repair and retry the failed step"
+                    } else {
+                        "save replay repair"
+                    },
+                    BrowserRisk::Normal,
+                ) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+                self.cancel_browser_replay_repair_selection(Some(window));
+                let controller = self
+                    .browser_bridge
+                    .bind(workspace_key.clone(), Duration::from_secs(300));
+                let this = cx.weak_entity();
+                let result_coordinator = coordinator.clone();
+                let result_workspace = workspace_key.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        let result = controller
+                            .request_replay_repair_apply(
+                                &coordinator,
+                                &repair,
+                                true,
+                                resume,
+                                context,
+                            )
+                            .await;
+                        let _ = this.update_in(&mut *cx, |shell, window, cx| {
+                            let still_exact = result_coordinator
+                                .active_state(&result_workspace)
+                                .is_some_and(|active| active.instance.id() == instance_id);
+                            if !still_exact {
+                                return;
+                            }
+                            let ui = shell
+                                .browser_ui
+                                .entry(result_workspace.clone())
+                                .or_default();
+                            match result {
+                                Ok(_) => {
+                                    ui.diagnostic = None;
+                                    ui.action_status = Some(if resume {
+                                        "Saved repair and resumed replay".to_string()
+                                    } else {
+                                        "Saved replay repair".to_string()
+                                    });
+                                }
+                                Err(error) => ui.diagnostic = Some(error.to_string()),
+                            }
+                            shell.sync_browser_host_visibility(Some(window));
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                self.browser_ui
+                    .entry(workspace_key)
+                    .or_default()
+                    .action_status = Some(
+                    if resume {
+                        "Saving repair and retrying..."
+                    } else {
+                        "Saving repair..."
+                    }
+                    .to_string(),
+                );
                 cx.notify();
                 return;
             }
@@ -2520,6 +3041,19 @@ impl NativeShell {
                 return;
             }
             BrowserPaneAction::ToggleAnnotation => {
+                if self
+                    .browser_replay_repair_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.workspace_key == workspace_key)
+                {
+                    self.cancel_browser_replay_repair_selection(Some(window));
+                    self.browser_ui
+                        .entry(workspace_key)
+                        .or_default()
+                        .action_status = Some("Cancelled replacement selection".to_string());
+                    cx.notify();
+                    return;
+                }
                 let enabled = !self
                     .browser_ui
                     .get(&workspace_key)

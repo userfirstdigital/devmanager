@@ -1,20 +1,21 @@
 use devmanager::browser::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_command_channel,
     browser_lifecycle_control, browser_operation_target_tab_id,
-    browser_request_preempts_operation_queue, browser_response_resource_ids,
-    browser_user_input_initialization_script, compile_browser_replay, crop_annotation_png,
-    effective_browser_annotation_risk, effective_browser_secret_type_risk,
-    parse_browser_annotation_ipc_message, parse_browser_page_ipc_message,
-    prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
-    route_browser_request, unique_download_path, unsupported_command_response,
-    unsupported_host_status, unsupported_platform_error, validate_annotation_candidate_context,
-    validate_browser_url, BrowserAction, BrowserActionTarget, BrowserAnnotation,
-    BrowserAnnotationCandidate, BrowserAnnotationCleanupLedger, BrowserAnnotationDraft,
-    BrowserAnnotationKind, BrowserAnnotationLifecycle, BrowserAnnotationOperation,
-    BrowserAnnotationRoute, BrowserAttachmentBroker, BrowserAttachmentRevision, BrowserBounds,
-    BrowserCommand, BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation,
-    BrowserDiagnosticLevel, BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef,
-    BrowserError, BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
+    browser_replay_repair_candidate_from_annotation, browser_request_preempts_operation_queue,
+    browser_response_resource_ids, browser_user_input_initialization_script,
+    compile_browser_replay, crop_annotation_png, effective_browser_annotation_risk,
+    effective_browser_secret_type_risk, parse_browser_annotation_ipc_message,
+    parse_browser_page_ipc_message, prepare_verified_download_root, prepare_verified_profile_root,
+    remove_verified_profile, route_browser_request, unique_download_path,
+    unsupported_command_response, unsupported_host_status, unsupported_platform_error,
+    validate_annotation_candidate_context, validate_browser_url, BrowserAction,
+    BrowserActionTarget, BrowserAnnotation, BrowserAnnotationCandidate,
+    BrowserAnnotationCleanupLedger, BrowserAnnotationDraft, BrowserAnnotationKind,
+    BrowserAnnotationLifecycle, BrowserAnnotationOperation, BrowserAnnotationRoute,
+    BrowserAttachmentBroker, BrowserAttachmentRevision, BrowserBounds, BrowserCommand,
+    BrowserCommandBridge, BrowserCommandRequest, BrowserConsoleOperation, BrowserDiagnosticLevel,
+    BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
+    BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserLocatorFailureTarget, BrowserMemoryTarget, BrowserNetworkOperation,
     BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
@@ -3084,6 +3085,79 @@ fn annotation_candidate() -> BrowserAnnotationCandidate {
             ("fontSize".to_string(), "14px".to_string()),
         ]),
     }
+}
+
+#[test]
+fn replay_repair_picker_accepts_only_an_exact_semantic_element_and_strips_backend_authority() {
+    let candidate = annotation_candidate();
+    let replacement =
+        browser_replay_repair_candidate_from_annotation(&candidate, BrowserRevision(7))
+            .expect("semantic element candidate");
+    assert_eq!(replacement.element_ref().revision, BrowserRevision(7));
+    assert_eq!(replacement.element_ref().locator, candidate.locator);
+    assert_eq!(replacement.element_ref().backend_node_id, None);
+
+    let mut region = annotation_candidate();
+    region.kind = BrowserAnnotationKind::Region;
+    assert!(matches!(
+        browser_replay_repair_candidate_from_annotation(&region, BrowserRevision(7)),
+        Err(BrowserError::InvalidAnnotation { field, .. }) if field == "kind"
+    ));
+
+    assert!(matches!(
+        browser_replay_repair_candidate_from_annotation(
+            &annotation_candidate(),
+            BrowserRevision(8)
+        ),
+        Err(BrowserError::StaleReference {
+            expected: BrowserRevision(8),
+            actual: BrowserRevision(7),
+        })
+    ));
+}
+
+#[test]
+fn native_repair_picker_clears_the_exact_annotation_candidate_before_user_preview() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let windows = include_str!("../src/browser/host/windows.rs").replace("\r\n", "\n");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs").replace("\r\n", "\n");
+
+    for host in [&windows, &unsupported] {
+        assert!(host.contains("pub fn cancel_annotation_selection("));
+    }
+    let cancel_start = windows.find("pub fn cancel_annotation_selection(").unwrap();
+    let cancel_end = windows[cancel_start..]
+        .find("\n    }")
+        .map(|end| cancel_start + end)
+        .unwrap();
+    let cancel = &windows[cancel_start..cancel_end];
+    assert!(cancel.contains("BrowserAnnotationRoute::new"));
+    assert!(cancel.contains("cancel_annotation_mode(&route)"));
+
+    let pump_start = app.find("fn pump_browser_events(").unwrap();
+    let pump_end = app[pump_start..]
+        .find("fn with_browser_host_control_barrier")
+        .map(|end| pump_start + end)
+        .unwrap();
+    let pump = &app[pump_start..pump_end];
+    let capture = pump
+        .find("BrowserPaneEventPlan::CaptureAnnotation")
+        .expect("annotation candidate event");
+    let capture = &pump[capture..];
+    let clear = capture
+        .find("cancel_annotation_selection")
+        .expect("accepted candidate cleared");
+    let preview = capture
+        .find("request_replay_repair_preview")
+        .expect("context-preserving preview lane");
+    assert!(clear < preview);
+    assert!(capture.contains("BrowserInvocationActor::User"));
+    assert!(capture.contains("browser_replay_repair_candidate_from_annotation"));
+    assert!(capture.contains("BrowserCommand::CaptureAnnotation"));
+    assert!(capture.contains("candidate.revision"));
+    assert!(capture.contains("selection.tab_id"));
+    assert!(capture.contains("selection.instance_id"));
+    assert!(capture.contains("selection.repair_id"));
 }
 
 #[test]

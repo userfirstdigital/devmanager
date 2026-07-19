@@ -689,6 +689,16 @@ impl BrowserWebViewHost {
         self.status.clone()
     }
 
+    pub fn cancel_annotation_selection(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+    ) -> Result<(), BrowserError> {
+        let route = BrowserAnnotationRoute::new(workspace_key.clone(), tab_id)?;
+        self.cancel_annotation_mode(&route);
+        Ok(())
+    }
+
     pub fn trusted_app_config_dir(&self) -> Option<&Path> {
         self.trusted_app_config_dir.as_deref()
     }

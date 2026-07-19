@@ -511,3 +511,114 @@ fn native_shell_owns_plaintext_outside_pane_persisted_and_remote_models_and_bloc
     assert!(annotation_editor.contains(".filter(|_| model.annotation_editor_visible())"));
     assert!(!pane.contains("secret_prompt.value"));
 }
+
+#[test]
+fn stale_prompt_submission_cannot_wake_a_replacement_replay() {
+    let coordinator = BrowserReplayCoordinator::default();
+    let original = coordinator
+        .start(
+            workspace("stale-submit"),
+            compile_browser_replay(&secret_recipe(), Vec::new()).unwrap(),
+        )
+        .unwrap();
+    let (mut vault, _) = BrowserReplaySecretPromptVault::install(
+        original.instance.clone(),
+        original.projection.unresolved_secret_inputs.clone(),
+    )
+    .unwrap();
+    vault
+        .edit(&original.instance, "credential", SECRET_SENTINEL)
+        .unwrap();
+    vault
+        .edit(&original.instance, "one-time-code", "123456")
+        .unwrap();
+
+    let replacement = coordinator
+        .replace(
+            workspace("stale-submit"),
+            compile_browser_replay(&secret_recipe(), Vec::new()).unwrap(),
+        )
+        .unwrap();
+    let (submission, _) = vault.submit(&original.instance).unwrap();
+    assert!(matches!(
+        coordinator.submit_secrets(&original.instance, submission),
+        Err(BrowserReplaySecretError::StaleAuthority)
+    ));
+    assert_eq!(
+        coordinator.status(&replacement.instance).unwrap().status,
+        BrowserReplayStatus::NeedsUserSecret
+    );
+    assert_eq!(
+        coordinator
+            .active_state(&workspace("stale-submit"))
+            .unwrap()
+            .projection
+            .unresolved_secret_inputs,
+        vec!["credential", "one-time-code"]
+    );
+}
+
+#[test]
+fn gpui_pump_installs_one_exact_prompt_and_retires_every_stale_authority() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+
+    let pump_start = app.find("fn pump_browser_events(").unwrap();
+    let pump_end = app[pump_start..]
+        .find("fn with_browser_host_control_barrier")
+        .map(|end| pump_start + end)
+        .unwrap();
+    let pump = &app[pump_start..pump_end];
+    let reconcile_call = pump
+        .find("reconcile_browser_replay_state")
+        .expect("33ms pump replay reconciliation");
+    assert!(reconcile_call < pump.find("if events.is_empty()").unwrap());
+
+    let reconcile_start = app
+        .find("fn reconcile_browser_replay_state(")
+        .expect("NativeShell replay launch boundary");
+    let reconcile_end = app[reconcile_start..]
+        .find("fn install_browser_replay_secret_prompt(")
+        .map(|end| reconcile_start + end)
+        .unwrap();
+    let reconcile = &app[reconcile_start..reconcile_end];
+    let compact_reconcile: String = reconcile.split_whitespace().collect();
+    assert!(reconcile.contains("active_browser_workspace"));
+    assert!(compact_reconcile.contains("replay_coordinator().active_state(&workspace_key)"));
+    assert!(reconcile.contains("BrowserReplayStatus::NeedsUserSecret"));
+    assert!(reconcile.contains("same_instance(&active.instance)"));
+    assert!(reconcile.contains("install_browser_replay_secret_prompt"));
+    assert!(compact_reconcile.contains("coordinator.submit_secrets(&instance,submission)"));
+    assert!(reconcile.contains("replay_replaced"));
+
+    let submit_start = app.find("fn submit_browser_replay_secret_prompt(").unwrap();
+    let submit_end = app[submit_start..]
+        .find("fn cancel_browser_replay_secret_prompt(")
+        .map(|end| submit_start + end)
+        .unwrap();
+    let submit = &app[submit_start..submit_end];
+    assert!(submit.contains("submitter(submission)?"));
+
+    let cancel_start = submit_end;
+    let cancel_end = app[cancel_start..]
+        .find("fn close_browser_replay_secret_prompt_for_route(")
+        .map(|end| cancel_start + end)
+        .unwrap();
+    let cancel = &app[cancel_start..cancel_end];
+    let compact_cancel: String = cancel.split_whitespace().collect();
+    let coordinator_cancel = compact_cancel
+        .find("replay_coordinator().cancel(&instance)")
+        .expect("Escape exact replay cancellation");
+    let vault_drop = compact_cancel
+        .find("browser_replay_secret_prompt.take()")
+        .expect("consuming zeroizing vault");
+    assert!(coordinator_cancel < vault_drop);
+
+    let route_start = cancel_end;
+    let route_end = app[route_start..]
+        .find("fn sync_browser_host_visibility(")
+        .map(|end| route_start + end)
+        .unwrap();
+    let route = &app[route_start..route_end];
+    assert!(route.contains("browser_replay_secret_prompt.take()"));
+    assert!(route.contains("route_switch(&instance)"));
+}
