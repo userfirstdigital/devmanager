@@ -1,5 +1,78 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 11: Current-revision preview, atomic locator apply, and same-step resume
+
+### Status and scope
+
+Checkpoint 11 started from the independently approved checkpoint-10 base `6972adb69462094913d1d94f28c29fe9275814a9`. Preview landed at `124769f864b115c9dd6c16fdeedb9ba3b05e7d7d`, digest/atomic exact-locator replacement at `594030ec54b186f05457970112d1b073b0296348`, and confirmation/approval/same-step resume at `d9707c2db5155ccbe94ce58a44fc111346f3d18a`. The separate replay scope-test correction landed at `f50cdf6f2e9bab05491b1740cff678ad6c4519de`. Task-8 evidence is the documentation commit containing this section. The controller freezes the full exact `6972adb..HEAD` range for independent review; checkpoint-11 approval remains pending that review.
+
+This checkpoint completes the internal locator-repair contract only. It adds no new `browser_workflow` MCP schema or operation, native repair/replay controls, provider/process lifecycle bridge, whole-PC control, Playwright, Node sidecar, or external Chrome mode. Existing MCP/provider code predates this range and is not a checkpoint-11 replay-repair entry point. Checkpoint 12 remains pending and was not started.
+
+### Contract delivered
+
+- Task 5 consumes the exact checkpoint-10 paused repair and its owner-scoped semantic snapshot/screenshot evidence. A live User/Agent preview authority binds workspace, replay, repair, tab, current page revision, semantic `BrowserElementRef`, candidate, and exact highlight token. The Windows overlay is pointer-transparent, emits no focus/click/input event, is excluded from recording and owned DOM-revision tracking, and uses compare-and-swap install/clear so stale completion cannot replace or clear a newer highlight. Drop-driven, bounded cleanup preserves a newer token while releasing the superseded candidate/authority.
+- Task 6 defines the private canonical digest as `SHA-256("devmanager.browser-recipe-v1.sha256\0" || compact validated v1 JSON)`. Strict load normalizes irrelevant formatting/key order before hashing; semantic changes differ. The execution handle binds one authenticated canonical recipe root before the first command. Apply reloads and verifies the digest, recipe ID, exact step index and ID, locator slot, and old locator; replaces only that locator; validates the complete v1 recipe; and rechecks at the final boundary.
+- Recipe apply reuses the process-global `RECIPE_WRITE_GATE` and existing same-directory temp/write/`sync_all`/atomic replacement primitive. Cooperating DevManager save/apply operations therefore leave a complete old or new recipe and remove the sibling temp on failure. This is not an OS-wide CAS against a non-cooperating external editor. On Windows the successful `MoveFileExW` replacement guarantee is not documented as equivalent to the non-Windows directory-sync crash-durability path.
+- Task 7 requires the exact committed preview plus explicit confirmation. Agent `Normal` risk is raised to the `Destructive` floor and higher risk is preserved; User risk remains declared. The private pre/post apply authority binds actor, operation ID, effective risk, candidate revision, exact token, stage, and one-shot receipt. Existing queue, approval, runtime target/revision inspection, cancellation epochs, and safe journal remain authoritative.
+- One coordinator gate owns `Preparing`/`Committing`, cancel/replace/interruption, recipe write, private locator override, and `Applied` state. Cancellation wins before any write, or file+override+`Applied` commit coherently before terminalization proceeds. Changed recipe/root/step/slot/old-locator, page revision, token, workspace, replay, repair, actor, operation, or authority fails closed. Post-write page/token/revision drift returns the committed Applied/paused projection and issues no browser action; later no-write resume requires a fresh exact preview of the already committed locator.
+- Resume cursor and locator slot are phase-aware for action, action wait, step wait, and each assertion. Progress does not advance before retry; a successful mutating action is not repeated after a later wait/assertion failure. A later failure receives a distinct repair ID, stale earlier authority cannot resume it, and cancel/replacement/terminal/coordinator drop releases both generations' evidence pins and cleanup authority. The memory-only secret store remains live while paused and closes on the established terminal/teardown paths.
+- Safe repair projections, errors, journals, and public command serialization contain no selector, page text, recipe value, file path, secret, callback message, raw host error, or arbitrary CDP payload. Evidence bodies remain behind owner-scoped resource handles. Repair instances, leases, receipts, candidates, sidecars, private apply state, and secret carriers remain non-serde and non-`Debug` where required.
+
+### Strict RED-to-GREEN chronology
+
+#### Task 5: evidence-bound current-revision preview
+
+- Focused Node, host, and authority REDs preceded `124769f864b115c9dd6c16fdeedb9ba3b05e7d7d` (`feat(browser): preview replay locator repairs`). They established pointer-transparent highlight behavior, token compare-and-swap, no revision/recording/input effects, exact current-revision semantic candidates, late-callback fencing, and bounded cleanup through the existing controller queue/journal.
+- The preview path stores a candidate only after exact native acknowledgement and post-await coordinator revalidation. Navigation, cancellation, workspace/replay/repair replacement, stale evidence, wrong actor/command/tab/token, and old-completion/new-preview ordering all fail closed without installing stale state.
+
+#### Task 6: canonical digest and atomic exact locator update
+
+- Digest, strict-load, every-slot locator lookup/replacement, changed-recipe, invalid-candidate, canonical-root, cooperative-writer, injected-replace-failure, and temp-cleanup REDs preceded `594030ec54b186f05457970112d1b073b0296348` (`feat(browser): atomically save locator repairs`).
+- The final implementation never mutates the immutable plan or another locator slot. It reloads, validates, compares, clones, changes one exact locator, validates again, rechecks immediately before replacement, and preserves the prior complete bytes on every pre-replacement failure.
+
+#### Task 7: confirmation, approval, race fencing, and same-step resume
+
+- Confirmation/risk/denial/interruption/race and executor-cursor REDs preceded `d9707c2db5155ccbe94ce58a44fc111346f3d18a` (`feat(browser): resume repaired replay steps`). Tests cover pre-write cancellation/replace/interruption, apply-winning coherent commit, post-write page drift, no-write exact revalidation, all four resume cursors, no duplicate successful mutation, second repair generation, and resource cleanup.
+- Independent review found that fallible post-validation context/operation-ID creation happened after the durable file+override+Applied commit. The injected factory RED returned an error after the recipe already contained the replacement. GREEN creates and validates that context after exact pre-validation acknowledgement but before `commit_locator_repair_apply`; failure drops the armed guard, restores Previewed, leaves file/override untouched, and closes authority. Existing post-commit host failures still return the committed Applied outcome.
+- Independent review also found that public Rust callers could construct the serde-skipped `BrowserCommand::RepairValidate` marker without its private sidecar. The source/compile RED required a private seal while preserving safe external `RepairValidate { .. }` matching. GREEN adds a private zero-sized seal field with a targeted `private_interfaces` allowance, updates both internal constructors and all exact patterns, and emits no new seal/private-interface warning.
+
+#### Separate replay scope-test correction
+
+- Production intentionally binds the authenticated canonical root with `Path`/`PathBuf`, while the old scope test rejected all `std::path` text and left `browser_replay` at 20/21. The strict correction at `f50cdf6f2e9bab05491b1740cff678ad6c4519de` pins one exact import and the exact six production Path/PathBuf lines while continuing to reject filesystem, host, controller, queue, approval, journal, command, MCP, pane, and zeroize coupling.
+- Review then reproduced an in-memory `std::path::Component` addition that the token allowlist alone missed. The final guard removes exactly the approved import from a temporary production-source string and rejects any remaining `std::path`; the Component mutation is a genuine RED-to-GREEN regression. The full replay suite is now 21/21.
+
+### Checkpoint-11 verification
+
+Every Cargo command ran one at a time with `-j 1`; every test command used `-- --test-threads=1`.
+
+- Focused integration suites: `browser_automation` 12, `browser_recipes` 17, `browser_replay` 21, `browser_replay_executor` 24, `browser_replay_repair` 10, `browser_host` 105, `browser_recording` 10, `browser_recording_ipc` 12, `browser_recording_mcp` 3, `browser_replay_secrets` 12, `browser_secret_prompt` 3, and `browser_workflow_coordinator` 24: 253 passed, 0 failed. The repair source-contract test also emitted one successful inner exact invocation, which is not double-counted.
+- Focused library modules: `browser::recipes::tests` 18, `browser::resources::tests` 10, `browser::replay::tests` 27, `browser::replay_executor::tests` 13, `browser::commands::secure_command_tests` 19, and `browser::host::windows::secret_document_state_tests` 19: 106 passed, 0 failed. The resource suite also emitted two successful inner child-helper invocations, which are not double-counted.
+- Aggregate browser filter (`cargo test --locked -j 1 browser -- --test-threads=1`): 224 top-level matches passed, 0 failed. Two emitted inner helper invocations also passed and are not double-counted.
+- Locked all-target check (`cargo check --locked --all-targets -j 1`): passed in 15.9 seconds. Cargo emitted 13 `dead_code` warnings confined to the deliberately unexposed checkpoint-12 apply/lifecycle path; there were no errors.
+- Windows release build (`cargo build --locked --release -j 1`): passed in 350.5 seconds and produced `target/release/devmanager.exe` (42,660,864 bytes). The sole installed x64 SDK compiler, `C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe` (file version `10.0.22621.3233`), was validated and assigned to `GPUI_FXC_PATH` only in the build process; the calling session and global environment remained unchanged. The same 13 deferred-lifecycle warnings appeared, with no errors.
+- Formatting and repository audit: `cargo fmt --all -- --check` passed in 2.0 seconds; no Task-8 placeholders remain; `git diff --check` passes; Task 8 changes exactly the four required documentation files; and the full `6972adb..Task-8` range contains exactly the 17 implementation/test paths plus those four docs. No MCP, provider, process-manager, or lifecycle path changed in that range.
+
+### Safety, race, leakage, and platform audit
+
+- Changed-recipe and final-boundary revalidation cover digest, root, recipe/step identity, slot, old locator, destination classification, and cooperating concurrent writes. Changed page/token/revision/workspace/replay/repair/actor/operation/cancellation authority is checked before acknowledgement, commit, and optional resume. File replacement failure leaves the old complete file; successful atomic replacement exposes the new complete file. No broader non-cooperating external-writer CAS or Windows directory-sync crash-durability claim is made.
+- Dedicated repair resources remain unpinned on disk and effectively pinned only by the exact live runtime lease. Preview cleanup is bounded/coalesced and compare-and-swap safe; private repair `Drop`, cancel, replace, terminalization, coordinator/store teardown, and second-generation cleanup release pins and authorities without clearing a newer highlight.
+- Source/trait/behavior tests keep locator/candidate/evidence authority, receipt, sidecar, apply state, secret leases, and highlight tokens off serde/Debug/public construction surfaces. Journal actor/intent/action summaries and errors remain fixed/value-free; captured snapshot/screenshot bodies are accessible only through owner-scoped resource handles.
+- Secret replay values survive the intentional locator pause only inside the zeroizing exact-instance store, cannot enter repair candidates/evidence/projections/journals/recording/MCP, and are closed/zeroized on cancellation, replacement, interruption, terminal return, or owner drop.
+- Windows is the functional preview/apply platform. The unsupported adapter validates private preview/apply sidecars and returns fixed `UnavailablePlatform` without a partial WebKit implementation. The native Windows all-target and release gates are recorded above; no macOS runtime or native macOS compilation was performed on this Windows host, so existing release CI remains the authoritative macOS compile surface.
+
+### Commits and immutable-review scope
+
+1. `6972adb69462094913d1d94f28c29fe9275814a9` — independently approved checkpoint-10 base.
+2. `124769f864b115c9dd6c16fdeedb9ba3b05e7d7d` — evidence-bound current-revision preview.
+3. `594030ec54b186f05457970112d1b073b0296348` — canonical digest and atomic exact-locator replacement.
+4. `d9707c2db5155ccbe94ce58a44fc111346f3d18a` — confirmation, approval, race fencing, same-step resume, and review remediations.
+5. `f50cdf6f2e9bab05491b1740cff678ad6c4519de` — exact canonical-root scope-test correction and its mutation hardening.
+6. The Task-8 evidence commit containing this section.
+
+The ignored immutable artifact is `.superpowers/sdd/review-6972adb-checkpoint11-locator-repair.diff`, generated from the full exact `6972adb..HEAD` range after the Task-8 commit. Its byte count, SHA-256, raw stable patch ID, exact path list, byte-identical regeneration, and reverse-apply result are reported in the external handoff so this included report does not self-reference.
+
+Checkpoint 11 stops here for independent review. Checkpoint 12 remains pending: no new replay-repair MCP/native/provider lifecycle entry point was added or started.
+
 ## Checkpoint 10: Typed locator failure, retained evidence, and stable pause
 
 ### Status and scope
