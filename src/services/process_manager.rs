@@ -640,6 +640,7 @@ impl ProcessManager {
         activate_tab: bool,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        self.validate_server_launch(app_state, command_id)?;
         let Some(launch) =
             self.prepare_start_server(app_state, command_id, dimensions, activate_tab)?
         else {
@@ -664,6 +665,7 @@ impl ProcessManager {
         banner: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        self.validate_server_launch(app_state, command_id)?;
         let (launch, clear_logs) =
             self.prepare_restart_server(app_state, command_id, dimensions, banner)?;
         let op_id = next_op_id();
@@ -808,6 +810,7 @@ impl ProcessManager {
         banner: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        self.validate_server_launch(app_state, command_id)?;
         let lookup = app_state
             .find_command(command_id)
             .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
@@ -851,6 +854,20 @@ impl ProcessManager {
             banner,
             response,
         )
+    }
+
+    pub fn validate_server_launch(
+        &self,
+        app_state: &AppState,
+        command_id: &str,
+    ) -> Result<(), String> {
+        let lookup = app_state
+            .find_command(command_id)
+            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
+        if lookup.command.command.trim().is_empty() {
+            return Err(format!("Server command `{command_id}` is empty"));
+        }
+        Ok(())
     }
 
     fn prepare_start_server(
@@ -6590,6 +6607,62 @@ mod tests {
             Some("existing-session")
         );
         assert!(manager.runtime_state().sessions.is_empty());
+    }
+
+    #[test]
+    fn blank_server_launches_leave_tabs_runtime_and_process_queue_untouched() {
+        let cwd = temp_test_dir("blank-server-launch-preflight");
+        for operation in ["start", "restart", "kill-port-restart"] {
+            let manager = ProcessManager::new();
+            let mut state = app_state_with_server(&cwd, true);
+            state.config.projects[0].folders[0].commands[0].command = " \t ".to_string();
+            let tabs_before = state.open_tabs.clone();
+            let active_before = state.active_tab_id.clone();
+            let runtime_before = manager.runtime_state();
+            let revision_before = manager.runtime_revision();
+
+            let result = match operation {
+                "start" => {
+                    manager.start_server(&mut state, "server-cmd", SessionDimensions::default())
+                }
+                "restart" => {
+                    manager.restart_server(&mut state, "server-cmd", SessionDimensions::default())
+                }
+                "kill-port-restart" => manager.schedule_kill_port_and_restart(
+                    &mut state,
+                    "server-cmd",
+                    4312,
+                    SessionDimensions::default(),
+                    "must not schedule",
+                    None,
+                ),
+                _ => unreachable!(),
+            };
+
+            assert_eq!(
+                result,
+                Err("Server command `server-cmd` is empty".to_string()),
+                "{operation}"
+            );
+            assert_eq!(state.open_tabs, tabs_before, "{operation}");
+            assert_eq!(state.active_tab_id, active_before, "{operation}");
+            let runtime_after = manager.runtime_state();
+            assert_eq!(
+                runtime_after.sessions.len(),
+                runtime_before.sessions.len(),
+                "{operation}"
+            );
+            assert_eq!(
+                runtime_after.active_session_id, runtime_before.active_session_id,
+                "{operation}"
+            );
+            assert_eq!(manager.runtime_revision(), revision_before, "{operation}");
+            assert!(
+                manager.drain_process_op_completions().is_empty(),
+                "{operation}"
+            );
+            stop_background_tasks_for_test(&manager);
+        }
     }
 
     #[test]

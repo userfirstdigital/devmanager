@@ -1724,7 +1724,21 @@ pub fn browser_action_plan(
         }
         BrowserPaneAction::Collapse => vec![BrowserCommand::SetPaneOpen { open: false }],
         BrowserPaneAction::CreateTab => vec![BrowserCommand::CreateTab { url: None }],
-        BrowserPaneAction::SelectTab(tab_id) => vec![BrowserCommand::SelectTab { tab_id }],
+        BrowserPaneAction::SelectTab(tab_id) => {
+            let snapshot = snapshot.ok_or_else(|| BrowserError::InvalidInvocation {
+                field: "tabId".to_string(),
+            })?;
+            if !snapshot.tabs.iter().any(|tab| tab.id == tab_id) {
+                return Err(BrowserError::InvalidInvocation {
+                    field: "tabId".to_string(),
+                });
+            }
+            if snapshot.selected_tab_id.as_deref() == Some(tab_id.as_str()) {
+                Vec::new()
+            } else {
+                vec![BrowserCommand::SelectTab { tab_id }]
+            }
+        }
         BrowserPaneAction::CloseTab(tab_id) => vec![BrowserCommand::CloseTab { tab_id }],
         BrowserPaneAction::Back => vec![BrowserCommand::Back {
             tab_id: selected_tab(snapshot)?.to_string(),

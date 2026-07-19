@@ -372,10 +372,10 @@ fn native_shell_applies_host_input_before_async_browser_completions() {
         .find("browser_host.pump_async_completions(window)")
         .expect("the GPUI pump should drain async WebView2 completions");
     let events_before = body
-        .find("browser_host.drain_events()")
+        .find("browser_host.drain_events_with_pre_apply_observer")
         .expect("the GPUI pump should drain host events");
     let events_after = body
-        .rfind("browser_host.drain_events()")
+        .rfind("browser_host.drain_events_with_pre_apply_observer")
         .expect("the GPUI pump should also drain completion-generated events");
 
     assert!(events_before < completions);
@@ -555,11 +555,11 @@ fn native_approval_rechecks_priority_work_and_user_input_after_dialog_before_res
         .map(|offset| dialog + offset)
         .expect("priority lifecycle work received during the dialog must be applied");
     let input = body[barrier..]
-        .find("browser_host.drain_events()")
+        .find("browser_host.drain_events_with_pre_apply_observer")
         .map(|offset| barrier + offset)
         .expect("trusted user input received during the dialog must cancel host work");
     let observe = body[input..]
-        .find("browser_bridge.observe_host_event_under_host_control_barrier(event)")
+        .find("observe_host_event_under_host_control_barrier(event)")
         .map(|offset| input + offset)
         .unwrap();
     let resume = body.find("browser_host.resolve_approval(").unwrap();
@@ -1020,6 +1020,62 @@ fn ui_actions_and_workspace_responses_cannot_cross_route() {
     let sync = browser_response_sync(std::slice::from_ref(&active), &active, &response).unwrap();
     assert_eq!(sync.workspace_key, active);
     assert_eq!(sync.snapshot, snapshot);
+}
+
+#[test]
+fn tab_selection_plan_rejects_unknown_and_elides_already_selected_tabs() {
+    let workspace = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let snapshot = BrowserWorkspaceSnapshot {
+        tabs: vec![
+            BrowserTabSnapshot {
+                id: "tab-a".to_string(),
+                title: "A".to_string(),
+                url: "https://a.test".to_string(),
+                viewport: BrowserViewport::default(),
+            },
+            BrowserTabSnapshot {
+                id: "tab-b".to_string(),
+                title: "B".to_string(),
+                url: "https://b.test".to_string(),
+                viewport: BrowserViewport::default(),
+            },
+        ],
+        selected_tab_id: Some("tab-a".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+
+    assert!(matches!(
+        browser_action_plan(
+            Some(&workspace),
+            Some(&snapshot),
+            "",
+            BrowserPaneAction::SelectTab("missing-tab".to_string()),
+        ),
+        Err(BrowserError::InvalidInvocation { field }) if field == "tabId"
+    ));
+
+    let selected = browser_action_plan(
+        Some(&workspace),
+        Some(&snapshot),
+        "",
+        BrowserPaneAction::SelectTab("tab-a".to_string()),
+    )
+    .unwrap();
+    assert!(selected.commands.is_empty());
+
+    let different = browser_action_plan(
+        Some(&workspace),
+        Some(&snapshot),
+        "",
+        BrowserPaneAction::SelectTab("tab-b".to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        different.commands,
+        vec![BrowserCommand::SelectTab {
+            tab_id: "tab-b".to_string()
+        }]
+    );
 }
 
 #[test]

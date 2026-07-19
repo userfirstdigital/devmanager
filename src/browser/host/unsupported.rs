@@ -309,6 +309,13 @@ impl BrowserWebViewHost {
         Vec::new()
     }
 
+    pub fn drain_events_with_pre_apply_observer(
+        &mut self,
+        _before_apply: impl FnMut(&BrowserHostEvent, &BrowserHostState),
+    ) -> Vec<BrowserHostEvent> {
+        Vec::new()
+    }
+
     pub fn workspace_snapshot(
         &self,
         workspace_key: &super::super::BrowserWorkspaceKey,

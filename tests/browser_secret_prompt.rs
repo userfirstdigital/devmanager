@@ -36,6 +36,41 @@ assert_not_impl_any!(
         serde::de::DeserializeOwned
 );
 
+#[test]
+fn browser_pane_validates_before_interrupting_replay_or_consuming_secret_prompt() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let start = app.find("fn apply_browser_pane_action(").unwrap();
+    let end = app[start..]
+        .find("fn handle_browser_replay_secret_key(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let action = &app[start..end];
+    let validate = action
+        .find("validate_browser_pane_action_before_replay_interrupt(")
+        .expect("pane action validation");
+    let bridge = action
+        .find("browser_bridge.interrupt_workspace")
+        .expect("shared replay cancellation");
+    let retire = action
+        .find("retire_browser_replay_ui_after_interrupt")
+        .expect("secret prompt retirement");
+
+    assert!(validate < bridge && bridge < retire);
+    assert!(!action[..validate].contains("close_browser_replay_secret_prompt_for_route"));
+    let helper_start = app
+        .find("fn validate_browser_pane_action_before_replay_interrupt(")
+        .unwrap();
+    let helper_end = app[helper_start..]
+        .find("#[cfg(test)]")
+        .map(|offset| helper_start + offset)
+        .unwrap();
+    let helper = &app[helper_start..helper_end];
+    assert!(
+        helper.find("browser_action_plan(").unwrap()
+            < helper.find("interrupt_then_retire()").unwrap()
+    );
+}
+
 const SECRET_SENTINEL: &str = "DM_PROMPT_SECRET_SENTINEL_5B1D";
 
 fn workspace(conversation: &str) -> BrowserWorkspaceKey {
@@ -493,12 +528,23 @@ fn native_shell_owns_plaintext_outside_pane_persisted_and_remote_models_and_bloc
         pane_action[blocked_annotation_action..pane_action.find("match action").unwrap()]
             .contains("return")
     );
-    for action in ["CreateTab", "SelectTab", "CloseTab", "Collapse"] {
+    let helper_start = app
+        .find("fn validate_browser_pane_action_before_replay_interrupt(")
+        .unwrap();
+    let helper_end = app[helper_start..]
+        .find("#[cfg(test)]")
+        .map(|offset| helper_start + offset)
+        .unwrap();
+    let pane_validation = &app[helper_start..helper_end];
+    assert!(pane_action.contains("validate_browser_pane_action_before_replay_interrupt"));
+    for action in ["CreateTab", "SelectTab", "Collapse"] {
         assert!(
-            pane_action.contains(&format!("BrowserPaneAction::{action}")),
+            pane_validation.contains(&format!("BrowserPaneAction::{action}")),
             "{action} must close an active secret prompt"
         );
     }
+    assert!(pane_validation.contains("interrupt_then_retire"));
+    assert!(pane.contains("BrowserPaneAction::CloseTab(tab_id)"));
     assert!(pane_action.contains("cancel_browser_replay_secret_prompt"));
 
     assert!(pane.contains("browser_replay_secret_mask(input.is_set)"));

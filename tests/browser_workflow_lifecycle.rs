@@ -311,6 +311,224 @@ fn assert_before(section: &str, earlier: &str, later: &str) {
 }
 
 #[test]
+fn queued_user_input_enters_shared_cancellation_before_host_revision_mutation() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let windows = include_str!("../src/browser/host/windows.rs").replace("\r\n", "\n");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs").replace("\r\n", "\n");
+
+    let pump = source_section(
+        &app,
+        "fn pump_browser_events(",
+        "fn with_browser_host_control_barrier",
+    );
+    assert!(pump.contains("drain_events_with_pre_apply_observer"));
+    assert!(!pump.contains("let mut events = browser_host.drain_events();"));
+
+    let drain = source_section(
+        &windows,
+        "pub fn drain_events_with_pre_apply_observer",
+        "pub fn workspace_snapshot(",
+    );
+    assert_before(drain, "before_apply(&event", "apply_user_input");
+    assert!(unsupported.contains("pub fn drain_events_with_pre_apply_observer"));
+}
+
+#[test]
+fn blank_server_commands_are_preflighted_before_every_lifecycle_and_process_boundary() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let process_manager = include_str!("../src/services/process_manager.rs").replace("\r\n", "\n");
+
+    let start = source_section(&app, "fn start_server_action(", "fn stop_server_action(");
+    assert!(
+        start.matches("validate_server_launch").count() >= 2,
+        "start must preflight before scheduling and again after the async port check"
+    );
+    assert_before(
+        start,
+        "validate_server_launch",
+        "interrupt_active_browser_replay_before_route_change",
+    );
+    assert!(
+        start.rfind("validate_server_launch").unwrap()
+            < start
+                .rfind("interrupt_active_browser_replay_before_route_change")
+                .unwrap()
+    );
+
+    for (start_label, end_label, process_call) in [
+        (
+            "fn restart_server_action(",
+            "fn clear_server_output_action(",
+            ".restart_server(",
+        ),
+        (
+            "fn kill_server_port_action(",
+            "fn select_server_tab_action(",
+            "schedule_kill_port_and_restart",
+        ),
+    ] {
+        let section = source_section(&app, start_label, end_label);
+        assert_before(
+            section,
+            "validate_server_launch",
+            "interrupt_active_browser_replay_before_route_change",
+        );
+        assert_before(section, "validate_server_launch", process_call);
+    }
+
+    let remote = source_section(
+        &app,
+        "fn pump_remote_host_requests(",
+        "fn handle_window_should_close(",
+    );
+    for (start_label, end_label, process_call) in [
+        (
+            "RemoteAction::StartServer {",
+            "RemoteAction::StopServer {",
+            "start_server_with_remote_response",
+        ),
+        (
+            "RemoteAction::RestartServer {",
+            "RemoteAction::LaunchAi {",
+            "restart_server_with_remote_response",
+        ),
+    ] {
+        let section = source_section(remote, start_label, end_label);
+        assert_before(
+            section,
+            "validate_server_launch",
+            "interrupt_active_browser_replay_before_route_change",
+        );
+        assert_before(section, "validate_server_launch", process_call);
+    }
+
+    for (start_label, end_label) in [
+        ("fn schedule_start_server(", "fn schedule_restart_server("),
+        (
+            "fn schedule_restart_server(",
+            "fn schedule_stop_server_and_wait(",
+        ),
+        (
+            "pub fn schedule_kill_port_and_restart(",
+            "fn prepare_start_server(",
+        ),
+    ] {
+        assert!(
+            source_section(&process_manager, start_label, end_label)
+                .contains("validate_server_launch"),
+            "{start_label} must reject blank commands before mutation or queue submission"
+        );
+    }
+}
+
+#[test]
+fn invalid_server_preflight_precedes_control_ownership_mutation() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    for (start_label, end_label) in [
+        ("fn start_server_action(", "fn stop_server_action("),
+        (
+            "fn restart_server_action(",
+            "fn clear_server_output_action(",
+        ),
+    ] {
+        let section = source_section(&app, start_label, end_label);
+        assert_before(section, "validate_server_launch", "ensure_mutation_control");
+        let validation = section.find("validate_server_launch").unwrap();
+        let control = section.find("ensure_mutation_control").unwrap();
+        let rejection = &section[validation..control];
+        assert!(rejection.contains("return;"));
+        assert!(!rejection.contains("interrupt_active_browser_replay_before_route_change"));
+        assert!(!rejection.contains("remote_send_action"));
+    }
+}
+
+#[test]
+fn server_selection_rejects_an_active_ai_tab_before_replay_cancellation() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let select = source_section(&app, "fn select_server_tab_action(", "fn launch_ai_action(");
+    assert!(select.contains("existing_server_tab(&self.state, command_id)"));
+    assert_before(
+        select,
+        "existing_server_tab(&self.state, command_id)",
+        "interrupt_active_browser_replay_before_route_change",
+    );
+    let helper = source_section(&app, "fn existing_server_tab", "#[cfg(test)]");
+    assert!(helper.contains(".filter(|tab| tab.tab_type == TabType::Server)"));
+}
+
+#[test]
+fn project_deletion_validates_exact_ownership_before_any_replay_cancellation() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let editor = source_section(
+        source_section(
+            &app,
+            "fn delete_editor_action(",
+            "fn delete_project_action(",
+        ),
+        "EditorPanel::Project(draft) => {",
+        "EditorPanel::Folder(draft) => {",
+    );
+    assert_before(
+        editor,
+        "validate_project_deletion(&self.state, &project_id)",
+        "interrupt_browser_project_before_mutation",
+    );
+
+    let local = source_section(
+        &app,
+        "fn delete_project_action(",
+        "fn delete_folder_action(",
+    );
+    assert_before(
+        local,
+        "validate_project_deletion(&self.state, project_id)",
+        "interrupt_browser_project_before_mutation",
+    );
+
+    let remote = source_section(
+        source_section(
+            &app,
+            "fn pump_remote_host_requests(",
+            "fn handle_window_should_close(",
+        ),
+        "RemoteAction::DeleteProject { project_id } => {",
+        "RemoteAction::SaveFolder {",
+    );
+    assert_before(
+        remote,
+        "validate_project_deletion(&self.state, &project_id)",
+        "delete_project_action",
+    );
+    assert!(remote.contains("RemoteActionResult::error"));
+    assert_before(remote, "delete_project_action", "did_change = true");
+    let helper = source_section(&app, "fn validate_project_deletion", "#[cfg(test)]");
+    assert!(helper.contains("find_project(project_id)"));
+}
+
+#[test]
+fn unknown_project_preflight_precedes_control_ownership_mutation() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let section = source_section(
+        &app,
+        "fn delete_project_action(",
+        "fn delete_folder_action(",
+    );
+    assert_before(
+        section,
+        "validate_project_deletion(&self.state, project_id)",
+        "ensure_mutation_control",
+    );
+    let validation = section
+        .find("validate_project_deletion(&self.state, project_id)")
+        .unwrap();
+    let control = section.find("ensure_mutation_control").unwrap();
+    let rejection = &section[validation..control];
+    assert!(rejection.contains("return;"));
+    assert!(!rejection.contains("interrupt_browser_project_before_mutation"));
+    assert!(!rejection.contains("spawn_remote_request"));
+}
+
+#[test]
 fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridge_first() {
     let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
     let process_manager = include_str!("../src/services/process_manager.rs").replace("\r\n", "\n");
@@ -434,13 +652,13 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
         (
             "fn restart_server_action(",
             "fn clear_server_output_action(",
-            "find_command(command_id)",
+            "validate_server_launch",
             ".restart_server(",
         ),
         (
             "fn kill_server_port_action(",
             "fn select_server_tab_action(",
-            "find_command(command_id)",
+            "validate_server_launch",
             "schedule_kill_port_and_restart",
         ),
         (
@@ -502,7 +720,7 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
     );
     assert_before(
         remote_restart_server,
-        "find_command(&command_id)",
+        "validate_server_launch",
         "interrupt_active_browser_replay_before_route_change",
     );
     assert_before(
@@ -557,7 +775,7 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
         (
             "RemoteAction::StartServer {",
             "RemoteAction::StopServer {",
-            "find_command(&command_id)",
+            "validate_server_launch",
             "start_server_with_remote_response",
         ),
         (

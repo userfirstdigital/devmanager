@@ -4580,6 +4580,13 @@ impl BrowserWebViewHost {
     }
 
     pub fn drain_events(&mut self) -> Vec<BrowserHostEvent> {
+        self.drain_events_with_pre_apply_observer(|_, _| {})
+    }
+
+    pub fn drain_events_with_pre_apply_observer(
+        &mut self,
+        mut before_apply: impl FnMut(&BrowserHostEvent, &BrowserHostState),
+    ) -> Vec<BrowserHostEvent> {
         self.pump_page_recording_ipc();
         let incoming: Vec<_> = self.event_receiver.try_iter().collect();
         let mut events = Vec::with_capacity(incoming.len());
@@ -4593,6 +4600,22 @@ impl BrowserWebViewHost {
             let Some(event) = contain_queued_host_event(event, document_taint) else {
                 continue;
             };
+            if let BrowserHostEvent::UserInput {
+                workspace_key,
+                tab_id,
+                ..
+            } = &event
+            {
+                let target_is_live = self
+                    .state
+                    .workspace(workspace_key)
+                    .map(|snapshot| snapshot.tabs.iter().any(|tab| tab.id == *tab_id))
+                    .unwrap_or(false);
+                if !target_is_live {
+                    continue;
+                }
+            }
+            before_apply(&event, &self.state);
             match &event {
                 BrowserHostEvent::UrlChanged {
                     workspace_key,
@@ -6602,15 +6625,15 @@ mod secret_document_state_tests {
     };
     use crate::browser::commands::HostControlQueue;
     use crate::browser::{
-        compile_browser_replay, BrowserApprovalPolicy, BrowserCommand, BrowserDiagnosticLevel,
-        BrowserDownloadState, BrowserError, BrowserHostControl, BrowserHostEvent,
-        BrowserInvocationActor, BrowserJournalActor, BrowserOperationTarget, BrowserPageLoadState,
-        BrowserRecipeAction, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
-        BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayLocatorSlot,
-        BrowserReplayRepairResumeCursor, BrowserResourceKind, BrowserResourceLimits,
-        BrowserResourceStore, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
-        BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport, BrowserWorkspaceKey,
-        BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
+        browser_command_channel, compile_browser_replay, BrowserApprovalPolicy, BrowserCommand,
+        BrowserDiagnosticLevel, BrowserDownloadState, BrowserError, BrowserHostControl,
+        BrowserHostEvent, BrowserInvocationActor, BrowserJournalActor, BrowserOperationTarget,
+        BrowserPageLoadState, BrowserRecipeAction, BrowserRecipeLocator, BrowserRecipeStep,
+        BrowserRecipeV1, BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayLocatorSlot,
+        BrowserReplayRepairResumeCursor, BrowserReplayStatus, BrowserResourceKind,
+        BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
+        BrowserScreenshotMode, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
+        BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
     };
     use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
 
@@ -6619,6 +6642,161 @@ mod secret_document_state_tests {
         CloseTab,
         ResetWorkspace,
         ClearProjectProfile,
+    }
+
+    #[tokio::test]
+    async fn queued_user_input_cancels_before_revision_and_fences_a_retained_response() {
+        let workspace_key =
+            BrowserWorkspaceKey::new("queued-input-project", "queued-input-conversation").unwrap();
+        let mut host = BrowserWebViewHost::unavailable("queued input fixture");
+        let initial = host
+            .state
+            .ensure_workspace(workspace_key.clone(), BrowserWorkspaceSnapshot::default())
+            .unwrap();
+        let tab_id = initial.snapshot.selected_tab_id.clone().unwrap();
+
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let replay = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "queued-input-replay".to_string(),
+                        name: "Queued input replay".to_string(),
+                        description: "Input cancellation ordering fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: Vec::new(),
+                        steps: vec![BrowserRecipeStep {
+                            id: "reload".to_string(),
+                            action: BrowserRecipeAction::Reload,
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let controller = bridge.bind(workspace_key.clone(), std::time::Duration::from_secs(1));
+        let pending = tokio::spawn({
+            let tab_id = tab_id.clone();
+            async move { controller.request(BrowserCommand::Reload { tab_id }).await }
+        });
+        let retained = inbox.recv().await.expect("retained controller request");
+
+        host.event_sender
+            .send(BrowserHostEvent::UserInput {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+                kind: BrowserUserInputKind::Keyboard,
+            })
+            .unwrap();
+        let initial_revision = initial.revision;
+        let mut observed_revision = None;
+        let events = host.drain_events_with_pre_apply_observer(|event, state| {
+            observed_revision = state
+                .workspace(&workspace_key)
+                .map(|snapshot| snapshot.revision);
+            bridge.observe_host_event(event);
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [BrowserHostEvent::UserInput { .. }]
+        ));
+        assert_eq!(observed_revision, Some(initial_revision));
+        assert_eq!(
+            host.state.workspace(&workspace_key).unwrap().revision.0,
+            initial_revision.0 + 1
+        );
+        assert_eq!(
+            coordinator.status(&replay.instance).unwrap().status,
+            BrowserReplayStatus::Cancelled
+        );
+        retained.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(pending.await.unwrap(), Err(BrowserError::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn stale_queued_user_input_is_dropped_before_shared_replay_cancellation() {
+        let workspace_key =
+            BrowserWorkspaceKey::new("stale-input-project", "stale-input-conversation").unwrap();
+        let mut host = BrowserWebViewHost::unavailable("stale queued input fixture");
+        let initial = host
+            .state
+            .ensure_workspace(workspace_key.clone(), BrowserWorkspaceSnapshot::default())
+            .unwrap();
+        let stale_tab_id = initial.snapshot.selected_tab_id.clone().unwrap();
+        host.event_sender
+            .send(BrowserHostEvent::UserInput {
+                workspace_key: workspace_key.clone(),
+                tab_id: stale_tab_id.clone(),
+                kind: BrowserUserInputKind::Keyboard,
+            })
+            .unwrap();
+        let replacement = host.state.close_tab(&workspace_key, &stale_tab_id).unwrap();
+        let replacement_tab_id = replacement.snapshot.selected_tab_id.clone().unwrap();
+        let revision_before = replacement.revision;
+
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let replay = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "stale-input-replay".to_string(),
+                        name: "Stale input replay".to_string(),
+                        description: "Stale input admission fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: Vec::new(),
+                        steps: vec![BrowserRecipeStep {
+                            id: "reload".to_string(),
+                            action: BrowserRecipeAction::Reload,
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let controller = bridge.bind(workspace_key.clone(), std::time::Duration::from_secs(1));
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: replacement_tab_id,
+                })
+                .await
+        });
+        let retained = inbox.recv().await.expect("retained replacement request");
+        let replay_status_before = coordinator.status(&replay.instance).unwrap().status;
+
+        let mut observer_calls = 0;
+        let events = host.drain_events_with_pre_apply_observer(|event, _state| {
+            observer_calls += 1;
+            bridge.observe_host_event(event);
+        });
+
+        assert!(events.is_empty());
+        assert_eq!(observer_calls, 0);
+        assert_eq!(
+            host.state.workspace(&workspace_key).unwrap().revision,
+            revision_before
+        );
+        assert_eq!(
+            coordinator.status(&replay.instance).unwrap().status,
+            replay_status_before
+        );
+        retained.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(pending.await.unwrap(), Ok(BrowserResponse::Acknowledged));
     }
 
     #[test]
@@ -7118,7 +7296,7 @@ mod secret_document_state_tests {
             event,
             BrowserHostEvent::PageLoad { url, .. } if url.is_empty()
         )));
-        assert!(safe
+        assert!(!safe
             .iter()
             .any(|event| matches!(event, BrowserHostEvent::UserInput { .. })));
         assert!(safe

@@ -7,9 +7,9 @@ use crate::browser::{
     browser_event_plan, browser_host_reconcile_plan, browser_pane_open_fallback,
     browser_replay_repair_candidate_from_annotation, browser_response_sync, browser_settings_plan,
     browser_workflow_review_editor_for_field, browser_workflow_review_editor_mutation,
-    calculate_browser_split, render_browser_pane, route_browser_request, BrowserAnnotation,
-    BrowserAttachmentBroker, BrowserAttachmentProjection, BrowserBounds, BrowserCommand,
-    BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
+    calculate_browser_split, render_browser_pane, route_browser_request, BrowserActionPlan,
+    BrowserAnnotation, BrowserAttachmentBroker, BrowserAttachmentProjection, BrowserBounds,
+    BrowserCommand, BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
     BrowserGatewayHandle, BrowserHostVisibility, BrowserInvocationActor, BrowserInvocationContext,
     BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
     BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserReplayInstance,
@@ -1539,15 +1539,14 @@ impl NativeShell {
     fn pump_browser_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let browser_bridge = self.browser_bridge.clone();
         let events = self.with_browser_host_control_barrier(window, |browser_host| {
-            let mut events = browser_host.drain_events();
-            for event in &events {
+            let mut events = browser_host.drain_events_with_pre_apply_observer(|event, _state| {
                 browser_bridge.observe_host_event_under_host_control_barrier(event);
-            }
+            });
             browser_host.pump_async_completions(window);
-            let completion_events = browser_host.drain_events();
-            for event in &completion_events {
-                browser_bridge.observe_host_event_under_host_control_barrier(event);
-            }
+            let completion_events =
+                browser_host.drain_events_with_pre_apply_observer(|event, _state| {
+                    browser_bridge.observe_host_event_under_host_control_barrier(event);
+                });
             events.extend(completion_events);
             events
         });
@@ -1824,10 +1823,12 @@ impl NativeShell {
                     let browser_bridge = self.browser_bridge.clone();
                     let (post_dialog_events, resolution) =
                         self.with_browser_host_control_barrier(window, |browser_host| {
-                            let events = browser_host.drain_events();
-                            for event in &events {
-                                browser_bridge.observe_host_event_under_host_control_barrier(event);
-                            }
+                            let events = browser_host.drain_events_with_pre_apply_observer(
+                                |event, _state| {
+                                    browser_bridge
+                                        .observe_host_event_under_host_control_barrier(event);
+                                },
+                            );
                             let resolution = browser_host.resolve_approval(
                                 window,
                                 &workspace_key,
@@ -2789,23 +2790,38 @@ impl NativeShell {
         if self.browser_replay_secret_prompt.is_some() && action.is_annotation_editor_action() {
             return;
         }
-
-        if self.browser_replay_secret_prompt.is_some()
-            && matches!(
-                &action,
-                BrowserPaneAction::Collapse
-                    | BrowserPaneAction::CreateTab
-                    | BrowserPaneAction::SelectTab(_)
-                    | BrowserPaneAction::Back
-                    | BrowserPaneAction::Forward
-                    | BrowserPaneAction::Reload
-                    | BrowserPaneAction::FocusAddress
-                    | BrowserPaneAction::SubmitAddress
-                    | BrowserPaneAction::StartRecording
-            )
-        {
-            self.close_browser_replay_secret_prompt_for_route(None);
+        if matches!(action, BrowserPaneAction::StartRecording) && self.remote_mode.is_some() {
+            self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                Some("Browser workflow recording is unavailable from a remote client.".to_string());
+            cx.notify();
+            return;
         }
+
+        let address_draft = self
+            .browser_ui
+            .get(&workspace_key)
+            .and_then(|ui| ui.address_draft.clone())
+            .unwrap_or_default();
+        let prompt_active = self.browser_replay_secret_prompt.is_some();
+        let plan = match validate_browser_pane_action_before_replay_interrupt(
+            &workspace_key,
+            &snapshot,
+            &address_draft,
+            &action,
+            prompt_active,
+            || {
+                self.browser_bridge.interrupt_workspace(&workspace_key);
+                self.retire_browser_replay_ui_after_interrupt(&workspace_key);
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                    Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
 
         match action {
             BrowserPaneAction::FocusReplaySecret {
@@ -3252,14 +3268,6 @@ impl NativeShell {
                 return;
             }
             BrowserPaneAction::StartRecording => {
-                if self.remote_mode.is_some() {
-                    self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(
-                        "Browser workflow recording is unavailable from a remote client."
-                            .to_string(),
-                    );
-                    cx.notify();
-                    return;
-                }
                 if self
                     .browser_host
                     .workspace_snapshot(&workspace_key)
@@ -3479,25 +3487,6 @@ impl NativeShell {
             _ => {}
         }
 
-        let address_draft = self
-            .browser_ui
-            .get(&workspace_key)
-            .and_then(|ui| ui.address_draft.clone())
-            .unwrap_or_default();
-        let plan = match browser_action_plan(
-            Some(&workspace_key),
-            Some(&snapshot),
-            &address_draft,
-            action.clone(),
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.browser_ui.entry(workspace_key).or_default().diagnostic =
-                    Some(error.to_string());
-                cx.notify();
-                return;
-            }
-        };
         if let Some(diagnostic) = plan.diagnostic {
             self.browser_ui
                 .entry(plan.workspace_key)
@@ -6090,25 +6079,31 @@ impl NativeShell {
                     focus,
                     dimensions,
                 } => {
-                    let command_exists = self.state.find_command(&command_id).is_some();
-                    if focus && command_exists {
-                        self.interrupt_active_browser_replay_before_route_change(None);
-                    }
-                    let result = self.process_manager.start_server_with_remote_response(
-                        &mut self.state,
-                        &command_id,
-                        dimensions,
-                        focus,
-                        response.clone(),
-                    );
-                    match result {
-                        Ok(()) => {
-                            did_change = true;
-                            self.save_session_state();
-                            defer_response_send = response.is_some();
-                            RemoteActionResult::ok(None, None)
+                    if let Err(error) = self
+                        .process_manager
+                        .validate_server_launch(&self.state, &command_id)
+                    {
+                        RemoteActionResult::error(error)
+                    } else {
+                        if focus {
+                            self.interrupt_active_browser_replay_before_route_change(None);
                         }
-                        Err(error) => RemoteActionResult::error(error),
+                        let result = self.process_manager.start_server_with_remote_response(
+                            &mut self.state,
+                            &command_id,
+                            dimensions,
+                            focus,
+                            response.clone(),
+                        );
+                        match result {
+                            Ok(()) => {
+                                did_change = true;
+                                self.save_session_state();
+                                defer_response_send = response.is_some();
+                                RemoteActionResult::ok(None, None)
+                            }
+                            Err(error) => RemoteActionResult::error(error),
+                        }
                     }
                 }
                 RemoteAction::StopServer { command_id } => {
@@ -6130,23 +6125,28 @@ impl NativeShell {
                     command_id,
                     dimensions,
                 } => {
-                    if self.state.find_command(&command_id).is_some() {
+                    if let Err(error) = self
+                        .process_manager
+                        .validate_server_launch(&self.state, &command_id)
+                    {
+                        RemoteActionResult::error(error)
+                    } else {
                         self.interrupt_active_browser_replay_before_route_change(None);
-                    }
-                    match self.process_manager.restart_server_with_remote_response(
-                        &mut self.state,
-                        &command_id,
-                        dimensions,
-                        "--- Restarting... ---",
-                        response.clone(),
-                    ) {
-                        Ok(()) => {
-                            did_change = true;
-                            self.save_session_state();
-                            defer_response_send = response.is_some();
-                            RemoteActionResult::ok(None, None)
+                        match self.process_manager.restart_server_with_remote_response(
+                            &mut self.state,
+                            &command_id,
+                            dimensions,
+                            "--- Restarting... ---",
+                            response.clone(),
+                        ) {
+                            Ok(()) => {
+                                did_change = true;
+                                self.save_session_state();
+                                defer_response_send = response.is_some();
+                                RemoteActionResult::ok(None, None)
+                            }
+                            Err(error) => RemoteActionResult::error(error),
                         }
-                        Err(error) => RemoteActionResult::error(error),
                     }
                 }
                 RemoteAction::LaunchAi {
@@ -6457,9 +6457,13 @@ impl NativeShell {
                     RemoteActionResult::ok(None, None)
                 }
                 RemoteAction::DeleteProject { project_id } => {
-                    self.delete_project_action(&project_id, cx);
-                    did_change = true;
-                    RemoteActionResult::ok(None, None)
+                    if let Err(error) = validate_project_deletion(&self.state, &project_id) {
+                        RemoteActionResult::error(error)
+                    } else {
+                        self.delete_project_action(&project_id, cx);
+                        did_change = true;
+                        RemoteActionResult::ok(None, None)
+                    }
                 }
                 RemoteAction::SaveFolder {
                     project_id,
@@ -9045,6 +9049,11 @@ impl NativeShell {
                 let Some(project_id) = draft.existing_id else {
                     return;
                 };
+                if let Err(error) = validate_project_deletion(&self.state, &project_id) {
+                    self.editor_notice = Some(error);
+                    cx.notify();
+                    return;
+                }
                 if self.remote_mode.is_some() {
                     if !self.ensure_remote_control(cx) {
                         return;
@@ -9254,6 +9263,11 @@ impl NativeShell {
     }
 
     fn delete_project_action(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if let Err(error) = validate_project_deletion(&self.state, project_id) {
+            self.terminal_notice = Some(error);
+            cx.notify();
+            return;
+        }
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -11788,6 +11802,14 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = self
+            .process_manager
+            .validate_server_launch(&self.state, command_id)
+        {
+            self.terminal_notice = Some(format!("Failed to start server: {error}"));
+            cx.notify();
+            return;
+        }
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -11807,11 +11829,6 @@ impl NativeShell {
             return;
         }
 
-        if self.state.find_command(command_id).is_none() {
-            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
-            cx.notify();
-            return;
-        }
         let dimensions = self.terminal_dimensions(window);
         let Some(port) = self
             .state
@@ -11872,6 +11889,14 @@ impl NativeShell {
                         background_executor.timer(Duration::from_millis(50)).await;
                     }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        if let Err(error) = this
+                            .process_manager
+                            .validate_server_launch(&this.state, &command_id)
+                        {
+                            this.terminal_notice = Some(format!("Failed to start server: {error}"));
+                            cx.notify();
+                            return;
+                        }
                         if let Some(state) = this.active_port_state.as_mut() {
                             if state.command_id == command_id && state.port == port {
                                 state.status = status.clone();
@@ -11990,6 +12015,14 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = self
+            .process_manager
+            .validate_server_launch(&self.state, command_id)
+        {
+            self.terminal_notice = Some(format!("Failed to restart server: {error}"));
+            cx.notify();
+            return;
+        }
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -12004,11 +12037,6 @@ impl NativeShell {
             return;
         }
 
-        if self.state.find_command(command_id).is_none() {
-            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
-            cx.notify();
-            return;
-        }
         self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
         let port = self
@@ -12089,6 +12117,16 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = self
+            .process_manager
+            .validate_server_launch(&self.state, command_id)
+        {
+            self.terminal_notice = Some(format!(
+                "Failed to restart server after freeing port: {error}"
+            ));
+            cx.notify();
+            return;
+        }
         let Some(lookup) = self
             .state
             .find_command(command_id)
@@ -12154,7 +12192,8 @@ impl NativeShell {
                 lookup.command.label.clone(),
             )
         });
-        if lookup.is_none() && self.state.find_tab(command_id).is_none() {
+        let server_tab_exists = existing_server_tab(&self.state, command_id).is_some();
+        if lookup.is_none() && !server_tab_exists {
             self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
             cx.notify();
             return;
@@ -17034,6 +17073,51 @@ fn local_browser_workflow_project_root(
         })
 }
 
+fn existing_server_tab<'a>(state: &'a AppState, tab_id: &str) -> Option<&'a SessionTab> {
+    state
+        .find_tab(tab_id)
+        .filter(|tab| tab.tab_type == TabType::Server)
+}
+
+fn validate_project_deletion(state: &AppState, project_id: &str) -> Result<(), String> {
+    state
+        .find_project(project_id)
+        .map(|_| ())
+        .ok_or_else(|| format!("Unknown project `{project_id}`"))
+}
+
+fn validate_browser_pane_action_before_replay_interrupt(
+    workspace_key: &BrowserWorkspaceKey,
+    snapshot: &BrowserWorkspaceSnapshot,
+    address_draft: &str,
+    action: &BrowserPaneAction,
+    prompt_active: bool,
+    mut interrupt_then_retire: impl FnMut(),
+) -> Result<BrowserActionPlan, BrowserError> {
+    let plan = browser_action_plan(
+        Some(workspace_key),
+        Some(snapshot),
+        address_draft,
+        action.clone(),
+    )?;
+    let interrupts_prompt_replay = match action {
+        BrowserPaneAction::SelectTab(_) => !plan.commands.is_empty(),
+        BrowserPaneAction::Collapse
+        | BrowserPaneAction::CreateTab
+        | BrowserPaneAction::Back
+        | BrowserPaneAction::Forward
+        | BrowserPaneAction::Reload
+        | BrowserPaneAction::FocusAddress
+        | BrowserPaneAction::SubmitAddress
+        | BrowserPaneAction::StartRecording => true,
+        _ => false,
+    };
+    if prompt_active && interrupts_prompt_replay {
+        interrupt_then_retire();
+    }
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18924,6 +19008,382 @@ mod tests {
             } else {
                 "\u{1b}a".to_string()
             })
+        );
+    }
+
+    #[test]
+    fn server_tab_fallback_rejects_an_active_ai_tab_without_state_mutation() {
+        let mut state = AppState::default();
+        let ai_tab = sample_ai_tab();
+        state.active_tab_id = Some(ai_tab.id.clone());
+        state.open_tabs.push(ai_tab);
+        let tabs_before = state.open_tabs.clone();
+        let active_before = state.active_tab_id.clone();
+
+        assert!(existing_server_tab(&state, "tab-1").is_none());
+        assert_eq!(state.open_tabs, tabs_before);
+        assert_eq!(state.active_tab_id, active_before);
+
+        state.open_tabs.push(SessionTab {
+            id: "server-tab".to_string(),
+            tab_type: TabType::Server,
+            project_id: "project-1".to_string(),
+            command_id: Some("server-command".to_string()),
+            pty_session_id: Some("server-command".to_string()),
+            label: Some("Server".to_string()),
+            ssh_connection_id: None,
+            browser_workspace: None,
+        });
+        assert_eq!(
+            existing_server_tab(&state, "server-tab").map(|tab| tab.tab_type.clone()),
+            Some(TabType::Server)
+        );
+    }
+
+    #[test]
+    fn stale_project_deletion_preflight_is_side_effect_free() {
+        let mut state = AppState::default();
+        let ai_tab = sample_ai_tab();
+        state.active_tab_id = Some(ai_tab.id.clone());
+        state.open_tabs.push(ai_tab);
+        let tabs_before = state.open_tabs.clone();
+        let active_before = state.active_tab_id.clone();
+        let projects_before = state.config.projects.clone();
+
+        assert_eq!(
+            validate_project_deletion(&state, "project-1"),
+            Err("Unknown project `project-1`".to_string())
+        );
+        assert_eq!(state.open_tabs, tabs_before);
+        assert_eq!(state.active_tab_id, active_before);
+        assert_eq!(state.config.projects, projects_before);
+
+        state.config.projects.push(Project {
+            id: "project-1".to_string(),
+            ..Project::default()
+        });
+        assert_eq!(validate_project_deletion(&state, "project-1"), Ok(()));
+    }
+
+    fn populated_secret_replay(
+        workspace_key: &BrowserWorkspaceKey,
+        recipe_id: &str,
+    ) -> (
+        BrowserCommandBridge,
+        crate::browser::BrowserReplayCoordinator,
+        crate::browser::BrowserReplayStart,
+        BrowserReplaySecretPromptVault,
+    ) {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput,
+            BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeValue, BrowserRecipeViewport, BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let (bridge, _inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let started = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: recipe_id.to_string(),
+                        name: "Prompt boundary fixture".to_string(),
+                        description: "Prompt boundary fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: vec![BrowserRecipeInput {
+                            name: "credential".to_string(),
+                            kind: BrowserRecipeInputKind::Secret,
+                            default_value: None,
+                        }],
+                        steps: vec![BrowserRecipeStep {
+                            id: "credential".to_string(),
+                            action: BrowserRecipeAction::Type {
+                                locator: BrowserRecipeLocator {
+                                    test_id: Some("credential".to_string()),
+                                    ..BrowserRecipeLocator::default()
+                                },
+                                value: BrowserRecipeValue::Input {
+                                    name: "credential".to_string(),
+                                },
+                            },
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (mut vault, _) = BrowserReplaySecretPromptVault::install(
+            started.instance.clone(),
+            started.projection.unresolved_secret_inputs.clone(),
+        )
+        .unwrap();
+        vault
+            .edit(&started.instance, "credential", "populated-secret")
+            .unwrap();
+        (bridge, coordinator, started, vault)
+    }
+
+    #[test]
+    fn invalid_lifecycle_preflights_preserve_control_runtime_queue_and_replay_witnesses() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct LifecycleBoundaryWitness {
+            control_owner: Option<String>,
+            control_generation: u64,
+            tabs: Vec<SessionTab>,
+            runtime_generation: u64,
+            queue_generation: u64,
+            replay_status: BrowserReplayStatus,
+        }
+
+        let mut state = AppState::default();
+        state.config.projects.push(sample_project());
+        let ai_tab = sample_ai_tab();
+        state.active_tab_id = Some(ai_tab.id.clone());
+        state.open_tabs.push(ai_tab);
+        let workspace_key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let (bridge, coordinator, started, _vault) =
+            populated_secret_replay(&workspace_key, "lifecycle-preflight-witness");
+        let process_manager = ProcessManager::new();
+        let runtime_generation = process_manager.runtime_revision();
+        let initial = LifecycleBoundaryWitness {
+            control_owner: Some("remote-controller".to_string()),
+            control_generation: 41,
+            tabs: state.open_tabs.clone(),
+            runtime_generation,
+            queue_generation: 17,
+            replay_status: coordinator.status(&started.instance).unwrap().status,
+        };
+
+        for preflight in [
+            process_manager.validate_server_launch(&state, "server-cmd"),
+            process_manager.validate_server_launch(&state, "missing-command"),
+            validate_project_deletion(&state, "missing-project"),
+        ] {
+            let mut witness = initial.clone();
+            let result = preflight.map(|_| {
+                witness.control_owner = None;
+                witness.control_generation += 1;
+                witness.tabs.clear();
+                witness.runtime_generation += 1;
+                witness.queue_generation += 1;
+                bridge.interrupt_workspace(&workspace_key);
+                witness.replay_status = coordinator.status(&started.instance).unwrap().status;
+            });
+
+            assert!(result.is_err());
+            assert_eq!(witness, initial);
+            assert_eq!(state.open_tabs, initial.tabs);
+            assert_eq!(process_manager.runtime_revision(), runtime_generation);
+            assert!(process_manager.drain_process_op_completions().is_empty());
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                initial.replay_status
+            );
+        }
+    }
+
+    #[test]
+    fn tab_selection_preflight_preserves_invalid_authority_and_cancels_valid_change_first() {
+        use crate::browser::{BrowserTabSnapshot, BrowserViewport};
+
+        let workspace_key = BrowserWorkspaceKey::new("tab-project", "tab-conversation").unwrap();
+        let snapshot = BrowserWorkspaceSnapshot {
+            tabs: vec![
+                BrowserTabSnapshot {
+                    id: "tab-a".to_string(),
+                    title: "A".to_string(),
+                    url: "https://a.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+                BrowserTabSnapshot {
+                    id: "tab-b".to_string(),
+                    title: "B".to_string(),
+                    url: "https://b.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+            ],
+            selected_tab_id: Some("tab-a".to_string()),
+            ..BrowserWorkspaceSnapshot::default()
+        };
+
+        for (recipe_id, action, expect_error) in [
+            (
+                "unknown-tab-prompt",
+                BrowserPaneAction::SelectTab("missing-tab".to_string()),
+                true,
+            ),
+            (
+                "selected-tab-prompt",
+                BrowserPaneAction::SelectTab("tab-a".to_string()),
+                false,
+            ),
+        ] {
+            let (bridge, coordinator, started, vault) =
+                populated_secret_replay(&workspace_key, recipe_id);
+            let status_before = coordinator.status(&started.instance).unwrap().status;
+            let mut prompt = Some(vault);
+            let mut boundary_called = false;
+            let result = validate_browser_pane_action_before_replay_interrupt(
+                &workspace_key,
+                &snapshot,
+                "",
+                &action,
+                true,
+                || {
+                    boundary_called = true;
+                    bridge.interrupt_workspace(&workspace_key);
+                    prompt.take();
+                },
+            );
+
+            assert_eq!(result.is_err(), expect_error, "{recipe_id}");
+            if let Ok(plan) = result {
+                assert!(plan.commands.is_empty(), "{recipe_id}");
+            }
+            assert!(!boundary_called, "{recipe_id}");
+            assert_eq!(
+                prompt.as_ref().unwrap().projection().is_set,
+                vec![true],
+                "{recipe_id}"
+            );
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                status_before,
+                "{recipe_id}"
+            );
+        }
+
+        let (bridge, coordinator, started, vault) =
+            populated_secret_replay(&workspace_key, "different-tab-prompt");
+        let mut prompt = Some(vault);
+        let mut status_before_retirement = None;
+        let plan = validate_browser_pane_action_before_replay_interrupt(
+            &workspace_key,
+            &snapshot,
+            "",
+            &BrowserPaneAction::SelectTab("tab-b".to_string()),
+            true,
+            || {
+                bridge.interrupt_workspace(&workspace_key);
+                status_before_retirement =
+                    Some(coordinator.status(&started.instance).unwrap().status);
+                prompt.take();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.commands,
+            vec![BrowserCommand::SelectTab {
+                tab_id: "tab-b".to_string()
+            }]
+        );
+        assert_eq!(
+            status_before_retirement,
+            Some(BrowserReplayStatus::Cancelled)
+        );
+        assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn invalid_browser_address_preserves_populated_prompt_and_replay_authority() {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput,
+            BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeValue, BrowserRecipeViewport, BrowserTabSnapshot, BrowserViewport,
+            BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let workspace_key =
+            BrowserWorkspaceKey::new("prompt-project", "prompt-conversation").unwrap();
+        let (bridge, _inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let started = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "invalid-address-prompt".to_string(),
+                        name: "Invalid address prompt".to_string(),
+                        description: "Prompt preservation fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: vec![BrowserRecipeInput {
+                            name: "credential".to_string(),
+                            kind: BrowserRecipeInputKind::Secret,
+                            default_value: None,
+                        }],
+                        steps: vec![BrowserRecipeStep {
+                            id: "credential".to_string(),
+                            action: BrowserRecipeAction::Type {
+                                locator: BrowserRecipeLocator {
+                                    test_id: Some("credential".to_string()),
+                                    ..BrowserRecipeLocator::default()
+                                },
+                                value: BrowserRecipeValue::Input {
+                                    name: "credential".to_string(),
+                                },
+                            },
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (mut vault, _) = BrowserReplaySecretPromptVault::install(
+            started.instance.clone(),
+            started.projection.unresolved_secret_inputs.clone(),
+        )
+        .unwrap();
+        vault
+            .edit(&started.instance, "credential", "populated-secret")
+            .unwrap();
+        let mut prompt = Some(vault);
+        let mut boundary_called = false;
+        let snapshot = BrowserWorkspaceSnapshot {
+            tabs: vec![BrowserTabSnapshot {
+                id: "prompt-tab".to_string(),
+                title: "Prompt fixture".to_string(),
+                url: "https://example.test".to_string(),
+                viewport: BrowserViewport::default(),
+            }],
+            selected_tab_id: Some("prompt-tab".to_string()),
+            ..BrowserWorkspaceSnapshot::default()
+        };
+
+        let result = validate_browser_pane_action_before_replay_interrupt(
+            &workspace_key,
+            &snapshot,
+            "   ",
+            &BrowserPaneAction::SubmitAddress,
+            prompt.is_some(),
+            || {
+                boundary_called = true;
+                bridge.interrupt_workspace(&workspace_key);
+                prompt.take();
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(BrowserError::NavigationFailure { url, message })
+                if url.is_empty() && message == "address cannot be blank"
+        ));
+        assert!(!boundary_called);
+        assert_eq!(prompt.as_ref().unwrap().projection().is_set, vec![true]);
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::NeedsUserSecret
         );
     }
 
