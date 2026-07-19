@@ -1511,12 +1511,12 @@ impl NativeShell {
         let events = self.with_browser_host_control_barrier(window, |browser_host| {
             let mut events = browser_host.drain_events();
             for event in &events {
-                browser_bridge.observe_host_event(event);
+                browser_bridge.observe_host_event_under_host_control_barrier(event);
             }
             browser_host.pump_async_completions(window);
             let completion_events = browser_host.drain_events();
             for event in &completion_events {
-                browser_bridge.observe_host_event(event);
+                browser_bridge.observe_host_event_under_host_control_barrier(event);
             }
             events.extend(completion_events);
             events
@@ -1670,7 +1670,7 @@ impl NativeShell {
                         self.with_browser_host_control_barrier(window, |browser_host| {
                             let events = browser_host.drain_events();
                             for event in &events {
-                                browser_bridge.observe_host_event(event);
+                                browser_bridge.observe_host_event_under_host_control_barrier(event);
                             }
                             let resolution = browser_host.resolve_approval(
                                 window,

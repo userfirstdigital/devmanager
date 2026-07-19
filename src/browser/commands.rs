@@ -1131,14 +1131,17 @@ impl BrowserCommandBridge {
     }
 
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
-        self.host_controls.with_locked(|| {
-            apply_host_event(
-                &self.response_linearization,
-                &self.cancellations,
-                &self.replay_coordinator,
-                event,
-            )
-        });
+        self.host_controls
+            .with_locked(|| self.observe_host_event_under_host_control_barrier(event));
+    }
+
+    pub(crate) fn observe_host_event_under_host_control_barrier(&self, event: &BrowserHostEvent) {
+        apply_host_event(
+            &self.response_linearization,
+            &self.cancellations,
+            &self.replay_coordinator,
+            event,
+        );
     }
 
     pub fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
@@ -5082,6 +5085,71 @@ mod secure_command_tests {
         response.join().unwrap();
         assert_eq!(pending.await.unwrap(), Err(BrowserError::Interrupted));
         assert!(!registration.is_current(BrowserRegistrationLeaseTicket(0)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_host_control_barrier_event_observation_cancels_user_input_and_noops_other_events(
+    ) {
+        let user_key = workspace("project-a", "user-conversation");
+        let no_op_key = workspace("project-a", "no-op-conversation");
+        let (bridge, mut inbox) = browser_command_channel(2);
+
+        let user_controller = bridge.bind(user_key.clone(), Duration::from_secs(1));
+        let user_pending = tokio::spawn(async move {
+            user_controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        let user_request = inbox.recv().await.expect("user-scoped request");
+
+        let no_op_controller = bridge.bind(no_op_key.clone(), Duration::from_secs(1));
+        let no_op_pending = tokio::spawn(async move {
+            no_op_controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-b".to_string(),
+                })
+                .await
+        });
+        let no_op_request = inbox.recv().await.expect("no-op-scoped request");
+
+        let worker_bridge = bridge.clone();
+        let worker_user_key = user_key.clone();
+        let worker_no_op_key = no_op_key.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_bridge.with_locked_host_controls(|controls| {
+                assert!(controls.is_empty());
+                worker_bridge.observe_host_event_under_host_control_barrier(
+                    &BrowserHostEvent::UserInput {
+                        workspace_key: worker_user_key,
+                        tab_id: "tab-a".to_string(),
+                        kind: BrowserUserInputKind::Pointer,
+                    },
+                );
+                worker_bridge.observe_host_event_under_host_control_barrier(
+                    &BrowserHostEvent::AutomationStateChanged {
+                        workspace_key: worker_no_op_key,
+                        tab_id: "tab-b".to_string(),
+                    },
+                );
+            });
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("barrier-held observation must not recursively lock host controls");
+        worker.join().unwrap();
+
+        assert_eq!(user_pending.await.unwrap(), Err(BrowserError::Interrupted));
+        user_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert!(no_op_request.cancellation_is_current());
+        no_op_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(
+            no_op_pending.await.unwrap(),
+            Ok(BrowserResponse::Acknowledged)
+        );
     }
 }
 

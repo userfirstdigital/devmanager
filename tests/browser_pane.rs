@@ -360,10 +360,14 @@ fn native_shell_routes_mcp_requests_through_the_async_host_queue() {
 #[test]
 fn native_shell_applies_host_input_before_async_browser_completions() {
     let source = include_str!("../src/app/mod.rs");
-    let pump = source
+    let pump_start = source
         .find("fn pump_browser_events")
         .expect("browser event pump should exist");
-    let body = &source[pump..];
+    let pump_end = source[pump_start..]
+        .find("fn with_browser_host_control_barrier")
+        .map(|offset| pump_start + offset)
+        .expect("host-control barrier should follow the event pump");
+    let body = &source[pump_start..pump_end];
     let completions = body
         .find("browser_host.pump_async_completions(window)")
         .expect("the GPUI pump should drain async WebView2 completions");
@@ -376,7 +380,15 @@ fn native_shell_applies_host_input_before_async_browser_completions() {
 
     assert!(events_before < completions);
     assert!(completions < events_after);
-    assert!(body[events_before..completions].contains("observe_host_event"));
+    assert!(
+        body[events_before..completions].contains("observe_host_event_under_host_control_barrier")
+    );
+    assert_eq!(
+        body.matches("observe_host_event_under_host_control_barrier")
+            .count(),
+        3,
+        "both pump drains and the post-dialog drain already hold the host-control barrier"
+    );
 }
 
 #[test]
@@ -509,9 +521,7 @@ fn synchronous_ui_commands_enter_the_host_inside_the_control_barrier() {
         .unwrap()
         + start;
     let dispatch = &source[start..end];
-    let barrier = dispatch
-        .find("with_locked_host_controls_for_command")
-        .unwrap();
+    let barrier = dispatch.find("with_locked_host_work_for_command").unwrap();
     let host_entry = dispatch.find("browser_host.handle_command").unwrap();
     assert!(barrier < host_entry);
 }
@@ -549,7 +559,7 @@ fn native_approval_rechecks_priority_work_and_user_input_after_dialog_before_res
         .map(|offset| barrier + offset)
         .expect("trusted user input received during the dialog must cancel host work");
     let observe = body[input..]
-        .find("browser_bridge.observe_host_event(event)")
+        .find("browser_bridge.observe_host_event_under_host_control_barrier(event)")
         .map(|offset| input + offset)
         .unwrap();
     let resume = body.find("browser_host.resolve_approval(").unwrap();
