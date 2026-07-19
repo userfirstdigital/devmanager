@@ -1100,14 +1100,55 @@ fn replay_cancellation_does_not_relabel_completed_or_failed_replays_as_cancelled
 
 #[test]
 fn replay_scope_has_no_execution_or_platform_coupling() {
+    const APPROVED_PATH_IMPORT: &str = "use std::path::{Path, PathBuf};";
     let source = include_str!("../src/browser/replay.rs");
     let source = source
         .rsplit_once("mod tests {")
         .map(|(production, _)| production)
         .expect("replay source keeps one explicit test-module boundary");
+    let has_only_approved_std_path_import = |candidate: &str| {
+        candidate.matches(APPROVED_PATH_IMPORT).count() == 1
+            && !candidate
+                .replacen(APPROVED_PATH_IMPORT, "", 1)
+                .contains("std::path")
+    };
+    assert!(has_only_approved_std_path_import(source));
+    let component_mutation = source.replacen(
+        APPROVED_PATH_IMPORT,
+        &format!("{APPROVED_PATH_IMPORT}\nuse std::path::Component;"),
+        1,
+    );
+    assert!(
+        !has_only_approved_std_path_import(&component_mutation),
+        "the replay scope guard must reject additional std::path imports"
+    );
+    assert_eq!(
+        source.matches(APPROVED_PATH_IMPORT).count(),
+        1,
+        "replay keeps one explicit canonical-root path import"
+    );
+    let path_coupling = source
+        .lines()
+        .filter(|line| {
+            line.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| matches!(token, "Path" | "PathBuf"))
+        })
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        path_coupling,
+        [
+            "use std::path::{Path, PathBuf};",
+            "canonical_recipe_root: Arc<OnceLock<PathBuf>>,",
+            "authenticated_canonical_root: &Path,",
+            "pub(crate) fn bound_canonical_recipe_root(&self) -> Result<&Path, BrowserReplayError> {",
+            ".map(PathBuf::as_path)",
+            "canonical_recipe_root: Arc<OnceLock<PathBuf>>,",
+        ],
+        "replay path coupling is limited to the authenticated canonical-root binding"
+    );
     for forbidden in [
         "std::fs",
-        "std::path",
         "BrowserHost",
         "BrowserController",
         "BrowserOperationQueue",
