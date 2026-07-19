@@ -1,17 +1,18 @@
 use devmanager::browser::{
     compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind,
     BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
-    BrowserRecipeViewport, BrowserReplayCancellationLease, BrowserReplayCoordinator,
-    BrowserReplayError, BrowserReplayExecutionHandle, BrowserReplayFailureCode, BrowserReplayPlan,
-    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplayStatus, BrowserWorkspaceKey,
-    BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_TEXT_BYTES,
-    MAX_BROWSER_REPLAY_URL_BYTES,
+    BrowserRecipeViewport, BrowserReplayActiveState, BrowserReplayCancellationLease,
+    BrowserReplayCoordinator, BrowserReplayError, BrowserReplayExecutionHandle,
+    BrowserReplayFailureCode, BrowserReplayPlan, BrowserReplayProjection, BrowserReplayPublicInput,
+    BrowserReplayStatus, BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
+    MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 assert_impl_all!(BrowserReplayPublicInput: Send, Sync);
 assert_impl_all!(BrowserReplayPlan: Send, Sync);
 assert_impl_all!(BrowserReplayCoordinator: Clone, Send, Sync);
+assert_impl_all!(BrowserReplayActiveState: Clone, Send, Sync);
 assert_impl_all!(BrowserReplayProjection: Clone, Send, Sync, std::fmt::Debug, serde::Serialize);
 assert_impl_all!(BrowserReplayCancellationLease: Clone, Send, Sync);
 assert_impl_all!(BrowserReplayExecutionHandle: Send, Sync);
@@ -19,6 +20,7 @@ assert_not_impl_any!(BrowserReplayPublicInput: std::fmt::Debug, serde::Serialize
 assert_not_impl_any!(BrowserReplayPlan: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayCancellationLease: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayExecutionHandle: Clone, std::fmt::Debug, serde::Serialize);
+assert_not_impl_any!(BrowserReplayActiveState: serde::Serialize);
 
 fn locator(test_id: &str) -> BrowserRecipeLocator {
     BrowserRecipeLocator {
@@ -904,6 +906,81 @@ fn replay_state_fences_one_active_instance_and_explicit_replacement_per_workspac
         BrowserReplayError::StaleInstance
     );
     assert!(coordinator.interrupt_workspace(&other).is_some());
+}
+
+#[test]
+fn replay_active_and_exact_lookup_preserve_private_identity_across_terminal_retention() {
+    let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+    let owner = workspace("lookup-project", "lookup-conversation");
+    let started = coordinator
+        .start(owner.clone(), plan_without_secrets())
+        .unwrap();
+
+    let active = coordinator
+        .active_state(&owner)
+        .expect("active replay state");
+    assert_eq!(active.instance, started.instance);
+    assert_eq!(active.projection, started.projection);
+    assert!(active.repair_instance.is_none());
+    assert!(active.repair.is_none());
+    assert_eq!(
+        coordinator
+            .exact_instance(&owner, started.instance.id())
+            .unwrap(),
+        started.instance
+    );
+    assert_eq!(
+        replay_error(coordinator.exact_instance(&owner, started.instance.id() + 1)),
+        BrowserReplayError::StaleInstance
+    );
+
+    coordinator.cancel(&started.instance).unwrap();
+    assert!(coordinator.active_state(&owner).is_none());
+    let retained = coordinator
+        .exact_instance(&owner, started.instance.id())
+        .expect("terminal identity remains exact while retained");
+    assert_eq!(
+        coordinator.status(&retained).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+}
+
+#[test]
+fn replay_project_and_global_interruption_return_exact_cancelled_counts() {
+    let coordinator = BrowserReplayCoordinator::with_terminal_capacity(8);
+    let first = workspace("project-a", "first");
+    let second = workspace("project-a", "second");
+    let other = workspace("project-b", "other");
+    let first_replay = coordinator.start(first, plan_without_secrets()).unwrap();
+    let second_replay = coordinator.start(second, plan_without_secrets()).unwrap();
+    let other_replay = coordinator
+        .start(other.clone(), plan_without_secrets())
+        .unwrap();
+
+    assert_eq!(coordinator.interrupt_project("project-a"), 2);
+    assert_eq!(
+        coordinator.status(&first_replay.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+    assert_eq!(
+        coordinator.status(&second_replay.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+    assert_eq!(
+        coordinator.status(&other_replay.instance).unwrap().status,
+        BrowserReplayStatus::Pending
+    );
+    assert_eq!(coordinator.interrupt_project("project-a"), 0);
+    assert_eq!(coordinator.interrupt_all(), 1);
+    assert_eq!(coordinator.interrupt_all(), 0);
+    assert_eq!(
+        coordinator
+            .exact_instance(&other, other_replay.instance.id())
+            .and_then(|instance| coordinator.status(&instance))
+            .unwrap()
+            .status,
+        BrowserReplayStatus::Cancelled
+    );
 }
 
 #[test]

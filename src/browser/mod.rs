@@ -147,12 +147,12 @@ pub use recording_mcp::{
     save_browser_recording_review,
 };
 pub use replay::{
-    compile_browser_replay, BrowserReplayCancellationLease, BrowserReplayCoordinator,
-    BrowserReplayError, BrowserReplayExecutionHandle, BrowserReplayFailureCode,
-    BrowserReplayInstance, BrowserReplayPlan, BrowserReplayProjection, BrowserReplayPublicInput,
-    BrowserReplayStart, BrowserReplayStatus, MAX_BROWSER_REPLAY_FILE_BYTES,
-    MAX_BROWSER_REPLAY_INPUTS, MAX_BROWSER_REPLAY_INPUT_NAME_BYTES, MAX_BROWSER_REPLAY_STEPS,
-    MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
+    compile_browser_replay, BrowserReplayActiveState, BrowserReplayCancellationLease,
+    BrowserReplayCoordinator, BrowserReplayError, BrowserReplayExecutionHandle,
+    BrowserReplayFailureCode, BrowserReplayInstance, BrowserReplayPlan, BrowserReplayProjection,
+    BrowserReplayPublicInput, BrowserReplayStart, BrowserReplayStatus,
+    MAX_BROWSER_REPLAY_FILE_BYTES, MAX_BROWSER_REPLAY_INPUTS, MAX_BROWSER_REPLAY_INPUT_NAME_BYTES,
+    MAX_BROWSER_REPLAY_STEPS, MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
 pub use replay_executor::execute_browser_replay;
 pub(crate) use replay_repair::BrowserReplayRepairResumeCursor;

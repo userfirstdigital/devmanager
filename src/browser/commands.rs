@@ -734,6 +734,52 @@ pub enum BrowserHostControl {
     },
 }
 
+fn interrupt_replay_for_control(
+    coordinator: &BrowserReplayCoordinator,
+    control: &BrowserHostControl,
+) {
+    match control {
+        BrowserHostControl::InterruptProject { project_id } => {
+            coordinator.interrupt_project(project_id);
+        }
+        BrowserHostControl::InterruptWorkspace { workspace_key }
+        | BrowserHostControl::InterruptTab { workspace_key, .. } => {
+            coordinator.interrupt_workspace(workspace_key);
+        }
+    }
+}
+
+fn apply_lifecycle_control(
+    cancellations: &CancellationEpochs,
+    coordinator: &BrowserReplayCoordinator,
+    control: &BrowserHostControl,
+) {
+    interrupt_replay_for_control(coordinator, control);
+    cancellations.interrupt_control(control);
+}
+
+fn apply_host_event(
+    cancellations: &CancellationEpochs,
+    coordinator: &BrowserReplayCoordinator,
+    event: &BrowserHostEvent,
+) {
+    if let BrowserHostEvent::UserInput {
+        workspace_key,
+        tab_id,
+        ..
+    } = event
+    {
+        apply_lifecycle_control(
+            cancellations,
+            coordinator,
+            &BrowserHostControl::InterruptTab {
+                workspace_key: workspace_key.clone(),
+                tab_id: tab_id.clone(),
+            },
+        );
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct BrowserRegistrationLease {
     active: Arc<AtomicBool>,
@@ -1027,6 +1073,7 @@ pub struct BrowserCommandBridge {
     cancellations: Arc<CancellationEpochs>,
     host_controls: Arc<HostControlQueue>,
     pending_work: Arc<PendingWork>,
+    replay_coordinator: BrowserReplayCoordinator,
 }
 
 impl BrowserCommandBridge {
@@ -1048,7 +1095,12 @@ impl BrowserCommandBridge {
             host_controls: Arc::clone(&self.host_controls),
             pending_work: Arc::clone(&self.pending_work),
             registration_lease,
+            replay_coordinator: self.replay_coordinator.clone(),
         }
+    }
+
+    pub fn replay_coordinator(&self) -> BrowserReplayCoordinator {
+        self.replay_coordinator.clone()
     }
 
     pub fn pending_work_count(&self) -> usize {
@@ -1056,7 +1108,8 @@ impl BrowserCommandBridge {
     }
 
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
-        self.cancellations.observe_host_event(event);
+        self.host_controls
+            .with_locked(|| apply_host_event(&self.cancellations, &self.replay_coordinator, event));
     }
 
     pub fn interrupt_workspace(&self, workspace_key: &BrowserWorkspaceKey) {
@@ -1064,7 +1117,7 @@ impl BrowserCommandBridge {
             workspace_key: workspace_key.clone(),
         };
         self.host_controls.push_and(control.clone(), || {
-            self.cancellations.interrupt_control(&control)
+            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
         });
     }
 
@@ -1077,6 +1130,7 @@ impl BrowserCommandBridge {
             workspace_key: workspace_key.clone(),
         };
         self.host_controls.push_and(control.clone(), || {
+            interrupt_replay_for_control(&self.replay_coordinator, &control);
             registration_lease.revoke();
             self.cancellations.interrupt_control(&control);
         });
@@ -1087,7 +1141,7 @@ impl BrowserCommandBridge {
             project_id: project_id.to_string(),
         };
         self.host_controls.push_and(control.clone(), || {
-            self.cancellations.interrupt_control(&control)
+            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
         });
     }
 
@@ -1097,7 +1151,14 @@ impl BrowserCommandBridge {
             tab_id: tab_id.to_string(),
         };
         self.host_controls.push_and(control.clone(), || {
-            self.cancellations.interrupt_control(&control)
+            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
+        });
+    }
+
+    pub fn interrupt_all(&self) {
+        self.host_controls.with_locked(|| {
+            self.replay_coordinator.interrupt_all();
+            self.cancellations.interrupt_all();
         });
     }
 
@@ -1110,7 +1171,11 @@ impl BrowserCommandBridge {
         self.host_controls
             .with_drain_locked(|controls, lifecycle_requests| {
                 if let Some(control) = browser_lifecycle_control(workspace_key, command) {
-                    self.cancellations.interrupt_control(&control);
+                    apply_lifecycle_control(
+                        &self.cancellations,
+                        &self.replay_coordinator,
+                        &control,
+                    );
                 }
                 let lifecycle_requests = lifecycle_requests
                     .into_iter()
@@ -1138,7 +1203,11 @@ impl BrowserCommandBridge {
         self.host_controls
             .with_drain_all_locked(|controls, lifecycle_requests, repair_cleanups| {
                 if let Some(control) = browser_lifecycle_control(workspace_key, command) {
-                    self.cancellations.interrupt_control(&control);
+                    apply_lifecycle_control(
+                        &self.cancellations,
+                        &self.replay_coordinator,
+                        &control,
+                    );
                 }
                 let lifecycle_requests = lifecycle_requests
                     .into_iter()
@@ -1216,6 +1285,7 @@ pub struct BrowserController {
     host_controls: Arc<HostControlQueue>,
     pending_work: Arc<PendingWork>,
     registration_lease: Option<BrowserRegistrationLease>,
+    replay_coordinator: BrowserReplayCoordinator,
 }
 
 impl BrowserController {
@@ -1717,7 +1787,7 @@ impl BrowserController {
             workspace_key: self.workspace_key.clone(),
         };
         self.host_controls.push_and(control.clone(), || {
-            self.cancellations.interrupt_control(&control)
+            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
         });
     }
 
@@ -1727,7 +1797,7 @@ impl BrowserController {
             tab_id: tab_id.to_string(),
         };
         self.host_controls.push_and(control.clone(), || {
-            self.cancellations.interrupt_control(&control)
+            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
         });
     }
 
@@ -1784,7 +1854,7 @@ impl BrowserController {
                     .as_ref()
                     .map(BrowserRegistrationLease::capture)
                     .transpose()?;
-                self.cancellations.interrupt_control(&control);
+                apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control);
                 let mut cancellation_ticket = self
                     .cancellations
                     .ticket(&self.workspace_key, command.tab_id());
@@ -2027,6 +2097,7 @@ pub struct BrowserCommandInbox {
     cancellations: Arc<CancellationEpochs>,
     host_controls: Arc<HostControlQueue>,
     pending_work: Arc<PendingWork>,
+    replay_coordinator: BrowserReplayCoordinator,
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
@@ -2060,7 +2131,7 @@ impl BrowserCommandInbox {
             workspace_key: workspace_key.clone(),
         };
         self.host_controls.push_and(control.clone(), || {
-            self.cancellations.interrupt_control(&control)
+            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
         });
     }
 
@@ -2070,7 +2141,7 @@ impl BrowserCommandInbox {
             tab_id: tab_id.to_string(),
         };
         self.host_controls.push_and(control.clone(), || {
-            self.cancellations.interrupt_control(&control)
+            apply_lifecycle_control(&self.cancellations, &self.replay_coordinator, &control)
         });
     }
 
@@ -2098,7 +2169,8 @@ impl BrowserCommandInbox {
     }
 
     pub fn observe_host_event(&self, event: &BrowserHostEvent) {
-        self.cancellations.observe_host_event(event);
+        self.host_controls
+            .with_locked(|| apply_host_event(&self.cancellations, &self.replay_coordinator, event));
     }
 }
 
@@ -2298,6 +2370,11 @@ impl BrowserCommandRequest {
     }
 
     pub fn respond(self, result: Result<BrowserResponse, BrowserError>) {
+        let result = if self.cancellation_is_current() {
+            result
+        } else {
+            Err(BrowserError::Interrupted)
+        };
         let _ = self.response.send(result);
     }
 }
@@ -2362,18 +2439,21 @@ pub fn browser_command_channel(capacity: usize) -> (BrowserCommandBridge, Browse
     let cancellations = Arc::new(CancellationEpochs::default());
     let host_controls = Arc::new(HostControlQueue::default());
     let pending_work = Arc::new(PendingWork::default());
+    let replay_coordinator = BrowserReplayCoordinator::default();
     (
         BrowserCommandBridge {
             sender,
             cancellations: Arc::clone(&cancellations),
             host_controls: Arc::clone(&host_controls),
             pending_work: Arc::clone(&pending_work),
+            replay_coordinator: replay_coordinator.clone(),
         },
         BrowserCommandInbox {
             receiver,
             cancellations,
             host_controls,
             pending_work,
+            replay_coordinator,
             _main_thread_only: PhantomData,
         },
     )
@@ -2674,14 +2754,15 @@ impl CancellationEpochs {
         ));
     }
 
-    fn observe_host_event(&self, event: &BrowserHostEvent) {
-        if let BrowserHostEvent::UserInput {
-            workspace_key,
-            tab_id,
-            ..
-        } = event
-        {
-            self.interrupt_tab(workspace_key, tab_id);
+    fn interrupt_all(&self) {
+        for sender in lock(&self.projects).values() {
+            advance(sender);
+        }
+        for sender in lock(&self.workspaces).values() {
+            advance(sender);
+        }
+        for sender in lock(&self.tabs).values() {
+            advance(sender);
         }
     }
 }

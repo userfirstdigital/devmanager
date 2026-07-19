@@ -2,7 +2,7 @@ use devmanager::browser::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_command_channel,
     browser_lifecycle_control, browser_operation_target_tab_id,
     browser_request_preempts_operation_queue, browser_response_resource_ids,
-    browser_user_input_initialization_script, crop_annotation_png,
+    browser_user_input_initialization_script, compile_browser_replay, crop_annotation_png,
     effective_browser_annotation_risk, effective_browser_secret_type_risk,
     parse_browser_annotation_ipc_message, parse_browser_page_ipc_message,
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
@@ -18,11 +18,13 @@ use devmanager::browser::{
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserLocatorFailureTarget, BrowserMemoryTarget, BrowserNetworkOperation,
     BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
-    BrowserPerformanceOperation, BrowserRecordingOperation, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
-    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot,
-    BrowserUserInputKind, BrowserViewport, BrowserWaitCondition, BrowserWaitResult,
-    BrowserWebViewHost, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BrowserPerformanceOperation, BrowserRecipeAction, BrowserRecipeStep, BrowserRecipeV1,
+    BrowserRecipeViewport, BrowserRecordingOperation, BrowserReplayStatus, BrowserResourceId,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
+    BrowserRevision, BrowserRisk, BrowserRuntimeTarget, BrowserScreenshotMode,
+    BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
+    BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost, BrowserWorkspaceKey,
+    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
     MAX_BROWSER_JOURNAL_ENTRIES,
 };
 
@@ -1622,6 +1624,31 @@ fn direct_annotation_commands_finalize_resource_pins_before_returning() {
 async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     let key = workspace("project-a", "conversation-a");
     let (bridge, mut inbox) = browser_command_channel(4);
+    let replay_coordinator = bridge.replay_coordinator();
+    let replay = replay_coordinator
+        .start(
+            key.clone(),
+            compile_browser_replay(
+                &BrowserRecipeV1 {
+                    schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                    id: "host-input-cancellation".to_string(),
+                    name: "Host input cancellation".to_string(),
+                    description: "Direct input cancels the workspace replay".to_string(),
+                    start_url: "https://example.test/start".to_string(),
+                    viewport: BrowserRecipeViewport::default(),
+                    inputs: Vec::new(),
+                    steps: vec![BrowserRecipeStep {
+                        id: "reload".to_string(),
+                        action: BrowserRecipeAction::Reload,
+                        wait: None,
+                        assertions: Vec::new(),
+                    }],
+                },
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let controller = bridge.bind(key.clone(), Duration::from_secs(1));
     let request_task = tokio::spawn(async move {
         controller
@@ -1640,6 +1667,10 @@ async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     assert_eq!(
         request_task.await.expect("interrupted request"),
         Err(BrowserError::Interrupted)
+    );
+    assert_eq!(
+        replay_coordinator.status(&replay.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
     );
 }
 

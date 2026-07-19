@@ -896,6 +896,75 @@ fn cancellation_status_fence_checks_both_sides_of_the_running_projection_read() 
 }
 
 #[tokio::test]
+async fn secret_readiness_waits_on_the_existing_value_free_signal_before_host_work() {
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .unwrap();
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(workspace("secret-readiness"), plan)
+        .unwrap();
+    let instance = started.instance.clone();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                replay_resource_store(),
+                &root,
+            )
+            .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !run.is_finished(),
+        "executor must await the exact secret-ready signal"
+    );
+    assert_no_request(&mut inbox).await;
+
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        coordinator
+            .status(&instance)
+            .unwrap()
+            .unresolved_secret_inputs,
+    )
+    .unwrap();
+    prompt
+        .edit(&instance, "credential", "private value")
+        .unwrap();
+    let (submission, _) = prompt.submit(&instance).unwrap();
+    coordinator.submit_secrets(&instance, submission).unwrap();
+
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+    next_request(&mut inbox, "ordinary text Type")
+        .await
+        .respond(Ok(secret_type_action_response(1)));
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+    secret.respond(Ok(secret_type_action_response(1)));
+
+    let outcome = run.await.unwrap().unwrap();
+    assert_eq!(outcome.status, BrowserReplayStatus::Completed);
+}
+
+#[tokio::test]
 async fn secret_type_uses_the_private_sidecar_while_text_type_stays_an_ordinary_action() {
     const SECRET_SENTINEL: &str = "DM_EXECUTOR_SECRET_SENTINEL_74A9";
     let root = canonical_project_root();

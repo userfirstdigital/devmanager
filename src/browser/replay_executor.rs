@@ -45,24 +45,48 @@ pub async fn execute_browser_replay(
     if let Some(cancelled) = cancelled_projection(&execution, coordinator, instance)? {
         return Ok(cancelled);
     }
-    match coordinator.status(instance)? {
-        projection if projection.status == BrowserReplayStatus::Pending => {
-            if let Err(error) = coordinator.begin(instance) {
-                return retained_terminal_after_transition_error(coordinator, instance, error);
+    loop {
+        if let Some(cancelled) = cancelled_projection(&execution, coordinator, instance)? {
+            return Ok(cancelled);
+        }
+        match coordinator.status(instance)? {
+            projection if projection.status == BrowserReplayStatus::Pending => {
+                if let Err(error) = coordinator.begin(instance) {
+                    return retained_terminal_after_transition_error(coordinator, instance, error);
+                }
+                break;
             }
+            projection if projection.status == BrowserReplayStatus::Running => break,
+            projection if projection.status == BrowserReplayStatus::NeedsUserSecret => {
+                if repair_watch.changed().await.is_err() {
+                    return match coordinator.status(instance) {
+                        Ok(projection)
+                            if matches!(
+                                projection.status,
+                                BrowserReplayStatus::Completed
+                                    | BrowserReplayStatus::Failed
+                                    | BrowserReplayStatus::Cancelled
+                            ) =>
+                        {
+                            Ok(projection)
+                        }
+                        Ok(_) => Err(BrowserReplayError::InvalidTransition),
+                        Err(error) => Err(error),
+                    };
+                }
+            }
+            projection
+                if matches!(
+                    projection.status,
+                    BrowserReplayStatus::Completed
+                        | BrowserReplayStatus::Failed
+                        | BrowserReplayStatus::Cancelled
+                ) =>
+            {
+                return Ok(projection);
+            }
+            _ => return Err(BrowserReplayError::InvalidTransition),
         }
-        projection if projection.status == BrowserReplayStatus::Running => {}
-        projection
-            if matches!(
-                projection.status,
-                BrowserReplayStatus::Completed
-                    | BrowserReplayStatus::Failed
-                    | BrowserReplayStatus::Cancelled
-            ) =>
-        {
-            return Ok(projection);
-        }
-        _ => return Err(BrowserReplayError::InvalidTransition),
     }
     let plan = execution.plan();
     let create = match checked_request(

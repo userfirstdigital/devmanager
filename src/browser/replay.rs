@@ -285,6 +285,14 @@ pub struct BrowserReplayProjection {
     pub failure: Option<BrowserReplayFailureCode>,
 }
 
+#[derive(Clone)]
+pub struct BrowserReplayActiveState {
+    pub instance: BrowserReplayInstance,
+    pub projection: BrowserReplayProjection,
+    pub repair_instance: Option<BrowserReplayRepairInstance>,
+    pub repair: Option<BrowserReplayRepairProjection>,
+}
+
 pub struct BrowserReplayStart {
     pub instance: BrowserReplayInstance,
     pub projection: BrowserReplayProjection,
@@ -672,6 +680,22 @@ fn signal_repair_state(active: &mut ActiveBrowserReplay) {
     active.repair_signal.send_replace(active.repair_generation);
 }
 
+fn active_repair_projection(
+    repair: &BrowserReplayPrivateRepairState,
+) -> Option<BrowserReplayRepairProjection> {
+    match &repair.phase {
+        BrowserReplayPrivateRepairPhase::Capturing => None,
+        BrowserReplayPrivateRepairPhase::Paused(paused) => Some(paused.projection.clone()),
+        BrowserReplayPrivateRepairPhase::Previewing(reservation) => {
+            Some(reservation.previous.projection.clone())
+        }
+        BrowserReplayPrivateRepairPhase::Preparing(reservation)
+        | BrowserReplayPrivateRepairPhase::Committing(reservation) => {
+            Some(reservation.previous.projection.clone())
+        }
+    }
+}
+
 struct BrowserReplayCoordinatorState {
     scope: Arc<BrowserReplayCoordinatorScope>,
     repair_scope: Arc<BrowserReplayRepairAuthorityScope>,
@@ -770,6 +794,72 @@ impl BrowserReplayCoordinator {
             .ok_or(BrowserReplayError::StaleInstance)
     }
 
+    pub fn active_state(
+        &self,
+        workspace: &BrowserWorkspaceKey,
+    ) -> Option<BrowserReplayActiveState> {
+        let state = self.lock();
+        let active = state.active.get(workspace)?;
+        Some(BrowserReplayActiveState {
+            instance: active.instance.clone(),
+            projection: active.projection.clone(),
+            repair_instance: active.repair.as_ref().map(|repair| repair.instance.clone()),
+            repair: active.repair.as_ref().and_then(active_repair_projection),
+        })
+    }
+
+    pub fn exact_instance(
+        &self,
+        workspace: &BrowserWorkspaceKey,
+        instance_id: u64,
+    ) -> Result<BrowserReplayInstance, BrowserReplayError> {
+        let state = self.lock();
+        state
+            .active
+            .get(workspace)
+            .filter(|active| active.instance.id() == instance_id)
+            .map(|active| active.instance.clone())
+            .or_else(|| {
+                state
+                    .terminal
+                    .iter()
+                    .rev()
+                    .find(|terminal| {
+                        terminal.instance.workspace_key() == workspace
+                            && terminal.instance.id() == instance_id
+                    })
+                    .map(|terminal| terminal.instance.clone())
+            })
+            .ok_or(BrowserReplayError::StaleInstance)
+    }
+
+    pub fn exact_repair(
+        &self,
+        workspace: &BrowserWorkspaceKey,
+        instance_id: u64,
+        repair_id: u64,
+    ) -> Result<BrowserReplayRepairInstance, BrowserReplayError> {
+        let state = self.lock();
+        let Some(active) = state.active.get(workspace) else {
+            if state.terminal.iter().any(|terminal| {
+                terminal.instance.workspace_key() == workspace
+                    && terminal.instance.id() == instance_id
+            }) {
+                return Err(BrowserReplayError::TerminalState);
+            }
+            return Err(BrowserReplayError::StaleInstance);
+        };
+        if active.instance.id() != instance_id {
+            return Err(BrowserReplayError::StaleInstance);
+        }
+        active
+            .repair
+            .as_ref()
+            .filter(|repair| repair.instance.repair_id() == repair_id)
+            .map(|repair| repair.instance.clone())
+            .ok_or(BrowserReplayError::InvalidRepairEvidence)
+    }
+
     pub fn begin(
         &self,
         instance: &BrowserReplayInstance,
@@ -800,6 +890,7 @@ impl BrowserReplayCoordinator {
             .install(&active.projection.unresolved_secret_inputs, submission)?;
         active.projection.status = BrowserReplayStatus::Running;
         active.projection.unresolved_secret_inputs.clear();
+        signal_repair_state(active);
         Ok(active.projection.clone())
     }
 
@@ -2089,6 +2180,41 @@ impl BrowserReplayCoordinator {
         Self::terminalize(&mut state, &instance, BrowserReplayStatus::Cancelled, None).ok()
     }
 
+    pub fn interrupt_project(&self, project_id: &str) -> usize {
+        let mut state = self.lock();
+        let mut instances = state
+            .active
+            .values()
+            .filter(|active| active.instance.workspace_key().project_id == project_id)
+            .map(|active| active.instance.clone())
+            .collect::<Vec<_>>();
+        instances.sort_by_key(BrowserReplayInstance::id);
+        instances
+            .into_iter()
+            .filter(|instance| {
+                Self::terminalize(&mut state, instance, BrowserReplayStatus::Cancelled, None)
+                    .is_ok()
+            })
+            .count()
+    }
+
+    pub fn interrupt_all(&self) -> usize {
+        let mut state = self.lock();
+        let mut instances = state
+            .active
+            .values()
+            .map(|active| active.instance.clone())
+            .collect::<Vec<_>>();
+        instances.sort_by_key(BrowserReplayInstance::id);
+        instances
+            .into_iter()
+            .filter(|instance| {
+                Self::terminalize(&mut state, instance, BrowserReplayStatus::Cancelled, None)
+                    .is_ok()
+            })
+            .count()
+    }
+
     pub fn retained_terminal_count(&self) -> usize {
         self.lock().terminal.len()
     }
@@ -2716,6 +2842,46 @@ mod tests {
             .publish_locator_repair(&repair, &snapshot, &screenshot)
             .unwrap();
         (started.instance, repair)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn exact_repair_lookup_returns_only_the_coordinator_owned_active_authority() {
+        let (root, store) = repair_store("exact-repair-lookup", 1024 * 1024);
+        let coordinator = BrowserReplayCoordinator::default();
+        let owner = BrowserWorkspaceKey::new("repair-lookup", "conversation").unwrap();
+        let (instance, repair) =
+            paused_repair(&coordinator, &store, owner.clone(), BrowserRevision(27));
+
+        let active = coordinator.active_state(&owner).unwrap();
+        assert_eq!(active.instance, instance);
+        assert!(active.repair_instance.as_ref() == Some(&repair));
+        assert_eq!(
+            active.repair.as_ref().unwrap().repair_id,
+            repair.repair_id()
+        );
+        assert!(
+            coordinator
+                .exact_repair(&owner, instance.id(), repair.repair_id())
+                .unwrap()
+                == repair
+        );
+        assert!(matches!(
+            coordinator.exact_repair(&owner, instance.id(), repair.repair_id() + 1),
+            Err(BrowserReplayError::InvalidRepairEvidence)
+        ));
+        assert!(matches!(
+            coordinator.exact_repair(&owner, instance.id() + 1, repair.repair_id()),
+            Err(BrowserReplayError::StaleInstance)
+        ));
+
+        coordinator.cancel(&instance).unwrap();
+        assert!(matches!(
+            coordinator.exact_repair(&owner, instance.id(), repair.repair_id()),
+            Err(BrowserReplayError::TerminalState)
+        ));
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn repair_candidate(revision: BrowserRevision, test_id: &str) -> BrowserReplayRepairCandidate {
