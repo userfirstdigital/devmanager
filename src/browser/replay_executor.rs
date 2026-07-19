@@ -41,6 +41,7 @@ pub async fn execute_browser_replay(
     let local_project_root =
         verified_authenticated_local_project_root(authenticated_local_project_root)
             .map_err(|_| BrowserReplayError::InvalidExecutionAuthority)?;
+    execution.bind_canonical_recipe_root(&local_project_root)?;
     if let Some(cancelled) = cancelled_projection(&execution, coordinator, instance)? {
         return Ok(cancelled);
     }
@@ -1963,12 +1964,14 @@ fn cancelled_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::replay::BrowserReplayRepairApplyCommit;
     use crate::browser::{
-        browser_command_channel, compile_browser_replay, BrowserActionResult,
-        BrowserLocatorFailureTarget, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeStep,
-        BrowserRecipeV1, BrowserRecipeViewport, BrowserReplaySecretPromptVault,
-        BrowserResourceKind, BrowserResourceLimits, BrowserSnapshotSummary, BrowserWaitResult,
-        BrowserWorkspaceKey, BrowserWorkspaceMutation, BROWSER_RECIPE_SCHEMA_VERSION,
+        browser_command_channel, compile_browser_replay, recipe_path, save_recipe,
+        BrowserActionResult, BrowserElementRef, BrowserLocatorFailureTarget, BrowserRecipeInput,
+        BrowserRecipeInputKind, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeViewport,
+        BrowserReplayRepairCandidate, BrowserReplaySecretPromptVault, BrowserResourceKind,
+        BrowserResourceLimits, BrowserSnapshotSummary, BrowserWaitResult, BrowserWorkspaceKey,
+        BrowserWorkspaceMutation, BROWSER_RECIPE_SCHEMA_VERSION,
     };
     use std::time::Duration;
 
@@ -2011,6 +2014,79 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn execute_browser_replay_binds_recipe_root_exactly_once_before_first_command() {
+        let owner = BrowserWorkspaceKey::new("executor-root-binding", "prebound").unwrap();
+        let recipe = BrowserRecipeV1 {
+            schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+            id: "executor-root-binding".to_string(),
+            name: "Root binding".to_string(),
+            description: "Executor must bind before dispatch".to_string(),
+            start_url: "https://example.test/".to_string(),
+            viewport: BrowserRecipeViewport::default(),
+            inputs: Vec::new(),
+            steps: vec![BrowserRecipeStep {
+                id: "reload".to_string(),
+                action: BrowserRecipeAction::Reload,
+                wait: None,
+                assertions: Vec::new(),
+            }],
+        };
+        let coordinator = BrowserReplayCoordinator::default();
+        let started = coordinator
+            .start(
+                owner.clone(),
+                compile_browser_replay(&recipe, Vec::new()).unwrap(),
+            )
+            .unwrap();
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
+        started
+            .execution
+            .bind_canonical_recipe_root(&project_root)
+            .unwrap();
+        let resource_root = std::env::temp_dir().join(format!(
+            "devmanager-executor-root-binding-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&resource_root);
+        let store = BrowserResourceStore::open(
+            &resource_root,
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024,
+                max_resource_bytes: 1024,
+            },
+        )
+        .unwrap();
+        let (bridge, mut inbox) = browser_command_channel(1);
+        let controller = bridge.bind(owner, Duration::from_millis(50));
+        let result = execute_browser_replay(
+            &controller,
+            &coordinator,
+            &started.instance,
+            started.execution,
+            BrowserInvocationActor::Agent,
+            &store,
+            &project_root,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(BrowserReplayError::RecipeRootAlreadyBound)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), inbox.recv())
+                .await
+                .is_err()
+        );
+
+        coordinator.cancel(&started.instance).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(resource_root).unwrap();
     }
 
     async fn next_test_request(
@@ -2079,6 +2155,7 @@ mod tests {
         owner: BrowserWorkspaceKey,
         store: BrowserResourceStore,
         resource_root: PathBuf,
+        project_root: PathBuf,
         bridge: crate::browser::BrowserCommandBridge,
         coordinator: BrowserReplayCoordinator,
         instance: BrowserReplayInstance,
@@ -2088,11 +2165,16 @@ mod tests {
 
     async fn recipe_fixture(label: &str, recipe: BrowserRecipeV1) -> FailedClickFixture {
         let owner = BrowserWorkspaceKey::new("executor-repair", label).unwrap();
-        let resource_root = std::env::temp_dir().join(format!(
+        let fixture_root = std::env::temp_dir().join(format!(
             "devmanager-executor-{label}-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&resource_root);
+        let _ = std::fs::remove_dir_all(&fixture_root);
+        let project_root = fixture_root.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = project_root.canonicalize().unwrap();
+        save_recipe(&project_root, &recipe).unwrap();
+        let resource_root = fixture_root.join("resources");
         let store = BrowserResourceStore::open(
             &resource_root,
             BrowserResourceLimits {
@@ -2115,9 +2197,7 @@ mod tests {
         let run_store = store.clone();
         let run_coordinator = coordinator.clone();
         let run_instance = instance.clone();
-        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap();
+        let run_project_root = project_root.clone();
         let run = tokio::spawn(async move {
             execute_browser_replay(
                 &controller,
@@ -2126,7 +2206,7 @@ mod tests {
                 started.execution,
                 BrowserInvocationActor::Agent,
                 &run_store,
-                &project_root,
+                &run_project_root,
             )
             .await
         });
@@ -2134,7 +2214,8 @@ mod tests {
         FailedClickFixture {
             owner,
             store,
-            resource_root,
+            resource_root: fixture_root,
+            project_root,
             bridge,
             coordinator,
             instance,
@@ -2222,6 +2303,23 @@ mod tests {
         }
     }
 
+    fn command_targets_test_id(command: &BrowserCommand, expected: &str) -> bool {
+        let target = match command {
+            BrowserCommand::Act { actions, .. } => match actions.as_slice() {
+                [BrowserAction::Click { target }] => Some(target),
+                _ => None,
+            },
+            BrowserCommand::Wait { condition, .. } => match condition {
+                BrowserWaitCondition::ElementPresent { target }
+                | BrowserWaitCondition::ElementVisible { target }
+                | BrowserWaitCondition::ElementValue { target, .. } => Some(target),
+                _ => None,
+            },
+            _ => None,
+        };
+        target.and_then(|target| target.locator.test_id.as_deref()) == Some(expected)
+    }
+
     async fn respond_fresh_repair_state(fixture: &mut FailedClickFixture) {
         let state = next_test_request(&mut fixture.inbox, "fresh repair workspace state").await;
         assert_eq!(state.command(), &BrowserCommand::WorkspaceState);
@@ -2288,7 +2386,7 @@ mod tests {
         request.respond(Ok(BrowserResponse::Screenshot {
             resource: screenshot.clone(),
         }));
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let paused = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if fixture
                     .coordinator
@@ -2302,14 +2400,139 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("stable paused repair");
+        .await;
+        if paused.is_err() {
+            panic!(
+                "stable paused repair: {:?}",
+                fixture.coordinator.status(&fixture.instance)
+            );
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(25), fixture.inbox.recv())
                 .await
                 .is_err()
         );
         (fixture, snapshot, screenshot)
+    }
+
+    async fn preview_exact_repair(
+        fixture: &mut FailedClickFixture,
+        replacement_test_id: &str,
+        revision: u64,
+    ) -> BrowserReplayRepairInstance {
+        let (repair, _, _) = fixture
+            .coordinator
+            .active_locator_repair_capture_for_test(&fixture.instance)
+            .unwrap();
+        let expected_phase = if fixture
+            .coordinator
+            .locator_repair_status(&repair)
+            .unwrap()
+            .phase
+            == crate::browser::BrowserReplayRepairPhase::Applied
+        {
+            crate::browser::BrowserReplayRepairPhase::Applied
+        } else {
+            crate::browser::BrowserReplayRepairPhase::Previewed
+        };
+        let candidate = BrowserReplayRepairCandidate::new(BrowserElementRef {
+            revision: crate::browser::BrowserRevision(revision),
+            locator: BrowserLocator {
+                test_id: Some(replacement_test_id.to_string()),
+                ..BrowserLocator::default()
+            },
+            backend_node_id: Some(revision.saturating_add(100)),
+        });
+        let controller = fixture
+            .bridge
+            .bind(fixture.owner.clone(), Duration::from_secs(1));
+        let preview_coordinator = fixture.coordinator.clone();
+        let preview_repair = repair.clone();
+        let preview = tokio::spawn(async move {
+            controller
+                .request_replay_repair_preview(
+                    &preview_coordinator,
+                    &preview_repair,
+                    candidate,
+                    BrowserInvocationActor::Agent,
+                )
+                .await
+        });
+        let preview_request = next_test_request(&mut fixture.inbox, "repair preview").await;
+        assert!(matches!(
+            preview_request.command(),
+            BrowserCommand::RepairHighlight { tab_id } if tab_id == "repair-tab"
+        ));
+        let preview_authority = preview_request
+            .repair_preview_highlight_authority()
+            .expect("exact preview authority")
+            .clone();
+        assert!(preview_authority.acknowledge_for_test());
+        preview_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(preview.await.unwrap().unwrap().phase, expected_phase);
+        repair
+    }
+
+    async fn apply_previewed_repair(
+        fixture: &mut FailedClickFixture,
+        repair: &BrowserReplayRepairInstance,
+        resume: bool,
+        expect_recipe_write: bool,
+    ) -> BrowserReplayRepairApplyCommit {
+        let apply_controller = fixture
+            .bridge
+            .bind(fixture.owner.clone(), Duration::from_secs(1));
+        let apply_coordinator = fixture.coordinator.clone();
+        let apply_repair = repair.clone();
+        let apply = tokio::spawn(async move {
+            apply_controller
+                .request_replay_repair_apply(
+                    &apply_coordinator,
+                    &apply_repair,
+                    true,
+                    resume,
+                    BrowserInvocationContext::agent(
+                        "apply executor locator repair",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let validation_count = if expect_recipe_write { 2 } else { 1 };
+        for index in 0..validation_count {
+            let label = if index == 0 {
+                "pre-commit repair validation"
+            } else {
+                "post-commit repair validation"
+            };
+            let request = next_test_request(&mut fixture.inbox, label).await;
+            assert!(matches!(
+                request.command(),
+                BrowserCommand::RepairValidate { tab_id, .. } if tab_id == "repair-tab"
+            ));
+            let authority = request
+                .repair_apply_authority()
+                .expect("exact apply authority")
+                .clone();
+            assert!(authority.acknowledge_for_test());
+            request.respond(Ok(BrowserResponse::Acknowledged));
+        }
+        let outcome = apply.await.unwrap().unwrap();
+        assert_eq!(outcome.recipe_written, expect_recipe_write);
+        outcome
+    }
+
+    async fn apply_exact_repair(
+        fixture: &mut FailedClickFixture,
+        replacement_test_id: &str,
+        revision: u64,
+    ) -> BrowserReplayRepairInstance {
+        let repair = preview_exact_repair(fixture, replacement_test_id, revision).await;
+        let outcome = apply_previewed_repair(fixture, &repair, true, true).await;
+        assert_eq!(outcome.replay.status, BrowserReplayStatus::Running);
+        drop(outcome);
+        repair
     }
 
     async fn assert_failed_and_clean(mut fixture: FailedClickFixture) {
@@ -2695,6 +2918,42 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn batch_c_resume_retries_only_action_wait_step_wait_or_exact_assertion_phase() {
+        let action = failed_click_fixture("phase-action").await;
+        let (mut action, action_snapshot, action_screenshot) = drive_fixture_to_pause(action).await;
+        let (_, action_slot, action_cursor) = action
+            .coordinator
+            .active_locator_repair_capture_for_test(&action.instance)
+            .unwrap();
+        assert_eq!(action_slot, BrowserReplayLocatorSlot::PrimaryAction);
+        assert!(action_cursor == BrowserReplayRepairResumeCursor::Action);
+        apply_exact_repair(&mut action, "repaired-submit", 9).await;
+        assert_eq!(
+            action
+                .coordinator
+                .status(&action.instance)
+                .unwrap()
+                .current_step_index,
+            0
+        );
+        let retried_action = next_test_request(&mut action.inbox, "retried action").await;
+        assert!(command_targets_test_id(
+            retried_action.command(),
+            "repaired-submit"
+        ));
+        retried_action.respond(Ok(completed_action_response()));
+        assert_eq!(
+            action.run.await.unwrap().unwrap().status,
+            BrowserReplayStatus::Completed
+        );
+        for id in [&action_snapshot.id, &action_screenshot.id] {
+            assert!(matches!(
+                action.store.handle(&action.owner, id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+        }
+        drop(action.store);
+        let _ = std::fs::remove_dir_all(action.resource_root);
+
         let action_wait_recipe = BrowserRecipeV1 {
             schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
             id: "phase-action-wait".to_string(),
@@ -2736,17 +2995,20 @@ mod tests {
             .unwrap();
         assert_eq!(slot, BrowserReplayLocatorSlot::ActionWait);
         assert!(cursor == BrowserReplayRepairResumeCursor::ActionWait);
-        action_wait
-            .coordinator
-            .resume_locator_repair_for_executor_test(&repair)
-            .unwrap();
+        assert_eq!(repair.replay(), &action_wait.instance);
+        apply_exact_repair(&mut action_wait, "repaired-action-ready", 9).await;
+        assert_eq!(
+            action_wait
+                .coordinator
+                .status(&action_wait.instance)
+                .unwrap()
+                .current_step_index,
+            0
+        );
         let retry = next_test_request(&mut action_wait.inbox, "retried action wait").await;
-        assert!(matches!(
+        assert!(command_targets_test_id(
             retry.command(),
-            BrowserCommand::Wait {
-                condition: BrowserWaitCondition::ElementPresent { .. },
-                ..
-            }
+            "repaired-action-ready"
         ));
         retry.respond(Ok(matched_wait_response()));
         assert_eq!(
@@ -2797,24 +3059,40 @@ mod tests {
         wait.respond(Err(BrowserError::Timeout {
             operation: "pageCondition".to_string(),
         }));
-        let (mut step_wait, _, _) = drive_fixture_to_pause(step_wait).await;
+        let (mut step_wait, step_snapshot, step_screenshot) =
+            drive_fixture_to_pause(step_wait).await;
         let (repair, slot, cursor) = step_wait
             .coordinator
             .active_locator_repair_capture_for_test(&step_wait.instance)
             .unwrap();
         assert_eq!(slot, BrowserReplayLocatorSlot::StepWait);
         assert!(cursor == BrowserReplayRepairResumeCursor::StepWait);
-        step_wait
-            .coordinator
-            .resume_locator_repair_for_executor_test(&repair)
-            .unwrap();
+        assert_eq!(repair.replay(), &step_wait.instance);
+        apply_exact_repair(&mut step_wait, "repaired-step-ready", 9).await;
+        assert_eq!(
+            step_wait
+                .coordinator
+                .status(&step_wait.instance)
+                .unwrap()
+                .current_step_index,
+            0
+        );
         let retry = next_test_request(&mut step_wait.inbox, "step-wait-only retry").await;
-        assert!(matches!(retry.command(), BrowserCommand::Wait { .. }));
+        assert!(command_targets_test_id(
+            retry.command(),
+            "repaired-step-ready"
+        ));
         retry.respond(Ok(matched_wait_response()));
         assert_eq!(
             step_wait.run.await.unwrap().unwrap().status,
             BrowserReplayStatus::Completed
         );
+        for id in [&step_snapshot.id, &step_screenshot.id] {
+            assert!(matches!(
+                step_wait.store.handle(&step_wait.owner, id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+        }
         drop(step_wait.store);
         let _ = std::fs::remove_dir_all(step_wait.resource_root);
 
@@ -2868,32 +3146,118 @@ mod tests {
         failed.respond(Err(BrowserError::Timeout {
             operation: "pageCondition".to_string(),
         }));
-        let (mut assertion, _, _) = drive_fixture_to_pause(assertion).await;
+        let (mut assertion, assertion_snapshot, assertion_screenshot) =
+            drive_fixture_to_pause(assertion).await;
         let (repair, slot, cursor) = assertion
             .coordinator
             .active_locator_repair_capture_for_test(&assertion.instance)
             .unwrap();
         assert_eq!(slot, BrowserReplayLocatorSlot::Assertion { index: 1 });
         assert!(cursor == BrowserReplayRepairResumeCursor::Assertion(1));
-        assertion
-            .coordinator
-            .resume_locator_repair_for_executor_test(&repair)
-            .unwrap();
+        assert_eq!(repair.replay(), &assertion.instance);
+        apply_exact_repair(&mut assertion, "repaired-result", 9).await;
+        assert_eq!(
+            assertion
+                .coordinator
+                .status(&assertion.instance)
+                .unwrap()
+                .current_step_index,
+            0
+        );
         let retry = next_test_request(&mut assertion.inbox, "assertion-one-only retry").await;
-        assert!(matches!(
-            retry.command(),
-            BrowserCommand::Wait {
-                condition: BrowserWaitCondition::ElementValue { .. },
-                ..
-            }
-        ));
+        assert!(command_targets_test_id(retry.command(), "repaired-result"));
         retry.respond(Ok(matched_wait_response()));
         assert_eq!(
             assertion.run.await.unwrap().unwrap().status,
             BrowserReplayStatus::Completed
         );
+        for id in [&assertion_snapshot.id, &assertion_screenshot.id] {
+            assert!(matches!(
+                assertion.store.handle(&assertion.owner, id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+        }
         drop(assertion.store);
         let _ = std::fs::remove_dir_all(assertion.resource_root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn applied_without_resume_requires_fresh_exact_preview_before_no_write_executor_retry() {
+        let fixture = failed_click_fixture("applied-no-resume").await;
+        let (mut fixture, snapshot, screenshot) = drive_fixture_to_pause(fixture).await;
+        let repair = preview_exact_repair(&mut fixture, "repaired-submit", 9).await;
+        let applied = apply_previewed_repair(&mut fixture, &repair, false, true).await;
+        assert!(applied.recipe_written);
+        assert_eq!(
+            applied.repair.phase,
+            crate::browser::BrowserReplayRepairPhase::Applied
+        );
+        assert_eq!(
+            applied.replay.status,
+            BrowserReplayStatus::PausedLocatorRepair
+        );
+        assert_eq!(applied.replay.current_step_index, 0);
+        drop(applied);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), fixture.inbox.recv())
+                .await
+                .is_err()
+        );
+
+        let controller = fixture
+            .bridge
+            .bind(fixture.owner.clone(), Duration::from_secs(1));
+        assert!(controller
+            .request_replay_repair_apply(
+                &fixture.coordinator,
+                &repair,
+                true,
+                true,
+                BrowserInvocationContext::agent(
+                    "reject non-fresh executor resume",
+                    BrowserRisk::Normal,
+                )
+                .unwrap(),
+            )
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), fixture.inbox.recv())
+                .await
+                .is_err()
+        );
+
+        let fresh = preview_exact_repair(&mut fixture, "repaired-submit", 10).await;
+        assert!(fresh == repair);
+        let recipe_file = recipe_path(&fixture.project_root, "repair-applied-no-resume").unwrap();
+        let committed = std::fs::read(&recipe_file).unwrap();
+        let mut permissions = std::fs::metadata(&recipe_file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&recipe_file, permissions.clone()).unwrap();
+        let resumed = apply_previewed_repair(&mut fixture, &repair, true, false).await;
+        assert!(!resumed.recipe_written);
+        assert_eq!(resumed.replay.status, BrowserReplayStatus::Running);
+        assert_eq!(resumed.replay.current_step_index, 0);
+        assert_eq!(std::fs::read(&recipe_file).unwrap(), committed);
+        drop(resumed);
+
+        let retry = next_test_request(&mut fixture.inbox, "fresh no-write action retry").await;
+        assert!(command_targets_test_id(retry.command(), "repaired-submit"));
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&recipe_file, permissions).unwrap();
+        retry.respond(Ok(completed_action_response()));
+        let completed = fixture.run.await.unwrap().unwrap();
+        assert_eq!(completed.status, BrowserReplayStatus::Completed);
+        assert_eq!(completed.current_step_index, 1);
+        for id in [&snapshot.id, &screenshot.id] {
+            assert!(matches!(
+                fixture.store.handle(&fixture.owner, id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+        }
+        drop(fixture.store);
+        let _ = std::fs::remove_dir_all(fixture.resource_root);
     }
 
     #[cfg(target_os = "windows")]
@@ -2928,24 +3292,22 @@ mod tests {
             .respond(Err(BrowserError::Timeout {
                 operation: "pageCondition".to_string(),
             }));
-        let (mut fixture, _, _) = drive_fixture_to_pause(fixture).await;
+        let (mut fixture, first_snapshot, first_screenshot) = drive_fixture_to_pause(fixture).await;
         let (stale_repair, stale_slot, stale_cursor) = fixture
             .coordinator
             .active_locator_repair_capture_for_test(&fixture.instance)
             .unwrap();
         assert_eq!(stale_slot, BrowserReplayLocatorSlot::StepWait);
         assert!(stale_cursor == BrowserReplayRepairResumeCursor::StepWait);
-        fixture
-            .coordinator
-            .resume_locator_repair_for_executor_test(&stale_repair)
-            .unwrap();
+        apply_exact_repair(&mut fixture, "ready-first-repair", 9).await;
 
         next_test_request(&mut fixture.inbox, "second failed step wait")
             .await
             .respond(Err(BrowserError::Timeout {
                 operation: "pageCondition".to_string(),
             }));
-        let (mut fixture, _, _) = drive_fixture_to_pause(fixture).await;
+        let (mut fixture, second_snapshot, second_screenshot) =
+            drive_fixture_to_pause(fixture).await;
         let (active_repair, active_slot, active_cursor) = fixture
             .coordinator
             .active_locator_repair_capture_for_test(&fixture.instance)
@@ -2954,12 +3316,23 @@ mod tests {
         assert_eq!(active_slot, BrowserReplayLocatorSlot::StepWait);
         assert!(active_cursor == BrowserReplayRepairResumeCursor::StepWait);
 
-        assert!(matches!(
-            fixture
-                .coordinator
-                .resume_locator_repair_for_executor_test(&stale_repair),
-            Err(BrowserReplayError::InvalidRepairEvidence)
-        ));
+        let stale_controller = fixture
+            .bridge
+            .bind(fixture.owner.clone(), Duration::from_secs(1));
+        assert!(stale_controller
+            .request_replay_repair_apply(
+                &fixture.coordinator,
+                &stale_repair,
+                true,
+                true,
+                BrowserInvocationContext::agent(
+                    "reject stale executor repair",
+                    BrowserRisk::Normal,
+                )
+                .unwrap(),
+            )
+            .await
+            .is_err());
         assert_eq!(
             fixture
                 .coordinator
@@ -2974,17 +3347,21 @@ mod tests {
                 .is_err()
         );
 
-        fixture
-            .coordinator
-            .resume_locator_repair_for_executor_test(&active_repair)
-            .unwrap();
-        next_test_request(&mut fixture.inbox, "active repair retry only")
-            .await
-            .respond(Ok(matched_wait_response()));
-        assert_eq!(
-            fixture.run.await.unwrap().unwrap().status,
-            BrowserReplayStatus::Completed
-        );
+        assert_eq!(active_repair.replay(), &fixture.instance);
+        fixture.coordinator.cancel(&fixture.instance).unwrap();
+        let terminal = fixture.run.await.unwrap().unwrap();
+        assert_eq!(terminal.status, BrowserReplayStatus::Cancelled);
+        for id in [
+            &first_snapshot.id,
+            &first_screenshot.id,
+            &second_snapshot.id,
+            &second_screenshot.id,
+        ] {
+            assert!(matches!(
+                fixture.store.handle(&fixture.owner, id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+        }
         drop(fixture.store);
         let _ = std::fs::remove_dir_all(fixture.resource_root);
     }

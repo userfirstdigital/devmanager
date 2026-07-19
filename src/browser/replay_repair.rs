@@ -1,6 +1,7 @@
 use super::{
-    BrowserRecipeLocator, BrowserReplayInstance, BrowserReplayRepairCandidate,
-    BrowserResourceHandle, BrowserRevision, BrowserWorkspaceKey,
+    BrowserInvocationActor, BrowserRecipeLocator, BrowserReplayInstance,
+    BrowserReplayRepairCandidate, BrowserResourceHandle, BrowserRevision, BrowserRisk,
+    BrowserWorkspaceKey,
 };
 use serde::Serialize;
 use std::hash::{Hash, Hasher};
@@ -362,6 +363,224 @@ impl BrowserReplayRepairPreviewReceipt {
         exact.then(|| BrowserReplayRepairPreviewAcknowledgement {
             repair: state.repair.clone(),
             preview_id: state.preview_id,
+            candidate: state.candidate.clone(),
+            recipe_locator: state.recipe_locator.clone(),
+            token: state.token.clone(),
+            lease: self.lease.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BrowserReplayRepairApplyLease(Arc<AtomicBool>);
+
+impl BrowserReplayRepairApplyLease {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    fn is_live(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+struct BrowserReplayRepairApplyReceiptState {
+    repair: BrowserReplayRepairInstance,
+    apply_id: NonZeroU64,
+    stage: BrowserReplayRepairApplyStage,
+    candidate: BrowserReplayRepairCandidate,
+    recipe_locator: BrowserRecipeLocator,
+    token: BrowserReplayRepairHighlightToken,
+    acknowledged: bool,
+    consumed: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserReplayRepairApplyAuthority {
+    repair: BrowserReplayRepairInstance,
+    apply_id: NonZeroU64,
+    stage: BrowserReplayRepairApplyStage,
+    actor: BrowserInvocationActor,
+    operation_id: Arc<str>,
+    effective_risk: BrowserRisk,
+    revision: BrowserRevision,
+    candidate: BrowserReplayRepairCandidate,
+    token: BrowserReplayRepairHighlightToken,
+    lease: BrowserReplayRepairApplyLease,
+    receipt: Arc<Mutex<BrowserReplayRepairApplyReceiptState>>,
+}
+
+pub(crate) struct BrowserReplayRepairApplyReceipt {
+    lease: BrowserReplayRepairApplyLease,
+    state: Arc<Mutex<BrowserReplayRepairApplyReceiptState>>,
+}
+
+pub(crate) struct BrowserReplayRepairApplyAcknowledgement {
+    pub(super) repair: BrowserReplayRepairInstance,
+    pub(super) apply_id: NonZeroU64,
+    pub(super) stage: BrowserReplayRepairApplyStage,
+    pub(super) candidate: BrowserReplayRepairCandidate,
+    pub(super) recipe_locator: BrowserRecipeLocator,
+    pub(super) token: BrowserReplayRepairHighlightToken,
+    lease: BrowserReplayRepairApplyLease,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowserReplayRepairApplyStage {
+    PreCommit,
+    PostCommit,
+}
+
+impl BrowserReplayRepairApplyAuthority {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn issue(
+        repair: BrowserReplayRepairInstance,
+        apply_id: NonZeroU64,
+        stage: BrowserReplayRepairApplyStage,
+        actor: BrowserInvocationActor,
+        operation_id: String,
+        effective_risk: BrowserRisk,
+        revision: BrowserRevision,
+        candidate: BrowserReplayRepairCandidate,
+        recipe_locator: BrowserRecipeLocator,
+        token: BrowserReplayRepairHighlightToken,
+    ) -> (Self, BrowserReplayRepairApplyReceipt) {
+        let lease = BrowserReplayRepairApplyLease::new();
+        let receipt = Arc::new(Mutex::new(BrowserReplayRepairApplyReceiptState {
+            repair: repair.clone(),
+            apply_id,
+            stage,
+            candidate: candidate.clone(),
+            recipe_locator,
+            token: token.clone(),
+            acknowledged: false,
+            consumed: false,
+        }));
+        (
+            Self {
+                repair,
+                apply_id,
+                stage,
+                actor,
+                operation_id: Arc::from(operation_id),
+                effective_risk,
+                revision,
+                candidate,
+                token,
+                lease: lease.clone(),
+                receipt: Arc::clone(&receipt),
+            },
+            BrowserReplayRepairApplyReceipt {
+                lease,
+                state: receipt,
+            },
+        )
+    }
+
+    pub(crate) fn repair(&self) -> &BrowserReplayRepairInstance {
+        &self.repair
+    }
+
+    pub(crate) fn apply_id(&self) -> u64 {
+        self.apply_id.get()
+    }
+
+    pub(crate) fn stage(&self) -> BrowserReplayRepairApplyStage {
+        self.stage
+    }
+
+    pub(crate) fn actor(&self) -> BrowserInvocationActor {
+        self.actor
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(crate) fn effective_risk(&self) -> BrowserRisk {
+        self.effective_risk
+    }
+
+    pub(crate) fn revision(&self) -> BrowserRevision {
+        self.revision
+    }
+
+    pub(crate) fn candidate(&self) -> &BrowserReplayRepairCandidate {
+        &self.candidate
+    }
+
+    pub(crate) fn token(&self) -> &BrowserReplayRepairHighlightToken {
+        &self.token
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.lease.is_live()
+    }
+
+    pub(crate) fn acknowledge_exact(&self) -> bool {
+        if !self.is_live() {
+            return false;
+        }
+        let mut receipt = self
+            .receipt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if receipt.consumed
+            || receipt.apply_id != self.apply_id
+            || receipt.stage != self.stage
+            || receipt.token != self.token
+        {
+            return false;
+        }
+        receipt.acknowledged = true;
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn acknowledge_for_test(&self) -> bool {
+        self.acknowledge_exact()
+    }
+
+    #[cfg(test)]
+    pub(super) fn effective_risk_for_test(&self) -> BrowserRisk {
+        self.effective_risk
+    }
+
+    pub(super) fn close(&self) {
+        self.lease.close();
+    }
+
+    pub(super) fn same_lease(&self, other: &BrowserReplayRepairApplyAcknowledgement) -> bool {
+        self.lease.same(&other.lease)
+    }
+}
+
+impl BrowserReplayRepairApplyReceipt {
+    pub(crate) fn consume_exact(
+        &self,
+        repair: &BrowserReplayRepairInstance,
+    ) -> Option<BrowserReplayRepairApplyAcknowledgement> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.consumed {
+            return None;
+        }
+        state.consumed = true;
+        let exact = self.lease.is_live() && state.acknowledged && state.repair == *repair;
+        exact.then(|| BrowserReplayRepairApplyAcknowledgement {
+            repair: state.repair.clone(),
+            apply_id: state.apply_id,
+            stage: state.stage,
             candidate: state.candidate.clone(),
             recipe_locator: state.recipe_locator.clone(),
             token: state.token.clone(),

@@ -21,6 +21,57 @@ assert_impl_all!(BrowserReplayRepairPhase: Clone, Send, Sync, Eq, std::fmt::Debu
 assert_impl_all!(BrowserReplayRepairProjection: Clone, Send, Sync, Eq, std::fmt::Debug, serde::Serialize);
 
 #[test]
+fn repair_apply_is_two_phase_preserves_applied_outcomes_and_seeds_later_repairs_from_override() {
+    let commands = include_str!("../src/browser/commands.rs");
+    let replay = include_str!("../src/browser/replay.rs");
+    let repair = include_str!("../src/browser/replay_repair.rs");
+
+    assert!(repair.contains("enum BrowserReplayRepairApplyStage"));
+    assert!(repair.contains("PreCommit"));
+    assert!(repair.contains("PostCommit"));
+    assert!(commands.contains("request_replay_repair_apply"));
+    assert!(commands.contains("reserve_locator_repair_post_commit_validation"));
+    assert!(commands.contains("complete_locator_repair_post_commit_validation"));
+    assert!(commands.contains("&mut commit"));
+    assert!(commands.contains("commit.replay = projection"));
+    assert!(commands.contains("Ok(commit)"));
+    assert!(!commands.contains(
+        "complete_locator_repair_post_commit_validation(\n            post_acknowledgement,\n            commit,"
+    ));
+
+    let reserve_start = replay
+        .find("pub(crate) fn reserve_locator_repair_capture")
+        .unwrap();
+    let reserve_end = replay[reserve_start..]
+        .find("pub(crate) fn issue_locator_repair_capture_authority")
+        .unwrap()
+        + reserve_start;
+    let reserve = &replay[reserve_start..reserve_end];
+    assert!(reserve.contains("_locator_overrides"));
+    assert!(reserve.contains(".get(&(step_index, locator_slot))"));
+    assert!(reserve.contains(".unwrap_or(plan_locator)"));
+
+    let publish_start = replay.find("pub(crate) fn publish_locator_repair").unwrap();
+    let publish_end = replay[publish_start..].find("pub fn complete(").unwrap() + publish_start;
+    let publish = &replay[publish_start..publish_end];
+    assert!(publish.contains("_locator_overrides"));
+    assert!(publish.contains(".or(plan_old_locator)"));
+    assert!(publish.contains("exact_old_locator.as_ref()"));
+
+    let post_start = replay
+        .find("pub(crate) fn complete_locator_repair_post_commit_validation")
+        .unwrap();
+    let post_end = replay[post_start..]
+        .find("pub(crate) fn locator_repair_status")
+        .unwrap()
+        + post_start;
+    let post = &replay[post_start..post_end];
+    assert!(post.contains("commit: &mut BrowserReplayRepairApplyCommit"));
+    assert!(post.contains("previous.applied_preview_fresh = false"));
+    assert!(!post.contains("previous.applied_preview_fresh = !resume"));
+}
+
+#[test]
 fn repair_candidate_carries_an_exact_element_reference_without_a_public_locator_projection() {
     let element_ref = BrowserElementRef {
         revision: BrowserRevision(17),

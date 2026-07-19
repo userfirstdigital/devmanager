@@ -2704,6 +2704,7 @@ class FakeMutationObserver {
   record(record) { this.records.push(record); }
   flush() { const records = this.records.splice(0); if (records.length) this.callback(records); }
 }
+
 class FakeElement {
   constructor(tag) {
     this.tagName = tag.toUpperCase(); this.children = []; this.parentElement = null;
@@ -2849,6 +2850,53 @@ process.stdout.write(JSON.stringify({ mutations: 1, children: body.children.leng
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         r#"{"mutations":1,"children":0}"#
+    );
+}
+
+#[test]
+fn repair_apply_validation_uses_existing_approval_queue_and_exact_native_state() {
+    let commands = include_str!("../src/browser/commands.rs");
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+
+    assert!(commands.contains("BrowserCommand::RepairValidate"));
+    assert!(commands.contains("BrowserReplayRepairPreviewSidecar::Apply"));
+    assert!(commands.contains("validate_repair_apply_sidecar"));
+    assert!(windows.contains("repair_apply_authority"));
+    assert!(windows.contains("authority.effective_risk()"));
+    assert!(windows.contains("requires_confirmation(initial_risk)"));
+    assert!(windows.contains("repair_highlight_matches"));
+    assert!(windows.contains("validate_element_ref(authority.candidate().element_ref())"));
+    assert!(windows.contains("authority.acknowledge_exact()"));
+    assert!(unsupported.contains("validate_repair_apply_sidecar"));
+
+    let approval_start = windows.find("pub fn resolve_approval(").unwrap();
+    let approval_end = windows[approval_start..]
+        .find("fn continue_actions(")
+        .unwrap()
+        + approval_start;
+    let approval = &windows[approval_start..approval_end];
+    assert!(approval.contains("begin_automation_request(window"));
+    assert!(approval.contains("Some(risk)"));
+    assert!(approval.contains("BrowserError::BlockedPermission"));
+}
+
+#[test]
+fn repair_validate_is_privately_sealed_but_externally_pattern_matchable() {
+    let _external_matcher: fn(&BrowserCommand) -> bool =
+        |command| matches!(command, BrowserCommand::RepairValidate { .. });
+    let commands = include_str!("../src/browser/commands.rs");
+
+    assert!(commands.contains("struct BrowserRepairValidateSeal;"));
+    assert!(!commands.contains("pub struct BrowserRepairValidateSeal;"));
+    assert!(commands.contains("#[allow(private_interfaces)]\n    RepairValidate {"));
+    assert!(commands.contains("_seal: BrowserRepairValidateSeal,"));
+    assert_eq!(
+        commands
+            .matches("_seal: BrowserRepairValidateSeal,")
+            .count(),
+        3,
+        "the enum field and both internal constructors must carry the private seal"
     );
 }
 

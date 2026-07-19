@@ -22,6 +22,70 @@ use std::time::Duration;
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
 static REPLAY_RESOURCE_STORE: OnceLock<BrowserResourceStore> = OnceLock::new();
 
+#[test]
+fn repaired_executor_phases_are_resumed_only_by_the_real_authorized_apply_pipeline() {
+    let executor = include_str!("../src/browser/replay_executor.rs");
+    let phase_start = executor
+        .find("async fn batch_c_resume_retries_only_action_wait_step_wait_or_exact_assertion_phase")
+        .unwrap();
+    let phase_end = executor[phase_start..]
+        .find("async fn stale_repair_cannot_resume_the_next_repair_in_the_same_executor")
+        .unwrap()
+        + phase_start;
+    let phases = &executor[phase_start..phase_end];
+    assert!(!phases.contains("resume_locator_repair_for_executor_test"));
+    assert!(phases.matches("apply_exact_repair(").count() >= 4);
+    for exact_cursor in [
+        "BrowserReplayRepairResumeCursor::Action",
+        "BrowserReplayRepairResumeCursor::ActionWait",
+        "BrowserReplayRepairResumeCursor::StepWait",
+        "BrowserReplayRepairResumeCursor::Assertion(1)",
+    ] {
+        assert!(phases.contains(exact_cursor), "missing {exact_cursor}");
+    }
+    assert!(phases.contains("single mutating action"));
+    assert!(phases.contains("step-wait-only retry"));
+    assert!(phases.contains("assertion-one-only retry"));
+
+    let second_start = phase_end;
+    let second_end = executor[second_start..]
+        .find("async fn secret_type_locator_failure_enters_primary_action_repair")
+        .unwrap()
+        + second_start;
+    let second = &executor[second_start..second_end];
+    assert!(!second.contains("resume_locator_repair_for_executor_test"));
+    assert_eq!(second.matches("apply_exact_repair(").count(), 1);
+    assert!(second.contains("assert_ne!(stale_repair.repair_id(), active_repair.repair_id())"));
+    assert!(second.contains("ready-first-repair"));
+    assert!(second.contains("BrowserReplayStatus::Cancelled"));
+    assert!(second.contains("second_snapshot.id"));
+    assert!(second.contains("second_screenshot.id"));
+
+    let fixture_start = executor.find("async fn recipe_fixture(").unwrap();
+    let fixture_end = executor[fixture_start..]
+        .find("async fn failed_click_fixture(")
+        .unwrap()
+        + fixture_start;
+    let fixture = &executor[fixture_start..fixture_end];
+    assert!(fixture.contains("save_recipe(&project_root, &recipe)"));
+    assert!(fixture.contains("&run_project_root"));
+
+    let applied_start = executor
+        .find("async fn applied_without_resume_requires_fresh_exact_preview_before_no_write_executor_retry")
+        .unwrap();
+    let applied_end = executor[applied_start..]
+        .find("async fn stale_repair_cannot_resume_the_next_repair_in_the_same_executor")
+        .unwrap()
+        + applied_start;
+    let applied = &executor[applied_start..applied_end];
+    assert!(applied.contains("apply_previewed_repair(&mut fixture, &repair, false, true)"));
+    assert!(applied.contains("preview_exact_repair(&mut fixture, \"repaired-submit\", 10)"));
+    assert!(applied.contains("apply_previewed_repair(&mut fixture, &repair, true, false)"));
+    assert!(applied.contains("permissions.set_readonly(true)"));
+    assert!(applied.contains("assert_eq!(resumed.replay.current_step_index, 0)"));
+    assert!(applied.contains("command_targets_test_id(retry.command(), \"repaired-submit\")"));
+}
+
 fn replay_resource_store() -> &'static BrowserResourceStore {
     REPLAY_RESOURCE_STORE.get_or_init(|| {
         let root = std::env::temp_dir().join(format!(

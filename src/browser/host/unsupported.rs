@@ -76,6 +76,7 @@ pub(crate) fn unsupported_request_response(
     request.validate_secret_sidecar()?;
     request.validate_repair_retention_sidecar()?;
     request.validate_repair_preview_sidecar()?;
+    request.validate_repair_apply_sidecar()?;
     if !request.cancellation_is_current() {
         return Err(BrowserError::Interrupted);
     }

@@ -211,6 +211,12 @@ impl BrowserDocumentSecretState {
         true
     }
 
+    fn repair_highlight_matches(&self, token: &BrowserReplayRepairHighlightToken) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.repair_highlight_token.as_ref() == Some(token))
+    }
+
     fn repair_highlight_cleanup_restore(
         &self,
         document_generation: u64,
@@ -987,6 +993,10 @@ impl BrowserWebViewHost {
             request.respond(Err(error));
             return;
         }
+        if let Err(error) = request.validate_repair_apply_sidecar() {
+            request.respond(Err(error));
+            return;
+        }
         if !request.cancellation_is_current() {
             request.respond(Err(BrowserError::Interrupted));
             return;
@@ -1007,7 +1017,9 @@ impl BrowserWebViewHost {
         }
         let repair_preview_marker = matches!(
             &command,
-            BrowserCommand::RepairHighlight { .. } | BrowserCommand::RepairClearHighlight { .. }
+            BrowserCommand::RepairHighlight { .. }
+                | BrowserCommand::RepairClearHighlight { .. }
+                | BrowserCommand::RepairValidate { .. }
         );
         if (request.context().actor != BrowserInvocationActor::Agent && !repair_preview_marker)
             || browser_request_preempts_operation_queue(&command)
@@ -1118,6 +1130,10 @@ impl BrowserWebViewHost {
             return;
         }
         if let Err(error) = request.validate_repair_preview_sidecar() {
+            self.finish_queued_request(window, target, operation_id, request, Err(error));
+            return;
+        }
+        if let Err(error) = request.validate_repair_apply_sidecar() {
             self.finish_queued_request(window, target, operation_id, request, Err(error));
             return;
         }
@@ -1570,6 +1586,9 @@ impl BrowserWebViewHost {
         request: &BrowserCommandRequest,
         approved_risk: Option<crate::browser::BrowserRisk>,
     ) -> BrowserStartResult {
+        if let Err(error) = request.validate_repair_apply_sidecar() {
+            return BrowserStartResult::Complete(Err(error));
+        }
         let workspace_key = request.workspace_key();
         let command = request.command();
         let tab_id = command
@@ -1587,6 +1606,7 @@ impl BrowserWebViewHost {
                 | BrowserCommand::Performance { .. }
                 | BrowserCommand::RepairHighlight { .. }
                 | BrowserCommand::RepairClearHighlight { .. }
+                | BrowserCommand::RepairValidate { .. }
                 | BrowserCommand::Cdp { .. }
         ) {
             if let Err(error) = self.ensure_document_content_available(workspace_key, tab_id) {
@@ -1600,6 +1620,14 @@ impl BrowserWebViewHost {
                 ..
             } => crate::browser::BrowserRisk::Destructive,
             BrowserCommand::Cdp { method, .. } => browser_cdp_method_risk(method),
+            BrowserCommand::RepairValidate { .. } => match request.repair_apply_authority() {
+                Some(authority) => authority.effective_risk(),
+                None => {
+                    return BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
+                        field: "repairApplySidecar".to_string(),
+                    }))
+                }
+            },
             _ => crate::browser::BrowserRisk::Normal,
         };
         let initial_risk =
@@ -1682,6 +1710,45 @@ impl BrowserWebViewHost {
                 BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
                     field: "repairPreviewSidecar".to_string(),
                 }))
+            }
+            BrowserCommand::RepairValidate { .. } => {
+                let authority = match request.repair_apply_authority() {
+                    Some(authority) if authority.is_live() => authority,
+                    _ => {
+                        return BrowserStartResult::Complete(Err(BrowserError::InvalidInvocation {
+                            field: "repairApplySidecar".to_string(),
+                        }))
+                    }
+                };
+                if !request.cancellation_is_current() {
+                    return BrowserStartResult::Complete(Err(BrowserError::Interrupted));
+                }
+                let snapshot = match self.state.workspace(workspace_key) {
+                    Some(snapshot) => snapshot,
+                    None => return BrowserStartResult::Complete(Err(missing_workspace())),
+                };
+                if snapshot.revision != authority.revision() {
+                    return BrowserStartResult::Complete(Err(BrowserError::StaleReference {
+                        expected: authority.revision(),
+                        actual: snapshot.revision,
+                    }));
+                }
+                if let Err(error) =
+                    snapshot.validate_element_ref(authority.candidate().element_ref())
+                {
+                    return BrowserStartResult::Complete(Err(error));
+                }
+                let repair_highlight_matches = self
+                    .document_secret_states
+                    .get(&view_key(workspace_key, tab_id))
+                    .is_some_and(|state| state.repair_highlight_matches(authority.token()));
+                if !repair_highlight_matches || !authority.is_live() {
+                    return BrowserStartResult::Complete(Err(BrowserError::Interrupted));
+                }
+                if !authority.acknowledge_exact() {
+                    return BrowserStartResult::Complete(Err(BrowserError::Interrupted));
+                }
+                BrowserStartResult::Complete(Ok(BrowserResponse::Acknowledged))
             }
             BrowserCommand::SecretType {
                 target: action_target,
@@ -5292,6 +5359,7 @@ impl BrowserWebViewHost {
             | BrowserCommand::Downloads { .. }
             | BrowserCommand::RepairHighlight { .. }
             | BrowserCommand::RepairClearHighlight { .. }
+            | BrowserCommand::RepairValidate { .. }
             | BrowserCommand::Cdp { .. } => Err(BrowserError::CrashedView {
                 message: "browser automation command requires the asynchronous request path"
                     .to_string(),
@@ -6230,6 +6298,7 @@ fn browser_command_is_automation(command: &BrowserCommand) -> bool {
             | BrowserCommand::Downloads { .. }
             | BrowserCommand::RepairHighlight { .. }
             | BrowserCommand::RepairClearHighlight { .. }
+            | BrowserCommand::RepairValidate { .. }
             | BrowserCommand::Cdp { .. }
     )
 }
@@ -6264,6 +6333,7 @@ fn browser_command_journal_actor(
                 command,
                 BrowserCommand::RepairHighlight { .. }
                     | BrowserCommand::RepairClearHighlight { .. }
+                    | BrowserCommand::RepairValidate { .. }
             ) =>
         {
             Some(BrowserJournalActor::User)
@@ -6396,6 +6466,7 @@ fn browser_command_summary(command: &BrowserCommand) -> String {
         BrowserCommand::RepairClearHighlight { .. } => {
             "clear replay repair preview highlight".to_string()
         }
+        BrowserCommand::RepairValidate { .. } => "validate replay repair locator".to_string(),
         BrowserCommand::Cdp { method, .. } => {
             format!("call browser CDP method {}", redact_browser_text(method))
         }
