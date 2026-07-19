@@ -1342,11 +1342,28 @@ impl NativeShell {
             });
         }
         let open_workspaces = self.open_browser_workspace_keys();
-        let browser_host = &mut self.browser_host;
-        let result = self.browser_bridge.with_locked_host_work_for_command(
+        let browser_bridge = self.browser_bridge.clone();
+        let result = browser_bridge.with_locked_host_work_for_command(
             workspace_key,
             &command,
             |controls, lifecycle_requests, repair_cleanups| {
+                match &command {
+                    BrowserCommand::Stop { .. }
+                    | BrowserCommand::CloseTab { .. }
+                    | BrowserCommand::ResetWorkspace => {
+                        self.retire_browser_replay_ui_after_interrupt(workspace_key);
+                    }
+                    BrowserCommand::ClearProjectProfile => {
+                        for key in open_workspaces
+                            .iter()
+                            .filter(|key| key.project_id == workspace_key.project_id)
+                        {
+                            self.retire_browser_replay_ui_after_interrupt(key);
+                        }
+                    }
+                    _ => {}
+                }
+                let browser_host = &mut self.browser_host;
                 for control in controls {
                     browser_host.handle_control(control);
                 }
@@ -2210,6 +2227,85 @@ impl NativeShell {
         vault.route_switch(&instance).ok()
     }
 
+    fn retire_browser_replay_ui_after_interrupt(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        if self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| vault.workspace_key() == workspace_key)
+        {
+            if let Some(vault) = self.browser_replay_secret_prompt.take() {
+                let instance = vault.instance().clone();
+                self.browser_replay_secret_submitter = None;
+                let _ = vault.route_switch(&instance);
+            }
+        }
+        if self
+            .browser_replay_repair_selection
+            .as_ref()
+            .is_some_and(|selection| &selection.workspace_key == workspace_key)
+        {
+            self.cancel_browser_replay_repair_selection(None);
+        }
+    }
+
+    fn discard_browser_workflow_state_after_replay_interrupt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) {
+        self.retire_browser_replay_ui_after_interrupt(workspace_key);
+        self.browser_host.discard_workflow_state(workspace_key);
+        if let Some(ui) = self.browser_ui.get_mut(workspace_key) {
+            ui.workflow_preview = None;
+            ui.workflow_editor = None;
+        }
+        if self.browser_workflow_route.as_ref() == Some(workspace_key) {
+            self.browser_workflow_route = None;
+        }
+    }
+
+    fn interrupt_active_browser_replay_before_route_change(
+        &mut self,
+        next_workspace: Option<&BrowserWorkspaceKey>,
+    ) {
+        let Some(previous) = self
+            .active_browser_workspace()
+            .map(|(workspace_key, _)| workspace_key)
+        else {
+            return;
+        };
+        if next_workspace == Some(&previous) {
+            return;
+        }
+        self.browser_bridge.interrupt_workspace(&previous);
+        self.discard_browser_workflow_state_after_replay_interrupt(&previous);
+    }
+
+    fn interrupt_browser_workspace_before_teardown(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        self.browser_bridge.interrupt_workspace(workspace_key);
+        self.discard_browser_workflow_state_after_replay_interrupt(workspace_key);
+    }
+
+    fn interrupt_browser_project_before_mutation(&mut self, project_id: &str) {
+        self.browser_bridge.interrupt_project(project_id);
+        let workspaces = self
+            .state
+            .ai_tabs()
+            .filter(|tab| tab.project_id == project_id)
+            .filter_map(|tab| browser_workspace_key_for_ai_tab(Some(tab)))
+            .collect::<Vec<_>>();
+        for workspace_key in workspaces {
+            self.discard_browser_workflow_state_after_replay_interrupt(&workspace_key);
+        }
+    }
+
+    fn interrupt_all_browser_replays_before_shutdown(&mut self) {
+        self.browser_bridge.interrupt_all();
+        let workspaces = self.open_browser_workspace_keys();
+        for workspace_key in workspaces {
+            self.discard_browser_workflow_state_after_replay_interrupt(&workspace_key);
+        }
+    }
+
     fn sync_browser_host_visibility(&mut self, window: Option<&Window>) {
         let workflow_route = if self.remote_mode.is_none()
             && self.state.settings().browser_enabled
@@ -2700,16 +2796,12 @@ impl NativeShell {
                 BrowserPaneAction::Collapse
                     | BrowserPaneAction::CreateTab
                     | BrowserPaneAction::SelectTab(_)
-                    | BrowserPaneAction::CloseTab(_)
                     | BrowserPaneAction::Back
                     | BrowserPaneAction::Forward
                     | BrowserPaneAction::Reload
                     | BrowserPaneAction::FocusAddress
                     | BrowserPaneAction::SubmitAddress
                     | BrowserPaneAction::StartRecording
-                    | BrowserPaneAction::Stop
-                    | BrowserPaneAction::ResetWorkspace
-                    | BrowserPaneAction::ClearProjectProfile
             )
         {
             self.close_browser_replay_secret_prompt_for_route(None);
@@ -5900,6 +5992,7 @@ impl NativeShell {
                             self.pending_window_close = false;
                             self.pending_shutdown_op_id = None;
                             self.terminal_actionable_notice = None;
+                            self.interrupt_all_browser_replays_before_shutdown();
                             if self.pending_install_update.take().is_some() {
                                 std::process::exit(0);
                             } else {
@@ -5997,6 +6090,10 @@ impl NativeShell {
                     focus,
                     dimensions,
                 } => {
+                    let command_exists = self.state.find_command(&command_id).is_some();
+                    if focus && command_exists {
+                        self.interrupt_active_browser_replay_before_route_change(None);
+                    }
                     let result = self.process_manager.start_server_with_remote_response(
                         &mut self.state,
                         &command_id,
@@ -6033,6 +6130,9 @@ impl NativeShell {
                     command_id,
                     dimensions,
                 } => {
+                    if self.state.find_command(&command_id).is_some() {
+                        self.interrupt_active_browser_replay_before_route_change(None);
+                    }
                     match self.process_manager.restart_server_with_remote_response(
                         &mut self.state,
                         &command_id,
@@ -6108,32 +6208,55 @@ impl NativeShell {
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::RestartAiTab { tab_id, dimensions } => match self
-                    .process_manager
-                    .restart_ai_session_activate_with_response(
-                        &mut self.state,
-                        &tab_id,
-                        dimensions,
-                        false,
-                        response.clone(),
-                    ) {
-                    Ok(session_id) => {
-                        did_change = true;
-                        self.save_session_state();
-                        defer_response_send = response.is_some();
-                        RemoteActionResult::ok(
-                            None,
-                            remote_ai_tab_payload_for_remote_response(
-                                &self.state,
-                                &self.process_manager,
-                                &session_id,
-                                Instant::now(),
-                            ),
-                        )
+                RemoteAction::RestartAiTab { tab_id, dimensions } => {
+                    if let Err(error) = self
+                        .process_manager
+                        .validate_ai_restart(&self.state, &tab_id)
+                    {
+                        RemoteActionResult::error(error)
+                    } else {
+                        let workspace_key =
+                            self.state.find_ai_tab(&tab_id).cloned().and_then(|tab| {
+                                self.state
+                                    .find_project(&tab.project_id)
+                                    .and_then(|_| browser_workspace_key_for_ai_tab(Some(&tab)))
+                            });
+                        if let Some(workspace_key) = workspace_key.as_ref() {
+                            self.interrupt_browser_workspace_before_teardown(workspace_key);
+                        }
+                        match self
+                            .process_manager
+                            .restart_ai_session_activate_with_response(
+                                &mut self.state,
+                                &tab_id,
+                                dimensions,
+                                false,
+                                response.clone(),
+                            ) {
+                            Ok(session_id) => {
+                                did_change = true;
+                                self.save_session_state();
+                                defer_response_send = response.is_some();
+                                RemoteActionResult::ok(
+                                    None,
+                                    remote_ai_tab_payload_for_remote_response(
+                                        &self.state,
+                                        &self.process_manager,
+                                        &session_id,
+                                        Instant::now(),
+                                    ),
+                                )
+                            }
+                            Err(error) => RemoteActionResult::error(error),
+                        }
                     }
-                    Err(error) => RemoteActionResult::error(error),
-                },
+                }
                 RemoteAction::CloseAiTab { tab_id } => {
+                    let workspace_key =
+                        browser_workspace_key_for_ai_tab(self.state.find_ai_tab(&tab_id));
+                    if let Some(workspace_key) = workspace_key.as_ref() {
+                        self.interrupt_browser_workspace_before_teardown(workspace_key);
+                    }
                     match self.process_manager.close_ai_session_with_response(
                         &mut self.state,
                         &tab_id,
@@ -6168,6 +6291,7 @@ impl NativeShell {
                                     .map(|project| project.id.clone())
                             })
                             .unwrap_or_default();
+                        self.interrupt_active_browser_replay_before_route_change(None);
                         self.state.open_ssh_tab(
                             &project_id,
                             &connection_id,
@@ -6186,6 +6310,9 @@ impl NativeShell {
                     connection_id,
                     dimensions,
                 } => {
+                    if self.state.find_ssh_connection(&connection_id).is_some() {
+                        self.interrupt_active_browser_replay_before_route_change(None);
+                    }
                     match self.process_manager.start_ssh_session_with_response(
                         &mut self.state,
                         &connection_id,
@@ -6205,6 +6332,11 @@ impl NativeShell {
                     connection_id,
                     dimensions,
                 } => {
+                    let connection_exists =
+                        self.state.find_ssh_connection(&connection_id).is_some();
+                    if connection_exists {
+                        self.interrupt_active_browser_replay_before_route_change(None);
+                    }
                     if let Some(tab_id) = self
                         .state
                         .find_ssh_tab_by_connection(&connection_id)
@@ -6265,6 +6397,17 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::CloseSession { session_id } => {
+                    let workspace_key = self
+                        .current_runtime_snapshot()
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|session| session.tab_id.as_deref())
+                        .and_then(|tab_id| {
+                            browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id))
+                        });
+                    if let Some(workspace_key) = workspace_key.as_ref() {
+                        self.interrupt_browser_workspace_before_teardown(workspace_key);
+                    }
                     match self.process_manager.close_session(&session_id) {
                         Ok(()) => {
                             did_change = true;
@@ -6275,6 +6418,11 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::CloseTab { tab_id } => {
+                    let workspace_key =
+                        browser_workspace_key_for_ai_tab(self.state.find_ai_tab(&tab_id));
+                    if let Some(workspace_key) = workspace_key.as_ref() {
+                        self.interrupt_browser_workspace_before_teardown(workspace_key);
+                    }
                     match self.process_manager.close_tab(&mut self.state, &tab_id) {
                         Ok(()) => {
                             did_change = true;
@@ -6761,7 +6909,6 @@ impl NativeShell {
     }
 
     fn handle_window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.close_browser_replay_secret_prompt_for_route(None);
         self.sync_terminal_focus(None);
         self.capture_window_bounds(window);
 
@@ -6798,6 +6945,7 @@ impl NativeShell {
             }
         }
 
+        self.interrupt_all_browser_replays_before_shutdown();
         self.save_session_state();
         match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
             Ok(op_id) => {
@@ -6890,6 +7038,9 @@ impl NativeShell {
 
         if !self.ensure_mutation_control(cx) {
             return;
+        }
+        if let Some(workspace_key) = browser_workspace_key_for_ai_tab(Some(&tab)) {
+            self.interrupt_browser_workspace_before_teardown(&workspace_key);
         }
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::CloseTab {
@@ -7033,6 +7184,16 @@ impl NativeShell {
             .map(|tab| tab.id.clone())
             .collect();
 
+        let removed_ai_workspaces = removed_ai_tabs
+            .iter()
+            .filter_map(|tab_id| {
+                browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        for workspace_key in &removed_ai_workspaces {
+            self.interrupt_browser_workspace_before_teardown(workspace_key);
+        }
+
         self.state.config = config;
         self.state.mark_dirty();
 
@@ -7096,6 +7257,7 @@ impl NativeShell {
     fn install_update_action(&mut self, cx: &mut Context<Self>) {
         match self.updater.install_update() {
             Ok(version) => {
+                self.interrupt_all_browser_replays_before_shutdown();
                 self.save_session_state();
                 match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
                     Ok(op_id) => {
@@ -7121,6 +7283,7 @@ impl NativeShell {
 
     fn force_quit_action(&mut self, cx: &mut Context<Self>) {
         self.terminal_actionable_notice = None;
+        self.interrupt_all_browser_replays_before_shutdown();
         if self.pending_install_update.take().is_some() {
             std::process::exit(0);
         } else {
@@ -7573,6 +7736,11 @@ impl NativeShell {
             }
             SessionKind::Claude | SessionKind::Codex => {
                 if let Some(tab_id) = session.tab_id.as_deref() {
+                    if let Some(workspace_key) =
+                        browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id))
+                    {
+                        self.interrupt_browser_workspace_before_teardown(&workspace_key);
+                    }
                     self.process_manager
                         .close_ai_session(&mut self.state, tab_id)
                 } else {
@@ -8905,6 +9073,7 @@ impl NativeShell {
                     );
                     return;
                 }
+                self.interrupt_browser_project_before_mutation(&project_id);
                 let ai_tab_ids: Vec<String> = self
                     .state
                     .ai_tabs()
@@ -9117,6 +9286,7 @@ impl NativeShell {
             return;
         }
 
+        self.interrupt_browser_project_before_mutation(project_id);
         let ai_tab_ids: Vec<String> = self
             .state
             .ai_tabs()
@@ -11637,12 +11807,20 @@ impl NativeShell {
             return;
         }
 
+        if self.state.find_command(command_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
+            cx.notify();
+            return;
+        }
         let dimensions = self.terminal_dimensions(window);
         let Some(port) = self
             .state
             .find_command(command_id)
             .and_then(|lookup| lookup.command.port)
         else {
+            if focus_started_server {
+                self.interrupt_active_browser_replay_before_route_change(None);
+            }
             let result = if focus_started_server {
                 self.process_manager
                     .start_server(&mut self.state, command_id, dimensions)
@@ -11722,6 +11900,9 @@ impl NativeShell {
                             return;
                         }
 
+                        if focus_started_server {
+                            this.interrupt_active_browser_replay_before_route_change(None);
+                        }
                         let result = if focus_started_server {
                             this.process_manager.start_server(
                                 &mut this.state,
@@ -11823,6 +12004,12 @@ impl NativeShell {
             return;
         }
 
+        if self.state.find_command(command_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
+            cx.notify();
+            return;
+        }
+        self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
         let port = self
             .state
@@ -11918,6 +12105,7 @@ impl NativeShell {
             return;
         };
 
+        self.interrupt_active_browser_replay_before_route_change(None);
         let _ = self.process_manager.write_virtual_text(
             command_id,
             &format!("\r\n\x1b[33m--- Resolving port {port} conflict... ---\x1b[0m\r\n"),
@@ -11959,16 +12147,21 @@ impl NativeShell {
     }
 
     fn select_server_tab_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
-        self.close_browser_replay_secret_prompt_for_route(None);
+        let lookup = self.state.find_command(command_id).map(|lookup| {
+            (
+                lookup.project.id.clone(),
+                lookup.command.id.clone(),
+                lookup.command.label.clone(),
+            )
+        });
+        if lookup.is_none() && self.state.find_tab(command_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
+            cx.notify();
+            return;
+        }
+        self.interrupt_active_browser_replay_before_route_change(None);
         if self.remote_mode.is_some() {
-            let lookup = self.state.find_command(command_id).map(|lookup| {
-                (
-                    lookup.project.id.clone(),
-                    lookup.command.id.clone(),
-                    lookup.command.label.clone(),
-                )
-            });
-            if let Some((project_id, command_id, label)) = lookup {
+            if let Some((project_id, command_id, label)) = lookup.clone() {
                 self.state
                     .open_server_tab(&project_id, &command_id, Some(label));
             } else {
@@ -11984,14 +12177,6 @@ impl NativeShell {
             cx.notify();
             return;
         }
-
-        let lookup = self.state.find_command(command_id).map(|lookup| {
-            (
-                lookup.project.id.clone(),
-                lookup.command.id.clone(),
-                lookup.command.label.clone(),
-            )
-        });
 
         if let Some((project_id, command_id, label)) = lookup {
             self.state
@@ -12015,6 +12200,11 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        if self.state.find_project(project_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown project `{project_id}`"));
+            cx.notify();
+            return;
+        }
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::LaunchAi {
@@ -12029,6 +12219,7 @@ impl NativeShell {
         }
 
         let dimensions = self.terminal_dimensions(window);
+        self.interrupt_active_browser_replay_before_route_change(None);
         match self.process_manager.start_ai_session(
             &mut self.state,
             project_id,
@@ -12049,9 +12240,10 @@ impl NativeShell {
     }
 
     fn select_ai_tab_action(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_browser_replay_secret_prompt_for_route(None);
         if self.remote_mode.is_some() {
             if let Some(tab) = self.state.find_ai_tab(tab_id).cloned() {
+                let next_workspace = browser_workspace_key_for_ai_tab(Some(&tab));
+                self.interrupt_active_browser_replay_before_route_change(next_workspace.as_ref());
                 self.state.select_tab(tab_id);
                 self.show_terminal_surface();
                 self.synced_session_id = tab.pty_session_id.clone();
@@ -12083,6 +12275,8 @@ impl NativeShell {
             return;
         };
 
+        let next_workspace = browser_workspace_key_for_ai_tab(Some(&tab));
+        self.interrupt_active_browser_replay_before_route_change(next_workspace.as_ref());
         self.state.select_tab(tab_id);
         self.show_terminal_surface();
         self.synced_session_id = tab.pty_session_id.clone();
@@ -12124,10 +12318,28 @@ impl NativeShell {
     }
 
     fn restart_ai_tab_action(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_browser_replay_secret_prompt_for_route(None);
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let Some(tab) = self.state.find_ai_tab(tab_id).cloned() else {
+            self.terminal_notice = Some(format!("Unknown AI tab `{tab_id}`"));
+            cx.notify();
+            return;
+        };
+        if self.state.find_project(&tab.project_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown project `{}`", tab.project_id));
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self
+            .process_manager
+            .validate_ai_restart(&self.state, tab_id)
+        {
+            self.terminal_notice = Some(format!("Failed to restart AI tab: {error}"));
+            cx.notify();
+            return;
+        }
+        let workspace_key = browser_workspace_key_for_ai_tab(Some(&tab));
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::RestartAiTab {
@@ -12140,6 +12352,10 @@ impl NativeShell {
             return;
         }
 
+        self.interrupt_active_browser_replay_before_route_change(workspace_key.as_ref());
+        if let Some(workspace_key) = workspace_key.as_ref() {
+            self.interrupt_browser_workspace_before_teardown(workspace_key);
+        }
         let dimensions = self.terminal_dimensions(window);
         match self
             .process_manager
@@ -12159,9 +12375,12 @@ impl NativeShell {
     }
 
     fn close_ai_tab_action(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        self.close_browser_replay_secret_prompt_for_route(None);
         if !self.ensure_mutation_control(cx) {
             return;
+        }
+        let workspace_key = browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id));
+        if let Some(workspace_key) = workspace_key.as_ref() {
+            self.interrupt_browser_workspace_before_teardown(workspace_key);
         }
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::CloseAiTab {
@@ -12186,13 +12405,18 @@ impl NativeShell {
     }
 
     fn open_ssh_tab_action(&mut self, connection_id: &str, cx: &mut Context<Self>) {
-        self.close_browser_replay_secret_prompt_for_route(None);
+        let Some(connection) = self.state.find_ssh_connection(connection_id).cloned() else {
+            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
+            cx.notify();
+            return;
+        };
         if self.remote_mode.is_some() {
             if let Some(tab) = self
                 .state
                 .find_ssh_tab_by_connection(connection_id)
                 .cloned()
             {
+                self.interrupt_active_browser_replay_before_route_change(None);
                 self.state.select_tab(&tab.id);
                 self.show_terminal_surface();
                 self.synced_session_id = tab.pty_session_id.clone();
@@ -12208,6 +12432,7 @@ impl NativeShell {
             if !self.ensure_mutation_control(cx) {
                 return;
             }
+            self.interrupt_active_browser_replay_before_route_change(None);
             self.remote_send_action(RemoteAction::OpenSshTab {
                 connection_id: connection_id.to_string(),
             });
@@ -12220,12 +12445,6 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
-        let connection = self.state.find_ssh_connection(connection_id).cloned();
-        let Some(connection) = connection else {
-            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
-            cx.notify();
-            return;
-        };
 
         let project_id = self
             .state
@@ -12243,6 +12462,7 @@ impl NativeShell {
                     .map(|project| project.id.clone())
             })
             .unwrap_or_default();
+        self.interrupt_active_browser_replay_before_route_change(None);
         let tab_id = self
             .state
             .open_ssh_tab(&project_id, connection_id, Some(connection.label));
@@ -12266,8 +12486,14 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        if self.state.find_ssh_connection(connection_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
+            cx.notify();
+            return;
+        }
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
+            self.interrupt_active_browser_replay_before_route_change(None);
             self.remote_send_action(RemoteAction::ConnectSsh {
                 connection_id: connection_id.to_string(),
                 dimensions,
@@ -12279,6 +12505,7 @@ impl NativeShell {
         }
 
         let dimensions = self.terminal_dimensions(window);
+        self.interrupt_active_browser_replay_before_route_change(None);
         match self
             .process_manager
             .start_ssh_session(&mut self.state, connection_id, dimensions)
@@ -12306,8 +12533,14 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        if self.state.find_ssh_connection(connection_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
+            cx.notify();
+            return;
+        }
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
+            self.interrupt_active_browser_replay_before_route_change(None);
             self.remote_send_action(RemoteAction::RestartSsh {
                 connection_id: connection_id.to_string(),
                 dimensions,
@@ -12327,6 +12560,7 @@ impl NativeShell {
             return;
         };
 
+        self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
         match self
             .process_manager

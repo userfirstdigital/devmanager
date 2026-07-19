@@ -1,18 +1,19 @@
 use base64::Engine as _;
 use devmanager::browser::{
     browser_command_channel, browser_recording_review_result, browser_recording_status_result,
-    save_recipe, BrowserActionResult, BrowserAnnotation, BrowserCommand, BrowserCommandInbox,
-    BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostControl,
-    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
-    BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserRecipeAction, BrowserRecipeInput,
-    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserRecipeValue, BrowserRecipeViewport, BrowserRecordingAction, BrowserRecordingActor,
-    BrowserRecordingInputSummary, BrowserRecordingOperation, BrowserRecordingResult,
-    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
-    BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult,
-    BrowserViewport, BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
+    compile_browser_replay, save_recipe, BrowserActionResult, BrowserAnnotation, BrowserCommand,
+    BrowserCommandInbox, BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle,
+    BrowserHostControl, BrowserHostState, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserRecipeAction,
+    BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep,
+    BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport, BrowserRecordingAction,
+    BrowserRecordingActor, BrowserRecordingInputSummary, BrowserRecordingOperation,
+    BrowserRecordingResult, BrowserRecordingStatus, BrowserReplaySecretError,
+    BrowserReplaySecretPromptVault, BrowserReplayStatus, BrowserResourceHandle, BrowserResourceId,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
+    BrowserRevision, BrowserRisk, BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserUploadResult, BrowserViewport, BrowserWaitResult, BrowserWorkflowCoordinator,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -227,6 +228,49 @@ fn workflow_secret_recipe() -> BrowserRecipeV1 {
             assertions: Vec::new(),
         }],
     }
+}
+
+fn install_gateway_secret_replay(
+    bridge: &devmanager::browser::BrowserCommandBridge,
+    key: &BrowserWorkspaceKey,
+    label: &str,
+) -> devmanager::browser::BrowserReplayStart {
+    let coordinator = bridge.replay_coordinator();
+    let mut recipe = workflow_secret_recipe();
+    recipe.id = format!("provider-loss-{label}");
+    let started = coordinator
+        .start(
+            key.clone(),
+            compile_browser_replay(&recipe, Vec::new()).unwrap(),
+        )
+        .unwrap();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        started.instance.clone(),
+        vec!["password".to_string()],
+    )
+    .unwrap();
+    prompt
+        .edit(
+            &started.instance,
+            "password",
+            "provider-loss-secret-sentinel",
+        )
+        .unwrap();
+    let (submission, _) = prompt.submit(&started.instance).unwrap();
+    coordinator
+        .submit_secrets(&started.instance, submission)
+        .unwrap();
+    assert!(started.execution.secret_lease("password").is_ok());
+    started
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProviderLossBoundary {
+    RegistrationReplacement,
+    ExactRevoke,
+    ProcessRevoke,
+    RevokeAll,
+    GatewayDrop,
 }
 
 fn workflow_public_input_recipe() -> BrowserRecipeV1 {
@@ -718,6 +762,104 @@ fn gateway_revocation_publishes_priority_host_cancellation() {
         bridge.drain_host_controls(),
         vec![BrowserHostControl::InterruptWorkspace { workspace_key: key }]
     );
+}
+
+#[tokio::test]
+async fn browser_provider_loss_boundaries_cancel_exact_replay_before_late_controller_response() {
+    for boundary in [
+        ProviderLossBoundary::RegistrationReplacement,
+        ProviderLossBoundary::ExactRevoke,
+        ProviderLossBoundary::ProcessRevoke,
+        ProviderLossBoundary::RevokeAll,
+        ProviderLossBoundary::GatewayDrop,
+    ] {
+        let label = format!("{boundary:?}").to_ascii_lowercase();
+        let project_id = format!("provider-loss-{label}");
+        let key = workspace(&project_id, "conversation");
+        let isolated_key = workspace(&project_id, "sibling-conversation");
+        let (bridge, mut inbox) = browser_command_channel(8);
+        let mut gateway = Some(BrowserGatewayHandle::start(bridge.clone()).unwrap());
+        let registrar = gateway.as_ref().unwrap().registrar();
+        let process_id = format!("provider-process-{label}");
+        let registration = registrar
+            .register(
+                process_id.clone(),
+                key.clone(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .unwrap();
+        let coordinator = bridge.replay_coordinator();
+        let started = install_gateway_secret_replay(&bridge, &key, &label);
+        let isolated = coordinator
+            .start(
+                isolated_key.clone(),
+                compile_browser_replay(&workflow_completion_recipe(), Vec::new()).unwrap(),
+            )
+            .unwrap();
+        let controller = bridge.bind(key.clone(), Duration::from_secs(1));
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "runtime-tab".to_string(),
+                })
+                .await
+        });
+        let request = inbox
+            .recv()
+            .await
+            .expect("retained provider controller request");
+
+        match boundary {
+            ProviderLossBoundary::RegistrationReplacement => {
+                registrar
+                    .register(
+                        process_id,
+                        workspace(&format!("provider-replacement-{label}"), "conversation"),
+                        BrowserWorkspaceSnapshot::default(),
+                    )
+                    .unwrap();
+            }
+            ProviderLossBoundary::ExactRevoke => assert!(registrar.revoke(&registration)),
+            ProviderLossBoundary::ProcessRevoke => {
+                assert!(registrar.revoke_process(&process_id))
+            }
+            ProviderLossBoundary::RevokeAll => registrar.revoke_all(),
+            ProviderLossBoundary::GatewayDrop => drop(gateway.take()),
+        }
+
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::Cancelled,
+            "{boundary:?} must terminalize the registered workspace replay"
+        );
+        assert!(
+            matches!(
+                started.execution.secret_lease("password"),
+                Err(BrowserReplaySecretError::ClosedStore)
+            ),
+            "{boundary:?} must close its secret store"
+        );
+        request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(
+            pending.await.unwrap(),
+            Err(devmanager::browser::BrowserError::Interrupted),
+            "{boundary:?} must reject retained late controller responses"
+        );
+        assert_eq!(
+            coordinator
+                .status(&started.instance)
+                .unwrap()
+                .current_step_index,
+            0,
+            "{boundary:?} must not allow a late advance or write"
+        );
+        assert_eq!(
+            coordinator.status(&isolated.instance).unwrap().status,
+            BrowserReplayStatus::Pending,
+            "{boundary:?} must not cancel an unregistered same-project sibling workspace"
+        );
+        drop(gateway);
+    }
 }
 
 #[test]

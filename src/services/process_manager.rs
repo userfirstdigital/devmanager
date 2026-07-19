@@ -2303,6 +2303,16 @@ impl ProcessManager {
         self.restart_ai_session_activate(app_state, tab_id, dimensions, true)
     }
 
+    pub fn validate_ai_restart(&self, app_state: &AppState, tab_id: &str) -> Result<(), String> {
+        let tab = app_state
+            .find_ai_tab(tab_id)
+            .ok_or_else(|| format!("Unknown AI tab `{tab_id}`"))?;
+        app_state
+            .find_project(&tab.project_id)
+            .ok_or_else(|| format!("Unknown project `{}`", tab.project_id))?;
+        resolve_ai_startup_command(&app_state.config.settings, tab.tab_type.clone()).map(|_| ())
+    }
+
     /// Same as `restart_ai_session` but lets the caller keep the native UI's
     /// current tab/session active. Remote-triggered AI restarts use this to
     /// recycle the PTY without yanking the desktop window onto the restarted
@@ -6451,6 +6461,58 @@ mod tests {
         }
     }
 
+    fn browser_provider_replay_plan(
+        label: &str,
+        with_secret: bool,
+    ) -> crate::browser::BrowserReplayPlan {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput,
+            BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeValue, BrowserRecipeViewport, BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let inputs = with_secret
+            .then(|| BrowserRecipeInput {
+                name: "password".to_string(),
+                kind: BrowserRecipeInputKind::Secret,
+                default_value: None,
+            })
+            .into_iter()
+            .collect();
+        let action = if with_secret {
+            BrowserRecipeAction::Type {
+                locator: BrowserRecipeLocator {
+                    test_id: Some("password".to_string()),
+                    ..BrowserRecipeLocator::default()
+                },
+                value: BrowserRecipeValue::Input {
+                    name: "password".to_string(),
+                },
+            }
+        } else {
+            BrowserRecipeAction::Reload
+        };
+        compile_browser_replay(
+            &BrowserRecipeV1 {
+                schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                id: format!("provider-lifecycle-{label}"),
+                name: "Provider lifecycle".to_string(),
+                description: "Exact process-exit lease fixture".to_string(),
+                start_url: "https://example.test/provider".to_string(),
+                viewport: BrowserRecipeViewport::default(),
+                inputs,
+                steps: vec![BrowserRecipeStep {
+                    id: "provider-step".to_string(),
+                    action,
+                    wait: None,
+                    assertions: Vec::new(),
+                }],
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     fn browser_attachment_snapshot(annotation_id: &str) -> BrowserWorkspaceSnapshot {
         serde_json::from_value(serde_json::json!({
             "annotations": [{
@@ -6484,6 +6546,50 @@ mod tests {
         {
             handle.join().expect("background task stops cleanly");
         }
+    }
+
+    #[test]
+    fn empty_ai_restart_command_fails_preflight_without_mutating_the_tab_or_runtime() {
+        let manager = ProcessManager::new();
+        let mut state = AppState::default();
+        state.config.settings.claude_command = Some("   ".to_string());
+        state.config.projects.push(Project {
+            id: "restart-project".to_string(),
+            name: "Restart project".to_string(),
+            root_path: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            folders: Vec::new(),
+            color: None,
+            pinned: Some(false),
+            notes: None,
+            save_log_files: Some(false),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        state.open_tabs.push(SessionTab {
+            id: "restart-tab".to_string(),
+            tab_type: TabType::Claude,
+            project_id: "restart-project".to_string(),
+            command_id: None,
+            pty_session_id: Some("existing-session".to_string()),
+            label: Some("Claude".to_string()),
+            ssh_connection_id: None,
+            browser_workspace: None,
+        });
+
+        assert_eq!(
+            manager.validate_ai_restart(&state, "restart-tab"),
+            Err("AI command is empty".to_string())
+        );
+        assert_eq!(
+            state
+                .find_ai_tab("restart-tab")
+                .and_then(|tab| tab.pty_session_id.as_deref()),
+            Some("existing-session")
+        );
+        assert!(manager.runtime_state().sessions.is_empty());
     }
 
     #[test]
@@ -6916,10 +7022,15 @@ mod tests {
         assert_eq!(gateway.registrar().active_registration_count(), 0);
     }
 
-    #[test]
-    fn terminal_exit_cleans_only_the_captured_browser_provider_registration() {
-        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
-        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+    #[tokio::test]
+    async fn terminal_exit_cleans_only_the_captured_browser_provider_registration() {
+        use crate::browser::{
+            BrowserCommand, BrowserError, BrowserReplaySecretError, BrowserReplaySecretPromptVault,
+            BrowserReplayStatus, BrowserResponse, BrowserWorkspaceKey,
+        };
+
+        let (bridge, mut inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge.clone()).unwrap();
         let manager = ProcessManager::new();
         manager.set_browser_gateway_registrar(Some(gateway.registrar()));
         let session_id = "shared-browser-exit-session";
@@ -6958,7 +7069,7 @@ mod tests {
             session_id,
             crate::browser::BrowserWorkspaceSnapshot::default(),
         );
-        let (replacement_token, replacement_overlay) = {
+        let (replacement_token, replacement_overlay, replacement_workspace) = {
             let sessions = manager.inner.browser_provider_sessions.lock().unwrap();
             let replacement = sessions.get(session_id).unwrap();
             (
@@ -6973,10 +7084,56 @@ mod tests {
                     .unwrap()
                     .path()
                     .to_path_buf(),
+                replacement.registration.workspace_key().clone(),
             )
         };
         assert!(!old_overlay.exists());
         assert!(replacement_overlay.exists());
+
+        let coordinator = bridge.replay_coordinator();
+        let replacement_replay = coordinator
+            .start(
+                replacement_workspace.clone(),
+                browser_provider_replay_plan("replacement", true),
+            )
+            .unwrap();
+        let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+            replacement_replay.instance.clone(),
+            vec!["password".to_string()],
+        )
+        .unwrap();
+        prompt
+            .edit(
+                &replacement_replay.instance,
+                "password",
+                "replacement-provider-secret",
+            )
+            .unwrap();
+        let (submission, _) = prompt.submit(&replacement_replay.instance).unwrap();
+        coordinator
+            .submit_secrets(&replacement_replay.instance, submission)
+            .unwrap();
+        let secret_lease = replacement_replay
+            .execution
+            .secret_lease("password")
+            .unwrap();
+        let isolated_workspace =
+            BrowserWorkspaceKey::new("browser-project", "sibling-conversation").unwrap();
+        let isolated = coordinator
+            .start(
+                isolated_workspace,
+                browser_provider_replay_plan("isolated", false),
+            )
+            .unwrap();
+        let controller = bridge.bind(replacement_workspace.clone(), Duration::from_secs(1));
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "runtime-tab".to_string(),
+                })
+                .await
+        });
+        let late_request = inbox.recv().await.expect("retained replacement request");
 
         manager.update_session_state(session_id, |state| {
             state.status = SessionStatus::Exited;
@@ -6998,6 +7155,15 @@ mod tests {
             replacement_token
         );
         assert!(replacement_overlay.exists());
+        assert_eq!(
+            coordinator
+                .status(&replacement_replay.instance)
+                .unwrap()
+                .status,
+            BrowserReplayStatus::Running,
+            "an old exit callback must not cancel replacement replay authority"
+        );
+        assert!(!pending.is_finished());
 
         let replacement_exit_notifier =
             session_change_notifier(manager.inner.clone(), session_id.to_string());
@@ -7011,6 +7177,30 @@ mod tests {
             .contains_key(session_id));
         assert_eq!(gateway.registrar().active_registration_count(), 0);
         assert!(!replacement_overlay.exists());
+        assert_eq!(
+            coordinator
+                .status(&replacement_replay.instance)
+                .unwrap()
+                .status,
+            BrowserReplayStatus::Cancelled
+        );
+        assert_eq!(
+            secret_lease.expose(|_| ()),
+            Err(BrowserReplaySecretError::ClosedStore)
+        );
+        late_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(pending.await.unwrap(), Err(BrowserError::Interrupted));
+        assert_eq!(
+            coordinator
+                .status(&replacement_replay.instance)
+                .unwrap()
+                .current_step_index,
+            0
+        );
+        assert_eq!(
+            coordinator.status(&isolated.instance).unwrap().status,
+            BrowserReplayStatus::Pending
+        );
     }
 
     #[tokio::test]

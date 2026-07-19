@@ -1,10 +1,14 @@
 use devmanager::browser::{
     browser_command_channel, compile_browser_replay, BrowserCommand, BrowserHostControl,
-    BrowserHostEvent, BrowserRecipeAction, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayStatus, BrowserResponse,
-    BrowserUserInputKind, BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
+    BrowserHostEvent, BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind,
+    BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
+    BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplaySecretError,
+    BrowserReplaySecretPromptVault, BrowserReplayStatus, BrowserResponse, BrowserUserInputKind,
+    BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use std::time::Duration;
+
+const SECRET_SENTINEL: &str = "task-4-secret-sentinel";
 
 fn workspace(project: &str, conversation: &str) -> BrowserWorkspaceKey {
     BrowserWorkspaceKey::new(project, conversation).unwrap()
@@ -32,6 +36,220 @@ fn replay_plan(label: &str) -> devmanager::browser::BrowserReplayPlan {
     .unwrap()
 }
 
+fn secret_replay_plan(label: &str) -> devmanager::browser::BrowserReplayPlan {
+    compile_browser_replay(
+        &BrowserRecipeV1 {
+            schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+            id: format!("lifecycle-secret-{label}"),
+            name: "Lifecycle secret replay".to_string(),
+            description: "Terminalization and zeroization fixture".to_string(),
+            start_url: "https://example.test/secret".to_string(),
+            viewport: BrowserRecipeViewport::default(),
+            inputs: vec![BrowserRecipeInput {
+                name: "password".to_string(),
+                kind: BrowserRecipeInputKind::Secret,
+                default_value: None,
+            }],
+            steps: vec![BrowserRecipeStep {
+                id: "type-secret".to_string(),
+                action: BrowserRecipeAction::Type {
+                    locator: BrowserRecipeLocator {
+                        test_id: Some("password".to_string()),
+                        ..BrowserRecipeLocator::default()
+                    },
+                    value: BrowserRecipeValue::Input {
+                        name: "password".to_string(),
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            }],
+        },
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+fn install_secret(
+    coordinator: &BrowserReplayCoordinator,
+    started: &devmanager::browser::BrowserReplayStart,
+) {
+    assert_eq!(
+        started.projection.status,
+        BrowserReplayStatus::NeedsUserSecret
+    );
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        started.instance.clone(),
+        vec!["password".to_string()],
+    )
+    .unwrap();
+    prompt
+        .edit(&started.instance, "password", SECRET_SENTINEL)
+        .unwrap();
+    let (submission, _) = prompt.submit(&started.instance).unwrap();
+    assert_eq!(
+        coordinator
+            .submit_secrets(&started.instance, submission)
+            .unwrap()
+            .status,
+        BrowserReplayStatus::Running
+    );
+    assert!(started.execution.secret_lease("password").is_ok());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LifecycleBoundary {
+    StopTab,
+    StopWorkspace,
+    LogicalTabClose,
+    ResetWorkspace,
+    ClearProject,
+    DirectInput,
+    SelectConversation,
+    RestartServer,
+    KillPortRestart,
+    RestartAiConversation,
+    RestartSsh,
+    CloseConversation,
+    DeleteProject,
+    QuitApplication,
+}
+
+async fn assert_boundary_terminalizes_before_late_response(boundary: LifecycleBoundary) {
+    let label = format!("{boundary:?}").to_ascii_lowercase();
+    let key = workspace(&format!("project-{label}"), "conversation");
+    let same_project = workspace(&format!("project-{label}"), "sibling");
+    let isolated_key = workspace(&format!("isolated-{label}"), "conversation");
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let coordinator = bridge.replay_coordinator();
+    let started = coordinator
+        .start(key.clone(), secret_replay_plan(&label))
+        .unwrap();
+    install_secret(&coordinator, &started);
+    let same_project_replay = coordinator
+        .start(
+            same_project.clone(),
+            replay_plan(&format!("{label}-sibling")),
+        )
+        .unwrap();
+    let isolated = coordinator
+        .start(
+            isolated_key.clone(),
+            replay_plan(&format!("{label}-isolated")),
+        )
+        .unwrap();
+    let controller = bridge.bind(key.clone(), Duration::from_secs(1));
+    let pending = tokio::spawn(async move {
+        controller
+            .request(BrowserCommand::Reload {
+                tab_id: "runtime-tab".to_string(),
+            })
+            .await
+    });
+    let request = inbox
+        .recv()
+        .await
+        .expect("retained late controller request");
+
+    match boundary {
+        LifecycleBoundary::StopTab => {
+            bridge
+                .bind(key.clone(), Duration::from_secs(1))
+                .notify(BrowserCommand::Stop {
+                    tab_id: Some("runtime-tab".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+        LifecycleBoundary::StopWorkspace => {
+            bridge
+                .bind(key.clone(), Duration::from_secs(1))
+                .notify(BrowserCommand::Stop { tab_id: None })
+                .await
+                .unwrap();
+        }
+        LifecycleBoundary::LogicalTabClose => {
+            bridge
+                .bind(key.clone(), Duration::from_secs(1))
+                .notify(BrowserCommand::CloseTab {
+                    tab_id: "runtime-tab".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        LifecycleBoundary::ResetWorkspace => {
+            bridge
+                .bind(key.clone(), Duration::from_secs(1))
+                .notify(BrowserCommand::ResetWorkspace)
+                .await
+                .unwrap();
+        }
+        LifecycleBoundary::ClearProject => {
+            bridge
+                .bind(key.clone(), Duration::from_secs(1))
+                .notify(BrowserCommand::ClearProjectProfile)
+                .await
+                .unwrap();
+        }
+        LifecycleBoundary::DirectInput => bridge.observe_host_event(&BrowserHostEvent::UserInput {
+            workspace_key: key.clone(),
+            tab_id: "runtime-tab".to_string(),
+            kind: BrowserUserInputKind::Keyboard,
+        }),
+        LifecycleBoundary::SelectConversation
+        | LifecycleBoundary::RestartServer
+        | LifecycleBoundary::KillPortRestart
+        | LifecycleBoundary::RestartAiConversation
+        | LifecycleBoundary::RestartSsh
+        | LifecycleBoundary::CloseConversation => bridge.interrupt_workspace(&key),
+        LifecycleBoundary::DeleteProject => bridge.interrupt_project(&key.project_id),
+        LifecycleBoundary::QuitApplication => bridge.interrupt_all(),
+    }
+
+    assert_cancelled(&coordinator, started.instance.id(), &key);
+    assert!(
+        matches!(
+            started.execution.secret_lease("password"),
+            Err(BrowserReplaySecretError::ClosedStore)
+        ),
+        "{boundary:?} must close its secret store"
+    );
+    request.respond(Ok(BrowserResponse::Acknowledged));
+    assert_eq!(
+        pending.await.unwrap(),
+        Err(devmanager::browser::BrowserError::Interrupted),
+        "{boundary:?} must fence a late controller response"
+    );
+    assert_eq!(
+        coordinator
+            .status(&started.instance)
+            .unwrap()
+            .current_step_index,
+        0,
+        "{boundary:?} must not allow a late step advance or recipe write"
+    );
+
+    let same_project_status = coordinator
+        .status(&same_project_replay.instance)
+        .unwrap()
+        .status;
+    let isolated_status = coordinator.status(&isolated.instance).unwrap().status;
+    match boundary {
+        LifecycleBoundary::ClearProject | LifecycleBoundary::DeleteProject => {
+            assert_eq!(same_project_status, BrowserReplayStatus::Cancelled);
+            assert_eq!(isolated_status, BrowserReplayStatus::Pending);
+        }
+        LifecycleBoundary::QuitApplication => {
+            assert_eq!(same_project_status, BrowserReplayStatus::Cancelled);
+            assert_eq!(isolated_status, BrowserReplayStatus::Cancelled);
+        }
+        _ => {
+            assert_eq!(same_project_status, BrowserReplayStatus::Pending);
+            assert_eq!(isolated_status, BrowserReplayStatus::Pending);
+        }
+    }
+}
+
 fn assert_cancelled(
     coordinator: &BrowserReplayCoordinator,
     instance_id: u64,
@@ -41,6 +259,414 @@ fn assert_cancelled(
     assert_eq!(
         coordinator.status(&instance).unwrap().status,
         BrowserReplayStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn browser_every_native_lifecycle_boundary_terminalizes_replay_and_fences_late_work() {
+    for boundary in [
+        LifecycleBoundary::StopTab,
+        LifecycleBoundary::StopWorkspace,
+        LifecycleBoundary::LogicalTabClose,
+        LifecycleBoundary::ResetWorkspace,
+        LifecycleBoundary::ClearProject,
+        LifecycleBoundary::DirectInput,
+        LifecycleBoundary::SelectConversation,
+        LifecycleBoundary::RestartServer,
+        LifecycleBoundary::KillPortRestart,
+        LifecycleBoundary::RestartAiConversation,
+        LifecycleBoundary::RestartSsh,
+        LifecycleBoundary::CloseConversation,
+        LifecycleBoundary::DeleteProject,
+        LifecycleBoundary::QuitApplication,
+    ] {
+        assert_boundary_terminalizes_before_late_response(boundary).await;
+    }
+}
+
+fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing source boundary: {start}"));
+    let end = source[start..]
+        .find(end)
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing source boundary after {start}: {end}"));
+    &source[start..end]
+}
+
+fn assert_before(section: &str, earlier: &str, later: &str) {
+    let earlier_label = earlier;
+    let later_label = later;
+    let earlier = section
+        .find(earlier_label)
+        .unwrap_or_else(|| panic!("missing lifecycle call: {earlier_label}"));
+    let later = section
+        .find(later_label)
+        .unwrap_or_else(|| panic!("missing protected mutation: {later_label}"));
+    assert!(
+        earlier < later,
+        "{earlier_label} must run before {later_label}"
+    );
+}
+
+#[test]
+fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridge_first() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let process_manager = include_str!("../src/services/process_manager.rs").replace("\r\n", "\n");
+
+    for helper in [
+        "fn interrupt_active_browser_replay_before_route_change(",
+        "fn interrupt_browser_workspace_before_teardown(",
+        "fn interrupt_browser_project_before_mutation(",
+        "fn interrupt_all_browser_replays_before_shutdown(",
+    ] {
+        assert!(app.contains(helper), "missing NativeShell helper: {helper}");
+    }
+
+    let discard_helper = source_section(
+        &app,
+        "fn discard_browser_workflow_state_after_replay_interrupt(",
+        "fn interrupt_active_browser_replay_before_route_change(",
+    );
+    assert!(discard_helper.contains("self.browser_host.discard_workflow_state"));
+
+    let route_helper = source_section(
+        &app,
+        "fn interrupt_active_browser_replay_before_route_change(",
+        "fn interrupt_browser_workspace_before_teardown(",
+    );
+    assert_before(
+        route_helper,
+        "next_workspace == Some(&previous)",
+        "self.browser_bridge.interrupt_workspace",
+    );
+    assert_before(
+        route_helper,
+        "self.browser_bridge.interrupt_workspace",
+        "discard_browser_workflow_state_after_replay_interrupt",
+    );
+    let workspace_helper = source_section(
+        &app,
+        "fn interrupt_browser_workspace_before_teardown(",
+        "fn interrupt_browser_project_before_mutation(",
+    );
+    assert_before(
+        workspace_helper,
+        "self.browser_bridge.interrupt_workspace",
+        "discard_browser_workflow_state_after_replay_interrupt",
+    );
+    let project_helper = source_section(
+        &app,
+        "fn interrupt_browser_project_before_mutation(",
+        "fn interrupt_all_browser_replays_before_shutdown(",
+    );
+    assert_before(
+        project_helper,
+        "self.browser_bridge.interrupt_project",
+        "discard_browser_workflow_state_after_replay_interrupt",
+    );
+    let shutdown_helper = source_section(
+        &app,
+        "fn interrupt_all_browser_replays_before_shutdown(",
+        "fn sync_browser_host_visibility(",
+    );
+    assert!(shutdown_helper.contains("self.browser_bridge.interrupt_all()"));
+
+    let command_dispatch = source_section(
+        &app,
+        "fn dispatch_browser_command(",
+        "fn synchronize_browser_response(",
+    );
+    assert_before(
+        command_dispatch,
+        "with_locked_host_work_for_command",
+        "retire_browser_replay_ui_after_interrupt",
+    );
+    assert_before(
+        command_dispatch,
+        "retire_browser_replay_ui_after_interrupt",
+        "browser_host.handle_command",
+    );
+
+    for (start, end, mutation) in [
+        (
+            "fn select_server_tab_action(",
+            "fn launch_ai_action(",
+            "self.state.select_tab",
+        ),
+        (
+            "fn launch_ai_action(",
+            "fn select_ai_tab_action(",
+            "process_manager.start_ai_session",
+        ),
+        (
+            "fn select_ai_tab_action(",
+            "fn close_ai_tab_action(",
+            "self.state.select_tab",
+        ),
+        (
+            "fn open_ssh_tab_action(",
+            "fn connect_ssh_action(",
+            ".open_ssh_tab(",
+        ),
+        (
+            "fn connect_ssh_action(",
+            "fn restart_ssh_action(",
+            "start_ssh_session",
+        ),
+    ] {
+        assert_before(
+            source_section(&app, start, end),
+            "interrupt_active_browser_replay_before_route_change",
+            mutation,
+        );
+    }
+
+    let open_ssh = source_section(&app, "fn open_ssh_tab_action(", "fn connect_ssh_action(");
+    assert_before(
+        open_ssh,
+        "find_ssh_connection(connection_id)",
+        "interrupt_active_browser_replay_before_route_change",
+    );
+
+    for (start, end, validation, mutation) in [
+        (
+            "fn restart_server_action(",
+            "fn clear_server_output_action(",
+            "find_command(command_id)",
+            ".restart_server(",
+        ),
+        (
+            "fn kill_server_port_action(",
+            "fn select_server_tab_action(",
+            "find_command(command_id)",
+            "schedule_kill_port_and_restart",
+        ),
+        (
+            "fn restart_ai_tab_action(",
+            "fn close_ai_tab_action(",
+            "find_ai_tab(tab_id)",
+            "restart_ai_session",
+        ),
+        (
+            "fn restart_ssh_action(",
+            "fn disconnect_ssh_action(",
+            "find_ssh_connection(connection_id)",
+            "restart_ssh_session",
+        ),
+    ] {
+        let section = source_section(&app, start, end);
+        assert_before(
+            section,
+            validation,
+            "interrupt_active_browser_replay_before_route_change",
+        );
+        assert_before(
+            section,
+            "interrupt_active_browser_replay_before_route_change",
+            mutation,
+        );
+    }
+
+    let restart_ai = source_section(&app, "fn restart_ai_tab_action(", "fn close_ai_tab_action(");
+    assert_before(
+        restart_ai,
+        "ensure_mutation_control",
+        "interrupt_active_browser_replay_before_route_change",
+    );
+    assert_before(
+        restart_ai,
+        ".validate_ai_restart(",
+        "interrupt_active_browser_replay_before_route_change",
+    );
+    assert_before(
+        restart_ai,
+        "interrupt_browser_workspace_before_teardown",
+        ".restart_ai_session(",
+    );
+    assert!(
+        !restart_ai.contains("close_browser_replay_secret_prompt_for_route"),
+        "AI restart must retire secret UI only after bridge cancellation"
+    );
+
+    let remote_requests = source_section(
+        &app,
+        "fn pump_remote_host_requests(",
+        "fn handle_window_should_close(",
+    );
+    let remote_restart_server = source_section(
+        remote_requests,
+        "RemoteAction::RestartServer {",
+        "RemoteAction::LaunchAi {",
+    );
+    assert_before(
+        remote_restart_server,
+        "find_command(&command_id)",
+        "interrupt_active_browser_replay_before_route_change",
+    );
+    assert_before(
+        remote_restart_server,
+        "interrupt_active_browser_replay_before_route_change",
+        "restart_server_with_remote_response",
+    );
+    let remote_launch_ai = source_section(
+        remote_requests,
+        "RemoteAction::LaunchAi {",
+        "RemoteAction::OpenAiTab {",
+    );
+    assert!(
+        !remote_launch_ai.contains("interrupt_active_browser_replay_before_route_change"),
+        "background remote AI launch must not cancel the selected conversation"
+    );
+    let remote_open_ai = source_section(
+        remote_requests,
+        "RemoteAction::OpenAiTab {",
+        "RemoteAction::RestartAiTab {",
+    );
+    assert!(
+        !remote_open_ai.contains("interrupt_active_browser_replay_before_route_change"),
+        "background remote AI restore must not cancel the selected conversation"
+    );
+    let remote_restart_ai = source_section(
+        remote_requests,
+        "RemoteAction::RestartAiTab {",
+        "RemoteAction::CloseAiTab {",
+    );
+    assert_before(
+        remote_restart_ai,
+        "find_ai_tab(&tab_id)",
+        "interrupt_browser_workspace_before_teardown",
+    );
+    assert_before(
+        remote_restart_ai,
+        ".validate_ai_restart(",
+        "interrupt_browser_workspace_before_teardown",
+    );
+    assert_before(
+        remote_restart_ai,
+        "interrupt_browser_workspace_before_teardown",
+        "restart_ai_session_activate_with_response",
+    );
+    assert!(
+        !remote_restart_ai.contains("interrupt_active_browser_replay_before_route_change"),
+        "background remote AI restart must cancel only its provider workspace"
+    );
+
+    for (start, end, validation, mutation) in [
+        (
+            "RemoteAction::StartServer {",
+            "RemoteAction::StopServer {",
+            "find_command(&command_id)",
+            "start_server_with_remote_response",
+        ),
+        (
+            "RemoteAction::ConnectSsh {",
+            "RemoteAction::RestartSsh {",
+            "find_ssh_connection(&connection_id)",
+            "start_ssh_session_with_response",
+        ),
+        (
+            "RemoteAction::RestartSsh {",
+            "RemoteAction::DisconnectSsh {",
+            "find_ssh_connection(&connection_id)",
+            "restart_ssh_session_with_response",
+        ),
+    ] {
+        let section = source_section(remote_requests, start, end);
+        assert_before(
+            section,
+            validation,
+            "interrupt_active_browser_replay_before_route_change",
+        );
+        assert_before(
+            section,
+            "interrupt_active_browser_replay_before_route_change",
+            mutation,
+        );
+    }
+
+    let close_tab = source_section(&app, "fn close_tab_action(", "fn confirm_live_tab_close(");
+    assert_before(
+        close_tab,
+        "interrupt_browser_workspace_before_teardown",
+        "process_manager.close_tab",
+    );
+    let close_ai = source_section(&app, "fn close_ai_tab_action(", "fn open_ssh_tab_action(");
+    assert_before(
+        close_ai,
+        "interrupt_browser_workspace_before_teardown",
+        "process_manager.close_tab",
+    );
+    let imported = source_section(
+        &app,
+        "fn apply_imported_config(",
+        "fn check_for_updates_action(",
+    );
+    assert_before(
+        imported,
+        "interrupt_browser_workspace_before_teardown",
+        "self.state.config = config",
+    );
+    let delete_project = source_section(
+        &app,
+        "fn delete_project_action(",
+        "fn delete_folder_action(",
+    );
+    assert_before(
+        delete_project,
+        "interrupt_browser_project_before_mutation",
+        "close_ai_session",
+    );
+
+    for (start, end, mutation) in [
+        (
+            "fn handle_window_should_close(",
+            "fn preview_notification_sound_action(",
+            "schedule_shutdown",
+        ),
+        (
+            "fn install_update_action(",
+            "fn force_quit_action(",
+            "schedule_shutdown",
+        ),
+        (
+            "fn force_quit_action(",
+            "fn terminal_font_size(",
+            "std::process::exit",
+        ),
+    ] {
+        assert_before(
+            source_section(&app, start, end),
+            "interrupt_all_browser_replays_before_shutdown",
+            mutation,
+        );
+    }
+
+    let terminal_exit = source_section(
+        &process_manager,
+        "fn cleanup_browser_provider_session_if_matches(",
+        "fn session_change_notifier(",
+    );
+    assert_before(
+        terminal_exit,
+        "expected.access().bearer_token()",
+        "sessions.remove(session_id)",
+    );
+    assert_before(
+        terminal_exit,
+        "sessions.remove(session_id)",
+        "removed.registrar.revoke",
+    );
+    let generic_spawn = source_section(
+        &process_manager,
+        "fn spawn_ai_session_with_writer_and_attachment_binding",
+        "fn shutdown_managed_processes_inner(",
+    );
+    assert!(
+        !generic_spawn.contains("BrowserGatewayRegistrar")
+            && !generic_spawn.contains("register_with_project_root"),
+        "registration ownership must remain outside generic process spawning"
     );
 }
 

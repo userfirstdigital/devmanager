@@ -1,6 +1,6 @@
 use devmanager::browser::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_command_channel,
-    browser_lifecycle_control, browser_operation_target_tab_id,
+    browser_lifecycle_control, browser_operation_target_tab_id, browser_pane_eligible,
     browser_replay_repair_candidate_from_annotation, browser_request_preempts_operation_queue,
     browser_response_resource_ids, browser_user_input_initialization_script,
     compile_browser_replay, crop_annotation_png, effective_browser_annotation_risk,
@@ -19,14 +19,14 @@ use devmanager::browser::{
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
     BrowserLocator, BrowserLocatorFailureTarget, BrowserMemoryTarget, BrowserNetworkOperation,
     BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
-    BrowserPerformanceOperation, BrowserRecipeAction, BrowserRecipeStep, BrowserRecipeV1,
-    BrowserRecipeViewport, BrowserRecordingOperation, BrowserReplayStatus, BrowserResourceId,
-    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
-    BrowserRevision, BrowserRisk, BrowserRuntimeTarget, BrowserScreenshotMode,
-    BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
-    BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost, BrowserWorkspaceKey,
-    BrowserWorkspaceMutation, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
-    MAX_BROWSER_JOURNAL_ENTRIES,
+    BrowserPaneContext, BrowserPaneSurface, BrowserPerformanceOperation, BrowserRecipeAction,
+    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeViewport, BrowserRecordingOperation,
+    BrowserReplayStatus, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserRuntimeTarget,
+    BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind,
+    BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost,
+    BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
+    BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_JOURNAL_ENTRIES,
 };
 
 #[test]
@@ -138,6 +138,36 @@ fn unsupported_macos_rejects_every_recording_operation_with_the_typed_platform_e
             Err(BrowserError::UnavailablePlatform {
                 platform: "macos".to_string(),
             }),
+        );
+    }
+}
+
+#[test]
+fn unsupported_macos_has_no_webview_backend_or_functional_replay_pane() {
+    let source = include_str!("../src/browser/host/unsupported.rs").to_ascii_lowercase();
+    assert!(!source.contains("use wry"));
+    assert!(!source.contains("webview2"));
+    assert!(!source.contains("webviewbuilder"));
+
+    let context = BrowserPaneContext {
+        browser_enabled: true,
+        platform_supported: unsupported_host_status("macos").available,
+        active_surface: Some(BrowserPaneSurface::Claude),
+        editor_open: false,
+        modal_open: false,
+    };
+    assert!(!browser_pane_eligible(&context));
+
+    for command in [
+        BrowserCommand::Stop { tab_id: None },
+        BrowserCommand::ResetWorkspace,
+        BrowserCommand::ClearProjectProfile,
+    ] {
+        assert_eq!(
+            unsupported_command_response("macos", command),
+            Err(BrowserError::UnavailablePlatform {
+                platform: "macos".to_string(),
+            })
         );
     }
 }
