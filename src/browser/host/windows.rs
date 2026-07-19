@@ -48,7 +48,7 @@ use base64::Engine as _;
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -562,6 +562,33 @@ struct BrowserProjectRuntime {
     context: WebContext,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserQueuedUserInputState {
+    NotUserInput,
+    Pending,
+    Published,
+    Suppressed,
+}
+
+struct BrowserQueuedHostEvent {
+    event: BrowserHostEvent,
+    user_input_state: BrowserQueuedUserInputState,
+}
+
+impl BrowserQueuedHostEvent {
+    fn new(event: BrowserHostEvent) -> Self {
+        let user_input_state = if matches!(event, BrowserHostEvent::UserInput { .. }) {
+            BrowserQueuedUserInputState::Pending
+        } else {
+            BrowserQueuedUserInputState::NotUserInput
+        };
+        Self {
+            event,
+            user_input_state,
+        }
+    }
+}
+
 pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     trusted_app_config_dir: Option<PathBuf>,
@@ -572,6 +599,7 @@ pub struct BrowserWebViewHost {
     bounds: BrowserBounds,
     event_sender: Sender<BrowserHostEvent>,
     event_receiver: Receiver<BrowserHostEvent>,
+    queued_host_events: VecDeque<BrowserQueuedHostEvent>,
     recording_transport: BrowserPageRecordingTransport,
     recording_ingresses: HashMap<BrowserViewKey, BrowserPageRecordingIngress>,
     workflow_coordinator: BrowserWorkflowCoordinator,
@@ -664,6 +692,7 @@ impl BrowserWebViewHost {
             },
             event_sender,
             event_receiver,
+            queued_host_events: VecDeque::new(),
             recording_transport: BrowserPageRecordingTransport::with_capacity(
                 MAX_BROWSER_PAGE_RECORDING_QUEUE,
             ),
@@ -987,6 +1016,30 @@ impl BrowserWebViewHost {
                 }
                 self.cancel_tab_operations(&workspace_key, &tab_id);
             }
+        }
+    }
+
+    pub(crate) fn interrupt_all_local_work(&mut self) {
+        let mut workspace_keys = self.state.workspace_keys();
+        workspace_keys.extend(
+            self.operation_queue
+                .targets()
+                .into_iter()
+                .map(|target| target.workspace_key),
+        );
+        workspace_keys.extend(
+            self.active_requests
+                .keys()
+                .map(|target| target.workspace_key.clone()),
+        );
+        workspace_keys.sort_by(|left, right| {
+            left.project_id
+                .cmp(&right.project_id)
+                .then_with(|| left.ai_tab_id.cmp(&right.ai_tab_id))
+        });
+        workspace_keys.dedup();
+        for workspace_key in workspace_keys {
+            self.handle_control(BrowserHostControl::InterruptWorkspace { workspace_key });
         }
     }
 
@@ -4583,14 +4636,66 @@ impl BrowserWebViewHost {
         self.drain_events_with_pre_apply_observer(|_, _| {})
     }
 
+    pub(crate) fn publish_pending_user_input_cutoffs(
+        &mut self,
+        mut before_apply: impl FnMut(&BrowserHostEvent, &BrowserHostState),
+    ) {
+        self.collect_queued_host_events();
+        self.publish_collected_user_input_cutoffs(&mut before_apply);
+        self.pump_page_recording_ipc();
+    }
+
+    fn publish_collected_user_input_cutoffs(
+        &mut self,
+        before_apply: &mut impl FnMut(&BrowserHostEvent, &BrowserHostState),
+    ) {
+        let BrowserWebViewHost {
+            state,
+            queued_host_events,
+            ..
+        } = self;
+        for queued in queued_host_events {
+            if queued.user_input_state != BrowserQueuedUserInputState::Pending {
+                continue;
+            }
+            let BrowserHostEvent::UserInput {
+                workspace_key,
+                tab_id,
+                ..
+            } = &queued.event
+            else {
+                queued.user_input_state = BrowserQueuedUserInputState::Suppressed;
+                continue;
+            };
+            let target_is_live = state
+                .workspace(workspace_key)
+                .map(|snapshot| snapshot.tabs.iter().any(|tab| tab.id == *tab_id))
+                .unwrap_or(false);
+            if target_is_live {
+                before_apply(&queued.event, state);
+                queued.user_input_state = BrowserQueuedUserInputState::Published;
+            } else {
+                queued.user_input_state = BrowserQueuedUserInputState::Suppressed;
+            }
+        }
+    }
+
     pub fn drain_events_with_pre_apply_observer(
         &mut self,
         mut before_apply: impl FnMut(&BrowserHostEvent, &BrowserHostState),
     ) -> Vec<BrowserHostEvent> {
+        self.collect_queued_host_events();
+        self.publish_collected_user_input_cutoffs(&mut before_apply);
         self.pump_page_recording_ipc();
-        let incoming: Vec<_> = self.event_receiver.try_iter().collect();
+        let incoming = std::mem::take(&mut self.queued_host_events);
         let mut events = Vec::with_capacity(incoming.len());
-        for event in incoming {
+        for queued in incoming {
+            if queued.user_input_state == BrowserQueuedUserInputState::Suppressed {
+                continue;
+            }
+            let user_input_published =
+                queued.user_input_state == BrowserQueuedUserInputState::Published;
+            let event = queued.event;
             let (workspace_key, tab_id) = browser_host_event_target(&event);
             let document_taint = self
                 .document_secret_states
@@ -4615,7 +4720,9 @@ impl BrowserWebViewHost {
                     continue;
                 }
             }
-            before_apply(&event, &self.state);
+            if !user_input_published {
+                before_apply(&event, &self.state);
+            }
             match &event {
                 BrowserHostEvent::UrlChanged {
                     workspace_key,
@@ -4742,6 +4849,12 @@ impl BrowserWebViewHost {
             events.push(event);
         }
         events
+    }
+
+    fn collect_queued_host_events(&mut self) {
+        let incoming = self.event_receiver.try_iter();
+        self.queued_host_events
+            .extend(incoming.map(BrowserQueuedHostEvent::new));
     }
 
     fn pump_page_recording_ipc(&mut self) {
@@ -6021,6 +6134,8 @@ fn configured_builder<'a>(
                             workspace_key: ipc_workspace.clone(),
                             tab_id: ipc_tab.clone(),
                             kind,
+                            interaction_epoch:
+                                crate::browser::model::next_browser_interaction_epoch(),
                         })
                     }
                     Ok(BrowserPageIpcMessage::DomMutation) => Some(BrowserHostEvent::DomMutation {
@@ -6068,6 +6183,8 @@ fn configured_builder<'a>(
                     workspace_key: ipc_workspace.clone(),
                     tab_id: ipc_tab.clone(),
                     kind,
+                    interaction_epoch:
+                        crate::browser::model::next_browser_interaction_epoch(),
                 },
                 Ok(BrowserPageIpcMessage::DomMutation) => BrowserHostEvent::DomMutation {
                     workspace_key: ipc_workspace.clone(),
@@ -6620,28 +6737,272 @@ mod secret_document_state_tests {
         conservative_tainted_document_risk, contain_queued_host_event,
         finish_secret_exposure_on_error, fixed_secret_type_callback_result,
         repair_cleanup_disposition, repair_clear_acknowledgement, repair_highlight_failure,
-        view_key, BrowserCaptureStoragePlan, BrowserDocumentSecretState, BrowserWebViewHost,
+        view_key, ActiveBrowserRequest, BrowserAsyncPhase, BrowserCaptureStoragePlan,
+        BrowserDocumentSecretState, BrowserQueuedWork, BrowserWebViewHost,
         RepairCleanupDisposition, RepairCleanupEvent, WORKSPACE_OPERATION_TAB,
     };
     use crate::browser::commands::HostControlQueue;
     use crate::browser::{
-        browser_command_channel, compile_browser_replay, BrowserApprovalPolicy, BrowserCommand,
-        BrowserDiagnosticLevel, BrowserDownloadState, BrowserError, BrowserHostControl,
-        BrowserHostEvent, BrowserInvocationActor, BrowserJournalActor, BrowserOperationTarget,
-        BrowserPageLoadState, BrowserRecipeAction, BrowserRecipeLocator, BrowserRecipeStep,
-        BrowserRecipeV1, BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayLocatorSlot,
-        BrowserReplayRepairResumeCursor, BrowserReplayStatus, BrowserResourceKind,
-        BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
-        BrowserScreenshotMode, BrowserTabSnapshot, BrowserUserInputKind, BrowserViewport,
-        BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
+        browser_command_channel, compile_browser_replay, route_browser_request,
+        BrowserApprovalPolicy, BrowserCommand, BrowserDiagnosticLevel, BrowserDownloadState,
+        BrowserError, BrowserHostControl, BrowserHostEvent, BrowserInvocationActor,
+        BrowserInvocationContext, BrowserJournalActor, BrowserOperationTarget,
+        BrowserPageLoadState, BrowserPageRecordingAuthority, BrowserPageRecordingIpc,
+        BrowserPageRecordingSubmit, BrowserRecipeAction, BrowserRecipeInput,
+        BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+        BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayCoordinator,
+        BrowserReplayLocatorSlot, BrowserReplayRepairResumeCursor, BrowserReplaySecretError,
+        BrowserReplaySecretPromptOperation, BrowserReplaySecretPromptVault, BrowserReplayStatus,
+        BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
+        BrowserRevision, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot,
+        BrowserUserInputKind, BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+        BROWSER_RECIPE_SCHEMA_VERSION,
     };
-    use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
+    use std::{num::NonZeroU64, path::PathBuf, sync::Arc, time::Instant};
 
     #[derive(Clone, Copy)]
     enum DocumentStateRemoval {
         CloseTab,
         ResetWorkspace,
         ClearProjectProfile,
+    }
+
+    #[tokio::test]
+    async fn all_workspace_shutdown_releases_active_and_queued_host_requests_before_state_mutation()
+    {
+        let workspace_key =
+            BrowserWorkspaceKey::new("shutdown-host-project", "conversation").unwrap();
+        let mut host = BrowserWebViewHost::unavailable("shutdown host cleanup fixture");
+        host.state
+            .ensure_workspace(
+                workspace_key.clone(),
+                BrowserWorkspaceSnapshot {
+                    tabs: vec![BrowserTabSnapshot {
+                        id: "tab-a".to_string(),
+                        title: "Fixture".to_string(),
+                        url: "https://example.test".to_string(),
+                        viewport: BrowserViewport::default(),
+                    }],
+                    selected_tab_id: Some("tab-a".to_string()),
+                    ..BrowserWorkspaceSnapshot::default()
+                },
+            )
+            .unwrap();
+
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let secret_replay = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "shutdown-secret-prompt".to_string(),
+                        name: "Shutdown secret prompt".to_string(),
+                        description: "Shutdown boundary fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: vec![BrowserRecipeInput {
+                            name: "credential".to_string(),
+                            kind: BrowserRecipeInputKind::Secret,
+                            default_value: None,
+                        }],
+                        steps: vec![BrowserRecipeStep {
+                            id: "credential".to_string(),
+                            action: BrowserRecipeAction::Type {
+                                locator: BrowserRecipeLocator {
+                                    test_id: Some("credential".to_string()),
+                                    ..BrowserRecipeLocator::default()
+                                },
+                                value: BrowserRecipeValue::Input {
+                                    name: "credential".to_string(),
+                                },
+                            },
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+            secret_replay.instance.clone(),
+            secret_replay.projection.unresolved_secret_inputs.clone(),
+        )
+        .unwrap();
+        prompt
+            .edit(&secret_replay.instance, "credential", "shutdown-secret")
+            .unwrap();
+
+        let repair_workspace =
+            BrowserWorkspaceKey::new("shutdown-host-project", "repair-conversation").unwrap();
+        let repair_replay = coordinator
+            .start(
+                repair_workspace.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "shutdown-repair".to_string(),
+                        name: "Shutdown repair".to_string(),
+                        description: "Shutdown boundary fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: Vec::new(),
+                        steps: vec![BrowserRecipeStep {
+                            id: "click".to_string(),
+                            action: BrowserRecipeAction::Click {
+                                locator: BrowserRecipeLocator {
+                                    test_id: Some("target".to_string()),
+                                    ..BrowserRecipeLocator::default()
+                                },
+                            },
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        coordinator.begin(&repair_replay.instance).unwrap();
+        let repair_root =
+            std::env::temp_dir().join(format!("devmanager-shutdown-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repair_root);
+        let repair_store = BrowserResourceStore::open(
+            &repair_root,
+            BrowserResourceLimits {
+                max_temporary_count: 4,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let repair = coordinator
+            .reserve_locator_repair_capture(
+                &repair_replay.instance,
+                &repair_store,
+                0,
+                BrowserReplayLocatorSlot::PrimaryAction,
+                "tab-a",
+                BrowserRevision(7),
+                BrowserReplayRepairResumeCursor::Action,
+            )
+            .unwrap();
+        let snapshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairSnapshot,
+                "application/json",
+                b"{}",
+            )
+            .unwrap();
+        let screenshot = coordinator
+            .retain_locator_repair_evidence_for_test(
+                &repair,
+                BrowserResourceKind::ReplayRepairScreenshot,
+                "image/png",
+                b"png",
+            )
+            .unwrap();
+        coordinator
+            .publish_locator_repair(&repair, &snapshot, &screenshot)
+            .unwrap();
+        let mut repair_selection = Some(repair);
+
+        let controller = bridge.bind(workspace_key.clone(), std::time::Duration::from_secs(1));
+        let active = tokio::spawn({
+            let controller = controller.clone();
+            async move {
+                controller
+                    .request(BrowserCommand::Reload {
+                        tab_id: "tab-a".to_string(),
+                    })
+                    .await
+            }
+        });
+        let active_request = inbox.recv().await.expect("active host request");
+        let queued = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        let queued_request = inbox.recv().await.expect("queued host request");
+        let target = BrowserOperationTarget::new(workspace_key, "tab-a").unwrap();
+        let active_id = active_request.context().operation_id.clone();
+        let active_work = host
+            .operation_queue
+            .enqueue(
+                target.clone(),
+                active_id,
+                BrowserQueuedWork::Request(active_request),
+            )
+            .expect("first request becomes active");
+        let BrowserQueuedWork::Request(active_request) = active_work else {
+            unreachable!()
+        };
+        host.active_requests.insert(
+            target.clone(),
+            ActiveBrowserRequest {
+                request: active_request,
+                phase: BrowserAsyncPhase::Wait,
+                approved_risk: None,
+                _started_at: Instant::now(),
+            },
+        );
+        let queued_id = queued_request.context().operation_id.clone();
+        assert!(host
+            .operation_queue
+            .enqueue(
+                target,
+                queued_id,
+                BrowserQueuedWork::Request(queued_request),
+            )
+            .is_none());
+
+        let mut state_replaced = false;
+        bridge.interrupt_all_with_host_cleanup(|| {
+            host.interrupt_all_local_work();
+            assert!(
+                host.active_requests.is_empty(),
+                "host active work must be released before state replacement"
+            );
+            assert!(
+                host.operation_queue.is_empty(),
+                "host queued work must be released before state replacement"
+            );
+            state_replaced = true;
+        });
+        let prompt_event = prompt
+            .route_switch(&secret_replay.instance)
+            .expect("shutdown retires the populated prompt");
+        assert_eq!(
+            prompt_event.operation,
+            BrowserReplaySecretPromptOperation::RouteSwitched
+        );
+        repair_selection.take();
+        assert!(state_replaced);
+        assert!(repair_selection.is_none());
+        assert_eq!(
+            coordinator.status(&secret_replay.instance).unwrap().status,
+            BrowserReplayStatus::Cancelled
+        );
+        assert_eq!(
+            coordinator.status(&repair_replay.instance).unwrap().status,
+            BrowserReplayStatus::Cancelled
+        );
+        assert!(matches!(
+            secret_replay.execution.secret_lease("credential"),
+            Err(BrowserReplaySecretError::ClosedStore)
+        ));
+        assert_eq!(active.await.unwrap(), Err(BrowserError::Interrupted));
+        assert_eq!(queued.await.unwrap(), Err(BrowserError::Interrupted));
+        drop(repair_store);
+        std::fs::remove_dir_all(repair_root).unwrap();
     }
 
     #[tokio::test]
@@ -6689,18 +7050,24 @@ mod secret_document_state_tests {
         let retained = inbox.recv().await.expect("retained controller request");
 
         host.event_sender
-            .send(BrowserHostEvent::UserInput {
-                workspace_key: workspace_key.clone(),
-                tab_id: tab_id.clone(),
-                kind: BrowserUserInputKind::Keyboard,
-            })
+            .send(BrowserHostEvent::user_input(
+                workspace_key.clone(),
+                tab_id.clone(),
+                BrowserUserInputKind::Keyboard,
+            ))
             .unwrap();
         let initial_revision = initial.revision;
         let mut observed_revision = None;
-        let events = host.drain_events_with_pre_apply_observer(|event, state| {
+        let mut observer_calls = 0;
+        host.publish_pending_user_input_cutoffs(|event, state| {
+            observer_calls += 1;
             observed_revision = state
                 .workspace(&workspace_key)
                 .map(|snapshot| snapshot.revision);
+            bridge.observe_host_event(event);
+        });
+        let events = host.drain_events_with_pre_apply_observer(|event, _state| {
+            observer_calls += 1;
             bridge.observe_host_event(event);
         });
 
@@ -6709,6 +7076,7 @@ mod secret_document_state_tests {
             [BrowserHostEvent::UserInput { .. }]
         ));
         assert_eq!(observed_revision, Some(initial_revision));
+        assert_eq!(observer_calls, 1, "the input cutoff is published once");
         assert_eq!(
             host.state.workspace(&workspace_key).unwrap().revision.0,
             initial_revision.0 + 1
@@ -6722,6 +7090,409 @@ mod secret_document_state_tests {
     }
 
     #[tokio::test]
+    async fn queued_user_input_publishes_replay_cutoff_before_same_gesture_recording_ipc() {
+        let workspace_key =
+            BrowserWorkspaceKey::new("input-recording-project", "input-recording-conversation")
+                .unwrap();
+        let mut host = BrowserWebViewHost::unavailable("input recording ordering fixture");
+        let initial = host
+            .state
+            .ensure_workspace(
+                workspace_key.clone(),
+                BrowserWorkspaceSnapshot {
+                    tabs: vec![BrowserTabSnapshot {
+                        id: "tab-a".to_string(),
+                        title: "Fixture".to_string(),
+                        url: "https://example.test".to_string(),
+                        viewport: BrowserViewport::default(),
+                    }],
+                    selected_tab_id: Some("tab-a".to_string()),
+                    ..BrowserWorkspaceSnapshot::default()
+                },
+            )
+            .unwrap();
+        let recording = host
+            .workflow_coordinator
+            .start_with_selected_tab(workspace_key.clone(), "tab-a")
+            .unwrap();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let ingress = host
+            .recording_transport
+            .ingress(workspace_key.clone(), "tab-a".to_string());
+        ingress.activate(recording.id(), nonce).unwrap();
+        let mut ipc = BrowserPageRecordingIpc::default();
+        ipc.activate(
+            BrowserPageRecordingAuthority::new(
+                recording.clone(),
+                "tab-a",
+                initial.revision,
+                "https://example.test",
+                nonce,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        host.recording_views
+            .insert(view_key(&workspace_key, "tab-a"), ipc);
+
+        let (bridge, _inbox) = browser_command_channel(4);
+        let replay_coordinator = bridge.replay_coordinator();
+        let replay = replay_coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "input-recording-replay".to_string(),
+                        name: "Input recording replay".to_string(),
+                        description: "Two-channel input ordering fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: Vec::new(),
+                        steps: vec![BrowserRecipeStep {
+                            id: "reload".to_string(),
+                            action: BrowserRecipeAction::Reload,
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        replay_coordinator.begin(&replay.instance).unwrap();
+
+        let body = format!(
+            r##"{{"version":1,"channel":"browserRecording","workspace":{{"projectId":"input-recording-project","aiTabId":"input-recording-conversation"}},"tabId":"tab-a","revision":{},"instanceId":{},"sequence":0,"actor":"user","source":"page","origin":"https://example.test","event":{{"type":"click","locator":{{"accessibilityRole":"button","accessibilityName":"Save","testId":"save","cssSelectors":["#save"]}}}},"nonce":"{nonce}"}}"##,
+            initial.revision.0,
+            recording.id(),
+        );
+        assert_eq!(
+            ingress.submit("https://example.test", body),
+            BrowserPageRecordingSubmit::Accepted
+        );
+        host.event_sender
+            .send(BrowserHostEvent::user_input(
+                workspace_key.clone(),
+                "tab-a",
+                BrowserUserInputKind::Pointer,
+            ))
+            .unwrap();
+
+        let workflow = host.workflow_coordinator.clone();
+        assert_eq!(
+            workflow.with_recorder(|recorder| recorder.active_step_count(&recording).unwrap()),
+            0
+        );
+        let mut observer_calls = 0;
+        let mut steps_at_cutoff = None;
+        let mut replay_at_cutoff = None;
+        host.publish_pending_user_input_cutoffs(|event, _state| {
+            observer_calls += 1;
+            bridge.observe_host_event(event);
+            replay_at_cutoff = Some(replay_coordinator.status(&replay.instance).unwrap().status);
+            steps_at_cutoff = Some(
+                workflow.with_recorder(|recorder| recorder.active_step_count(&recording).unwrap()),
+            );
+        });
+        let events = host.drain_events_with_pre_apply_observer(|event, _state| {
+            observer_calls += 1;
+            bridge.observe_host_event(event);
+        });
+        let second_drain = host.drain_events_with_pre_apply_observer(|event, _state| {
+            observer_calls += 1;
+            bridge.observe_host_event(event);
+        });
+
+        assert_eq!(replay_at_cutoff, Some(BrowserReplayStatus::Cancelled));
+        assert_eq!(
+            steps_at_cutoff,
+            Some(0),
+            "the replay cutoff must publish before same-gesture recording mutation"
+        );
+        assert_eq!(
+            workflow.with_recorder(|recorder| recorder.active_step_count(&recording).unwrap()),
+            1,
+            "the buffered recording message is ingested exactly once after the cutoff"
+        );
+        assert_eq!(
+            observer_calls, 1,
+            "the buffered input publishes exactly once"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [BrowserHostEvent::UserInput { .. }]
+        ));
+        assert!(second_drain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_user_input_from_before_a_replay_does_not_cancel_newer_replay_or_request() {
+        let workspace_key =
+            BrowserWorkspaceKey::new("older-input-project", "newer-replay-conversation").unwrap();
+        let mut host = BrowserWebViewHost::unavailable("queued input epoch fixture");
+        let initial = host
+            .state
+            .ensure_workspace(workspace_key.clone(), BrowserWorkspaceSnapshot::default())
+            .unwrap();
+        let tab_id = initial.snapshot.selected_tab_id.clone().unwrap();
+
+        // The actual user gesture predates both pieces of work below, even
+        // though the UI-thread drain observes it after they have started.
+        host.event_sender
+            .send(BrowserHostEvent::user_input(
+                workspace_key.clone(),
+                tab_id.clone(),
+                BrowserUserInputKind::Pointer,
+            ))
+            .unwrap();
+
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let replay = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "newer-replay-after-queued-input".to_string(),
+                        name: "Newer replay".to_string(),
+                        description: "Queued input epoch fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: Vec::new(),
+                        steps: vec![BrowserRecipeStep {
+                            id: "reload".to_string(),
+                            action: BrowserRecipeAction::Reload,
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        coordinator.begin(&replay.instance).unwrap();
+        let controller = bridge.bind(workspace_key.clone(), std::time::Duration::from_secs(1));
+        let pending = tokio::spawn({
+            let tab_id = tab_id.clone();
+            async move { controller.request(BrowserCommand::Reload { tab_id }).await }
+        });
+        let retained = inbox.recv().await.expect("retained newer request");
+
+        let initial_revision = initial.revision;
+        let mut observer_calls = 0;
+        host.publish_pending_user_input_cutoffs(|event, _state| {
+            observer_calls += 1;
+            bridge.observe_host_event(event);
+        });
+        let events = host.drain_events_with_pre_apply_observer(|event, _state| {
+            observer_calls += 1;
+            bridge.observe_host_event(event);
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [BrowserHostEvent::UserInput { .. }]
+        ));
+        assert_eq!(
+            host.state.workspace(&workspace_key).unwrap().revision.0,
+            initial_revision.0 + 1,
+            "the historical input can still update visible page state"
+        );
+        assert_eq!(observer_calls, 1, "the historical cutoff is published once");
+        assert_eq!(
+            coordinator.status(&replay.instance).unwrap().status,
+            BrowserReplayStatus::Running,
+            "a queued input must not cancel a replay created after that gesture"
+        );
+        assert_eq!(bridge.pending_work_count(), 1);
+        assert!(!pending.is_finished());
+
+        retained.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(pending.await.unwrap(), Ok(BrowserResponse::Acknowledged));
+    }
+
+    #[tokio::test]
+    async fn newer_queued_user_input_preempts_replay_owned_close_and_later_replay_work() {
+        let workspace_key =
+            BrowserWorkspaceKey::new("input-close-project", "input-close-conversation").unwrap();
+        let mut host = BrowserWebViewHost::unavailable("input close ordering fixture");
+        let initial = host
+            .state
+            .ensure_workspace(
+                workspace_key.clone(),
+                BrowserWorkspaceSnapshot {
+                    tabs: vec![BrowserTabSnapshot {
+                        id: "tab-a".to_string(),
+                        title: "Fixture".to_string(),
+                        url: "https://example.test".to_string(),
+                        viewport: BrowserViewport::default(),
+                    }],
+                    selected_tab_id: Some("tab-a".to_string()),
+                    ..BrowserWorkspaceSnapshot::default()
+                },
+            )
+            .unwrap();
+        let original_revision = initial.revision;
+
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let started = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "input-before-close".to_string(),
+                        name: "Input before replay-owned close".to_string(),
+                        description: "Host barrier ordering fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: Vec::new(),
+                        steps: vec![
+                            BrowserRecipeStep {
+                                id: "close".to_string(),
+                                action: BrowserRecipeAction::CloseTab {
+                                    tab: "tab-1".to_string(),
+                                },
+                                wait: None,
+                                assertions: Vec::new(),
+                            },
+                            BrowserRecipeStep {
+                                id: "later".to_string(),
+                                action: BrowserRecipeAction::Reload,
+                                wait: None,
+                                assertions: Vec::new(),
+                            },
+                        ],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        coordinator.begin(&started.instance).unwrap();
+        let replay_instance = started.instance.clone();
+        let replay_epoch = started.execution.interaction_epoch();
+        let controller = bridge.bind(workspace_key.clone(), std::time::Duration::from_secs(1));
+        let close_controller = controller.clone();
+        let close = tokio::spawn(async move {
+            close_controller
+                .request_replay_lifecycle_command(
+                    BrowserCommand::CloseTab {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "replay closes its current tab",
+                        BrowserRisk::Destructive,
+                    )
+                    .unwrap()
+                    .with_interaction_epoch(replay_epoch),
+                    &started.execution,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while bridge.pending_work_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replay-owned close enqueues");
+
+        host.event_sender
+            .send(BrowserHostEvent::user_input(
+                workspace_key.clone(),
+                "tab-a",
+                BrowserUserInputKind::Pointer,
+            ))
+            .unwrap();
+
+        let observer_bridge = bridge.clone();
+        let close_route = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
+            assert!(controls.is_empty());
+            host.publish_pending_user_input_cutoffs(|event, _state| {
+                observer_bridge.observe_host_event_under_host_control_barrier(event);
+            });
+            let request = lifecycle_requests
+                .pop()
+                .expect("one replay-owned close request");
+            route_browser_request(true, request, |request| {
+                let mutation = host.state.close_tab(&workspace_key, "tab-a").unwrap();
+                request.respond(Ok(BrowserResponse::Workspace { mutation }));
+            })
+        });
+        let close_result = close.await.unwrap();
+
+        let observer_bridge = bridge.clone();
+        let events = host.drain_events_with_pre_apply_observer(|event, _state| {
+            observer_bridge.observe_host_event_under_host_control_barrier(event);
+        });
+
+        let later_tab = host
+            .state
+            .workspace(&workspace_key)
+            .and_then(|snapshot| snapshot.selected_tab_id.clone())
+            .expect("workspace keeps a selected tab");
+        let later_controller = controller.clone();
+        let later = tokio::spawn(async move {
+            later_controller
+                .request_with_context(
+                    BrowserCommand::Reload { tab_id: later_tab },
+                    BrowserInvocationContext::agent("later replay step", BrowserRisk::Normal)
+                        .unwrap()
+                        .with_interaction_epoch(replay_epoch),
+                )
+                .await
+        });
+        let mut later_host_mutated = false;
+        let later_route =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), inbox.recv()).await {
+                Ok(Some(later_request)) => {
+                    Some(route_browser_request(true, later_request, |request| {
+                        later_host_mutated = true;
+                        request.respond(Ok(BrowserResponse::Acknowledged));
+                    }))
+                }
+                Ok(None) => panic!("browser command inbox closed"),
+                Err(_) if later.is_finished() => None,
+                Err(_) => panic!("later replay request neither enqueued nor completed"),
+            };
+        let later_result = tokio::time::timeout(std::time::Duration::from_secs(1), later)
+            .await
+            .expect("later replay request completes")
+            .unwrap();
+
+        assert_eq!(close_route, Err(BrowserError::Interrupted));
+        assert_eq!(close_result, Err(BrowserError::Interrupted));
+        assert!(matches!(
+            events.as_slice(),
+            [BrowserHostEvent::UserInput { .. }]
+        ));
+        assert_eq!(
+            host.state.workspace(&workspace_key).unwrap().revision.0,
+            original_revision.0 + 1,
+            "the prepublished input is projected exactly once"
+        );
+        assert_eq!(
+            coordinator.status(&replay_instance).unwrap().status,
+            BrowserReplayStatus::Cancelled
+        );
+        assert!(matches!(
+            later_route,
+            None | Some(Err(BrowserError::Interrupted))
+        ));
+        assert_eq!(later_result, Err(BrowserError::Interrupted));
+        assert!(
+            !later_host_mutated,
+            "later replay work cannot mutate the host"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_queued_user_input_is_dropped_before_shared_replay_cancellation() {
         let workspace_key =
             BrowserWorkspaceKey::new("stale-input-project", "stale-input-conversation").unwrap();
@@ -6732,11 +7503,11 @@ mod secret_document_state_tests {
             .unwrap();
         let stale_tab_id = initial.snapshot.selected_tab_id.clone().unwrap();
         host.event_sender
-            .send(BrowserHostEvent::UserInput {
-                workspace_key: workspace_key.clone(),
-                tab_id: stale_tab_id.clone(),
-                kind: BrowserUserInputKind::Keyboard,
-            })
+            .send(BrowserHostEvent::user_input(
+                workspace_key.clone(),
+                stale_tab_id.clone(),
+                BrowserUserInputKind::Keyboard,
+            ))
             .unwrap();
         let replacement = host.state.close_tab(&workspace_key, &stale_tab_id).unwrap();
         let replacement_tab_id = replacement.snapshot.selected_tab_id.clone().unwrap();
@@ -6780,6 +7551,10 @@ mod secret_document_state_tests {
         let replay_status_before = coordinator.status(&replay.instance).unwrap().status;
 
         let mut observer_calls = 0;
+        host.publish_pending_user_input_cutoffs(|event, _state| {
+            observer_calls += 1;
+            bridge.observe_host_event(event);
+        });
         let events = host.drain_events_with_pre_apply_observer(|event, _state| {
             observer_calls += 1;
             bridge.observe_host_event(event);
@@ -7258,11 +8033,11 @@ mod secret_document_state_tests {
                 level: BrowserDiagnosticLevel::Info,
                 message: "fixed workspace lifecycle diagnostic".to_string(),
             },
-            BrowserHostEvent::UserInput {
-                workspace_key: workspace_key.clone(),
-                tab_id: tab_id.clone(),
-                kind: BrowserUserInputKind::Keyboard,
-            },
+            BrowserHostEvent::user_input(
+                workspace_key.clone(),
+                tab_id.clone(),
+                BrowserUserInputKind::Keyboard,
+            ),
             BrowserHostEvent::DomMutation {
                 workspace_key: workspace_key.clone(),
                 tab_id: tab_id.clone(),

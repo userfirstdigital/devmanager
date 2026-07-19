@@ -2,10 +2,10 @@ use super::{
     compile_browser_replay, execute_browser_replay, list_recipes, load_recipe,
     verified_authenticated_local_project_root, BrowserController, BrowserElementRef, BrowserError,
     BrowserInvocationActor, BrowserInvocationContext, BrowserRecipeInputKind, BrowserRecipeV1,
-    BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplayError, BrowserReplayFailureCode,
-    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplayRepairCandidate,
-    BrowserReplayRepairProjection, BrowserResourceHandle, BrowserResourceKind,
-    BrowserResourceStore, BrowserWorkspaceKey,
+    BrowserRecipeViewport, BrowserReplayAdmission, BrowserReplayCoordinator, BrowserReplayError,
+    BrowserReplayFailureCode, BrowserReplayProjection, BrowserReplayPublicInput,
+    BrowserReplayRepairCandidate, BrowserReplayRepairProjection, BrowserResourceHandle,
+    BrowserResourceKind, BrowserResourceStore, BrowserWorkspaceKey,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -98,13 +98,15 @@ impl BrowserWorkflowMcpService {
         &self,
         recipe_id: &str,
         inputs: Vec<BrowserReplayPublicInput>,
+        admission: BrowserReplayAdmission,
     ) -> Result<BrowserReplayProjection, BrowserWorkflowServiceError> {
         let root = self.verify_authenticated_root()?;
         let recipe = load_recipe(&root, recipe_id).map_err(map_load_error)?;
         let plan = compile_browser_replay(&recipe, inputs).map_err(map_compile_error)?;
         let start = self
-            .coordinator
-            .replace(self.controller.workspace_key().clone(), plan)
+            .controller
+            .replace_replay_if_admitted(admission, plan)
+            .map_err(BrowserWorkflowServiceError::Browser)?
             .map_err(map_replay_error)?;
         let projection = start.projection.clone();
         let controller = self.controller.clone();
@@ -132,6 +134,14 @@ impl BrowserWorkflowMcpService {
             }
         });
         Ok(projection)
+    }
+
+    pub(crate) fn capture_replay_admission(
+        &self,
+    ) -> Result<BrowserReplayAdmission, BrowserWorkflowServiceError> {
+        self.controller
+            .capture_replay_admission()
+            .map_err(BrowserWorkflowServiceError::Browser)
     }
 
     pub(crate) fn status(
@@ -378,11 +388,12 @@ pub fn get_browser_workflow_recipe(
 mod tests {
     use super::*;
     use crate::browser::{
-        browser_command_channel, save_recipe, BrowserCommand, BrowserElementRef,
-        BrowserInvocationContext, BrowserLocator, BrowserRecipeAction, BrowserRecipeLocator,
-        BrowserRecipeStep, BrowserReplayLocatorSlot, BrowserReplayRepairPhase,
-        BrowserReplayRepairResumeCursor, BrowserResourceKind, BrowserResourceLimits,
-        BrowserResponse, BrowserRevision, BrowserRisk, BROWSER_RECIPE_SCHEMA_VERSION,
+        browser_command_channel, save_recipe, BrowserCommand, BrowserElementRef, BrowserHostEvent,
+        BrowserInvocationContext, BrowserLocator, BrowserRecipeAction, BrowserRecipeInput,
+        BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeValue,
+        BrowserReplayLocatorSlot, BrowserReplayRepairPhase, BrowserReplayRepairResumeCursor,
+        BrowserReplayStatus, BrowserResourceKind, BrowserResourceLimits, BrowserResponse,
+        BrowserRevision, BrowserRisk, BrowserUserInputKind, BROWSER_RECIPE_SCHEMA_VERSION,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -406,6 +417,36 @@ mod tests {
                     locator: BrowserRecipeLocator {
                         test_id: Some("old-target".to_string()),
                         ..BrowserRecipeLocator::default()
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            }],
+        }
+    }
+
+    fn secret_replay_recipe() -> BrowserRecipeV1 {
+        BrowserRecipeV1 {
+            schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+            id: "route-admission-secret-replay".to_string(),
+            name: "Route admission secret replay".to_string(),
+            description: "Reject replay creation after route loss".to_string(),
+            start_url: "https://example.test".to_string(),
+            viewport: BrowserRecipeViewport::default(),
+            inputs: vec![BrowserRecipeInput {
+                name: "password".to_string(),
+                kind: BrowserRecipeInputKind::Secret,
+                default_value: None,
+            }],
+            steps: vec![BrowserRecipeStep {
+                id: "type-password".to_string(),
+                action: BrowserRecipeAction::Type {
+                    locator: BrowserRecipeLocator {
+                        test_id: Some("password".to_string()),
+                        ..BrowserRecipeLocator::default()
+                    },
+                    value: BrowserRecipeValue::Input {
+                        name: "password".to_string(),
                     },
                 },
                 wait: None,
@@ -643,6 +684,165 @@ mod tests {
         drop(bridge);
         drop(inbox);
         drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn later_user_input_during_validation_stales_replay_admission_but_older_input_does_not() {
+        let workspace =
+            BrowserWorkspaceKey::new("workflow-input-admission", "conversation").unwrap();
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let controller = bridge.bind(workspace.clone(), Duration::from_secs(1));
+        let plan = || compile_browser_replay(&secret_replay_recipe(), Vec::new()).unwrap();
+
+        let admission = controller.capture_replay_admission().unwrap();
+        let validating_controller = controller.clone();
+        let validation = tokio::spawn(async move {
+            validating_controller
+                .request_with_context(
+                    BrowserCommand::WorkspaceState,
+                    BrowserInvocationContext::agent(
+                        "validate replay before later input",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let validation_request = inbox.recv().await.expect("workspace validation request");
+        let later_input = BrowserHostEvent::user_input(
+            workspace.clone(),
+            "tab-a",
+            BrowserUserInputKind::Keyboard,
+        );
+        validation_request.respond(Ok(BrowserResponse::WorkspaceState {
+            snapshot: super::super::BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..super::super::BrowserWorkspaceSnapshot::default()
+            },
+        }));
+        assert!(matches!(
+            validation.await.unwrap(),
+            Ok(BrowserResponse::WorkspaceState { .. })
+        ));
+        bridge.observe_host_event(&later_input);
+
+        assert!(matches!(
+            controller.replace_replay_if_admitted(admission, plan()),
+            Err(BrowserError::Interrupted)
+        ));
+        assert!(bridge
+            .replay_coordinator()
+            .active_state(&workspace)
+            .is_none());
+
+        let older_input =
+            BrowserHostEvent::user_input(workspace.clone(), "tab-a", BrowserUserInputKind::Pointer);
+        let newer_admission = controller.capture_replay_admission().unwrap();
+        bridge.observe_host_event(&older_input);
+        let started = controller
+            .replace_replay_if_admitted(newer_admission, plan())
+            .unwrap()
+            .expect("input older than admission must not cancel newer replay");
+        assert_eq!(
+            started.projection.status,
+            BrowserReplayStatus::NeedsUserSecret
+        );
+        bridge.interrupt_workspace(&workspace);
+    }
+
+    #[tokio::test]
+    async fn route_loss_after_successful_validation_rejects_replay_before_secret_residue() {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-workflow-route-admission-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let recipe = secret_replay_recipe();
+        save_recipe(&root, &recipe).unwrap();
+        let store = BrowserResourceStore::open(
+            root.join("resources"),
+            BrowserResourceLimits {
+                max_temporary_count: 0,
+                max_temporary_bytes: 1024 * 1024,
+                max_resource_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let workspace =
+            BrowserWorkspaceKey::new("workflow-route-admission", "conversation").unwrap();
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let controller = bridge.bind(workspace.clone(), Duration::from_secs(1));
+        let service = BrowserWorkflowMcpService::new(controller.clone(), store, root.clone());
+        let admission = service.capture_replay_admission().unwrap();
+
+        let validating_controller = controller.clone();
+        let validation = tokio::spawn(async move {
+            validating_controller
+                .request_with_context(
+                    BrowserCommand::WorkspaceState,
+                    BrowserInvocationContext::agent(
+                        "validate workflow replay route",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let request = inbox.recv().await.expect("workspace validation request");
+        request.respond(Ok(BrowserResponse::WorkspaceState {
+            snapshot: super::super::BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..super::super::BrowserWorkspaceSnapshot::default()
+            },
+        }));
+        assert!(matches!(
+            validation.await.unwrap(),
+            Ok(BrowserResponse::WorkspaceState { .. })
+        ));
+
+        bridge.interrupt_workspace(&workspace);
+        assert!(matches!(
+            service.replay(&recipe.id, Vec::new(), admission),
+            Err(BrowserWorkflowServiceError::Browser(
+                BrowserError::Interrupted
+            ))
+        ));
+        assert!(
+            bridge
+                .replay_coordinator()
+                .active_state(&workspace)
+                .is_none(),
+            "route loss must reject before a hidden NeedsUserSecret replay exists"
+        );
+
+        let admitted = service.capture_replay_admission().unwrap();
+        let started = controller
+            .replace_replay_if_admitted(
+                admitted,
+                compile_browser_replay(&recipe, Vec::new()).unwrap(),
+            )
+            .unwrap()
+            .expect("replay start wins the opposite linearization order");
+        assert_eq!(
+            started.projection.status,
+            BrowserReplayStatus::NeedsUserSecret
+        );
+        let coordinator = bridge.replay_coordinator();
+        bridge.interrupt_workspace(&workspace);
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::Cancelled
+        );
+        assert!(coordinator.active_state(&workspace).is_none());
+
+        drop(service);
+        drop(controller);
+        drop(bridge);
+        drop(inbox);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

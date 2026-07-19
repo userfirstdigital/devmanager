@@ -1,4 +1,5 @@
 use super::commands::verified_authenticated_local_project_root;
+use super::model::next_browser_interaction_epoch;
 use super::recipes::{
     canonical_browser_recipe_digest, recipe_step_locator_at, replace_recipe_locator_atomic,
     BrowserRecipeDigestV1, BrowserRecipeLocatorReplaceError,
@@ -326,6 +327,7 @@ impl BrowserReplayCancellationLease {
 
 pub struct BrowserReplayExecutionHandle {
     instance: BrowserReplayInstance,
+    interaction_epoch: u64,
     plan: Arc<BrowserReplayPlan>,
     lease: BrowserReplayCancellationLease,
     secret_store: BrowserReplaySecretStore,
@@ -333,6 +335,22 @@ pub struct BrowserReplayExecutionHandle {
     locator_overrides: Arc<Mutex<HashMap<(usize, BrowserReplayLocatorSlot), BrowserRecipeLocator>>>,
     #[allow(dead_code)] // Task 7 binds this in the executor and reads it during coordinator apply.
     canonical_recipe_root: Arc<OnceLock<PathBuf>>,
+}
+
+pub(crate) struct BrowserReplayLifecycleAuthority {
+    instance: BrowserReplayInstance,
+    interaction_epoch: u64,
+    lease: BrowserReplayCancellationLease,
+}
+
+impl BrowserReplayLifecycleAuthority {
+    pub(crate) fn workspace_key(&self) -> &BrowserWorkspaceKey {
+        self.instance.workspace_key()
+    }
+
+    pub(crate) fn interaction_epoch(&self) -> u64 {
+        self.interaction_epoch
+    }
 }
 
 impl BrowserReplayExecutionHandle {
@@ -346,6 +364,18 @@ impl BrowserReplayExecutionHandle {
 
     pub fn is_cancelled(&self) -> bool {
         self.lease.is_cancelled()
+    }
+
+    pub(crate) fn interaction_epoch(&self) -> u64 {
+        self.interaction_epoch
+    }
+
+    pub(crate) fn lifecycle_authority(&self) -> BrowserReplayLifecycleAuthority {
+        BrowserReplayLifecycleAuthority {
+            instance: self.instance.clone(),
+            interaction_epoch: self.interaction_epoch,
+            lease: self.lease.clone(),
+        }
     }
 
     pub fn secret_lease(
@@ -657,6 +687,7 @@ fn repair_resource_mime(kind: BrowserResourceKind) -> Option<&'static str> {
 
 struct ActiveBrowserReplay {
     instance: BrowserReplayInstance,
+    interaction_epoch: u64,
     plan: Arc<BrowserReplayPlan>,
     projection: BrowserReplayProjection,
     lease: BrowserReplayCancellationLease,
@@ -756,7 +787,12 @@ impl BrowserReplayCoordinator {
         plan: BrowserReplayPlan,
     ) -> Result<BrowserReplayStart, BrowserReplayError> {
         let mut state = self.lock();
-        Self::start_locked(&mut state, workspace_key, plan)
+        Self::start_locked(
+            &mut state,
+            workspace_key,
+            plan,
+            next_browser_interaction_epoch(),
+        )
     }
 
     pub fn replace(
@@ -772,7 +808,29 @@ impl BrowserReplayCoordinator {
         {
             Self::terminalize(&mut state, &instance, BrowserReplayStatus::Cancelled, None)?;
         }
-        Self::start_locked(&mut state, workspace_key, plan)
+        Self::start_locked(
+            &mut state,
+            workspace_key,
+            plan,
+            next_browser_interaction_epoch(),
+        )
+    }
+
+    pub(crate) fn replace_with_interaction_epoch(
+        &self,
+        workspace_key: BrowserWorkspaceKey,
+        plan: BrowserReplayPlan,
+        interaction_epoch: u64,
+    ) -> Result<BrowserReplayStart, BrowserReplayError> {
+        let mut state = self.lock();
+        if let Some(instance) = state
+            .active
+            .get(&workspace_key)
+            .map(|active| active.instance.clone())
+        {
+            Self::terminalize(&mut state, &instance, BrowserReplayStatus::Cancelled, None)?;
+        }
+        Self::start_locked(&mut state, workspace_key, plan, interaction_epoch)
     }
 
     pub fn status(
@@ -2231,6 +2289,18 @@ impl BrowserReplayCoordinator {
         Self::terminalize(&mut state, &instance, BrowserReplayStatus::Cancelled, None).ok()
     }
 
+    pub(crate) fn interrupt_workspace_through_interaction_epoch(
+        &self,
+        workspace_key: &BrowserWorkspaceKey,
+        interaction_epoch: u64,
+    ) -> Option<BrowserReplayProjection> {
+        let mut state = self.lock();
+        let instance = state.active.get(workspace_key).and_then(|active| {
+            (active.interaction_epoch <= interaction_epoch).then(|| active.instance.clone())
+        })?;
+        Self::terminalize(&mut state, &instance, BrowserReplayStatus::Cancelled, None).ok()
+    }
+
     pub fn interrupt_project(&self, project_id: &str) -> usize {
         let mut state = self.lock();
         let mut instances = state
@@ -2280,6 +2350,7 @@ impl BrowserReplayCoordinator {
         state: &mut BrowserReplayCoordinatorState,
         workspace_key: BrowserWorkspaceKey,
         plan: BrowserReplayPlan,
+        interaction_epoch: u64,
     ) -> Result<BrowserReplayStart, BrowserReplayError> {
         if state.active.contains_key(&workspace_key) {
             return Err(BrowserReplayError::AlreadyActive);
@@ -2307,6 +2378,7 @@ impl BrowserReplayCoordinator {
         let canonical_recipe_root = Arc::new(OnceLock::new());
         let execution = BrowserReplayExecutionHandle {
             instance: instance.clone(),
+            interaction_epoch,
             plan: Arc::clone(&plan),
             lease: lease.clone(),
             secret_store: secret_store.share_authority(),
@@ -2333,6 +2405,7 @@ impl BrowserReplayCoordinator {
             workspace_key,
             ActiveBrowserReplay {
                 instance: instance.clone(),
+                interaction_epoch,
                 plan,
                 projection: projection.clone(),
                 lease: lease.clone(),
@@ -2385,6 +2458,22 @@ impl BrowserReplayCoordinator {
             return Err(BrowserReplayError::TerminalState);
         }
         Err(BrowserReplayError::StaleInstance)
+    }
+
+    pub(crate) fn lifecycle_authority_is_current(
+        &self,
+        authority: &BrowserReplayLifecycleAuthority,
+    ) -> bool {
+        let state = self.lock();
+        state
+            .active
+            .get(authority.instance.workspace_key())
+            .is_some_and(|active| {
+                active.instance == authority.instance
+                    && active.interaction_epoch == authority.interaction_epoch
+                    && active.lease.same_authority(&authority.lease)
+                    && !active.lease.is_cancelled()
+            })
     }
 
     fn terminalize(

@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_BROWSER_INTERACTION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_browser_interaction_epoch() -> u64 {
+    let epoch = NEXT_BROWSER_INTERACTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+    assert_ne!(epoch, u64::MAX, "browser interaction epoch space exhausted");
+    epoch
+}
 
 pub(super) fn browser_annotation_urls_equivalent(left: &str, right: &str) -> bool {
     redact_browser_text(left) == redact_browser_text(right)

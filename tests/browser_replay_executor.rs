@@ -1,16 +1,16 @@
 use devmanager::browser::{
-    browser_command_channel, compile_browser_replay, execute_browser_replay, BrowserAction,
-    BrowserActionResult, BrowserActionTarget, BrowserCommand, BrowserCommandRequest, BrowserError,
-    BrowserInvocationActor, BrowserLocator, BrowserRecipeAction, BrowserRecipeAssertion,
-    BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
-    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
-    BrowserRecipeWait, BrowserReplayCoordinator, BrowserReplayFailureCode, BrowserReplayProjection,
-    BrowserReplayPublicInput, BrowserReplaySecretPromptVault, BrowserReplayStatus,
-    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
-    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
-    BrowserTabSnapshot, BrowserUploadResult, BrowserViewport, BrowserWaitCondition,
-    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
-    BROWSER_RECIPE_SCHEMA_VERSION,
+    browser_command_channel, compile_browser_replay, execute_browser_replay, route_browser_request,
+    BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserCommand, BrowserCommandRequest,
+    BrowserError, BrowserInvocationActor, BrowserLocator, BrowserRecipeAction,
+    BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind,
+    BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
+    BrowserRecipeViewport, BrowserRecipeWait, BrowserReplayCoordinator, BrowserReplayFailureCode,
+    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplaySecretPromptVault,
+    BrowserReplayStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
+    BrowserScreenshotMode, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
+    BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation,
+    BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
@@ -199,7 +199,11 @@ async fn next_request(
             requests.pop()
         });
         if let Some(request) = lifecycle {
-            return request;
+            let mut routed = None;
+            route_browser_request(true, request, |request| routed = Some(request)).unwrap_or_else(
+                |error| panic!("{label} lifecycle route admission failed: {error}"),
+            );
+            return routed.expect("open lifecycle route dispatches the request");
         }
         match tokio::time::timeout(Duration::from_millis(10), inbox.recv()).await {
             Ok(Some(request)) => return request,
@@ -1282,13 +1286,13 @@ async fn every_recipe_action_maps_to_one_existing_command() {
     let recipe = action_recipe(actions);
     let total_steps = recipe.steps.len();
     let plan = compile_browser_replay(&recipe, Vec::new()).unwrap();
-    let coordinator = BrowserReplayCoordinator::default();
+    let (bridge, mut inbox) = browser_command_channel(32);
+    let coordinator = bridge.replay_coordinator();
     let started = coordinator
         .start(workspace("all-actions"), plan)
         .expect("start action replay");
     let instance = started.instance.clone();
     let root = canonical_project_root();
-    let (bridge, mut inbox) = browser_command_channel(32);
     let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
     let run = tokio::spawn({
         let coordinator = coordinator.clone();
@@ -2428,7 +2432,8 @@ async fn tab_aliases_advance_only_on_exact_create_select_and_close_snapshots() {
             }),
         }
         let plan = compile_browser_replay(&action_recipe(actions), Vec::new()).unwrap();
-        let coordinator = BrowserReplayCoordinator::default();
+        let (bridge, mut inbox) = browser_command_channel(8);
+        let coordinator = bridge.replay_coordinator();
         let started = coordinator
             .start(
                 workspace(&format!("tab-snapshot-mismatch-{case_index}")),
@@ -2437,7 +2442,6 @@ async fn tab_aliases_advance_only_on_exact_create_select_and_close_snapshots() {
             .expect("start tab snapshot replay");
         let instance = started.instance.clone();
         let root = canonical_project_root();
-        let (bridge, mut inbox) = browser_command_channel(8);
         let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
         let run = tokio::spawn({
             let coordinator = coordinator.clone();

@@ -1324,10 +1324,26 @@ impl NativeShell {
             .collect()
     }
 
+    fn active_open_browser_route(&self) -> Option<BrowserWorkspaceKey> {
+        (self.remote_mode.is_none()
+            && self.state.settings().browser_enabled
+            && self.browser_host.status().available)
+            .then(|| self.active_browser_workspace())
+            .flatten()
+            .and_then(|(workspace_key, snapshot)| snapshot.pane_open.then_some(workspace_key))
+    }
+
     fn browser_route_is_open(&self, workspace_key: &BrowserWorkspaceKey) -> bool {
-        self.state
-            .find_ai_tab(&workspace_key.ai_tab_id)
-            .is_some_and(|tab| tab.project_id == workspace_key.project_id)
+        self.active_open_browser_route().as_ref() == Some(workspace_key)
+    }
+
+    fn browser_route_can_be_opened(&self, workspace_key: &BrowserWorkspaceKey) -> bool {
+        self.remote_mode.is_none()
+            && self.state.settings().browser_enabled
+            && self.browser_host.status().available
+            && self
+                .active_browser_workspace()
+                .is_some_and(|(active_key, _)| active_key == *workspace_key)
     }
 
     fn dispatch_browser_command(
@@ -1336,17 +1352,28 @@ impl NativeShell {
         command: BrowserCommand,
         window: &Window,
     ) -> Result<BrowserResponse, BrowserError> {
-        if !self.browser_route_is_open(workspace_key) {
+        let opens_selected_route = matches!(
+            command,
+            BrowserCommand::Ensure { .. } | BrowserCommand::SetPaneOpen { open: true }
+        ) && self.browser_route_can_be_opened(workspace_key);
+        if !self.browser_route_is_open(workspace_key) && !opens_selected_route {
             return Err(BrowserError::CrashedView {
-                message: "browser command route does not match an open AI conversation".to_string(),
+                message: "browser command route is not the active visible local AI conversation"
+                    .to_string(),
             });
         }
         let open_workspaces = self.open_browser_workspace_keys();
+        let active_browser_route = self.active_open_browser_route();
         let browser_bridge = self.browser_bridge.clone();
+        let event_bridge = browser_bridge.clone();
         let result = browser_bridge.with_locked_host_work_for_command(
             workspace_key,
             &command,
             |controls, lifecycle_requests, repair_cleanups| {
+                self.browser_host
+                    .publish_pending_user_input_cutoffs(|event, _state| {
+                        event_bridge.observe_host_event_under_host_control_barrier(event);
+                    });
                 match &command {
                     BrowserCommand::Stop { .. }
                     | BrowserCommand::CloseTab { .. }
@@ -1371,17 +1398,13 @@ impl NativeShell {
                     browser_host.handle_repair_highlight_cleanup(window, cleanup);
                 }
                 for request in lifecycle_requests {
-                    if open_workspaces
-                        .iter()
-                        .any(|open| open == request.workspace_key())
-                    {
-                        browser_host.handle_request(window, request);
-                    } else {
-                        request.respond(Err(BrowserError::CrashedView {
-                            message: "browser command route does not match an open AI conversation"
-                                .to_string(),
-                        }));
-                    }
+                    let _ = route_browser_request_for_active_workspace(
+                        active_browser_route.as_ref(),
+                        request,
+                        |request| {
+                            browser_host.handle_request(window, request);
+                        },
+                    );
                 }
                 browser_host.handle_command(window, workspace_key, command.clone())
             },
@@ -1523,11 +1546,13 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         let workspace_key = request.workspace_key().clone();
-        let route_is_open = self.browser_route_is_open(&workspace_key);
+        let active_browser_route = self.active_open_browser_route();
         let route_result = self.with_browser_host_control_barrier(window, |browser_host| {
-            route_browser_request(route_is_open, request, |request| {
-                browser_host.handle_request(window, request)
-            })
+            route_browser_request_for_active_workspace(
+                active_browser_route.as_ref(),
+                request,
+                |request| browser_host.handle_request(window, request),
+            )
         });
         if let Err(error) = route_result {
             self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(error.to_string());
@@ -1870,34 +1895,30 @@ impl NativeShell {
         window: &Window,
         enter_host: impl FnOnce(&mut BrowserWebViewHost) -> R,
     ) -> R {
-        let open_workspaces = self.open_browser_workspace_keys();
+        let active_browser_route = self.active_open_browser_route();
         let browser_host = &mut self.browser_host;
-        self.browser_bridge
-            .with_locked_host_work_and_repair_cleanups(
-                |controls, lifecycle_requests, repair_cleanups| {
-                    for control in controls {
-                        browser_host.handle_control(control);
-                    }
-                    for cleanup in repair_cleanups {
-                        browser_host.handle_repair_highlight_cleanup(window, cleanup);
-                    }
-                    for request in lifecycle_requests {
-                        if open_workspaces
-                            .iter()
-                            .any(|open| open == request.workspace_key())
-                        {
-                            browser_host.handle_request(window, request);
-                        } else {
-                            request.respond(Err(BrowserError::CrashedView {
-                                message:
-                                    "browser command route does not match an open AI conversation"
-                                        .to_string(),
-                            }));
-                        }
-                    }
-                    enter_host(browser_host)
-                },
-            )
+        let browser_bridge = self.browser_bridge.clone();
+        browser_bridge.with_locked_host_work_and_repair_cleanups(
+            |controls, lifecycle_requests, repair_cleanups| {
+                browser_host.publish_pending_user_input_cutoffs(|event, _state| {
+                    browser_bridge.observe_host_event_under_host_control_barrier(event);
+                });
+                for control in controls {
+                    browser_host.handle_control(control);
+                }
+                for cleanup in repair_cleanups {
+                    browser_host.handle_repair_highlight_cleanup(window, cleanup);
+                }
+                for request in lifecycle_requests {
+                    let _ = route_browser_request_for_active_workspace(
+                        active_browser_route.as_ref(),
+                        request,
+                        |request| browser_host.handle_request(window, request),
+                    );
+                }
+                enter_host(browser_host)
+            },
+        )
     }
 
     fn browser_pane_context(&self) -> BrowserPaneContext {
@@ -2300,7 +2321,10 @@ impl NativeShell {
     }
 
     fn interrupt_all_browser_replays_before_shutdown(&mut self) {
-        self.browser_bridge.interrupt_all();
+        let browser_bridge = self.browser_bridge.clone();
+        browser_bridge.interrupt_all_with_host_cleanup(|| {
+            self.browser_host.interrupt_all_local_work();
+        });
         let workspaces = self.open_browser_workspace_keys();
         for workspace_key in workspaces {
             self.discard_browser_workflow_state_after_replay_interrupt(&workspace_key);
@@ -2802,13 +2826,11 @@ impl NativeShell {
             .get(&workspace_key)
             .and_then(|ui| ui.address_draft.clone())
             .unwrap_or_default();
-        let prompt_active = self.browser_replay_secret_prompt.is_some();
         let plan = match validate_browser_pane_action_before_replay_interrupt(
             &workspace_key,
             &snapshot,
             &address_draft,
             &action,
-            prompt_active,
             || {
                 self.browser_bridge.interrupt_workspace(&workspace_key);
                 self.retire_browser_replay_ui_after_interrupt(&workspace_key);
@@ -5018,6 +5040,7 @@ impl NativeShell {
         client_id: String,
         client_token: String,
     ) {
+        self.interrupt_all_browser_replays_before_shutdown();
         client.take_control();
         let snapshot = client.latest_snapshot().unwrap_or(snapshot);
         let address_for_mode = address.clone();
@@ -5338,6 +5361,7 @@ impl NativeShell {
     }
 
     fn disconnect_remote_host(&mut self, message: Option<String>) {
+        self.interrupt_all_browser_replays_before_shutdown();
         self.remote_connect_request_id = self.remote_connect_request_id.saturating_add(1);
         if let Some(remote_mode) = self.remote_mode.take() {
             remote_mode.port_forwards.shutdown();
@@ -7154,6 +7178,12 @@ impl NativeShell {
         source_path: &std::path::Path,
         cx: &mut Context<Self>,
     ) {
+        let replace_disables_browser = matches!(mode, ConfigImportMode::Replace)
+            && self.state.settings().browser_enabled
+            && !config.settings.browser_enabled;
+        if replace_disables_browser {
+            self.interrupt_all_browser_replays_before_shutdown();
+        }
         let removed_ai_tabs: Vec<String> = self
             .state
             .ai_tabs()
@@ -7200,6 +7230,8 @@ impl NativeShell {
 
         self.state.config = config;
         self.state.mark_dirty();
+        let browser_gateway_diagnostic = self.reconcile_browser_gateway();
+        self.sync_browser_host_visibility(None);
 
         for tab_id in removed_ai_tabs {
             let _ = self
@@ -7216,6 +7248,7 @@ impl NativeShell {
                 .close_ssh_session(&mut self.state, &tab_id);
             self.state.remove_tab(&tab_id);
         }
+        self.sync_browser_host_visibility(None);
 
         self.synced_session_id = None;
         self.last_dimensions = None;
@@ -7230,7 +7263,10 @@ impl NativeShell {
             ConfigImportMode::Merge => "Imported config with merge",
             ConfigImportMode::Replace => "Replaced config from import",
         };
-        self.editor_notice = Some(format!("{mode_label}: {}", source_path.display()));
+        self.editor_notice = Some(match browser_gateway_diagnostic {
+            Some(diagnostic) => format!("{mode_label}: {}\n{diagnostic}", source_path.display()),
+            None => format!("{mode_label}: {}", source_path.display()),
+        });
         cx.notify();
     }
 
@@ -8691,7 +8727,11 @@ impl NativeShell {
         settings.shell_integration_enabled = draft.shell_integration_enabled;
         settings.terminal_mouse_override = draft.terminal_mouse_override;
         settings.terminal_read_only = draft.terminal_read_only;
-        apply_browser_enabled_preference(&mut settings, draft.browser_enabled);
+        let next_browser_enabled = draft.browser_enabled;
+        if self.state.settings().browser_enabled && !next_browser_enabled {
+            self.interrupt_all_browser_replays_before_shutdown();
+        }
+        apply_browser_enabled_preference(&mut settings, next_browser_enabled);
 
         self.state.update_settings(settings);
         let browser_gateway_diagnostic = self.reconcile_browser_gateway();
@@ -17091,7 +17131,6 @@ fn validate_browser_pane_action_before_replay_interrupt(
     snapshot: &BrowserWorkspaceSnapshot,
     address_draft: &str,
     action: &BrowserPaneAction,
-    prompt_active: bool,
     mut interrupt_then_retire: impl FnMut(),
 ) -> Result<BrowserActionPlan, BrowserError> {
     let plan = browser_action_plan(
@@ -17100,7 +17139,7 @@ fn validate_browser_pane_action_before_replay_interrupt(
         address_draft,
         action.clone(),
     )?;
-    let interrupts_prompt_replay = match action {
+    let interrupts_active_replay = match action {
         BrowserPaneAction::SelectTab(_) => !plan.commands.is_empty(),
         BrowserPaneAction::Collapse
         | BrowserPaneAction::CreateTab
@@ -17109,13 +17148,24 @@ fn validate_browser_pane_action_before_replay_interrupt(
         | BrowserPaneAction::Reload
         | BrowserPaneAction::FocusAddress
         | BrowserPaneAction::SubmitAddress
+        | BrowserPaneAction::SetViewport(_)
+        | BrowserPaneAction::ToggleAnnotation
         | BrowserPaneAction::StartRecording => true,
         _ => false,
     };
-    if prompt_active && interrupts_prompt_replay {
+    if interrupts_active_replay {
         interrupt_then_retire();
     }
     Ok(plan)
+}
+
+fn route_browser_request_for_active_workspace(
+    active_workspace: Option<&BrowserWorkspaceKey>,
+    request: BrowserCommandRequest,
+    dispatch_open: impl FnOnce(BrowserCommandRequest),
+) -> Result<(), BrowserError> {
+    let route_is_open = active_workspace == Some(request.workspace_key());
+    route_browser_request(route_is_open, request, dispatch_open)
 }
 
 #[cfg(test)]
@@ -19234,7 +19284,6 @@ mod tests {
                 &snapshot,
                 "",
                 &action,
-                true,
                 || {
                     boundary_called = true;
                     bridge.interrupt_workspace(&workspace_key);
@@ -19268,7 +19317,6 @@ mod tests {
             &snapshot,
             "",
             &BrowserPaneAction::SelectTab("tab-b".to_string()),
-            true,
             || {
                 bridge.interrupt_workspace(&workspace_key);
                 status_before_retirement =
@@ -19289,6 +19337,389 @@ mod tests {
             Some(BrowserReplayStatus::Cancelled)
         );
         assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn host_barriers_publish_queued_input_before_priority_lifecycle_dispatch() {
+        let source = include_str!("mod.rs");
+        let dispatch_start = source.find("fn dispatch_browser_command(").unwrap();
+        let dispatch_end = source[dispatch_start..]
+            .find("fn synchronize_browser_response(")
+            .map(|offset| dispatch_start + offset)
+            .unwrap();
+        let dispatch = &source[dispatch_start..dispatch_end];
+        let dispatch_publish = dispatch.find("publish_pending_user_input_cutoffs").unwrap();
+        let dispatch_lifecycle = dispatch.find("for request in lifecycle_requests").unwrap();
+        assert!(dispatch_publish < dispatch_lifecycle);
+
+        let barrier_start = source
+            .find("fn with_browser_host_control_barrier<R>(")
+            .unwrap();
+        let barrier_end = source[barrier_start..]
+            .find("fn browser_pane_context(")
+            .map(|offset| barrier_start + offset)
+            .unwrap();
+        let barrier = &source[barrier_start..barrier_end];
+        let barrier_publish = barrier.find("publish_pending_user_input_cutoffs").unwrap();
+        let barrier_lifecycle = barrier.find("for request in lifecycle_requests").unwrap();
+        let enter_host = barrier.find("enter_host(browser_host)").unwrap();
+        assert!(barrier_publish < barrier_lifecycle && barrier_lifecycle < enter_host);
+    }
+
+    #[test]
+    fn valid_conflicting_pane_controls_cancel_running_replays_even_without_a_secret_prompt() {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeViewport, BrowserTabSnapshot, BrowserViewport,
+            BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        fn running_replay(
+            workspace_key: &BrowserWorkspaceKey,
+            recipe_id: &str,
+        ) -> (
+            BrowserCommandBridge,
+            crate::browser::BrowserReplayCoordinator,
+            crate::browser::BrowserReplayStart,
+        ) {
+            let (bridge, _inbox) = browser_command_channel(4);
+            let coordinator = bridge.replay_coordinator();
+            let started = coordinator
+                .start(
+                    workspace_key.clone(),
+                    compile_browser_replay(
+                        &BrowserRecipeV1 {
+                            schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                            id: recipe_id.to_string(),
+                            name: "Running pane replay".to_string(),
+                            description: "Pane interruption fixture".to_string(),
+                            start_url: "https://example.test".to_string(),
+                            viewport: BrowserRecipeViewport::default(),
+                            inputs: Vec::new(),
+                            steps: vec![BrowserRecipeStep {
+                                id: "reload".to_string(),
+                                action: BrowserRecipeAction::Reload,
+                                wait: None,
+                                assertions: Vec::new(),
+                            }],
+                        },
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            coordinator.begin(&started.instance).unwrap();
+            (bridge, coordinator, started)
+        }
+
+        let workspace_key = BrowserWorkspaceKey::new("pane-project", "pane-conversation").unwrap();
+        let snapshot = BrowserWorkspaceSnapshot {
+            pane_open: true,
+            tabs: vec![
+                BrowserTabSnapshot {
+                    id: "tab-a".to_string(),
+                    title: "A".to_string(),
+                    url: "https://a.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+                BrowserTabSnapshot {
+                    id: "tab-b".to_string(),
+                    title: "B".to_string(),
+                    url: "https://b.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+            ],
+            selected_tab_id: Some("tab-a".to_string()),
+            ..BrowserWorkspaceSnapshot::default()
+        };
+
+        for (recipe_id, address, action) in [
+            ("running-collapse", "", BrowserPaneAction::Collapse),
+            (
+                "running-select-tab",
+                "",
+                BrowserPaneAction::SelectTab("tab-b".to_string()),
+            ),
+            (
+                "running-navigate",
+                "https://next.test/path",
+                BrowserPaneAction::SubmitAddress,
+            ),
+            ("running-back", "", BrowserPaneAction::Back),
+            (
+                "running-viewport",
+                "",
+                BrowserPaneAction::SetViewport(crate::browser::BrowserViewportPreset::Mobile),
+            ),
+            (
+                "running-annotation",
+                "",
+                BrowserPaneAction::ToggleAnnotation,
+            ),
+        ] {
+            let (bridge, coordinator, started) = running_replay(&workspace_key, recipe_id);
+            let mut boundary_called = false;
+            let plan = validate_browser_pane_action_before_replay_interrupt(
+                &workspace_key,
+                &snapshot,
+                address,
+                &action,
+                || {
+                    boundary_called = true;
+                    bridge.interrupt_workspace(&workspace_key);
+                },
+            )
+            .unwrap();
+
+            assert!(!plan.commands.is_empty(), "{recipe_id}");
+            assert!(boundary_called, "{recipe_id}");
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                BrowserReplayStatus::Cancelled,
+                "{recipe_id}"
+            );
+        }
+
+        for (recipe_id, address, action, expect_error) in [
+            (
+                "invalid-unknown-tab",
+                "",
+                BrowserPaneAction::SelectTab("missing-tab".to_string()),
+                true,
+            ),
+            (
+                "noop-selected-tab",
+                "",
+                BrowserPaneAction::SelectTab("tab-a".to_string()),
+                false,
+            ),
+            (
+                "invalid-blank-address",
+                "   ",
+                BrowserPaneAction::SubmitAddress,
+                true,
+            ),
+        ] {
+            let (bridge, coordinator, started) = running_replay(&workspace_key, recipe_id);
+            let mut boundary_called = false;
+            let result = validate_browser_pane_action_before_replay_interrupt(
+                &workspace_key,
+                &snapshot,
+                address,
+                &action,
+                || {
+                    boundary_called = true;
+                    bridge.interrupt_workspace(&workspace_key);
+                },
+            );
+
+            assert_eq!(result.is_err(), expect_error, "{recipe_id}");
+            if let Ok(plan) = result {
+                assert!(plan.commands.is_empty(), "{recipe_id}");
+            }
+            assert!(!boundary_called, "{recipe_id}");
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                BrowserReplayStatus::Running,
+                "{recipe_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_loss_after_successful_validation_rejects_priority_lifecycle_dispatch() {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeViewport, BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let replay_plan = |id: &str| {
+            compile_browser_replay(
+                &BrowserRecipeV1 {
+                    schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                    id: id.to_string(),
+                    name: "Lifecycle route replay".to_string(),
+                    description: "Priority route admission fixture".to_string(),
+                    start_url: "https://example.test".to_string(),
+                    viewport: BrowserRecipeViewport::default(),
+                    inputs: Vec::new(),
+                    steps: vec![BrowserRecipeStep {
+                        id: "reload".to_string(),
+                        action: BrowserRecipeAction::Reload,
+                        wait: None,
+                        assertions: Vec::new(),
+                    }],
+                },
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let workspace_key =
+            BrowserWorkspaceKey::new("lifecycle-route-project", "conversation").unwrap();
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let coordinator = bridge.replay_coordinator();
+
+        let validating_controller = controller.clone();
+        let validation = tokio::spawn(async move {
+            validating_controller
+                .request_with_context(
+                    BrowserCommand::WorkspaceState,
+                    BrowserInvocationContext::agent(
+                        "validate lifecycle route",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let validation_request = inbox.recv().await.expect("workspace validation request");
+        validation_request.respond(Ok(BrowserResponse::WorkspaceState {
+            snapshot: BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        }));
+        assert!(matches!(
+            validation.await.unwrap(),
+            Ok(BrowserResponse::WorkspaceState { .. })
+        ));
+
+        bridge.interrupt_workspace(&workspace_key);
+        let replay = coordinator
+            .start(workspace_key.clone(), replay_plan("inactive-route"))
+            .unwrap();
+        coordinator.begin(&replay.instance).unwrap();
+        let retained_controller = controller.clone();
+        let retained = tokio::spawn(async move {
+            retained_controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        let retained_request = inbox.recv().await.expect("retained tab request");
+        assert!(retained_request.cancellation_is_current());
+        let close_controller = controller.clone();
+        let close = tokio::spawn(async move {
+            close_controller
+                .request(BrowserCommand::CloseTab {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.pending_work_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("priority lifecycle request must enqueue");
+        assert_eq!(
+            coordinator.status(&replay.instance).unwrap().status,
+            BrowserReplayStatus::Running,
+            "an unadmitted lifecycle request cannot cancel a newer inactive-route replay"
+        );
+        assert!(
+            retained_request.cancellation_is_current(),
+            "route-rejected lifecycle work cannot advance tab cancellation epochs"
+        );
+        let (_controls, mut lifecycle_requests) =
+            bridge.with_locked_host_work(|controls, requests| (controls, requests));
+        assert_eq!(lifecycle_requests.len(), 1);
+        let request = lifecycle_requests.pop().unwrap();
+        let mut host_mutated = false;
+        let error = route_browser_request_for_active_workspace(None, request, |_| {
+            host_mutated = true;
+        })
+        .expect_err("lost route must reject the priority lifecycle request");
+
+        assert!(!host_mutated, "CloseTab must not reach the browser host");
+        assert_eq!(close.await.unwrap(), Err(error));
+        assert_eq!(
+            coordinator.status(&replay.instance).unwrap().status,
+            BrowserReplayStatus::Running
+        );
+        assert!(retained_request.cancellation_is_current());
+        retained_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(retained.await.unwrap(), Ok(BrowserResponse::Acknowledged));
+
+        coordinator.cancel(&replay.instance).unwrap();
+        let active_replay = coordinator
+            .start(workspace_key.clone(), replay_plan("active-route"))
+            .unwrap();
+        coordinator.begin(&active_replay.instance).unwrap();
+        let active_close_controller = controller.clone();
+        let active_close = tokio::spawn(async move {
+            active_close_controller
+                .request_with_context(
+                    BrowserCommand::CloseTab {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "direct agent close outside replay execution",
+                        BrowserRisk::Destructive,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.pending_work_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active lifecycle request must enqueue");
+        let (_controls, mut active_requests) =
+            bridge.with_locked_host_work(|controls, requests| (controls, requests));
+        let active_request = active_requests.pop().expect("active lifecycle request");
+        let mut active_host_mutated = false;
+        route_browser_request_for_active_workspace(
+            Some(&workspace_key),
+            active_request,
+            |request| {
+                assert_eq!(
+                    coordinator.status(&active_replay.instance).unwrap().status,
+                    BrowserReplayStatus::Cancelled,
+                    "valid lifecycle cancellation must precede host mutation"
+                );
+                assert!(request.cancellation_is_current());
+                active_host_mutated = true;
+                request.respond(Ok(BrowserResponse::Acknowledged));
+            },
+        )
+        .unwrap();
+        assert!(active_host_mutated);
+        assert_eq!(
+            active_close.await.unwrap(),
+            Ok(BrowserResponse::Acknowledged)
+        );
+    }
+
+    #[test]
+    fn ordinary_settings_disable_interrupts_all_browser_work_before_config_assignment() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let start = source
+            .find("fn apply_settings_draft(")
+            .expect("settings application helper");
+        let end = source[start..]
+            .find("fn save_editor_action(")
+            .map(|offset| start + offset)
+            .expect("settings helper boundary");
+        let apply = &source[start..end];
+        let interrupt = apply
+            .find("self.interrupt_all_browser_replays_before_shutdown()")
+            .expect("ordinary settings disable must interrupt local browser work");
+        let preference = apply
+            .find("apply_browser_enabled_preference(&mut settings, next_browser_enabled)")
+            .expect("browser preference assignment");
+        let assignment = apply
+            .find("self.state.update_settings(settings)")
+            .expect("settings state assignment");
+
+        assert!(interrupt < preference);
+        assert!(preference < assignment);
     }
 
     #[test]
@@ -19366,7 +19797,6 @@ mod tests {
             &snapshot,
             "   ",
             &BrowserPaneAction::SubmitAddress,
-            prompt.is_some(),
             || {
                 boundary_called = true;
                 bridge.interrupt_workspace(&workspace_key);

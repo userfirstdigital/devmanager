@@ -265,6 +265,8 @@ impl BrowserWebViewHost {
 
     pub fn handle_control(&mut self, _control: BrowserHostControl) {}
 
+    pub(crate) fn interrupt_all_local_work(&mut self) {}
+
     pub(crate) fn handle_repair_highlight_cleanup(
         &mut self,
         _window: &gpui::Window,
@@ -307,6 +309,12 @@ impl BrowserWebViewHost {
 
     pub fn drain_events(&mut self) -> Vec<BrowserHostEvent> {
         Vec::new()
+    }
+
+    pub(crate) fn publish_pending_user_input_cutoffs(
+        &mut self,
+        _before_apply: impl FnMut(&BrowserHostEvent, &BrowserHostState),
+    ) {
     }
 
     pub fn drain_events_with_pre_apply_observer(

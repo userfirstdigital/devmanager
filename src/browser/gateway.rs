@@ -598,13 +598,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::browser::{
-        browser_command_channel, compile_browser_replay, BrowserCommand, BrowserError,
-        BrowserHostEvent, BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind,
-        BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
-        BrowserRecipeViewport, BrowserReplayLocatorSlot, BrowserReplayRepairResumeCursor,
-        BrowserReplaySecretError, BrowserReplaySecretPromptVault, BrowserReplayStatus,
-        BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
-        BrowserRevision, BrowserUserInputKind, BROWSER_RECIPE_SCHEMA_VERSION,
+        browser_command_channel, compile_browser_replay, route_browser_request, BrowserCommand,
+        BrowserError, BrowserHostEvent, BrowserRecipeAction, BrowserRecipeInput,
+        BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+        BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayLocatorSlot,
+        BrowserReplayRepairResumeCursor, BrowserReplaySecretError, BrowserReplaySecretPromptVault,
+        BrowserReplayStatus, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
+        BrowserResponse, BrowserRevision, BrowserUserInputKind, BROWSER_RECIPE_SCHEMA_VERSION,
     };
 
     fn provider_repair_plan(label: &str) -> crate::browser::BrowserReplayPlan {
@@ -1063,11 +1063,11 @@ mod tests {
                         .unwrap();
                 }
                 Boundary::DirectInput => {
-                    bridge.observe_host_event(&BrowserHostEvent::UserInput {
-                        workspace_key: key.clone(),
-                        tab_id: "runtime-tab".to_string(),
-                        kind: BrowserUserInputKind::Keyboard,
-                    });
+                    bridge.observe_host_event(&BrowserHostEvent::user_input(
+                        key.clone(),
+                        "runtime-tab",
+                        BrowserUserInputKind::Keyboard,
+                    ));
                 }
                 Boundary::SelectConversation
                 | Boundary::RestartServer
@@ -1077,6 +1077,26 @@ mod tests {
                 | Boundary::CloseConversation => bridge.interrupt_workspace(&key),
                 Boundary::DeleteProject => bridge.interrupt_project(&project_id),
                 Boundary::QuitApplication => bridge.interrupt_all(),
+            }
+
+            if matches!(
+                boundary,
+                Boundary::StopTab
+                    | Boundary::StopWorkspace
+                    | Boundary::LogicalTabClose
+                    | Boundary::ResetWorkspace
+                    | Boundary::ClearProject
+            ) {
+                let lifecycle_request =
+                    bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
+                        assert!(controls.is_empty());
+                        assert_eq!(lifecycle_requests.len(), 1);
+                        lifecycle_requests.remove(0)
+                    });
+                route_browser_request(true, lifecycle_request, |request| {
+                    request.respond(Ok(BrowserResponse::Acknowledged));
+                })
+                .unwrap();
             }
 
             assert_eq!(

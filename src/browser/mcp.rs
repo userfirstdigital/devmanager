@@ -909,6 +909,17 @@ impl BrowserMcpServer {
                 .workflow
                 .verify_authenticated_root()
                 .map_err(ToolFailure::from)?;
+            let replay_admission = if matches!(request.operation, BrowserWorkflowOperation::Replay)
+            {
+                Some(
+                    self.context
+                        .workflow
+                        .capture_replay_admission()
+                        .map_err(ToolFailure::from)?,
+                )
+            } else {
+                None
+            };
             self.validate_and_ensure(&context).await?;
             match request.operation {
                 BrowserWorkflowOperation::List => {
@@ -958,7 +969,11 @@ impl BrowserMcpServer {
                     let replay = self
                         .context
                         .workflow
-                        .replay(recipe_id, inputs)
+                        .replay(
+                            recipe_id,
+                            inputs,
+                            replay_admission.expect("replay captured route admission"),
+                        )
                         .map_err(ToolFailure::from)?;
                     Ok(browser_workflow_payload(request.operation, replay, None))
                 }

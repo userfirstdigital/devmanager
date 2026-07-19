@@ -862,6 +862,73 @@ async fn browser_provider_loss_boundaries_cancel_exact_replay_before_late_contro
     }
 }
 
+#[tokio::test]
+async fn disabling_browser_for_a_retained_workspace_revokes_registration_and_fences_hidden_replay()
+{
+    let key = workspace("import-retained-project", "import-retained-conversation");
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge.clone()).expect("start gateway");
+    let registrar = gateway.registrar();
+    let registration = registrar
+        .register(
+            "retained-ai-process",
+            key.clone(),
+            BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        )
+        .expect("register retained workspace");
+    let stale_token = registration.access().bearer_token_for_launch().to_string();
+    let coordinator = bridge.replay_coordinator();
+    let started = install_gateway_secret_replay(&bridge, &key, "replace-import-disable");
+
+    let controller = bridge.bind(key.clone(), Duration::from_secs(1));
+    let pending = tokio::spawn(async move {
+        controller
+            .request(BrowserCommand::Reload {
+                tab_id: "runtime-tab".to_string(),
+            })
+            .await
+    });
+    let retained = inbox
+        .recv()
+        .await
+        .expect("retained request before Browser disable");
+
+    // The replace-import transaction must execute these in this order: first
+    // terminalize replay/UI authority, then assign disabled config, then let
+    // gateway reconciliation revoke every provider registration.
+    bridge.interrupt_all();
+    registrar.revoke_all();
+
+    assert_eq!(registrar.active_registration_count(), 0);
+    assert_eq!(
+        coordinator.status(&started.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+    assert!(matches!(
+        started.execution.secret_lease("password"),
+        Err(BrowserReplaySecretError::ClosedStore)
+    ));
+    retained.respond(Ok(BrowserResponse::Acknowledged));
+    assert_eq!(
+        pending.await.unwrap(),
+        Err(devmanager::browser::BrowserError::Interrupted)
+    );
+    assert!(coordinator.active_state(&key).is_none());
+
+    let host = format!("127.0.0.1:{}", gateway.port());
+    let stale = raw_mcp_request(
+        gateway.port(),
+        &host,
+        Some(&format!("Bearer {stale_token}")),
+        "/mcp",
+        initialize_body(),
+    );
+    assert_eq!(status_code(&stale), 401, "{stale}");
+}
+
 #[test]
 fn gateway_registration_rejects_post_start_trust_root_swap_without_outside_writes() {
     let config = unique_gateway_config_dir("root-swap");

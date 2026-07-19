@@ -717,10 +717,37 @@ fn windows_host_uses_a_private_active_only_recording_channel_and_fences_view_lif
             "missing Windows host seam: {required}"
         );
     }
+    let publish_start = windows
+        .find("pub(crate) fn publish_pending_user_input_cutoffs(")
+        .expect("trusted input cutoff publication seam");
+    let publish_end = windows[publish_start..]
+        .find("\n    fn publish_collected_user_input_cutoffs(")
+        .map(|offset| publish_start + offset)
+        .expect("cutoff publication helper seam");
+    let publish = &windows[publish_start..publish_end];
     assert!(
-        windows.find("self.pump_page_recording_ipc()")
-            < windows.find("self.event_receiver.try_iter()"),
-        "semantic reservations must be made before generic input revision events drain"
+        publish.find("collect_queued_host_events").unwrap()
+            < publish
+                .find("publish_collected_user_input_cutoffs")
+                .unwrap()
+            && publish
+                .find("publish_collected_user_input_cutoffs")
+                .unwrap()
+                < publish.find("pump_page_recording_ipc").unwrap(),
+        "trusted input cutoffs must publish before recording IPC mutates workflow state"
+    );
+    let collect_start = windows
+        .find("fn collect_queued_host_events(")
+        .expect("raw host event collection seam");
+    let collect_end = windows[collect_start..]
+        .find("\n    fn pump_page_recording_ipc(")
+        .map(|offset| collect_start + offset)
+        .expect("recording ingestion seam");
+    let collect = &windows[collect_start..collect_end];
+    assert!(collect.contains("self.event_receiver.try_iter()"));
+    assert!(
+        !collect.contains("pump_page_recording_ipc"),
+        "raw host-event collection must remain mutation free"
     );
     assert!(
         !windows.contains("BrowserHostEvent::PageRecording"),

@@ -1216,7 +1216,8 @@ async fn checked_repair_capture_request(
         return Err(ReplayActionFailure::Terminal(projection));
     }
     let context = BrowserInvocationContext::for_actor(actor, intent, BrowserRisk::Normal)
-        .map_err(|_| ReplayActionFailure::StepFailed)?;
+        .map_err(|_| ReplayActionFailure::StepFailed)?
+        .with_interaction_epoch(execution.interaction_epoch());
     let response = controller
         .request_replay_repair_capture(coordinator, repair, command, context)
         .await;
@@ -1539,7 +1540,8 @@ async fn secret_semantic_action(
         "replay step secret type",
         BrowserRisk::AccountSecurity,
     )
-    .map_err(|_| ReplayActionFailure::StepFailed)?;
+    .map_err(|_| ReplayActionFailure::StepFailed)?
+    .with_interaction_epoch(execution.interaction_epoch());
     let response = controller
         .request_replay_secret_type(
             BrowserCommand::SecretType {
@@ -1697,8 +1699,29 @@ async fn checked_request_with_options(
     if let Some(projection) = terminal_projection(execution, coordinator, instance)? {
         return Err(ReplayActionFailure::Terminal(projection));
     }
-    let response =
-        request_with_options(controller, actor, intent, risk, local_project_root, command).await;
+    let response = if matches!(&command, BrowserCommand::CloseTab { .. }) {
+        let context = BrowserInvocationContext::for_actor(actor, intent, risk)
+            .map(|context| context.with_interaction_epoch(execution.interaction_epoch()));
+        match context {
+            Ok(context) => {
+                controller
+                    .request_replay_lifecycle_command(command, context, execution)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        request_with_options(
+            controller,
+            actor,
+            intent,
+            risk,
+            local_project_root,
+            execution.interaction_epoch(),
+            command,
+        )
+        .await
+    };
     if let Some(projection) = terminal_projection(execution, coordinator, instance)? {
         return Err(ReplayActionFailure::Terminal(projection));
     }
@@ -1851,9 +1874,11 @@ async fn request_with_options(
     intent: &'static str,
     risk: BrowserRisk,
     local_project_root: Option<&Path>,
+    interaction_epoch: u64,
     command: BrowserCommand,
 ) -> Result<BrowserResponse, BrowserError> {
-    let context = BrowserInvocationContext::for_actor(actor, intent, risk)?;
+    let context = BrowserInvocationContext::for_actor(actor, intent, risk)?
+        .with_interaction_epoch(interaction_epoch);
     match local_project_root {
         Some(root) => {
             controller

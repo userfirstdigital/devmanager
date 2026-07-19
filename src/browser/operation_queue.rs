@@ -161,6 +161,28 @@ impl<T> BrowserOperationQueue<T> {
         targets
     }
 
+    pub fn targets(&self) -> Vec<BrowserOperationTarget> {
+        let mut targets: Vec<_> = self
+            .active
+            .keys()
+            .chain(self.queued.keys())
+            .cloned()
+            .collect();
+        targets.sort_by(|left, right| {
+            left.workspace_key
+                .project_id
+                .cmp(&right.workspace_key.project_id)
+                .then_with(|| {
+                    left.workspace_key
+                        .ai_tab_id
+                        .cmp(&right.workspace_key.ai_tab_id)
+                })
+                .then_with(|| left.tab_id.cmp(&right.tab_id))
+        });
+        targets.dedup();
+        targets
+    }
+
     pub fn cancel_workspace(
         &mut self,
         workspace_key: &BrowserWorkspaceKey,

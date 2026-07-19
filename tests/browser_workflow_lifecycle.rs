@@ -1,8 +1,8 @@
 use devmanager::browser::{
-    browser_command_channel, compile_browser_replay, BrowserCommand, BrowserHostControl,
-    BrowserHostEvent, BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind,
-    BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
-    BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplaySecretError,
+    browser_command_channel, compile_browser_replay, route_browser_request, BrowserCommand,
+    BrowserHostControl, BrowserHostEvent, BrowserRecipeAction, BrowserRecipeInput,
+    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+    BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayCoordinator, BrowserReplaySecretError,
     BrowserReplaySecretPromptVault, BrowserReplayStatus, BrowserResponse, BrowserUserInputKind,
     BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
 };
@@ -191,11 +191,11 @@ async fn assert_boundary_terminalizes_before_late_response(boundary: LifecycleBo
                 .await
                 .unwrap();
         }
-        LifecycleBoundary::DirectInput => bridge.observe_host_event(&BrowserHostEvent::UserInput {
-            workspace_key: key.clone(),
-            tab_id: "runtime-tab".to_string(),
-            kind: BrowserUserInputKind::Keyboard,
-        }),
+        LifecycleBoundary::DirectInput => bridge.observe_host_event(&BrowserHostEvent::user_input(
+            key.clone(),
+            "runtime-tab",
+            BrowserUserInputKind::Keyboard,
+        )),
         LifecycleBoundary::SelectConversation
         | LifecycleBoundary::RestartServer
         | LifecycleBoundary::KillPortRestart
@@ -204,6 +204,25 @@ async fn assert_boundary_terminalizes_before_late_response(boundary: LifecycleBo
         | LifecycleBoundary::CloseConversation => bridge.interrupt_workspace(&key),
         LifecycleBoundary::DeleteProject => bridge.interrupt_project(&key.project_id),
         LifecycleBoundary::QuitApplication => bridge.interrupt_all(),
+    }
+
+    if matches!(
+        boundary,
+        LifecycleBoundary::StopTab
+            | LifecycleBoundary::StopWorkspace
+            | LifecycleBoundary::LogicalTabClose
+            | LifecycleBoundary::ResetWorkspace
+            | LifecycleBoundary::ClearProject
+    ) {
+        let lifecycle_request = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
+            assert!(controls.is_empty());
+            assert_eq!(lifecycle_requests.len(), 1);
+            lifecycle_requests.remove(0)
+        });
+        route_browser_request(true, lifecycle_request, |request| {
+            request.respond(Ok(BrowserResponse::Acknowledged));
+        })
+        .unwrap();
     }
 
     assert_cancelled(&coordinator, started.instance.id(), &key);
@@ -529,6 +548,178 @@ fn unknown_project_preflight_precedes_control_ownership_mutation() {
 }
 
 #[test]
+fn remote_host_state_transitions_interrupt_all_local_browser_work_before_replacement_or_restore() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let interruption = "self.interrupt_all_browser_replays_before_shutdown();";
+
+    let connect = source_section(
+        &app,
+        "fn apply_connected_remote_host(",
+        "fn begin_remote_reconnect(",
+    );
+    let body_start = connect
+        .find(") {")
+        .map(|offset| offset + ") {".len())
+        .expect("remote-connect function body");
+    assert!(
+        connect[body_start..].trim_start().starts_with(interruption),
+        "remote connect must interrupt every local browser replay as its first executable statement"
+    );
+    for mutation in [
+        "client.take_control()",
+        "self.local_state_backup",
+        "self.remote_mode",
+        "self.state = self.merge_remote_snapshot_into_state",
+    ] {
+        assert_before(connect, interruption, mutation);
+    }
+
+    let disconnect = source_section(
+        &app,
+        "fn disconnect_remote_host(",
+        "fn current_runtime_snapshot(",
+    );
+    assert_before(disconnect, interruption, "self.local_state_backup.take()");
+    assert_before(disconnect, interruption, "self.state = local_state");
+}
+
+#[test]
+fn browser_route_admission_requires_the_exact_active_visible_local_workspace() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let route = source_section(
+        &app,
+        "fn active_open_browser_route(",
+        "fn dispatch_browser_command(",
+    );
+
+    assert!(
+        route.contains("self.remote_mode.is_none()"),
+        "a matching remote snapshot must never admit the local browser route"
+    );
+    assert!(
+        route.contains("self.state.settings().browser_enabled"),
+        "disabled Browser settings must close every local route"
+    );
+    assert!(
+        route.contains("self.browser_host.status().available"),
+        "an unavailable native host must close every local route"
+    );
+    assert!(
+        route.contains("active_browser_workspace()") || route.contains("active_tab()"),
+        "route admission must use the selected conversation, not any open AI tab"
+    );
+    assert!(
+        route.contains("pane_open"),
+        "a collapsed pane must not admit hidden provider automation"
+    );
+
+    let dispatch = source_section(
+        &app,
+        "fn dispatch_browser_command(",
+        "fn synchronize_browser_response(",
+    );
+    assert_before(
+        dispatch,
+        "browser_route_is_open(workspace_key)",
+        "with_locked_host_work_for_command",
+    );
+    let async_route = source_section(
+        &app,
+        "fn handle_browser_request(",
+        "fn pump_browser_events(",
+    );
+    assert_before(
+        async_route,
+        "active_open_browser_route()",
+        "route_browser_request_for_active_workspace(",
+    );
+
+    assert_before(
+        dispatch,
+        "active_open_browser_route()",
+        "route_browser_request_for_active_workspace(",
+    );
+    let host_barrier = source_section(
+        &app,
+        "fn with_browser_host_control_barrier",
+        "fn browser_pane_context(",
+    );
+    assert_before(
+        host_barrier,
+        "active_open_browser_route()",
+        "route_browser_request_for_active_workspace(",
+    );
+
+    let mcp = include_str!("../src/browser/mcp.rs").replace("\r\n", "\n");
+    let workflow = source_section(
+        &mcp,
+        "async fn browser_workflow(",
+        "fn browser_workflow_status_payload(",
+    );
+    assert_before(
+        workflow,
+        "capture_replay_admission()",
+        "validate_and_ensure(&context).await",
+    );
+    assert_before(workflow, "validate_and_ensure(&context).await", ".replay(");
+}
+
+#[test]
+fn priority_lifecycle_enqueue_is_side_effect_free_until_strict_route_admission() {
+    let commands = include_str!("../src/browser/commands.rs").replace("\r\n", "\n");
+    let enqueue = source_section(
+        &commands,
+        "    fn enqueue_lifecycle_command(",
+        "#[allow(dead_code)]",
+    );
+    assert!(enqueue.contains("lifecycle_requests.push_back"));
+    assert!(
+        !enqueue.contains("apply_lifecycle_control("),
+        "enqueue must not cancel replays or advance epochs before route admission"
+    );
+
+    let route = source_section(
+        &commands,
+        "pub fn route_browser_request(",
+        "impl BrowserCommandRequest",
+    );
+    assert_before(
+        route,
+        "if !route_is_open",
+        "request.admit_lifecycle_control()",
+    );
+    assert_before(
+        route,
+        "request.admit_lifecycle_control()",
+        "dispatch_open(request)",
+    );
+}
+
+#[test]
+fn replace_import_disabling_browser_interrupts_before_assignment_then_reconciles_authority() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let imported = source_section(
+        &app,
+        "fn apply_imported_config(",
+        "fn check_for_updates_action(",
+    );
+    let interruption = "interrupt_all_browser_replays_before_shutdown";
+    let assignment = "self.state.config = config";
+
+    assert!(
+        imported.contains("ConfigImportMode::Replace") && imported.contains("browser_enabled"),
+        "replace import must classify the enabled-to-disabled Browser transition"
+    );
+    assert_before(imported, interruption, assignment);
+    assert_before(imported, assignment, "reconcile_browser_gateway()");
+    assert_before(
+        imported,
+        "reconcile_browser_gateway()",
+        "sync_browser_host_visibility(None)",
+    );
+}
+
+#[test]
 fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridge_first() {
     let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
     let process_manager = include_str!("../src/services/process_manager.rs").replace("\r\n", "\n");
@@ -589,7 +780,13 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
         "fn interrupt_all_browser_replays_before_shutdown(",
         "fn sync_browser_host_visibility(",
     );
-    assert!(shutdown_helper.contains("self.browser_bridge.interrupt_all()"));
+    assert!(shutdown_helper.contains("interrupt_all_with_host_cleanup"));
+    assert!(shutdown_helper.contains("self.browser_host.interrupt_all_local_work()"));
+    assert_before(
+        shutdown_helper,
+        "interrupt_all_with_host_cleanup",
+        "open_browser_workspace_keys()",
+    );
 
     let command_dispatch = source_section(
         &app,
@@ -992,6 +1189,15 @@ async fn browser_direct_input_and_each_lifecycle_command_cancel_before_late_work
         let controller = bridge.bind(key.clone(), Duration::from_secs(1));
 
         controller.notify(command).await.unwrap();
+        let lifecycle_request = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
+            assert!(controls.is_empty());
+            assert_eq!(lifecycle_requests.len(), 1);
+            lifecycle_requests.remove(0)
+        });
+        route_browser_request(true, lifecycle_request, |request| {
+            request.respond(Ok(BrowserResponse::Acknowledged));
+        })
+        .unwrap();
         assert_cancelled(&coordinator, started.instance.id(), &key);
     }
 
@@ -1005,11 +1211,11 @@ async fn browser_direct_input_and_each_lifecycle_command_cancel_before_late_work
     let isolated = coordinator
         .start(isolated_key, replay_plan("direct-input-isolated"))
         .unwrap();
-    bridge.observe_host_event(&BrowserHostEvent::UserInput {
-        workspace_key: key.clone(),
-        tab_id: "runtime-tab".to_string(),
-        kind: BrowserUserInputKind::Pointer,
-    });
+    bridge.observe_host_event(&BrowserHostEvent::user_input(
+        key.clone(),
+        "runtime-tab",
+        BrowserUserInputKind::Pointer,
+    ));
     assert_cancelled(&coordinator, started.instance.id(), &key);
     assert_eq!(
         coordinator.status(&isolated.instance).unwrap().status,
@@ -1073,5 +1279,95 @@ async fn browser_interrupt_all_cancels_every_replay_and_pending_request_without_
     assert_eq!(
         pending.await.unwrap(),
         Err(devmanager::browser::BrowserError::Interrupted)
+    );
+}
+
+#[tokio::test]
+async fn remote_mode_boundaries_cancel_local_secrets_late_work_and_hidden_replay_without_touching_remote_state(
+) {
+    let first = workspace("local-project-a", "first");
+    let second = workspace("local-project-b", "second");
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let coordinator = bridge.replay_coordinator();
+
+    let first_replay = coordinator
+        .start(first.clone(), secret_replay_plan("remote-connect-first"))
+        .unwrap();
+    install_secret(&coordinator, &first_replay);
+    let second_replay = coordinator
+        .start(second.clone(), secret_replay_plan("remote-connect-second"))
+        .unwrap();
+    install_secret(&coordinator, &second_replay);
+
+    let controller = bridge.bind(first.clone(), Duration::from_secs(1));
+    let pending = tokio::spawn(async move {
+        controller
+            .request(BrowserCommand::Reload {
+                tab_id: "runtime-tab".to_string(),
+            })
+            .await
+    });
+    let retained = inbox.recv().await.expect("retained local request");
+
+    let (remote_bridge, _remote_inbox) = browser_command_channel(1);
+    let remote_coordinator = remote_bridge.replay_coordinator();
+    let remote_key = workspace("remote-project", "remote-conversation");
+    let remote_replay = remote_coordinator
+        .start(remote_key, replay_plan("remote-isolated"))
+        .unwrap();
+    remote_coordinator.begin(&remote_replay.instance).unwrap();
+
+    // This is the shared-bridge operation the native connect boundary must
+    // execute before replacing local application state.
+    bridge.interrupt_all();
+    assert_cancelled(&coordinator, first_replay.instance.id(), &first);
+    assert_cancelled(&coordinator, second_replay.instance.id(), &second);
+    for replay in [&first_replay, &second_replay] {
+        assert!(matches!(
+            replay.execution.secret_lease("password"),
+            Err(BrowserReplaySecretError::ClosedStore)
+        ));
+    }
+    retained.respond(Ok(BrowserResponse::Acknowledged));
+    assert_eq!(
+        pending.await.unwrap(),
+        Err(devmanager::browser::BrowserError::Interrupted)
+    );
+    assert_eq!(
+        remote_coordinator
+            .status(&remote_replay.instance)
+            .unwrap()
+            .status,
+        BrowserReplayStatus::Running
+    );
+
+    // A stale local MCP registration could otherwise create this invisible
+    // prompt while the remote snapshot owns the UI.
+    let hidden = coordinator
+        .replace(
+            first.clone(),
+            secret_replay_plan("hidden-during-remote-mode"),
+        )
+        .unwrap();
+    assert_eq!(
+        hidden.projection.status,
+        BrowserReplayStatus::NeedsUserSecret
+    );
+
+    // Disconnect must cancel any such hidden work before restoring the saved
+    // local snapshot, so reconciliation cannot resurrect its secret prompt.
+    bridge.interrupt_all();
+    assert_cancelled(&coordinator, hidden.instance.id(), &first);
+    assert!(matches!(
+        hidden.execution.secret_lease("password"),
+        Err(BrowserReplaySecretError::ClosedStore)
+    ));
+    assert!(coordinator.active_state(&first).is_none());
+    assert_eq!(
+        remote_coordinator
+            .status(&remote_replay.instance)
+            .unwrap()
+            .status,
+        BrowserReplayStatus::Running
     );
 }

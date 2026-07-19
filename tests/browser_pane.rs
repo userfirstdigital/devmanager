@@ -351,7 +351,8 @@ fn native_shell_routes_mcp_requests_through_the_async_host_queue() {
         .expect("browser event pump should follow request handler");
     let handler = &source[start..end];
 
-    assert!(handler.contains("route_browser_request("));
+    assert!(handler.contains("self.active_open_browser_route()"));
+    assert!(handler.contains("route_browser_request_for_active_workspace("));
     assert!(handler.contains("browser_host.handle_request(window, request)"));
     assert!(handler.contains("with_browser_host_control_barrier"));
     assert!(!handler.contains("dispatch_browser_command"));
@@ -1084,11 +1085,8 @@ fn user_input_and_new_window_events_stay_in_the_matching_conversation() {
     let other = BrowserWorkspaceKey::new("project-a", "conversation-b").unwrap();
     let open = vec![active.clone(), other.clone()];
 
-    let user_input = BrowserHostEvent::UserInput {
-        workspace_key: active.clone(),
-        tab_id: "tab-a".to_string(),
-        kind: BrowserUserInputKind::Keyboard,
-    };
+    let user_input =
+        BrowserHostEvent::user_input(active.clone(), "tab-a", BrowserUserInputKind::Keyboard);
     assert_eq!(
         browser_event_plan(&open, &user_input),
         Some(BrowserPaneEventPlan::SyncSnapshot {

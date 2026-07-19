@@ -942,6 +942,81 @@ async fn production_request_router_rejects_closed_routes_without_dispatching() {
 }
 
 #[tokio::test]
+async fn closed_route_rejects_before_replay_state_exists_and_reopened_route_can_start_cleanly() {
+    let key = workspace("route-project", "route-conversation");
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let coordinator = bridge.replay_coordinator();
+
+    let closed_controller = bridge.bind(key.clone(), Duration::from_secs(1));
+    let closed = tokio::spawn(async move {
+        closed_controller
+            .request(BrowserCommand::WorkspaceState)
+            .await
+    });
+    let closed_request = inbox.recv().await.expect("closed route request");
+    let error = route_browser_request(false, closed_request, |_| {
+        panic!("collapsed or non-selected route dispatched")
+    })
+    .expect_err("closed route must reject before workflow replay admission");
+    assert_eq!(closed.await.unwrap(), Err(error));
+    assert!(
+        coordinator.active_state(&key).is_none(),
+        "route rejection must leave no hidden replay or secret-prompt residue"
+    );
+
+    let reopened_controller = bridge.bind(key.clone(), Duration::from_secs(1));
+    let reopened = tokio::spawn(async move {
+        reopened_controller
+            .request(BrowserCommand::WorkspaceState)
+            .await
+    });
+    let reopened_request = inbox.recv().await.expect("reopened route request");
+    route_browser_request(true, reopened_request, |request| {
+        request.respond(Ok(BrowserResponse::WorkspaceState {
+            snapshot: BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        }));
+    })
+    .expect("the exact active visible route dispatches");
+    assert!(matches!(
+        reopened.await.unwrap(),
+        Ok(BrowserResponse::WorkspaceState { .. })
+    ));
+
+    let started = coordinator
+        .start(
+            key,
+            compile_browser_replay(
+                &BrowserRecipeV1 {
+                    schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                    id: "route-reopened-replay".to_string(),
+                    name: "Route reopened replay".to_string(),
+                    description: "Route admission residue fixture".to_string(),
+                    start_url: "https://example.test".to_string(),
+                    viewport: BrowserRecipeViewport::default(),
+                    inputs: Vec::new(),
+                    steps: vec![BrowserRecipeStep {
+                        id: "reload".to_string(),
+                        action: BrowserRecipeAction::Reload,
+                        wait: None,
+                        assertions: Vec::new(),
+                    }],
+                },
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    coordinator.begin(&started.instance).unwrap();
+    assert_eq!(
+        coordinator.status(&started.instance).unwrap().status,
+        BrowserReplayStatus::Running
+    );
+}
+
+#[tokio::test]
 async fn controller_timeout_also_bounds_a_saturated_inbox() {
     let key = workspace("project-a", "conversation-a");
     let (bridge, _inbox) = browser_command_channel(1);
@@ -1120,10 +1195,6 @@ async fn stop_and_user_input_interrupt_outstanding_tab_operations() {
         })
         .await
         .expect("queue stop");
-    assert_eq!(
-        stopped_task.await.expect("stopped task"),
-        Err(BrowserError::Interrupted)
-    );
     let stop_request = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
         assert!(controls.is_empty());
         assert_eq!(lifecycle_requests.len(), 1);
@@ -1135,7 +1206,14 @@ async fn stop_and_user_input_interrupt_outstanding_tab_operations() {
             tab_id: Some("tab-a".to_string()),
         }
     );
-    stop_request.respond(Ok(BrowserResponse::Acknowledged));
+    route_browser_request(true, stop_request, |request| {
+        request.respond(Ok(BrowserResponse::Acknowledged));
+    })
+    .unwrap();
+    assert_eq!(
+        stopped_task.await.expect("stopped task"),
+        Err(BrowserError::Interrupted)
+    );
 
     let user_interrupted_task = tokio::spawn({
         let controller = controller.clone();
@@ -1234,6 +1312,17 @@ async fn clear_profile_invalidates_buffered_project_envelopes_but_not_later_requ
         .notify(BrowserCommand::ClearProjectProfile)
         .await
         .unwrap();
+    let clear = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
+        assert!(controls.is_empty());
+        assert_eq!(lifecycle_requests.len(), 1);
+        lifecycle_requests.remove(0)
+    });
+    assert_eq!(clear.command(), &BrowserCommand::ClearProjectProfile);
+    assert!(clear.cancellation_is_current());
+    route_browser_request(true, clear, |request| {
+        request.respond(Ok(BrowserResponse::Acknowledged));
+    })
+    .unwrap();
     let fresh = tokio::spawn({
         let second = second.clone();
         async move {
@@ -1251,15 +1340,6 @@ async fn clear_profile_invalidates_buffered_project_envelopes_but_not_later_requ
                 .await
         }
     });
-
-    let clear = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
-        assert!(controls.is_empty());
-        assert_eq!(lifecycle_requests.len(), 1);
-        lifecycle_requests.remove(0)
-    });
-    assert_eq!(clear.command(), &BrowserCommand::ClearProjectProfile);
-    assert!(clear.cancellation_is_current());
-    clear.respond(Ok(BrowserResponse::Acknowledged));
     let fresh_request = inbox
         .recv()
         .await
@@ -1690,11 +1770,11 @@ async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     });
     let _request = inbox.recv().await.expect("reload request");
 
-    bridge.observe_host_event(&BrowserHostEvent::UserInput {
-        workspace_key: key,
-        tab_id: "tab-a".to_string(),
-        kind: BrowserUserInputKind::Keyboard,
-    });
+    bridge.observe_host_event(&BrowserHostEvent::user_input(
+        key,
+        "tab-a",
+        BrowserUserInputKind::Keyboard,
+    ));
     assert_eq!(
         request_task.await.expect("interrupted request"),
         Err(BrowserError::Interrupted)
@@ -2079,11 +2159,7 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
             state: BrowserPageLoadState::Finished,
             url: "https://example.test".to_string(),
         },
-        BrowserHostEvent::UserInput {
-            workspace_key: key.clone(),
-            tab_id: "tab-a".to_string(),
-            kind: BrowserUserInputKind::Pointer,
-        },
+        BrowserHostEvent::user_input(key.clone(), "tab-a", BrowserUserInputKind::Pointer),
         BrowserHostEvent::NewWindow {
             workspace_key: key.clone(),
             tab_id: "tab-a".to_string(),

@@ -64,7 +64,7 @@ pub use commands::{
 };
 pub(crate) use commands::{
     validate_direct_repair_preview_command, validate_direct_secret_command,
-    verified_authenticated_local_project_root, BrowserRegistrationLease,
+    verified_authenticated_local_project_root, BrowserRegistrationLease, BrowserReplayAdmission,
     BrowserReplayRepairCleanupWork,
 };
 pub use downloads::{

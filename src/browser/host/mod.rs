@@ -580,6 +580,16 @@ impl BrowserHostState {
         self.workspaces.get(workspace_key)
     }
 
+    pub(crate) fn workspace_keys(&self) -> Vec<BrowserWorkspaceKey> {
+        let mut keys = self.workspaces.keys().cloned().collect::<Vec<_>>();
+        keys.sort_by(|left, right| {
+            left.project_id
+                .cmp(&right.project_id)
+                .then_with(|| left.ai_tab_id.cmp(&right.ai_tab_id))
+        });
+        keys
+    }
+
     fn workspace_mut(
         &mut self,
         workspace_key: &BrowserWorkspaceKey,
