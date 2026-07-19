@@ -2148,6 +2148,32 @@ impl BrowserReplayCoordinator {
         )
     }
 
+    pub(crate) fn fail_nonterminal(
+        &self,
+        instance: &BrowserReplayInstance,
+        failure: BrowserReplayFailureCode,
+    ) -> Result<BrowserReplayProjection, BrowserReplayError> {
+        let mut state = self.lock();
+        {
+            let active = Self::exact_active_mut(&mut state, instance)?;
+            if !matches!(
+                active.projection.status,
+                BrowserReplayStatus::Pending
+                    | BrowserReplayStatus::Running
+                    | BrowserReplayStatus::NeedsUserSecret
+                    | BrowserReplayStatus::PausedLocatorRepair
+            ) {
+                return Err(BrowserReplayError::InvalidTransition);
+            }
+        }
+        Self::terminalize(
+            &mut state,
+            instance,
+            BrowserReplayStatus::Failed,
+            Some(failure),
+        )
+    }
+
     pub fn cancel(
         &self,
         instance: &BrowserReplayInstance,

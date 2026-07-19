@@ -1360,6 +1360,10 @@ impl BrowserController {
         &self.workspace_key
     }
 
+    pub(crate) fn replay_coordinator(&self) -> BrowserReplayCoordinator {
+        self.replay_coordinator.clone()
+    }
+
     pub fn pending_work_count(&self) -> usize {
         self.pending_work.count()
     }
@@ -1515,6 +1519,27 @@ impl BrowserController {
         candidate: BrowserReplayRepairCandidate,
         actor: BrowserInvocationActor,
     ) -> Result<super::BrowserReplayRepairProjection, BrowserError> {
+        let context = BrowserInvocationContext::for_actor(
+            actor,
+            "preview replay repair locator",
+            BrowserRisk::Normal,
+        )
+        .map_err(|_| invalid_repair_preview_sidecar())?;
+        self.request_replay_repair_preview_with_context(coordinator, repair, candidate, context)
+            .await
+    }
+
+    pub(crate) async fn request_replay_repair_preview_with_context(
+        &self,
+        coordinator: &BrowserReplayCoordinator,
+        repair: &BrowserReplayRepairInstance,
+        candidate: BrowserReplayRepairCandidate,
+        context: BrowserInvocationContext,
+    ) -> Result<super::BrowserReplayRepairProjection, BrowserError> {
+        context
+            .validate()
+            .map_err(|_| invalid_repair_preview_sidecar())?;
+        let actor = context.actor;
         if !matches!(
             actor,
             BrowserInvocationActor::User | BrowserInvocationActor::Agent
@@ -1526,12 +1551,6 @@ impl BrowserController {
             .host_controls
             .try_admit_repair_cleanup()
             .ok_or(BrowserError::ResourceRootBusy)?;
-        let context = BrowserInvocationContext::for_actor(
-            actor,
-            "preview replay repair locator",
-            BrowserRisk::Normal,
-        )
-        .map_err(|_| invalid_repair_preview_sidecar())?;
         let (authority, receipt): (
             BrowserReplayRepairPreviewAuthority,
             BrowserReplayRepairPreviewReceipt,
@@ -3616,7 +3635,7 @@ mod secure_command_tests {
 
     #[cfg(target_os = "windows")]
     #[tokio::test]
-    async fn repair_preview_uses_fixed_context_and_superseded_install_cannot_block_new_preview() {
+    async fn repair_preview_wrapper_is_fixed_and_context_entry_preserves_mcp_invocation() {
         let root = std::env::temp_dir().join(format!(
             "devmanager-repair-preview-command-{}",
             std::process::id()
@@ -3723,6 +3742,47 @@ mod secure_command_tests {
         b_request.respond(Ok(BrowserResponse::Acknowledged));
         assert_eq!(
             b_task.await.unwrap().unwrap().phase,
+            crate::browser::BrowserReplayRepairPhase::Previewed
+        );
+
+        let context_controller = controller.clone();
+        let context_coordinator = coordinator.clone();
+        let context_repair = repair.clone();
+        let context_task = tokio::spawn(async move {
+            context_controller
+                .request_replay_repair_preview_with_context(
+                    &context_coordinator,
+                    &context_repair,
+                    repair_preview_candidate("context-preserved"),
+                    BrowserInvocationContext::agent(
+                        "preview the exact candidate selected by the workflow caller",
+                        BrowserRisk::PermissionChange,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let context_request = inbox.recv().await.expect("context preview marker");
+        assert_eq!(
+            context_request.context().actor,
+            BrowserInvocationActor::Agent
+        );
+        assert_eq!(
+            context_request.context().intent,
+            "preview the exact candidate selected by the workflow caller"
+        );
+        assert_eq!(
+            context_request.context().declared_risk,
+            BrowserRisk::PermissionChange
+        );
+        let context_authority = context_request
+            .repair_preview_highlight_authority()
+            .expect("context preview authority")
+            .clone();
+        assert!(context_authority.acknowledge_for_test());
+        context_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(
+            context_task.await.unwrap().unwrap().phase,
             crate::browser::BrowserReplayRepairPhase::Previewed
         );
 

@@ -24,6 +24,7 @@ mod replay_repair;
 mod replay_secrets;
 mod resources;
 mod storage;
+mod workflow_mcp;
 
 pub(crate) use annotations::redacted_browser_annotation;
 pub use annotations::{
@@ -170,3 +171,11 @@ pub use resources::{
     BrowserResourceKind, BrowserResourceLimits, BrowserResourceMetadata, BrowserResourceStore,
 };
 pub use storage::BrowserStorageLayout;
+pub use workflow_mcp::{
+    get_browser_workflow_recipe, list_browser_workflow_recipes, BrowserWorkflowRecipeGet,
+    BrowserWorkflowRecipeInputSummary, BrowserWorkflowRecipeSummary,
+};
+pub(crate) use workflow_mcp::{
+    BrowserWorkflowMcpService, BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus,
+    BrowserWorkflowServiceError,
+};

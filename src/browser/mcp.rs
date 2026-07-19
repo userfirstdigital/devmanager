@@ -2,9 +2,12 @@ use super::{
     classify_upload_path, effective_browser_risk, resource_id_from_uri,
     verified_authenticated_local_project_root, BrowserAction, BrowserActionTarget,
     BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation, BrowserController,
-    BrowserDownloadOperation, BrowserError, BrowserInvocationContext, BrowserNetworkOperation,
-    BrowserPerformanceOperation, BrowserRecordingOperation, BrowserResourceStore, BrowserResponse,
-    BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
+    BrowserDownloadOperation, BrowserElementRef, BrowserError, BrowserInvocationContext,
+    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserRecipeInputKind,
+    BrowserRecordingOperation, BrowserReplayProjection, BrowserReplayPublicInput,
+    BrowserReplayRepairProjection, BrowserResourceStore, BrowserResponse, BrowserRisk,
+    BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition, BrowserWorkflowMcpService,
+    BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus, BrowserWorkflowServiceError,
     BrowserWorkspaceSnapshot,
 };
 use base64::Engine as _;
@@ -85,6 +88,95 @@ struct BrowserRecordingRequestWire {
 #[derive(Debug)]
 struct BrowserRecordingRequest {
     parsed: Result<BrowserRecordingRequestWire, String>,
+}
+
+impl From<BrowserWorkflowPublicInputKind> for BrowserRecipeInputKind {
+    fn from(value: BrowserWorkflowPublicInputKind) -> Self {
+        match value {
+            BrowserWorkflowPublicInputKind::Text => Self::Text,
+            BrowserWorkflowPublicInputKind::Url => Self::Url,
+            BrowserWorkflowPublicInputKind::File => Self::File,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename_all = "camelCase")]
+enum BrowserWorkflowOperation {
+    List,
+    Get,
+    Replay,
+    Status,
+    Cancel,
+    RepairPreview,
+    RepairApply,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename_all = "camelCase")]
+enum BrowserWorkflowPublicInputKind {
+    Text,
+    Url,
+    File,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserWorkflowPublicInputWire {
+    #[schemars(length(max = 128))]
+    name: String,
+    kind: BrowserWorkflowPublicInputKind,
+    #[schemars(length(max = 65536))]
+    value: String,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserWorkflowRequestWire {
+    #[schemars(length(max = 1024))]
+    intent: String,
+    risk: BrowserMcpRisk,
+    operation: BrowserWorkflowOperation,
+    #[schemars(length(max = 128))]
+    recipe_id: Option<String>,
+    #[schemars(length(max = 64))]
+    inputs: Option<Vec<BrowserWorkflowPublicInputWire>>,
+    #[schemars(range(min = 1))]
+    replay_instance_id: Option<u64>,
+    #[schemars(range(min = 1))]
+    repair_id: Option<u64>,
+    candidate: Option<BrowserElementRef>,
+    confirm: Option<bool>,
+    resume: Option<bool>,
+}
+
+#[derive(Debug)]
+struct BrowserWorkflowRequest {
+    parsed: Result<BrowserWorkflowRequestWire, String>,
+}
+
+impl<'de> Deserialize<'de> for BrowserWorkflowRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Ok(Self {
+            parsed: serde_json::from_value(value).map_err(|error| error.to_string()),
+        })
+    }
+}
+
+impl rmcp::schemars::JsonSchema for BrowserWorkflowRequest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "BrowserWorkflowRequest".into()
+    }
+
+    fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        BrowserWorkflowRequestWire::json_schema(generator)
+    }
 }
 
 impl<'de> Deserialize<'de> for BrowserRecordingRequest {
@@ -272,6 +364,7 @@ struct BrowserMcpContext {
     first_use: Mutex<bool>,
     resource_store: BrowserResourceStore,
     project_root: PathBuf,
+    workflow: BrowserWorkflowMcpService,
 }
 
 #[derive(Clone)]
@@ -287,6 +380,11 @@ impl BrowserMcpServer {
         resource_store: BrowserResourceStore,
         project_root: PathBuf,
     ) -> Self {
+        let workflow = BrowserWorkflowMcpService::new(
+            controller.clone(),
+            resource_store.clone(),
+            project_root.clone(),
+        );
         Self {
             context: Arc::new(BrowserMcpContext {
                 controller,
@@ -295,6 +393,7 @@ impl BrowserMcpServer {
                 first_use: Mutex::new(false),
                 resource_store,
                 project_root,
+                workflow,
             }),
             tool_router: Self::tool_router(),
         }
@@ -737,6 +836,151 @@ impl BrowserMcpServer {
                 "resource": result.resource,
                 "overwroteExisting": result.overwrote_existing,
             }))
+        }
+        .await;
+        into_tool_result(result)
+    }
+
+    #[tool(
+        name = "browser_workflow",
+        description = "List, inspect, replay, cancel, or repair repository workflows in this conversation's DevManager browser pane."
+    )]
+    async fn browser_workflow(
+        &self,
+        Parameters(request): Parameters<BrowserWorkflowRequest>,
+    ) -> CallToolResult {
+        let result = async {
+            let request = request.parsed.map_err(|message| {
+                ToolFailure::invalid_request(format!(
+                    "malformed browser_workflow request: {message}"
+                ))
+            })?;
+            if request.intent.len() > MAX_BROWSER_MCP_INTENT_BYTES {
+                return Err(ToolFailure::invalid_request(
+                    "intent must be at most 1024 bytes",
+                ));
+            }
+            validate_browser_workflow_operation(&request)?;
+            let context = invocation_context(&request.intent, request.risk)?;
+            self.context
+                .workflow
+                .verify_authenticated_root()
+                .map_err(ToolFailure::from)?;
+            self.validate_and_ensure(&context).await?;
+            match request.operation {
+                BrowserWorkflowOperation::List => {
+                    let recipes = self.context.workflow.list().map_err(ToolFailure::from)?;
+                    Ok(json!({
+                        "ok": true,
+                        "version": 1,
+                        "operation": request.operation,
+                        "recipes": recipes,
+                    }))
+                }
+                BrowserWorkflowOperation::Get => {
+                    let recipe_id = request
+                        .recipe_id
+                        .as_deref()
+                        .expect("get validation requires recipeId");
+                    let result = self
+                        .context
+                        .workflow
+                        .get(recipe_id)
+                        .map_err(ToolFailure::from)?;
+                    Ok(json!({
+                        "ok": true,
+                        "version": 1,
+                        "operation": request.operation,
+                        "recipe": result.recipe,
+                        "resource": result.resource,
+                    }))
+                }
+                BrowserWorkflowOperation::Replay => {
+                    let recipe_id = request
+                        .recipe_id
+                        .as_deref()
+                        .expect("replay validation requires recipeId");
+                    let inputs = request
+                        .inputs
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|input| {
+                            BrowserReplayPublicInput::new(
+                                input.name,
+                                input.kind.into(),
+                                input.value,
+                            )
+                        })
+                        .collect();
+                    let replay = self
+                        .context
+                        .workflow
+                        .replay(recipe_id, inputs)
+                        .map_err(ToolFailure::from)?;
+                    Ok(browser_workflow_payload(request.operation, replay, None))
+                }
+                BrowserWorkflowOperation::Status => {
+                    let replay_instance_id = request
+                        .replay_instance_id
+                        .expect("status validation requires replayInstanceId");
+                    let status = self
+                        .context
+                        .workflow
+                        .status(replay_instance_id)
+                        .map_err(ToolFailure::from)?;
+                    Ok(browser_workflow_status_payload(request.operation, status))
+                }
+                BrowserWorkflowOperation::Cancel => {
+                    let replay_instance_id = request
+                        .replay_instance_id
+                        .expect("cancel validation requires replayInstanceId");
+                    let replay = self
+                        .context
+                        .workflow
+                        .cancel(replay_instance_id)
+                        .map_err(ToolFailure::from)?;
+                    Ok(browser_workflow_payload(request.operation, replay, None))
+                }
+                BrowserWorkflowOperation::RepairPreview => {
+                    let replay_instance_id = request
+                        .replay_instance_id
+                        .expect("repairPreview validation requires replayInstanceId");
+                    let repair_id = request
+                        .repair_id
+                        .expect("repairPreview validation requires repairId");
+                    let candidate = request
+                        .candidate
+                        .expect("repairPreview validation requires candidate");
+                    let status = self
+                        .context
+                        .workflow
+                        .repair_preview(replay_instance_id, repair_id, candidate, context)
+                        .await
+                        .map_err(ToolFailure::from)?;
+                    Ok(browser_workflow_status_payload(request.operation, status))
+                }
+                BrowserWorkflowOperation::RepairApply => {
+                    let replay_instance_id = request
+                        .replay_instance_id
+                        .expect("repairApply validation requires replayInstanceId");
+                    let repair_id = request
+                        .repair_id
+                        .expect("repairApply validation requires repairId");
+                    let confirmed = request
+                        .confirm
+                        .expect("repairApply validation requires confirm");
+                    let resume = request
+                        .resume
+                        .expect("repairApply validation requires resume");
+                    let result = self
+                        .context
+                        .workflow
+                        .repair_apply(replay_instance_id, repair_id, confirmed, resume, context)
+                        .await
+                        .map_err(ToolFailure::from)?;
+                    Ok(browser_workflow_apply_payload(request.operation, result))
+                }
+            }
         }
         .await;
         into_tool_result(result)
@@ -1204,6 +1448,46 @@ impl From<BrowserError> for ToolFailure {
     }
 }
 
+impl From<BrowserWorkflowServiceError> for ToolFailure {
+    fn from(error: BrowserWorkflowServiceError) -> Self {
+        let (code, message) = match error {
+            BrowserWorkflowServiceError::InvalidRequest => {
+                ("invalid_request", "browser workflow inputs are invalid")
+            }
+            BrowserWorkflowServiceError::InvalidRecipe => {
+                ("invalid_recipe", "browser workflow recipe is invalid")
+            }
+            BrowserWorkflowServiceError::MissingRecipe => {
+                ("missing_file", "browser workflow recipe was not found")
+            }
+            BrowserWorkflowServiceError::RepositoryUnavailable => (
+                "resource_root_unavailable",
+                "browser workflow repository is unavailable",
+            ),
+            BrowserWorkflowServiceError::ResourceUnavailable => (
+                "resource_root_unavailable",
+                "browser workflow resource is unavailable",
+            ),
+            BrowserWorkflowServiceError::StaleReference => {
+                ("stale_reference", "browser replay identity is stale")
+            }
+            BrowserWorkflowServiceError::InvalidState => (
+                "invalid_request",
+                "browser replay state does not allow this operation",
+            ),
+            BrowserWorkflowServiceError::InvalidProjectRoot => (
+                "invalid_request",
+                "authenticated local project root is unavailable",
+            ),
+            BrowserWorkflowServiceError::Browser(error) => return Self::from(error),
+        };
+        Self {
+            code,
+            message: message.to_string(),
+        }
+    }
+}
+
 fn into_tool_result(result: Result<Value, ToolFailure>) -> CallToolResult {
     match result {
         Ok(value) => CallToolResult::structured(value),
@@ -1215,6 +1499,72 @@ fn into_tool_result(result: Result<Value, ToolFailure>) -> CallToolResult {
             }
         })),
     }
+}
+
+fn browser_workflow_status_payload(
+    operation: BrowserWorkflowOperation,
+    status: BrowserWorkflowReplayStatus,
+) -> Value {
+    browser_workflow_payload(operation, status.replay, status.repair.as_ref())
+}
+
+fn browser_workflow_apply_payload(
+    operation: BrowserWorkflowOperation,
+    result: BrowserWorkflowRepairApplyResult,
+) -> Value {
+    json!({
+        "ok": true,
+        "version": 1,
+        "operation": operation,
+        "replay": compact_browser_replay(&result.replay),
+        "repair": compact_browser_repair(&result.repair),
+        "recipeWritten": result.recipe_written,
+    })
+}
+
+fn browser_workflow_payload(
+    operation: BrowserWorkflowOperation,
+    replay: BrowserReplayProjection,
+    repair: Option<&BrowserReplayRepairProjection>,
+) -> Value {
+    json!({
+        "ok": true,
+        "version": 1,
+        "operation": operation,
+        "replay": compact_browser_replay(&replay),
+        "repair": repair.map(compact_browser_repair),
+    })
+}
+
+fn compact_browser_replay(replay: &BrowserReplayProjection) -> Value {
+    json!({
+        "instanceId": replay.instance_id,
+        "recipeId": replay.recipe_id,
+        "status": replay.status,
+        "currentStepIndex": replay.current_step_index,
+        "totalSteps": replay.total_steps,
+        "currentStepId": replay.current_step_id,
+        "unresolvedSecretInputs": replay.unresolved_secret_inputs,
+        "failure": replay.failure,
+    })
+}
+
+fn compact_browser_repair(repair: &BrowserReplayRepairProjection) -> Value {
+    json!({
+        "replayInstanceId": repair.replay_instance_id,
+        "repairId": repair.repair_id,
+        "recipeId": repair.recipe_id,
+        "stepId": repair.step_id,
+        "stepIndex": repair.step_index,
+        "locatorSlot": repair.locator_slot,
+        "tabId": repair.tab_id,
+        "revision": repair.revision,
+        "resources": {
+            "snapshot": repair.snapshot,
+            "screenshot": repair.screenshot,
+        },
+        "phase": repair.phase,
+    })
 }
 
 fn require_response(
@@ -1238,6 +1588,103 @@ fn required_nonblank(value: Option<String>, field: &str) -> Result<String, ToolF
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ToolFailure::invalid_request(format!("{field} is required")))
+}
+
+fn validate_browser_workflow_operation(
+    request: &BrowserWorkflowRequestWire,
+) -> Result<(), ToolFailure> {
+    if let Some(inputs) = &request.inputs {
+        if inputs.len() > 64 {
+            return Err(ToolFailure::invalid_request(
+                "inputs must contain at most 64 items",
+            ));
+        }
+        for input in inputs {
+            if input.name.trim().is_empty() || input.name.len() > 128 {
+                return Err(ToolFailure::invalid_request(
+                    "workflow input name is invalid",
+                ));
+            }
+            let max_bytes = match input.kind {
+                BrowserWorkflowPublicInputKind::Text => 65_536,
+                BrowserWorkflowPublicInputKind::Url => 8_192,
+                BrowserWorkflowPublicInputKind::File => 32_768,
+            };
+            if input.value.len() > max_bytes {
+                return Err(ToolFailure::invalid_request(
+                    "workflow input value is too large",
+                ));
+            }
+        }
+    }
+
+    let recipe_id = request
+        .recipe_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && value.len() <= 128);
+    let positive_replay_id = request.replay_instance_id.filter(|id| *id != 0);
+    let positive_repair_id = request.repair_id.filter(|id| *id != 0);
+    let no_recipe = request.recipe_id.is_none();
+    let no_inputs = request.inputs.is_none();
+    let no_replay = request.replay_instance_id.is_none();
+    let no_repair = request.repair_id.is_none();
+    let no_candidate = request.candidate.is_none();
+    let no_confirm = request.confirm.is_none();
+    let no_resume = request.resume.is_none();
+
+    let valid = match request.operation {
+        BrowserWorkflowOperation::List => {
+            no_recipe
+                && no_inputs
+                && no_replay
+                && no_repair
+                && no_candidate
+                && no_confirm
+                && no_resume
+        }
+        BrowserWorkflowOperation::Get => {
+            recipe_id.is_some()
+                && no_inputs
+                && no_replay
+                && no_repair
+                && no_candidate
+                && no_confirm
+                && no_resume
+        }
+        BrowserWorkflowOperation::Replay => {
+            recipe_id.is_some() && no_replay && no_repair && no_candidate && no_confirm && no_resume
+        }
+        BrowserWorkflowOperation::Status | BrowserWorkflowOperation::Cancel => {
+            no_recipe
+                && no_inputs
+                && positive_replay_id.is_some()
+                && no_repair
+                && no_candidate
+                && no_confirm
+                && no_resume
+        }
+        BrowserWorkflowOperation::RepairPreview => {
+            no_recipe
+                && no_inputs
+                && positive_replay_id.is_some()
+                && positive_repair_id.is_some()
+                && request.candidate.is_some()
+                && no_confirm
+                && no_resume
+        }
+        BrowserWorkflowOperation::RepairApply => {
+            no_recipe
+                && no_inputs
+                && positive_replay_id.is_some()
+                && positive_repair_id.is_some()
+                && no_candidate
+                && request.confirm == Some(true)
+                && request.resume.is_some()
+        }
+    };
+    valid.then_some(()).ok_or_else(|| {
+        ToolFailure::invalid_request("workflow operation fields do not match the operation")
+    })
 }
 
 fn invocation_context(

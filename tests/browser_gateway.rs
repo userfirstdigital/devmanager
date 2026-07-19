@@ -1,16 +1,18 @@
 use base64::Engine as _;
 use devmanager::browser::{
     browser_command_channel, browser_recording_review_result, browser_recording_status_result,
-    BrowserActionResult, BrowserAnnotation, BrowserCommand, BrowserCommandInbox,
+    save_recipe, BrowserActionResult, BrowserAnnotation, BrowserCommand, BrowserCommandInbox,
     BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostControl,
     BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
-    BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserRecipeInputKind,
-    BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingInputSummary,
-    BrowserRecordingOperation, BrowserRecordingResult, BrowserRecordingStatus,
-    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
-    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserSnapshotSummary,
-    BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
-    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserRecipeAction, BrowserRecipeInput,
+    BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+    BrowserRecipeValue, BrowserRecipeViewport, BrowserRecordingAction, BrowserRecordingActor,
+    BrowserRecordingInputSummary, BrowserRecordingOperation, BrowserRecordingResult,
+    BrowserRecordingStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
+    BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult,
+    BrowserViewport, BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -171,6 +173,91 @@ fn fixture_annotation(
     .expect("valid annotation fixture")
 }
 
+fn workflow_completion_recipe() -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "complete-flow".to_string(),
+        name: "Complete flow".to_string(),
+        description: "Complete through the real replay executor".to_string(),
+        start_url: "https://example.test/start".to_string(),
+        viewport: BrowserRecipeViewport {
+            width: 1280,
+            height: 720,
+            scale_percent: 100,
+        },
+        inputs: Vec::new(),
+        steps: vec![BrowserRecipeStep {
+            id: "capture".to_string(),
+            action: BrowserRecipeAction::Screenshot { full_page: false },
+            wait: None,
+            assertions: Vec::new(),
+        }],
+    }
+}
+
+fn workflow_secret_recipe() -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "secret-flow".to_string(),
+        name: "Secret flow".to_string(),
+        description: "Wait for a user-owned secret prompt".to_string(),
+        start_url: "https://example.test/secret".to_string(),
+        viewport: BrowserRecipeViewport {
+            width: 1280,
+            height: 720,
+            scale_percent: 100,
+        },
+        inputs: vec![BrowserRecipeInput {
+            name: "password".to_string(),
+            kind: BrowserRecipeInputKind::Secret,
+            default_value: None,
+        }],
+        steps: vec![BrowserRecipeStep {
+            id: "type-secret".to_string(),
+            action: BrowserRecipeAction::Type {
+                locator: BrowserRecipeLocator {
+                    test_id: Some("password".to_string()),
+                    ..BrowserRecipeLocator::default()
+                },
+                value: BrowserRecipeValue::Input {
+                    name: "password".to_string(),
+                },
+            },
+            wait: None,
+            assertions: Vec::new(),
+        }],
+    }
+}
+
+fn workflow_public_input_recipe() -> BrowserRecipeV1 {
+    let mut recipe = workflow_secret_recipe();
+    recipe.id = "public-input-flow".to_string();
+    recipe.name = "Public input flow".to_string();
+    recipe.inputs = vec![
+        BrowserRecipeInput {
+            name: "query".to_string(),
+            kind: BrowserRecipeInputKind::Text,
+            default_value: None,
+        },
+        BrowserRecipeInput {
+            name: "destination".to_string(),
+            kind: BrowserRecipeInputKind::Url,
+            default_value: Some("https://example.test/default".to_string()),
+        },
+        BrowserRecipeInput {
+            name: "upload".to_string(),
+            kind: BrowserRecipeInputKind::File,
+            default_value: None,
+        },
+        BrowserRecipeInput {
+            name: "password".to_string(),
+            kind: BrowserRecipeInputKind::Secret,
+            default_value: None,
+        },
+    ];
+    recipe
+}
+
 async fn run_fake_host(
     inbox: BrowserCommandInbox,
     commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>>,
@@ -310,6 +397,9 @@ async fn run_fake_host_with_state(
                 .map(|mutation| BrowserResponse::Workspace { mutation }),
             BrowserCommand::Navigate { tab_id, url } => host
                 .navigate_tab(&key, &tab_id, &url)
+                .map(|mutation| BrowserResponse::Workspace { mutation }),
+            BrowserCommand::UpdateViewport { tab_id, viewport } => host
+                .update_viewport(&key, &tab_id, viewport)
                 .map(|mutation| BrowserResponse::Workspace { mutation }),
             BrowserCommand::Back { .. }
             | BrowserCommand::Forward { .. }
@@ -1202,6 +1292,7 @@ async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
                 "browser_tabs",
                 "browser_upload",
                 "browser_wait",
+                "browser_workflow",
             ]
         );
         assert!(listed.tools.iter().all(|tool| {
@@ -1470,6 +1561,350 @@ async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
         let _ = client.cancel().await;
     };
     let (_, ()) = tokio::join!(run_fake_host(inbox, commands), scenario);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_workflow_is_registered_on_the_authenticated_gateway() {
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register(
+            "workflow-gateway-process",
+            workspace("workflow-gateway-project", "workflow-gateway-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register workflow gateway token");
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+            .auth_header(registration.access().bearer_token_for_launch()),
+    );
+    let client = ClientInfo::default()
+        .serve(transport)
+        .await
+        .expect("initialize workflow gateway client");
+
+    let listed = client.peer().list_tools(None).await.expect("list tools");
+    assert_eq!(
+        listed
+            .tools
+            .iter()
+            .filter(|tool| tool.name == "browser_workflow")
+            .count(),
+        1
+    );
+
+    client
+        .cancel()
+        .await
+        .expect("close workflow gateway client");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_workflow_replay_status_replacement_and_cancel_use_the_shared_coordinator() {
+    let project_root = unique_gateway_config_dir("workflow-replay-root");
+    std::fs::create_dir_all(&project_root).expect("create workflow replay project root");
+    let project_root = project_root.canonicalize().unwrap();
+    save_recipe(&project_root, &workflow_completion_recipe()).unwrap();
+    save_recipe(&project_root, &workflow_secret_recipe()).unwrap();
+    let (bridge, inbox) = browser_command_channel(32);
+    let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register_with_project_root(
+            "workflow-replay-process",
+            workspace("workflow-replay-project", "workflow-replay-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+            &project_root,
+        )
+        .expect("register workflow replay token");
+    let scenario = async move {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize workflow replay client");
+
+        let completed_start = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "run the completion workflow",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "complete-flow"
+                }))),
+            )
+            .await
+            .expect("start completion workflow");
+        assert_eq!(completed_start.is_error, Some(false));
+        let completed_start = completed_start.structured_content.unwrap();
+        let completed_id = completed_start["replay"]["instanceId"]
+            .as_u64()
+            .expect("numeric replay instance id");
+        assert!(completed_start.get("workspace").is_none());
+        assert!(completed_start["replay"].get("workspaceKey").is_none());
+
+        let mut completed = None;
+        for _ in 0..100 {
+            let status = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new("browser_workflow").with_arguments(arguments(
+                        json!({
+                            "intent": "inspect the exact completion replay",
+                            "risk": "normal",
+                            "operation": "status",
+                            "replayInstanceId": completed_id
+                        }),
+                    )),
+                )
+                .await
+                .expect("read completion replay status");
+            assert_eq!(status.is_error, Some(false));
+            let body = status.structured_content.unwrap();
+            if body["replay"]["status"] == "completed" {
+                completed = Some(body);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let completed = completed.expect("real replay completed through fake host queue");
+        assert_eq!(completed["replay"]["instanceId"], completed_id);
+        assert_eq!(completed["replay"]["currentStepIndex"], 1);
+        assert_eq!(completed["replay"]["totalSteps"], 1);
+
+        let first_secret = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "start the secret-gated workflow",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "secret-flow"
+                }))),
+            )
+            .await
+            .expect("start first secret workflow");
+        assert_eq!(first_secret.is_error, Some(false));
+        let first_secret = first_secret.structured_content.unwrap();
+        let first_secret_id = first_secret["replay"]["instanceId"].as_u64().unwrap();
+        assert_eq!(first_secret["replay"]["status"], "needsUserSecret");
+        assert_eq!(
+            first_secret["replay"]["unresolvedSecretInputs"],
+            json!(["password"])
+        );
+
+        let replacement = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "replace the exact secret-gated workflow",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "secret-flow"
+                }))),
+            )
+            .await
+            .expect("replace secret workflow");
+        assert_eq!(replacement.is_error, Some(false));
+        let replacement = replacement.structured_content.unwrap();
+        let replacement_id = replacement["replay"]["instanceId"].as_u64().unwrap();
+        assert!(replacement_id > first_secret_id);
+
+        let old_status = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "inspect the replaced exact replay",
+                    "risk": "normal",
+                    "operation": "status",
+                    "replayInstanceId": first_secret_id
+                }))),
+            )
+            .await
+            .expect("read replaced replay status");
+        assert_eq!(old_status.is_error, Some(false));
+        assert_eq!(
+            old_status.structured_content.unwrap()["replay"]["status"],
+            "cancelled"
+        );
+
+        let cancelled = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "cancel the exact replacement replay",
+                    "risk": "normal",
+                    "operation": "cancel",
+                    "replayInstanceId": replacement_id
+                }))),
+            )
+            .await
+            .expect("cancel replacement replay");
+        assert_eq!(cancelled.is_error, Some(false));
+        assert_eq!(
+            cancelled.structured_content.unwrap()["replay"]["status"],
+            "cancelled"
+        );
+
+        let stale = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "inspect a stale replay",
+                    "risk": "normal",
+                    "operation": "status",
+                    "replayInstanceId": replacement_id + 999
+                }))),
+            )
+            .await
+            .expect("stale replay returns typed result");
+        assert_eq!(stale.is_error, Some(true));
+        assert_eq!(
+            stale.structured_content.unwrap()["error"]["code"],
+            "stale_reference"
+        );
+
+        client.cancel().await.expect("close workflow replay client");
+    };
+    tokio::join!(run_fake_host(inbox, commands), scenario);
+    std::fs::remove_dir_all(project_root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_workflow_replay_compiles_only_bounded_declared_public_inputs() {
+    let project_root = unique_gateway_config_dir("workflow-input-root");
+    std::fs::create_dir_all(&project_root).expect("create workflow input project root");
+    let project_root = project_root.canonicalize().unwrap();
+    save_recipe(&project_root, &workflow_public_input_recipe()).unwrap();
+    let (bridge, inbox) = browser_command_channel(32);
+    let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register_with_project_root(
+            "workflow-input-process",
+            workspace("workflow-input-project", "workflow-input-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+            &project_root,
+        )
+        .expect("register workflow input token");
+    let scenario = async move {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize workflow input client");
+
+        for inputs in [
+            json!([]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"unknown","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"first"},
+                {"name":"query","kind":"text","value":"second"},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"url","value":"https://example.test"},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"destination","kind":"url","value":"javascript:alert(1)"},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"upload","kind":"file","value":""}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"x".repeat(65_537)},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"upload","kind":"file","value":"fixture.txt"},
+                {"name":"password","kind":"secret","value":"must-not-enter-the-tool"}
+            ]),
+        ] {
+            let rejected = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new("browser_workflow").with_arguments(arguments(
+                        json!({
+                            "intent": "validate public workflow inputs",
+                            "risk": "normal",
+                            "operation": "replay",
+                            "recipeId": "public-input-flow",
+                            "inputs": inputs
+                        }),
+                    )),
+                )
+                .await
+                .expect("invalid workflow inputs return a typed result");
+            assert_eq!(rejected.is_error, Some(true));
+            assert_eq!(
+                rejected.structured_content.unwrap()["error"]["code"],
+                "invalid_request"
+            );
+        }
+
+        let valid = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "run with exact public workflow inputs",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "public-input-flow",
+                    "inputs": [
+                        {"name":"query","kind":"text","value":"hello"},
+                        {"name":"upload","kind":"file","value":"fixture.txt"}
+                    ]
+                }))),
+            )
+            .await
+            .expect("valid workflow inputs start replay");
+        assert_eq!(valid.is_error, Some(false));
+        let valid = valid.structured_content.unwrap();
+        assert_eq!(valid["replay"]["instanceId"], 1);
+        assert_eq!(valid["replay"]["status"], "needsUserSecret");
+        let safe_text = serde_json::to_string(&valid).unwrap();
+        assert!(!safe_text.contains("hello"));
+        assert!(!safe_text.contains("fixture.txt"));
+        assert!(!safe_text.contains("https://example.test/default"));
+        let replay_id = valid["replay"]["instanceId"].as_u64().unwrap();
+        let cancelled = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "cancel the public-input replay",
+                    "risk": "normal",
+                    "operation": "cancel",
+                    "replayInstanceId": replay_id
+                }))),
+            )
+            .await
+            .expect("cancel public-input replay");
+        assert_eq!(cancelled.is_error, Some(false));
+
+        client.cancel().await.expect("close workflow input client");
+    };
+    tokio::join!(run_fake_host(inbox, commands), scenario);
+    std::fs::remove_dir_all(project_root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

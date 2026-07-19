@@ -32,6 +32,7 @@ pub enum BrowserResourceKind {
     ConsoleLog,
     NetworkLog,
     WorkflowReview,
+    WorkflowRecipe,
     Other,
 }
 
