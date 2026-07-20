@@ -192,6 +192,8 @@ type CodexAdapterPreparer = Arc<dyn Fn(&str) -> Result<PreparedCodexAdapter, Str
 type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 type ProcessManagerBackgroundTestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type ProcessManagerDetachedWorkerTestHook = Arc<dyn Fn() + Send + Sync>;
 
 trait CodexFallbackTerminalOps: Send + Sync {
     fn terminate_and_reap(
@@ -246,6 +248,10 @@ pub(crate) struct ProcessManagerInner {
     handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
     #[cfg(test)]
     background_test_hook: RwLock<Option<ProcessManagerBackgroundTestHook>>,
+    #[cfg(test)]
+    auto_restart_worker_test_hook: RwLock<Option<ProcessManagerDetachedWorkerTestHook>>,
+    #[cfg(test)]
+    codex_fallback_worker_test_hook: RwLock<Option<ProcessManagerDetachedWorkerTestHook>>,
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +577,10 @@ impl ProcessManager {
             handle_lifecycle: handle_lifecycle.clone(),
             #[cfg(test)]
             background_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            auto_restart_worker_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            codex_fallback_worker_test_hook: RwLock::new(None),
         });
         let claude_overlay_owner = Arc::new(ClaudeOverlayOwner {
             inner: Arc::downgrade(&inner),
@@ -4414,41 +4424,26 @@ fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
             if inner.background_stop.load(Ordering::SeqCst) {
                 return;
             }
-            let queue = inner.op_queue.lock().ok().and_then(|queue| queue.upgrade());
-            if let Some(queue) = queue {
-                let op_id = next_op_id();
-                let _ = queue.submit(ProcessOp::StartServer {
-                    op_id,
-                    launch: launch_clone,
-                    dimensions: SessionDimensions::default(),
-                    activate: false,
-                    response: None,
-                });
-                return;
-            }
-            if let Err(error) =
-                spawn_server_session_with_inner(&inner, &launch_clone, SessionDimensions::default())
+            #[cfg(test)]
+            if let Some(hook) = inner
+                .auto_restart_worker_test_hook
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
             {
-                let mut changed = false;
-                if let Ok(mut runtime) = inner.runtime_state.write() {
-                    if let Some(session) = runtime.sessions.get_mut(&launch_clone.command_id) {
-                        let dirty_before = session.dirty_generation;
-                        session.status = SessionStatus::Failed;
-                        session.exit = Some(SessionExitState {
-                            code: None,
-                            signal: None,
-                            closed_by_user: false,
-                            summary: format!("Auto-restart failed: {error}"),
-                        });
-                        session.mark_dirty();
-                        changed = session.dirty_generation != dirty_before;
-                    }
-                }
-                if changed {
-                    bump_runtime_revision(&inner);
-                    emit_tracked_remote_runtime_snapshot(&inner, &launch_clone.command_id);
-                }
+                hook();
             }
+            let Ok(manager) = process_manager_from_inner(inner) else {
+                return;
+            };
+            let op_id = next_op_id();
+            let _ = manager.op_queue.submit(ProcessOp::StartServer {
+                op_id,
+                launch: launch_clone,
+                dimensions: SessionDimensions::default(),
+                activate: false,
+                response: None,
+            });
         });
     }
 }
@@ -5374,6 +5369,19 @@ fn schedule_codex_original_fallback(
         let Some(inner) = inner.upgrade() else {
             return;
         };
+        #[cfg(test)]
+        if let Some(hook) = inner
+            .codex_fallback_worker_test_hook
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
+        }
+        let Ok(manager) = process_manager_from_inner(inner) else {
+            return;
+        };
+        let inner = manager.inner.clone();
 
         let removed = {
             let mut registry = inner
@@ -5415,16 +5423,11 @@ fn schedule_codex_original_fallback(
             .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch, &environment));
         if fallback_result.is_err() {
             unbind_attachment_if_matches(&inner, attachment_binding.as_ref());
-            if let Ok(manager) = process_manager_from_inner(inner.clone()) {
-                manager.cleanup_browser_provider_session(&session_id);
-                manager.set_browser_diagnostic(
-                    &launch.tab_id,
-                    Some(
-                        "Browser tools unavailable because Codex fallback launch failed"
-                            .to_string(),
-                    ),
-                );
-            }
+            manager.cleanup_browser_provider_session(&session_id);
+            manager.set_browser_diagnostic(
+                &launch.tab_id,
+                Some("Browser tools unavailable because Codex fallback launch failed".to_string()),
+            );
         }
     });
 }
@@ -9138,6 +9141,184 @@ mod tests {
             inner.upgrade().is_none(),
             "the final internal manager handle must shut down and release workers"
         );
+    }
+
+    #[test]
+    fn detached_auto_restart_cannot_launch_after_final_manager_shutdown() {
+        let manager = ProcessManager::new();
+        stop_background_tasks_for_test(&manager);
+        manager.inner.background_stop.store(false, Ordering::SeqCst);
+
+        let launch = ServerLaunchSpec {
+            command_id: "shutdown-auto-restart".to_string(),
+            project_id: "project".to_string(),
+            cwd: std::env::current_dir().unwrap(),
+            program: "definitely-not-a-devmanager-server".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            auto_restart: true,
+            log_file_path: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            launch.command_id.clone(),
+            launch.cwd.clone(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Crashed;
+        session.configure_server(launch.clone());
+        manager.register_runtime_session(session);
+        manager
+            .inner
+            .restart_backoffs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                launch.command_id.clone(),
+                RestartBackoff {
+                    delay: Duration::ZERO,
+                    last_crash: Instant::now(),
+                },
+            );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        *manager
+            .inner
+            .auto_restart_worker_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            let _ = entered_tx.try_send(());
+            let _ = release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv();
+        }));
+
+        let runtime_state = manager.inner.runtime_state.clone();
+        let inner = Arc::downgrade(&manager.inner);
+        handle_auto_restart(&manager.inner);
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("auto-restart worker must reach the shutdown race barrier");
+
+        drop(manager);
+        release_tx.send(()).expect("release auto-restart worker");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            inner.upgrade().is_none(),
+            "rejected auto-restart worker must release the manager inner"
+        );
+        let runtime = runtime_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = runtime
+            .sessions
+            .get(&launch.command_id)
+            .expect("auto-restart runtime state");
+        assert_eq!(session.status, SessionStatus::Starting);
+        assert_eq!(session.pid, None);
+    }
+
+    #[test]
+    fn detached_codex_fallback_cannot_mutate_or_launch_after_final_manager_shutdown() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
+        }));
+        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
+        let steps = terminal_ops.steps.clone();
+        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
+        let removed_events = Arc::new(AtomicU64::new(0));
+        let observed_removed_events = removed_events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            if matches!(event, RemoteSessionEvent::CodexAdapterRemoved { .. }) {
+                observed_removed_events.fetch_add(1, Ordering::SeqCst);
+            }
+        })));
+
+        let session_id = "shutdown-codex-fallback";
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            session_id,
+            BrowserWorkspaceSnapshot::default(),
+        );
+        let broker = manager.browser_attachment_broker();
+        let original_binding = broker.binding(session_id).expect("initial browser binding");
+        let original_launch = launch.clone();
+        let environment = manager.prepare_codex_launch_for_session(&mut launch, session_id);
+        let identity = manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sessions
+            .get(session_id)
+            .expect("installed Codex adapter")
+            .identity()
+            .clone();
+        assert!(mark_codex_remote_command_injected(
+            &manager.inner,
+            session_id,
+            &identity,
+        ));
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        *manager
+            .inner
+            .codex_fallback_worker_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            let _ = entered_tx.try_send(());
+            let _ = release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv();
+        }));
+
+        let runtime_state = manager.inner.runtime_state.clone();
+        let inner = Arc::downgrade(&manager.inner);
+        schedule_codex_original_fallback(
+            manager.inner.clone(),
+            session_id.to_string(),
+            identity,
+            original_launch,
+            environment,
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Codex fallback worker must reach the shutdown race barrier");
+
+        drop(manager);
+        release_tx.send(()).expect("release Codex fallback worker");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            inner.upgrade().is_none(),
+            "rejected Codex fallback worker must release the manager inner"
+        );
+        assert!(steps.lock().unwrap().is_empty());
+        assert_eq!(removed_events.load(Ordering::SeqCst), 0);
+        assert_eq!(broker.binding(session_id), Some(original_binding));
+        assert!(!runtime_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sessions
+            .contains_key(session_id));
     }
 
     #[test]
