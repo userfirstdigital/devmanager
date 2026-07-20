@@ -1,5 +1,202 @@
 # Task 5C Report: Sequential checkpoints
 
+## Checkpoint 12: Exact workflow MCP, native lifecycle, and provider ownership
+
+### Status and scope
+
+Checkpoint 12 and its shutdown/security hardening are complete through `db8f08e`.
+The final independent review found 0 Critical, 0 Important, and 0 Minor findings,
+so the checkpoint is approved from the implementation and local-release-gate
+perspective. The recorded implementation lineage is:
+
+- `358e2b5` — unify replay lifecycle cancellation.
+- `b2a1674` — linearize responses and cancellation.
+- `93c3b5b` — avoid the reentrant event-barrier lock.
+- `4efa39b` — expose workflow replay through MCP.
+- `6013a04` — harden workflow MCP parsing.
+- `bb56f0e` — add native replay-repair controls.
+- `4405395` — cancel replay across native lifecycle transitions.
+- `b5ab77b` — harden lifecycle validation ordering.
+- `32ac723` — linearize workflow lifecycle authority.
+- `34b614b` — synchronize ProcessManager worker teardown.
+- `af3a523` — fence detached launch workers.
+- `fce1ddd` — harden detached-worker lifecycle test coverage.
+- `20c4821` — prove auto-restart completion before shutdown.
+- `8cbaedd` — avoid GPUI reentrancy while opening a WebView.
+- `8483061` — fence WebView retries and native window teardown.
+- `a2b7c0b` — preserve teardown liveness while a close is vetoed.
+- `f137a57` — make native teardown cancellation-aware.
+- `07cca1f` — defer cancellation of an in-progress native build.
+- `de332e5` — finish teardown outside the closing window-owned pump.
+- `4914bf0` — drain canceled window generations before reopening.
+- `7efb2cd` — bound authenticated MCP request bodies.
+- `a7e2f36` — bound workflow repository and locator inputs.
+- `db8f08e` — omit the test-only replay cursor from production state.
+
+The final evidence below belongs to `db8f08e` unless an earlier strict-TDD RED/GREEN
+point is named explicitly. Local Windows x64 release evidence is complete. Windows
+ARM64 and macOS ARM64 package jobs were not run locally, and exhaustive real-agent
+tool invocation is not inferred from the native companion-pane acceptance already
+performed.
+
+### Exact MCP and resource contract
+
+- One grouped `browser_workflow` tool exposes exactly `list`, `get`, `replay`,
+  `status`, `cancel`, `repairPreview`, and `repairApply`. Every request requires a
+  bounded nonblank `intent`; one exact `normal`, `financial`, `destructive`,
+  `accountSecurity`, `permissionChange`, `outsideWorkspaceFile`, or `osPermission`
+  risk; and rejects unknown members.
+- `list` accepts no operation fields; `get` accepts only `recipeId`; `replay`
+  accepts `recipeId` and optional public inputs; `status` and `cancel` accept only a
+  positive `replayInstanceId`; `repairPreview` requires positive replay/repair IDs
+  and a semantic candidate; `repairApply` requires positive replay/repair IDs,
+  `confirm: true`, and explicit `resume`, with no candidate.
+- `intent` is at most 1,024 bytes and `recipeId` at most 128 bytes. Public replay
+  values contain exactly `name`, `kind`, and `value` and accept only `text`, `url`,
+  and `file`, never `secret`. A request is bounded to 64 inputs, 128-byte nonblank
+  names, and runtime value limits of 65,536 text bytes, 8,192 URL bytes, and 32,768
+  file-path bytes. Repair candidates contain `revision`, a semantic `locator` with
+  accessibility-role/name, test-ID, and CSS-selector fallbacks, and optional
+  `backendNodeId`.
+- Every success contains `ok: true`, `version: 1`, and exact `operation`. `list`
+  adds sorted `recipes`; `get` adds `recipe` and `resource`; replay/status/cancel and
+  preview add `replay` plus current `repair` or `null`; apply adds `replay`, `repair`,
+  and `recipeWritten`.
+- Compact replay results expose only instance/recipe IDs, fixed status, step
+  position, unresolved Secret names, and fixed failure. Compact repair results
+  expose only exact replay/repair/recipe/step/tab/revision/slot metadata, fixed
+  phase, and snapshot/screenshot handles; apply adds `recipeWritten`. They do not
+  echo the workspace, canonical root, submitted values, Secret values, candidate,
+  selectors, page text, paths, or resource bodies.
+- `list` returns deterministic summaries. `get` returns a summary and an
+  owner-scoped `WorkflowRecipe` resource containing the full validated JSON.
+  Repair evidence remains in owner-scoped resources. Resource list/read repeats
+  live registration-lease checks, so stale or foreign-workspace access fails. Recipe
+  resources are unpinned and use the existing bounded oldest-first cleanup.
+- Replay status is one of `pending`, `running`, `needsUserSecret`,
+  `pausedLocatorRepair`, `completed`, `failed`, or `cancelled`; failure is
+  `stepFailed` or `assertionFailed`. Repair phase is `awaitingPreview`, `previewed`,
+  or `applied`. Locator slot is `primaryAction`, `optionalAction`, `dragSource`,
+  `dragDestination`, `actionWait`, `stepWait`, or indexed `assertion`. Failures use
+  the existing typed MCP envelope, including `stale_reference`, `invalid_request`,
+  `missing_file`, and `invalid_recipe`.
+
+### Bearer workspace and canonical-root binding
+
+- The shared gateway binds only `http://127.0.0.1:<random-port>/mcp`. Registration
+  creates a fresh random 32-byte/256-bit in-memory Bearer token bound to one process
+  session, exact `BrowserWorkspaceKey { project_id, ai_tab_id }`, registration
+  lease, and canonical local project root.
+- Dispatch requires the exact token and a `127.0.0.1` or `localhost` Host at the
+  gateway's exact port, and rechecks the lease around service execution. Missing,
+  malformed, stale, replaced, or cross-workspace credentials are unauthorized.
+- Every workflow filesystem/effect path revalidates the authenticated canonical
+  root. Remote/UNC roots, aliases, missing paths, and non-directories fail before
+  recipe access or browser effects. Callers cannot override workspace or root in
+  the workflow wire.
+
+### Native-only Secret handoff and repair flow
+
+- MCP may start a recipe containing Secret declarations and observe unresolved
+  names, but has neither a Secret public input kind nor a secret-submission
+  operation. NativeShell owns the only value-entry vault, uses
+  `Zeroizing<String>`, renders a constant mask and value-free `is_set` state, and
+  submits directly to the shared coordinator. Plaintext is absent from MCP,
+  resources, persisted/remote pane state, recording, journals, and debug output.
+  Canceling the prompt cancels the exact replay and clears the vault.
+- `repairPreview` requires the exact active replay/repair identity and current
+  evidence revision, then previews a semantic candidate through the existing
+  controller queue and journal. `repairApply` requires that exact preview and
+  `confirm: true`; Agent risk is raised to at least `destructive`. `resume: false`
+  saves only and `resume: true` saves and retries the failed phase.
+- The native pane owns equivalent **Select replacement**, **Save repair**, and
+  **Save and retry** controls. Exact identity/revision/root/recipe validation remains
+  active before and after the queued operation, and applied recipes report whether
+  a write occurred without exposing the candidate or selectors in the safe result.
+
+### Cancellation ownership matrix
+
+| Trigger | Exact ownership |
+| --- | --- |
+| MCP/native explicit Cancel | Replay instance |
+| Stop tab or close logical tab | Owning conversation workspace |
+| Stop workspace or reset workspace | Exact workspace |
+| Direct trusted user input | Exact workspace/tab and pending operation; older queued input cannot cancel a later replay admission |
+| Conversation or terminal-surface switch | Previous active workspace only |
+| Clear project profile or delete project | All project workspaces only |
+| Browser disable/configuration replacement | All local browser replays before gateway/host mutation |
+| Registration replacement/revocation or provider-process exit | Exact registered workspace/lease |
+| AI conversation restart/close | Exact provider workspace; replacement receives a new registration/token |
+| Shutdown, update, force quit, or local/remote transition | All local replay and pending browser authority before host/process mutation |
+
+All paths use the shared controller/replay authority. Cancellation clears volatile
+Secret state, repair evidence/highlights, and native replay UI and fences late host
+responses so they cannot advance the retired instance.
+
+### Provider, fallback, platform, and exclusions
+
+- Claude receives an ephemeral `--mcp-config` overlay with authorization sourced
+  from the child-only `DEVMANAGER_BROWSER_TOKEN`. Codex receives session-specific
+  `mcp_servers.devmanager_browser` URL, bearer-token environment variable,
+  `required=false`, and `default_tools_approval_mode="approve"`. Nothing changes
+  global user provider configuration, and token diagnostics are redacted.
+- Registration, overlay, adapter, bridge, gateway, or WebView failure cleans partial
+  ownership and launches the original Claude/Codex command with Browser unavailable;
+  terminal use remains functional.
+- Windows is functional through Wry/WebView2. Non-Windows, including the macOS ARM64
+  release target, compiles a typed unavailable adapter with no partial WebKit host.
+  The release matrix remains Windows x64 NSIS+WiX, Windows ARM64 NSIS, and macOS
+  ARM64 app+DMG; the macOS jobs prove compile/package compatibility, not Browser
+  functionality.
+- This checkpoint adds no whole-PC control, Playwright browser backend, Node
+  sidecar, external-Chrome mode, desktop-control surface, or second replay owner.
+  Recipe CDP markers remain fixed-method/empty-params/value-free markers and do not
+  become a raw CDP or JavaScript escape; this does not remove the separate trusted
+  project `browser_cdp` tool.
+
+### Final checkpoint-12 evidence
+
+- Test-only follow-up `20c4821` (`test(process): prove auto restart completion before
+  shutdown`): **complete**. Before its deterministic server-spawn seam, the
+  single-threaded locked all-target RED reached 765/766 library tests and failed only
+  when the new completion proof timed out.
+- Post-seam evidence: the exact focused proof and its repeated focused runs passed;
+  all four detached-worker races passed 4/4; ProcessManager passed 80/80;
+  `cargo fmt --all -- --check` and the source-diff check were green.
+- Fresh locked all-target test: **exit 0 in 618.1 seconds**, with 766/766 library
+  tests and every integration and example target green.
+- Final independent review of `de332e5..db8f08e`: **ready**, with 0 Critical,
+  0 Important, and 0 Minor findings. `git diff --check de332e5..db8f08e` passed.
+- Final-head `cargo fmt --all -- --check`: **passed**. Final-head
+  `cargo check --locked --all-targets -j1`: **passed in 101.7 seconds with no
+  warnings**.
+- Final-head `cargo test --locked --all-targets -j1 -- --test-threads=1`:
+  **exit 0 in 778.8 seconds**, with 788/788 library tests and every integration,
+  binary, and example target green.
+- `cargo build --release --locked -j1`: **exit 0 in 352.8 seconds**. The release
+  executable is 43,836,928 bytes with SHA-256
+  `3D005567239D106292625642F116FFFD39E8BBBEC398B22D4BA8F671D8E5C3C0`.
+- `cargo packager --release --formats nsis,wix`: **exit 0 in 35 seconds**. The x64
+  MSI is 17,809,408 bytes with SHA-256
+  `A80C82A041702FCB222F0E44BAB7F75714AEF625C12413B5AAB84A1B2CE46880`; the x64
+  NSIS setup is 13,649,949 bytes with SHA-256
+  `B3B7B3AE84EBF55EF263E5B9F69DFF39C12A0D28A9E5E2B5D9552A6160027083`.
+- The exact formerly stuck Quit-again/Quit-anyway browser-initialization path was
+  exercised with temporary instrumentation and the release candidate exited in
+  32 ms after its browser lease drained. A subsequent clean uninstrumented candidate
+  launched, but Windows Computer Use returned `foreground window did not report a
+  process id` on both the initial bind and the permitted refresh/retry; the isolated
+  PID was stopped and the installed DevManager process remained untouched. No clean
+  rerun result is inferred.
+- Earlier manual native acceptance demonstrated the split companion pane,
+  Claude/Codex launch and session injection, conversation isolation and restoration,
+  browser tabs, viewport controls, annotation capture, recording review, and
+  collapse/reopen. It did not demonstrate a real provider successfully invoking
+  every MCP tool, upload/download, next-prompt annotation consumption, or a complete
+  recipe replay/repair flow.
+- Windows ARM64 NSIS and macOS ARM64 app/DMG remain CI-matrix gates and were not run
+  locally. No cross-architecture package result is inferred from the x64 artifacts.
+
 ## Checkpoint 11: Current-revision preview, atomic locator apply, and same-step resume
 
 ### Status and scope
