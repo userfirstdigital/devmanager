@@ -249,4 +249,3 @@ Document exact RED/GREEN commands, counts, platform limits, and explicit checkpo
 - [ ] **Step 4: Freeze and review**
 
 Create `.superpowers/sdd/review-<base>..<head>.diff`, record byte size, SHA-256, and stable patch ID, verify a clean worktree, and stop for independent spec/quality review. Do not start locator repair until APPROVED.
-

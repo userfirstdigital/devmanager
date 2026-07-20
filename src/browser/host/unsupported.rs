@@ -1,19 +1,24 @@
+#[cfg(any(not(target_os = "windows"), test))]
+use super::super::BrowserCommandRequest;
 #[cfg(not(target_os = "windows"))]
 use super::super::{
     apply_browser_workflow_review_mutation, browser_workflow_review_projection,
     discard_browser_workflow_review, preview_browser_workflow_review, save_browser_workflow_review,
-    BrowserBounds, BrowserCommandRequest, BrowserHostControl, BrowserHostEvent,
-    BrowserPageRecordingIpcError, BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError,
-    BrowserRecordingInstance, BrowserRecordingReview, BrowserRecordingStatus,
+    BrowserBounds, BrowserHostControl, BrowserHostEvent, BrowserPageRecordingIpcError,
+    BrowserPaneSurface, BrowserRecipeV1, BrowserRecordingError, BrowserRecordingInstance,
+    BrowserRecordingReview, BrowserRecordingStatus, BrowserReplayRepairCleanupWork,
     BrowserWorkflowCoordinator, BrowserWorkflowReviewMutation, BrowserWorkflowReviewProjection,
     BrowserWorkspaceKey,
 };
 use super::super::{
-    validate_direct_secret_command, BrowserCommand, BrowserError, BrowserHostStatus,
-    BrowserResponse,
+    validate_direct_repair_preview_command, validate_direct_secret_command, BrowserCommand,
+    BrowserError, BrowserHostStatus, BrowserResponse,
 };
 #[cfg(not(target_os = "windows"))]
-use super::{BrowserHostState, BrowserWorkspaceSnapshot};
+use super::{
+    BrowserAppExitDisposition, BrowserHostState, BrowserNativeWindowLifetime,
+    BrowserWorkspaceSnapshot,
+};
 #[cfg(not(target_os = "windows"))]
 use crate::browser::BrowserAttachmentProjection;
 #[cfg(not(target_os = "windows"))]
@@ -36,6 +41,8 @@ pub fn unsupported_host_status(platform: impl Into<String>) -> BrowserHostStatus
 }
 
 pub fn unsupported_platform_error(platform: impl Into<String>) -> BrowserError {
+    // Locator failures can only be produced by the Windows host action boundary.
+    // Unsupported hosts must remain unavailable without attempting locator resolution.
     BrowserError::UnavailablePlatform {
         platform: platform.into(),
     }
@@ -46,6 +53,7 @@ pub fn unsupported_command_response(
     command: BrowserCommand,
 ) -> Result<BrowserResponse, BrowserError> {
     validate_direct_secret_command(&command)?;
+    validate_direct_repair_preview_command(&command)?;
     unsupported_validated_command_response(platform, command)
 }
 
@@ -63,12 +71,28 @@ pub(crate) fn unsupported_validated_command_response(
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
+pub(crate) fn unsupported_request_response(
+    platform: impl Into<String>,
+    request: &BrowserCommandRequest,
+) -> Result<BrowserResponse, BrowserError> {
+    request.validate_secret_sidecar()?;
+    request.validate_repair_retention_sidecar()?;
+    request.validate_repair_preview_sidecar()?;
+    request.validate_repair_apply_sidecar()?;
+    if !request.cancellation_is_current() {
+        return Err(BrowserError::Interrupted);
+    }
+    unsupported_validated_command_response(platform, request.command().clone())
+}
+
 #[cfg(not(target_os = "windows"))]
 pub struct BrowserWebViewHost {
     status: BrowserHostStatus,
     #[allow(dead_code)]
     state: BrowserHostState,
     workflow_coordinator: BrowserWorkflowCoordinator,
+    native_window_lifetime: BrowserNativeWindowLifetime,
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
@@ -79,6 +103,7 @@ impl BrowserWebViewHost {
             status: unsupported_host_status(std::env::consts::OS),
             state: BrowserHostState::new(app_config_dir),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
     }
@@ -93,12 +118,41 @@ impl BrowserWebViewHost {
             },
             state: BrowserHostState::new(PathBuf::new()),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
     }
 
     pub fn status(&self) -> BrowserHostStatus {
         self.status.clone()
+    }
+
+    pub fn attach_foreground_executor(&mut self, _executor: gpui::ForegroundExecutor) {}
+
+    pub(crate) fn window_lifetime_fence(&self) -> BrowserNativeWindowLifetime {
+        self.native_window_lifetime.clone()
+    }
+
+    pub(crate) fn begin_native_window_teardown(&mut self) -> BrowserAppExitDisposition {
+        self.native_window_lifetime.begin_teardown()
+    }
+
+    pub(crate) fn finish_native_window_teardown_cleanup(&mut self) {}
+
+    pub(crate) fn resume_native_window_after_canceled_teardown(&mut self) -> bool {
+        self.native_window_lifetime.resume_after_canceled_teardown()
+    }
+
+    pub(crate) fn native_window_teardown_ready(&self) -> bool {
+        self.native_window_lifetime.teardown_ready()
+    }
+
+    pub fn cancel_annotation_selection(
+        &mut self,
+        _workspace_key: &BrowserWorkspaceKey,
+        _tab_id: &str,
+    ) -> Result<(), BrowserError> {
+        Err(unsupported_platform_error(std::env::consts::OS))
     }
 
     pub fn trusted_app_config_dir(&self) -> Option<&Path> {
@@ -231,20 +285,20 @@ impl BrowserWebViewHost {
     }
 
     pub fn handle_request(&mut self, _window: &gpui::Window, request: BrowserCommandRequest) {
-        if let Err(error) = request.validate_secret_sidecar() {
-            request.respond(Err(error));
-            return;
-        }
-        if !request.cancellation_is_current() {
-            request.respond(Err(BrowserError::Interrupted));
-            return;
-        }
-        let result =
-            unsupported_validated_command_response(std::env::consts::OS, request.command().clone());
+        let result = unsupported_request_response(std::env::consts::OS, &request);
         request.respond(result);
     }
 
     pub fn handle_control(&mut self, _control: BrowserHostControl) {}
+
+    pub(crate) fn interrupt_all_local_work(&mut self) {}
+
+    pub(crate) fn handle_repair_highlight_cleanup(
+        &mut self,
+        _window: &gpui::Window,
+        _cleanup: BrowserReplayRepairCleanupWork,
+    ) {
+    }
 
     pub fn pump_async_completions(&mut self, _window: &gpui::Window) {}
 
@@ -280,6 +334,19 @@ impl BrowserWebViewHost {
     }
 
     pub fn drain_events(&mut self) -> Vec<BrowserHostEvent> {
+        Vec::new()
+    }
+
+    pub(crate) fn publish_pending_user_input_cutoffs(
+        &mut self,
+        _before_apply: impl FnMut(&BrowserHostEvent, &BrowserHostState),
+    ) {
+    }
+
+    pub fn drain_events_with_pre_apply_observer(
+        &mut self,
+        _before_apply: impl FnMut(&BrowserHostEvent, &BrowserHostState),
+    ) -> Vec<BrowserHostEvent> {
         Vec::new()
     }
 

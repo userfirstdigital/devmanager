@@ -1,9 +1,10 @@
 use devmanager::browser::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_command_channel,
-    browser_lifecycle_control, browser_operation_target_tab_id,
-    browser_request_preempts_operation_queue, browser_response_resource_ids,
-    browser_user_input_initialization_script, crop_annotation_png,
-    effective_browser_annotation_risk, parse_browser_annotation_ipc_message,
+    browser_lifecycle_control, browser_operation_target_tab_id, browser_pane_eligible,
+    browser_replay_repair_candidate_from_annotation, browser_request_preempts_operation_queue,
+    browser_response_resource_ids, browser_user_input_initialization_script,
+    compile_browser_replay, crop_annotation_png, effective_browser_annotation_risk,
+    effective_browser_secret_type_risk, parse_browser_annotation_ipc_message,
     parse_browser_page_ipc_message, prepare_verified_download_root, prepare_verified_profile_root,
     remove_verified_profile, route_browser_request, unique_download_path,
     unsupported_command_response, unsupported_host_status, unsupported_platform_error,
@@ -16,14 +17,16 @@ use devmanager::browser::{
     BrowserDownloadOperation, BrowserDownloadState, BrowserElementRef, BrowserError,
     BrowserHostControl, BrowserHostEvent, BrowserHostState, BrowserHostStatus,
     BrowserInvocationActor, BrowserInvocationContext, BrowserJournalActor, BrowserJournalEntry,
-    BrowserLocator, BrowserMemoryTarget, BrowserNetworkOperation, BrowserOperationQueue,
-    BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
-    BrowserPerformanceOperation, BrowserRecordingOperation, BrowserResourceId, BrowserResourceKind,
-    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
+    BrowserLocator, BrowserLocatorFailureTarget, BrowserMemoryTarget, BrowserNetworkOperation,
+    BrowserOperationQueue, BrowserOperationTarget, BrowserPageIpcMessage, BrowserPageLoadState,
+    BrowserPaneContext, BrowserPaneSurface, BrowserPerformanceOperation, BrowserRecipeAction,
+    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeViewport, BrowserRecordingOperation,
+    BrowserReplayStatus, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
+    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserRuntimeTarget,
     BrowserScreenshotMode, BrowserStorageLayout, BrowserTabSnapshot, BrowserUserInputKind,
     BrowserViewport, BrowserWaitCondition, BrowserWaitResult, BrowserWebViewHost,
     BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
-    MAX_BROWSER_JOURNAL_ENTRIES,
+    BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_JOURNAL_ENTRIES,
 };
 
 #[test]
@@ -137,6 +140,300 @@ fn unsupported_macos_rejects_every_recording_operation_with_the_typed_platform_e
             }),
         );
     }
+}
+
+#[test]
+fn unsupported_macos_has_no_webview_backend_or_functional_replay_pane() {
+    let source = include_str!("../src/browser/host/unsupported.rs").to_ascii_lowercase();
+    assert!(!source.contains("use wry"));
+    assert!(!source.contains("webview2"));
+    assert!(!source.contains("webviewbuilder"));
+
+    let context = BrowserPaneContext {
+        browser_enabled: true,
+        platform_supported: unsupported_host_status("macos").available,
+        active_surface: Some(BrowserPaneSurface::Claude),
+        editor_open: false,
+        modal_open: false,
+    };
+    assert!(!browser_pane_eligible(&context));
+
+    for command in [
+        BrowserCommand::Stop { tab_id: None },
+        BrowserCommand::ResetWorkspace,
+        BrowserCommand::ClearProjectProfile,
+    ] {
+        assert_eq!(
+            unsupported_command_response("macos", command),
+            Err(BrowserError::UnavailablePlatform {
+                platform: "macos".to_string(),
+            })
+        );
+    }
+}
+
+#[test]
+fn locator_failure_errors_are_typed_value_free_and_distinct_from_crashes() {
+    const LOCATOR_SENTINEL: &str = "DM_LOCATOR_SENTINEL_5A24D";
+    const PAGE_SENTINEL: &str = "DM_PAGE_SENTINEL_9C71E";
+
+    for target in [
+        BrowserLocatorFailureTarget::Primary,
+        BrowserLocatorFailureTarget::Source,
+        BrowserLocatorFailureTarget::Destination,
+    ] {
+        let error = BrowserError::LocatorNotFound { target };
+        let serialized = serde_json::to_string(&error).expect("serialize fixed locator failure");
+        let debug = format!("{error:?}");
+        assert!(serialized.contains("locatorNotFound"));
+        assert!(!serialized.contains(LOCATOR_SENTINEL));
+        assert!(!serialized.contains(PAGE_SENTINEL));
+        assert!(!debug.contains(LOCATOR_SENTINEL));
+        assert!(!debug.contains(PAGE_SENTINEL));
+    }
+
+    let crash = BrowserError::CrashedView {
+        message: "automation_failed".to_string(),
+    };
+    assert_ne!(
+        crash,
+        BrowserError::LocatorNotFound {
+            target: BrowserLocatorFailureTarget::Primary,
+        }
+    );
+}
+
+#[test]
+fn windows_injected_actions_return_only_fixed_missing_target_codes() {
+    let initialization = browser_user_input_initialization_script();
+    for code in [
+        "locator_primary_not_found",
+        "locator_source_not_found",
+        "locator_destination_not_found",
+    ] {
+        assert!(
+            initialization.contains(code),
+            "missing fixed injected locator code: {code}"
+        );
+    }
+
+    let windows = include_str!("../src/browser/host/windows.rs");
+    for contract in [
+        "BrowserLocatorFailureTarget::Primary",
+        "BrowserLocatorFailureTarget::Source",
+        "BrowserLocatorFailureTarget::Destination",
+        "ACTION_CALLBACK_LOCATOR_PRIMARY_NOT_FOUND",
+        "ACTION_CALLBACK_LOCATOR_SOURCE_NOT_FOUND",
+        "ACTION_CALLBACK_LOCATOR_DESTINATION_NOT_FOUND",
+    ] {
+        assert!(
+            windows.contains(contract),
+            "missing host mapping: {contract}"
+        );
+    }
+    assert!(windows.contains("ACTION_CALLBACK_AUTOMATION_FAILED"));
+    assert!(windows.contains("return \"automation_failed\";"));
+    assert!(
+        !windows.contains("return candidate;"),
+        "page-controlled exception text must never cross the action callback boundary"
+    );
+
+    let secret_start = windows
+        .find("fn complete_secret_type(")
+        .expect("secret completion");
+    let secret_end = windows[secret_start..]
+        .find("fn complete_console(")
+        .map(|offset| secret_start + offset)
+        .expect("next completion method");
+    let secret_completion = &windows[secret_start..secret_end];
+    assert!(secret_completion.contains("BrowserLocatorFailureTarget::Primary"));
+
+    let mcp = include_str!("../src/browser/mcp.rs");
+    assert!(mcp.contains("BrowserError::LocatorNotFound { .. } => \"locator_not_found\""));
+
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+    assert!(unsupported.contains("BrowserError::UnavailablePlatform"));
+}
+
+#[test]
+fn node_injected_actions_classify_primary_source_and_destination_without_locator_values() {
+    let harness = format!(
+        r##"
+const write = process.stdout.write.bind(process.stdout);
+class FakeElement {{
+  constructor(id) {{
+    this.id = id;
+    this.tagName = "INPUT";
+    this.isConnected = true;
+    this.attributes = {{ type: "text", autocomplete: "current-password" }};
+    const values = new Map();
+    this.style = {{
+      setProperty(name, value) {{ values.set(name, value); }},
+      getPropertyValue(name) {{ return values.get(name) || ""; }},
+      getPropertyPriority() {{ return ""; }},
+    }};
+  }}
+  getAttribute(name) {{ return this.attributes[name] || null; }}
+  click() {{}}
+  focus() {{}}
+  dispatchEvent() {{ return true; }}
+}}
+globalThis.Element = FakeElement;
+globalThis.CSS = {{ escape: (value) => String(value) }};
+globalThis.location = new URL("https://example.test/");
+globalThis.performance = {{ now: () => 0, getEntriesByType: () => [] }};
+globalThis.MutationObserver = class {{ constructor() {{}} observe() {{}} }};
+globalThis.PerformanceObserver = class {{ constructor() {{}} observe() {{}} }};
+globalThis.XMLHttpRequest = class {{ addEventListener() {{}} getResponseHeader() {{ return ""; }} }};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+globalThis.console = {{ debug() {{}}, info() {{}}, log() {{}}, warn() {{}}, error() {{}} }};
+globalThis.DataTransfer = class {{}};
+globalThis.DragEvent = class {{ constructor(type) {{ this.type = type; }} }};
+const source = new FakeElement("source");
+const collisionPrimary = new FakeElement("collision-primary");
+collisionPrimary.click = () => {{ throw new Error("locator_primary_not_found"); }};
+const collisionSource = new FakeElement("collision-source");
+collisionSource.dispatchEvent = () => {{ throw new Error("locator_source_not_found"); }};
+const collisionDestination = new FakeElement("collision-destination");
+collisionDestination.dispatchEvent = () => {{ throw new Error("locator_destination_not_found"); }};
+const collisionSecret = new FakeElement("collision-secret");
+collisionSecret.focus = () => {{ throw new Error("element_not_found"); }};
+const collisionCaptured = new FakeElement("collision-captured");
+const collisionCapturedSecret = new FakeElement("collision-captured-secret");
+const arbitrary = new FakeElement("arbitrary");
+arbitrary.click = () => {{ throw new Error("page-controlled arbitrary error"); }};
+globalThis.document = {{
+  activeElement: null,
+  body: {{}},
+  querySelector(selector) {{
+    return {{
+      "#source": source,
+      "#collision-primary": collisionPrimary,
+      "#collision-source": collisionSource,
+      "#collision-destination": collisionDestination,
+      "#collision-secret": collisionSecret,
+      "#collision-captured": collisionCaptured,
+      "#collision-captured-secret": collisionCapturedSecret,
+      "#arbitrary": arbitrary,
+    }}[selector] || null;
+  }},
+  querySelectorAll() {{ return []; }},
+  elementFromPoint() {{ return null; }},
+}};
+globalThis.window = {{
+  addEventListener() {{}}, removeEventListener() {{}},
+  ipc: {{ postMessage() {{}} }},
+  fetch: async () => ({{ headers: {{ get() {{ return ""; }} }}, clone() {{ return this; }}, text: async () => "" }}),
+}};
+{}
+const locator = (selector) => ({{ locator: {{ cssSelectors: [selector] }} }});
+let capturedActionFailure = null;
+try {{ window.__devmanagerBrowser.act([{{ operation: "click", target: locator("#missing-primary") }}]); }}
+catch (error) {{ capturedActionFailure = error; }}
+collisionCaptured.click = () => {{ throw capturedActionFailure; }};
+const result = (action) => {{
+  try {{
+    const value = window.__devmanagerBrowser.act([action]);
+    return typeof value === "string" ? value : "completed";
+  }}
+  catch (error) {{ return error.message; }}
+}};
+const hostBoundary = (action) => {{
+  const ticket = "host-action-ticket";
+  try {{ return window.__devmanagerBrowser.act([action], ticket); }}
+  catch (error) {{
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error, ticket);
+    if (["locator_primary_not_found", "locator_source_not_found", "locator_destination_not_found"].includes(candidate)) return candidate;
+    return "automation_failed";
+  }}
+}};
+const secretHostBoundary = () => {{
+  const ticket = "host-secret-ticket";
+  window.__devmanagerBrowser.inspectSecretTarget(locator("#collision-secret"), "ticket");
+  try {{
+    window.__devmanagerBrowser.typeSecret("ticket", "not-a-secret");
+    return "secret_type_ok";
+  }} catch (error) {{
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error, ticket);
+    if (["element_not_found", "target_changed"].includes(candidate)) return candidate;
+    return "automation_failed";
+  }}
+}};
+let capturedSecretFailure = null;
+try {{ window.__devmanagerBrowser.typeSecret("missing-ticket", "not-a-secret"); }}
+catch (error) {{ capturedSecretFailure = error; }}
+collisionCapturedSecret.focus = () => {{ throw capturedSecretFailure; }};
+const capturedSecretHostBoundary = () => {{
+  const ticket = "host-captured-secret-ticket";
+  window.__devmanagerBrowser.inspectSecretTarget(locator("#collision-captured-secret"), "ticket-captured");
+  try {{
+    window.__devmanagerBrowser.typeSecret("ticket-captured", "not-a-secret");
+    return "secret_type_ok";
+  }} catch (error) {{
+    const candidate = window.__devmanagerBrowser.nativeFailureCode(error, ticket);
+    if (["element_not_found", "target_changed"].includes(candidate)) return candidate;
+    return "automation_failed";
+  }}
+}};
+const missingSecretHostBoundary = () => {{
+  const ticket = "host-missing-secret-ticket";
+  try {{
+    window.__devmanagerBrowser.typeSecret(ticket, "not-a-secret");
+    return "secret_type_ok";
+  }} catch (error) {{
+    return window.__devmanagerBrowser.nativeFailureCode(error, ticket) || "automation_failed";
+  }}
+}};
+write(JSON.stringify({{
+  primary: result({{ operation: "click", target: locator("#missing-primary") }}),
+  source: result({{ operation: "dragDrop", source: locator("#missing-source"), destination: locator("#destination") }}),
+  destination: result({{ operation: "dragDrop", source: locator("#source"), destination: locator("#missing-destination") }}),
+  hostPrimary: hostBoundary({{ operation: "click", target: locator("#missing-primary") }}),
+  arbitrary: hostBoundary({{ operation: "click", target: locator("#arbitrary") }}),
+  collisionPrimary: hostBoundary({{ operation: "click", target: locator("#collision-primary") }}),
+  collisionSource: hostBoundary({{ operation: "dragDrop", source: locator("#collision-source"), destination: locator("#source") }}),
+  collisionDestination: hostBoundary({{ operation: "dragDrop", source: locator("#source"), destination: locator("#collision-destination") }}),
+  collisionCaptured: hostBoundary({{ operation: "click", target: locator("#collision-captured") }}),
+  collisionSecret: secretHostBoundary(),
+  collisionCapturedSecret: capturedSecretHostBoundary(),
+  hostMissingSecret: missingSecretHostBoundary(),
+}}));
+"##,
+        browser_user_input_initialization_script(),
+    );
+    let harness_path = std::env::temp_dir().join(format!(
+        "devmanager-browser-locator-harness-{}.js",
+        std::process::id()
+    ));
+    std::fs::write(&harness_path, harness).expect("write locator Node harness");
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("execute locator Node harness");
+    let _ = std::fs::remove_file(&harness_path);
+    assert!(
+        output.status.success(),
+        "Node harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("Node JSON output"),
+        serde_json::json!({
+            "primary": "locator_primary_not_found",
+            "source": "locator_source_not_found",
+            "destination": "locator_destination_not_found",
+            "hostPrimary": "locator_primary_not_found",
+            "arbitrary": "automation_failed",
+            "collisionPrimary": "automation_failed",
+            "collisionSource": "automation_failed",
+            "collisionDestination": "automation_failed",
+            "collisionCaptured": "automation_failed",
+            "collisionSecret": "automation_failed",
+            "collisionCapturedSecret": "automation_failed",
+            "hostMissingSecret": "element_not_found",
+        })
+    );
 }
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::{BTreeMap, BTreeSet};
@@ -645,6 +942,81 @@ async fn production_request_router_rejects_closed_routes_without_dispatching() {
 }
 
 #[tokio::test]
+async fn closed_route_rejects_before_replay_state_exists_and_reopened_route_can_start_cleanly() {
+    let key = workspace("route-project", "route-conversation");
+    let (bridge, mut inbox) = browser_command_channel(4);
+    let coordinator = bridge.replay_coordinator();
+
+    let closed_controller = bridge.bind(key.clone(), Duration::from_secs(1));
+    let closed = tokio::spawn(async move {
+        closed_controller
+            .request(BrowserCommand::WorkspaceState)
+            .await
+    });
+    let closed_request = inbox.recv().await.expect("closed route request");
+    let error = route_browser_request(false, closed_request, |_| {
+        panic!("collapsed or non-selected route dispatched")
+    })
+    .expect_err("closed route must reject before workflow replay admission");
+    assert_eq!(closed.await.unwrap(), Err(error));
+    assert!(
+        coordinator.active_state(&key).is_none(),
+        "route rejection must leave no hidden replay or secret-prompt residue"
+    );
+
+    let reopened_controller = bridge.bind(key.clone(), Duration::from_secs(1));
+    let reopened = tokio::spawn(async move {
+        reopened_controller
+            .request(BrowserCommand::WorkspaceState)
+            .await
+    });
+    let reopened_request = inbox.recv().await.expect("reopened route request");
+    route_browser_request(true, reopened_request, |request| {
+        request.respond(Ok(BrowserResponse::WorkspaceState {
+            snapshot: BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        }));
+    })
+    .expect("the exact active visible route dispatches");
+    assert!(matches!(
+        reopened.await.unwrap(),
+        Ok(BrowserResponse::WorkspaceState { .. })
+    ));
+
+    let started = coordinator
+        .start(
+            key,
+            compile_browser_replay(
+                &BrowserRecipeV1 {
+                    schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                    id: "route-reopened-replay".to_string(),
+                    name: "Route reopened replay".to_string(),
+                    description: "Route admission residue fixture".to_string(),
+                    start_url: "https://example.test".to_string(),
+                    viewport: BrowserRecipeViewport::default(),
+                    inputs: Vec::new(),
+                    steps: vec![BrowserRecipeStep {
+                        id: "reload".to_string(),
+                        action: BrowserRecipeAction::Reload,
+                        wait: None,
+                        assertions: Vec::new(),
+                    }],
+                },
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    coordinator.begin(&started.instance).unwrap();
+    assert_eq!(
+        coordinator.status(&started.instance).unwrap().status,
+        BrowserReplayStatus::Running
+    );
+}
+
+#[tokio::test]
 async fn controller_timeout_also_bounds_a_saturated_inbox() {
     let key = workspace("project-a", "conversation-a");
     let (bridge, _inbox) = browser_command_channel(1);
@@ -823,10 +1195,6 @@ async fn stop_and_user_input_interrupt_outstanding_tab_operations() {
         })
         .await
         .expect("queue stop");
-    assert_eq!(
-        stopped_task.await.expect("stopped task"),
-        Err(BrowserError::Interrupted)
-    );
     let stop_request = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
         assert!(controls.is_empty());
         assert_eq!(lifecycle_requests.len(), 1);
@@ -838,7 +1206,14 @@ async fn stop_and_user_input_interrupt_outstanding_tab_operations() {
             tab_id: Some("tab-a".to_string()),
         }
     );
-    stop_request.respond(Ok(BrowserResponse::Acknowledged));
+    route_browser_request(true, stop_request, |request| {
+        request.respond(Ok(BrowserResponse::Acknowledged));
+    })
+    .unwrap();
+    assert_eq!(
+        stopped_task.await.expect("stopped task"),
+        Err(BrowserError::Interrupted)
+    );
 
     let user_interrupted_task = tokio::spawn({
         let controller = controller.clone();
@@ -937,6 +1312,17 @@ async fn clear_profile_invalidates_buffered_project_envelopes_but_not_later_requ
         .notify(BrowserCommand::ClearProjectProfile)
         .await
         .unwrap();
+    let clear = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
+        assert!(controls.is_empty());
+        assert_eq!(lifecycle_requests.len(), 1);
+        lifecycle_requests.remove(0)
+    });
+    assert_eq!(clear.command(), &BrowserCommand::ClearProjectProfile);
+    assert!(clear.cancellation_is_current());
+    route_browser_request(true, clear, |request| {
+        request.respond(Ok(BrowserResponse::Acknowledged));
+    })
+    .unwrap();
     let fresh = tokio::spawn({
         let second = second.clone();
         async move {
@@ -954,15 +1340,6 @@ async fn clear_profile_invalidates_buffered_project_envelopes_but_not_later_requ
                 .await
         }
     });
-
-    let clear = bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
-        assert!(controls.is_empty());
-        assert_eq!(lifecycle_requests.len(), 1);
-        lifecycle_requests.remove(0)
-    });
-    assert_eq!(clear.command(), &BrowserCommand::ClearProjectProfile);
-    assert!(clear.cancellation_is_current());
-    clear.respond(Ok(BrowserResponse::Acknowledged));
     let fresh_request = inbox
         .recv()
         .await
@@ -1322,11 +1699,12 @@ fn annotation_delete_enters_destructive_approval_before_mutation_and_resumes_dis
         .unwrap()
         + response_start;
     let response = &source[response_start..response_end];
-    assert!(response.contains("browser_command_is_journaled"));
+    assert!(response.contains("browser_command_journal_actor"));
+    assert!(source.contains("BrowserInvocationActor::Agent if browser_command_is_journaled"));
     assert!(response.contains("append_journal_entry"));
     assert!(response.contains("reconcile_annotation_pins"));
     assert!(response.contains("if annotation_command"));
-    assert!(response.contains("else if agent_journaled"));
+    assert!(response.contains("else if journal_actor.is_some()"));
     assert!(
         response.find("append_journal_entry").unwrap()
             < response
@@ -1357,6 +1735,31 @@ fn direct_annotation_commands_finalize_resource_pins_before_returning() {
 async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     let key = workspace("project-a", "conversation-a");
     let (bridge, mut inbox) = browser_command_channel(4);
+    let replay_coordinator = bridge.replay_coordinator();
+    let replay = replay_coordinator
+        .start(
+            key.clone(),
+            compile_browser_replay(
+                &BrowserRecipeV1 {
+                    schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                    id: "host-input-cancellation".to_string(),
+                    name: "Host input cancellation".to_string(),
+                    description: "Direct input cancels the workspace replay".to_string(),
+                    start_url: "https://example.test/start".to_string(),
+                    viewport: BrowserRecipeViewport::default(),
+                    inputs: Vec::new(),
+                    steps: vec![BrowserRecipeStep {
+                        id: "reload".to_string(),
+                        action: BrowserRecipeAction::Reload,
+                        wait: None,
+                        assertions: Vec::new(),
+                    }],
+                },
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let controller = bridge.bind(key.clone(), Duration::from_secs(1));
     let request_task = tokio::spawn(async move {
         controller
@@ -1367,14 +1770,18 @@ async fn routed_user_input_events_interrupt_the_matching_controller_tab() {
     });
     let _request = inbox.recv().await.expect("reload request");
 
-    bridge.observe_host_event(&BrowserHostEvent::UserInput {
-        workspace_key: key,
-        tab_id: "tab-a".to_string(),
-        kind: BrowserUserInputKind::Keyboard,
-    });
+    bridge.observe_host_event(&BrowserHostEvent::user_input(
+        key,
+        "tab-a",
+        BrowserUserInputKind::Keyboard,
+    ));
     assert_eq!(
         request_task.await.expect("interrupted request"),
         Err(BrowserError::Interrupted)
+    );
+    assert_eq!(
+        replay_coordinator.status(&replay.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
     );
 }
 
@@ -1752,11 +2159,7 @@ fn browser_command_response_and_event_json_names_are_stable_camel_case() {
             state: BrowserPageLoadState::Finished,
             url: "https://example.test".to_string(),
         },
-        BrowserHostEvent::UserInput {
-            workspace_key: key.clone(),
-            tab_id: "tab-a".to_string(),
-            kind: BrowserUserInputKind::Pointer,
-        },
+        BrowserHostEvent::user_input(key.clone(), "tab-a", BrowserUserInputKind::Pointer),
         BrowserHostEvent::NewWindow {
             workspace_key: key.clone(),
             tab_id: "tab-a".to_string(),
@@ -1966,8 +2369,144 @@ fn secure_command_real_host_ingress_rejects_missing_or_stale_sidecar_before_work
 
     let unsupported = include_str!("../src/browser/host/unsupported.rs");
     let unsupported_request = &unsupported[unsupported.find("pub fn handle_request(").unwrap()..];
-    assert!(unsupported_request.contains("unsupported_validated_command_response"));
+    assert!(unsupported_request.contains("unsupported_request_response"));
     assert!(!unsupported_request.contains("self.handle_command(window"));
+}
+
+#[test]
+fn repair_preview_markers_are_rejected_on_the_direct_host_boundary() {
+    for marker in [
+        BrowserCommand::RepairHighlight {
+            tab_id: "tab-a".to_string(),
+        },
+        BrowserCommand::RepairClearHighlight {
+            tab_id: "tab-a".to_string(),
+        },
+    ] {
+        assert!(matches!(
+            unsupported_command_response("fixture", marker),
+            Err(BrowserError::InvalidInvocation { field }) if field == "repairPreviewSidecar"
+        ));
+    }
+
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let direct_start = windows.find("pub fn handle_command(").unwrap();
+    let direct_end = windows[direct_start..]
+        .find("pub fn handle_request(")
+        .unwrap()
+        + direct_start;
+    let direct = &windows[direct_start..direct_end];
+    assert!(
+        direct
+            .find("validate_direct_repair_preview_command")
+            .unwrap()
+            < direct.find("pump_page_recording_ipc").unwrap()
+    );
+}
+
+#[test]
+fn repair_capture_host_bridge_validates_before_dedicated_or_ordinary_storage() {
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let snapshot_start = windows.find("fn complete_snapshot(").unwrap();
+    let screenshot_start = windows[snapshot_start..]
+        .find("fn complete_screenshot(")
+        .map(|offset| snapshot_start + offset)
+        .unwrap();
+    let wait_start = windows[screenshot_start..]
+        .find("fn complete_wait(")
+        .map(|offset| screenshot_start + offset)
+        .unwrap();
+
+    for completion in [
+        &windows[snapshot_start..screenshot_start],
+        &windows[screenshot_start..wait_start],
+    ] {
+        let sidecar = completion
+            .find("validate_repair_retention_sidecar")
+            .expect("host completion validates the private sidecar");
+        let plan = completion
+            .find("browser_capture_storage_plan")
+            .expect("host completion checks exact tab and revision through the pure plan");
+        let retain = completion
+            .find("retain_repair_resource")
+            .expect("repair branch uses retained repair storage");
+        assert!(sidecar < plan && plan < retain);
+        assert!(completion.contains("if storage.repair"));
+        assert!(completion.contains("request.retain_repair_resource"));
+        assert!(completion.contains("self.store_resource"));
+        assert!(completion.contains("storage.kind"));
+        assert!(completion.contains("storage.mime_type"));
+        assert!(completion.contains("self.repair_capture_resource_store"));
+        assert!(!completion.contains("BrowserResourceStore::open_verified"));
+    }
+    let snapshot = &windows[snapshot_start..screenshot_start];
+    let snapshot_plan = snapshot.find("browser_capture_storage_plan").unwrap();
+    assert!(snapshot_plan < snapshot.find("ok_or_else(missing_workspace)").unwrap());
+    assert!(snapshot_plan < snapshot.find("ok_or_else(|| missing_tab(tab_id))").unwrap());
+
+    let store_start = windows
+        .find("fn repair_capture_resource_store(")
+        .expect("repair store opener collapses every root/open failure");
+    let store_end = windows[store_start..]
+        .find("fn store_resource(")
+        .map(|offset| store_start + offset)
+        .unwrap();
+    let store = &windows[store_start..store_end];
+    assert!(store.contains("verified_trusted_app_config_dir()"));
+    assert!(store.contains("BrowserResourceStore::open_verified"));
+    assert_eq!(
+        store
+            .matches("BrowserError::ResourceRootUnavailable")
+            .count(),
+        2,
+        "both trusted-root revalidation and store open must collapse to one fixed error"
+    );
+
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+    let request_start = unsupported
+        .find("pub(crate) fn unsupported_request_response(")
+        .unwrap();
+    let request_end = unsupported[request_start..]
+        .find("pub struct BrowserWebViewHost")
+        .map(|offset| request_start + offset)
+        .unwrap();
+    let request = &unsupported[request_start..request_end];
+    let secret = request.find("validate_secret_sidecar").unwrap();
+    let repair = request.find("validate_repair_retention_sidecar").unwrap();
+    let platform = request
+        .find("unsupported_validated_command_response")
+        .unwrap();
+    assert!(secret < platform && repair < platform);
+
+    let ingress_start = windows.find("pub fn handle_request(").unwrap();
+    let ingress_end = windows[ingress_start..]
+        .find("pub fn pump_async_completions(")
+        .map(|offset| ingress_start + offset)
+        .unwrap();
+    let ingress = &windows[ingress_start..ingress_end];
+    assert!(
+        ingress.find("records_workflow_recipe_action").unwrap()
+            < ingress.find("reserve_agent_command").unwrap()
+    );
+    let respond_start = windows.find("fn respond_request(").unwrap();
+    let respond_end = windows[respond_start..]
+        .find("fn cancel_tab_operations(")
+        .map(|offset| respond_start + offset)
+        .unwrap();
+    let respond = &windows[respond_start..respond_end];
+    assert!(
+        respond.find("records_workflow_recipe_action").unwrap()
+            < respond.find("complete_agent_command").unwrap()
+    );
+    let journal = &respond[respond.find("let journal_actor").unwrap()..];
+    let journal_gate = &journal[..journal
+        .find("if request.records_workflow_recipe_action()")
+        .unwrap()];
+    assert!(journal_gate.contains("browser_command_journal_actor"));
+    let actor_gate = &windows[windows.find("fn browser_command_journal_actor").unwrap()..];
+    assert!(actor_gate.contains("BrowserInvocationActor::Agent if browser_command_is_journaled"));
+    assert!(actor_gate.contains("BrowserInvocationActor::User"));
+    assert!(actor_gate.contains("BrowserCommand::RepairHighlight"));
 }
 
 #[test]
@@ -2292,6 +2831,214 @@ fn initialization_script_has_self_cleaning_element_and_region_annotation_overlay
 }
 
 #[test]
+fn repair_highlight_overlay_is_owned_pointer_transparent_event_free_and_exact_cas() {
+    let harness = [
+        r#"
+const messages = [];
+let activeObserver = null;
+class FakeMutationObserver {
+  constructor(callback) { this.callback = callback; this.records = []; activeObserver = this; }
+  observe() {}
+  record(record) { this.records.push(record); }
+  flush() { const records = this.records.splice(0); if (records.length) this.callback(records); }
+}
+
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase(); this.children = []; this.parentElement = null;
+    const style = {};
+    this.style = new Proxy(style, { set: (target, key, value) => { target[key] = value; activeObserver?.record({ target: this, attributeName: "style" }); return true; } });
+    this.attributes = new Map(); this.listeners = new Map(); this.id = ""; this.innerText = "";
+    this.focusCalls = 0; this.clickCalls = 0; this.dispatched = [];
+  }
+  setAttribute(key, value) { this.attributes.set(key, String(value)); activeObserver?.record({ target: this, attributeName: key }); }
+  getAttribute(key) { return this.attributes.has(key) ? this.attributes.get(key) : null; }
+  hasAttribute(key) { return this.attributes.has(key); }
+  addEventListener(type, handler) { this.listeners.set(type, handler); }
+  removeEventListener(type, handler) { if (this.listeners.get(type) === handler) this.listeners.delete(type); }
+  appendChild(child) { child.parentElement = this; this.children.push(child); activeObserver?.record({ target: this, addedNodes: [child], removedNodes: [] }); return child; }
+  remove() { if (!this.parentElement) return; const parent = this.parentElement; parent.children = parent.children.filter((child) => child !== this); this.parentElement = null; activeObserver?.record({ target: parent, addedNodes: [], removedNodes: [this] }); }
+  getBoundingClientRect() { return this.bounds || { x: 8, y: 10, width: 80, height: 24 }; }
+  matches() { return false; }
+  closest() { return null; }
+  focus() { this.focusCalls += 1; }
+  click() { this.clickCalls += 1; }
+  dispatchEvent(event) { this.dispatched.push(event.type); return true; }
+}
+globalThis.Element = FakeElement;
+globalThis.MutationObserver = FakeMutationObserver;
+globalThis.PerformanceObserver = class { observe() {} };
+globalThis.XMLHttpRequest = class {};
+XMLHttpRequest.prototype.open = function() {};
+XMLHttpRequest.prototype.send = function() {};
+globalThis.CSS = { escape: (value) => String(value) };
+globalThis.location = new URL("https://example.test/form");
+globalThis.performance = { now: () => 0, getEntriesByType: () => [] };
+globalThis.getComputedStyle = () => ({ display: "block", visibility: "visible", opacity: "1", position: "static" });
+const body = new FakeElement("body");
+const documentElement = new FakeElement("html");
+const target = new FakeElement("button"); target.setAttribute("data-testid", "save");
+globalThis.document = {
+  body, documentElement, readyState: "complete", title: "Fixture",
+  createElement: (tag) => new FakeElement(tag),
+  querySelector: (selector) => selector === '[data-testid="save"]' ? target : null,
+  querySelectorAll: () => [],
+  elementFromPoint: () => target,
+  activeElement: target,
+};
+const windowListeners = new Map();
+globalThis.window = {
+  innerWidth: 200, innerHeight: 100, devicePixelRatio: 1,
+  ipc: { postMessage: (message) => messages.push(JSON.parse(message)) },
+  addEventListener(type, handler) { const values = windowListeners.get(type) || []; values.push(handler); windowListeners.set(type, values); },
+  removeEventListener(type, handler) { windowListeners.set(type, (windowListeners.get(type) || []).filter((value) => value !== handler)); },
+};
+"#,
+        browser_user_input_initialization_script(),
+        r#"
+(async () => {
+const highlight = window.__devmanagerBrowser.repairHighlight;
+const candidate = { locator: { testId: "save", accessibilityRole: null, accessibilityName: null, cssSelectors: [] } };
+const tokenA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const tokenB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const tokenOld = "cccccccccccccccccccccccccccccccc";
+const first = highlight.install(candidate, tokenA, null);
+if (!first || first.token !== tokenA || first.installed !== true) throw new Error("first exact token was not acknowledged");
+if (body.children.length !== 1 || body.children[0].children.length !== 1) throw new Error("owned overlay shape missing");
+const firstRoot = body.children[0];
+if (firstRoot.style.pointerEvents !== "none" || firstRoot.children[0].style.pointerEvents !== "none") throw new Error("overlay can intercept pointers");
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.some((message) => message.type === "domMutation")) throw new Error("owned install changed DOM revision");
+
+const second = highlight.install(candidate, tokenB, tokenA);
+if (!second || second.token !== tokenB || second.installed !== true) throw new Error("new exact token was not acknowledged");
+const secondRoot = body.children[0];
+const lateInstall = highlight.install(candidate, tokenOld, tokenA);
+if (!lateInstall || lateInstall.token !== tokenOld || lateInstall.installed !== false || body.children[0] !== secondRoot) throw new Error("old completion overwrote the newer overlay");
+const oldClear = highlight.clear(tokenA);
+if (!oldClear || oldClear.token !== tokenA || oldClear.cleared !== false || body.children[0] !== secondRoot) throw new Error("old clear removed the newer overlay");
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.some((message) => message.type === "domMutation")) throw new Error("owned replace changed DOM revision");
+
+activeObserver.record({ target, attributeName: "data-real-page-change" });
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.filter((message) => message.type === "domMutation").length !== 1) throw new Error("real page mutation was suppressed");
+const exactClear = highlight.clear(tokenB);
+if (!exactClear || exactClear.token !== tokenB || exactClear.cleared !== true || body.children.length !== 0) throw new Error("exact clear failed");
+
+// A may reach the page before its authority is superseded. Host completion first rolls A
+// back to the committed predecessor, then queued B can CAS against that predecessor. A's
+// later guard cleanup remains exact and cannot remove B.
+const committedToken = "dddddddddddddddddddddddddddddddd";
+const supersededToken = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const currentToken = "ffffffffffffffffffffffffffffffff";
+if (!highlight.install(candidate, committedToken, null).installed) throw new Error("committed predecessor install failed");
+const committedRoot = body.children[0];
+if (!highlight.install(candidate, supersededToken, committedToken).installed) throw new Error("superseded A install failed");
+const supersededRoot = body.children[0];
+const failedRollbackA = highlight.clear(supersededToken, tokenOld);
+if (failedRollbackA.cleared || failedRollbackA.resultingToken !== supersededToken || body.children[0] !== supersededRoot) throw new Error("failed restore authorization mutated the current preview");
+target.bounds = { x: 8, y: 10, width: 0, height: 0 };
+const rollbackA = highlight.clear(supersededToken, committedToken);
+if (!rollbackA.cleared || !rollbackA.restored || rollbackA.resultingToken !== committedToken || body.children[0] !== committedRoot) throw new Error("superseded A did not restore the exact committed predecessor after its target became invisible");
+target.bounds = { x: 8, y: 10, width: 80, height: 24 };
+const installB = highlight.install(candidate, currentToken, committedToken);
+if (!installB.installed || installB.token !== currentToken) throw new Error("current B could not replace restored predecessor");
+const lateClearA = highlight.clear(supersededToken, committedToken);
+if (lateClearA.cleared || lateClearA.resultingToken !== currentToken || body.children.length !== 1) throw new Error("late A cleanup removed current B");
+const clearB = highlight.clear(currentToken);
+if (!clearB.cleared || body.children.length !== 0) throw new Error("current B exact cleanup failed");
+
+// FIFO cleanup is A-before-B. A is retained as B's predecessor, so consuming A
+// while B is current must release A's detached root and prevent B from restoring it.
+const fifoTokenA = "11111111111111111111111111111111";
+const fifoTokenB = "22222222222222222222222222222222";
+if (!highlight.install(candidate, fifoTokenA, null).installed) throw new Error("FIFO predecessor A install failed");
+if (!highlight.install(candidate, fifoTokenB, fifoTokenA).installed) throw new Error("FIFO current B install failed");
+const fifoClearA = highlight.clear(fifoTokenA);
+if (fifoClearA.cleared || fifoClearA.resultingToken !== fifoTokenB || fifoClearA.predecessorConsumed !== true) throw new Error("FIFO A cleanup did not consume B's predecessor");
+const fifoClearB = highlight.clear(fifoTokenB);
+if (!fifoClearB.cleared || fifoClearB.restored || fifoClearB.resultingToken !== null || body.children.length !== 0) throw new Error("terminal B cleanup did not converge to no token");
+activeObserver.flush();
+await new Promise((resolve) => setTimeout(resolve, 75));
+if (messages.filter((message) => message.type === "domMutation").length !== 1) throw new Error("owned clear changed DOM revision");
+if (target.focusCalls !== 0 || target.clickCalls !== 0 || target.dispatched.length !== 0) throw new Error("preview dispatched page interaction");
+if (firstRoot.listeners.size !== 0 || secondRoot.listeners.size !== 0) throw new Error("preview installed event listeners");
+if (messages.some((message) => ["userInput", "annotationCandidate"].includes(message.type))) throw new Error("preview emitted page events");
+process.stdout.write(JSON.stringify({ mutations: 1, children: body.children.length }));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"#,
+    ]
+    .concat();
+    let temp = TestDir::new("repair-highlight-overlay-node");
+    let harness_path = temp.path().join("harness.js");
+    std::fs::write(&harness_path, harness).expect("write repair highlight harness");
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("execute repair highlight harness in Node");
+    assert!(
+        output.status.success(),
+        "Node harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        r#"{"mutations":1,"children":0}"#
+    );
+}
+
+#[test]
+fn repair_apply_validation_uses_existing_approval_queue_and_exact_native_state() {
+    let commands = include_str!("../src/browser/commands.rs");
+    let windows = include_str!("../src/browser/host/windows.rs");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+
+    assert!(commands.contains("BrowserCommand::RepairValidate"));
+    assert!(commands.contains("BrowserReplayRepairPreviewSidecar::Apply"));
+    assert!(commands.contains("validate_repair_apply_sidecar"));
+    assert!(windows.contains("repair_apply_authority"));
+    assert!(windows.contains("authority.effective_risk()"));
+    assert!(windows.contains("requires_confirmation(initial_risk)"));
+    assert!(windows.contains("repair_highlight_matches"));
+    assert!(windows.contains("validate_element_ref(authority.candidate().element_ref())"));
+    assert!(windows.contains("authority.acknowledge_exact()"));
+    assert!(unsupported.contains("validate_repair_apply_sidecar"));
+
+    let approval_start = windows.find("pub fn resolve_approval(").unwrap();
+    let approval_end = windows[approval_start..]
+        .find("fn continue_actions(")
+        .unwrap()
+        + approval_start;
+    let approval = &windows[approval_start..approval_end];
+    assert!(approval.contains("begin_automation_request(window"));
+    assert!(approval.contains("Some(risk)"));
+    assert!(approval.contains("BrowserError::BlockedPermission"));
+}
+
+#[test]
+fn repair_validate_is_privately_sealed_but_externally_pattern_matchable() {
+    let _external_matcher: fn(&BrowserCommand) -> bool =
+        |command| matches!(command, BrowserCommand::RepairValidate { .. });
+    let commands = include_str!("../src/browser/commands.rs").replace("\r\n", "\n");
+
+    assert!(commands.contains("struct BrowserRepairValidateSeal;"));
+    assert!(!commands.contains("pub struct BrowserRepairValidateSeal;"));
+    assert!(commands.contains("#[allow(private_interfaces)]\n    RepairValidate {"));
+    assert!(commands.contains("_seal: BrowserRepairValidateSeal,"));
+    assert_eq!(
+        commands
+            .matches("_seal: BrowserRepairValidateSeal,")
+            .count(),
+        3,
+        "the enum field and both internal constructors must carry the private seal"
+    );
+}
+
+#[test]
 fn annotation_overlay_emits_element_and_region_candidates_then_removes_every_owned_hook() {
     let harness = [
         r#"
@@ -2444,6 +3191,79 @@ fn annotation_candidate() -> BrowserAnnotationCandidate {
             ("fontSize".to_string(), "14px".to_string()),
         ]),
     }
+}
+
+#[test]
+fn replay_repair_picker_accepts_only_an_exact_semantic_element_and_strips_backend_authority() {
+    let candidate = annotation_candidate();
+    let replacement =
+        browser_replay_repair_candidate_from_annotation(&candidate, BrowserRevision(7))
+            .expect("semantic element candidate");
+    assert_eq!(replacement.element_ref().revision, BrowserRevision(7));
+    assert_eq!(replacement.element_ref().locator, candidate.locator);
+    assert_eq!(replacement.element_ref().backend_node_id, None);
+
+    let mut region = annotation_candidate();
+    region.kind = BrowserAnnotationKind::Region;
+    assert!(matches!(
+        browser_replay_repair_candidate_from_annotation(&region, BrowserRevision(7)),
+        Err(BrowserError::InvalidAnnotation { field, .. }) if field == "kind"
+    ));
+
+    assert!(matches!(
+        browser_replay_repair_candidate_from_annotation(
+            &annotation_candidate(),
+            BrowserRevision(8)
+        ),
+        Err(BrowserError::StaleReference {
+            expected: BrowserRevision(8),
+            actual: BrowserRevision(7),
+        })
+    ));
+}
+
+#[test]
+fn native_repair_picker_clears_the_exact_annotation_candidate_before_user_preview() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let windows = include_str!("../src/browser/host/windows.rs").replace("\r\n", "\n");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs").replace("\r\n", "\n");
+
+    for host in [&windows, &unsupported] {
+        assert!(host.contains("pub fn cancel_annotation_selection("));
+    }
+    let cancel_start = windows.find("pub fn cancel_annotation_selection(").unwrap();
+    let cancel_end = windows[cancel_start..]
+        .find("\n    }")
+        .map(|end| cancel_start + end)
+        .unwrap();
+    let cancel = &windows[cancel_start..cancel_end];
+    assert!(cancel.contains("BrowserAnnotationRoute::new"));
+    assert!(cancel.contains("cancel_annotation_mode(&route)"));
+
+    let pump_start = app.find("fn pump_browser_events(").unwrap();
+    let pump_end = app[pump_start..]
+        .find("fn with_browser_host_control_barrier")
+        .map(|end| pump_start + end)
+        .unwrap();
+    let pump = &app[pump_start..pump_end];
+    let capture = pump
+        .find("BrowserPaneEventPlan::CaptureAnnotation")
+        .expect("annotation candidate event");
+    let capture = &pump[capture..];
+    let clear = capture
+        .find("cancel_annotation_selection")
+        .expect("accepted candidate cleared");
+    let preview = capture
+        .find("request_replay_repair_preview")
+        .expect("context-preserving preview lane");
+    assert!(clear < preview);
+    assert!(capture.contains("BrowserInvocationActor::User"));
+    assert!(capture.contains("browser_replay_repair_candidate_from_annotation"));
+    assert!(capture.contains("BrowserCommand::CaptureAnnotation"));
+    assert!(capture.contains("candidate.revision"));
+    assert!(capture.contains("selection.tab_id"));
+    assert!(capture.contains("selection.instance_id"));
+    assert!(capture.contains("selection.repair_id"));
 }
 
 #[test]
@@ -3091,6 +3911,56 @@ fn windows_native_metadata_callbacks_and_event_drain_consult_document_taint() {
 }
 
 #[test]
+fn windows_host_applies_an_account_security_floor_to_every_secret_type() {
+    let ordinary = BrowserRuntimeTarget {
+        origin_url: "https://example.test".to_string(),
+        role: Some("textbox".to_string()),
+        input_type: Some("text".to_string()),
+        ..BrowserRuntimeTarget::default()
+    };
+    let one_time_code = BrowserRuntimeTarget {
+        autocomplete: Some("one-time-code".to_string()),
+        ..ordinary.clone()
+    };
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::Normal, &ordinary),
+        BrowserRisk::AccountSecurity
+    );
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::Normal, &one_time_code),
+        BrowserRisk::AccountSecurity
+    );
+
+    let permission = BrowserRuntimeTarget {
+        permission: Some("camera".to_string()),
+        ..ordinary.clone()
+    };
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::Normal, &permission),
+        BrowserRisk::PermissionChange,
+        "a higher runtime risk must win over the secret floor"
+    );
+    assert_eq!(
+        effective_browser_secret_type_risk(BrowserRisk::OsPermission, &ordinary),
+        BrowserRisk::OsPermission,
+        "a higher declared risk must win over the secret floor"
+    );
+
+    let source = include_str!("../src/browser/host/windows.rs");
+    let inspect = source
+        .find("BrowserAsyncPhase::InspectSecretType { ticket } =>")
+        .expect("secret target inspection branch");
+    let approval = source[inspect..]
+        .find("requires_confirmation(effective_risk)")
+        .map(|offset| inspect + offset)
+        .expect("secret approval gate");
+    assert!(
+        source[inspect..approval].contains("effective_browser_secret_type_risk"),
+        "the real host must apply the shared secret risk floor before approval"
+    );
+}
+
+#[test]
 fn download_paths_stay_in_project_directory_and_never_overwrite() {
     let temp = TestDir::new("download-paths");
     let downloads = temp.path().join("downloads");
@@ -3364,7 +4234,7 @@ fn verified_resource_store_rejects_an_intermediate_resources_reparse() {
 }
 
 #[test]
-fn verified_resource_store_revalidates_after_open_before_each_write() {
+fn verified_resource_store_root_lock_blocks_post_open_swap_and_store_remains_usable() {
     let temp = TestDir::new("resource-root-swap");
     let trusted = temp.path().join("trusted-config");
     let outside = temp.path().join("outside-resources");
@@ -3375,22 +4245,20 @@ fn verified_resource_store_revalidates_after_open_before_each_write() {
     )
     .unwrap();
     let resources = trusted.join("browser").join("resources");
-    std::fs::remove_dir_all(&resources).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    create_directory_redirect(&outside, &resources).expect("swap resource root for redirect");
-
-    assert!(matches!(
-        store.put(
+    assert!(std::fs::remove_dir_all(&resources).is_err());
+    assert!(resources.is_dir());
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert!(store
+        .put(
             &workspace("project-a", "conversation-a"),
             BrowserResourceKind::ConsoleLog,
             "text/plain",
-            b"must stay inside",
+            b"stays inside",
             false,
-        ),
-        Err(BrowserError::OutsideWorkspace { .. })
-    ));
+        )
+        .is_ok());
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-    remove_directory_redirect(&resources);
 }
 
 #[test]
@@ -3727,6 +4595,7 @@ fn annotation_details_failure_restores_pin_and_forged_same_owner_resources_are_m
         assert!(state.workspace(&key).unwrap().annotation(id).is_ok());
     }
 
+    drop(store);
     let failing_store = BrowserResourceStore::open(
         temp.path(),
         BrowserResourceLimits {
@@ -3740,7 +4609,7 @@ fn annotation_details_failure_restores_pin_and_forged_same_owner_resources_are_m
         state.annotation_details(&key, "ann-valid", &failing_store),
         Err(BrowserError::ResourceTooLarge { .. })
     ));
-    assert!(!store.handle(&key, &screenshot.id).unwrap().pinned);
+    assert!(!failing_store.handle(&key, &screenshot.id).unwrap().pinned);
     assert!(state.workspace(&key).unwrap().journal_entries.is_empty());
 }
 

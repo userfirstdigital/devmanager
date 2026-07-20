@@ -1,17 +1,18 @@
 use devmanager::browser::{
     compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput, BrowserRecipeInputKind,
     BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
-    BrowserRecipeViewport, BrowserReplayCancellationLease, BrowserReplayCoordinator,
-    BrowserReplayError, BrowserReplayExecutionHandle, BrowserReplayFailureCode, BrowserReplayPlan,
-    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplayStatus, BrowserWorkspaceKey,
-    BROWSER_RECIPE_SCHEMA_VERSION, MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_TEXT_BYTES,
-    MAX_BROWSER_REPLAY_URL_BYTES,
+    BrowserRecipeViewport, BrowserReplayActiveState, BrowserReplayCancellationLease,
+    BrowserReplayCoordinator, BrowserReplayError, BrowserReplayExecutionHandle,
+    BrowserReplayFailureCode, BrowserReplayPlan, BrowserReplayProjection, BrowserReplayPublicInput,
+    BrowserReplayStatus, BrowserWorkspaceKey, BROWSER_RECIPE_SCHEMA_VERSION,
+    MAX_BROWSER_REPLAY_SECRET_INPUTS, MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 assert_impl_all!(BrowserReplayPublicInput: Send, Sync);
 assert_impl_all!(BrowserReplayPlan: Send, Sync);
 assert_impl_all!(BrowserReplayCoordinator: Clone, Send, Sync);
+assert_impl_all!(BrowserReplayActiveState: Clone, Send, Sync);
 assert_impl_all!(BrowserReplayProjection: Clone, Send, Sync, std::fmt::Debug, serde::Serialize);
 assert_impl_all!(BrowserReplayCancellationLease: Clone, Send, Sync);
 assert_impl_all!(BrowserReplayExecutionHandle: Send, Sync);
@@ -19,6 +20,7 @@ assert_not_impl_any!(BrowserReplayPublicInput: std::fmt::Debug, serde::Serialize
 assert_not_impl_any!(BrowserReplayPlan: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayCancellationLease: std::fmt::Debug, serde::Serialize);
 assert_not_impl_any!(BrowserReplayExecutionHandle: Clone, std::fmt::Debug, serde::Serialize);
+assert_not_impl_any!(BrowserReplayActiveState: serde::Serialize);
 
 fn locator(test_id: &str) -> BrowserRecipeLocator {
     BrowserRecipeLocator {
@@ -703,6 +705,10 @@ fn replay_errors_have_only_fixed_value_free_messages() {
         BrowserReplayError::IncompleteReplay,
         BrowserReplayError::TerminalState,
         BrowserReplayError::InstanceIdExhausted,
+        BrowserReplayError::RepairInstanceIdExhausted,
+        BrowserReplayError::InvalidRepairSlot,
+        BrowserReplayError::InvalidRepairEvidence,
+        BrowserReplayError::RepairEvidenceUnavailable,
     ];
     for error in errors {
         let display = error.to_string();
@@ -713,7 +719,7 @@ fn replay_errors_have_only_fixed_value_free_messages() {
 }
 
 #[test]
-fn replay_state_enforces_exact_progress_pause_completion_and_terminal_immutability() {
+fn replay_state_enforces_exact_progress_completion_and_terminal_immutability() {
     let coordinator = BrowserReplayCoordinator::with_terminal_capacity(4);
     let owner = workspace("project-a", "conversation-a");
     let started = coordinator.start(owner, plan_without_secrets()).unwrap();
@@ -742,16 +748,6 @@ fn replay_state_enforces_exact_progress_pause_completion_and_terminal_immutabili
     assert_eq!(
         replay_error(coordinator.advance_step(&instance, 0)),
         BrowserReplayError::StepOutOfOrder
-    );
-    let paused = coordinator.pause_locator_repair(&instance).unwrap();
-    assert_eq!(paused.status, BrowserReplayStatus::PausedLocatorRepair);
-    assert_eq!(
-        replay_error(coordinator.advance_step(&instance, 1)),
-        BrowserReplayError::InvalidTransition
-    );
-    assert_eq!(
-        coordinator.resume_locator_repair(&instance).unwrap().status,
-        BrowserReplayStatus::Running
     );
     coordinator.advance_step(&instance, 1).unwrap();
     coordinator.advance_step(&instance, 2).unwrap();
@@ -913,6 +909,81 @@ fn replay_state_fences_one_active_instance_and_explicit_replacement_per_workspac
 }
 
 #[test]
+fn replay_active_and_exact_lookup_preserve_private_identity_across_terminal_retention() {
+    let coordinator = BrowserReplayCoordinator::with_terminal_capacity(2);
+    let owner = workspace("lookup-project", "lookup-conversation");
+    let started = coordinator
+        .start(owner.clone(), plan_without_secrets())
+        .unwrap();
+
+    let active = coordinator
+        .active_state(&owner)
+        .expect("active replay state");
+    assert_eq!(active.instance, started.instance);
+    assert_eq!(active.projection, started.projection);
+    assert!(active.repair_instance.is_none());
+    assert!(active.repair.is_none());
+    assert_eq!(
+        coordinator
+            .exact_instance(&owner, started.instance.id())
+            .unwrap(),
+        started.instance
+    );
+    assert_eq!(
+        replay_error(coordinator.exact_instance(&owner, started.instance.id() + 1)),
+        BrowserReplayError::StaleInstance
+    );
+
+    coordinator.cancel(&started.instance).unwrap();
+    assert!(coordinator.active_state(&owner).is_none());
+    let retained = coordinator
+        .exact_instance(&owner, started.instance.id())
+        .expect("terminal identity remains exact while retained");
+    assert_eq!(
+        coordinator.status(&retained).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+}
+
+#[test]
+fn replay_project_and_global_interruption_return_exact_cancelled_counts() {
+    let coordinator = BrowserReplayCoordinator::with_terminal_capacity(8);
+    let first = workspace("project-a", "first");
+    let second = workspace("project-a", "second");
+    let other = workspace("project-b", "other");
+    let first_replay = coordinator.start(first, plan_without_secrets()).unwrap();
+    let second_replay = coordinator.start(second, plan_without_secrets()).unwrap();
+    let other_replay = coordinator
+        .start(other.clone(), plan_without_secrets())
+        .unwrap();
+
+    assert_eq!(coordinator.interrupt_project("project-a"), 2);
+    assert_eq!(
+        coordinator.status(&first_replay.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+    assert_eq!(
+        coordinator.status(&second_replay.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+    assert_eq!(
+        coordinator.status(&other_replay.instance).unwrap().status,
+        BrowserReplayStatus::Pending
+    );
+    assert_eq!(coordinator.interrupt_project("project-a"), 0);
+    assert_eq!(coordinator.interrupt_all(), 1);
+    assert_eq!(coordinator.interrupt_all(), 0);
+    assert_eq!(
+        coordinator
+            .exact_instance(&other, other_replay.instance.id())
+            .and_then(|instance| coordinator.status(&instance))
+            .unwrap()
+            .status,
+        BrowserReplayStatus::Cancelled
+    );
+}
+
+#[test]
 fn replay_state_rejects_colliding_local_ids_from_an_unrelated_coordinator() {
     let left = BrowserReplayCoordinator::with_terminal_capacity(2);
     let right = BrowserReplayCoordinator::with_terminal_capacity(2);
@@ -962,7 +1033,7 @@ fn replay_state_terminal_cleanup_is_bounded_and_evicts_oldest_identity() {
 }
 
 #[test]
-fn replay_cancellation_uses_one_authority_across_running_and_locator_pause_gaps() {
+fn replay_cancellation_uses_one_authority_across_running_progress() {
     let coordinator = BrowserReplayCoordinator::with_terminal_capacity(8);
     let owner = workspace("project-running", "conversation-a");
     let started = coordinator
@@ -976,7 +1047,6 @@ fn replay_cancellation_uses_one_authority_across_running_and_locator_pause_gaps(
     coordinator.status(&started.instance).unwrap();
     coordinator.begin(&started.instance).unwrap();
     coordinator.advance_step(&started.instance, 0).unwrap();
-    coordinator.pause_locator_repair(&started.instance).unwrap();
     coordinator.status(&started.instance).unwrap();
     assert_eq!(started.lease.authority_id(), authority_id);
     assert!(started.lease.same_authority(&lease_clone));
@@ -1107,10 +1177,55 @@ fn replay_cancellation_does_not_relabel_completed_or_failed_replays_as_cancelled
 
 #[test]
 fn replay_scope_has_no_execution_or_platform_coupling() {
+    const APPROVED_PATH_IMPORT: &str = "use std::path::{Path, PathBuf};";
     let source = include_str!("../src/browser/replay.rs");
+    let source = source
+        .rsplit_once("mod tests {")
+        .map(|(production, _)| production)
+        .expect("replay source keeps one explicit test-module boundary");
+    let has_only_approved_std_path_import = |candidate: &str| {
+        candidate.matches(APPROVED_PATH_IMPORT).count() == 1
+            && !candidate
+                .replacen(APPROVED_PATH_IMPORT, "", 1)
+                .contains("std::path")
+    };
+    assert!(has_only_approved_std_path_import(source));
+    let component_mutation = source.replacen(
+        APPROVED_PATH_IMPORT,
+        &format!("{APPROVED_PATH_IMPORT}\nuse std::path::Component;"),
+        1,
+    );
+    assert!(
+        !has_only_approved_std_path_import(&component_mutation),
+        "the replay scope guard must reject additional std::path imports"
+    );
+    assert_eq!(
+        source.matches(APPROVED_PATH_IMPORT).count(),
+        1,
+        "replay keeps one explicit canonical-root path import"
+    );
+    let path_coupling = source
+        .lines()
+        .filter(|line| {
+            line.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| matches!(token, "Path" | "PathBuf"))
+        })
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        path_coupling,
+        [
+            "use std::path::{Path, PathBuf};",
+            "canonical_recipe_root: Arc<OnceLock<PathBuf>>,",
+            "authenticated_canonical_root: &Path,",
+            "pub(crate) fn bound_canonical_recipe_root(&self) -> Result<&Path, BrowserReplayError> {",
+            ".map(PathBuf::as_path)",
+            "canonical_recipe_root: Arc<OnceLock<PathBuf>>,",
+        ],
+        "replay path coupling is limited to the authenticated canonical-root binding"
+    );
     for forbidden in [
         "std::fs",
-        "std::path",
         "BrowserHost",
         "BrowserController",
         "BrowserOperationQueue",

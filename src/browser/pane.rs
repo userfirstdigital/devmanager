@@ -1,19 +1,24 @@
 use super::{
     model::browser_annotation_urls_equivalent, save_recipe, validate_browser_url,
-    BrowserAnnotation, BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserApprovalRequest,
-    BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserError, BrowserHostEvent,
-    BrowserJournalEntry, BrowserPageLoadState, BrowserRecipeAction, BrowserRecipeAssertion,
-    BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeV1,
-    BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait, BrowserRecordingActor,
-    BrowserRecordingError, BrowserRecordingMetadata, BrowserRecordingReview,
-    BrowserRecordingStatus, BrowserResponse, BrowserRevision, BrowserTabSnapshot, BrowserViewport,
-    BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
-    MAX_BROWSER_RECORDING_INPUTS,
+    BrowserAnnotation, BrowserAnnotationCandidate, BrowserAnnotationDraft, BrowserAnnotationKind,
+    BrowserApprovalRequest, BrowserBounds, BrowserCommand, BrowserDownloadState, BrowserElementRef,
+    BrowserError, BrowserHostEvent, BrowserJournalEntry, BrowserPageLoadState, BrowserRecipeAction,
+    BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind,
+    BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport, BrowserRecipeWait,
+    BrowserRecordingActor, BrowserRecordingError, BrowserRecordingMetadata, BrowserRecordingReview,
+    BrowserRecordingStatus, BrowserReplayInstance, BrowserReplayProjection,
+    BrowserReplayRepairCandidate, BrowserReplayRepairPhase, BrowserReplayRepairProjection,
+    BrowserReplaySecretError, BrowserReplaySecretSubmission, BrowserResponse, BrowserRevision,
+    BrowserTabSnapshot, BrowserViewport, BrowserWorkflowCoordinator, BrowserWorkspaceKey,
+    BrowserWorkspaceSnapshot, MAX_BROWSER_RECORDING_INPUTS, MAX_BROWSER_REPLAY_SECRET_INPUTS,
+    MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES, MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES,
 };
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use crate::theme;
 use gpui::{
@@ -28,6 +33,340 @@ pub enum BrowserPaneSurface {
     Claude,
     Codex,
     Ssh,
+}
+
+pub const BROWSER_REPLAY_SECRET_MASK: &str = "••••••••";
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserReplaySecretPromptOperation {
+    Installed,
+    Edited,
+    Backspaced,
+    Focused,
+    Submitted,
+    Cancelled,
+    RouteSwitched,
+    ReplayReplaced,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserReplaySecretPromptEvent {
+    pub workspace_key: BrowserWorkspaceKey,
+    pub instance_id: u64,
+    pub operation: BrowserReplaySecretPromptOperation,
+    pub input_name: Option<String>,
+    pub focused_input: Option<String>,
+    pub is_set: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserReplaySecretPromptProjection {
+    pub workspace_key: BrowserWorkspaceKey,
+    pub instance_id: u64,
+    pub input_names: Vec<String>,
+    pub focused_input: Option<String>,
+    pub is_set: Vec<bool>,
+}
+
+impl BrowserReplaySecretPromptProjection {
+    pub fn mask_for(&self, input_name: &str) -> Option<&'static str> {
+        self.input_names
+            .iter()
+            .position(|name| name == input_name)
+            .and_then(|index| self.is_set.get(index).copied())
+            .map(browser_replay_secret_mask)
+    }
+}
+
+pub fn browser_replay_secret_mask(is_set: bool) -> &'static str {
+    if is_set {
+        BROWSER_REPLAY_SECRET_MASK
+    } else {
+        ""
+    }
+}
+
+struct BrowserReplaySecretPromptValue {
+    name: String,
+    value: Zeroizing<String>,
+}
+
+impl BrowserReplaySecretPromptValue {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            value: Zeroizing::new(String::with_capacity(MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES)),
+        }
+    }
+
+    fn append(&mut self, text: &str) -> Result<(), BrowserReplaySecretError> {
+        let next_len = self
+            .value
+            .len()
+            .checked_add(text.len())
+            .ok_or(BrowserReplaySecretError::InvalidSubmission)?;
+        if next_len > MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES || next_len > self.value.capacity() {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        let pointer = self.value.as_ptr();
+        let capacity = self.value.capacity();
+        self.value.push_str(text);
+        debug_assert_eq!(self.value.as_ptr(), pointer);
+        debug_assert_eq!(self.value.capacity(), capacity);
+        Ok(())
+    }
+}
+
+pub struct BrowserReplaySecretPromptVault {
+    instance: BrowserReplayInstance,
+    values: Vec<BrowserReplaySecretPromptValue>,
+    focused_index: usize,
+}
+
+impl BrowserReplaySecretPromptVault {
+    pub fn install(
+        instance: BrowserReplayInstance,
+        input_names: Vec<String>,
+    ) -> Result<(Self, BrowserReplaySecretPromptEvent), BrowserReplaySecretError> {
+        if !valid_prompt_input_names(&input_names) {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        let values = input_names
+            .into_iter()
+            .map(BrowserReplaySecretPromptValue::new)
+            .collect();
+        let vault = Self {
+            instance,
+            values,
+            focused_index: 0,
+        };
+        let event = vault.event(BrowserReplaySecretPromptOperation::Installed, None, None);
+        Ok((vault, event))
+    }
+
+    pub fn projection(&self) -> BrowserReplaySecretPromptProjection {
+        BrowserReplaySecretPromptProjection {
+            workspace_key: self.instance.workspace_key().clone(),
+            instance_id: self.instance.id(),
+            input_names: self.values.iter().map(|entry| entry.name.clone()).collect(),
+            focused_input: self
+                .values
+                .get(self.focused_index)
+                .map(|entry| entry.name.clone()),
+            is_set: self
+                .values
+                .iter()
+                .map(|entry| !entry.value.is_empty())
+                .collect(),
+        }
+    }
+
+    pub fn edit(
+        &mut self,
+        instance: &BrowserReplayInstance,
+        input_name: &str,
+        text: &str,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        self.ensure_exact(instance)?;
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        let index = self
+            .input_index(input_name)
+            .ok_or(BrowserReplaySecretError::InvalidSubmission)?;
+        let entry = &mut self.values[index];
+        entry.append(text)?;
+        self.focused_index = index;
+        Ok(self.event(
+            BrowserReplaySecretPromptOperation::Edited,
+            Some(input_name),
+            Some(true),
+        ))
+    }
+
+    pub fn backspace(
+        &mut self,
+        instance: &BrowserReplayInstance,
+        input_name: &str,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        self.ensure_exact(instance)?;
+        let index = self
+            .input_index(input_name)
+            .ok_or(BrowserReplaySecretError::InvalidSubmission)?;
+        let entry = &mut self.values[index];
+        entry.value.pop();
+        let is_set = !entry.value.is_empty();
+        self.focused_index = index;
+        Ok(self.event(
+            BrowserReplaySecretPromptOperation::Backspaced,
+            Some(input_name),
+            Some(is_set),
+        ))
+    }
+
+    pub fn focus(
+        &mut self,
+        instance: &BrowserReplayInstance,
+        input_name: &str,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        self.ensure_exact(instance)?;
+        let index = self
+            .input_index(input_name)
+            .ok_or(BrowserReplaySecretError::InvalidSubmission)?;
+        self.focused_index = index;
+        Ok(self.event(
+            BrowserReplaySecretPromptOperation::Focused,
+            Some(input_name),
+            Some(!self.values[index].value.is_empty()),
+        ))
+    }
+
+    pub fn submit(
+        mut self,
+        instance: &BrowserReplayInstance,
+    ) -> Result<
+        (
+            BrowserReplaySecretSubmission,
+            BrowserReplaySecretPromptEvent,
+        ),
+        BrowserReplaySecretError,
+    > {
+        self.ensure_exact(instance)?;
+        if self.values.iter().any(|entry| entry.value.is_empty()) {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        let event = self.event(BrowserReplaySecretPromptOperation::Submitted, None, None);
+        let values = self
+            .values
+            .iter_mut()
+            .map(|entry| (entry.name.clone(), std::mem::take(&mut *entry.value)))
+            .collect();
+        Ok((
+            BrowserReplaySecretSubmission::from_user_prompt(values),
+            event,
+        ))
+    }
+
+    pub fn cancel(
+        self,
+        instance: &BrowserReplayInstance,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        self.consume_event(instance, BrowserReplaySecretPromptOperation::Cancelled)
+    }
+
+    pub fn route_switch(
+        self,
+        instance: &BrowserReplayInstance,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        self.consume_event(instance, BrowserReplaySecretPromptOperation::RouteSwitched)
+    }
+
+    pub fn replay_replaced(
+        self,
+        instance: &BrowserReplayInstance,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        self.consume_event(instance, BrowserReplaySecretPromptOperation::ReplayReplaced)
+    }
+
+    pub fn same_instance(&self, instance: &BrowserReplayInstance) -> bool {
+        self.instance == *instance
+    }
+
+    pub fn workspace_key(&self) -> &BrowserWorkspaceKey {
+        self.instance.workspace_key()
+    }
+
+    pub(crate) fn instance(&self) -> &BrowserReplayInstance {
+        &self.instance
+    }
+
+    fn consume_event(
+        self,
+        instance: &BrowserReplayInstance,
+        operation: BrowserReplaySecretPromptOperation,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        self.ensure_exact(instance)?;
+        Ok(self.event(operation, None, None))
+    }
+
+    fn ensure_exact(
+        &self,
+        instance: &BrowserReplayInstance,
+    ) -> Result<(), BrowserReplaySecretError> {
+        if self.instance != *instance {
+            return Err(BrowserReplaySecretError::StaleAuthority);
+        }
+        Ok(())
+    }
+
+    fn input_index(&self, input_name: &str) -> Option<usize> {
+        self.values
+            .iter()
+            .position(|entry| entry.name == input_name)
+    }
+
+    fn event(
+        &self,
+        operation: BrowserReplaySecretPromptOperation,
+        input_name: Option<&str>,
+        is_set: Option<bool>,
+    ) -> BrowserReplaySecretPromptEvent {
+        BrowserReplaySecretPromptEvent {
+            workspace_key: self.instance.workspace_key().clone(),
+            instance_id: self.instance.id(),
+            operation,
+            input_name: input_name.map(str::to_string),
+            focused_input: self
+                .values
+                .get(self.focused_index)
+                .map(|entry| entry.name.clone()),
+            is_set,
+        }
+    }
+}
+
+fn valid_prompt_input_names(input_names: &[String]) -> bool {
+    if input_names.is_empty() || input_names.len() > MAX_BROWSER_REPLAY_SECRET_INPUTS {
+        return false;
+    }
+    let mut names = HashSet::with_capacity(input_names.len());
+    input_names.iter().all(|name| {
+        !name.is_empty()
+            && name.len() <= MAX_BROWSER_REPLAY_SECRET_INPUT_NAME_BYTES
+            && name.trim() == name
+            && !name.chars().any(char::is_control)
+            && !super::automation::browser_text_contains_secret(name)
+            && names.insert(name.as_str())
+    })
+}
+
+#[cfg(test)]
+mod replay_secret_prompt_memory_tests {
+    use super::{BrowserReplaySecretPromptValue, MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES};
+
+    #[test]
+    fn secret_prompt_value_preallocates_once_and_never_moves_while_filling_to_limit() {
+        let mut value = BrowserReplaySecretPromptValue::new("credential".to_string());
+        let initial_pointer = value.value.as_ptr();
+        let initial_capacity = value.value.capacity();
+        assert!(initial_capacity >= MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES);
+
+        while value.value.len() < MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES {
+            let remaining = MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES - value.value.len();
+            let chunk = "x".repeat(remaining.min(257));
+            value.append(&chunk).expect("bounded append");
+            assert_eq!(value.value.as_ptr(), initial_pointer);
+            assert_eq!(value.value.capacity(), initial_capacity);
+        }
+
+        assert_eq!(value.value.len(), MAX_BROWSER_REPLAY_SECRET_VALUE_BYTES);
+        assert!(value.append("x").is_err());
+        assert_eq!(value.value.as_ptr(), initial_pointer);
+        assert_eq!(value.value.capacity(), initial_capacity);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -918,6 +1257,31 @@ pub enum BrowserPaneAction {
     FocusAnnotation,
     EditAddress(String),
     SubmitAddress,
+    FocusReplaySecret {
+        workspace_key: BrowserWorkspaceKey,
+        instance_id: u64,
+        input_name: String,
+    },
+    SubmitReplaySecrets {
+        workspace_key: BrowserWorkspaceKey,
+        instance_id: u64,
+    },
+    CancelReplaySecrets {
+        workspace_key: BrowserWorkspaceKey,
+        instance_id: u64,
+    },
+    CancelReplay {
+        instance_id: u64,
+    },
+    BeginReplayRepairSelection {
+        instance_id: u64,
+        repair_id: u64,
+    },
+    ApplyReplayRepair {
+        instance_id: u64,
+        repair_id: u64,
+        resume: bool,
+    },
     SetViewport(BrowserViewportPreset),
     ToggleAnnotation,
     SaveAnnotation,
@@ -951,6 +1315,54 @@ pub enum BrowserPaneAction {
     ClearProjectProfile,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrowserReplayPaneProjection {
+    pub replay: BrowserReplayProjection,
+    pub repair: Option<BrowserReplayRepairProjection>,
+    pub selecting_replacement: bool,
+    pub repair_apply_ready: bool,
+}
+
+impl fmt::Debug for BrowserReplayPaneProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let repair = self.repair.as_ref();
+        formatter
+            .debug_struct("BrowserReplayPaneProjection")
+            .field("recipe_id", &self.replay.recipe_id)
+            .field("status", &self.replay.status)
+            .field("current_step_index", &self.replay.current_step_index)
+            .field("total_steps", &self.replay.total_steps)
+            .field(
+                "unresolved_secret_inputs",
+                &self.replay.unresolved_secret_inputs,
+            )
+            .field("repair_step_id", &repair.map(|repair| &repair.step_id))
+            .field("repair_step_index", &repair.map(|repair| repair.step_index))
+            .field(
+                "repair_locator_slot",
+                &repair.map(|repair| repair.locator_slot),
+            )
+            .field("repair_phase", &repair.map(|repair| repair.phase))
+            .field("repair_snapshot_available", &repair.is_some())
+            .field("repair_screenshot_available", &repair.is_some())
+            .field("selecting_replacement", &self.selecting_replacement)
+            .field("repair_apply_ready", &self.repair_apply_ready)
+            .finish()
+    }
+}
+
+impl BrowserPaneAction {
+    pub fn is_annotation_editor_action(&self) -> bool {
+        matches!(
+            self,
+            Self::FocusAnnotation
+                | Self::ToggleAnnotation
+                | Self::SaveAnnotation
+                | Self::CancelAnnotation
+        )
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct BrowserPaneTransient {
     pub address_draft: Option<String>,
@@ -968,6 +1380,36 @@ pub struct BrowserPaneTransient {
     pub workflow_review: Option<BrowserWorkflowReviewProjection>,
     pub workflow_preview: Option<String>,
     pub workflow_editor: Option<BrowserWorkflowReviewEditor>,
+    pub replay_secret_prompt: Option<BrowserReplaySecretPromptProjection>,
+    pub replay: Option<BrowserReplayPaneProjection>,
+}
+
+impl fmt::Debug for BrowserPaneTransient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserPaneTransient")
+            .field("address_draft_set", &self.address_draft.is_some())
+            .field("address_cursor", &self.address_cursor)
+            .field("address_focused", &self.address_focused)
+            .field("loading", &self.loading)
+            .field("diagnostic_set", &self.diagnostic.is_some())
+            .field("action_status_set", &self.action_status.is_some())
+            .field("divider_dragging", &self.divider_dragging)
+            .field("annotation_mode", &self.annotation_mode)
+            .field("annotation_draft_set", &self.annotation_draft.is_some())
+            .field(
+                "annotation_comment_set",
+                &!self.annotation_comment.is_empty(),
+            )
+            .field("annotation_cursor", &self.annotation_cursor)
+            .field("annotation_focused", &self.annotation_focused)
+            .field("workflow_review_set", &self.workflow_review.is_some())
+            .field("workflow_preview_set", &self.workflow_preview.is_some())
+            .field("workflow_editor_set", &self.workflow_editor.is_some())
+            .field("replay_secret_prompt", &self.replay_secret_prompt)
+            .field("replay", &self.replay)
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -994,6 +1436,43 @@ pub struct BrowserPaneModel {
     pub workflow_review: Option<BrowserWorkflowReviewProjection>,
     pub workflow_preview: Option<String>,
     pub workflow_editor: Option<BrowserWorkflowReviewEditor>,
+    pub replay_secret_prompt: Option<BrowserReplaySecretPromptProjection>,
+    pub replay: Option<BrowserReplayPaneProjection>,
+}
+
+impl fmt::Debug for BrowserPaneModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserPaneModel")
+            .field("workspace_key", &self.workspace_key)
+            .field("eligible", &self.eligible)
+            .field("pane_open", &self.pane_open)
+            .field("split_percent", &self.split_percent)
+            .field("tab_count", &self.tabs.len())
+            .field("selected_tab_id", &self.selected_tab_id)
+            .field("address_draft_set", &!self.address_draft.is_empty())
+            .field("address_cursor", &self.address_cursor)
+            .field("address_focused", &self.address_focused)
+            .field("loading", &self.loading)
+            .field("diagnostic_set", &self.diagnostic.is_some())
+            .field("action_status_set", &self.action_status.is_some())
+            .field("journal_entry_count", &self.journal_entries.len())
+            .field("divider_dragging", &self.divider_dragging)
+            .field("annotation_mode", &self.annotation_mode)
+            .field("annotation_draft_set", &self.annotation_draft.is_some())
+            .field(
+                "annotation_comment_set",
+                &!self.annotation_comment.is_empty(),
+            )
+            .field("annotation_cursor", &self.annotation_cursor)
+            .field("annotation_focused", &self.annotation_focused)
+            .field("workflow_review_set", &self.workflow_review.is_some())
+            .field("workflow_preview_set", &self.workflow_preview.is_some())
+            .field("workflow_editor_set", &self.workflow_editor.is_some())
+            .field("replay_secret_prompt", &self.replay_secret_prompt)
+            .field("replay", &self.replay)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1108,6 +1587,7 @@ impl BrowserPaneModel {
         let annotation_cursor = transient
             .annotation_cursor
             .min(annotation_comment.chars().count());
+        let annotation_input_available = transient.replay_secret_prompt.is_none();
         Self {
             workspace_key,
             eligible: browser_pane_eligible(context),
@@ -1132,12 +1612,49 @@ impl BrowserPaneModel {
             annotation_draft: transient.annotation_draft,
             annotation_comment,
             annotation_cursor,
-            annotation_focused: transient.annotation_focused,
+            annotation_focused: transient.annotation_focused && annotation_input_available,
             workflow_review: transient.workflow_review,
             workflow_preview: transient.workflow_preview,
             workflow_editor: transient.workflow_editor,
+            replay_secret_prompt: transient.replay_secret_prompt,
+            replay: transient.replay,
         }
     }
+
+    pub fn annotation_editor_visible(&self) -> bool {
+        self.annotation_draft.is_some() && self.replay_secret_prompt.is_none()
+    }
+
+    pub fn page_surface_visible(&self) -> bool {
+        !matches!(
+            self.workflow_review.as_ref().map(|review| &review.state),
+            Some(BrowserWorkflowReviewUiState::Review { .. })
+        ) && self.replay_secret_prompt.is_none()
+    }
+}
+
+pub fn browser_replay_repair_candidate_from_annotation(
+    candidate: &BrowserAnnotationCandidate,
+    expected_revision: BrowserRevision,
+) -> Result<BrowserReplayRepairCandidate, BrowserError> {
+    candidate.validate()?;
+    if candidate.kind != BrowserAnnotationKind::Element {
+        return Err(BrowserError::InvalidAnnotation {
+            field: "kind".to_string(),
+            message: "repair replacement must be a semantic element".to_string(),
+        });
+    }
+    if candidate.revision != expected_revision {
+        return Err(BrowserError::StaleReference {
+            expected: expected_revision,
+            actual: candidate.revision,
+        });
+    }
+    Ok(BrowserReplayRepairCandidate::new(BrowserElementRef {
+        revision: candidate.revision,
+        locator: candidate.locator.clone(),
+        backend_node_id: None,
+    }))
 }
 
 pub fn selected_browser_tab_id(snapshot: &BrowserWorkspaceSnapshot) -> Option<&str> {
@@ -1207,7 +1724,21 @@ pub fn browser_action_plan(
         }
         BrowserPaneAction::Collapse => vec![BrowserCommand::SetPaneOpen { open: false }],
         BrowserPaneAction::CreateTab => vec![BrowserCommand::CreateTab { url: None }],
-        BrowserPaneAction::SelectTab(tab_id) => vec![BrowserCommand::SelectTab { tab_id }],
+        BrowserPaneAction::SelectTab(tab_id) => {
+            let snapshot = snapshot.ok_or_else(|| BrowserError::InvalidInvocation {
+                field: "tabId".to_string(),
+            })?;
+            if !snapshot.tabs.iter().any(|tab| tab.id == tab_id) {
+                return Err(BrowserError::InvalidInvocation {
+                    field: "tabId".to_string(),
+                });
+            }
+            if snapshot.selected_tab_id.as_deref() == Some(tab_id.as_str()) {
+                Vec::new()
+            } else {
+                vec![BrowserCommand::SelectTab { tab_id }]
+            }
+        }
         BrowserPaneAction::CloseTab(tab_id) => vec![BrowserCommand::CloseTab { tab_id }],
         BrowserPaneAction::Back => vec![BrowserCommand::Back {
             tab_id: selected_tab(snapshot)?.to_string(),
@@ -1249,6 +1780,12 @@ pub fn browser_action_plan(
         | BrowserPaneAction::MutateRecordingReview { .. }
         | BrowserPaneAction::FocusRecordingReviewField { .. }
         | BrowserPaneAction::CancelRecordingReviewEdit => Vec::new(),
+        BrowserPaneAction::FocusReplaySecret { .. }
+        | BrowserPaneAction::SubmitReplaySecrets { .. }
+        | BrowserPaneAction::CancelReplaySecrets { .. }
+        | BrowserPaneAction::CancelReplay { .. }
+        | BrowserPaneAction::BeginReplayRepairSelection { .. }
+        | BrowserPaneAction::ApplyReplayRepair { .. } => Vec::new(),
         BrowserPaneAction::SaveAnnotation | BrowserPaneAction::CancelAnnotation => Vec::new(),
         BrowserPaneAction::DividerBegin { .. }
         | BrowserPaneAction::DividerUpdate { .. }
@@ -1686,19 +2223,27 @@ pub struct BrowserPaneActions {
     pub on_action:
         Arc<dyn Fn(BrowserPaneAction) -> Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>>,
     pub on_address_key: Box<dyn Fn(&KeyDownEvent, &mut Window, &mut App)>,
+    pub on_replay_secret_key: Box<dyn Fn(&KeyDownEvent, &mut Window, &mut App)>,
     pub on_annotation_key: Box<dyn Fn(&KeyDownEvent, &mut Window, &mut App)>,
     pub on_workflow_key: Box<dyn Fn(&KeyDownEvent, &mut Window, &mut App)>,
     pub on_page_bounds: Arc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>,
 }
 
+struct BrowserReplaySecretPromptRenderInput<'a> {
+    name: &'a str,
+    is_set: bool,
+}
+
 pub fn render_browser_pane(
     model: BrowserPaneModel,
     address_focus: FocusHandle,
+    replay_secret_focus: FocusHandle,
     annotation_focus: FocusHandle,
     workflow_focus: FocusHandle,
     actions: BrowserPaneActions,
 ) -> impl IntoElement {
     let action = actions.on_action.clone();
+    let show_page_surface = model.page_surface_visible();
     let selected_viewport = model
         .selected_tab_id
         .as_deref()
@@ -1790,8 +2335,11 @@ pub fn render_browser_pane(
         model.address_draft.clone()
     };
     let page_bounds = actions.on_page_bounds.clone();
-    let annotation_editor =
-        model.annotation_draft.as_ref().map(|draft| {
+    let annotation_editor = model
+        .annotation_draft
+        .as_ref()
+        .filter(|_| model.annotation_editor_visible())
+        .map(|draft| {
             let cursor_byte = model
                 .annotation_comment
                 .char_indices()
@@ -1877,6 +2425,230 @@ pub fn render_browser_pane(
                 )
                 .into_any_element()
         });
+    let replay_panel = model.replay.as_ref().map(|projection| {
+        let instance_id = projection.replay.instance_id;
+        let current_step = if projection.replay.total_steps == 0 {
+            0
+        } else {
+            projection
+                .replay
+                .current_step_index
+                .saturating_add(1)
+                .min(projection.replay.total_steps)
+        };
+        let unresolved = (!projection.replay.unresolved_secret_inputs.is_empty()).then(|| {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::WARNING_TEXT))
+                .child(SharedString::from(format!(
+                    "Secrets needed: {}",
+                    projection.replay.unresolved_secret_inputs.join(", ")
+                )))
+        });
+        let repair_summary = projection.repair.as_ref().map(|repair| {
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(SharedString::from(format!(
+                    "Repair step {} ({:?}) - {:?} - snapshot and screenshot ready",
+                    repair.step_index.saturating_add(1),
+                    repair.locator_slot,
+                    repair.phase
+                )))
+        });
+        let repair_controls = projection.repair.as_ref().map(|repair| {
+            let repair_id = repair.repair_id;
+            let mut controls = vec![browser_button(
+                if projection.selecting_replacement {
+                    "Selecting replacement..."
+                } else {
+                    "Select replacement"
+                },
+                projection.selecting_replacement,
+                false,
+                action(BrowserPaneAction::BeginReplayRepairSelection {
+                    instance_id,
+                    repair_id,
+                }),
+            )
+            .into_any_element()];
+            if projection.repair_apply_ready
+                && matches!(
+                    repair.phase,
+                    BrowserReplayRepairPhase::Previewed | BrowserReplayRepairPhase::Applied
+                )
+            {
+                if repair.phase == BrowserReplayRepairPhase::Previewed {
+                    controls.push(
+                        browser_button(
+                            "Save repair",
+                            false,
+                            false,
+                            action(BrowserPaneAction::ApplyReplayRepair {
+                                instance_id,
+                                repair_id,
+                                resume: false,
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                controls.push(
+                    browser_button(
+                        "Save and retry",
+                        false,
+                        false,
+                        action(BrowserPaneAction::ApplyReplayRepair {
+                            instance_id,
+                            repair_id,
+                            resume: true,
+                        }),
+                    )
+                    .into_any_element(),
+                );
+            }
+            div().flex().items_center().gap(px(4.0)).children(controls)
+        });
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .p(px(6.0))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER_PRIMARY))
+            .bg(rgb(theme::PANEL_HEADER_BG))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(SharedString::from(format!(
+                                "Replay {} - {:?} - step {current_step}/{}",
+                                projection.replay.recipe_id,
+                                projection.replay.status,
+                                projection.replay.total_steps
+                            ))),
+                    )
+                    .child(browser_button(
+                        "Cancel replay",
+                        false,
+                        true,
+                        action(BrowserPaneAction::CancelReplay { instance_id }),
+                    )),
+            )
+            .children(unresolved)
+            .children(repair_summary)
+            .children(repair_controls)
+            .into_any_element()
+    });
+    let replay_secret_prompt_panel = model.replay_secret_prompt.as_ref().map(|prompt| {
+        let workspace_key = prompt.workspace_key.clone();
+        let instance_id = prompt.instance_id;
+        let input_rows = prompt
+            .input_names
+            .iter()
+            .zip(prompt.is_set.iter().copied())
+            .map(|(name, is_set)| {
+                let input = BrowserReplaySecretPromptRenderInput {
+                    name: name.as_str(),
+                    is_set,
+                };
+                let focused = prompt.focused_input.as_deref() == Some(input.name);
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .p(px(5.0))
+                    .border_1()
+                    .border_color(rgb(if focused {
+                        theme::PRIMARY
+                    } else {
+                        theme::BORDER_PRIMARY
+                    }))
+                    .bg(rgb(theme::APP_BG))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        action(BrowserPaneAction::FocusReplaySecret {
+                            workspace_key: workspace_key.clone(),
+                            instance_id,
+                            input_name: input.name.to_string(),
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(140.0))
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(SharedString::from(input.name.to_string())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(theme::TEXT_PRIMARY))
+                            .child(SharedString::from(
+                                browser_replay_secret_mask(input.is_set).to_string(),
+                            )),
+                    )
+                    .into_any_element()
+            });
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(10.0))
+            .bg(rgb(theme::PANEL_BG))
+            .track_focus(&replay_secret_focus)
+            .on_key_down(actions.on_replay_secret_key)
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .child("Enter replay secrets"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("Values stay in volatile native memory and are never shown."),
+            )
+            .children(input_rows)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(browser_button(
+                        "Submit",
+                        false,
+                        false,
+                        action(BrowserPaneAction::SubmitReplaySecrets {
+                            workspace_key: workspace_key.clone(),
+                            instance_id,
+                        }),
+                    ))
+                    .child(browser_button(
+                        "Cancel",
+                        false,
+                        true,
+                        action(BrowserPaneAction::CancelReplaySecrets {
+                            workspace_key,
+                            instance_id,
+                        }),
+                    )),
+            )
+            .into_any_element()
+    });
     let workflow_controls = match model.workflow_review.as_ref().map(|review| &review.state) {
         Some(BrowserWorkflowReviewUiState::Recording { instance_id }) => vec![browser_button(
             "Stop Recording",
@@ -1905,7 +2677,11 @@ pub fn render_browser_pane(
         .into_any_element()],
         None => Vec::new(),
     };
-    let workflow_review_panel = model.workflow_review.as_ref().and_then(|review| {
+    let workflow_review = model
+        .workflow_review
+        .as_ref()
+        .filter(|_| model.replay_secret_prompt.is_none());
+    let workflow_review_panel = workflow_review.and_then(|review| {
         let BrowserWorkflowReviewUiState::Review { instance_id } = &review.state else {
             return None;
         };
@@ -2422,7 +3198,7 @@ pub fn render_browser_pane(
                 .into_any_element(),
         )
     });
-    let page_surface = workflow_review_panel.is_none().then(|| {
+    let page_surface = show_page_surface.then(|| {
         div()
             .flex_1()
             .min_h(px(0.0))
@@ -2617,8 +3393,10 @@ pub fn render_browser_pane(
                         .unwrap_or_else(|| "Browser ready".to_string())
                 }))),
         )
+        .children(replay_panel)
         .child(div().flex_none().flex().flex_col().children(journal_rows))
         .children(annotation_editor)
+        .children(replay_secret_prompt_panel)
         .children(workflow_review_panel)
         .children(page_surface)
 }

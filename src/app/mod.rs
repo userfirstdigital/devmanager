@@ -5,15 +5,19 @@ use crate::assets::AppAssets;
 use crate::browser::{
     browser_action_plan, browser_annotation_preview_plan, browser_command_channel,
     browser_event_plan, browser_host_reconcile_plan, browser_pane_open_fallback,
-    browser_response_sync, browser_settings_plan, browser_workflow_review_editor_for_field,
-    browser_workflow_review_editor_mutation, calculate_browser_split, render_browser_pane,
-    route_browser_request, BrowserAnnotation, BrowserAttachmentBroker, BrowserAttachmentProjection,
-    BrowserBounds, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
-    BrowserCommandRequest, BrowserError, BrowserGatewayHandle, BrowserHostVisibility,
-    BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
-    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserResponse,
-    BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    browser_replay_repair_candidate_from_annotation, browser_response_sync, browser_settings_plan,
+    browser_workflow_review_editor_for_field, browser_workflow_review_editor_mutation,
+    calculate_browser_split, render_browser_pane, route_browser_request, BrowserActionPlan,
+    BrowserAnnotation, BrowserAppExitDisposition, BrowserAttachmentBroker,
+    BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandInbox, BrowserCommandRequest, BrowserError, BrowserGatewayHandle,
+    BrowserHostVisibility, BrowserInvocationActor, BrowserInvocationContext, BrowserPaneAction,
+    BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel,
+    BrowserPaneSurface, BrowserPaneTransient, BrowserReplayInstance, BrowserReplayPaneProjection,
+    BrowserReplaySecretError, BrowserReplaySecretPromptEvent, BrowserReplaySecretPromptVault,
+    BrowserReplaySecretSubmission, BrowserReplayStatus, BrowserResponse, BrowserRevision,
+    BrowserRisk, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -117,13 +121,6 @@ pub fn run() {
     Application::new()
         .with_assets(AppAssets::new())
         .run(|cx: &mut App| {
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-
             let saved_bounds = SessionManager::new()
                 .load_workspace()
                 .ok()
@@ -154,10 +151,24 @@ pub fn run() {
                 },
                 |window, cx| {
                     let shell = cx.new(NativeShell::new);
+                    let window_lifetime = shell.read(cx).browser_host.window_lifetime_fence();
+                    let closed_window_lifetime = window_lifetime.clone();
+                    cx.on_window_closed(move |cx| {
+                        let centralized_exit = closed_window_lifetime.teardown_ready();
+                        closed_window_lifetime.assert_drained_after_window_close();
+                        if !centralized_exit && cx.windows().is_empty() {
+                            execute_app_termination(PendingAppTermination::Quit, cx);
+                        }
+                    })
+                    .detach();
                     let close_handler = shell.clone();
+                    let closing_window_lifetime = window_lifetime;
                     window.on_window_should_close(cx, move |window, cx| {
-                        close_handler
-                            .update(cx, |shell, cx| shell.handle_window_should_close(window, cx))
+                        closing_window_lifetime.guard_window_close(|| {
+                            close_handler.update(cx, |shell, cx| {
+                                shell.handle_window_should_close(window, cx)
+                            })
+                        })
                     });
                     let _ = shell.update(cx, |shell, cx| {
                         shell.register_focus_observers(window, cx);
@@ -176,6 +187,77 @@ enum ActionableNotice {
     ForceQuit { message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAppTermination {
+    Quit,
+    ExitAfterUpdate,
+}
+
+impl PendingAppTermination {
+    fn coalesce(self, requested: Self) -> Self {
+        if matches!(self, Self::ExitAfterUpdate) || matches!(requested, Self::ExitAfterUpdate) {
+            Self::ExitAfterUpdate
+        } else {
+            Self::Quit
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownFailureDisposition {
+    IgnoreStale,
+    PreservePendingTermination,
+    ResumeInteractiveShutdown,
+}
+
+fn shutdown_completion_is_current(pending_op_id: Option<u64>, completion_op_id: u64) -> bool {
+    pending_op_id == Some(completion_op_id)
+}
+
+fn shutdown_failure_disposition(
+    pending_op_id: Option<u64>,
+    completion_op_id: u64,
+    pending_termination: Option<PendingAppTermination>,
+) -> ShutdownFailureDisposition {
+    if !shutdown_completion_is_current(pending_op_id, completion_op_id) {
+        ShutdownFailureDisposition::IgnoreStale
+    } else if pending_termination.is_some() {
+        ShutdownFailureDisposition::PreservePendingTermination
+    } else {
+        ShutdownFailureDisposition::ResumeInteractiveShutdown
+    }
+}
+
+fn retire_pending_shutdown_for_forced_termination(
+    pending_op_id: &mut Option<u64>,
+    pending_window_close: &mut bool,
+) {
+    *pending_op_id = None;
+    *pending_window_close = false;
+}
+
+fn promote_pending_app_termination_for_update(pending: &mut Option<PendingAppTermination>) {
+    if let Some(current) = *pending {
+        *pending = Some(current.coalesce(PendingAppTermination::ExitAfterUpdate));
+    }
+}
+
+fn take_ready_app_termination(
+    pending: &mut Option<PendingAppTermination>,
+    native_window_teardown_ready: bool,
+) -> Option<PendingAppTermination> {
+    native_window_teardown_ready
+        .then(|| pending.take())
+        .flatten()
+}
+
+fn execute_app_termination(termination: PendingAppTermination, cx: &App) {
+    match termination {
+        PendingAppTermination::Quit => cx.quit(),
+        PendingAppTermination::ExitAfterUpdate => std::process::exit(0),
+    }
+}
+
 struct NativeShell {
     state: AppState,
     session_manager: SessionManager,
@@ -188,7 +270,11 @@ struct NativeShell {
     browser_tasks_started: bool,
     browser_ui: HashMap<BrowserWorkspaceKey, BrowserWorkspaceUiState>,
     browser_workflow_route: Option<BrowserWorkspaceKey>,
+    browser_replay_secret_prompt: Option<BrowserReplaySecretPromptVault>,
+    browser_replay_secret_submitter: Option<BrowserReplaySecretSubmitter>,
+    browser_replay_repair_selection: Option<BrowserReplayRepairSelection>,
     browser_address_focus: FocusHandle,
+    browser_replay_secret_focus: FocusHandle,
     browser_annotation_focus: FocusHandle,
     browser_workflow_focus: FocusHandle,
     browser_split_bounds: Option<BrowserBounds>,
@@ -246,7 +332,20 @@ struct NativeShell {
     pending_shutdown_op_id: Option<u64>,
     pending_window_close: bool,
     pending_install_update: Option<String>,
+    pending_app_termination: Option<PendingAppTermination>,
     window_subscriptions: Vec<Subscription>,
+}
+
+type BrowserReplaySecretSubmitter =
+    Box<dyn FnOnce(BrowserReplaySecretSubmission) -> Result<(), BrowserReplaySecretError> + Send>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserReplayRepairSelection {
+    workspace_key: BrowserWorkspaceKey,
+    instance_id: u64,
+    repair_id: u64,
+    tab_id: String,
+    revision: BrowserRevision,
 }
 
 struct NativeDialogPauseGuard {
@@ -907,7 +1006,7 @@ impl BrowserAttachmentProjectionSink for NativeShellBrowserAttachmentProjectionS
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
-        let (browser_host, browser_app_config_dir, browser_config_diagnostic) =
+        let (mut browser_host, browser_app_config_dir, browser_config_diagnostic) =
             match crate::persistence::app_config_dir() {
                 Ok(app_config_dir) => {
                     let browser_host = BrowserWebViewHost::new(&app_config_dir);
@@ -927,6 +1026,7 @@ impl NativeShell {
                     )
                 }
             };
+        browser_host.attach_foreground_executor(cx.foreground_executor().clone());
         let (browser_bridge, browser_inbox) = browser_command_channel(64);
         let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
@@ -1147,7 +1247,11 @@ impl NativeShell {
             browser_tasks_started: false,
             browser_ui: HashMap::new(),
             browser_workflow_route: None,
+            browser_replay_secret_prompt: None,
+            browser_replay_secret_submitter: None,
+            browser_replay_repair_selection: None,
             browser_address_focus: cx.focus_handle(),
+            browser_replay_secret_focus: cx.focus_handle(),
             browser_annotation_focus: cx.focus_handle(),
             browser_workflow_focus: cx.focus_handle(),
             browser_split_bounds: None,
@@ -1205,6 +1309,7 @@ impl NativeShell {
             pending_shutdown_op_id: None,
             pending_window_close: false,
             pending_install_update: None,
+            pending_app_termination: None,
             window_subscriptions: Vec::new(),
         };
 
@@ -1301,10 +1406,26 @@ impl NativeShell {
             .collect()
     }
 
+    fn active_open_browser_route(&self) -> Option<BrowserWorkspaceKey> {
+        (self.remote_mode.is_none()
+            && self.state.settings().browser_enabled
+            && self.browser_host.status().available)
+            .then(|| self.active_browser_workspace())
+            .flatten()
+            .and_then(|(workspace_key, snapshot)| snapshot.pane_open.then_some(workspace_key))
+    }
+
     fn browser_route_is_open(&self, workspace_key: &BrowserWorkspaceKey) -> bool {
-        self.state
-            .find_ai_tab(&workspace_key.ai_tab_id)
-            .is_some_and(|tab| tab.project_id == workspace_key.project_id)
+        self.active_open_browser_route().as_ref() == Some(workspace_key)
+    }
+
+    fn browser_route_can_be_opened(&self, workspace_key: &BrowserWorkspaceKey) -> bool {
+        self.remote_mode.is_none()
+            && self.state.settings().browser_enabled
+            && self.browser_host.status().available
+            && self
+                .active_browser_workspace()
+                .is_some_and(|(active_key, _)| active_key == *workspace_key)
     }
 
     fn dispatch_browser_command(
@@ -1313,32 +1434,59 @@ impl NativeShell {
         command: BrowserCommand,
         window: &Window,
     ) -> Result<BrowserResponse, BrowserError> {
-        if !self.browser_route_is_open(workspace_key) {
+        let opens_selected_route = matches!(
+            command,
+            BrowserCommand::Ensure { .. } | BrowserCommand::SetPaneOpen { open: true }
+        ) && self.browser_route_can_be_opened(workspace_key);
+        if !self.browser_route_is_open(workspace_key) && !opens_selected_route {
             return Err(BrowserError::CrashedView {
-                message: "browser command route does not match an open AI conversation".to_string(),
+                message: "browser command route is not the active visible local AI conversation"
+                    .to_string(),
             });
         }
         let open_workspaces = self.open_browser_workspace_keys();
-        let browser_host = &mut self.browser_host;
-        let result = self.browser_bridge.with_locked_host_controls_for_command(
+        let active_browser_route = self.active_open_browser_route();
+        let browser_bridge = self.browser_bridge.clone();
+        let event_bridge = browser_bridge.clone();
+        let result = browser_bridge.with_locked_host_work_for_command(
             workspace_key,
             &command,
-            |controls, lifecycle_requests| {
+            |controls, lifecycle_requests, repair_cleanups| {
+                self.browser_host
+                    .publish_pending_user_input_cutoffs(|event, _state| {
+                        event_bridge.observe_host_event_under_host_control_barrier(event);
+                    });
+                match &command {
+                    BrowserCommand::Stop { .. }
+                    | BrowserCommand::CloseTab { .. }
+                    | BrowserCommand::ResetWorkspace => {
+                        self.retire_browser_replay_ui_after_interrupt(workspace_key);
+                    }
+                    BrowserCommand::ClearProjectProfile => {
+                        for key in open_workspaces
+                            .iter()
+                            .filter(|key| key.project_id == workspace_key.project_id)
+                        {
+                            self.retire_browser_replay_ui_after_interrupt(key);
+                        }
+                    }
+                    _ => {}
+                }
+                let browser_host = &mut self.browser_host;
                 for control in controls {
                     browser_host.handle_control(control);
                 }
+                for cleanup in repair_cleanups {
+                    browser_host.handle_repair_highlight_cleanup(window, cleanup);
+                }
                 for request in lifecycle_requests {
-                    if open_workspaces
-                        .iter()
-                        .any(|open| open == request.workspace_key())
-                    {
-                        browser_host.handle_request(window, request);
-                    } else {
-                        request.respond(Err(BrowserError::CrashedView {
-                            message: "browser command route does not match an open AI conversation"
-                                .to_string(),
-                        }));
-                    }
+                    let _ = route_browser_request_for_active_workspace(
+                        active_browser_route.as_ref(),
+                        request,
+                        |request| {
+                            browser_host.handle_request(window, request);
+                        },
+                    );
                 }
                 browser_host.handle_command(window, workspace_key, command.clone())
             },
@@ -1480,11 +1628,13 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         let workspace_key = request.workspace_key().clone();
-        let route_is_open = self.browser_route_is_open(&workspace_key);
+        let active_browser_route = self.active_open_browser_route();
         let route_result = self.with_browser_host_control_barrier(window, |browser_host| {
-            route_browser_request(route_is_open, request, |request| {
-                browser_host.handle_request(window, request)
-            })
+            route_browser_request_for_active_workspace(
+                active_browser_route.as_ref(),
+                request,
+                |request| browser_host.handle_request(window, request),
+            )
         });
         if let Err(error) = route_result {
             self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(error.to_string());
@@ -1496,21 +1646,25 @@ impl NativeShell {
     fn pump_browser_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let browser_bridge = self.browser_bridge.clone();
         let events = self.with_browser_host_control_barrier(window, |browser_host| {
-            let mut events = browser_host.drain_events();
-            for event in &events {
-                browser_bridge.observe_host_event(event);
-            }
+            let mut events = browser_host.drain_events_with_pre_apply_observer(|event, _state| {
+                browser_bridge.observe_host_event_under_host_control_barrier(event);
+            });
             browser_host.pump_async_completions(window);
-            let completion_events = browser_host.drain_events();
-            for event in &completion_events {
-                browser_bridge.observe_host_event(event);
-            }
+            let completion_events =
+                browser_host.drain_events_with_pre_apply_observer(|event, _state| {
+                    browser_bridge.observe_host_event_under_host_control_barrier(event);
+                });
             events.extend(completion_events);
             events
         });
+        if self.try_finish_app_termination(cx) {
+            return;
+        }
         let projected_attachments = self.reconcile_browser_attachment_projections(window);
+        let replay_changed = self.reconcile_browser_replay_state(window, cx);
         if events.is_empty() {
-            if projected_attachments {
+            if projected_attachments || replay_changed {
+                self.sync_browser_host_visibility(Some(window));
                 cx.notify();
             }
             return;
@@ -1576,6 +1730,123 @@ impl NativeShell {
                     tab_id,
                     candidate,
                 } => {
+                    if let Some(selection) =
+                        self.browser_replay_repair_selection
+                            .clone()
+                            .filter(|selection| {
+                                selection.workspace_key == workspace_key
+                                    && selection.tab_id == tab_id
+                            })
+                    {
+                        let coordinator = self.browser_bridge.replay_coordinator();
+                        let active = coordinator.active_state(&workspace_key);
+                        let exact = active.as_ref().is_some_and(|active| {
+                            active.instance.id() == selection.instance_id
+                                && active.projection.status
+                                    == BrowserReplayStatus::PausedLocatorRepair
+                                && active.repair.as_ref().is_some_and(|repair| {
+                                    repair.repair_id == selection.repair_id
+                                        && repair.tab_id == selection.tab_id
+                                        && repair.revision == selection.revision
+                                        && candidate.revision == selection.revision
+                                })
+                        });
+                        let repair = exact
+                            .then(|| {
+                                coordinator.exact_repair(
+                                    &workspace_key,
+                                    selection.instance_id,
+                                    selection.repair_id,
+                                )
+                            })
+                            .transpose();
+
+                        let cleared =
+                            self.with_browser_host_control_barrier(window, |browser_host| {
+                                browser_host.cancel_annotation_selection(
+                                    &selection.workspace_key,
+                                    &selection.tab_id,
+                                )
+                            });
+                        self.browser_replay_repair_selection = None;
+                        let ui = self.browser_ui.entry(workspace_key.clone()).or_default();
+                        ui.annotation_mode = false;
+                        if let Err(error) = cleared {
+                            ui.diagnostic = Some(error.to_string());
+                            continue;
+                        }
+                        let repair = match repair {
+                            Ok(Some(repair)) => repair,
+                            Ok(None) | Err(_) => {
+                                ui.diagnostic = Some(
+                                    "Replay repair selection is no longer current.".to_string(),
+                                );
+                                continue;
+                            }
+                        };
+                        let replacement = match browser_replay_repair_candidate_from_annotation(
+                            &candidate,
+                            selection.revision,
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(error) => {
+                                ui.diagnostic = Some(error.to_string());
+                                continue;
+                            }
+                        };
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Previewing replacement element...".to_string());
+
+                        let controller = self
+                            .browser_bridge
+                            .bind(workspace_key.clone(), Duration::from_secs(300));
+                        let result_coordinator = coordinator.clone();
+                        let result_workspace = workspace_key.clone();
+                        let instance_id = selection.instance_id;
+                        let repair_id = selection.repair_id;
+                        let this = cx.weak_entity();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let result = controller
+                                    .request_replay_repair_preview(
+                                        &coordinator,
+                                        &repair,
+                                        replacement,
+                                        BrowserInvocationActor::User,
+                                    )
+                                    .await;
+                                let _ = this.update_in(&mut *cx, |shell, _window, cx| {
+                                    let still_exact = result_coordinator
+                                        .active_state(&result_workspace)
+                                        .is_some_and(|active| {
+                                            active.instance.id() == instance_id
+                                                && active.repair.as_ref().is_some_and(|repair| {
+                                                    repair.repair_id == repair_id
+                                                })
+                                        });
+                                    if !still_exact {
+                                        return;
+                                    }
+                                    let ui = shell
+                                        .browser_ui
+                                        .entry(result_workspace.clone())
+                                        .or_default();
+                                    match result {
+                                        Ok(_) => {
+                                            ui.diagnostic = None;
+                                            ui.action_status =
+                                                Some("Replacement preview ready".to_string());
+                                        }
+                                        Err(error) => {
+                                            ui.diagnostic = Some(error.to_string());
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        continue;
+                    }
                     let result = self.dispatch_browser_command(
                         &workspace_key,
                         BrowserCommand::CaptureAnnotation { tab_id, candidate },
@@ -1614,6 +1885,13 @@ impl NativeShell {
                     ui.annotation_mode = enabled;
                 }
                 BrowserPaneEventPlan::ClearAnnotation { workspace_key } => {
+                    if self
+                        .browser_replay_repair_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.workspace_key == workspace_key)
+                    {
+                        self.cancel_browser_replay_repair_selection(Some(window));
+                    }
                     let ui = self.browser_ui.entry(workspace_key).or_default();
                     ui.annotation_mode = false;
                     ui.annotation_draft = None;
@@ -1655,10 +1933,12 @@ impl NativeShell {
                     let browser_bridge = self.browser_bridge.clone();
                     let (post_dialog_events, resolution) =
                         self.with_browser_host_control_barrier(window, |browser_host| {
-                            let events = browser_host.drain_events();
-                            for event in &events {
-                                browser_bridge.observe_host_event(event);
-                            }
+                            let events = browser_host.drain_events_with_pre_apply_observer(
+                                |event, _state| {
+                                    browser_bridge
+                                        .observe_host_event_under_host_control_barrier(event);
+                                },
+                            );
                             let resolution = browser_host.resolve_approval(
                                 window,
                                 &workspace_key,
@@ -1700,28 +1980,30 @@ impl NativeShell {
         window: &Window,
         enter_host: impl FnOnce(&mut BrowserWebViewHost) -> R,
     ) -> R {
-        let open_workspaces = self.open_browser_workspace_keys();
+        let active_browser_route = self.active_open_browser_route();
         let browser_host = &mut self.browser_host;
-        self.browser_bridge
-            .with_locked_host_work(|controls, lifecycle_requests| {
+        let browser_bridge = self.browser_bridge.clone();
+        browser_bridge.with_locked_host_work_and_repair_cleanups(
+            |controls, lifecycle_requests, repair_cleanups| {
+                browser_host.publish_pending_user_input_cutoffs(|event, _state| {
+                    browser_bridge.observe_host_event_under_host_control_barrier(event);
+                });
                 for control in controls {
                     browser_host.handle_control(control);
                 }
+                for cleanup in repair_cleanups {
+                    browser_host.handle_repair_highlight_cleanup(window, cleanup);
+                }
                 for request in lifecycle_requests {
-                    if open_workspaces
-                        .iter()
-                        .any(|open| open == request.workspace_key())
-                    {
-                        browser_host.handle_request(window, request);
-                    } else {
-                        request.respond(Err(BrowserError::CrashedView {
-                            message: "browser command route does not match an open AI conversation"
-                                .to_string(),
-                        }));
-                    }
+                    let _ = route_browser_request_for_active_workspace(
+                        active_browser_route.as_ref(),
+                        request,
+                        |request| browser_host.handle_request(window, request),
+                    );
                 }
                 enter_host(browser_host)
-            })
+            },
+        )
     }
 
     fn browser_pane_context(&self) -> BrowserPaneContext {
@@ -1739,6 +2021,470 @@ impl NativeShell {
         }
     }
 
+    fn reconcile_browser_replay_repair_selection(&mut self, window: &Window) -> bool {
+        let Some(selection) = self.browser_replay_repair_selection.clone() else {
+            return false;
+        };
+        let active_workspace = self
+            .active_browser_workspace()
+            .map(|(workspace_key, _)| workspace_key);
+        if active_workspace.as_ref() != Some(&selection.workspace_key) {
+            return self.cancel_browser_replay_repair_selection(Some(window));
+        }
+        let coordinator = self.browser_bridge.replay_coordinator();
+        let active = coordinator.active_state(&selection.workspace_key);
+        let live_snapshot = self
+            .browser_host
+            .workspace_snapshot(&selection.workspace_key);
+        let exact = active.as_ref().is_some_and(|active| {
+            active.instance.id() == selection.instance_id
+                && active.projection.status == BrowserReplayStatus::PausedLocatorRepair
+                && active.repair.as_ref().is_some_and(|repair| {
+                    repair.repair_id == selection.repair_id
+                        && repair.tab_id == selection.tab_id
+                        && repair.revision == selection.revision
+                })
+        }) && live_snapshot.is_some_and(|snapshot| {
+            snapshot.revision == selection.revision
+                && snapshot.selected_tab_id.as_deref() == Some(selection.tab_id.as_str())
+        });
+        if exact {
+            return false;
+        }
+        self.cancel_browser_replay_repair_selection(Some(window))
+    }
+
+    fn cancel_browser_replay_repair_selection(&mut self, window: Option<&Window>) -> bool {
+        let Some(selection) = self.browser_replay_repair_selection.take() else {
+            return false;
+        };
+        let result = if let Some(window) = window {
+            self.with_browser_host_control_barrier(window, |browser_host| {
+                browser_host
+                    .cancel_annotation_selection(&selection.workspace_key, &selection.tab_id)
+            })
+        } else {
+            self.browser_host
+                .cancel_annotation_selection(&selection.workspace_key, &selection.tab_id)
+        };
+        let ui = self.browser_ui.entry(selection.workspace_key).or_default();
+        ui.annotation_mode = false;
+        if let Err(error) = result {
+            ui.diagnostic = Some(error.to_string());
+        }
+        true
+    }
+
+    fn reconcile_browser_replay_state(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = self.reconcile_browser_replay_repair_selection(window);
+        let Some(workspace_key) = self
+            .active_browser_workspace()
+            .map(|(workspace_key, _)| workspace_key)
+        else {
+            return self
+                .close_browser_replay_secret_prompt_for_route(None)
+                .is_some()
+                || changed;
+        };
+        let active = self
+            .browser_bridge
+            .replay_coordinator()
+            .active_state(&workspace_key);
+        let Some(active) = active else {
+            if self
+                .browser_replay_secret_prompt
+                .as_ref()
+                .is_some_and(|vault| vault.workspace_key() == &workspace_key)
+            {
+                if let Some(vault) = self.browser_replay_secret_prompt.take() {
+                    let instance = vault.instance().clone();
+                    self.browser_replay_secret_submitter = None;
+                    let _ = vault.replay_replaced(&instance);
+                    changed = true;
+                }
+            } else {
+                changed = self
+                    .close_browser_replay_secret_prompt_for_route(Some(&workspace_key))
+                    .is_some()
+                    || changed;
+            }
+            return changed;
+        };
+
+        if active.projection.status != BrowserReplayStatus::NeedsUserSecret {
+            if self
+                .browser_replay_secret_prompt
+                .as_ref()
+                .is_some_and(|vault| vault.workspace_key() == &workspace_key)
+            {
+                if let Some(vault) = self.browser_replay_secret_prompt.take() {
+                    let instance = vault.instance().clone();
+                    self.browser_replay_secret_submitter = None;
+                    let _ = vault.replay_replaced(&instance);
+                    changed = true;
+                }
+            } else {
+                changed = self
+                    .close_browser_replay_secret_prompt_for_route(Some(&workspace_key))
+                    .is_some()
+                    || changed;
+            }
+            return changed;
+        }
+
+        if self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| vault.same_instance(&active.instance))
+        {
+            return changed;
+        }
+        if let Some(vault) = self.browser_replay_secret_prompt.take() {
+            let instance = vault.instance().clone();
+            self.browser_replay_secret_submitter = None;
+            let _ = vault.replay_replaced(&instance);
+        }
+        let prompt_instance = active.instance;
+        let input_names = active.projection.unresolved_secret_inputs;
+        let coordinator = self.browser_bridge.replay_coordinator();
+        let instance = prompt_instance.clone();
+        let submitter: BrowserReplaySecretSubmitter = Box::new(move |submission| {
+            coordinator
+                .submit_secrets(&instance, submission)
+                .map(|_| ())
+        });
+        match self.install_browser_replay_secret_prompt(
+            prompt_instance,
+            input_names,
+            submitter,
+            window,
+            cx,
+        ) {
+            Ok(_) => changed = true,
+            Err(error) => {
+                self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                    Some(error.to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn install_browser_replay_secret_prompt(
+        &mut self,
+        instance: BrowserReplayInstance,
+        input_names: Vec<String>,
+        submitter: BrowserReplaySecretSubmitter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        if let Some(previous) = self.browser_replay_secret_prompt.take() {
+            let previous_instance = previous.instance().clone();
+            let _ = previous.replay_replaced(&previous_instance);
+        }
+        self.browser_replay_secret_submitter = None;
+        let (vault, event) = BrowserReplaySecretPromptVault::install(instance, input_names)?;
+        self.browser_replay_secret_prompt = Some(vault);
+        self.browser_replay_secret_submitter = Some(submitter);
+        window.focus(&self.browser_replay_secret_focus);
+        cx.notify();
+        Ok(event)
+    }
+
+    fn focus_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        input_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let vault = self
+            .browser_replay_secret_prompt
+            .as_mut()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let event = vault.focus(&instance, input_name)?;
+        window.focus(&self.browser_replay_secret_focus);
+        cx.notify();
+        Ok(event)
+    }
+
+    fn edit_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        input_name: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let vault = self
+            .browser_replay_secret_prompt
+            .as_mut()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let event = vault.edit(&instance, input_name, text)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn backspace_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        input_name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let vault = self
+            .browser_replay_secret_prompt
+            .as_mut()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let event = vault.backspace(&instance, input_name)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn submit_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let exact = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        if exact.projection().is_set.iter().any(|is_set| !is_set) {
+            return Err(BrowserReplaySecretError::InvalidSubmission);
+        }
+        let vault = self
+            .browser_replay_secret_prompt
+            .take()
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = vault.instance().clone();
+        let (submission, event) = vault.submit(&instance)?;
+        let submitter = self
+            .browser_replay_secret_submitter
+            .take()
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        submitter(submission)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn cancel_browser_replay_secret_prompt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+        instance_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<BrowserReplaySecretPromptEvent, BrowserReplaySecretError> {
+        let exact = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .filter(|vault| {
+                vault.workspace_key() == workspace_key && vault.instance().id() == instance_id
+            })
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        let instance = exact.instance().clone();
+        self.browser_bridge
+            .replay_coordinator()
+            .cancel(&instance)
+            .map_err(|_| BrowserReplaySecretError::StaleAuthority)?;
+        let vault = self
+            .browser_replay_secret_prompt
+            .take()
+            .ok_or(BrowserReplaySecretError::StaleAuthority)?;
+        self.browser_replay_secret_submitter = None;
+        let event = vault.cancel(&instance)?;
+        cx.notify();
+        Ok(event)
+    }
+
+    fn close_browser_replay_secret_prompt_for_route(
+        &mut self,
+        route: Option<&BrowserWorkspaceKey>,
+    ) -> Option<BrowserReplaySecretPromptEvent> {
+        let close = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| route != Some(vault.workspace_key()));
+        if !close {
+            return None;
+        }
+        let vault = self.browser_replay_secret_prompt.take()?;
+        let instance = vault.instance().clone();
+        self.browser_replay_secret_submitter = None;
+        vault.route_switch(&instance).ok()
+    }
+
+    fn retire_browser_replay_ui_after_interrupt(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        if self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| vault.workspace_key() == workspace_key)
+        {
+            if let Some(vault) = self.browser_replay_secret_prompt.take() {
+                let instance = vault.instance().clone();
+                self.browser_replay_secret_submitter = None;
+                let _ = vault.route_switch(&instance);
+            }
+        }
+        if self
+            .browser_replay_repair_selection
+            .as_ref()
+            .is_some_and(|selection| &selection.workspace_key == workspace_key)
+        {
+            self.cancel_browser_replay_repair_selection(None);
+        }
+    }
+
+    fn discard_browser_workflow_state_after_replay_interrupt(
+        &mut self,
+        workspace_key: &BrowserWorkspaceKey,
+    ) {
+        self.retire_browser_replay_ui_after_interrupt(workspace_key);
+        self.browser_host.discard_workflow_state(workspace_key);
+        if let Some(ui) = self.browser_ui.get_mut(workspace_key) {
+            ui.workflow_preview = None;
+            ui.workflow_editor = None;
+        }
+        if self.browser_workflow_route.as_ref() == Some(workspace_key) {
+            self.browser_workflow_route = None;
+        }
+    }
+
+    fn interrupt_active_browser_replay_before_route_change(
+        &mut self,
+        next_workspace: Option<&BrowserWorkspaceKey>,
+    ) {
+        let Some(previous) = self
+            .active_browser_workspace()
+            .map(|(workspace_key, _)| workspace_key)
+        else {
+            return;
+        };
+        if next_workspace == Some(&previous) {
+            return;
+        }
+        self.browser_bridge.interrupt_workspace(&previous);
+        self.discard_browser_workflow_state_after_replay_interrupt(&previous);
+    }
+
+    fn interrupt_browser_workspace_before_teardown(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        self.browser_bridge.interrupt_workspace(workspace_key);
+        self.discard_browser_workflow_state_after_replay_interrupt(workspace_key);
+    }
+
+    fn interrupt_browser_project_before_mutation(&mut self, project_id: &str) {
+        self.browser_bridge.interrupt_project(project_id);
+        let workspaces = self
+            .state
+            .ai_tabs()
+            .filter(|tab| tab.project_id == project_id)
+            .filter_map(|tab| browser_workspace_key_for_ai_tab(Some(tab)))
+            .collect::<Vec<_>>();
+        for workspace_key in workspaces {
+            self.discard_browser_workflow_state_after_replay_interrupt(&workspace_key);
+        }
+    }
+
+    fn interrupt_all_browser_replays_before_shutdown(&mut self) {
+        let browser_bridge = self.browser_bridge.clone();
+        browser_bridge.interrupt_all_with_host_cleanup(|| {
+            self.browser_host.interrupt_all_local_work();
+        });
+        let workspaces = self.open_browser_workspace_keys();
+        for workspace_key in workspaces {
+            self.discard_browser_workflow_state_after_replay_interrupt(&workspace_key);
+        }
+    }
+
+    fn begin_browser_window_teardown(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> BrowserAppExitDisposition {
+        self.interrupt_all_browser_replays_before_shutdown();
+        let disposition = self.browser_host.begin_native_window_teardown();
+        if disposition == BrowserAppExitDisposition::Deferred {
+            self.schedule_browser_native_teardown_cleanup(cx);
+        }
+        disposition
+    }
+
+    fn schedule_browser_native_teardown_cleanup(&mut self, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |shell, cx| {
+                shell.browser_host.finish_native_window_teardown_cleanup();
+                let _ = shell.try_finish_app_termination(cx);
+            });
+        });
+    }
+
+    fn resume_browser_window_after_canceled_shutdown(&mut self) {
+        if self.pending_app_termination.is_some() {
+            return;
+        }
+        let _ = self
+            .browser_host
+            .resume_native_window_after_canceled_teardown();
+    }
+
+    fn request_app_termination(
+        &mut self,
+        requested: PendingAppTermination,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_app_termination = Some(
+            self.pending_app_termination
+                .map_or(requested, |current| current.coalesce(requested)),
+        );
+        retire_pending_shutdown_for_forced_termination(
+            &mut self.pending_shutdown_op_id,
+            &mut self.pending_window_close,
+        );
+        match self.begin_browser_window_teardown(cx) {
+            BrowserAppExitDisposition::ExitNow => {
+                let _ = self.try_finish_app_termination(cx);
+            }
+            BrowserAppExitDisposition::Deferred => {
+                self.terminal_notice = Some(
+                    "Waiting for browser initialization to stop before exiting...".to_string(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    fn try_finish_app_termination(&mut self, cx: &mut Context<Self>) -> bool {
+        let native_window_teardown_ready = self.browser_host.native_window_teardown_ready();
+        let Some(termination) = take_ready_app_termination(
+            &mut self.pending_app_termination,
+            native_window_teardown_ready,
+        ) else {
+            return false;
+        };
+        execute_app_termination(termination, cx);
+        true
+    }
+
     fn sync_browser_host_visibility(&mut self, window: Option<&Window>) {
         let workflow_route = if self.remote_mode.is_none()
             && self.state.settings().browser_enabled
@@ -1752,6 +2498,7 @@ impl NativeShell {
         } else {
             None
         };
+        self.close_browser_replay_secret_prompt_for_route(workflow_route.as_ref());
         if self.browser_workflow_route != workflow_route {
             if let Some(previous) = self.browser_workflow_route.take() {
                 self.browser_host.discard_workflow_state(&previous);
@@ -1784,6 +2531,13 @@ impl NativeShell {
             self.browser_host.page_recording_status(workspace_key)
                 == crate::browser::BrowserRecordingStatus::Review
         }) {
+            active_workspace = None;
+        }
+        if self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .is_some_and(|vault| Some(vault.workspace_key()) == active_workspace.as_ref())
+        {
             active_workspace = None;
         }
         if let Some(snapshot) = plan.and_then(|plan| plan.ensure_snapshot) {
@@ -1843,6 +2597,44 @@ impl NativeShell {
         } else {
             None
         };
+        let replay_secret_prompt = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .filter(|vault| vault.workspace_key() == &workspace_key)
+            .map(BrowserReplaySecretPromptVault::projection);
+        let replay_coordinator = self.browser_bridge.replay_coordinator();
+        let replay = replay_coordinator
+            .active_state(&workspace_key)
+            .map(|active| {
+                let repair_apply_ready = active
+                    .repair
+                    .as_ref()
+                    .and_then(|repair| {
+                        replay_coordinator
+                            .exact_repair(&workspace_key, active.instance.id(), repair.repair_id)
+                            .ok()
+                    })
+                    .and_then(|repair| replay_coordinator.locator_repair_apply_ready(&repair).ok())
+                    .unwrap_or(false);
+                let selecting_replacement = self
+                    .browser_replay_repair_selection
+                    .as_ref()
+                    .is_some_and(|selection| {
+                        selection.workspace_key == workspace_key
+                            && selection.instance_id == active.instance.id()
+                            && active.repair.as_ref().is_some_and(|repair| {
+                                selection.repair_id == repair.repair_id
+                                    && selection.tab_id == repair.tab_id
+                                    && selection.revision == repair.revision
+                            })
+                    });
+                BrowserReplayPaneProjection {
+                    replay: active.projection,
+                    repair: active.repair,
+                    selecting_replacement,
+                    repair_apply_ready,
+                }
+            });
         Some(BrowserPaneModel::new(
             workspace_key,
             &self.browser_pane_context(),
@@ -1863,6 +2655,8 @@ impl NativeShell {
                 workflow_review,
                 workflow_preview: ui.workflow_preview,
                 workflow_editor: ui.workflow_editor,
+                replay_secret_prompt,
+                replay,
             },
         ))
     }
@@ -2171,7 +2965,296 @@ impl NativeShell {
             }
         };
 
+        if self.browser_replay_secret_prompt.is_some() && action.is_annotation_editor_action() {
+            return;
+        }
+        if matches!(action, BrowserPaneAction::StartRecording) && self.remote_mode.is_some() {
+            self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                Some("Browser workflow recording is unavailable from a remote client.".to_string());
+            cx.notify();
+            return;
+        }
+
+        let address_draft = self
+            .browser_ui
+            .get(&workspace_key)
+            .and_then(|ui| ui.address_draft.clone())
+            .unwrap_or_default();
+        let plan = match validate_browser_pane_action_before_replay_interrupt(
+            &workspace_key,
+            &snapshot,
+            &address_draft,
+            &action,
+            || {
+                self.browser_bridge.interrupt_workspace(&workspace_key);
+                self.retire_browser_replay_ui_after_interrupt(&workspace_key);
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                    Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+
         match action {
+            BrowserPaneAction::FocusReplaySecret {
+                workspace_key: action_workspace,
+                instance_id,
+                input_name,
+            } => {
+                let result = if action_workspace == workspace_key {
+                    self.focus_browser_replay_secret_prompt(
+                        &action_workspace,
+                        instance_id,
+                        &input_name,
+                        window,
+                        cx,
+                    )
+                } else {
+                    Err(BrowserReplaySecretError::StaleAuthority)
+                };
+                if let Err(error) = result {
+                    self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                        Some(error.to_string());
+                    cx.notify();
+                }
+                return;
+            }
+            BrowserPaneAction::SubmitReplaySecrets {
+                workspace_key: action_workspace,
+                instance_id,
+            } => {
+                let result = if action_workspace == workspace_key {
+                    self.submit_browser_replay_secret_prompt(&action_workspace, instance_id, cx)
+                } else {
+                    Err(BrowserReplaySecretError::StaleAuthority)
+                };
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Submitted replay secrets".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::CancelReplaySecrets {
+                workspace_key: action_workspace,
+                instance_id,
+            } => {
+                let result = if action_workspace == workspace_key {
+                    self.cancel_browser_replay_secret_prompt(&action_workspace, instance_id, cx)
+                } else {
+                    Err(BrowserReplaySecretError::StaleAuthority)
+                };
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Cancelled replay secret prompt".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::CancelReplay { instance_id } => {
+                let coordinator = self.browser_bridge.replay_coordinator();
+                let result = coordinator
+                    .exact_instance(&workspace_key, instance_id)
+                    .and_then(|instance| coordinator.cancel(&instance));
+                let cancelled = result.is_ok();
+                let ui = self.browser_ui.entry(workspace_key.clone()).or_default();
+                match result {
+                    Ok(_) => {
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Cancelled browser replay".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                if cancelled {
+                    self.reconcile_browser_replay_state(window, cx);
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::BeginReplayRepairSelection {
+                instance_id,
+                repair_id,
+            } => {
+                let coordinator = self.browser_bridge.replay_coordinator();
+                let result = (|| {
+                    let active = coordinator.active_state(&workspace_key).ok_or_else(|| {
+                        BrowserError::InvalidInvocation {
+                            field: "replayInstanceId".to_string(),
+                        }
+                    })?;
+                    if active.instance.id() != instance_id
+                        || active.projection.status != BrowserReplayStatus::PausedLocatorRepair
+                    {
+                        return Err(BrowserError::InvalidInvocation {
+                            field: "replayInstanceId".to_string(),
+                        });
+                    }
+                    let _repair_instance = coordinator
+                        .exact_repair(&workspace_key, instance_id, repair_id)
+                        .map_err(|_| BrowserError::InvalidInvocation {
+                            field: "repairId".to_string(),
+                        })?;
+                    let repair = active
+                        .repair
+                        .ok_or_else(|| BrowserError::InvalidInvocation {
+                            field: "repairId".to_string(),
+                        })?;
+                    if repair.repair_id != repair_id {
+                        return Err(BrowserError::InvalidInvocation {
+                            field: "repairId".to_string(),
+                        });
+                    }
+                    let live = self
+                        .browser_host
+                        .workspace_snapshot(&workspace_key)
+                        .ok_or_else(|| BrowserError::CrashedView {
+                            message: "repair page is unavailable".to_string(),
+                        })?;
+                    if live.revision != repair.revision
+                        || live.selected_tab_id.as_deref() != Some(repair.tab_id.as_str())
+                    {
+                        return Err(BrowserError::StaleReference {
+                            expected: repair.revision,
+                            actual: live.revision,
+                        });
+                    }
+                    self.cancel_browser_replay_repair_selection(Some(window));
+                    self.dispatch_browser_command(
+                        &workspace_key,
+                        BrowserCommand::SetAnnotationMode {
+                            tab_id: repair.tab_id.clone(),
+                            enabled: true,
+                        },
+                        window,
+                    )?;
+                    self.browser_replay_repair_selection = Some(BrowserReplayRepairSelection {
+                        workspace_key: workspace_key.clone(),
+                        instance_id,
+                        repair_id,
+                        tab_id: repair.tab_id,
+                        revision: repair.revision,
+                    });
+                    Ok(())
+                })();
+                let ui = self.browser_ui.entry(workspace_key).or_default();
+                match result {
+                    Ok(()) => {
+                        ui.annotation_mode = true;
+                        ui.diagnostic = None;
+                        ui.action_status = Some("Select a replacement element".to_string());
+                    }
+                    Err(error) => ui.diagnostic = Some(error.to_string()),
+                }
+                self.sync_browser_host_visibility(Some(window));
+                cx.notify();
+                return;
+            }
+            BrowserPaneAction::ApplyReplayRepair {
+                instance_id,
+                repair_id,
+                resume,
+            } => {
+                let coordinator = self.browser_bridge.replay_coordinator();
+                let repair = match coordinator.exact_repair(&workspace_key, instance_id, repair_id)
+                {
+                    Ok(repair) => repair,
+                    Err(error) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+                let context = match BrowserInvocationContext::user(
+                    if resume {
+                        "save replay repair and retry the failed step"
+                    } else {
+                        "save replay repair"
+                    },
+                    BrowserRisk::Normal,
+                ) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        self.browser_ui.entry(workspace_key).or_default().diagnostic =
+                            Some(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+                self.cancel_browser_replay_repair_selection(Some(window));
+                let controller = self
+                    .browser_bridge
+                    .bind(workspace_key.clone(), Duration::from_secs(300));
+                let this = cx.weak_entity();
+                let result_coordinator = coordinator.clone();
+                let result_workspace = workspace_key.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        let result = controller
+                            .request_replay_repair_apply(
+                                &coordinator,
+                                &repair,
+                                true,
+                                resume,
+                                context,
+                            )
+                            .await;
+                        let _ = this.update_in(&mut *cx, |shell, window, cx| {
+                            let still_exact = result_coordinator
+                                .active_state(&result_workspace)
+                                .is_some_and(|active| active.instance.id() == instance_id);
+                            if !still_exact {
+                                return;
+                            }
+                            let ui = shell
+                                .browser_ui
+                                .entry(result_workspace.clone())
+                                .or_default();
+                            match result {
+                                Ok(_) => {
+                                    ui.diagnostic = None;
+                                    ui.action_status = Some(if resume {
+                                        "Saved repair and resumed replay".to_string()
+                                    } else {
+                                        "Saved replay repair".to_string()
+                                    });
+                                }
+                                Err(error) => ui.diagnostic = Some(error.to_string()),
+                            }
+                            shell.sync_browser_host_visibility(Some(window));
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                self.browser_ui
+                    .entry(workspace_key)
+                    .or_default()
+                    .action_status = Some(
+                    if resume {
+                        "Saving repair and retrying..."
+                    } else {
+                        "Saving repair..."
+                    }
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
             BrowserPaneAction::DividerBegin { .. } => {
                 self.browser_divider_drag = Some(BrowserDividerDrag { workspace_key });
                 self.sync_browser_host_visibility(Some(window));
@@ -2242,6 +3325,19 @@ impl NativeShell {
                 return;
             }
             BrowserPaneAction::ToggleAnnotation => {
+                if self
+                    .browser_replay_repair_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.workspace_key == workspace_key)
+                {
+                    self.cancel_browser_replay_repair_selection(Some(window));
+                    self.browser_ui
+                        .entry(workspace_key)
+                        .or_default()
+                        .action_status = Some("Cancelled replacement selection".to_string());
+                    cx.notify();
+                    return;
+                }
                 let enabled = !self
                     .browser_ui
                     .get(&workspace_key)
@@ -2348,14 +3444,6 @@ impl NativeShell {
                 return;
             }
             BrowserPaneAction::StartRecording => {
-                if self.remote_mode.is_some() {
-                    self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(
-                        "Browser workflow recording is unavailable from a remote client."
-                            .to_string(),
-                    );
-                    cx.notify();
-                    return;
-                }
                 if self
                     .browser_host
                     .workspace_snapshot(&workspace_key)
@@ -2575,25 +3663,6 @@ impl NativeShell {
             _ => {}
         }
 
-        let address_draft = self
-            .browser_ui
-            .get(&workspace_key)
-            .and_then(|ui| ui.address_draft.clone())
-            .unwrap_or_default();
-        let plan = match browser_action_plan(
-            Some(&workspace_key),
-            Some(&snapshot),
-            &address_draft,
-            action.clone(),
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.browser_ui.entry(workspace_key).or_default().diagnostic =
-                    Some(error.to_string());
-                cx.notify();
-                return;
-            }
-        };
         if let Some(diagnostic) = plan.diagnostic {
             self.browser_ui
                 .entry(plan.workspace_key)
@@ -2645,6 +3714,94 @@ impl NativeShell {
         }
         self.sync_browser_host_visibility(Some(window));
         cx.notify();
+    }
+
+    fn handle_browser_replay_secret_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(projection) = self
+            .browser_replay_secret_prompt
+            .as_ref()
+            .map(BrowserReplaySecretPromptVault::projection)
+        else {
+            return;
+        };
+        let workspace_key = projection.workspace_key;
+        let instance_id = projection.instance_id;
+        let Some(input_name) = projection.focused_input else {
+            window.prevent_default();
+            return;
+        };
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let result = match key.as_str() {
+            "escape" => self.cancel_browser_replay_secret_prompt(&workspace_key, instance_id, cx),
+            "enter" => self.submit_browser_replay_secret_prompt(&workspace_key, instance_id, cx),
+            "backspace" => self.backspace_browser_replay_secret_prompt(
+                &workspace_key,
+                instance_id,
+                &input_name,
+                cx,
+            ),
+            "tab" => {
+                let current = projection
+                    .input_names
+                    .iter()
+                    .position(|name| name == &input_name)
+                    .unwrap_or_default();
+                let next = if event.keystroke.modifiers.shift {
+                    current
+                        .checked_sub(1)
+                        .unwrap_or_else(|| projection.input_names.len().saturating_sub(1))
+                } else {
+                    (current + 1) % projection.input_names.len()
+                };
+                self.focus_browser_replay_secret_prompt(
+                    &workspace_key,
+                    instance_id,
+                    &projection.input_names[next],
+                    window,
+                    cx,
+                )
+            }
+            _ if event.keystroke.modifiers.control
+                || event.keystroke.modifiers.platform
+                || event.keystroke.modifiers.alt =>
+            {
+                Ok(BrowserReplaySecretPromptEvent {
+                    workspace_key: workspace_key.clone(),
+                    instance_id,
+                    operation: crate::browser::BrowserReplaySecretPromptOperation::Focused,
+                    input_name: Some(input_name.clone()),
+                    focused_input: Some(input_name.clone()),
+                    is_set: None,
+                })
+            }
+            _ => match event.keystroke.key_char.as_deref() {
+                Some(text) if !text.is_empty() => self.edit_browser_replay_secret_prompt(
+                    &workspace_key,
+                    instance_id,
+                    &input_name,
+                    text,
+                    cx,
+                ),
+                _ => Ok(BrowserReplaySecretPromptEvent {
+                    workspace_key: workspace_key.clone(),
+                    instance_id,
+                    operation: crate::browser::BrowserReplaySecretPromptOperation::Focused,
+                    input_name: Some(input_name.clone()),
+                    focused_input: Some(input_name),
+                    is_set: None,
+                }),
+            },
+        };
+        if let Err(error) = result {
+            self.browser_ui.entry(workspace_key).or_default().diagnostic = Some(error.to_string());
+            cx.notify();
+        }
+        window.prevent_default();
     }
 
     fn handle_browser_address_key(
@@ -2701,6 +3858,10 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_replay_secret_prompt.is_some() {
+            window.prevent_default();
+            return;
+        }
         let Some((workspace_key, _)) = self.active_browser_workspace() else {
             return;
         };
@@ -4033,6 +5194,7 @@ impl NativeShell {
         client_id: String,
         client_token: String,
     ) {
+        self.interrupt_all_browser_replays_before_shutdown();
         client.take_control();
         let snapshot = client.latest_snapshot().unwrap_or(snapshot);
         let address_for_mode = address.clone();
@@ -4353,6 +5515,7 @@ impl NativeShell {
     }
 
     fn disconnect_remote_host(&mut self, message: Option<String>) {
+        self.interrupt_all_browser_replays_before_shutdown();
         self.remote_connect_request_id = self.remote_connect_request_id.saturating_add(1);
         if let Some(remote_mode) = self.remote_mode.take() {
             remote_mode.port_forwards.shutdown();
@@ -4992,15 +6155,19 @@ impl NativeShell {
                         }
                     }
                     ProcessOpKind::Shutdown => {
-                        if self.pending_shutdown_op_id == Some(completion.op_id) {
+                        if shutdown_completion_is_current(
+                            self.pending_shutdown_op_id,
+                            completion.op_id,
+                        ) {
                             self.pending_window_close = false;
                             self.pending_shutdown_op_id = None;
                             self.terminal_actionable_notice = None;
-                            if self.pending_install_update.take().is_some() {
-                                std::process::exit(0);
+                            let termination = if self.pending_install_update.take().is_some() {
+                                PendingAppTermination::ExitAfterUpdate
                             } else {
-                                cx.quit();
-                            }
+                                PendingAppTermination::Quit
+                            };
+                            self.request_app_termination(termination, cx);
                         }
                     }
                     ProcessOpKind::KillProcess | ProcessOpKind::KillProcessTree => {
@@ -5046,12 +6213,30 @@ impl NativeShell {
                             Some(format!("Failed to run AI session action: {error}"));
                     }
                     ProcessOpKind::Shutdown => {
-                        let message = format!("Shutdown did not complete cleanly: {error}");
-                        self.terminal_notice = Some(message.clone());
-                        self.terminal_actionable_notice =
-                            Some(ActionableNotice::ForceQuit { message });
-                        self.pending_window_close = false;
-                        self.pending_shutdown_op_id = None;
+                        match shutdown_failure_disposition(
+                            self.pending_shutdown_op_id,
+                            completion.op_id,
+                            self.pending_app_termination,
+                        ) {
+                            ShutdownFailureDisposition::IgnoreStale => continue,
+                            ShutdownFailureDisposition::PreservePendingTermination => {
+                                self.pending_window_close = false;
+                                self.pending_shutdown_op_id = None;
+                                self.terminal_actionable_notice = None;
+                                self.terminal_notice = Some(format!(
+                                    "Shutdown did not complete cleanly: {error}. Waiting for browser initialization to stop before exiting..."
+                                ));
+                            }
+                            ShutdownFailureDisposition::ResumeInteractiveShutdown => {
+                                let message = format!("Shutdown did not complete cleanly: {error}");
+                                self.terminal_notice = Some(message.clone());
+                                self.terminal_actionable_notice =
+                                    Some(ActionableNotice::ForceQuit { message });
+                                self.pending_window_close = false;
+                                self.pending_shutdown_op_id = None;
+                                self.resume_browser_window_after_canceled_shutdown();
+                            }
+                        }
                     }
                     _ => {
                         self.terminal_notice = Some(error);
@@ -5093,21 +6278,31 @@ impl NativeShell {
                     focus,
                     dimensions,
                 } => {
-                    let result = self.process_manager.start_server_with_remote_response(
-                        &mut self.state,
-                        &command_id,
-                        dimensions,
-                        focus,
-                        response.clone(),
-                    );
-                    match result {
-                        Ok(()) => {
-                            did_change = true;
-                            self.save_session_state();
-                            defer_response_send = response.is_some();
-                            RemoteActionResult::ok(None, None)
+                    if let Err(error) = self
+                        .process_manager
+                        .validate_server_launch(&self.state, &command_id)
+                    {
+                        RemoteActionResult::error(error)
+                    } else {
+                        if focus {
+                            self.interrupt_active_browser_replay_before_route_change(None);
                         }
-                        Err(error) => RemoteActionResult::error(error),
+                        let result = self.process_manager.start_server_with_remote_response(
+                            &mut self.state,
+                            &command_id,
+                            dimensions,
+                            focus,
+                            response.clone(),
+                        );
+                        match result {
+                            Ok(()) => {
+                                did_change = true;
+                                self.save_session_state();
+                                defer_response_send = response.is_some();
+                                RemoteActionResult::ok(None, None)
+                            }
+                            Err(error) => RemoteActionResult::error(error),
+                        }
                     }
                 }
                 RemoteAction::StopServer { command_id } => {
@@ -5129,20 +6324,28 @@ impl NativeShell {
                     command_id,
                     dimensions,
                 } => {
-                    match self.process_manager.restart_server_with_remote_response(
-                        &mut self.state,
-                        &command_id,
-                        dimensions,
-                        "--- Restarting... ---",
-                        response.clone(),
-                    ) {
-                        Ok(()) => {
-                            did_change = true;
-                            self.save_session_state();
-                            defer_response_send = response.is_some();
-                            RemoteActionResult::ok(None, None)
+                    if let Err(error) = self
+                        .process_manager
+                        .validate_server_launch(&self.state, &command_id)
+                    {
+                        RemoteActionResult::error(error)
+                    } else {
+                        self.interrupt_active_browser_replay_before_route_change(None);
+                        match self.process_manager.restart_server_with_remote_response(
+                            &mut self.state,
+                            &command_id,
+                            dimensions,
+                            "--- Restarting... ---",
+                            response.clone(),
+                        ) {
+                            Ok(()) => {
+                                did_change = true;
+                                self.save_session_state();
+                                defer_response_send = response.is_some();
+                                RemoteActionResult::ok(None, None)
+                            }
+                            Err(error) => RemoteActionResult::error(error),
                         }
-                        Err(error) => RemoteActionResult::error(error),
                     }
                 }
                 RemoteAction::LaunchAi {
@@ -5204,32 +6407,55 @@ impl NativeShell {
                         Err(error) => RemoteActionResult::error(error),
                     }
                 }
-                RemoteAction::RestartAiTab { tab_id, dimensions } => match self
-                    .process_manager
-                    .restart_ai_session_activate_with_response(
-                        &mut self.state,
-                        &tab_id,
-                        dimensions,
-                        false,
-                        response.clone(),
-                    ) {
-                    Ok(session_id) => {
-                        did_change = true;
-                        self.save_session_state();
-                        defer_response_send = response.is_some();
-                        RemoteActionResult::ok(
-                            None,
-                            remote_ai_tab_payload_for_remote_response(
-                                &self.state,
-                                &self.process_manager,
-                                &session_id,
-                                Instant::now(),
-                            ),
-                        )
+                RemoteAction::RestartAiTab { tab_id, dimensions } => {
+                    if let Err(error) = self
+                        .process_manager
+                        .validate_ai_restart(&self.state, &tab_id)
+                    {
+                        RemoteActionResult::error(error)
+                    } else {
+                        let workspace_key =
+                            self.state.find_ai_tab(&tab_id).cloned().and_then(|tab| {
+                                self.state
+                                    .find_project(&tab.project_id)
+                                    .and_then(|_| browser_workspace_key_for_ai_tab(Some(&tab)))
+                            });
+                        if let Some(workspace_key) = workspace_key.as_ref() {
+                            self.interrupt_browser_workspace_before_teardown(workspace_key);
+                        }
+                        match self
+                            .process_manager
+                            .restart_ai_session_activate_with_response(
+                                &mut self.state,
+                                &tab_id,
+                                dimensions,
+                                false,
+                                response.clone(),
+                            ) {
+                            Ok(session_id) => {
+                                did_change = true;
+                                self.save_session_state();
+                                defer_response_send = response.is_some();
+                                RemoteActionResult::ok(
+                                    None,
+                                    remote_ai_tab_payload_for_remote_response(
+                                        &self.state,
+                                        &self.process_manager,
+                                        &session_id,
+                                        Instant::now(),
+                                    ),
+                                )
+                            }
+                            Err(error) => RemoteActionResult::error(error),
+                        }
                     }
-                    Err(error) => RemoteActionResult::error(error),
-                },
+                }
                 RemoteAction::CloseAiTab { tab_id } => {
+                    let workspace_key =
+                        browser_workspace_key_for_ai_tab(self.state.find_ai_tab(&tab_id));
+                    if let Some(workspace_key) = workspace_key.as_ref() {
+                        self.interrupt_browser_workspace_before_teardown(workspace_key);
+                    }
                     match self.process_manager.close_ai_session_with_response(
                         &mut self.state,
                         &tab_id,
@@ -5264,6 +6490,7 @@ impl NativeShell {
                                     .map(|project| project.id.clone())
                             })
                             .unwrap_or_default();
+                        self.interrupt_active_browser_replay_before_route_change(None);
                         self.state.open_ssh_tab(
                             &project_id,
                             &connection_id,
@@ -5282,6 +6509,9 @@ impl NativeShell {
                     connection_id,
                     dimensions,
                 } => {
+                    if self.state.find_ssh_connection(&connection_id).is_some() {
+                        self.interrupt_active_browser_replay_before_route_change(None);
+                    }
                     match self.process_manager.start_ssh_session_with_response(
                         &mut self.state,
                         &connection_id,
@@ -5301,6 +6531,11 @@ impl NativeShell {
                     connection_id,
                     dimensions,
                 } => {
+                    let connection_exists =
+                        self.state.find_ssh_connection(&connection_id).is_some();
+                    if connection_exists {
+                        self.interrupt_active_browser_replay_before_route_change(None);
+                    }
                     if let Some(tab_id) = self
                         .state
                         .find_ssh_tab_by_connection(&connection_id)
@@ -5361,6 +6596,17 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::CloseSession { session_id } => {
+                    let workspace_key = self
+                        .current_runtime_snapshot()
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|session| session.tab_id.as_deref())
+                        .and_then(|tab_id| {
+                            browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id))
+                        });
+                    if let Some(workspace_key) = workspace_key.as_ref() {
+                        self.interrupt_browser_workspace_before_teardown(workspace_key);
+                    }
                     match self.process_manager.close_session(&session_id) {
                         Ok(()) => {
                             did_change = true;
@@ -5371,6 +6617,11 @@ impl NativeShell {
                     }
                 }
                 RemoteAction::CloseTab { tab_id } => {
+                    let workspace_key =
+                        browser_workspace_key_for_ai_tab(self.state.find_ai_tab(&tab_id));
+                    if let Some(workspace_key) = workspace_key.as_ref() {
+                        self.interrupt_browser_workspace_before_teardown(workspace_key);
+                    }
                     match self.process_manager.close_tab(&mut self.state, &tab_id) {
                         Ok(()) => {
                             did_change = true;
@@ -5405,9 +6656,13 @@ impl NativeShell {
                     RemoteActionResult::ok(None, None)
                 }
                 RemoteAction::DeleteProject { project_id } => {
-                    self.delete_project_action(&project_id, cx);
-                    did_change = true;
-                    RemoteActionResult::ok(None, None)
+                    if let Err(error) = validate_project_deletion(&self.state, &project_id) {
+                        RemoteActionResult::error(error)
+                    } else {
+                        self.delete_project_action(&project_id, cx);
+                        did_change = true;
+                        RemoteActionResult::ok(None, None)
+                    }
                 }
                 RemoteAction::SaveFolder {
                     project_id,
@@ -5893,6 +7148,7 @@ impl NativeShell {
             }
         }
 
+        let _ = self.begin_browser_window_teardown(cx);
         self.save_session_state();
         match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
             Ok(op_id) => {
@@ -5903,6 +7159,7 @@ impl NativeShell {
                 false
             }
             Err(error) => {
+                self.resume_browser_window_after_canceled_shutdown();
                 self.terminal_notice = Some(format!("Failed to start shutdown: {error}"));
                 cx.notify();
                 false
@@ -5985,6 +7242,9 @@ impl NativeShell {
 
         if !self.ensure_mutation_control(cx) {
             return;
+        }
+        if let Some(workspace_key) = browser_workspace_key_for_ai_tab(Some(&tab)) {
+            self.interrupt_browser_workspace_before_teardown(&workspace_key);
         }
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::CloseTab {
@@ -6094,6 +7354,12 @@ impl NativeShell {
         source_path: &std::path::Path,
         cx: &mut Context<Self>,
     ) {
+        let replace_disables_browser = matches!(mode, ConfigImportMode::Replace)
+            && self.state.settings().browser_enabled
+            && !config.settings.browser_enabled;
+        if replace_disables_browser {
+            self.interrupt_all_browser_replays_before_shutdown();
+        }
         let removed_ai_tabs: Vec<String> = self
             .state
             .ai_tabs()
@@ -6128,8 +7394,20 @@ impl NativeShell {
             .map(|tab| tab.id.clone())
             .collect();
 
+        let removed_ai_workspaces = removed_ai_tabs
+            .iter()
+            .filter_map(|tab_id| {
+                browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        for workspace_key in &removed_ai_workspaces {
+            self.interrupt_browser_workspace_before_teardown(workspace_key);
+        }
+
         self.state.config = config;
         self.state.mark_dirty();
+        let browser_gateway_diagnostic = self.reconcile_browser_gateway();
+        self.sync_browser_host_visibility(None);
 
         for tab_id in removed_ai_tabs {
             let _ = self
@@ -6146,6 +7424,7 @@ impl NativeShell {
                 .close_ssh_session(&mut self.state, &tab_id);
             self.state.remove_tab(&tab_id);
         }
+        self.sync_browser_host_visibility(None);
 
         self.synced_session_id = None;
         self.last_dimensions = None;
@@ -6160,7 +7439,10 @@ impl NativeShell {
             ConfigImportMode::Merge => "Imported config with merge",
             ConfigImportMode::Replace => "Replaced config from import",
         };
-        self.editor_notice = Some(format!("{mode_label}: {}", source_path.display()));
+        self.editor_notice = Some(match browser_gateway_diagnostic {
+            Some(diagnostic) => format!("{mode_label}: {}\n{diagnostic}", source_path.display()),
+            None => format!("{mode_label}: {}", source_path.display()),
+        });
         cx.notify();
     }
 
@@ -6191,6 +7473,8 @@ impl NativeShell {
     fn install_update_action(&mut self, cx: &mut Context<Self>) {
         match self.updater.install_update() {
             Ok(version) => {
+                promote_pending_app_termination_for_update(&mut self.pending_app_termination);
+                let _ = self.begin_browser_window_teardown(cx);
                 self.save_session_state();
                 match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
                     Ok(op_id) => {
@@ -6201,6 +7485,7 @@ impl NativeShell {
                         ));
                     }
                     Err(error) => {
+                        self.resume_browser_window_after_canceled_shutdown();
                         self.editor_notice =
                             Some(format!("Failed to start shutdown before update: {error}"));
                     }
@@ -6216,11 +7501,12 @@ impl NativeShell {
 
     fn force_quit_action(&mut self, cx: &mut Context<Self>) {
         self.terminal_actionable_notice = None;
-        if self.pending_install_update.take().is_some() {
-            std::process::exit(0);
+        let termination = if self.pending_install_update.take().is_some() {
+            PendingAppTermination::ExitAfterUpdate
         } else {
-            cx.quit();
-        }
+            PendingAppTermination::Quit
+        };
+        self.request_app_termination(termination, cx);
     }
 
     fn terminal_font_size(&self) -> f32 {
@@ -6254,6 +7540,7 @@ impl NativeShell {
     }
 
     fn open_editor(&mut self, panel: EditorPanel, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         self.editor_panel = Some(panel);
         self.editor_active_field = None;
         self.editor_cursor = 0;
@@ -6558,11 +7845,13 @@ impl NativeShell {
     }
 
     fn open_add_project_action(&mut self, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         self.add_project_wizard = Some(workspace::AddProjectWizard::default());
         cx.notify();
     }
 
     fn open_process_monitor_action(&mut self, cx: &mut Context<Self>) {
+        self.close_browser_replay_secret_prompt_for_route(None);
         self.process_monitor = Some(process_monitor::ProcessMonitorState::default());
         self.process_monitor_revision = self.process_manager.runtime_revision();
         cx.notify();
@@ -6666,6 +7955,11 @@ impl NativeShell {
             }
             SessionKind::Claude | SessionKind::Codex => {
                 if let Some(tab_id) = session.tab_id.as_deref() {
+                    if let Some(workspace_key) =
+                        browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id))
+                    {
+                        self.interrupt_browser_workspace_before_teardown(&workspace_key);
+                    }
                     self.process_manager
                         .close_ai_session(&mut self.state, tab_id)
                 } else {
@@ -7612,7 +8906,11 @@ impl NativeShell {
         settings.shell_integration_enabled = draft.shell_integration_enabled;
         settings.terminal_mouse_override = draft.terminal_mouse_override;
         settings.terminal_read_only = draft.terminal_read_only;
-        apply_browser_enabled_preference(&mut settings, draft.browser_enabled);
+        let next_browser_enabled = draft.browser_enabled;
+        if self.state.settings().browser_enabled && !next_browser_enabled {
+            self.interrupt_all_browser_replays_before_shutdown();
+        }
+        apply_browser_enabled_preference(&mut settings, next_browser_enabled);
 
         self.state.update_settings(settings);
         let browser_gateway_diagnostic = self.reconcile_browser_gateway();
@@ -7970,6 +9268,11 @@ impl NativeShell {
                 let Some(project_id) = draft.existing_id else {
                     return;
                 };
+                if let Err(error) = validate_project_deletion(&self.state, &project_id) {
+                    self.editor_notice = Some(error);
+                    cx.notify();
+                    return;
+                }
                 if self.remote_mode.is_some() {
                     if !self.ensure_remote_control(cx) {
                         return;
@@ -7998,6 +9301,7 @@ impl NativeShell {
                     );
                     return;
                 }
+                self.interrupt_browser_project_before_mutation(&project_id);
                 let ai_tab_ids: Vec<String> = self
                     .state
                     .ai_tabs()
@@ -8178,6 +9482,11 @@ impl NativeShell {
     }
 
     fn delete_project_action(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        if let Err(error) = validate_project_deletion(&self.state, project_id) {
+            self.terminal_notice = Some(error);
+            cx.notify();
+            return;
+        }
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -8210,6 +9519,7 @@ impl NativeShell {
             return;
         }
 
+        self.interrupt_browser_project_before_mutation(project_id);
         let ai_tab_ids: Vec<String> = self
             .state
             .ai_tabs()
@@ -9041,6 +10351,10 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_replay_secret_prompt.is_some() {
+            window.prevent_default();
+            return;
+        }
         if self.handle_wizard_key(event, window, cx) {
             return;
         }
@@ -10714,6 +12028,14 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = self
+            .process_manager
+            .validate_server_launch(&self.state, command_id)
+        {
+            self.terminal_notice = Some(format!("Failed to start server: {error}"));
+            cx.notify();
+            return;
+        }
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -10739,6 +12061,9 @@ impl NativeShell {
             .find_command(command_id)
             .and_then(|lookup| lookup.command.port)
         else {
+            if focus_started_server {
+                self.interrupt_active_browser_replay_before_route_change(None);
+            }
             let result = if focus_started_server {
                 self.process_manager
                     .start_server(&mut self.state, command_id, dimensions)
@@ -10790,6 +12115,14 @@ impl NativeShell {
                         background_executor.timer(Duration::from_millis(50)).await;
                     }
                     let _ = this.update(&mut async_cx, |this, cx: &mut Context<'_, Self>| {
+                        if let Err(error) = this
+                            .process_manager
+                            .validate_server_launch(&this.state, &command_id)
+                        {
+                            this.terminal_notice = Some(format!("Failed to start server: {error}"));
+                            cx.notify();
+                            return;
+                        }
                         if let Some(state) = this.active_port_state.as_mut() {
                             if state.command_id == command_id && state.port == port {
                                 state.status = status.clone();
@@ -10818,6 +12151,9 @@ impl NativeShell {
                             return;
                         }
 
+                        if focus_started_server {
+                            this.interrupt_active_browser_replay_before_route_change(None);
+                        }
                         let result = if focus_started_server {
                             this.process_manager.start_server(
                                 &mut this.state,
@@ -10905,6 +12241,14 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = self
+            .process_manager
+            .validate_server_launch(&self.state, command_id)
+        {
+            self.terminal_notice = Some(format!("Failed to restart server: {error}"));
+            cx.notify();
+            return;
+        }
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -10919,6 +12263,7 @@ impl NativeShell {
             return;
         }
 
+        self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
         let port = self
             .state
@@ -10998,6 +12343,16 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Err(error) = self
+            .process_manager
+            .validate_server_launch(&self.state, command_id)
+        {
+            self.terminal_notice = Some(format!(
+                "Failed to restart server after freeing port: {error}"
+            ));
+            cx.notify();
+            return;
+        }
         let Some(lookup) = self
             .state
             .find_command(command_id)
@@ -11014,6 +12369,7 @@ impl NativeShell {
             return;
         };
 
+        self.interrupt_active_browser_replay_before_route_change(None);
         let _ = self.process_manager.write_virtual_text(
             command_id,
             &format!("\r\n\x1b[33m--- Resolving port {port} conflict... ---\x1b[0m\r\n"),
@@ -11055,15 +12411,22 @@ impl NativeShell {
     }
 
     fn select_server_tab_action(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        let lookup = self.state.find_command(command_id).map(|lookup| {
+            (
+                lookup.project.id.clone(),
+                lookup.command.id.clone(),
+                lookup.command.label.clone(),
+            )
+        });
+        let server_tab_exists = existing_server_tab(&self.state, command_id).is_some();
+        if lookup.is_none() && !server_tab_exists {
+            self.terminal_notice = Some(format!("Unknown command `{command_id}`"));
+            cx.notify();
+            return;
+        }
+        self.interrupt_active_browser_replay_before_route_change(None);
         if self.remote_mode.is_some() {
-            let lookup = self.state.find_command(command_id).map(|lookup| {
-                (
-                    lookup.project.id.clone(),
-                    lookup.command.id.clone(),
-                    lookup.command.label.clone(),
-                )
-            });
-            if let Some((project_id, command_id, label)) = lookup {
+            if let Some((project_id, command_id, label)) = lookup.clone() {
                 self.state
                     .open_server_tab(&project_id, &command_id, Some(label));
             } else {
@@ -11079,14 +12442,6 @@ impl NativeShell {
             cx.notify();
             return;
         }
-
-        let lookup = self.state.find_command(command_id).map(|lookup| {
-            (
-                lookup.project.id.clone(),
-                lookup.command.id.clone(),
-                lookup.command.label.clone(),
-            )
-        });
 
         if let Some((project_id, command_id, label)) = lookup {
             self.state
@@ -11110,6 +12465,11 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        if self.state.find_project(project_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown project `{project_id}`"));
+            cx.notify();
+            return;
+        }
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::LaunchAi {
@@ -11124,6 +12484,7 @@ impl NativeShell {
         }
 
         let dimensions = self.terminal_dimensions(window);
+        self.interrupt_active_browser_replay_before_route_change(None);
         match self.process_manager.start_ai_session(
             &mut self.state,
             project_id,
@@ -11146,6 +12507,8 @@ impl NativeShell {
     fn select_ai_tab_action(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.remote_mode.is_some() {
             if let Some(tab) = self.state.find_ai_tab(tab_id).cloned() {
+                let next_workspace = browser_workspace_key_for_ai_tab(Some(&tab));
+                self.interrupt_active_browser_replay_before_route_change(next_workspace.as_ref());
                 self.state.select_tab(tab_id);
                 self.show_terminal_surface();
                 self.synced_session_id = tab.pty_session_id.clone();
@@ -11177,6 +12540,8 @@ impl NativeShell {
             return;
         };
 
+        let next_workspace = browser_workspace_key_for_ai_tab(Some(&tab));
+        self.interrupt_active_browser_replay_before_route_change(next_workspace.as_ref());
         self.state.select_tab(tab_id);
         self.show_terminal_surface();
         self.synced_session_id = tab.pty_session_id.clone();
@@ -11221,6 +12586,25 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        let Some(tab) = self.state.find_ai_tab(tab_id).cloned() else {
+            self.terminal_notice = Some(format!("Unknown AI tab `{tab_id}`"));
+            cx.notify();
+            return;
+        };
+        if self.state.find_project(&tab.project_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown project `{}`", tab.project_id));
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self
+            .process_manager
+            .validate_ai_restart(&self.state, tab_id)
+        {
+            self.terminal_notice = Some(format!("Failed to restart AI tab: {error}"));
+            cx.notify();
+            return;
+        }
+        let workspace_key = browser_workspace_key_for_ai_tab(Some(&tab));
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
             self.remote_send_action(RemoteAction::RestartAiTab {
@@ -11233,6 +12617,10 @@ impl NativeShell {
             return;
         }
 
+        self.interrupt_active_browser_replay_before_route_change(workspace_key.as_ref());
+        if let Some(workspace_key) = workspace_key.as_ref() {
+            self.interrupt_browser_workspace_before_teardown(workspace_key);
+        }
         let dimensions = self.terminal_dimensions(window);
         match self
             .process_manager
@@ -11254,6 +12642,10 @@ impl NativeShell {
     fn close_ai_tab_action(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         if !self.ensure_mutation_control(cx) {
             return;
+        }
+        let workspace_key = browser_workspace_key_for_ai_tab(self.state.find_ai_tab(tab_id));
+        if let Some(workspace_key) = workspace_key.as_ref() {
+            self.interrupt_browser_workspace_before_teardown(workspace_key);
         }
         if self.remote_mode.is_some() {
             self.remote_send_action(RemoteAction::CloseAiTab {
@@ -11278,12 +12670,18 @@ impl NativeShell {
     }
 
     fn open_ssh_tab_action(&mut self, connection_id: &str, cx: &mut Context<Self>) {
+        let Some(connection) = self.state.find_ssh_connection(connection_id).cloned() else {
+            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
+            cx.notify();
+            return;
+        };
         if self.remote_mode.is_some() {
             if let Some(tab) = self
                 .state
                 .find_ssh_tab_by_connection(connection_id)
                 .cloned()
             {
+                self.interrupt_active_browser_replay_before_route_change(None);
                 self.state.select_tab(&tab.id);
                 self.show_terminal_surface();
                 self.synced_session_id = tab.pty_session_id.clone();
@@ -11299,6 +12697,7 @@ impl NativeShell {
             if !self.ensure_mutation_control(cx) {
                 return;
             }
+            self.interrupt_active_browser_replay_before_route_change(None);
             self.remote_send_action(RemoteAction::OpenSshTab {
                 connection_id: connection_id.to_string(),
             });
@@ -11311,12 +12710,6 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
-        let connection = self.state.find_ssh_connection(connection_id).cloned();
-        let Some(connection) = connection else {
-            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
-            cx.notify();
-            return;
-        };
 
         let project_id = self
             .state
@@ -11334,6 +12727,7 @@ impl NativeShell {
                     .map(|project| project.id.clone())
             })
             .unwrap_or_default();
+        self.interrupt_active_browser_replay_before_route_change(None);
         let tab_id = self
             .state
             .open_ssh_tab(&project_id, connection_id, Some(connection.label));
@@ -11357,8 +12751,14 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        if self.state.find_ssh_connection(connection_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
+            cx.notify();
+            return;
+        }
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
+            self.interrupt_active_browser_replay_before_route_change(None);
             self.remote_send_action(RemoteAction::ConnectSsh {
                 connection_id: connection_id.to_string(),
                 dimensions,
@@ -11370,6 +12770,7 @@ impl NativeShell {
         }
 
         let dimensions = self.terminal_dimensions(window);
+        self.interrupt_active_browser_replay_before_route_change(None);
         match self
             .process_manager
             .start_ssh_session(&mut self.state, connection_id, dimensions)
@@ -11397,8 +12798,14 @@ impl NativeShell {
         if !self.ensure_mutation_control(cx) {
             return;
         }
+        if self.state.find_ssh_connection(connection_id).is_none() {
+            self.terminal_notice = Some(format!("Unknown SSH connection `{connection_id}`"));
+            cx.notify();
+            return;
+        }
         if self.remote_mode.is_some() {
             let dimensions = self.terminal_dimensions(window);
+            self.interrupt_active_browser_replay_before_route_change(None);
             self.remote_send_action(RemoteAction::RestartSsh {
                 connection_id: connection_id.to_string(),
                 dimensions,
@@ -11418,6 +12825,7 @@ impl NativeShell {
             return;
         };
 
+        self.interrupt_active_browser_replay_before_route_change(None);
         let dimensions = self.terminal_dimensions(window);
         match self
             .process_manager
@@ -11914,6 +13322,10 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_replay_secret_prompt.is_some() {
+            window.prevent_default();
+            return;
+        }
         if self.handle_wizard_key(event, window, cx) {
             return;
         }
@@ -13497,6 +14909,9 @@ impl Render for NativeShell {
                                 on_address_key: Box::new(
                                     cx.listener(Self::handle_browser_address_key),
                                 ),
+                                on_replay_secret_key: Box::new(
+                                    cx.listener(Self::handle_browser_replay_secret_key),
+                                ),
                                 on_annotation_key: Box::new(
                                     cx.listener(Self::handle_browser_annotation_key),
                                 ),
@@ -13609,6 +15024,7 @@ impl Render for NativeShell {
                                         .child(render_browser_pane(
                                             browser,
                                             self.browser_address_focus.clone(),
+                                            self.browser_replay_secret_focus.clone(),
                                             self.browser_annotation_focus.clone(),
                                             self.browser_workflow_focus.clone(),
                                             browser_actions,
@@ -15883,6 +17299,61 @@ fn local_browser_workflow_project_root(
         })
 }
 
+fn existing_server_tab<'a>(state: &'a AppState, tab_id: &str) -> Option<&'a SessionTab> {
+    state
+        .find_tab(tab_id)
+        .filter(|tab| tab.tab_type == TabType::Server)
+}
+
+fn validate_project_deletion(state: &AppState, project_id: &str) -> Result<(), String> {
+    state
+        .find_project(project_id)
+        .map(|_| ())
+        .ok_or_else(|| format!("Unknown project `{project_id}`"))
+}
+
+fn validate_browser_pane_action_before_replay_interrupt(
+    workspace_key: &BrowserWorkspaceKey,
+    snapshot: &BrowserWorkspaceSnapshot,
+    address_draft: &str,
+    action: &BrowserPaneAction,
+    mut interrupt_then_retire: impl FnMut(),
+) -> Result<BrowserActionPlan, BrowserError> {
+    let plan = browser_action_plan(
+        Some(workspace_key),
+        Some(snapshot),
+        address_draft,
+        action.clone(),
+    )?;
+    let interrupts_active_replay = match action {
+        BrowserPaneAction::SelectTab(_) => !plan.commands.is_empty(),
+        BrowserPaneAction::Collapse
+        | BrowserPaneAction::CreateTab
+        | BrowserPaneAction::Back
+        | BrowserPaneAction::Forward
+        | BrowserPaneAction::Reload
+        | BrowserPaneAction::FocusAddress
+        | BrowserPaneAction::SubmitAddress
+        | BrowserPaneAction::SetViewport(_)
+        | BrowserPaneAction::ToggleAnnotation
+        | BrowserPaneAction::StartRecording => true,
+        _ => false,
+    };
+    if interrupts_active_replay {
+        interrupt_then_retire();
+    }
+    Ok(plan)
+}
+
+fn route_browser_request_for_active_workspace(
+    active_workspace: Option<&BrowserWorkspaceKey>,
+    request: BrowserCommandRequest,
+    dispatch_open: impl FnOnce(BrowserCommandRequest),
+) -> Result<(), BrowserError> {
+    let route_is_open = active_workspace == Some(request.workspace_key());
+    route_browser_request(route_is_open, request, dispatch_open)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15898,6 +17369,105 @@ mod tests {
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn update_exit_dominates_repeated_normal_quit_requests() {
+        assert_eq!(
+            PendingAppTermination::Quit.coalesce(PendingAppTermination::Quit),
+            PendingAppTermination::Quit
+        );
+        assert_eq!(
+            PendingAppTermination::Quit.coalesce(PendingAppTermination::ExitAfterUpdate),
+            PendingAppTermination::ExitAfterUpdate
+        );
+        assert_eq!(
+            PendingAppTermination::ExitAfterUpdate.coalesce(PendingAppTermination::Quit),
+            PendingAppTermination::ExitAfterUpdate
+        );
+    }
+
+    #[test]
+    fn pending_app_termination_is_retained_until_native_window_teardown_drains() {
+        let mut pending = Some(PendingAppTermination::ExitAfterUpdate);
+
+        assert_eq!(take_ready_app_termination(&mut pending, false), None);
+        assert_eq!(pending, Some(PendingAppTermination::ExitAfterUpdate));
+        assert_eq!(
+            take_ready_app_termination(&mut pending, true),
+            Some(PendingAppTermination::ExitAfterUpdate)
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn shutdown_failures_ignore_stale_ops_and_preserve_forced_exit_authority() {
+        assert_eq!(
+            shutdown_failure_disposition(
+                Some(42),
+                41,
+                Some(PendingAppTermination::ExitAfterUpdate),
+            ),
+            ShutdownFailureDisposition::IgnoreStale
+        );
+        assert_eq!(
+            shutdown_failure_disposition(None, 42, Some(PendingAppTermination::Quit)),
+            ShutdownFailureDisposition::IgnoreStale
+        );
+        assert_eq!(
+            shutdown_failure_disposition(
+                Some(42),
+                42,
+                Some(PendingAppTermination::ExitAfterUpdate),
+            ),
+            ShutdownFailureDisposition::PreservePendingTermination
+        );
+        assert_eq!(
+            shutdown_failure_disposition(Some(42), 42, Some(PendingAppTermination::Quit)),
+            ShutdownFailureDisposition::PreservePendingTermination
+        );
+        assert_eq!(
+            shutdown_failure_disposition(Some(42), 42, None),
+            ShutdownFailureDisposition::ResumeInteractiveShutdown
+        );
+    }
+
+    #[test]
+    fn forced_termination_retires_the_shutdown_op_before_late_success_or_failure() {
+        let mut pending_shutdown_op_id = Some(42);
+        let mut pending_window_close = true;
+
+        retire_pending_shutdown_for_forced_termination(
+            &mut pending_shutdown_op_id,
+            &mut pending_window_close,
+        );
+
+        assert_eq!(pending_shutdown_op_id, None);
+        assert!(!pending_window_close);
+        assert!(!shutdown_completion_is_current(pending_shutdown_op_id, 42));
+        assert_eq!(
+            shutdown_failure_disposition(
+                pending_shutdown_op_id,
+                42,
+                Some(PendingAppTermination::ExitAfterUpdate),
+            ),
+            ShutdownFailureDisposition::IgnoreStale
+        );
+    }
+
+    #[test]
+    fn successful_update_install_promotes_only_an_existing_pending_termination() {
+        let mut quit = Some(PendingAppTermination::Quit);
+        promote_pending_app_termination_for_update(&mut quit);
+        assert_eq!(quit, Some(PendingAppTermination::ExitAfterUpdate));
+
+        let mut update = Some(PendingAppTermination::ExitAfterUpdate);
+        promote_pending_app_termination_for_update(&mut update);
+        assert_eq!(update, Some(PendingAppTermination::ExitAfterUpdate));
+
+        let mut no_pending_termination = None;
+        promote_pending_app_termination_for_update(&mut no_pending_termination);
+        assert_eq!(no_pending_termination, None);
+    }
 
     fn sample_ai_tab() -> SessionTab {
         SessionTab {
@@ -17773,6 +19343,762 @@ mod tests {
             } else {
                 "\u{1b}a".to_string()
             })
+        );
+    }
+
+    #[test]
+    fn server_tab_fallback_rejects_an_active_ai_tab_without_state_mutation() {
+        let mut state = AppState::default();
+        let ai_tab = sample_ai_tab();
+        state.active_tab_id = Some(ai_tab.id.clone());
+        state.open_tabs.push(ai_tab);
+        let tabs_before = state.open_tabs.clone();
+        let active_before = state.active_tab_id.clone();
+
+        assert!(existing_server_tab(&state, "tab-1").is_none());
+        assert_eq!(state.open_tabs, tabs_before);
+        assert_eq!(state.active_tab_id, active_before);
+
+        state.open_tabs.push(SessionTab {
+            id: "server-tab".to_string(),
+            tab_type: TabType::Server,
+            project_id: "project-1".to_string(),
+            command_id: Some("server-command".to_string()),
+            pty_session_id: Some("server-command".to_string()),
+            label: Some("Server".to_string()),
+            ssh_connection_id: None,
+            browser_workspace: None,
+        });
+        assert_eq!(
+            existing_server_tab(&state, "server-tab").map(|tab| tab.tab_type.clone()),
+            Some(TabType::Server)
+        );
+    }
+
+    #[test]
+    fn stale_project_deletion_preflight_is_side_effect_free() {
+        let mut state = AppState::default();
+        let ai_tab = sample_ai_tab();
+        state.active_tab_id = Some(ai_tab.id.clone());
+        state.open_tabs.push(ai_tab);
+        let tabs_before = state.open_tabs.clone();
+        let active_before = state.active_tab_id.clone();
+        let projects_before = state.config.projects.clone();
+
+        assert_eq!(
+            validate_project_deletion(&state, "project-1"),
+            Err("Unknown project `project-1`".to_string())
+        );
+        assert_eq!(state.open_tabs, tabs_before);
+        assert_eq!(state.active_tab_id, active_before);
+        assert_eq!(state.config.projects, projects_before);
+
+        state.config.projects.push(Project {
+            id: "project-1".to_string(),
+            ..Project::default()
+        });
+        assert_eq!(validate_project_deletion(&state, "project-1"), Ok(()));
+    }
+
+    fn populated_secret_replay(
+        workspace_key: &BrowserWorkspaceKey,
+        recipe_id: &str,
+    ) -> (
+        BrowserCommandBridge,
+        crate::browser::BrowserReplayCoordinator,
+        crate::browser::BrowserReplayStart,
+        BrowserReplaySecretPromptVault,
+    ) {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput,
+            BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeValue, BrowserRecipeViewport, BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let (bridge, _inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let started = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: recipe_id.to_string(),
+                        name: "Prompt boundary fixture".to_string(),
+                        description: "Prompt boundary fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: vec![BrowserRecipeInput {
+                            name: "credential".to_string(),
+                            kind: BrowserRecipeInputKind::Secret,
+                            default_value: None,
+                        }],
+                        steps: vec![BrowserRecipeStep {
+                            id: "credential".to_string(),
+                            action: BrowserRecipeAction::Type {
+                                locator: BrowserRecipeLocator {
+                                    test_id: Some("credential".to_string()),
+                                    ..BrowserRecipeLocator::default()
+                                },
+                                value: BrowserRecipeValue::Input {
+                                    name: "credential".to_string(),
+                                },
+                            },
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (mut vault, _) = BrowserReplaySecretPromptVault::install(
+            started.instance.clone(),
+            started.projection.unresolved_secret_inputs.clone(),
+        )
+        .unwrap();
+        vault
+            .edit(&started.instance, "credential", "populated-secret")
+            .unwrap();
+        (bridge, coordinator, started, vault)
+    }
+
+    #[test]
+    fn invalid_lifecycle_preflights_preserve_control_runtime_queue_and_replay_witnesses() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct LifecycleBoundaryWitness {
+            control_owner: Option<String>,
+            control_generation: u64,
+            tabs: Vec<SessionTab>,
+            runtime_generation: u64,
+            queue_generation: u64,
+            replay_status: BrowserReplayStatus,
+        }
+
+        let mut state = AppState::default();
+        state.config.projects.push(sample_project());
+        let ai_tab = sample_ai_tab();
+        state.active_tab_id = Some(ai_tab.id.clone());
+        state.open_tabs.push(ai_tab);
+        let workspace_key = BrowserWorkspaceKey::new("project-1", "tab-1").unwrap();
+        let (bridge, coordinator, started, _vault) =
+            populated_secret_replay(&workspace_key, "lifecycle-preflight-witness");
+        let process_manager = ProcessManager::new();
+        let runtime_generation = process_manager.runtime_revision();
+        let initial = LifecycleBoundaryWitness {
+            control_owner: Some("remote-controller".to_string()),
+            control_generation: 41,
+            tabs: state.open_tabs.clone(),
+            runtime_generation,
+            queue_generation: 17,
+            replay_status: coordinator.status(&started.instance).unwrap().status,
+        };
+
+        for preflight in [
+            process_manager.validate_server_launch(&state, "server-cmd"),
+            process_manager.validate_server_launch(&state, "missing-command"),
+            validate_project_deletion(&state, "missing-project"),
+        ] {
+            let mut witness = initial.clone();
+            let result = preflight.map(|_| {
+                witness.control_owner = None;
+                witness.control_generation += 1;
+                witness.tabs.clear();
+                witness.runtime_generation += 1;
+                witness.queue_generation += 1;
+                bridge.interrupt_workspace(&workspace_key);
+                witness.replay_status = coordinator.status(&started.instance).unwrap().status;
+            });
+
+            assert!(result.is_err());
+            assert_eq!(witness, initial);
+            assert_eq!(state.open_tabs, initial.tabs);
+            assert_eq!(process_manager.runtime_revision(), runtime_generation);
+            assert!(process_manager.drain_process_op_completions().is_empty());
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                initial.replay_status
+            );
+        }
+    }
+
+    #[test]
+    fn tab_selection_preflight_preserves_invalid_authority_and_cancels_valid_change_first() {
+        use crate::browser::{BrowserTabSnapshot, BrowserViewport};
+
+        let workspace_key = BrowserWorkspaceKey::new("tab-project", "tab-conversation").unwrap();
+        let snapshot = BrowserWorkspaceSnapshot {
+            tabs: vec![
+                BrowserTabSnapshot {
+                    id: "tab-a".to_string(),
+                    title: "A".to_string(),
+                    url: "https://a.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+                BrowserTabSnapshot {
+                    id: "tab-b".to_string(),
+                    title: "B".to_string(),
+                    url: "https://b.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+            ],
+            selected_tab_id: Some("tab-a".to_string()),
+            ..BrowserWorkspaceSnapshot::default()
+        };
+
+        for (recipe_id, action, expect_error) in [
+            (
+                "unknown-tab-prompt",
+                BrowserPaneAction::SelectTab("missing-tab".to_string()),
+                true,
+            ),
+            (
+                "selected-tab-prompt",
+                BrowserPaneAction::SelectTab("tab-a".to_string()),
+                false,
+            ),
+        ] {
+            let (bridge, coordinator, started, vault) =
+                populated_secret_replay(&workspace_key, recipe_id);
+            let status_before = coordinator.status(&started.instance).unwrap().status;
+            let mut prompt = Some(vault);
+            let mut boundary_called = false;
+            let result = validate_browser_pane_action_before_replay_interrupt(
+                &workspace_key,
+                &snapshot,
+                "",
+                &action,
+                || {
+                    boundary_called = true;
+                    bridge.interrupt_workspace(&workspace_key);
+                    prompt.take();
+                },
+            );
+
+            assert_eq!(result.is_err(), expect_error, "{recipe_id}");
+            if let Ok(plan) = result {
+                assert!(plan.commands.is_empty(), "{recipe_id}");
+            }
+            assert!(!boundary_called, "{recipe_id}");
+            assert_eq!(
+                prompt.as_ref().unwrap().projection().is_set,
+                vec![true],
+                "{recipe_id}"
+            );
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                status_before,
+                "{recipe_id}"
+            );
+        }
+
+        let (bridge, coordinator, started, vault) =
+            populated_secret_replay(&workspace_key, "different-tab-prompt");
+        let mut prompt = Some(vault);
+        let mut status_before_retirement = None;
+        let plan = validate_browser_pane_action_before_replay_interrupt(
+            &workspace_key,
+            &snapshot,
+            "",
+            &BrowserPaneAction::SelectTab("tab-b".to_string()),
+            || {
+                bridge.interrupt_workspace(&workspace_key);
+                status_before_retirement =
+                    Some(coordinator.status(&started.instance).unwrap().status);
+                prompt.take();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.commands,
+            vec![BrowserCommand::SelectTab {
+                tab_id: "tab-b".to_string()
+            }]
+        );
+        assert_eq!(
+            status_before_retirement,
+            Some(BrowserReplayStatus::Cancelled)
+        );
+        assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn host_barriers_publish_queued_input_before_priority_lifecycle_dispatch() {
+        let source = include_str!("mod.rs");
+        let dispatch_start = source.find("fn dispatch_browser_command(").unwrap();
+        let dispatch_end = source[dispatch_start..]
+            .find("fn synchronize_browser_response(")
+            .map(|offset| dispatch_start + offset)
+            .unwrap();
+        let dispatch = &source[dispatch_start..dispatch_end];
+        let dispatch_publish = dispatch.find("publish_pending_user_input_cutoffs").unwrap();
+        let dispatch_lifecycle = dispatch.find("for request in lifecycle_requests").unwrap();
+        assert!(dispatch_publish < dispatch_lifecycle);
+
+        let barrier_start = source
+            .find("fn with_browser_host_control_barrier<R>(")
+            .unwrap();
+        let barrier_end = source[barrier_start..]
+            .find("fn browser_pane_context(")
+            .map(|offset| barrier_start + offset)
+            .unwrap();
+        let barrier = &source[barrier_start..barrier_end];
+        let barrier_publish = barrier.find("publish_pending_user_input_cutoffs").unwrap();
+        let barrier_lifecycle = barrier.find("for request in lifecycle_requests").unwrap();
+        let enter_host = barrier.find("enter_host(browser_host)").unwrap();
+        assert!(barrier_publish < barrier_lifecycle && barrier_lifecycle < enter_host);
+    }
+
+    #[test]
+    fn valid_conflicting_pane_controls_cancel_running_replays_even_without_a_secret_prompt() {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeViewport, BrowserTabSnapshot, BrowserViewport,
+            BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        fn running_replay(
+            workspace_key: &BrowserWorkspaceKey,
+            recipe_id: &str,
+        ) -> (
+            BrowserCommandBridge,
+            crate::browser::BrowserReplayCoordinator,
+            crate::browser::BrowserReplayStart,
+        ) {
+            let (bridge, _inbox) = browser_command_channel(4);
+            let coordinator = bridge.replay_coordinator();
+            let started = coordinator
+                .start(
+                    workspace_key.clone(),
+                    compile_browser_replay(
+                        &BrowserRecipeV1 {
+                            schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                            id: recipe_id.to_string(),
+                            name: "Running pane replay".to_string(),
+                            description: "Pane interruption fixture".to_string(),
+                            start_url: "https://example.test".to_string(),
+                            viewport: BrowserRecipeViewport::default(),
+                            inputs: Vec::new(),
+                            steps: vec![BrowserRecipeStep {
+                                id: "reload".to_string(),
+                                action: BrowserRecipeAction::Reload,
+                                wait: None,
+                                assertions: Vec::new(),
+                            }],
+                        },
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            coordinator.begin(&started.instance).unwrap();
+            (bridge, coordinator, started)
+        }
+
+        let workspace_key = BrowserWorkspaceKey::new("pane-project", "pane-conversation").unwrap();
+        let snapshot = BrowserWorkspaceSnapshot {
+            pane_open: true,
+            tabs: vec![
+                BrowserTabSnapshot {
+                    id: "tab-a".to_string(),
+                    title: "A".to_string(),
+                    url: "https://a.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+                BrowserTabSnapshot {
+                    id: "tab-b".to_string(),
+                    title: "B".to_string(),
+                    url: "https://b.test".to_string(),
+                    viewport: BrowserViewport::default(),
+                },
+            ],
+            selected_tab_id: Some("tab-a".to_string()),
+            ..BrowserWorkspaceSnapshot::default()
+        };
+
+        for (recipe_id, address, action) in [
+            ("running-collapse", "", BrowserPaneAction::Collapse),
+            (
+                "running-select-tab",
+                "",
+                BrowserPaneAction::SelectTab("tab-b".to_string()),
+            ),
+            (
+                "running-navigate",
+                "https://next.test/path",
+                BrowserPaneAction::SubmitAddress,
+            ),
+            ("running-back", "", BrowserPaneAction::Back),
+            (
+                "running-viewport",
+                "",
+                BrowserPaneAction::SetViewport(crate::browser::BrowserViewportPreset::Mobile),
+            ),
+            (
+                "running-annotation",
+                "",
+                BrowserPaneAction::ToggleAnnotation,
+            ),
+        ] {
+            let (bridge, coordinator, started) = running_replay(&workspace_key, recipe_id);
+            let mut boundary_called = false;
+            let plan = validate_browser_pane_action_before_replay_interrupt(
+                &workspace_key,
+                &snapshot,
+                address,
+                &action,
+                || {
+                    boundary_called = true;
+                    bridge.interrupt_workspace(&workspace_key);
+                },
+            )
+            .unwrap();
+
+            assert!(!plan.commands.is_empty(), "{recipe_id}");
+            assert!(boundary_called, "{recipe_id}");
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                BrowserReplayStatus::Cancelled,
+                "{recipe_id}"
+            );
+        }
+
+        for (recipe_id, address, action, expect_error) in [
+            (
+                "invalid-unknown-tab",
+                "",
+                BrowserPaneAction::SelectTab("missing-tab".to_string()),
+                true,
+            ),
+            (
+                "noop-selected-tab",
+                "",
+                BrowserPaneAction::SelectTab("tab-a".to_string()),
+                false,
+            ),
+            (
+                "invalid-blank-address",
+                "   ",
+                BrowserPaneAction::SubmitAddress,
+                true,
+            ),
+        ] {
+            let (bridge, coordinator, started) = running_replay(&workspace_key, recipe_id);
+            let mut boundary_called = false;
+            let result = validate_browser_pane_action_before_replay_interrupt(
+                &workspace_key,
+                &snapshot,
+                address,
+                &action,
+                || {
+                    boundary_called = true;
+                    bridge.interrupt_workspace(&workspace_key);
+                },
+            );
+
+            assert_eq!(result.is_err(), expect_error, "{recipe_id}");
+            if let Ok(plan) = result {
+                assert!(plan.commands.is_empty(), "{recipe_id}");
+            }
+            assert!(!boundary_called, "{recipe_id}");
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                BrowserReplayStatus::Running,
+                "{recipe_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_loss_after_successful_validation_rejects_priority_lifecycle_dispatch() {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeViewport, BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let replay_plan = |id: &str| {
+            compile_browser_replay(
+                &BrowserRecipeV1 {
+                    schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                    id: id.to_string(),
+                    name: "Lifecycle route replay".to_string(),
+                    description: "Priority route admission fixture".to_string(),
+                    start_url: "https://example.test".to_string(),
+                    viewport: BrowserRecipeViewport::default(),
+                    inputs: Vec::new(),
+                    steps: vec![BrowserRecipeStep {
+                        id: "reload".to_string(),
+                        action: BrowserRecipeAction::Reload,
+                        wait: None,
+                        assertions: Vec::new(),
+                    }],
+                },
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let workspace_key =
+            BrowserWorkspaceKey::new("lifecycle-route-project", "conversation").unwrap();
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let coordinator = bridge.replay_coordinator();
+
+        let validating_controller = controller.clone();
+        let validation = tokio::spawn(async move {
+            validating_controller
+                .request_with_context(
+                    BrowserCommand::WorkspaceState,
+                    BrowserInvocationContext::agent(
+                        "validate lifecycle route",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let validation_request = inbox.recv().await.expect("workspace validation request");
+        validation_request.respond(Ok(BrowserResponse::WorkspaceState {
+            snapshot: BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        }));
+        assert!(matches!(
+            validation.await.unwrap(),
+            Ok(BrowserResponse::WorkspaceState { .. })
+        ));
+
+        bridge.interrupt_workspace(&workspace_key);
+        let replay = coordinator
+            .start(workspace_key.clone(), replay_plan("inactive-route"))
+            .unwrap();
+        coordinator.begin(&replay.instance).unwrap();
+        let retained_controller = controller.clone();
+        let retained = tokio::spawn(async move {
+            retained_controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        let retained_request = inbox.recv().await.expect("retained tab request");
+        assert!(retained_request.cancellation_is_current());
+        let close_controller = controller.clone();
+        let close = tokio::spawn(async move {
+            close_controller
+                .request(BrowserCommand::CloseTab {
+                    tab_id: "tab-a".to_string(),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.pending_work_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("priority lifecycle request must enqueue");
+        assert_eq!(
+            coordinator.status(&replay.instance).unwrap().status,
+            BrowserReplayStatus::Running,
+            "an unadmitted lifecycle request cannot cancel a newer inactive-route replay"
+        );
+        assert!(
+            retained_request.cancellation_is_current(),
+            "route-rejected lifecycle work cannot advance tab cancellation epochs"
+        );
+        let (_controls, mut lifecycle_requests) =
+            bridge.with_locked_host_work(|controls, requests| (controls, requests));
+        assert_eq!(lifecycle_requests.len(), 1);
+        let request = lifecycle_requests.pop().unwrap();
+        let mut host_mutated = false;
+        let error = route_browser_request_for_active_workspace(None, request, |_| {
+            host_mutated = true;
+        })
+        .expect_err("lost route must reject the priority lifecycle request");
+
+        assert!(!host_mutated, "CloseTab must not reach the browser host");
+        assert_eq!(close.await.unwrap(), Err(error));
+        assert_eq!(
+            coordinator.status(&replay.instance).unwrap().status,
+            BrowserReplayStatus::Running
+        );
+        assert!(retained_request.cancellation_is_current());
+        retained_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(retained.await.unwrap(), Ok(BrowserResponse::Acknowledged));
+
+        coordinator.cancel(&replay.instance).unwrap();
+        let active_replay = coordinator
+            .start(workspace_key.clone(), replay_plan("active-route"))
+            .unwrap();
+        coordinator.begin(&active_replay.instance).unwrap();
+        let active_close_controller = controller.clone();
+        let active_close = tokio::spawn(async move {
+            active_close_controller
+                .request_with_context(
+                    BrowserCommand::CloseTab {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "direct agent close outside replay execution",
+                        BrowserRisk::Destructive,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.pending_work_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active lifecycle request must enqueue");
+        let (_controls, mut active_requests) =
+            bridge.with_locked_host_work(|controls, requests| (controls, requests));
+        let active_request = active_requests.pop().expect("active lifecycle request");
+        let mut active_host_mutated = false;
+        route_browser_request_for_active_workspace(
+            Some(&workspace_key),
+            active_request,
+            |request| {
+                assert_eq!(
+                    coordinator.status(&active_replay.instance).unwrap().status,
+                    BrowserReplayStatus::Cancelled,
+                    "valid lifecycle cancellation must precede host mutation"
+                );
+                assert!(request.cancellation_is_current());
+                active_host_mutated = true;
+                request.respond(Ok(BrowserResponse::Acknowledged));
+            },
+        )
+        .unwrap();
+        assert!(active_host_mutated);
+        assert_eq!(
+            active_close.await.unwrap(),
+            Ok(BrowserResponse::Acknowledged)
+        );
+    }
+
+    #[test]
+    fn ordinary_settings_disable_interrupts_all_browser_work_before_config_assignment() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let start = source
+            .find("fn apply_settings_draft(")
+            .expect("settings application helper");
+        let end = source[start..]
+            .find("fn save_editor_action(")
+            .map(|offset| start + offset)
+            .expect("settings helper boundary");
+        let apply = &source[start..end];
+        let interrupt = apply
+            .find("self.interrupt_all_browser_replays_before_shutdown()")
+            .expect("ordinary settings disable must interrupt local browser work");
+        let preference = apply
+            .find("apply_browser_enabled_preference(&mut settings, next_browser_enabled)")
+            .expect("browser preference assignment");
+        let assignment = apply
+            .find("self.state.update_settings(settings)")
+            .expect("settings state assignment");
+
+        assert!(interrupt < preference);
+        assert!(preference < assignment);
+    }
+
+    #[test]
+    fn invalid_browser_address_preserves_populated_prompt_and_replay_authority() {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput,
+            BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeValue, BrowserRecipeViewport, BrowserTabSnapshot, BrowserViewport,
+            BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let workspace_key =
+            BrowserWorkspaceKey::new("prompt-project", "prompt-conversation").unwrap();
+        let (bridge, _inbox) = browser_command_channel(4);
+        let coordinator = bridge.replay_coordinator();
+        let started = coordinator
+            .start(
+                workspace_key.clone(),
+                compile_browser_replay(
+                    &BrowserRecipeV1 {
+                        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                        id: "invalid-address-prompt".to_string(),
+                        name: "Invalid address prompt".to_string(),
+                        description: "Prompt preservation fixture".to_string(),
+                        start_url: "https://example.test".to_string(),
+                        viewport: BrowserRecipeViewport::default(),
+                        inputs: vec![BrowserRecipeInput {
+                            name: "credential".to_string(),
+                            kind: BrowserRecipeInputKind::Secret,
+                            default_value: None,
+                        }],
+                        steps: vec![BrowserRecipeStep {
+                            id: "credential".to_string(),
+                            action: BrowserRecipeAction::Type {
+                                locator: BrowserRecipeLocator {
+                                    test_id: Some("credential".to_string()),
+                                    ..BrowserRecipeLocator::default()
+                                },
+                                value: BrowserRecipeValue::Input {
+                                    name: "credential".to_string(),
+                                },
+                            },
+                            wait: None,
+                            assertions: Vec::new(),
+                        }],
+                    },
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (mut vault, _) = BrowserReplaySecretPromptVault::install(
+            started.instance.clone(),
+            started.projection.unresolved_secret_inputs.clone(),
+        )
+        .unwrap();
+        vault
+            .edit(&started.instance, "credential", "populated-secret")
+            .unwrap();
+        let mut prompt = Some(vault);
+        let mut boundary_called = false;
+        let snapshot = BrowserWorkspaceSnapshot {
+            tabs: vec![BrowserTabSnapshot {
+                id: "prompt-tab".to_string(),
+                title: "Prompt fixture".to_string(),
+                url: "https://example.test".to_string(),
+                viewport: BrowserViewport::default(),
+            }],
+            selected_tab_id: Some("prompt-tab".to_string()),
+            ..BrowserWorkspaceSnapshot::default()
+        };
+
+        let result = validate_browser_pane_action_before_replay_interrupt(
+            &workspace_key,
+            &snapshot,
+            "   ",
+            &BrowserPaneAction::SubmitAddress,
+            || {
+                boundary_called = true;
+                bridge.interrupt_workspace(&workspace_key);
+                prompt.take();
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(BrowserError::NavigationFailure { url, message })
+                if url.is_empty() && message == "address cannot be blank"
+        ));
+        assert!(!boundary_called);
+        assert_eq!(prompt.as_ref().unwrap().projection().is_set, vec![true]);
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::NeedsUserSecret
         );
     }
 

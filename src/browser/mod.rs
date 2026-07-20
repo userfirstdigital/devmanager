@@ -18,9 +18,13 @@ mod recording_ipc;
 mod recording_mcp;
 mod replay;
 mod replay_executor;
+// Task 2's domain slice will consume this private authority seam and remove the allowance.
+#[cfg_attr(not(test), allow(dead_code))]
+mod replay_repair;
 mod replay_secrets;
 mod resources;
 mod storage;
+mod workflow_mcp;
 
 pub(crate) use annotations::redacted_browser_annotation;
 pub use annotations::{
@@ -39,15 +43,15 @@ pub use attachments::{
 pub(crate) use attachments::{compact_browser_attachment_text, compact_browser_attachment_url};
 pub use automation::{
     browser_cdp_method_risk, build_semantic_snapshot, effective_browser_risk,
-    effective_browser_risk_for_targets, redact_browser_resource_bytes, redact_browser_text,
-    runtime_target_risk, BrowserAction, BrowserActionResult, BrowserActionTarget,
-    BrowserConsoleEntry, BrowserConsoleOperation, BrowserDownloadEntry, BrowserDownloadOperation,
-    BrowserLocatorStrategy, BrowserNetworkEntry, BrowserNetworkOperation,
-    BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
-    BrowserRawSemanticElement, BrowserRedactedAction, BrowserRuntimeTarget, BrowserScreenshotMode,
-    BrowserSemanticElement, BrowserSemanticSnapshot, BrowserSnapshotSummary,
-    BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition, BrowserWaitResult,
-    MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
+    effective_browser_risk_for_targets, effective_browser_secret_type_risk,
+    redact_browser_resource_bytes, redact_browser_text, runtime_target_risk, BrowserAction,
+    BrowserActionResult, BrowserActionTarget, BrowserConsoleEntry, BrowserConsoleOperation,
+    BrowserDownloadEntry, BrowserDownloadOperation, BrowserLocatorStrategy, BrowserNetworkEntry,
+    BrowserNetworkOperation, BrowserPerformanceOperation, BrowserPerformanceSnapshot, BrowserPoint,
+    BrowserRawSemanticElement, BrowserRedactedAction, BrowserReplayRepairCandidate,
+    BrowserRuntimeTarget, BrowserScreenshotMode, BrowserSemanticElement, BrowserSemanticSnapshot,
+    BrowserSnapshotSummary, BrowserTelemetryBuffer, BrowserUploadResult, BrowserWaitCondition,
+    BrowserWaitResult, MAX_BROWSER_ACTIONS, MAX_BROWSER_JOURNAL_ENTRIES, REDACTED_VALUE,
 };
 pub use commands::{
     browser_command_channel, browser_lifecycle_control, browser_operation_target_tab_id,
@@ -59,14 +63,16 @@ pub use commands::{
     BrowserRecordingOperation, BrowserRecordingResult, BrowserResponse, BrowserUserInputKind,
 };
 pub(crate) use commands::{
-    validate_direct_secret_command, verified_authenticated_local_project_root,
-    BrowserRegistrationLease,
+    validate_direct_repair_preview_command, validate_direct_secret_command,
+    verified_authenticated_local_project_root, BrowserRegistrationLease, BrowserReplayAdmission,
+    BrowserReplayRepairCleanupWork,
 };
 pub use downloads::{
     prepare_verified_download_root, prepare_verified_profile_root, remove_verified_profile,
     BrowserDownloadStore,
 };
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
+pub(crate) use host::BrowserAppExitDisposition;
 pub use host::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
     unique_download_path, unsupported_command_response, unsupported_host_status,
@@ -78,8 +84,8 @@ pub use host::{
 pub use model::{
     BrowserAnnotation, BrowserAnnotationKind, BrowserAttachmentRevision, BrowserBounds,
     BrowserElementRef, BrowserError, BrowserJournalActor, BrowserJournalEntry, BrowserLocator,
-    BrowserResourceId, BrowserRevision, BrowserTabSnapshot, BrowserViewport, BrowserWorkspaceKey,
-    BrowserWorkspaceSnapshot,
+    BrowserLocatorFailureTarget, BrowserResourceId, BrowserRevision, BrowserTabSnapshot,
+    BrowserViewport, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 pub use operation_queue::{
     BrowserOperationQueue, BrowserOperationTarget, BrowserQueueCancellation,
@@ -88,19 +94,22 @@ pub use pane::{
     apply_browser_workflow_review_mutation, browser_action_plan, browser_annotation_preview_plan,
     browser_content_bounds, browser_event_plan, browser_host_reconcile_plan,
     browser_host_visibility, browser_pane_eligible, browser_pane_open_fallback,
+    browser_replay_repair_candidate_from_annotation, browser_replay_secret_mask,
     browser_response_sync, browser_settings_plan, browser_workflow_review_editor_for_field,
     browser_workflow_review_editor_mutation, browser_workflow_review_projection,
     calculate_browser_split, discard_browser_workflow_review, normalize_browser_address,
     preview_browser_workflow_review, render_browser_pane, save_browser_workflow_review,
     selected_browser_tab_id, BrowserActionPlan, BrowserHostReconcilePlan, BrowserHostVisibility,
     BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
-    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserSettingsAction,
+    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserReplayPaneProjection,
+    BrowserReplaySecretPromptEvent, BrowserReplaySecretPromptOperation,
+    BrowserReplaySecretPromptProjection, BrowserReplaySecretPromptVault, BrowserSettingsAction,
     BrowserSettingsPlan, BrowserSnapshotSync, BrowserSplitLayout, BrowserViewportPreset,
     BrowserWorkflowReviewAssertionKind, BrowserWorkflowReviewEditor,
     BrowserWorkflowReviewEditorField, BrowserWorkflowReviewInputProjection,
     BrowserWorkflowReviewMetadataProjection, BrowserWorkflowReviewMutation,
     BrowserWorkflowReviewProjection, BrowserWorkflowReviewStepProjection,
-    BrowserWorkflowReviewUiState,
+    BrowserWorkflowReviewUiState, BROWSER_REPLAY_SECRET_MASK,
 };
 pub use policy::{classify_upload_path, BrowserApprovalPolicy, BrowserRisk};
 pub use provider::{
@@ -141,14 +150,19 @@ pub use recording_mcp::{
     save_browser_recording_review,
 };
 pub use replay::{
-    compile_browser_replay, BrowserReplayCancellationLease, BrowserReplayCoordinator,
-    BrowserReplayError, BrowserReplayExecutionHandle, BrowserReplayFailureCode,
-    BrowserReplayInstance, BrowserReplayPlan, BrowserReplayProjection, BrowserReplayPublicInput,
-    BrowserReplayStart, BrowserReplayStatus, MAX_BROWSER_REPLAY_FILE_BYTES,
-    MAX_BROWSER_REPLAY_INPUTS, MAX_BROWSER_REPLAY_INPUT_NAME_BYTES, MAX_BROWSER_REPLAY_STEPS,
-    MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
+    compile_browser_replay, BrowserReplayActiveState, BrowserReplayCancellationLease,
+    BrowserReplayCoordinator, BrowserReplayError, BrowserReplayExecutionHandle,
+    BrowserReplayFailureCode, BrowserReplayInstance, BrowserReplayPlan, BrowserReplayProjection,
+    BrowserReplayPublicInput, BrowserReplayStart, BrowserReplayStatus,
+    MAX_BROWSER_REPLAY_FILE_BYTES, MAX_BROWSER_REPLAY_INPUTS, MAX_BROWSER_REPLAY_INPUT_NAME_BYTES,
+    MAX_BROWSER_REPLAY_STEPS, MAX_BROWSER_REPLAY_TEXT_BYTES, MAX_BROWSER_REPLAY_URL_BYTES,
 };
 pub use replay_executor::execute_browser_replay;
+pub(crate) use replay_repair::BrowserReplayRepairResumeCursor;
+pub use replay_repair::{
+    BrowserReplayLocatorSlot, BrowserReplayRepairInstance, BrowserReplayRepairPhase,
+    BrowserReplayRepairProjection,
+};
 pub use replay_secrets::{
     BrowserReplaySecretError, BrowserReplaySecretLease, BrowserReplaySecretStore,
     BrowserReplaySecretSubmission, MAX_BROWSER_REPLAY_SECRET_INPUTS,
@@ -159,3 +173,11 @@ pub use resources::{
     BrowserResourceKind, BrowserResourceLimits, BrowserResourceMetadata, BrowserResourceStore,
 };
 pub use storage::BrowserStorageLayout;
+pub use workflow_mcp::{
+    get_browser_workflow_recipe, list_browser_workflow_recipes, BrowserWorkflowRecipeGet,
+    BrowserWorkflowRecipeInputSummary, BrowserWorkflowRecipeSummary,
+};
+pub(crate) use workflow_mcp::{
+    BrowserWorkflowMcpService, BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus,
+    BrowserWorkflowServiceError,
+};

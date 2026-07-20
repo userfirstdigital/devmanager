@@ -175,7 +175,7 @@ fn pending_annotation_chip_actions_preview_and_nested_remove_stops_propagation()
 
 #[test]
 fn native_chip_actions_reuse_authoritative_sources_and_the_existing_host_barrier() {
-    let source = include_str!("../src/app/mod.rs");
+    let source = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
     let source_start = source
         .find("fn pending_annotation_source_for_tab(")
         .expect("shared authoritative pending source");

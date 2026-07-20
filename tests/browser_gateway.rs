@@ -1,16 +1,19 @@
 use base64::Engine as _;
 use devmanager::browser::{
     browser_command_channel, browser_recording_review_result, browser_recording_status_result,
-    BrowserActionResult, BrowserAnnotation, BrowserCommand, BrowserCommandInbox,
-    BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle, BrowserHostControl,
-    BrowserHostState, BrowserHostStatus, BrowserInvocationActor, BrowserInvocationContext,
-    BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserRecipeInputKind,
-    BrowserRecordingAction, BrowserRecordingActor, BrowserRecordingInputSummary,
-    BrowserRecordingOperation, BrowserRecordingResult, BrowserRecordingStatus,
-    BrowserResourceHandle, BrowserResourceId, BrowserResourceKind, BrowserResourceLimits,
-    BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk, BrowserSnapshotSummary,
-    BrowserStorageLayout, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
-    BrowserWaitResult, BrowserWorkflowCoordinator, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    compile_browser_replay, save_recipe, BrowserActionResult, BrowserAnnotation, BrowserCommand,
+    BrowserCommandInbox, BrowserConsoleEntry, BrowserDownloadEntry, BrowserGatewayHandle,
+    BrowserHostControl, BrowserHostState, BrowserHostStatus, BrowserInvocationActor,
+    BrowserInvocationContext, BrowserNetworkEntry, BrowserPerformanceSnapshot, BrowserRecipeAction,
+    BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep,
+    BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport, BrowserRecordingAction,
+    BrowserRecordingActor, BrowserRecordingInputSummary, BrowserRecordingOperation,
+    BrowserRecordingResult, BrowserRecordingStatus, BrowserReplaySecretError,
+    BrowserReplaySecretPromptVault, BrowserReplayStatus, BrowserResourceHandle, BrowserResourceId,
+    BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore, BrowserResponse,
+    BrowserRevision, BrowserRisk, BrowserSnapshotSummary, BrowserStorageLayout, BrowserTabSnapshot,
+    BrowserUploadResult, BrowserViewport, BrowserWaitResult, BrowserWorkflowCoordinator,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use rmcp::model::{CallToolRequestParams, ClientInfo, ReadResourceRequestParams, ResourceContents};
 use rmcp::transport::{
@@ -107,6 +110,23 @@ fn raw_mcp_request_with_headers(
     response
 }
 
+fn raw_chunked_mcp_request(port: u16, host: &str, authorization: &str, body: &[u8]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect gateway");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let headers = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).expect("write headers");
+    let _ = stream.write_all(body);
+    let _ = stream.write_all(b"\r\n0\r\n\r\n");
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response
+}
+
 fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
     response.lines().find_map(|line| {
         let (header, value) = line.split_once(':')?;
@@ -169,6 +189,134 @@ fn fixture_annotation(
         "resolved": false
     }))
     .expect("valid annotation fixture")
+}
+
+fn workflow_completion_recipe() -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "complete-flow".to_string(),
+        name: "Complete flow".to_string(),
+        description: "Complete through the real replay executor".to_string(),
+        start_url: "https://example.test/start".to_string(),
+        viewport: BrowserRecipeViewport {
+            width: 1280,
+            height: 720,
+            scale_percent: 100,
+        },
+        inputs: Vec::new(),
+        steps: vec![BrowserRecipeStep {
+            id: "capture".to_string(),
+            action: BrowserRecipeAction::Screenshot { full_page: false },
+            wait: None,
+            assertions: Vec::new(),
+        }],
+    }
+}
+
+fn workflow_secret_recipe() -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "secret-flow".to_string(),
+        name: "Secret flow".to_string(),
+        description: "Wait for a user-owned secret prompt".to_string(),
+        start_url: "https://example.test/secret".to_string(),
+        viewport: BrowserRecipeViewport {
+            width: 1280,
+            height: 720,
+            scale_percent: 100,
+        },
+        inputs: vec![BrowserRecipeInput {
+            name: "password".to_string(),
+            kind: BrowserRecipeInputKind::Secret,
+            default_value: None,
+        }],
+        steps: vec![BrowserRecipeStep {
+            id: "type-secret".to_string(),
+            action: BrowserRecipeAction::Type {
+                locator: BrowserRecipeLocator {
+                    test_id: Some("password".to_string()),
+                    ..BrowserRecipeLocator::default()
+                },
+                value: BrowserRecipeValue::Input {
+                    name: "password".to_string(),
+                },
+            },
+            wait: None,
+            assertions: Vec::new(),
+        }],
+    }
+}
+
+fn install_gateway_secret_replay(
+    bridge: &devmanager::browser::BrowserCommandBridge,
+    key: &BrowserWorkspaceKey,
+    label: &str,
+) -> devmanager::browser::BrowserReplayStart {
+    let coordinator = bridge.replay_coordinator();
+    let mut recipe = workflow_secret_recipe();
+    recipe.id = format!("provider-loss-{label}");
+    let started = coordinator
+        .start(
+            key.clone(),
+            compile_browser_replay(&recipe, Vec::new()).unwrap(),
+        )
+        .unwrap();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        started.instance.clone(),
+        vec!["password".to_string()],
+    )
+    .unwrap();
+    prompt
+        .edit(
+            &started.instance,
+            "password",
+            "provider-loss-secret-sentinel",
+        )
+        .unwrap();
+    let (submission, _) = prompt.submit(&started.instance).unwrap();
+    coordinator
+        .submit_secrets(&started.instance, submission)
+        .unwrap();
+    assert!(started.execution.secret_lease("password").is_ok());
+    started
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProviderLossBoundary {
+    RegistrationReplacement,
+    ExactRevoke,
+    ProcessRevoke,
+    RevokeAll,
+    GatewayDrop,
+}
+
+fn workflow_public_input_recipe() -> BrowserRecipeV1 {
+    let mut recipe = workflow_secret_recipe();
+    recipe.id = "public-input-flow".to_string();
+    recipe.name = "Public input flow".to_string();
+    recipe.inputs = vec![
+        BrowserRecipeInput {
+            name: "query".to_string(),
+            kind: BrowserRecipeInputKind::Text,
+            default_value: None,
+        },
+        BrowserRecipeInput {
+            name: "destination".to_string(),
+            kind: BrowserRecipeInputKind::Url,
+            default_value: Some("https://example.test/default".to_string()),
+        },
+        BrowserRecipeInput {
+            name: "upload".to_string(),
+            kind: BrowserRecipeInputKind::File,
+            default_value: None,
+        },
+        BrowserRecipeInput {
+            name: "password".to_string(),
+            kind: BrowserRecipeInputKind::Secret,
+            default_value: None,
+        },
+    ];
+    recipe
 }
 
 async fn run_fake_host(
@@ -310,6 +458,9 @@ async fn run_fake_host_with_state(
                 .map(|mutation| BrowserResponse::Workspace { mutation }),
             BrowserCommand::Navigate { tab_id, url } => host
                 .navigate_tab(&key, &tab_id, &url)
+                .map(|mutation| BrowserResponse::Workspace { mutation }),
+            BrowserCommand::UpdateViewport { tab_id, viewport } => host
+                .update_viewport(&key, &tab_id, viewport)
                 .map(|mutation| BrowserResponse::Workspace { mutation }),
             BrowserCommand::Back { .. }
             | BrowserCommand::Forward { .. }
@@ -630,6 +781,171 @@ fn gateway_revocation_publishes_priority_host_cancellation() {
     );
 }
 
+#[tokio::test]
+async fn browser_provider_loss_boundaries_cancel_exact_replay_before_late_controller_response() {
+    for boundary in [
+        ProviderLossBoundary::RegistrationReplacement,
+        ProviderLossBoundary::ExactRevoke,
+        ProviderLossBoundary::ProcessRevoke,
+        ProviderLossBoundary::RevokeAll,
+        ProviderLossBoundary::GatewayDrop,
+    ] {
+        let label = format!("{boundary:?}").to_ascii_lowercase();
+        let project_id = format!("provider-loss-{label}");
+        let key = workspace(&project_id, "conversation");
+        let isolated_key = workspace(&project_id, "sibling-conversation");
+        let (bridge, mut inbox) = browser_command_channel(8);
+        let mut gateway = Some(BrowserGatewayHandle::start(bridge.clone()).unwrap());
+        let registrar = gateway.as_ref().unwrap().registrar();
+        let process_id = format!("provider-process-{label}");
+        let registration = registrar
+            .register(
+                process_id.clone(),
+                key.clone(),
+                BrowserWorkspaceSnapshot::default(),
+            )
+            .unwrap();
+        let coordinator = bridge.replay_coordinator();
+        let started = install_gateway_secret_replay(&bridge, &key, &label);
+        let isolated = coordinator
+            .start(
+                isolated_key.clone(),
+                compile_browser_replay(&workflow_completion_recipe(), Vec::new()).unwrap(),
+            )
+            .unwrap();
+        let controller = bridge.bind(key.clone(), Duration::from_secs(1));
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "runtime-tab".to_string(),
+                })
+                .await
+        });
+        let request = inbox
+            .recv()
+            .await
+            .expect("retained provider controller request");
+
+        match boundary {
+            ProviderLossBoundary::RegistrationReplacement => {
+                registrar
+                    .register(
+                        process_id,
+                        workspace(&format!("provider-replacement-{label}"), "conversation"),
+                        BrowserWorkspaceSnapshot::default(),
+                    )
+                    .unwrap();
+            }
+            ProviderLossBoundary::ExactRevoke => assert!(registrar.revoke(&registration)),
+            ProviderLossBoundary::ProcessRevoke => {
+                assert!(registrar.revoke_process(&process_id))
+            }
+            ProviderLossBoundary::RevokeAll => registrar.revoke_all(),
+            ProviderLossBoundary::GatewayDrop => drop(gateway.take()),
+        }
+
+        assert_eq!(
+            coordinator.status(&started.instance).unwrap().status,
+            BrowserReplayStatus::Cancelled,
+            "{boundary:?} must terminalize the registered workspace replay"
+        );
+        assert!(
+            matches!(
+                started.execution.secret_lease("password"),
+                Err(BrowserReplaySecretError::ClosedStore)
+            ),
+            "{boundary:?} must close its secret store"
+        );
+        request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(
+            pending.await.unwrap(),
+            Err(devmanager::browser::BrowserError::Interrupted),
+            "{boundary:?} must reject retained late controller responses"
+        );
+        assert_eq!(
+            coordinator
+                .status(&started.instance)
+                .unwrap()
+                .current_step_index,
+            0,
+            "{boundary:?} must not allow a late advance or write"
+        );
+        assert_eq!(
+            coordinator.status(&isolated.instance).unwrap().status,
+            BrowserReplayStatus::Pending,
+            "{boundary:?} must not cancel an unregistered same-project sibling workspace"
+        );
+        drop(gateway);
+    }
+}
+
+#[tokio::test]
+async fn disabling_browser_for_a_retained_workspace_revokes_registration_and_fences_hidden_replay()
+{
+    let key = workspace("import-retained-project", "import-retained-conversation");
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge.clone()).expect("start gateway");
+    let registrar = gateway.registrar();
+    let registration = registrar
+        .register(
+            "retained-ai-process",
+            key.clone(),
+            BrowserWorkspaceSnapshot {
+                pane_open: true,
+                ..BrowserWorkspaceSnapshot::default()
+            },
+        )
+        .expect("register retained workspace");
+    let stale_token = registration.access().bearer_token_for_launch().to_string();
+    let coordinator = bridge.replay_coordinator();
+    let started = install_gateway_secret_replay(&bridge, &key, "replace-import-disable");
+
+    let controller = bridge.bind(key.clone(), Duration::from_secs(1));
+    let pending = tokio::spawn(async move {
+        controller
+            .request(BrowserCommand::Reload {
+                tab_id: "runtime-tab".to_string(),
+            })
+            .await
+    });
+    let retained = inbox
+        .recv()
+        .await
+        .expect("retained request before Browser disable");
+
+    // The replace-import transaction must execute these in this order: first
+    // terminalize replay/UI authority, then assign disabled config, then let
+    // gateway reconciliation revoke every provider registration.
+    bridge.interrupt_all();
+    registrar.revoke_all();
+
+    assert_eq!(registrar.active_registration_count(), 0);
+    assert_eq!(
+        coordinator.status(&started.instance).unwrap().status,
+        BrowserReplayStatus::Cancelled
+    );
+    assert!(matches!(
+        started.execution.secret_lease("password"),
+        Err(BrowserReplaySecretError::ClosedStore)
+    ));
+    retained.respond(Ok(BrowserResponse::Acknowledged));
+    assert_eq!(
+        pending.await.unwrap(),
+        Err(devmanager::browser::BrowserError::Interrupted)
+    );
+    assert!(coordinator.active_state(&key).is_none());
+
+    let host = format!("127.0.0.1:{}", gateway.port());
+    let stale = raw_mcp_request(
+        gateway.port(),
+        &host,
+        Some(&format!("Bearer {stale_token}")),
+        "/mcp",
+        initialize_body(),
+    );
+    assert_eq!(status_code(&stale), 401, "{stale}");
+}
+
 #[test]
 fn gateway_registration_rejects_post_start_trust_root_swap_without_outside_writes() {
     let config = unique_gateway_config_dir("root-swap");
@@ -694,6 +1010,41 @@ fn auth_and_host_are_rejected_before_rmcp_dispatch() {
         initialize_body(),
     );
     assert_eq!(status_code(&wrong_path), 404, "{wrong_path}");
+}
+
+#[test]
+fn authenticated_gateway_rejects_declared_and_chunked_oversized_bodies_without_losing_session_use()
+{
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register(
+            "bounded-body-process",
+            workspace("bounded-body-project", "bounded-body-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register bounded body fixture");
+    let host = format!("127.0.0.1:{}", gateway.port());
+    let bearer = format!("Bearer {}", registration.access().bearer_token_for_launch());
+    let oversized = "x".repeat(MAX_REQUEST_BYTES + 1);
+
+    let declared = raw_mcp_request(gateway.port(), &host, Some(&bearer), "/mcp", &oversized);
+    assert_eq!(status_code(&declared), 413, "{declared}");
+
+    let chunked = raw_chunked_mcp_request(gateway.port(), &host, &bearer, oversized.as_bytes());
+    assert_eq!(status_code(&chunked), 413, "{chunked}");
+
+    let initialized = raw_mcp_request(
+        gateway.port(),
+        &host,
+        Some(&bearer),
+        "/mcp",
+        initialize_body(),
+    );
+    assert_eq!(status_code(&initialized), 200, "{initialized}");
 }
 
 #[test]
@@ -1202,6 +1553,7 @@ async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
                 "browser_tabs",
                 "browser_upload",
                 "browser_wait",
+                "browser_workflow",
             ]
         );
         assert!(listed.tools.iter().all(|tool| {
@@ -1470,6 +1822,350 @@ async fn real_rmcp_client_lists_the_browser_tools_with_exact_bound_schemas() {
         let _ = client.cancel().await;
     };
     let (_, ()) = tokio::join!(run_fake_host(inbox, commands), scenario);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_workflow_is_registered_on_the_authenticated_gateway() {
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register(
+            "workflow-gateway-process",
+            workspace("workflow-gateway-project", "workflow-gateway-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register workflow gateway token");
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+            .auth_header(registration.access().bearer_token_for_launch()),
+    );
+    let client = ClientInfo::default()
+        .serve(transport)
+        .await
+        .expect("initialize workflow gateway client");
+
+    let listed = client.peer().list_tools(None).await.expect("list tools");
+    assert_eq!(
+        listed
+            .tools
+            .iter()
+            .filter(|tool| tool.name == "browser_workflow")
+            .count(),
+        1
+    );
+
+    client
+        .cancel()
+        .await
+        .expect("close workflow gateway client");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_workflow_replay_status_replacement_and_cancel_use_the_shared_coordinator() {
+    let project_root = unique_gateway_config_dir("workflow-replay-root");
+    std::fs::create_dir_all(&project_root).expect("create workflow replay project root");
+    let project_root = project_root.canonicalize().unwrap();
+    save_recipe(&project_root, &workflow_completion_recipe()).unwrap();
+    save_recipe(&project_root, &workflow_secret_recipe()).unwrap();
+    let (bridge, inbox) = browser_command_channel(32);
+    let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register_with_project_root(
+            "workflow-replay-process",
+            workspace("workflow-replay-project", "workflow-replay-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+            &project_root,
+        )
+        .expect("register workflow replay token");
+    let scenario = async move {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize workflow replay client");
+
+        let completed_start = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "run the completion workflow",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "complete-flow"
+                }))),
+            )
+            .await
+            .expect("start completion workflow");
+        assert_eq!(completed_start.is_error, Some(false));
+        let completed_start = completed_start.structured_content.unwrap();
+        let completed_id = completed_start["replay"]["instanceId"]
+            .as_u64()
+            .expect("numeric replay instance id");
+        assert!(completed_start.get("workspace").is_none());
+        assert!(completed_start["replay"].get("workspaceKey").is_none());
+
+        let mut completed = None;
+        for _ in 0..100 {
+            let status = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new("browser_workflow").with_arguments(arguments(
+                        json!({
+                            "intent": "inspect the exact completion replay",
+                            "risk": "normal",
+                            "operation": "status",
+                            "replayInstanceId": completed_id
+                        }),
+                    )),
+                )
+                .await
+                .expect("read completion replay status");
+            assert_eq!(status.is_error, Some(false));
+            let body = status.structured_content.unwrap();
+            if body["replay"]["status"] == "completed" {
+                completed = Some(body);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let completed = completed.expect("real replay completed through fake host queue");
+        assert_eq!(completed["replay"]["instanceId"], completed_id);
+        assert_eq!(completed["replay"]["currentStepIndex"], 1);
+        assert_eq!(completed["replay"]["totalSteps"], 1);
+
+        let first_secret = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "start the secret-gated workflow",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "secret-flow"
+                }))),
+            )
+            .await
+            .expect("start first secret workflow");
+        assert_eq!(first_secret.is_error, Some(false));
+        let first_secret = first_secret.structured_content.unwrap();
+        let first_secret_id = first_secret["replay"]["instanceId"].as_u64().unwrap();
+        assert_eq!(first_secret["replay"]["status"], "needsUserSecret");
+        assert_eq!(
+            first_secret["replay"]["unresolvedSecretInputs"],
+            json!(["password"])
+        );
+
+        let replacement = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "replace the exact secret-gated workflow",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "secret-flow"
+                }))),
+            )
+            .await
+            .expect("replace secret workflow");
+        assert_eq!(replacement.is_error, Some(false));
+        let replacement = replacement.structured_content.unwrap();
+        let replacement_id = replacement["replay"]["instanceId"].as_u64().unwrap();
+        assert!(replacement_id > first_secret_id);
+
+        let old_status = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "inspect the replaced exact replay",
+                    "risk": "normal",
+                    "operation": "status",
+                    "replayInstanceId": first_secret_id
+                }))),
+            )
+            .await
+            .expect("read replaced replay status");
+        assert_eq!(old_status.is_error, Some(false));
+        assert_eq!(
+            old_status.structured_content.unwrap()["replay"]["status"],
+            "cancelled"
+        );
+
+        let cancelled = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "cancel the exact replacement replay",
+                    "risk": "normal",
+                    "operation": "cancel",
+                    "replayInstanceId": replacement_id
+                }))),
+            )
+            .await
+            .expect("cancel replacement replay");
+        assert_eq!(cancelled.is_error, Some(false));
+        assert_eq!(
+            cancelled.structured_content.unwrap()["replay"]["status"],
+            "cancelled"
+        );
+
+        let stale = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "inspect a stale replay",
+                    "risk": "normal",
+                    "operation": "status",
+                    "replayInstanceId": replacement_id + 999
+                }))),
+            )
+            .await
+            .expect("stale replay returns typed result");
+        assert_eq!(stale.is_error, Some(true));
+        assert_eq!(
+            stale.structured_content.unwrap()["error"]["code"],
+            "stale_reference"
+        );
+
+        client.cancel().await.expect("close workflow replay client");
+    };
+    tokio::join!(run_fake_host(inbox, commands), scenario);
+    std::fs::remove_dir_all(project_root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_workflow_replay_compiles_only_bounded_declared_public_inputs() {
+    let project_root = unique_gateway_config_dir("workflow-input-root");
+    std::fs::create_dir_all(&project_root).expect("create workflow input project root");
+    let project_root = project_root.canonicalize().unwrap();
+    save_recipe(&project_root, &workflow_public_input_recipe()).unwrap();
+    let (bridge, inbox) = browser_command_channel(32);
+    let commands: Arc<Mutex<Vec<(BrowserWorkspaceKey, BrowserCommand)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register_with_project_root(
+            "workflow-input-process",
+            workspace("workflow-input-project", "workflow-input-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+            &project_root,
+        )
+        .expect("register workflow input token");
+    let scenario = async move {
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(gateway.endpoint().to_string())
+                .auth_header(registration.access().bearer_token_for_launch()),
+        );
+        let client = ClientInfo::default()
+            .serve(transport)
+            .await
+            .expect("initialize workflow input client");
+
+        for inputs in [
+            json!([]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"unknown","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"first"},
+                {"name":"query","kind":"text","value":"second"},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"url","value":"https://example.test"},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"destination","kind":"url","value":"javascript:alert(1)"},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"upload","kind":"file","value":""}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"x".repeat(65_537)},
+                {"name":"upload","kind":"file","value":"fixture.txt"}
+            ]),
+            json!([
+                {"name":"query","kind":"text","value":"hello"},
+                {"name":"upload","kind":"file","value":"fixture.txt"},
+                {"name":"password","kind":"secret","value":"must-not-enter-the-tool"}
+            ]),
+        ] {
+            let rejected = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new("browser_workflow").with_arguments(arguments(
+                        json!({
+                            "intent": "validate public workflow inputs",
+                            "risk": "normal",
+                            "operation": "replay",
+                            "recipeId": "public-input-flow",
+                            "inputs": inputs
+                        }),
+                    )),
+                )
+                .await
+                .expect("invalid workflow inputs return a typed result");
+            assert_eq!(rejected.is_error, Some(true));
+            assert_eq!(
+                rejected.structured_content.unwrap()["error"]["code"],
+                "invalid_request"
+            );
+        }
+
+        let valid = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "run with exact public workflow inputs",
+                    "risk": "normal",
+                    "operation": "replay",
+                    "recipeId": "public-input-flow",
+                    "inputs": [
+                        {"name":"query","kind":"text","value":"hello"},
+                        {"name":"upload","kind":"file","value":"fixture.txt"}
+                    ]
+                }))),
+            )
+            .await
+            .expect("valid workflow inputs start replay");
+        assert_eq!(valid.is_error, Some(false));
+        let valid = valid.structured_content.unwrap();
+        assert_eq!(valid["replay"]["instanceId"], 1);
+        assert_eq!(valid["replay"]["status"], "needsUserSecret");
+        let safe_text = serde_json::to_string(&valid).unwrap();
+        assert!(!safe_text.contains("hello"));
+        assert!(!safe_text.contains("fixture.txt"));
+        assert!(!safe_text.contains("https://example.test/default"));
+        let replay_id = valid["replay"]["instanceId"].as_u64().unwrap();
+        let cancelled = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("browser_workflow").with_arguments(arguments(json!({
+                    "intent": "cancel the public-input replay",
+                    "risk": "normal",
+                    "operation": "cancel",
+                    "replayInstanceId": replay_id
+                }))),
+            )
+            .await
+            .expect("cancel public-input replay");
+        assert_eq!(cancelled.is_error, Some(false));
+
+        client.cancel().await.expect("close workflow input client");
+    };
+    tokio::join!(run_fake_host(inbox, commands), scenario);
+    std::fs::remove_dir_all(project_root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1923,12 +2619,12 @@ async fn browser_recording_resource_failure_is_typed_path_free_and_retains_revie
     coordinator.stop(&instance).unwrap();
 
     let resource_root = unique_gateway_config_dir("recording-resource-path-sentinel");
-    let resources =
-        BrowserResourceStore::open(&resource_root, BrowserResourceLimits::default()).unwrap();
-    std::fs::remove_dir_all(resources.root()).unwrap();
-    std::fs::write(
-        resources.root(),
-        b"recording-resource-underlying-error-detail-sentinel",
+    let resources = BrowserResourceStore::open(
+        &resource_root,
+        BrowserResourceLimits {
+            max_resource_bytes: 0,
+            ..BrowserResourceLimits::default()
+        },
     )
     .unwrap();
 
@@ -2014,7 +2710,9 @@ async fn browser_recording_resource_failure_is_typed_path_free_and_retains_revie
         coordinator.current_instance(&owner).unwrap().id(),
         instance.id()
     );
-    std::fs::remove_file(resource_root).unwrap();
+    assert!(resource_root.is_dir());
+    drop(resources);
+    std::fs::remove_dir_all(resource_root).unwrap();
     std::fs::remove_dir_all(project_root).unwrap();
 }
 

@@ -1914,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "devmanager"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -1927,10 +1927,12 @@ dependencies = [
  "getrandom 0.3.4",
  "gpui",
  "hmac",
+ "http-body-util",
  "image",
  "mime_guess",
  "portable-pty",
  "qrcode",
+ "raw-window-handle",
  "rcgen",
  "regex",
  "rfd",

@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_BROWSER_INTERACTION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_browser_interaction_epoch() -> u64 {
+    let epoch = NEXT_BROWSER_INTERACTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+    assert_ne!(epoch, u64::MAX, "browser interaction epoch space exhausted");
+    epoch
+}
 
 pub(super) fn browser_annotation_urls_equivalent(left: &str, right: &str) -> bool {
     redact_browser_text(left) == redact_browser_text(right)
@@ -208,6 +217,8 @@ pub enum BrowserError {
         byte_size: u64,
         limit: u64,
     },
+    ResourceRootBusy,
+    ResourceRootUnavailable,
     OutsideWorkspace {
         path: PathBuf,
     },
@@ -226,8 +237,14 @@ pub enum BrowserError {
         url: String,
         message: String,
     },
+    InitializingView {
+        tab_id: String,
+    },
     CrashedView {
         message: String,
+    },
+    LocatorNotFound {
+        target: BrowserLocatorFailureTarget,
     },
     BlockedPermission {
         permission: String,
@@ -240,6 +257,14 @@ pub enum BrowserError {
         path: PathBuf,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BrowserLocatorFailureTarget {
+    Primary,
+    Source,
+    Destination,
 }
 
 impl fmt::Display for BrowserError {
@@ -278,6 +303,10 @@ impl fmt::Display for BrowserError {
                 formatter,
                 "browser resource size {byte_size} exceeds limit {limit}"
             ),
+            Self::ResourceRootBusy => formatter.write_str("browser resource root is busy"),
+            Self::ResourceRootUnavailable => {
+                formatter.write_str("browser resource root is unavailable")
+            }
             Self::OutsideWorkspace { path } => write!(
                 formatter,
                 "browser file is outside the project workspace: {}",
@@ -302,8 +331,17 @@ impl fmt::Display for BrowserError {
             Self::NavigationFailure { url, message } => {
                 write!(formatter, "browser navigation failed for {url}: {message}")
             }
+            Self::InitializingView { tab_id } => {
+                write!(
+                    formatter,
+                    "browser view is still initializing for tab {tab_id}"
+                )
+            }
             Self::CrashedView { message } => {
                 write!(formatter, "browser view crashed: {message}")
+            }
+            Self::LocatorNotFound { target } => {
+                write!(formatter, "browser {target:?} locator target was not found")
             }
             Self::BlockedPermission { permission } => {
                 write!(formatter, "browser permission was blocked: {permission}")

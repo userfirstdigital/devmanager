@@ -5,17 +5,19 @@ use super::{
     BrowserCommandBridge, BrowserProviderAccess, BrowserRegistrationLease, BrowserResourceLimits,
     BrowserResourceStore, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{header, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::Router;
 use base64::Engine as _;
+use http_body_util::LengthLimitError;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::fmt;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use std::time::{Duration, Instant};
 use tower::Service;
 
 const GATEWAY_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_MCP_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 type RegistrationService = StreamableHttpService<BrowserMcpServer, LocalSessionManager>;
 
@@ -523,6 +526,14 @@ async fn dispatch_registration(
     if !lease.is_current(ticket) {
         return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    let request = bounded_mcp_request(request).await;
+    if !lease.is_current(ticket) {
+        return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let request = match request {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let response = match service.call(request).await {
         Ok(response) => response.map(Body::new),
         Err(never) => match never {},
@@ -531,6 +542,23 @@ async fn dispatch_registration(
         return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     response
+}
+
+async fn bounded_mcp_request(request: Request<Body>) -> Result<Request<Body>, Response<Body>> {
+    let (parts, body) = request.into_parts();
+    let bytes = to_bytes(body, MAX_MCP_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|error| {
+            if error
+                .source()
+                .is_some_and(|source| source.is::<LengthLimitError>())
+            {
+                plain_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+            } else {
+                plain_response(StatusCode::BAD_REQUEST, "invalid request body")
+            }
+        })?;
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 fn validate_host(request: &Request<Body>, port: u16) -> Result<(), Response<Body>> {
@@ -597,7 +625,49 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::{browser_command_channel, BrowserCommand, BrowserError};
+    use crate::browser::{
+        browser_command_channel, compile_browser_replay, route_browser_request, BrowserCommand,
+        BrowserError, BrowserHostEvent, BrowserRecipeAction, BrowserRecipeInput,
+        BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+        BrowserRecipeValue, BrowserRecipeViewport, BrowserReplayLocatorSlot,
+        BrowserReplayRepairResumeCursor, BrowserReplaySecretError, BrowserReplaySecretPromptVault,
+        BrowserReplayStatus, BrowserResourceKind, BrowserResourceLimits, BrowserResourceStore,
+        BrowserResponse, BrowserRevision, BrowserUserInputKind, BROWSER_RECIPE_SCHEMA_VERSION,
+    };
+
+    fn provider_repair_plan(label: &str) -> crate::browser::BrowserReplayPlan {
+        compile_browser_replay(
+            &BrowserRecipeV1 {
+                schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                id: format!("provider-repair-{label}"),
+                name: "Provider repair retention".to_string(),
+                description: "Registration loss releases repair evidence".to_string(),
+                start_url: "https://example.test/repair".to_string(),
+                viewport: BrowserRecipeViewport::default(),
+                inputs: vec![BrowserRecipeInput {
+                    name: "password".to_string(),
+                    kind: BrowserRecipeInputKind::Secret,
+                    default_value: None,
+                }],
+                steps: vec![BrowserRecipeStep {
+                    id: "type-password".to_string(),
+                    action: BrowserRecipeAction::Type {
+                        locator: BrowserRecipeLocator {
+                            test_id: Some("password".to_string()),
+                            ..BrowserRecipeLocator::default()
+                        },
+                        value: BrowserRecipeValue::Input {
+                            name: "password".to_string(),
+                        },
+                    },
+                    wait: None,
+                    assertions: Vec::new(),
+                }],
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn start_waits_for_thread_runtime_failure_before_returning() {
@@ -707,5 +777,407 @@ mod tests {
         let (_controls, lifecycle_requests) =
             bridge.with_locked_host_work(|controls, requests| (controls, requests));
         assert!(lifecycle_requests.is_empty());
+    }
+
+    #[test]
+    fn browser_provider_registration_loss_releases_retained_repair_evidence_at_every_boundary() {
+        #[derive(Clone, Copy, Debug)]
+        enum Boundary {
+            Replacement,
+            ExactRevoke,
+            ProcessRevoke,
+            RevokeAll,
+            GatewayDrop,
+        }
+
+        for boundary in [
+            Boundary::Replacement,
+            Boundary::ExactRevoke,
+            Boundary::ProcessRevoke,
+            Boundary::RevokeAll,
+            Boundary::GatewayDrop,
+        ] {
+            let label = format!("{boundary:?}").to_ascii_lowercase();
+            let root = std::env::temp_dir().join(format!(
+                "devmanager-provider-repair-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let resource_store = BrowserResourceStore::open(
+                root.join("resources"),
+                BrowserResourceLimits {
+                    max_temporary_count: 0,
+                    max_temporary_bytes: 1024 * 1024,
+                    max_resource_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap();
+            let (bridge, _inbox) = browser_command_channel(8);
+            let mut gateway = Some(
+                BrowserGatewayHandle::start_with_app_config_dir(bridge.clone(), root.join("app"))
+                    .unwrap(),
+            );
+            let registrar = gateway.as_ref().unwrap().registrar();
+            let key = BrowserWorkspaceKey::new(format!("provider-repair-{label}"), "conversation")
+                .unwrap();
+            let process_id = format!("provider-repair-process-{label}");
+            let registration = registrar
+                .register(
+                    process_id.clone(),
+                    key.clone(),
+                    BrowserWorkspaceSnapshot::default(),
+                )
+                .unwrap();
+            let coordinator = bridge.replay_coordinator();
+            let started = coordinator
+                .start(key.clone(), provider_repair_plan(&label))
+                .unwrap();
+            let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+                started.instance.clone(),
+                vec!["password".to_string()],
+            )
+            .unwrap();
+            prompt
+                .edit(&started.instance, "password", "provider-repair-secret")
+                .unwrap();
+            let (submission, _) = prompt.submit(&started.instance).unwrap();
+            coordinator
+                .submit_secrets(&started.instance, submission)
+                .unwrap();
+            let secret_lease = started.execution.secret_lease("password").unwrap();
+            assert!(secret_lease
+                .expose(|value| value == "provider-repair-secret")
+                .unwrap());
+            let repair = coordinator
+                .reserve_locator_repair_capture(
+                    &started.instance,
+                    &resource_store,
+                    0,
+                    BrowserReplayLocatorSlot::PrimaryAction,
+                    "runtime-tab",
+                    BrowserRevision(1),
+                    BrowserReplayRepairResumeCursor::Action,
+                )
+                .unwrap();
+            let snapshot = coordinator
+                .retain_locator_repair_evidence_for_test(
+                    &repair,
+                    BrowserResourceKind::ReplayRepairSnapshot,
+                    "application/json",
+                    b"{}",
+                )
+                .unwrap();
+            let screenshot = coordinator
+                .retain_locator_repair_evidence_for_test(
+                    &repair,
+                    BrowserResourceKind::ReplayRepairScreenshot,
+                    "image/png",
+                    b"png",
+                )
+                .unwrap();
+            coordinator
+                .publish_locator_repair(&repair, &snapshot, &screenshot)
+                .unwrap();
+
+            match boundary {
+                Boundary::Replacement => {
+                    registrar
+                        .register(
+                            process_id,
+                            BrowserWorkspaceKey::new(
+                                format!("provider-repair-replacement-{label}"),
+                                "conversation",
+                            )
+                            .unwrap(),
+                            BrowserWorkspaceSnapshot::default(),
+                        )
+                        .unwrap();
+                }
+                Boundary::ExactRevoke => assert!(registrar.revoke(&registration)),
+                Boundary::ProcessRevoke => assert!(registrar.revoke_process(&process_id)),
+                Boundary::RevokeAll => registrar.revoke_all(),
+                Boundary::GatewayDrop => drop(gateway.take()),
+            }
+
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                BrowserReplayStatus::Cancelled
+            );
+            assert_eq!(
+                secret_lease.expose(|_| ()),
+                Err(BrowserReplaySecretError::ClosedStore)
+            );
+            assert!(matches!(
+                resource_store.handle(&key, &snapshot.id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+            assert!(matches!(
+                resource_store.handle(&key, &screenshot.id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+            drop(gateway);
+            drop(resource_store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_native_lifecycle_boundaries_release_every_retained_repair_resource() {
+        #[derive(Clone, Copy, Debug)]
+        enum Boundary {
+            StopTab,
+            StopWorkspace,
+            LogicalTabClose,
+            ResetWorkspace,
+            ClearProject,
+            DirectInput,
+            SelectConversation,
+            RestartServer,
+            KillPortRestart,
+            RestartAiConversation,
+            RestartSsh,
+            CloseConversation,
+            DeleteProject,
+            QuitApplication,
+        }
+
+        for boundary in [
+            Boundary::StopTab,
+            Boundary::StopWorkspace,
+            Boundary::LogicalTabClose,
+            Boundary::ResetWorkspace,
+            Boundary::ClearProject,
+            Boundary::DirectInput,
+            Boundary::SelectConversation,
+            Boundary::RestartServer,
+            Boundary::KillPortRestart,
+            Boundary::RestartAiConversation,
+            Boundary::RestartSsh,
+            Boundary::CloseConversation,
+            Boundary::DeleteProject,
+            Boundary::QuitApplication,
+        ] {
+            let label = format!("{boundary:?}").to_ascii_lowercase();
+            let root = std::env::temp_dir().join(format!(
+                "devmanager-native-repair-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let resource_store = BrowserResourceStore::open(
+                root.join("resources"),
+                BrowserResourceLimits {
+                    max_temporary_count: 0,
+                    max_temporary_bytes: 1024 * 1024,
+                    max_resource_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap();
+            let project_id = format!("native-repair-{label}");
+            let key = BrowserWorkspaceKey::new(project_id.clone(), "conversation").unwrap();
+            let sibling_key =
+                BrowserWorkspaceKey::new(project_id.clone(), "sibling-conversation").unwrap();
+            let isolated_key =
+                BrowserWorkspaceKey::new(format!("isolated-{label}"), "conversation").unwrap();
+            let (bridge, mut inbox) = browser_command_channel(8);
+            let coordinator = bridge.replay_coordinator();
+            let started = coordinator
+                .start(key.clone(), provider_repair_plan(&label))
+                .unwrap();
+            let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+                started.instance.clone(),
+                vec!["password".to_string()],
+            )
+            .unwrap();
+            prompt
+                .edit(&started.instance, "password", "native-repair-secret")
+                .unwrap();
+            let (submission, _) = prompt.submit(&started.instance).unwrap();
+            coordinator
+                .submit_secrets(&started.instance, submission)
+                .unwrap();
+            let secret_lease = started.execution.secret_lease("password").unwrap();
+            let repair = coordinator
+                .reserve_locator_repair_capture(
+                    &started.instance,
+                    &resource_store,
+                    0,
+                    BrowserReplayLocatorSlot::PrimaryAction,
+                    "runtime-tab",
+                    BrowserRevision(1),
+                    BrowserReplayRepairResumeCursor::Action,
+                )
+                .unwrap();
+            let snapshot = coordinator
+                .retain_locator_repair_evidence_for_test(
+                    &repair,
+                    BrowserResourceKind::ReplayRepairSnapshot,
+                    "application/json",
+                    b"{}",
+                )
+                .unwrap();
+            let screenshot = coordinator
+                .retain_locator_repair_evidence_for_test(
+                    &repair,
+                    BrowserResourceKind::ReplayRepairScreenshot,
+                    "image/png",
+                    b"png",
+                )
+                .unwrap();
+            coordinator
+                .publish_locator_repair(&repair, &snapshot, &screenshot)
+                .unwrap();
+            let sibling = coordinator
+                .start(
+                    sibling_key.clone(),
+                    provider_repair_plan(&format!("{label}-sibling")),
+                )
+                .unwrap();
+            let isolated = coordinator
+                .start(
+                    isolated_key.clone(),
+                    provider_repair_plan(&format!("{label}-isolated")),
+                )
+                .unwrap();
+            let controller = bridge.bind(key.clone(), Duration::from_secs(1));
+            let pending = tokio::spawn(async move {
+                controller
+                    .request(BrowserCommand::Reload {
+                        tab_id: "runtime-tab".to_string(),
+                    })
+                    .await
+            });
+            let request = inbox.recv().await.expect("retained native repair request");
+
+            match boundary {
+                Boundary::StopTab => {
+                    bridge
+                        .bind(key.clone(), Duration::from_secs(1))
+                        .notify(BrowserCommand::Stop {
+                            tab_id: Some("runtime-tab".to_string()),
+                        })
+                        .await
+                        .unwrap();
+                }
+                Boundary::StopWorkspace => {
+                    bridge
+                        .bind(key.clone(), Duration::from_secs(1))
+                        .notify(BrowserCommand::Stop { tab_id: None })
+                        .await
+                        .unwrap();
+                }
+                Boundary::LogicalTabClose => {
+                    bridge
+                        .bind(key.clone(), Duration::from_secs(1))
+                        .notify(BrowserCommand::CloseTab {
+                            tab_id: "runtime-tab".to_string(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                Boundary::ResetWorkspace => {
+                    bridge
+                        .bind(key.clone(), Duration::from_secs(1))
+                        .notify(BrowserCommand::ResetWorkspace)
+                        .await
+                        .unwrap();
+                }
+                Boundary::ClearProject => {
+                    bridge
+                        .bind(key.clone(), Duration::from_secs(1))
+                        .notify(BrowserCommand::ClearProjectProfile)
+                        .await
+                        .unwrap();
+                }
+                Boundary::DirectInput => {
+                    bridge.observe_host_event(&BrowserHostEvent::user_input(
+                        key.clone(),
+                        "runtime-tab",
+                        BrowserUserInputKind::Keyboard,
+                    ));
+                }
+                Boundary::SelectConversation
+                | Boundary::RestartServer
+                | Boundary::KillPortRestart
+                | Boundary::RestartAiConversation
+                | Boundary::RestartSsh
+                | Boundary::CloseConversation => bridge.interrupt_workspace(&key),
+                Boundary::DeleteProject => bridge.interrupt_project(&project_id),
+                Boundary::QuitApplication => bridge.interrupt_all(),
+            }
+
+            if matches!(
+                boundary,
+                Boundary::StopTab
+                    | Boundary::StopWorkspace
+                    | Boundary::LogicalTabClose
+                    | Boundary::ResetWorkspace
+                    | Boundary::ClearProject
+            ) {
+                let lifecycle_request =
+                    bridge.with_locked_host_work(|controls, mut lifecycle_requests| {
+                        assert!(controls.is_empty());
+                        assert_eq!(lifecycle_requests.len(), 1);
+                        lifecycle_requests.remove(0)
+                    });
+                route_browser_request(true, lifecycle_request, |request| {
+                    request.respond(Ok(BrowserResponse::Acknowledged));
+                })
+                .unwrap();
+            }
+
+            assert_eq!(
+                coordinator.status(&started.instance).unwrap().status,
+                BrowserReplayStatus::Cancelled,
+                "{boundary:?} must terminalize replay before releasing evidence"
+            );
+            assert_eq!(
+                secret_lease.expose(|_| ()),
+                Err(BrowserReplaySecretError::ClosedStore),
+                "{boundary:?} must close the retained secret lease"
+            );
+            assert!(matches!(
+                resource_store.handle(&key, &snapshot.id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+            assert!(matches!(
+                resource_store.handle(&key, &screenshot.id),
+                Err(BrowserError::MissingResource { .. })
+            ));
+            request.respond(Ok(BrowserResponse::Acknowledged));
+            assert_eq!(
+                pending.await.unwrap(),
+                Err(BrowserError::Interrupted),
+                "{boundary:?} must fence a retained late response"
+            );
+            assert_eq!(
+                coordinator
+                    .status(&started.instance)
+                    .unwrap()
+                    .current_step_index,
+                0,
+                "{boundary:?} must not advance or write after cancellation"
+            );
+
+            let sibling_status = coordinator.status(&sibling.instance).unwrap().status;
+            let isolated_status = coordinator.status(&isolated.instance).unwrap().status;
+            match boundary {
+                Boundary::ClearProject | Boundary::DeleteProject => {
+                    assert_eq!(sibling_status, BrowserReplayStatus::Cancelled);
+                    assert_eq!(isolated_status, BrowserReplayStatus::NeedsUserSecret);
+                }
+                Boundary::QuitApplication => {
+                    assert_eq!(sibling_status, BrowserReplayStatus::Cancelled);
+                    assert_eq!(isolated_status, BrowserReplayStatus::Cancelled);
+                }
+                _ => {
+                    assert_eq!(sibling_status, BrowserReplayStatus::NeedsUserSecret);
+                    assert_eq!(isolated_status, BrowserReplayStatus::NeedsUserSecret);
+                }
+            }
+            drop(resource_store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

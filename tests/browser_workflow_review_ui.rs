@@ -1307,7 +1307,7 @@ fn review_reordering_rejects_tab_lifecycle_boundaries_but_allows_adjacent_action
 
 #[test]
 fn narrow_review_pane_uses_wrapped_bounded_control_groups() {
-    let pane_source = include_str!("../src/browser/pane.rs");
+    let pane_source = include_str!("../src/browser/pane.rs").replace("\r\n", "\n");
 
     assert!(
         pane_source.contains("workflow_control_group"),

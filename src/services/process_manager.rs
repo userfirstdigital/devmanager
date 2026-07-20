@@ -70,11 +70,81 @@ pub(crate) fn ai_session_needs_restore(
     !session.status.is_live() || !session_attached
 }
 
-#[derive(Clone)]
 pub struct ProcessManager {
     inner: Arc<ProcessManagerInner>,
     op_queue: Arc<ProcessOpQueue>,
     _claude_overlay_owner: Arc<ClaudeOverlayOwner>,
+    handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
+}
+
+#[derive(Debug)]
+struct ProcessManagerHandleLifecycle {
+    state: Mutex<ProcessManagerHandleLifecycleState>,
+}
+
+#[derive(Debug)]
+struct ProcessManagerHandleLifecycleState {
+    active_handles: usize,
+    shutting_down: bool,
+}
+
+impl ProcessManagerHandleLifecycle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ProcessManagerHandleLifecycleState {
+                active_handles: 1,
+                shutting_down: false,
+            }),
+        }
+    }
+
+    fn acquire(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutting_down {
+            return Err("Process manager is shutting down.".to_string());
+        }
+        state.active_handles = state.active_handles.saturating_add(1);
+        Ok(())
+    }
+
+    fn release(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(state.active_handles > 0);
+        state.active_handles = state.active_handles.saturating_sub(1);
+        if state.active_handles == 0 && !state.shutting_down {
+            state.shutting_down = true;
+            return true;
+        }
+        false
+    }
+}
+
+impl Clone for ProcessManager {
+    fn clone(&self) -> Self {
+        self.handle_lifecycle
+            .acquire()
+            .expect("a live ProcessManager handle must remain cloneable");
+        Self {
+            inner: self.inner.clone(),
+            op_queue: self.op_queue.clone(),
+            _claude_overlay_owner: self._claude_overlay_owner.clone(),
+            handle_lifecycle: self.handle_lifecycle.clone(),
+        }
+    }
+}
+
+impl Drop for ProcessManager {
+    fn drop(&mut self) {
+        if self.handle_lifecycle.release() {
+            shutdown_process_manager_workers(&self.inner);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -124,6 +194,24 @@ type RemoteSessionEventHandler = Arc<dyn Fn(RemoteSessionEvent) + Send + Sync>;
 type CodexHooksSupportProbe = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 #[cfg(test)]
 type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type ProcessManagerBackgroundTestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessManagerDetachedWorkerTestPhase {
+    BeforeAcquire,
+    AfterAcquire,
+    AfterEffect,
+}
+#[cfg(test)]
+type ProcessManagerDetachedWorkerTestHook =
+    Arc<dyn Fn(ProcessManagerDetachedWorkerTestPhase) + Send + Sync>;
+#[cfg(test)]
+type ProcessManagerServerSessionSpawnerTestHook = Arc<
+    dyn Fn(&Arc<ProcessManagerInner>, &ServerLaunchSpec, SessionDimensions) -> Result<(), String>
+        + Send
+        + Sync,
+>;
 
 pub(crate) struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
@@ -156,7 +244,14 @@ pub(crate) struct ProcessManagerInner {
     codex_adapter_registry: Mutex<CodexAdapterRegistry>,
     background_stop: AtomicBool,
     background_thread: Mutex<Option<thread::JoinHandle<()>>>,
-    op_queue: Mutex<Option<Arc<ProcessOpQueue>>>,
+    op_queue: Mutex<Weak<ProcessOpQueue>>,
+    handle_lifecycle: Arc<ProcessManagerHandleLifecycle>,
+    #[cfg(test)]
+    background_test_hook: RwLock<Option<ProcessManagerBackgroundTestHook>>,
+    #[cfg(test)]
+    auto_restart_worker_test_hook: RwLock<Option<ProcessManagerDetachedWorkerTestHook>>,
+    #[cfg(test)]
+    server_session_spawner_test_hook: RwLock<Option<ProcessManagerServerSessionSpawnerTestHook>>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +497,7 @@ impl Default for ProcessManager {
 impl ProcessManager {
     pub fn new() -> Self {
         let debug_enabled = debug_enabled();
+        let handle_lifecycle = Arc::new(ProcessManagerHandleLifecycle::new());
         let claude_hook_registry = Arc::new(ClaudeHookRegistry::default());
         let codex_hook_registry = Arc::new(CodexHookRegistry::default());
         let claude_hook_temp_root = prepare_claude_overlay_process_root();
@@ -436,7 +532,14 @@ impl ProcessManager {
             codex_adapter_registry: Mutex::new(CodexAdapterRegistry::default()),
             background_stop: AtomicBool::new(false),
             background_thread: Mutex::new(None),
-            op_queue: Mutex::new(None),
+            op_queue: Mutex::new(Weak::new()),
+            handle_lifecycle: handle_lifecycle.clone(),
+            #[cfg(test)]
+            background_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            auto_restart_worker_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            server_session_spawner_test_hook: RwLock::new(None),
         });
         let claude_overlay_owner = Arc::new(ClaudeOverlayOwner {
             inner: Arc::downgrade(&inner),
@@ -558,22 +661,21 @@ impl ProcessManager {
             }
         })));
 
-        let op_queue = Arc::new(ProcessOpQueue::new(inner.clone()));
+        let op_queue = ProcessOpQueue::new(Arc::downgrade(&inner));
         if let Ok(mut slot) = inner.op_queue.lock() {
-            *slot = Some(op_queue.clone());
+            *slot = Arc::downgrade(&op_queue);
         }
 
-        let thread_handle = spawn_background_tasks(inner.clone());
+        let thread_handle = spawn_background_tasks(Arc::downgrade(&inner));
         if let Ok(mut handle_slot) = inner.background_thread.lock() {
             *handle_slot = Some(thread_handle);
         }
-
-        let op_queue = Arc::new(ProcessOpQueue::new(inner.clone()));
 
         Self {
             inner,
             op_queue,
             _claude_overlay_owner: claude_overlay_owner,
+            handle_lifecycle,
         }
     }
 
@@ -593,6 +695,7 @@ impl ProcessManager {
         activate_tab: bool,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        self.validate_server_launch(app_state, command_id)?;
         let Some(launch) =
             self.prepare_start_server(app_state, command_id, dimensions, activate_tab)?
         else {
@@ -617,6 +720,7 @@ impl ProcessManager {
         banner: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        self.validate_server_launch(app_state, command_id)?;
         let (launch, clear_logs) =
             self.prepare_restart_server(app_state, command_id, dimensions, banner)?;
         let op_id = next_op_id();
@@ -761,6 +865,7 @@ impl ProcessManager {
         banner: &str,
         response: Option<Sender<RemoteActionResult>>,
     ) -> Result<(), String> {
+        self.validate_server_launch(app_state, command_id)?;
         let lookup = app_state
             .find_command(command_id)
             .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
@@ -804,6 +909,20 @@ impl ProcessManager {
             banner,
             response,
         )
+    }
+
+    pub fn validate_server_launch(
+        &self,
+        app_state: &AppState,
+        command_id: &str,
+    ) -> Result<(), String> {
+        let lookup = app_state
+            .find_command(command_id)
+            .ok_or_else(|| format!("Unknown command `{command_id}`"))?;
+        if lookup.command.command.trim().is_empty() {
+            return Err(format!("Server command `{command_id}` is empty"));
+        }
+        Ok(())
     }
 
     fn prepare_start_server(
@@ -2213,6 +2332,16 @@ impl ProcessManager {
         self.restart_ai_session_activate(app_state, tab_id, dimensions, true)
     }
 
+    pub fn validate_ai_restart(&self, app_state: &AppState, tab_id: &str) -> Result<(), String> {
+        let tab = app_state
+            .find_ai_tab(tab_id)
+            .ok_or_else(|| format!("Unknown AI tab `{tab_id}`"))?;
+        app_state
+            .find_project(&tab.project_id)
+            .ok_or_else(|| format!("Unknown project `{}`", tab.project_id))?;
+        resolve_ai_startup_command(&app_state.config.settings, tab.tab_type.clone()).map(|_| ())
+    }
+
     /// Same as `restart_ai_session` but lets the caller keep the native UI's
     /// current tab/session active. Remote-triggered AI restarts use this to
     /// recycle the PTY without yanking the desktop window onto the restarted
@@ -3182,23 +3311,48 @@ impl ProcessManager {
 
         #[cfg(not(test))]
         {
-            let manager = self.clone();
+            let inner = Arc::downgrade(&self.inner);
             thread::spawn(move || {
-                let _ =
-                    manager.reap_session_processes_until_clear(&session_id, SESSION_REAPER_TIMEOUT);
-                if pid_file::active_tracked_pids_for_session(&session_id).is_empty()
-                    && !live_runtime_root_running(&manager.inner, &session_id)
+                if force_reap_session_processes_until_clear_weak(
+                    &inner,
+                    &session_id,
+                    SESSION_REAPER_TIMEOUT,
+                )
+                .is_none()
                 {
                     return;
                 }
-                let _ = manager.reap_session_processes_until_clear(
+                let Some(current_inner) = inner.upgrade() else {
+                    return;
+                };
+                let cleared = pid_file::active_tracked_pids_for_session(&session_id).is_empty()
+                    && !live_runtime_root_running(&current_inner, &session_id);
+                if cleared {
+                    mark_session_reaped(&current_inner, &session_id);
+                    return;
+                }
+                drop(current_inner);
+                if force_reap_session_processes_until_clear_weak(
+                    &inner,
                     &session_id,
                     SESSION_REAPER_ESCALATED_TIMEOUT,
-                );
-                if !pid_file::active_tracked_pids_for_session(&session_id).is_empty()
-                    || live_runtime_root_running(&manager.inner, &session_id)
+                )
+                .is_none()
                 {
-                    manager.note_reap_incomplete(&session_id);
+                    return;
+                }
+                let Some(current_inner) = inner.upgrade() else {
+                    return;
+                };
+                let reap_incomplete = !pid_file::active_tracked_pids_for_session(&session_id)
+                    .is_empty()
+                    || live_runtime_root_running(&current_inner, &session_id);
+                if reap_incomplete {
+                    if let Ok(manager) = process_manager_from_inner(current_inner) {
+                        manager.note_reap_incomplete(&session_id);
+                    }
+                } else {
+                    mark_session_reaped(&current_inner, &session_id);
                 }
             });
         }
@@ -3331,6 +3485,7 @@ impl ProcessManager {
         });
     }
 
+    #[cfg(test)]
     fn reap_session_processes_until_clear(&self, session_id: &str, timeout: Duration) -> usize {
         let reaped = force_reap_session_processes_until_clear(&self.inner, session_id, timeout);
         if pid_file::active_tracked_pids_for_session(session_id).is_empty()
@@ -3489,17 +3644,7 @@ fn drain_browser_provider_sessions_inner(inner: &ProcessManagerInner) {
 
 impl Drop for ProcessManagerInner {
     fn drop(&mut self) {
-        self.background_stop.store(true, Ordering::SeqCst);
-        if let Ok(mut handle) = self.background_thread.lock() {
-            if let Some(handle) = handle.take() {
-                let _ = handle.join();
-            }
-        }
-        if let Ok(mut slot) = self.op_queue.lock() {
-            if let Some(queue) = slot.take() {
-                queue.shutdown();
-            }
-        }
+        shutdown_process_manager_workers(self);
         if let Ok(sessions) = self.sessions.lock() {
             for session in sessions.values() {
                 let _ = session.close(false);
@@ -3511,24 +3656,59 @@ impl Drop for ProcessManagerInner {
     }
 }
 
+fn shutdown_process_manager_workers(inner: &ProcessManagerInner) {
+    inner.background_stop.store(true, Ordering::SeqCst);
+    let queue = inner.op_queue.lock().ok().and_then(|queue| queue.upgrade());
+    if let Some(queue) = queue {
+        queue.shutdown();
+    }
+    if let Ok(mut handle) = inner.background_thread.lock() {
+        if let Some(handle) = handle.take() {
+            if handle.thread().id() == thread::current().id() {
+                drop(handle);
+            } else {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 fn debug_enabled() -> bool {
     std::env::var("DEVMANAGER_TERMINAL_DEBUG")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
-fn spawn_background_tasks(inner: Arc<ProcessManagerInner>) -> thread::JoinHandle<()> {
+fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut system = sysinfo::System::new();
         loop {
+            let Some(inner) = inner.upgrade() else {
+                break;
+            };
+            if inner.background_stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            #[cfg(test)]
+            if let Some(hook) = inner
+                .background_test_hook
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                hook();
+            }
             if inner.background_stop.load(Ordering::SeqCst) {
                 break;
             }
 
             refresh_resource_snapshots(&inner, &mut system);
             reconcile_ai_activity(&inner);
-            handle_auto_restart(inner.clone());
+            handle_auto_restart(&inner);
             reconcile_exit_states(&inner);
+
+            drop(inner);
 
             thread::sleep(Duration::from_secs(1));
         }
@@ -3807,6 +3987,27 @@ fn force_reap_session_processes_until_clear(
     reaped
 }
 
+#[cfg(not(test))]
+fn force_reap_session_processes_until_clear_weak(
+    inner: &Weak<ProcessManagerInner>,
+    session_id: &str,
+    timeout: Duration,
+) -> Option<usize> {
+    let started_at = Instant::now();
+    let mut reaped = 0;
+    loop {
+        let current_inner = inner.upgrade()?;
+        reaped += force_reap_session_processes(&current_inner, session_id);
+        let cleared = pid_file::active_tracked_pids_for_session(session_id).is_empty()
+            && !live_runtime_root_running(&current_inner, session_id);
+        drop(current_inner);
+        if cleared || started_at.elapsed() >= timeout {
+            return Some(reaped);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn force_reap_session_processes(inner: &Arc<ProcessManagerInner>, session_id: &str) -> usize {
     let mut forced_kill_pids = 0;
     for pid in collect_session_reap_pids(inner, session_id) {
@@ -4068,7 +4269,7 @@ fn reconcile_ai_activity(inner: &Arc<ProcessManagerInner>) {
     }
 }
 
-fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
+fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
     let mut restart_candidates = Vec::new();
     if let Ok(runtime) = inner.runtime_state.read() {
         for session in runtime.sessions.values() {
@@ -4129,48 +4330,44 @@ fn handle_auto_restart(inner: Arc<ProcessManagerInner>) {
         }
 
         let launch_clone = launch.clone();
-        let inner_clone = inner.clone();
+        let inner = Arc::downgrade(inner);
         thread::spawn(move || {
             thread::sleep(delay);
-            if inner_clone.background_stop.load(Ordering::SeqCst) {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if inner.background_stop.load(Ordering::SeqCst) {
                 return;
             }
-            if let Ok(queue) = inner_clone.op_queue.lock() {
-                if let Some(queue) = queue.as_ref() {
-                    let op_id = next_op_id();
-                    let _ = queue.submit(ProcessOp::StartServer {
-                        op_id,
-                        launch: launch_clone,
-                        dimensions: SessionDimensions::default(),
-                        activate: false,
-                        response: None,
-                    });
-                    return;
-                }
-            }
-            if let Err(error) = spawn_server_session_with_inner(
-                &inner_clone,
-                &launch_clone,
-                SessionDimensions::default(),
-            ) {
-                let mut changed = false;
-                if let Ok(mut runtime) = inner_clone.runtime_state.write() {
-                    if let Some(session) = runtime.sessions.get_mut(&launch_clone.command_id) {
-                        let dirty_before = session.dirty_generation;
-                        session.status = SessionStatus::Failed;
-                        session.exit = Some(SessionExitState {
-                            code: None,
-                            signal: None,
-                            closed_by_user: false,
-                            summary: format!("Auto-restart failed: {error}"),
-                        });
-                        session.mark_dirty();
-                        changed = session.dirty_generation != dirty_before;
-                    }
-                }
-                if changed {
-                    bump_runtime_revision(&inner_clone);
-                    emit_tracked_remote_runtime_snapshot(&inner_clone, &launch_clone.command_id);
+            #[cfg(test)]
+            let worker_test_hook = inner
+                .auto_restart_worker_test_hook
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            #[cfg(test)]
+            let manager =
+                process_manager_from_inner_with_observer(inner, worker_test_hook.as_ref());
+            #[cfg(not(test))]
+            let manager = process_manager_from_inner(inner);
+            let Ok(manager) = manager else {
+                return;
+            };
+            let op_id = next_op_id();
+            if manager
+                .op_queue
+                .submit(ProcessOp::StartServer {
+                    op_id,
+                    launch: launch_clone,
+                    dimensions: SessionDimensions::default(),
+                    activate: false,
+                    response: None,
+                })
+                .is_ok()
+            {
+                #[cfg(test)]
+                if let Some(hook) = worker_test_hook.as_ref() {
+                    hook(ProcessManagerDetachedWorkerTestPhase::AfterEffect);
                 }
             }
         });
@@ -5155,7 +5352,11 @@ fn session_change_notifier_with_attachment_binding(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&session_id)
         .map(|session| session.registration.clone());
+    let inner = Arc::downgrade(&inner);
     Arc::new(move || {
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
         if note_runtime_generation_change(&inner, &session_id) {
             mark_remote_session_dirty(&inner, &session_id);
             emit_remote_runtime_snapshot(&inner, &session_id);
@@ -5190,10 +5391,14 @@ fn session_output_notifier(
     inner: Arc<ProcessManagerInner>,
     session_id: String,
 ) -> Arc<dyn Fn(Vec<u8>, TerminalModeSnapshot) + Send + Sync> {
+    let inner = Arc::downgrade(&inner);
     Arc::new(move |bytes, mode| {
         if bytes.is_empty() {
             return;
         }
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
         emit_remote_session_event(
             &inner,
             RemoteSessionEvent::Output {
@@ -5268,24 +5473,58 @@ fn next_ssh_session_id(connection_id: &str) -> String {
     format!("{connection_id}-{scope}-{millis:x}-{counter:x}")
 }
 
-fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> ProcessManager {
+fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> Result<ProcessManager, String> {
+    #[cfg(test)]
+    {
+        process_manager_from_inner_with_observer(inner, None)
+    }
+    #[cfg(not(test))]
+    {
+        process_manager_from_inner_core(inner)
+    }
+}
+
+#[cfg(test)]
+fn process_manager_from_inner_with_observer(
+    inner: Arc<ProcessManagerInner>,
+    observer: Option<&ProcessManagerDetachedWorkerTestHook>,
+) -> Result<ProcessManager, String> {
+    process_manager_from_inner_core(inner, observer)
+}
+
+fn process_manager_from_inner_core(
+    inner: Arc<ProcessManagerInner>,
+    #[cfg(test)] observer: Option<&ProcessManagerDetachedWorkerTestHook>,
+) -> Result<ProcessManager, String> {
     let op_queue = inner
         .op_queue
         .lock()
         .ok()
-        .and_then(|guard| guard.clone())
-        .expect("process op queue missing");
+        .and_then(|queue| queue.upgrade())
+        .ok_or_else(|| "Process operation queue is unavailable.".to_string())?;
     let claude_overlay_owner = inner
         .claude_overlay_owner
         .lock()
         .ok()
         .and_then(|owner| owner.upgrade())
-        .expect("Claude overlay owner missing");
-    ProcessManager {
+        .ok_or_else(|| "Claude overlay owner is unavailable.".to_string())?;
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        observer(ProcessManagerDetachedWorkerTestPhase::BeforeAcquire);
+    }
+    inner.handle_lifecycle.acquire()?;
+    let handle_lifecycle = inner.handle_lifecycle.clone();
+    let manager = ProcessManager {
         inner,
         op_queue,
         _claude_overlay_owner: claude_overlay_owner,
+        handle_lifecycle,
+    };
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        observer(ProcessManagerDetachedWorkerTestPhase::AfterAcquire);
     }
+    Ok(manager)
 }
 
 pub(crate) fn execute_process_op_inner(
@@ -5294,7 +5533,10 @@ pub(crate) fn execute_process_op_inner(
 ) -> ProcessOpCompletion {
     let op_id = op.op_id();
     let target_id = op.target_id();
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = match process_manager_from_inner(inner.clone()) {
+        Ok(manager) => manager,
+        Err(error) => return op.into_failure_completion(error),
+    };
     let (kind, result, context, remote_response) = match op {
         ProcessOp::StartServer {
             launch,
@@ -5306,20 +5548,38 @@ pub(crate) fn execute_process_op_inner(
             if activate {
                 manager.set_active_session(launch.command_id.clone());
             }
-            let result =
-                spawn_server_session_with_inner(inner, &launch, dimensions).map_err(|error| {
-                    manager.update_session_state(&launch.command_id, |state| {
-                        state.status = SessionStatus::Failed;
-                        state.exit = Some(SessionExitState {
-                            code: None,
-                            signal: None,
-                            closed_by_user: false,
-                            summary: error.clone(),
-                        });
-                        state.mark_dirty();
+            let result = {
+                #[cfg(test)]
+                {
+                    let spawner = inner
+                        .server_session_spawner_test_hook
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(spawner) = spawner {
+                        spawner(inner, &launch, dimensions)
+                    } else {
+                        spawn_server_session_with_inner(inner, &launch, dimensions)
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    spawn_server_session_with_inner(inner, &launch, dimensions)
+                }
+            }
+            .map_err(|error| {
+                manager.update_session_state(&launch.command_id, |state| {
+                    state.status = SessionStatus::Failed;
+                    state.exit = Some(SessionExitState {
+                        code: None,
+                        signal: None,
+                        closed_by_user: false,
+                        summary: error.clone(),
                     });
-                    error
+                    state.mark_dirty();
                 });
+                error
+            });
             if result.is_ok() {
                 manager.update_session_state(&launch.command_id, |state| {
                     state.configure_server(launch.clone());
@@ -5845,7 +6105,7 @@ fn spawn_ssh_session_with_inner(
     session_id: &str,
     dimensions: SessionDimensions,
 ) -> Result<(), String> {
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = process_manager_from_inner(inner.clone())?;
     if manager.session_exists(session_id) {
         return Ok(());
     }
@@ -5960,7 +6220,7 @@ fn spawn_ai_session_with_writer_and_attachment_binding<F>(
 where
     F: FnOnce(&TerminalSession, &str) -> Result<(), String>,
 {
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = process_manager_from_inner(inner.clone())?;
     if manager.session_exists(session_id) {
         return Ok(());
     }
@@ -6050,7 +6310,8 @@ fn shutdown_managed_processes_inner(
     inner: &Arc<ProcessManagerInner>,
     timeout: Duration,
 ) -> ManagedShutdownReport {
-    let manager = process_manager_from_inner(inner.clone());
+    let manager = process_manager_from_inner(inner.clone())
+        .expect("managed shutdown requires an active ProcessManager handle");
     let session_ids = manager.live_session_ids();
     for session_id in &session_ids {
         let _ = manager.request_session_close(session_id, false);
@@ -6162,6 +6423,58 @@ mod tests {
         }
     }
 
+    fn browser_provider_replay_plan(
+        label: &str,
+        with_secret: bool,
+    ) -> crate::browser::BrowserReplayPlan {
+        use crate::browser::{
+            compile_browser_replay, BrowserRecipeAction, BrowserRecipeInput,
+            BrowserRecipeInputKind, BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1,
+            BrowserRecipeValue, BrowserRecipeViewport, BROWSER_RECIPE_SCHEMA_VERSION,
+        };
+
+        let inputs = with_secret
+            .then(|| BrowserRecipeInput {
+                name: "password".to_string(),
+                kind: BrowserRecipeInputKind::Secret,
+                default_value: None,
+            })
+            .into_iter()
+            .collect();
+        let action = if with_secret {
+            BrowserRecipeAction::Type {
+                locator: BrowserRecipeLocator {
+                    test_id: Some("password".to_string()),
+                    ..BrowserRecipeLocator::default()
+                },
+                value: BrowserRecipeValue::Input {
+                    name: "password".to_string(),
+                },
+            }
+        } else {
+            BrowserRecipeAction::Reload
+        };
+        compile_browser_replay(
+            &BrowserRecipeV1 {
+                schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+                id: format!("provider-lifecycle-{label}"),
+                name: "Provider lifecycle".to_string(),
+                description: "Exact process-exit lease fixture".to_string(),
+                start_url: "https://example.test/provider".to_string(),
+                viewport: BrowserRecipeViewport::default(),
+                inputs,
+                steps: vec![BrowserRecipeStep {
+                    id: "provider-step".to_string(),
+                    action,
+                    wait: None,
+                    assertions: Vec::new(),
+                }],
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
     fn browser_attachment_snapshot(annotation_id: &str) -> BrowserWorkspaceSnapshot {
         serde_json::from_value(serde_json::json!({
             "annotations": [{
@@ -6194,6 +6507,152 @@ mod tests {
             .take()
         {
             handle.join().expect("background task stops cleanly");
+        }
+    }
+
+    fn lifecycle_state_for_test(lifecycle: &ProcessManagerHandleLifecycle) -> (usize, bool) {
+        let state = lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.active_handles, state.shutting_down)
+    }
+
+    fn configure_auto_restart_race(manager: &ProcessManager, command_id: &str) -> ServerLaunchSpec {
+        stop_background_tasks_for_test(manager);
+        manager.inner.background_stop.store(false, Ordering::SeqCst);
+
+        let launch = ServerLaunchSpec {
+            command_id: command_id.to_string(),
+            project_id: "project".to_string(),
+            cwd: std::env::current_dir().unwrap(),
+            program: "definitely-not-a-devmanager-server".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            auto_restart: true,
+            log_file_path: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            launch.command_id.clone(),
+            launch.cwd.clone(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Crashed;
+        session.configure_server(launch.clone());
+        manager.register_runtime_session(session);
+        manager
+            .inner
+            .restart_backoffs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                launch.command_id.clone(),
+                RestartBackoff {
+                    delay: Duration::ZERO,
+                    last_crash: Instant::now(),
+                },
+            );
+        launch
+    }
+
+    #[test]
+    fn empty_ai_restart_command_fails_preflight_without_mutating_the_tab_or_runtime() {
+        let manager = ProcessManager::new();
+        let mut state = AppState::default();
+        state.config.settings.claude_command = Some("   ".to_string());
+        state.config.projects.push(Project {
+            id: "restart-project".to_string(),
+            name: "Restart project".to_string(),
+            root_path: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            folders: Vec::new(),
+            color: None,
+            pinned: Some(false),
+            notes: None,
+            save_log_files: Some(false),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        state.open_tabs.push(SessionTab {
+            id: "restart-tab".to_string(),
+            tab_type: TabType::Claude,
+            project_id: "restart-project".to_string(),
+            command_id: None,
+            pty_session_id: Some("existing-session".to_string()),
+            label: Some("Claude".to_string()),
+            ssh_connection_id: None,
+            browser_workspace: None,
+        });
+
+        assert_eq!(
+            manager.validate_ai_restart(&state, "restart-tab"),
+            Err("AI command is empty".to_string())
+        );
+        assert_eq!(
+            state
+                .find_ai_tab("restart-tab")
+                .and_then(|tab| tab.pty_session_id.as_deref()),
+            Some("existing-session")
+        );
+        assert!(manager.runtime_state().sessions.is_empty());
+    }
+
+    #[test]
+    fn blank_server_launches_leave_tabs_runtime_and_process_queue_untouched() {
+        let cwd = temp_test_dir("blank-server-launch-preflight");
+        for operation in ["start", "restart", "kill-port-restart"] {
+            let manager = ProcessManager::new();
+            let mut state = app_state_with_server(&cwd, true);
+            state.config.projects[0].folders[0].commands[0].command = " \t ".to_string();
+            let tabs_before = state.open_tabs.clone();
+            let active_before = state.active_tab_id.clone();
+            let runtime_before = manager.runtime_state();
+            let revision_before = manager.runtime_revision();
+
+            let result = match operation {
+                "start" => {
+                    manager.start_server(&mut state, "server-cmd", SessionDimensions::default())
+                }
+                "restart" => {
+                    manager.restart_server(&mut state, "server-cmd", SessionDimensions::default())
+                }
+                "kill-port-restart" => manager.schedule_kill_port_and_restart(
+                    &mut state,
+                    "server-cmd",
+                    4312,
+                    SessionDimensions::default(),
+                    "must not schedule",
+                    None,
+                ),
+                _ => unreachable!(),
+            };
+
+            assert_eq!(
+                result,
+                Err("Server command `server-cmd` is empty".to_string()),
+                "{operation}"
+            );
+            assert_eq!(state.open_tabs, tabs_before, "{operation}");
+            assert_eq!(state.active_tab_id, active_before, "{operation}");
+            let runtime_after = manager.runtime_state();
+            assert_eq!(
+                runtime_after.sessions.len(),
+                runtime_before.sessions.len(),
+                "{operation}"
+            );
+            assert_eq!(
+                runtime_after.active_session_id, runtime_before.active_session_id,
+                "{operation}"
+            );
+            assert_eq!(manager.runtime_revision(), revision_before, "{operation}");
+            assert!(
+                manager.drain_process_op_completions().is_empty(),
+                "{operation}"
+            );
+            stop_background_tasks_for_test(&manager);
         }
     }
 
@@ -6611,10 +7070,15 @@ mod tests {
         assert_eq!(gateway.registrar().active_registration_count(), 0);
     }
 
-    #[test]
-    fn terminal_exit_cleans_only_the_captured_browser_provider_registration() {
-        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
-        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+    #[tokio::test]
+    async fn terminal_exit_cleans_only_the_captured_browser_provider_registration() {
+        use crate::browser::{
+            BrowserCommand, BrowserError, BrowserReplaySecretError, BrowserReplaySecretPromptVault,
+            BrowserReplayStatus, BrowserResponse, BrowserWorkspaceKey,
+        };
+
+        let (bridge, mut inbox) = crate::browser::browser_command_channel(8);
+        let gateway = crate::browser::BrowserGatewayHandle::start(bridge.clone()).unwrap();
         let manager = ProcessManager::new();
         manager.set_browser_gateway_registrar(Some(gateway.registrar()));
         let session_id = "shared-browser-exit-session";
@@ -6653,7 +7117,7 @@ mod tests {
             session_id,
             crate::browser::BrowserWorkspaceSnapshot::default(),
         );
-        let (replacement_token, replacement_overlay) = {
+        let (replacement_token, replacement_overlay, replacement_workspace) = {
             let sessions = manager.inner.browser_provider_sessions.lock().unwrap();
             let replacement = sessions.get(session_id).unwrap();
             (
@@ -6668,10 +7132,56 @@ mod tests {
                     .unwrap()
                     .path()
                     .to_path_buf(),
+                replacement.registration.workspace_key().clone(),
             )
         };
         assert!(!old_overlay.exists());
         assert!(replacement_overlay.exists());
+
+        let coordinator = bridge.replay_coordinator();
+        let replacement_replay = coordinator
+            .start(
+                replacement_workspace.clone(),
+                browser_provider_replay_plan("replacement", true),
+            )
+            .unwrap();
+        let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+            replacement_replay.instance.clone(),
+            vec!["password".to_string()],
+        )
+        .unwrap();
+        prompt
+            .edit(
+                &replacement_replay.instance,
+                "password",
+                "replacement-provider-secret",
+            )
+            .unwrap();
+        let (submission, _) = prompt.submit(&replacement_replay.instance).unwrap();
+        coordinator
+            .submit_secrets(&replacement_replay.instance, submission)
+            .unwrap();
+        let secret_lease = replacement_replay
+            .execution
+            .secret_lease("password")
+            .unwrap();
+        let isolated_workspace =
+            BrowserWorkspaceKey::new("browser-project", "sibling-conversation").unwrap();
+        let isolated = coordinator
+            .start(
+                isolated_workspace,
+                browser_provider_replay_plan("isolated", false),
+            )
+            .unwrap();
+        let controller = bridge.bind(replacement_workspace.clone(), Duration::from_secs(1));
+        let pending = tokio::spawn(async move {
+            controller
+                .request(BrowserCommand::Reload {
+                    tab_id: "runtime-tab".to_string(),
+                })
+                .await
+        });
+        let late_request = inbox.recv().await.expect("retained replacement request");
 
         manager.update_session_state(session_id, |state| {
             state.status = SessionStatus::Exited;
@@ -6693,6 +7203,15 @@ mod tests {
             replacement_token
         );
         assert!(replacement_overlay.exists());
+        assert_eq!(
+            coordinator
+                .status(&replacement_replay.instance)
+                .unwrap()
+                .status,
+            BrowserReplayStatus::Running,
+            "an old exit callback must not cancel replacement replay authority"
+        );
+        assert!(!pending.is_finished());
 
         let replacement_exit_notifier =
             session_change_notifier(manager.inner.clone(), session_id.to_string());
@@ -6706,6 +7225,30 @@ mod tests {
             .contains_key(session_id));
         assert_eq!(gateway.registrar().active_registration_count(), 0);
         assert!(!replacement_overlay.exists());
+        assert_eq!(
+            coordinator
+                .status(&replacement_replay.instance)
+                .unwrap()
+                .status,
+            BrowserReplayStatus::Cancelled
+        );
+        assert_eq!(
+            secret_lease.expose(|_| ()),
+            Err(BrowserReplaySecretError::ClosedStore)
+        );
+        late_request.respond(Ok(BrowserResponse::Acknowledged));
+        assert_eq!(pending.await.unwrap(), Err(BrowserError::Interrupted));
+        assert_eq!(
+            coordinator
+                .status(&replacement_replay.instance)
+                .unwrap()
+                .current_step_index,
+            0
+        );
+        assert_eq!(
+            coordinator.status(&isolated.instance).unwrap().status,
+            BrowserReplayStatus::Pending
+        );
     }
 
     #[test]
@@ -7996,6 +8539,308 @@ mod tests {
 
         assert!(!settings_path.exists());
         assert!(!process_root.exists());
+    }
+
+    #[test]
+    fn dropping_last_process_manager_releases_inner_and_background_workers() {
+        let manager = ProcessManager::new();
+        let inner = Arc::downgrade(&manager.inner);
+        let change_notifier =
+            session_change_notifier(manager.inner.clone(), "released-session".to_string());
+        let output_notifier =
+            session_output_notifier(manager.inner.clone(), "released-session".to_string());
+
+        drop(manager);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            inner.upgrade().is_none(),
+            "the last manager handle must release its inner state and worker ownership"
+        );
+        change_notifier();
+        output_notifier(Vec::new(), TerminalModeSnapshot::default());
+    }
+
+    #[test]
+    fn dropping_last_process_manager_stops_an_in_progress_background_tick() {
+        let manager = ProcessManager::new();
+        let inner = Arc::downgrade(&manager.inner);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        *manager
+            .inner
+            .background_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            let _ = entered_tx.try_send(());
+            let _ = release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv();
+        }));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("background worker must reach the controlled checkpoint");
+
+        let stop_inner = inner.clone();
+        let (stop_seen_tx, stop_seen_rx) = std::sync::mpsc::sync_channel(1);
+        let stop_observer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let stop_seen = loop {
+                if stop_inner
+                    .upgrade()
+                    .is_some_and(|inner| inner.background_stop.load(Ordering::SeqCst))
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let _ = stop_seen_tx.send(stop_seen);
+            let _ = release_tx.send(());
+        });
+
+        drop(manager);
+
+        assert!(
+            stop_seen_rx.recv().expect("stop observation"),
+            "dropping the last manager handle must signal the live background worker"
+        );
+        stop_observer.join().expect("stop observer");
+        assert!(
+            inner.upgrade().is_none(),
+            "dropping the last manager handle must await background worker release"
+        );
+    }
+
+    #[test]
+    fn internal_process_manager_handle_defers_final_worker_shutdown() {
+        let manager = ProcessManager::new();
+        let inner = Arc::downgrade(&manager.inner);
+        let internal = process_manager_from_inner(manager.inner.clone())
+            .expect("active manager allows an internal handle");
+
+        drop(manager);
+
+        let retained = inner
+            .upgrade()
+            .expect("internal manager must retain the shared state");
+        assert!(!retained.background_stop.load(Ordering::SeqCst));
+        drop(retained);
+
+        drop(internal);
+
+        assert!(
+            inner.upgrade().is_none(),
+            "the final internal manager handle must shut down and release workers"
+        );
+    }
+
+    #[test]
+    fn detached_auto_restart_shutdown_wins_at_lifecycle_admission() {
+        let manager = ProcessManager::new();
+        let launch = configure_auto_restart_race(&manager, "shutdown-auto-restart");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        *manager
+            .inner
+            .auto_restart_worker_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |phase| {
+            if phase == ProcessManagerDetachedWorkerTestPhase::BeforeAcquire {
+                let _ = entered_tx.try_send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }
+        }));
+
+        let runtime_state = manager.inner.runtime_state.clone();
+        let lifecycle = manager.handle_lifecycle.clone();
+        let op_queue = manager.op_queue.clone();
+        let inner = Arc::downgrade(&manager.inner);
+        handle_auto_restart(&manager.inner);
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("auto-restart worker must pause immediately before lifecycle admission");
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+        assert_eq!(op_queue.successful_submissions_for_test(), 0);
+
+        drop(manager);
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        release_tx.send(()).expect("release auto-restart worker");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            inner.upgrade().is_none(),
+            "rejected auto-restart worker must release the manager inner"
+        );
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        assert_eq!(op_queue.successful_submissions_for_test(), 0);
+        let runtime = runtime_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = runtime
+            .sessions
+            .get(&launch.command_id)
+            .expect("auto-restart runtime state");
+        assert_eq!(session.status, SessionStatus::Starting);
+        assert_eq!(session.pid, None);
+    }
+
+    #[test]
+    fn detached_auto_restart_worker_lease_defers_final_shutdown() {
+        const FIXTURE_SPAWN_ERROR: &str = "fixture invalid auto-restart launch";
+
+        let manager = ProcessManager::new();
+        let launch = configure_auto_restart_race(&manager, "admitted-auto-restart");
+        let spawn_hits = Arc::new(AtomicU64::new(0));
+        let observed_spawn_hits = spawn_hits.clone();
+        *manager
+            .inner
+            .server_session_spawner_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |_, _, _| {
+            observed_spawn_hits.fetch_add(1, Ordering::SeqCst);
+            Err(FIXTURE_SPAWN_ERROR.to_string())
+        }));
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_acquired_tx, release_acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let release_acquired_rx = Arc::new(Mutex::new(release_acquired_rx));
+        let (effect_tx, effect_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_effect_tx, release_effect_rx) = std::sync::mpsc::sync_channel(1);
+        let release_effect_rx = Arc::new(Mutex::new(release_effect_rx));
+        let acquired_hits = Arc::new(AtomicU64::new(0));
+        let observed_acquired_hits = acquired_hits.clone();
+        let effect_hits = Arc::new(AtomicU64::new(0));
+        let observed_effect_hits = effect_hits.clone();
+        *manager
+            .inner
+            .auto_restart_worker_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(move |phase| match phase {
+                ProcessManagerDetachedWorkerTestPhase::AfterAcquire => {
+                    observed_acquired_hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = acquired_tx.try_send(());
+                    let _ = release_acquired_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                }
+                ProcessManagerDetachedWorkerTestPhase::AfterEffect => {
+                    observed_effect_hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = effect_tx.try_send(());
+                    let _ = release_effect_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                }
+                ProcessManagerDetachedWorkerTestPhase::BeforeAcquire => {}
+            }));
+
+        let lifecycle = manager.handle_lifecycle.clone();
+        let op_queue = manager.op_queue.clone();
+        let inner = Arc::downgrade(&manager.inner);
+        handle_auto_restart(&manager.inner);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("auto-restart worker must pause after lifecycle admission");
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (2, false));
+        assert_eq!(op_queue.successful_submissions_for_test(), 0);
+
+        drop(manager);
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+        release_acquired_tx
+            .send(())
+            .expect("release admitted auto-restart worker");
+        effect_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("admitted auto-restart worker must submit exactly one operation");
+
+        let (active_handles, shutting_down) = lifecycle_state_for_test(&lifecycle);
+        assert!(active_handles >= 1);
+        assert!(!shutting_down);
+        assert_eq!(acquired_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(effect_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(op_queue.successful_submissions_for_test(), 1);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while op_queue.completed_operations_for_test() != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(op_queue.completed_operations_for_test(), 1);
+
+        let mut completions = Vec::new();
+        while completions.is_empty() && Instant::now() < deadline {
+            completions.extend(op_queue.drain_completions());
+            if completions.is_empty() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(completions.len(), 1);
+        let completion = completions.pop().expect("one auto-restart completion");
+        assert_eq!(completion.kind, ProcessOpKind::StartServer);
+        assert_eq!(completion.target_id, launch.command_id);
+        assert_eq!(
+            completion.context.session_id,
+            Some(launch.command_id.clone())
+        );
+        assert!(!completion.context.focus);
+        assert!(completion.remote_response.is_none());
+        let error = completion
+            .result
+            .expect_err("the deliberately invalid auto-restart launch must fail");
+        assert_eq!(error, FIXTURE_SPAWN_ERROR);
+        assert!(!error.contains("Process manager is shutting down"));
+        assert_eq!(op_queue.successful_submissions_for_test(), 1);
+        assert_eq!(op_queue.completed_operations_for_test(), 1);
+        assert_eq!(spawn_hits.load(Ordering::SeqCst), 1);
+        assert!(op_queue.drain_completions().is_empty());
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+
+        release_effect_tx
+            .send(())
+            .expect("release auto-restart worker after completion observation");
+        while lifecycle_state_for_test(&lifecycle) != (0, true) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(inner.upgrade().is_none());
+        assert_eq!(op_queue.successful_submissions_for_test(), 1);
+        assert_eq!(op_queue.completed_operations_for_test(), 1);
+        assert_eq!(spawn_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn process_manager_registers_one_shared_operation_queue() {
+        let manager = ProcessManager::new();
+        let inner_queue = manager
+            .inner
+            .op_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+            .expect("inner operation queue");
+
+        assert!(Arc::ptr_eq(&manager.op_queue, &inner_queue));
     }
 
     #[test]

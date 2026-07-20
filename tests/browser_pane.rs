@@ -321,6 +321,286 @@ fn native_shell_awaits_browser_commands_in_a_window_local_main_thread_task() {
 }
 
 #[test]
+fn native_webview_construction_never_runs_under_the_gpui_app_borrow() {
+    let host = include_str!("../src/browser/host/windows.rs");
+    let ensure_start = host
+        .find("fn ensure_view(")
+        .expect("native host should have a single view admission point");
+    let ensure_end = host[ensure_start..]
+        .find("fn evaluate_history(")
+        .map(|offset| ensure_start + offset)
+        .expect("history helper should follow view admission");
+    let ensure = &host[ensure_start..ensure_end];
+    assert!(ensure.contains("spawn_native_view_build"));
+    assert!(
+        !ensure.contains("build_as_child"),
+        "synchronous host entry still holds GPUI AppCell and bridge borrows"
+    );
+
+    let spawn_start = host
+        .find("fn spawn_native_view_build(")
+        .expect("prepared builds should be scheduled outside the GPUI app borrow");
+    let spawn_end = host[spawn_start..]
+        .find("fn complete_native_view_build(")
+        .map(|offset| spawn_start + offset)
+        .expect("native completion should follow native scheduling");
+    let spawn = &host[spawn_start..spawn_end];
+    assert!(spawn.contains(".spawn(async move {"));
+    assert!(spawn.contains("job.build()"));
+    assert!(spawn.contains("BrowserNativeViewBuildJob { spec, project }"));
+    assert!(!spawn.contains("AsyncApp"));
+    assert!(!spawn.contains("update_in("));
+    assert!(!spawn.contains("with_locked_host_work"));
+
+    let completion_start = host[spawn_start..]
+        .find("fn complete_native_view_build(")
+        .map(|offset| spawn_start + offset)
+        .expect("native build completion should restore the host lease");
+    let completion_end = host[completion_start..]
+        .find("fn pump_native_view_build_completions(")
+        .map(|offset| completion_start + offset)
+        .expect("completion pump should follow completion application");
+    let completion = &host[completion_start..completion_end];
+    let restore = completion
+        .find("self.projects.insert")
+        .expect("every result must restore its project WebContext");
+    let accept = completion
+        .find("self.native_view_builds.complete")
+        .expect("completion should retire the exact build lease");
+    assert!(restore < accept);
+    assert!(completion.contains("set_bounds(wry_bounds(self.bounds))"));
+    assert!(completion.contains("self.apply_visibility_plan()"));
+
+    let build_start = host
+        .find("impl BrowserNativeViewBuildJob")
+        .expect("foreground job should own WebView construction");
+    let build_end = host[build_start..]
+        .find("impl BrowserWebViewHost")
+        .map(|offset| build_start + offset)
+        .expect("host implementation should follow the detached build job");
+    let build = &host[build_start..build_end];
+    assert!(build.contains("builder.build_as_child(&parent_window)"));
+    assert_eq!(host.matches("build_as_child").count(), 1);
+    assert!(!build.contains("AsyncApp"));
+    assert!(!build.contains("WeakEntity"));
+
+    let request_start = host
+        .find("pub fn handle_request(")
+        .expect("native host should receive controller requests");
+    let request_end = host[request_start..]
+        .find("pub(crate) fn handle_repair_highlight_cleanup(")
+        .map(|offset| request_start + offset)
+        .expect("request handler should end before repair cleanup");
+    let request = &host[request_start..request_end];
+    let readiness = request
+        .find("require_command_view_ready")
+        .expect("view readiness must be established before agent side effects");
+    let recording = request
+        .find("reserve_agent_command")
+        .expect("agent workflow recording admission should remain present");
+    assert!(readiness < recording);
+    let readiness_branch = &request[readiness..recording];
+    assert!(readiness_branch.contains("request.respond(Err(error))"));
+    assert!(!readiness_branch.contains("self.respond_request"));
+}
+
+#[test]
+fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_exit() {
+    let lifetime = include_str!("../src/browser/host/mod.rs");
+    let host = include_str!("../src/browser/host/windows.rs");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
+    let app = include_str!("../src/app/mod.rs");
+
+    assert!(lifetime.contains("struct BrowserNativeWindowLifetime"));
+    assert!(lifetime.contains("struct BrowserNativeWindowBuildLease"));
+    assert!(lifetime.contains("BrowserNativeWindowPhase::Closing"));
+    assert!(lifetime.contains("lease_count"));
+    assert!(host.contains("struct BrowserParentWindowLease"));
+    assert!(host.contains("parent_window: BrowserParentWindowLease"));
+    assert!(host.contains("parent_window.build_is_allowed()"));
+    assert!(host.contains("cancellation.is_canceled()"));
+    assert!(host.contains("fn begin_native_window_teardown("));
+    assert!(host.contains("fn resume_native_window_after_canceled_teardown("));
+    assert!(host.contains("self.native_view_builds.cancel_all()"));
+    assert!(host.contains("self.native_view_build_specs.clear()"));
+    assert!(host.contains("native_view_build_tasks: HashMap<u64, Task<()>>"));
+    assert!(host.contains("pending_native_view_build_task_teardown: Vec<Task<()>>"));
+
+    let spawn_start = host
+        .find("fn spawn_native_view_build(")
+        .expect("native build scheduler");
+    let spawn_end = host[spawn_start..]
+        .find("fn complete_native_view_build(")
+        .map(|offset| spawn_start + offset)
+        .expect("native build scheduler end");
+    let spawn = &host[spawn_start..spawn_end];
+    assert!(spawn.contains("self.native_view_build_tasks.insert(build_id, task)"));
+    assert!(!spawn.contains(".detach()"));
+
+    let cancel_start = host
+        .find("fn cancel_all_native_view_builds(")
+        .expect("native build cancellation");
+    let cancel_end = host[cancel_start..]
+        .find("fn evaluate_history(")
+        .map(|offset| cancel_start + offset)
+        .expect("native build cancellation end");
+    let cancel = &host[cancel_start..cancel_end];
+    assert!(cancel.contains("pending_native_view_build_task_teardown"));
+    assert!(cancel.contains("native_view_build_tasks.drain()"));
+    assert!(!cancel.contains("native_view_build_tasks.clear()"));
+
+    let teardown_start = host
+        .find("fn begin_native_window_teardown(")
+        .expect("native teardown entrypoint");
+    let teardown_end = host[teardown_start..]
+        .find("fn resume_native_window_after_canceled_teardown(")
+        .map(|offset| teardown_start + offset)
+        .expect("native teardown end");
+    let teardown = &host[teardown_start..teardown_end];
+    assert!(teardown.contains("pending_native_view_teardown"));
+    assert!(teardown.contains("retain_teardown_cleanup"));
+    assert!(!teardown.contains("self.views.clear()"));
+
+    let host_pump_start = host
+        .find("pub fn pump_async_completions(")
+        .expect("native completion pump");
+    let host_pump_end = host[host_pump_start..]
+        .find("fn operation_target(")
+        .map(|offset| host_pump_start + offset)
+        .expect("native completion pump end");
+    let host_pump = &host[host_pump_start..host_pump_end];
+    let deferred_task_drop = host_pump
+        .find("self.finish_native_view_build_task_teardown()")
+        .expect("deferred native build task cancellation");
+    let deferred_drop = host_pump
+        .find("self.finish_native_view_teardown()")
+        .expect("deferred WebView destruction");
+    let build_completion = host_pump
+        .find("self.pump_native_view_build_completions(window)")
+        .expect("native build completion");
+    assert!(deferred_task_drop < deferred_drop);
+    assert!(deferred_drop < build_completion);
+
+    let completion_start = host
+        .find("fn complete_native_view_build(")
+        .expect("native completion handler");
+    let completion_end = host[completion_start..]
+        .find("fn pump_native_view_build_completions(")
+        .map(|offset| completion_start + offset)
+        .expect("native completion pump");
+    let completion = &host[completion_start..completion_end];
+    let drop_result = completion
+        .find("drop(result)")
+        .expect("canceled WebView result must be dropped explicitly");
+    let release_window = completion
+        .find("drop(parent_window)")
+        .expect("window lease must be released explicitly");
+    assert!(drop_result < release_window);
+
+    assert!(app.contains("enum PendingAppTermination"));
+    assert!(app.contains("fn request_app_termination("));
+    assert!(app.contains("fn try_finish_app_termination("));
+    assert!(app.contains("fn execute_app_termination("));
+    assert!(app.contains("fn schedule_browser_native_teardown_cleanup("));
+    assert!(app.contains("resume_native_window_after_canceled_teardown"));
+    assert!(app.contains("BrowserAppExitDisposition::Deferred"));
+    assert!(app.contains("BrowserAppExitDisposition::ExitNow"));
+    assert_eq!(app.matches("cx.quit()").count(), 1);
+    assert_eq!(app.matches("std::process::exit(0)").count(), 1);
+
+    let app_teardown_start = app
+        .find("fn begin_browser_window_teardown(")
+        .expect("browser window teardown entrypoint");
+    let app_teardown_end = app[app_teardown_start..]
+        .find("fn schedule_browser_native_teardown_cleanup(")
+        .map(|offset| app_teardown_start + offset)
+        .expect("app-level native teardown cleanup scheduler");
+    assert!(app[app_teardown_start..app_teardown_end]
+        .contains("self.schedule_browser_native_teardown_cleanup(cx)"));
+
+    let should_close_start = app
+        .find("window.on_window_should_close")
+        .expect("low-level GPUI close guard");
+    let should_close_end = app[should_close_start..]
+        .find("shell.register_focus_observers")
+        .map(|offset| should_close_start + offset)
+        .expect("close guard end");
+    let should_close = &app[should_close_start..should_close_end];
+    let guarded_close = should_close
+        .find("guard_window_close")
+        .expect("native lifetime close guard");
+    let shell_update = should_close
+        .find("shell.handle_window_should_close")
+        .expect("shell close handler");
+    assert!(guarded_close < shell_update);
+    assert!(should_close[guarded_close..shell_update].contains("||"));
+    assert!(!should_close.contains("if closing_window_lifetime.window_close_must_be_deferred()"));
+
+    let closed_start = app
+        .find("cx.on_window_closed")
+        .expect("post-close assertion");
+    let closed_end = app[closed_start..]
+        .find("let close_handler")
+        .map(|offset| closed_start + offset)
+        .expect("post-close assertion end");
+    let closed = &app[closed_start..closed_end];
+    assert!(closed.contains("assert_drained_after_window_close"));
+    assert!(closed.contains("teardown_ready"));
+
+    let deferred_cleanup_start = app
+        .find("fn schedule_browser_native_teardown_cleanup(")
+        .expect("app-level native teardown cleanup scheduler");
+    let deferred_cleanup_end = app[deferred_cleanup_start..]
+        .find("fn resume_browser_window_after_canceled_shutdown(")
+        .map(|offset| deferred_cleanup_start + offset)
+        .expect("app-level native teardown cleanup scheduler end");
+    let deferred_cleanup = &app[deferred_cleanup_start..deferred_cleanup_end];
+    assert!(deferred_cleanup.contains("cx.defer(move |cx|"));
+    let native_cleanup = deferred_cleanup
+        .find("finish_native_window_teardown_cleanup")
+        .expect("cleanup must not depend on a closing window task");
+    let termination = deferred_cleanup
+        .find("try_finish_app_termination")
+        .expect("cleanup should retry deferred app termination");
+    assert!(native_cleanup < termination);
+
+    let host_cleanup_start = host
+        .find("fn finish_native_window_teardown_cleanup(")
+        .expect("window-independent native teardown cleanup");
+    let host_cleanup_end = host[host_cleanup_start..]
+        .find("fn finish_native_view_build_task_teardown(")
+        .map(|offset| host_cleanup_start + offset)
+        .expect("window-independent native teardown cleanup end");
+    let host_cleanup = &host[host_cleanup_start..host_cleanup_end];
+    let task_drop = host_cleanup
+        .find("self.finish_native_view_build_task_teardown()")
+        .expect("deferred native build tasks must be canceled");
+    let view_drop = host_cleanup
+        .find("self.finish_native_view_teardown()")
+        .expect("deferred native views must be destroyed on the GPUI thread");
+    let completion_drop = host_cleanup
+        .find("self.drop_native_view_build_completions()")
+        .expect("completed builds must release their parent-window leases");
+    assert!(task_drop < view_drop);
+    assert!(view_drop < completion_drop);
+    assert!(unsupported.contains("fn finish_native_window_teardown_cleanup("));
+
+    let pump_start = app.find("fn pump_browser_events(").expect("browser pump");
+    let pump_end = app[pump_start..]
+        .find("fn reconcile_browser_replay_state(")
+        .map(|offset| pump_start + offset)
+        .expect("browser pump end");
+    let pump = &app[pump_start..pump_end];
+    let completion = pump
+        .find("browser_host.pump_async_completions")
+        .expect("native completion pump");
+    let termination = pump
+        .find("self.try_finish_app_termination")
+        .expect("deferred termination retry");
+    assert!(completion < termination);
+}
+
+#[test]
 fn native_browser_storage_never_treats_the_process_cwd_as_trusted_config() {
     let source = include_str!("../src/app/mod.rs");
     assert!(!source.contains(
@@ -351,7 +631,8 @@ fn native_shell_routes_mcp_requests_through_the_async_host_queue() {
         .expect("browser event pump should follow request handler");
     let handler = &source[start..end];
 
-    assert!(handler.contains("route_browser_request("));
+    assert!(handler.contains("self.active_open_browser_route()"));
+    assert!(handler.contains("route_browser_request_for_active_workspace("));
     assert!(handler.contains("browser_host.handle_request(window, request)"));
     assert!(handler.contains("with_browser_host_control_barrier"));
     assert!(!handler.contains("dispatch_browser_command"));
@@ -360,23 +641,35 @@ fn native_shell_routes_mcp_requests_through_the_async_host_queue() {
 #[test]
 fn native_shell_applies_host_input_before_async_browser_completions() {
     let source = include_str!("../src/app/mod.rs");
-    let pump = source
+    let pump_start = source
         .find("fn pump_browser_events")
         .expect("browser event pump should exist");
-    let body = &source[pump..];
+    let pump_end = source[pump_start..]
+        .find("fn with_browser_host_control_barrier")
+        .map(|offset| pump_start + offset)
+        .expect("host-control barrier should follow the event pump");
+    let body = &source[pump_start..pump_end];
     let completions = body
         .find("browser_host.pump_async_completions(window)")
         .expect("the GPUI pump should drain async WebView2 completions");
     let events_before = body
-        .find("browser_host.drain_events()")
+        .find("browser_host.drain_events_with_pre_apply_observer")
         .expect("the GPUI pump should drain host events");
     let events_after = body
-        .rfind("browser_host.drain_events()")
+        .rfind("browser_host.drain_events_with_pre_apply_observer")
         .expect("the GPUI pump should also drain completion-generated events");
 
     assert!(events_before < completions);
     assert!(completions < events_after);
-    assert!(body[events_before..completions].contains("observe_host_event"));
+    assert!(
+        body[events_before..completions].contains("observe_host_event_under_host_control_barrier")
+    );
+    assert_eq!(
+        body.matches("observe_host_event_under_host_control_barrier")
+            .count(),
+        3,
+        "both pump drains and the post-dialog drain already hold the host-control barrier"
+    );
 }
 
 #[test]
@@ -509,9 +802,7 @@ fn synchronous_ui_commands_enter_the_host_inside_the_control_barrier() {
         .unwrap()
         + start;
     let dispatch = &source[start..end];
-    let barrier = dispatch
-        .find("with_locked_host_controls_for_command")
-        .unwrap();
+    let barrier = dispatch.find("with_locked_host_work_for_command").unwrap();
     let host_entry = dispatch.find("browser_host.handle_command").unwrap();
     assert!(barrier < host_entry);
 }
@@ -545,11 +836,11 @@ fn native_approval_rechecks_priority_work_and_user_input_after_dialog_before_res
         .map(|offset| dialog + offset)
         .expect("priority lifecycle work received during the dialog must be applied");
     let input = body[barrier..]
-        .find("browser_host.drain_events()")
+        .find("browser_host.drain_events_with_pre_apply_observer")
         .map(|offset| barrier + offset)
         .expect("trusted user input received during the dialog must cancel host work");
     let observe = body[input..]
-        .find("browser_bridge.observe_host_event(event)")
+        .find("observe_host_event_under_host_control_barrier(event)")
         .map(|offset| input + offset)
         .unwrap();
     let resume = body.find("browser_host.resolve_approval(").unwrap();
@@ -1013,16 +1304,69 @@ fn ui_actions_and_workspace_responses_cannot_cross_route() {
 }
 
 #[test]
+fn tab_selection_plan_rejects_unknown_and_elides_already_selected_tabs() {
+    let workspace = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
+    let snapshot = BrowserWorkspaceSnapshot {
+        tabs: vec![
+            BrowserTabSnapshot {
+                id: "tab-a".to_string(),
+                title: "A".to_string(),
+                url: "https://a.test".to_string(),
+                viewport: BrowserViewport::default(),
+            },
+            BrowserTabSnapshot {
+                id: "tab-b".to_string(),
+                title: "B".to_string(),
+                url: "https://b.test".to_string(),
+                viewport: BrowserViewport::default(),
+            },
+        ],
+        selected_tab_id: Some("tab-a".to_string()),
+        ..BrowserWorkspaceSnapshot::default()
+    };
+
+    assert!(matches!(
+        browser_action_plan(
+            Some(&workspace),
+            Some(&snapshot),
+            "",
+            BrowserPaneAction::SelectTab("missing-tab".to_string()),
+        ),
+        Err(BrowserError::InvalidInvocation { field }) if field == "tabId"
+    ));
+
+    let selected = browser_action_plan(
+        Some(&workspace),
+        Some(&snapshot),
+        "",
+        BrowserPaneAction::SelectTab("tab-a".to_string()),
+    )
+    .unwrap();
+    assert!(selected.commands.is_empty());
+
+    let different = browser_action_plan(
+        Some(&workspace),
+        Some(&snapshot),
+        "",
+        BrowserPaneAction::SelectTab("tab-b".to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        different.commands,
+        vec![BrowserCommand::SelectTab {
+            tab_id: "tab-b".to_string()
+        }]
+    );
+}
+
+#[test]
 fn user_input_and_new_window_events_stay_in_the_matching_conversation() {
     let active = BrowserWorkspaceKey::new("project-a", "conversation-a").unwrap();
     let other = BrowserWorkspaceKey::new("project-a", "conversation-b").unwrap();
     let open = vec![active.clone(), other.clone()];
 
-    let user_input = BrowserHostEvent::UserInput {
-        workspace_key: active.clone(),
-        tab_id: "tab-a".to_string(),
-        kind: BrowserUserInputKind::Keyboard,
-    };
+    let user_input =
+        BrowserHostEvent::user_input(active.clone(), "tab-a", BrowserUserInputKind::Keyboard);
     assert_eq!(
         browser_event_plan(&open, &user_input),
         Some(BrowserPaneEventPlan::SyncSnapshot {

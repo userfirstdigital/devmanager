@@ -1,23 +1,102 @@
 use devmanager::browser::{
-    browser_command_channel, compile_browser_replay, execute_browser_replay, BrowserAction,
-    BrowserActionResult, BrowserActionTarget, BrowserCommand, BrowserCommandRequest, BrowserError,
-    BrowserInvocationActor, BrowserLocator, BrowserRecipeAction, BrowserRecipeAssertion,
-    BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind, BrowserRecipeLocator,
-    BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue, BrowserRecipeViewport,
-    BrowserRecipeWait, BrowserReplayCoordinator, BrowserReplayFailureCode, BrowserReplayProjection,
-    BrowserReplayPublicInput, BrowserReplayStatus, BrowserResourceHandle, BrowserResourceId,
-    BrowserResourceKind, BrowserResponse, BrowserRevision, BrowserRisk, BrowserScreenshotMode,
-    BrowserTabSnapshot, BrowserUploadResult, BrowserViewport, BrowserWaitCondition,
-    BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation, BrowserWorkspaceSnapshot,
-    BROWSER_RECIPE_SCHEMA_VERSION,
+    browser_command_channel, compile_browser_replay, execute_browser_replay, route_browser_request,
+    BrowserAction, BrowserActionResult, BrowserActionTarget, BrowserCommand, BrowserCommandRequest,
+    BrowserError, BrowserInvocationActor, BrowserLocator, BrowserRecipeAction,
+    BrowserRecipeAssertion, BrowserRecipeElementState, BrowserRecipeInput, BrowserRecipeInputKind,
+    BrowserRecipeLocator, BrowserRecipeStep, BrowserRecipeV1, BrowserRecipeValue,
+    BrowserRecipeViewport, BrowserRecipeWait, BrowserReplayCoordinator, BrowserReplayFailureCode,
+    BrowserReplayProjection, BrowserReplayPublicInput, BrowserReplaySecretPromptVault,
+    BrowserReplayStatus, BrowserResourceHandle, BrowserResourceId, BrowserResourceKind,
+    BrowserResourceLimits, BrowserResourceStore, BrowserResponse, BrowserRevision, BrowserRisk,
+    BrowserScreenshotMode, BrowserTabSnapshot, BrowserUploadResult, BrowserViewport,
+    BrowserWaitCondition, BrowserWaitResult, BrowserWorkspaceKey, BrowserWorkspaceMutation,
+    BrowserWorkspaceSnapshot, BROWSER_RECIPE_SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
+static REPLAY_RESOURCE_STORE: OnceLock<BrowserResourceStore> = OnceLock::new();
+
+#[test]
+fn repaired_executor_phases_are_resumed_only_by_the_real_authorized_apply_pipeline() {
+    let executor = include_str!("../src/browser/replay_executor.rs");
+    let phase_start = executor
+        .find("async fn batch_c_resume_retries_only_action_wait_step_wait_or_exact_assertion_phase")
+        .unwrap();
+    let phase_end = executor[phase_start..]
+        .find("async fn stale_repair_cannot_resume_the_next_repair_in_the_same_executor")
+        .unwrap()
+        + phase_start;
+    let phases = &executor[phase_start..phase_end];
+    assert!(!phases.contains("resume_locator_repair_for_executor_test"));
+    assert!(phases.matches("apply_exact_repair(").count() >= 4);
+    for exact_cursor in [
+        "BrowserReplayRepairResumeCursor::Action",
+        "BrowserReplayRepairResumeCursor::ActionWait",
+        "BrowserReplayRepairResumeCursor::StepWait",
+        "BrowserReplayRepairResumeCursor::Assertion(1)",
+    ] {
+        assert!(phases.contains(exact_cursor), "missing {exact_cursor}");
+    }
+    assert!(phases.contains("single mutating action"));
+    assert!(phases.contains("step-wait-only retry"));
+    assert!(phases.contains("assertion-one-only retry"));
+
+    let second_start = phase_end;
+    let second_end = executor[second_start..]
+        .find("async fn secret_type_locator_failure_enters_primary_action_repair")
+        .unwrap()
+        + second_start;
+    let second = &executor[second_start..second_end];
+    assert!(!second.contains("resume_locator_repair_for_executor_test"));
+    assert_eq!(second.matches("apply_exact_repair(").count(), 1);
+    assert!(second.contains("assert_ne!(stale_repair.repair_id(), active_repair.repair_id())"));
+    assert!(second.contains("ready-first-repair"));
+    assert!(second.contains("BrowserReplayStatus::Cancelled"));
+    assert!(second.contains("second_snapshot.id"));
+    assert!(second.contains("second_screenshot.id"));
+
+    let fixture_start = executor.find("async fn recipe_fixture(").unwrap();
+    let fixture_end = executor[fixture_start..]
+        .find("async fn failed_click_fixture(")
+        .unwrap()
+        + fixture_start;
+    let fixture = &executor[fixture_start..fixture_end];
+    assert!(fixture.contains("save_recipe(&project_root, &recipe)"));
+    assert!(fixture.contains("&run_project_root"));
+
+    let applied_start = executor
+        .find("async fn applied_without_resume_requires_fresh_exact_preview_before_no_write_executor_retry")
+        .unwrap();
+    let applied_end = executor[applied_start..]
+        .find("async fn stale_repair_cannot_resume_the_next_repair_in_the_same_executor")
+        .unwrap()
+        + applied_start;
+    let applied = &executor[applied_start..applied_end];
+    assert!(applied.contains("apply_previewed_repair(&mut fixture, &repair, false, true)"));
+    assert!(applied.contains("preview_exact_repair(&mut fixture, \"repaired-submit\", 10)"));
+    assert!(applied.contains("apply_previewed_repair(&mut fixture, &repair, true, false)"));
+    assert!(applied.contains("permissions.set_readonly(true)"));
+    assert!(applied.contains("assert_eq!(resumed.replay.current_step_index, 0)"));
+    assert!(applied.contains("command_targets_test_id(retry.command(), \"repaired-submit\")"));
+}
+
+fn replay_resource_store() -> &'static BrowserResourceStore {
+    REPLAY_RESOURCE_STORE.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!(
+            "devmanager-replay-executor-resources-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        BrowserResourceStore::open(root, BrowserResourceLimits::default())
+            .expect("open replay executor resource store")
+    })
+}
 
 #[cfg(target_os = "windows")]
 fn create_directory_redirect(target: &Path, link: &Path) -> std::io::Result<()> {
@@ -120,7 +199,11 @@ async fn next_request(
             requests.pop()
         });
         if let Some(request) = lifecycle {
-            return request;
+            let mut routed = None;
+            route_browser_request(true, request, |request| routed = Some(request)).unwrap_or_else(
+                |error| panic!("{label} lifecycle route admission failed: {error}"),
+            );
+            return routed.expect("open lifecycle route dispatches the request");
         }
         match tokio::time::timeout(Duration::from_millis(10), inbox.recv()).await {
             Ok(Some(request)) => return request,
@@ -200,6 +283,62 @@ fn upload_recipe() -> BrowserRecipeV1 {
             wait: None,
             assertions: Vec::new(),
         }],
+    }
+}
+
+fn secret_type_recipe() -> BrowserRecipeV1 {
+    BrowserRecipeV1 {
+        schema_version: BROWSER_RECIPE_SCHEMA_VERSION,
+        id: "executor-secret-type".to_string(),
+        name: "Executor secret type".to_string(),
+        description: "Ordinary and private Type routing fixture".to_string(),
+        start_url: "https://example.test/sign-in".to_string(),
+        viewport: BrowserRecipeViewport::default(),
+        inputs: vec![
+            BrowserRecipeInput {
+                name: "display-name".to_string(),
+                kind: BrowserRecipeInputKind::Text,
+                default_value: None,
+            },
+            BrowserRecipeInput {
+                name: "credential".to_string(),
+                kind: BrowserRecipeInputKind::Secret,
+                default_value: None,
+            },
+        ],
+        steps: vec![
+            BrowserRecipeStep {
+                id: "type-display-name".to_string(),
+                action: BrowserRecipeAction::Type {
+                    locator: recipe_locator("display-name"),
+                    value: BrowserRecipeValue::Input {
+                        name: "display-name".to_string(),
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            },
+            BrowserRecipeStep {
+                id: "type-credential".to_string(),
+                action: BrowserRecipeAction::Type {
+                    locator: recipe_locator("credential"),
+                    value: BrowserRecipeValue::Input {
+                        name: "credential".to_string(),
+                    },
+                },
+                wait: None,
+                assertions: Vec::new(),
+            },
+        ],
+    }
+}
+
+fn secret_type_action_response(completed_actions: usize) -> BrowserResponse {
+    BrowserResponse::Action {
+        result: BrowserActionResult {
+            completed_actions,
+            revision: BrowserRevision(7),
+        },
     }
 }
 
@@ -415,6 +554,7 @@ async fn setup_uses_fresh_tab_and_awaits_each_exact_response() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -535,6 +675,7 @@ async fn setup_uses_fresh_tab_and_awaits_each_exact_response() {
                 &invalid_instance,
                 invalid.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &invalid_root,
             )
             .await
@@ -616,6 +757,7 @@ async fn replay_preflight_rejects_untrusted_authority_without_state_or_browser_s
             &instance,
             started.execution,
             case.actor,
+            replay_resource_store(),
             &case.root,
         )
         .await;
@@ -665,6 +807,7 @@ async fn replay_preflight_rejects_a_foreign_execution_handle_without_side_effect
         &expected_instance,
         foreign.execution,
         BrowserInvocationActor::Agent,
+        replay_resource_store(),
         &canonical_project_root(),
     )
     .await
@@ -703,6 +846,7 @@ async fn cancellation_while_setup_is_awaiting_discards_the_late_response() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -732,7 +876,7 @@ async fn cancellation_while_setup_is_awaiting_discards_the_late_response() {
 
 #[test]
 fn cancellation_status_fence_checks_both_sides_of_the_running_projection_read() {
-    let source = include_str!("../src/browser/replay_executor.rs");
+    let source = include_str!("../src/browser/replay_executor.rs").replace("\r\n", "\n");
     let start = source.find("fn terminal_projection(").unwrap();
     let end = source[start..].find("fn resolve_value").unwrap() + start;
     let fence = &source[start..end];
@@ -753,6 +897,301 @@ fn cancellation_status_fence_checks_both_sides_of_the_running_projection_read() 
         cancellation_checks[0] < status && status < cancellation_checks[1],
         "a cancellation racing the status/lease split can return stale Running"
     );
+}
+
+#[tokio::test]
+async fn secret_readiness_waits_on_the_existing_value_free_signal_before_host_work() {
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .unwrap();
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(workspace("secret-readiness"), plan)
+        .unwrap();
+    let instance = started.instance.clone();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                replay_resource_store(),
+                &root,
+            )
+            .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !run.is_finished(),
+        "executor must await the exact secret-ready signal"
+    );
+    assert_no_request(&mut inbox).await;
+
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        coordinator
+            .status(&instance)
+            .unwrap()
+            .unresolved_secret_inputs,
+    )
+    .unwrap();
+    prompt
+        .edit(&instance, "credential", "private value")
+        .unwrap();
+    let (submission, _) = prompt.submit(&instance).unwrap();
+    coordinator.submit_secrets(&instance, submission).unwrap();
+
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+    next_request(&mut inbox, "ordinary text Type")
+        .await
+        .respond(Ok(secret_type_action_response(1)));
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+    secret.respond(Ok(secret_type_action_response(1)));
+
+    let outcome = run.await.unwrap().unwrap();
+    assert_eq!(outcome.status, BrowserReplayStatus::Completed);
+}
+
+#[tokio::test]
+async fn secret_type_uses_the_private_sidecar_while_text_type_stays_an_ordinary_action() {
+    const SECRET_SENTINEL: &str = "DM_EXECUTOR_SECRET_SENTINEL_74A9";
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .expect("compile secret Type replay");
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(workspace("secret-routing"), plan)
+        .expect("start secret Type replay");
+    assert_eq!(
+        started.projection.status,
+        BrowserReplayStatus::NeedsUserSecret
+    );
+    let instance = started.instance.clone();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        started.projection.unresolved_secret_inputs.clone(),
+    )
+    .expect("install exact secret prompt");
+    prompt
+        .edit(&instance, "credential", SECRET_SENTINEL)
+        .expect("edit exact secret input");
+    let (submission, _) = prompt.submit(&instance).expect("consume secret prompt");
+    coordinator
+        .submit_secrets(&instance, submission)
+        .expect("install replay secrets");
+
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                replay_resource_store(),
+                &root,
+            )
+            .await
+        }
+    });
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+
+    let ordinary = next_request(&mut inbox, "ordinary text Type").await;
+    assert_eq!(
+        ordinary.command(),
+        &BrowserCommand::Act {
+            tab_id: "runtime-setup".to_string(),
+            actions: vec![BrowserAction::Type {
+                target: action_target("display-name"),
+                text: "ordinary user".to_string(),
+            }],
+        }
+    );
+    assert!(matches!(ordinary.validate_secret_sidecar(), Ok(None)));
+    ordinary.respond(Ok(secret_type_action_response(1)));
+
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert_eq!(
+        secret.command(),
+        &BrowserCommand::SecretType {
+            tab_id: "runtime-setup".to_string(),
+            target: action_target("credential"),
+            input_name: "credential".to_string(),
+        }
+    );
+    assert_eq!(secret.context().declared_risk, BrowserRisk::AccountSecurity);
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+    let safe_surfaces = format!(
+        "{}\n{:?}\n{:?}\n{:?}",
+        serde_json::to_string(secret.command()).unwrap(),
+        secret.command(),
+        secret.context(),
+        coordinator.status(&instance).unwrap(),
+    );
+    assert!(!safe_surfaces.contains(SECRET_SENTINEL));
+    assert!(!safe_surfaces.contains("ordinary user"));
+    secret.respond(Ok(secret_type_action_response(1)));
+
+    let outcome = run
+        .await
+        .expect("secret executor task")
+        .expect("secret replay projection");
+    assert_eq!(outcome.status, BrowserReplayStatus::Completed);
+    assert_eq!(outcome.current_step_index, 2);
+    assert_no_request(&mut inbox).await;
+}
+
+#[tokio::test]
+async fn secret_type_requires_the_standard_exactly_one_action_response() {
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .unwrap();
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator
+        .start(workspace("secret-response"), plan)
+        .unwrap();
+    let instance = started.instance.clone();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        started.projection.unresolved_secret_inputs.clone(),
+    )
+    .unwrap();
+    prompt
+        .edit(&instance, "credential", "private value")
+        .unwrap();
+    let (submission, _) = prompt.submit(&instance).unwrap();
+    coordinator.submit_secrets(&instance, submission).unwrap();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                replay_resource_store(),
+                &root,
+            )
+            .await
+        }
+    });
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+    next_request(&mut inbox, "ordinary text Type")
+        .await
+        .respond(Ok(secret_type_action_response(1)));
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+    secret.respond(Ok(secret_type_action_response(2)));
+
+    let outcome = run.await.unwrap().unwrap();
+    assert_eq!(outcome.status, BrowserReplayStatus::Failed);
+    assert_eq!(outcome.failure, Some(BrowserReplayFailureCode::StepFailed));
+    assert_eq!(outcome.current_step_index, 1);
+    assert_no_request(&mut inbox).await;
+}
+
+#[tokio::test]
+async fn secret_type_cancellation_closes_the_exact_sidecar_and_fences_the_late_response() {
+    let root = canonical_project_root();
+    let plan = compile_browser_replay(
+        &secret_type_recipe(),
+        vec![BrowserReplayPublicInput::new(
+            "display-name",
+            BrowserRecipeInputKind::Text,
+            "ordinary user",
+        )],
+    )
+    .unwrap();
+    let coordinator = BrowserReplayCoordinator::default();
+    let started = coordinator.start(workspace("secret-cancel"), plan).unwrap();
+    let instance = started.instance.clone();
+    let (mut prompt, _) = BrowserReplaySecretPromptVault::install(
+        instance.clone(),
+        started.projection.unresolved_secret_inputs.clone(),
+    )
+    .unwrap();
+    prompt
+        .edit(&instance, "credential", "private value")
+        .unwrap();
+    let (submission, _) = prompt.submit(&instance).unwrap();
+    coordinator.submit_secrets(&instance, submission).unwrap();
+    let (bridge, mut inbox) = browser_command_channel(8);
+    let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
+    let run = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let instance = instance.clone();
+        async move {
+            execute_browser_replay(
+                &controller,
+                &coordinator,
+                &instance,
+                started.execution,
+                BrowserInvocationActor::Agent,
+                replay_resource_store(),
+                &root,
+            )
+            .await
+        }
+    });
+    respond_default_setup(&mut inbox, "https://example.test/sign-in").await;
+    next_request(&mut inbox, "ordinary text Type")
+        .await
+        .respond(Ok(secret_type_action_response(1)));
+    let secret = next_request(&mut inbox, "private secret Type").await;
+    assert!(matches!(secret.validate_secret_sidecar(), Ok(Some(_))));
+
+    let cancelled = coordinator
+        .interrupt_workspace(instance.workspace_key())
+        .expect("cancel exact replay during secure host request");
+    assert_eq!(cancelled.status, BrowserReplayStatus::Cancelled);
+    assert!(matches!(
+        secret.validate_secret_sidecar(),
+        Err(BrowserError::InvalidInvocation { field }) if field == "secretSidecar"
+    ));
+    secret.respond(Ok(secret_type_action_response(1)));
+
+    let outcome = run.await.unwrap().unwrap();
+    assert_eq!(outcome.status, BrowserReplayStatus::Cancelled);
+    assert_eq!(outcome.current_step_index, 1);
+    assert_no_request(&mut inbox).await;
 }
 
 #[tokio::test]
@@ -847,13 +1286,13 @@ async fn every_recipe_action_maps_to_one_existing_command() {
     let recipe = action_recipe(actions);
     let total_steps = recipe.steps.len();
     let plan = compile_browser_replay(&recipe, Vec::new()).unwrap();
-    let coordinator = BrowserReplayCoordinator::default();
+    let (bridge, mut inbox) = browser_command_channel(32);
+    let coordinator = bridge.replay_coordinator();
     let started = coordinator
         .start(workspace("all-actions"), plan)
         .expect("start action replay");
     let instance = started.instance.clone();
     let root = canonical_project_root();
-    let (bridge, mut inbox) = browser_command_channel(32);
     let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
     let run = tokio::spawn({
         let coordinator = coordinator.clone();
@@ -864,6 +1303,7 @@ async fn every_recipe_action_maps_to_one_existing_command() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1217,6 +1657,7 @@ async fn replay_cdp_declares_shared_conservative_method_risk() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1273,6 +1714,7 @@ async fn every_recipe_step_wait_maps_to_the_typed_host_wait() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1423,6 +1865,7 @@ async fn replay_forwards_the_maximum_valid_recipe_wait_without_truncation() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1475,6 +1918,7 @@ async fn unmatched_step_wait_fails_without_advancing_or_running_later_work() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1573,6 +2017,7 @@ async fn page_condition_timeout_is_assertion_failure_but_transport_timeout_is_st
                     &instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -1654,6 +2099,7 @@ async fn wrong_response_variant_fails_setup_action_wait_and_assertion() {
                     &instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -1749,6 +2195,7 @@ async fn host_error_details_collapse_to_a_value_free_failure_projection() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1827,6 +2274,7 @@ async fn cancellation_and_replacement_fence_late_action_wait_and_assertion_respo
                     &old_instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -1937,6 +2385,7 @@ async fn interrupted_host_command_terminalizes_the_exact_replay_as_cancelled() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -1983,7 +2432,8 @@ async fn tab_aliases_advance_only_on_exact_create_select_and_close_snapshots() {
             }),
         }
         let plan = compile_browser_replay(&action_recipe(actions), Vec::new()).unwrap();
-        let coordinator = BrowserReplayCoordinator::default();
+        let (bridge, mut inbox) = browser_command_channel(8);
+        let coordinator = bridge.replay_coordinator();
         let started = coordinator
             .start(
                 workspace(&format!("tab-snapshot-mismatch-{case_index}")),
@@ -1992,7 +2442,6 @@ async fn tab_aliases_advance_only_on_exact_create_select_and_close_snapshots() {
             .expect("start tab snapshot replay");
         let instance = started.instance.clone();
         let root = canonical_project_root();
-        let (bridge, mut inbox) = browser_command_channel(8);
         let controller = bridge.bind(instance.workspace_key().clone(), Duration::from_secs(1));
         let run = tokio::spawn({
             let coordinator = coordinator.clone();
@@ -2003,6 +2452,7 @@ async fn tab_aliases_advance_only_on_exact_create_select_and_close_snapshots() {
                     &instance,
                     started.execution,
                     BrowserInvocationActor::Agent,
+                    replay_resource_store(),
                     &root,
                 )
                 .await
@@ -2145,6 +2595,7 @@ async fn legacy_create_tab_one_binds_the_recipe_alias_to_the_created_runtime_tab
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2234,6 +2685,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2300,6 +2752,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &outside_instance,
                 outside.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2372,6 +2825,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &escaping_instance,
                 escaping.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2431,6 +2885,7 @@ async fn upload_resolves_at_execution_and_declares_containment_risk() {
                 &missing_instance,
                 missing.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2482,6 +2937,7 @@ async fn replay_runs_action_wait_assertions_and_advances_only_after_success() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await
@@ -2637,6 +3093,7 @@ async fn assertion_failure_stops_before_advance_or_later_assertions() {
                 &instance,
                 started.execution,
                 BrowserInvocationActor::Agent,
+                replay_resource_store(),
                 &root,
             )
             .await

@@ -2,7 +2,19 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
 (() => {
   const marker = "__devmanagerBrowser";
   if (window[marker]) return;
-  const NativeError = Error;
+  class NativeFailure extends Error {
+    constructor(code, ticket) {
+      super(code);
+      this.code = code;
+      nativeFailureTickets.set(this, ticket);
+    }
+  }
+  const nativeFailureTickets = new WeakMap();
+  const nativeFailureCode = (failure, ticket) => {
+    if (!(failure instanceof NativeFailure) || nativeFailureTickets.get(failure) !== ticket) return null;
+    nativeFailureTickets.delete(failure);
+    return failure.code;
+  };
 
   const MAX_CONSOLE = 200;
   const MAX_NETWORK = 300;
@@ -589,9 +601,10 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     element.dispatchEvent(new Event("input", { bubbles: true }));
     element.dispatchEvent(new Event("change", { bubbles: true }));
   };
-  const applyAction = (action) => {
+  const applyAction = (action, failureTicket) => {
     const element = resolveTarget(action.target || action.source);
-    if (!element && action.operation !== "scroll" && action.operation !== "keypress") throw new Error("element_not_found");
+    if (!element && action.operation === "dragDrop") throw new NativeFailure("locator_source_not_found", failureTicket);
+    if (!element && (action.operation !== "scroll" && action.operation !== "keypress" || action.target)) throw new NativeFailure("locator_primary_not_found", failureTicket);
     switch (action.operation) {
       case "click": element.click(); break;
       case "hover": element.dispatchEvent(new MouseEvent("mousemove", { bubbles: true })); break;
@@ -617,7 +630,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       }
       case "dragDrop": {
         const destination = resolveTarget(action.destination);
-        if (!destination) throw new Error("element_not_found");
+        if (!destination) throw new NativeFailure("locator_destination_not_found", failureTicket);
         const transfer = new DataTransfer();
         element.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
         destination.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
@@ -656,22 +669,43 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
     }
   };
 
+  const SECRET_INPUT_TYPES = Object.freeze(["text", "password", "email", "tel", "url", "number", "search"]);
+  const SECRET_AUTOCOMPLETE_VALUES = Object.freeze(["current-password", "new-password", "one-time-code", "username", "email", "off"]);
+  const secretTargetInputType = (element) => {
+    const inputType = String(element?.getAttribute?.("type") || "").toLowerCase();
+    return SECRET_INPUT_TYPES.includes(inputType) ? inputType : null;
+  };
+  const secretTargetAutocomplete = (element) => {
+    const autocomplete = String(element?.getAttribute?.("autocomplete") || "")
+      .toLowerCase().split(/\s+/).at(-1);
+    return SECRET_AUTOCOMPLETE_VALUES.includes(autocomplete) ? autocomplete : null;
+  };
+  const secretTargetImplicitRole = (element) => {
+    const tag = element?.tagName?.toLowerCase();
+    if (tag === "button") return "button";
+    if (tag === "a") return "link";
+    if (tag === "textarea") return "textbox";
+    if (tag === "select") return "combobox";
+    if (["h1", "h2", "h3", "h4", "h5", "h6"].includes(tag)) return "heading";
+    if (tag !== "input") return null;
+    const inputType = String(element?.getAttribute?.("type") || "text").toLowerCase();
+    if (inputType === "checkbox") return "checkbox";
+    if (inputType === "radio") return "radio";
+    if (["button", "submit", "reset"].includes(inputType)) return "button";
+    return "textbox";
+  };
+  const contentFreeSecretTarget = (element) => ({
+    originUrl: location.origin,
+    role: secretTargetImplicitRole(element),
+    name: null,
+    inputType: secretTargetInputType(element),
+    autocomplete: secretTargetAutocomplete(element),
+    formAction: null,
+    permission: null,
+  });
   const runtimeTarget = (element) => {
+    if (state.secretTainted) return contentFreeSecretTarget(element);
     const form = element?.closest?.("form");
-    if (state.secretTainted) {
-      const inputType = String(element?.getAttribute?.("type") || "").toLowerCase();
-      const autocomplete = String(element?.getAttribute?.("autocomplete") || "")
-        .toLowerCase().split(/\s+/).at(-1);
-      return {
-        originUrl: location.origin,
-        role: element ? implicitRole(element) : null,
-        name: null,
-        inputType: ["text", "password", "email", "tel", "url", "number", "search"].includes(inputType) ? inputType : null,
-        autocomplete: ["current-password", "new-password", "one-time-code", "username", "email", "off"].includes(autocomplete) ? autocomplete : null,
-        formAction: null,
-        permission: null,
-      };
-    }
     return {
       originUrl: location.origin,
       role: element ? roleOf(element) : null,
@@ -682,7 +716,7 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       permission: null,
     };
   };
-  const secretRiskSignature = (element) => JSON.stringify(runtimeTarget(element));
+  const secretRiskSignature = (element) => JSON.stringify(contentFreeSecretTarget(element));
   const clearContentTelemetry = () => {
     state.console.length = 0;
     state.network.length = 0;
@@ -699,6 +733,83 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
   };
   const requireContentTelemetry = () => {
     if (state.secretTainted) throw new Error("secret_tainted_document");
+  };
+
+  let repairHighlightSession = null;
+  const repairHighlightToken = (value) => {
+    if (typeof value !== "string" || value.length < 32 || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) return null;
+    return value;
+  };
+  const repairHighlightOverlay = (target) => {
+    const element = resolveTarget(target);
+    if (!(element instanceof Element) || !isVisible(element)) return null;
+    const bounds = clampedAnnotationBounds(element.getBoundingClientRect());
+    const root = document.createElement("div");
+    const box = document.createElement("div");
+    annotationOwnedNodes.add(root);
+    annotationOwnedNodes.add(box);
+    root.setAttribute("data-devmanager-repair-highlight", "true");
+    box.setAttribute("data-devmanager-repair-highlight-box", "true");
+    Object.assign(root.style, {
+      position: "fixed", inset: "0", zIndex: "2147483646", pointerEvents: "none",
+      userSelect: "none",
+    });
+    Object.assign(box.style, {
+      position: "fixed", left: `${bounds.x}px`, top: `${bounds.y}px`,
+      width: `${bounds.width}px`, height: `${bounds.height}px`,
+      border: "3px solid #8b5cf6", background: "rgba(139, 92, 246, 0.12)",
+      boxShadow: "0 0 0 2px rgba(255, 255, 255, 0.9)", boxSizing: "border-box",
+      borderRadius: "4px", pointerEvents: "none", userSelect: "none",
+    });
+    root.appendChild(box);
+    return root;
+  };
+  const repairHighlightInstall = (target, tokenValue, expectedPreviousValue) => {
+    const token = repairHighlightToken(tokenValue);
+    const expectedPrevious = expectedPreviousValue === null
+      ? null
+      : repairHighlightToken(expectedPreviousValue);
+    if (!token || (expectedPreviousValue !== null && !expectedPrevious)) {
+      return { token: typeof tokenValue === "string" ? tokenValue : "", installed: false };
+    }
+    const current = repairHighlightSession?.token || null;
+    if (current !== expectedPrevious) return { token, installed: false };
+    const root = repairHighlightOverlay(target);
+    if (!root) return { token, installed: false };
+    const previous = repairHighlightSession
+      ? Object.freeze({ token: repairHighlightSession.token, root: repairHighlightSession.root })
+      : null;
+    repairHighlightSession?.root.remove();
+    document.body.appendChild(root);
+    repairHighlightSession = Object.freeze({ token, root, previous });
+    return { token, installed: true };
+  };
+  const repairHighlightClear = (tokenValue, restoreTokenValue = null) => {
+    const token = repairHighlightToken(tokenValue);
+    if (!token) {
+      return { token: typeof tokenValue === "string" ? tokenValue : "", cleared: false, restored: false, predecessorConsumed: false, resultingToken: repairHighlightSession?.token || null };
+    }
+    if (repairHighlightSession?.token !== token) {
+      let predecessorConsumed = false;
+      if (repairHighlightSession?.previous?.token === token) {
+        const current = repairHighlightSession;
+        repairHighlightSession = Object.freeze({ token: current.token, root: current.root, previous: null });
+        predecessorConsumed = true;
+      }
+      return { token, cleared: false, restored: false, predecessorConsumed, resultingToken: repairHighlightSession?.token || null };
+    }
+    const restoreToken = restoreTokenValue === null ? null : repairHighlightToken(restoreTokenValue);
+    if (restoreTokenValue !== null && (!restoreToken || repairHighlightSession.previous?.token !== restoreToken)) {
+      return { token, cleared: false, restored: false, predecessorConsumed: false, resultingToken: repairHighlightSession.token };
+    }
+    const restored = restoreToken ? repairHighlightSession.previous : null;
+    repairHighlightSession.root.remove();
+    repairHighlightSession = null;
+    if (restored && restoreToken) {
+      document.body.appendChild(restored.root);
+      repairHighlightSession = Object.freeze({ token: restoreToken, root: restored.root, previous: null });
+    }
+    return { token, cleared: true, restored: Boolean(repairHighlightSession), predecessorConsumed: false, resultingToken: repairHighlightSession?.token || null };
   };
 
   const api = {
@@ -740,11 +851,11 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       if (typeof WeakRef !== "function" || !normalizedToken || normalizedToken.length > 256 || /[\u0000-\u001f\u007f]/.test(normalizedToken)) return null;
       const element = resolveTarget(target);
       if (!element) return null;
-      const inspectedTarget = runtimeTarget(element);
+      const inspectedTarget = contentFreeSecretTarget(element);
       pendingSecretTicket = Object.freeze({
         token: normalizedToken,
         element: new WeakRef(element),
-        signature: JSON.stringify(inspectedTarget),
+        signature: secretRiskSignature(element),
       });
       return inspectedTarget;
     },
@@ -753,20 +864,20 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       pendingSecretTicket = null;
       if (!ticket || ticket.token !== String(token ?? "")) {
         markSecretTainted();
-        throw new NativeError("element_not_found");
+        throw new NativeFailure("element_not_found", token);
       }
       const element = ticket.element.deref();
       if (!element) {
         markSecretTainted();
-        throw new NativeError("element_not_found");
+        throw new NativeFailure("element_not_found", token);
       }
       const connected = element.isConnected === true;
       const currentSignature = secretRiskSignature(element);
       markSecretTainted();
       if (!connected || ticket.signature !== currentSignature) {
-        throw new NativeError("target_changed");
+        throw new NativeFailure("target_changed", token);
       }
-      if (!registerMaskedSecretElement(element)) throw new NativeError("target_changed");
+      if (!registerMaskedSecretElement(element)) throw new NativeFailure("target_changed", token);
       element.style?.setProperty?.("-webkit-text-security", "disc", "important");
       element.focus();
       element.value = String(value ?? "");
@@ -774,14 +885,15 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       enforceSecretMask();
       return { completedActions: 1 };
     },
-    act: (actions) => {
+    act: (actions, failureTicket) => {
       let completedActions = 0;
       for (const action of actions) {
-        applyAction(action);
+        applyAction(action, failureTicket);
         completedActions += 1;
       }
       return { completedActions };
     },
+    nativeFailureCode,
     wait: async (condition, timeoutMs) => {
       const started = now();
       for (;;) {
@@ -822,6 +934,10 @@ pub const USER_INPUT_INITIALIZATION_SCRIPT: &str = r#"
       },
       cancel: () => annotationCleanup(false),
       active: () => Boolean(annotationSession),
+    }),
+    repairHighlight: Object.freeze({
+      install: repairHighlightInstall,
+      clear: repairHighlightClear,
     }),
     secretTainted: () => state.secretTainted,
   };
