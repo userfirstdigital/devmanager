@@ -46,7 +46,7 @@ use crate::browser::{
     MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use base64::Engine as _;
-use gpui::ForegroundExecutor;
+use gpui::{ForegroundExecutor, Task};
 use raw_window_handle::{
     HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle,
     WindowHandle as BorrowedWindowHandle,
@@ -218,6 +218,7 @@ impl BrowserNativeViewBuildQueue {
 
     fn cancel_all(&mut self) {
         self.pending.clear();
+        self.active_projects.clear();
         self.waiting.clear();
         self.failures.clear();
     }
@@ -934,11 +935,13 @@ pub struct BrowserWebViewHost {
     state: BrowserHostState,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
+    pending_native_view_teardown: Option<BrowserNativeViewTeardown>,
     native_executor: Option<ForegroundExecutor>,
     native_window_lifetime: BrowserNativeWindowLifetime,
     native_view_builds: BrowserNativeViewBuildQueue,
     native_view_build_specs: HashMap<u64, BrowserNativeViewBuildSpec>,
     native_view_build_cancellations: HashMap<u64, BrowserNativeViewBuildCancellation>,
+    native_view_build_tasks: HashMap<u64, Task<()>>,
     native_view_sender: Sender<BrowserNativeViewBuildCompletion>,
     native_view_receiver: Receiver<BrowserNativeViewBuildCompletion>,
     document_secret_states: HashMap<BrowserViewKey, Arc<BrowserDocumentSecretState>>,
@@ -962,6 +965,11 @@ pub struct BrowserWebViewHost {
     annotation_sender: Sender<BrowserAnnotationCompletion>,
     annotation_receiver: Receiver<BrowserAnnotationCompletion>,
     _main_thread_only: PhantomData<Rc<()>>,
+}
+
+struct BrowserNativeViewTeardown {
+    views: Vec<WebView>,
+    lease: super::BrowserNativeWindowTeardownLease,
 }
 
 impl BrowserWebViewHost {
@@ -1030,11 +1038,13 @@ impl BrowserWebViewHost {
             trusted_app_config_dir,
             projects: HashMap::new(),
             views: HashMap::new(),
+            pending_native_view_teardown: None,
             native_executor: None,
             native_window_lifetime: BrowserNativeWindowLifetime::default(),
             native_view_builds: BrowserNativeViewBuildQueue::default(),
             native_view_build_specs: HashMap::new(),
             native_view_build_cancellations: HashMap::new(),
+            native_view_build_tasks: HashMap::new(),
             native_view_sender,
             native_view_receiver,
             document_secret_states: HashMap::new(),
@@ -1081,13 +1091,27 @@ impl BrowserWebViewHost {
     }
 
     pub(crate) fn begin_native_window_teardown(&mut self) -> BrowserAppExitDisposition {
-        let disposition = self.native_window_lifetime.begin_teardown();
+        let _ = self.native_window_lifetime.begin_teardown();
         self.cancel_all_native_view_builds();
         self.recording_views.clear();
         self.recording_ingresses.clear();
         self.document_secret_states.clear();
-        self.views.clear();
-        disposition
+        if !self.views.is_empty() {
+            let retired_views = self.views.drain().map(|(_, view)| view).collect::<Vec<_>>();
+            if let Some(pending) = self.pending_native_view_teardown.as_mut() {
+                pending.views.extend(retired_views);
+            } else {
+                let lease = self
+                    .native_window_lifetime
+                    .retain_teardown_cleanup()
+                    .expect("native browser teardown cleanup lease");
+                self.pending_native_view_teardown = Some(BrowserNativeViewTeardown {
+                    views: retired_views,
+                    lease,
+                });
+            }
+        }
+        self.native_window_lifetime.exit_disposition()
     }
 
     pub(crate) fn resume_native_window_after_canceled_teardown(&mut self) -> bool {
@@ -1516,6 +1540,7 @@ impl BrowserWebViewHost {
     }
 
     pub fn pump_async_completions(&mut self, window: &gpui::Window) {
+        self.finish_native_view_teardown();
         self.pump_native_view_build_completions(window);
         let completions: Vec<_> = self.async_receiver.try_iter().collect();
         for completion in completions {
@@ -1526,6 +1551,15 @@ impl BrowserWebViewHost {
             self.complete_annotation_capture(completion);
         }
         self.pump_repair_highlight_cleanups(window);
+    }
+
+    fn finish_native_view_teardown(&mut self) {
+        let Some(pending) = self.pending_native_view_teardown.take() else {
+            return;
+        };
+        let BrowserNativeViewTeardown { views, lease } = pending;
+        drop(views);
+        drop(lease);
     }
 
     fn operation_target(
@@ -6106,12 +6140,12 @@ impl BrowserWebViewHost {
             .expect("checked browser project context");
         let job = BrowserNativeViewBuildJob { spec, project };
         let sender = self.native_view_sender.clone();
-        executor
-            .spawn(async move {
-                let completion = job.build();
-                let _ = sender.send(completion);
-            })
-            .detach();
+        let task = executor.spawn(async move {
+            let completion = job.build();
+            let _ = sender.send(completion);
+        });
+        let replaced = self.native_view_build_tasks.insert(build_id, task);
+        debug_assert!(replaced.is_none(), "native WebView build task id reused");
         Ok(())
     }
 
@@ -6129,6 +6163,7 @@ impl BrowserWebViewHost {
             result,
             parent_window,
         } = completion;
+        self.native_view_build_tasks.remove(&build_id);
         let project_id = key.workspace_key.project_id.clone();
         let replaced = self.projects.insert(project_id, project);
         debug_assert!(replaced.is_none(), "leased WebContext was restored twice");
@@ -6268,15 +6303,9 @@ impl BrowserWebViewHost {
         for cancellation in self.native_view_build_cancellations.values() {
             cancellation.cancel();
         }
-        let queued_build_ids = self
-            .native_view_build_specs
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+        self.native_view_build_tasks.clear();
         self.native_view_build_specs.clear();
-        for build_id in queued_build_ids {
-            self.native_view_build_cancellations.remove(&build_id);
-        }
+        self.native_view_build_cancellations.clear();
         self.native_view_builds.cancel_all();
     }
 
@@ -7521,6 +7550,7 @@ mod secret_document_state_tests {
         assert!(!completed.accepted);
         assert!(completed.next.is_none());
         assert!(queue.pending.is_empty());
+        assert!(queue.active_projects.is_empty());
         assert!(queue.waiting.is_empty());
         assert!(queue.failures.is_empty());
     }

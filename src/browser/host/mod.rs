@@ -127,6 +127,17 @@ impl BrowserNativeWindowLifetime {
         self.exit_disposition()
     }
 
+    pub(crate) fn retain_teardown_cleanup(&self) -> Option<BrowserNativeWindowTeardownLease> {
+        if self.state.phase.get() != BrowserNativeWindowPhase::Closing {
+            return None;
+        }
+        let lease_count = self.state.lease_count.get().checked_add(1)?;
+        self.state.lease_count.set(lease_count);
+        Some(BrowserNativeWindowTeardownLease {
+            state: Rc::clone(&self.state),
+        })
+    }
+
     pub(crate) fn resume_after_canceled_teardown(&self) -> bool {
         if self.state.phase.get() != BrowserNativeWindowPhase::Closing {
             return false;
@@ -180,6 +191,18 @@ impl Drop for BrowserNativeWindowBuildLease {
     fn drop(&mut self) {
         let leases = self.state.lease_count.get();
         debug_assert!(leases > 0, "native browser window lease underflow");
+        self.state.lease_count.set(leases.saturating_sub(1));
+    }
+}
+
+pub(crate) struct BrowserNativeWindowTeardownLease {
+    state: Rc<BrowserNativeWindowLifetimeState>,
+}
+
+impl Drop for BrowserNativeWindowTeardownLease {
+    fn drop(&mut self) {
+        let leases = self.state.lease_count.get();
+        debug_assert!(leases > 0, "native browser teardown lease underflow");
         self.state.lease_count.set(leases.saturating_sub(1));
     }
 }
@@ -295,6 +318,32 @@ mod native_window_lifetime_tests {
 
         drop(lease);
         assert!(lifetime.teardown_ready());
+    }
+
+    #[test]
+    fn deferred_webview_destruction_retains_the_window_until_cleanup_finishes() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+
+        assert_eq!(
+            lifetime.begin_teardown(),
+            BrowserAppExitDisposition::ExitNow
+        );
+        let cleanup = lifetime
+            .retain_teardown_cleanup()
+            .expect("teardown cleanup lease");
+
+        assert_eq!(
+            lifetime.exit_disposition(),
+            BrowserAppExitDisposition::Deferred
+        );
+        assert!(!lifetime.teardown_ready());
+
+        drop(cleanup);
+        assert!(lifetime.teardown_ready());
+        assert_eq!(
+            lifetime.exit_disposition(),
+            BrowserAppExitDisposition::ExitNow
+        );
     }
 }
 
