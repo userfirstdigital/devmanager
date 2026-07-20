@@ -164,11 +164,11 @@ pub fn run() {
                     let close_handler = shell.clone();
                     let closing_window_lifetime = window_lifetime;
                     window.on_window_should_close(cx, move |window, cx| {
-                        if closing_window_lifetime.window_close_must_be_deferred() {
-                            return false;
-                        }
-                        close_handler
-                            .update(cx, |shell, cx| shell.handle_window_should_close(window, cx))
+                        closing_window_lifetime.guard_window_close(|| {
+                            close_handler.update(cx, |shell, cx| {
+                                shell.handle_window_should_close(window, cx)
+                            })
+                        })
                     });
                     let _ = shell.update(cx, |shell, cx| {
                         shell.register_focus_observers(window, cx);
@@ -201,6 +201,54 @@ impl PendingAppTermination {
             Self::Quit
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownFailureDisposition {
+    IgnoreStale,
+    PreservePendingTermination,
+    ResumeInteractiveShutdown,
+}
+
+fn shutdown_completion_is_current(pending_op_id: Option<u64>, completion_op_id: u64) -> bool {
+    pending_op_id == Some(completion_op_id)
+}
+
+fn shutdown_failure_disposition(
+    pending_op_id: Option<u64>,
+    completion_op_id: u64,
+    pending_termination: Option<PendingAppTermination>,
+) -> ShutdownFailureDisposition {
+    if !shutdown_completion_is_current(pending_op_id, completion_op_id) {
+        ShutdownFailureDisposition::IgnoreStale
+    } else if pending_termination.is_some() {
+        ShutdownFailureDisposition::PreservePendingTermination
+    } else {
+        ShutdownFailureDisposition::ResumeInteractiveShutdown
+    }
+}
+
+fn retire_pending_shutdown_for_forced_termination(
+    pending_op_id: &mut Option<u64>,
+    pending_window_close: &mut bool,
+) {
+    *pending_op_id = None;
+    *pending_window_close = false;
+}
+
+fn promote_pending_app_termination_for_update(pending: &mut Option<PendingAppTermination>) {
+    if let Some(current) = *pending {
+        *pending = Some(current.coalesce(PendingAppTermination::ExitAfterUpdate));
+    }
+}
+
+fn take_ready_app_termination(
+    pending: &mut Option<PendingAppTermination>,
+    native_window_teardown_ready: bool,
+) -> Option<PendingAppTermination> {
+    native_window_teardown_ready
+        .then(|| pending.take())
+        .flatten()
 }
 
 fn execute_app_termination(termination: PendingAppTermination, cx: &App) {
@@ -2374,7 +2422,9 @@ impl NativeShell {
     }
 
     fn resume_browser_window_after_canceled_shutdown(&mut self) {
-        self.pending_app_termination = None;
+        if self.pending_app_termination.is_some() {
+            return;
+        }
         let _ = self
             .browser_host
             .resume_native_window_after_canceled_teardown();
@@ -2388,6 +2438,10 @@ impl NativeShell {
         self.pending_app_termination = Some(
             self.pending_app_termination
                 .map_or(requested, |current| current.coalesce(requested)),
+        );
+        retire_pending_shutdown_for_forced_termination(
+            &mut self.pending_shutdown_op_id,
+            &mut self.pending_window_close,
         );
         match self.begin_browser_window_teardown() {
             BrowserAppExitDisposition::ExitNow => {
@@ -2403,13 +2457,13 @@ impl NativeShell {
     }
 
     fn try_finish_app_termination(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(termination) = self.pending_app_termination else {
+        let native_window_teardown_ready = self.browser_host.native_window_teardown_ready();
+        let Some(termination) = take_ready_app_termination(
+            &mut self.pending_app_termination,
+            native_window_teardown_ready,
+        ) else {
             return false;
         };
-        if !self.browser_host.native_window_teardown_ready() {
-            return false;
-        }
-        self.pending_app_termination = None;
         execute_app_termination(termination, cx);
         true
     }
@@ -6084,7 +6138,10 @@ impl NativeShell {
                         }
                     }
                     ProcessOpKind::Shutdown => {
-                        if self.pending_shutdown_op_id == Some(completion.op_id) {
+                        if shutdown_completion_is_current(
+                            self.pending_shutdown_op_id,
+                            completion.op_id,
+                        ) {
                             self.pending_window_close = false;
                             self.pending_shutdown_op_id = None;
                             self.terminal_actionable_notice = None;
@@ -6139,13 +6196,30 @@ impl NativeShell {
                             Some(format!("Failed to run AI session action: {error}"));
                     }
                     ProcessOpKind::Shutdown => {
-                        let message = format!("Shutdown did not complete cleanly: {error}");
-                        self.terminal_notice = Some(message.clone());
-                        self.terminal_actionable_notice =
-                            Some(ActionableNotice::ForceQuit { message });
-                        self.pending_window_close = false;
-                        self.pending_shutdown_op_id = None;
-                        self.resume_browser_window_after_canceled_shutdown();
+                        match shutdown_failure_disposition(
+                            self.pending_shutdown_op_id,
+                            completion.op_id,
+                            self.pending_app_termination,
+                        ) {
+                            ShutdownFailureDisposition::IgnoreStale => continue,
+                            ShutdownFailureDisposition::PreservePendingTermination => {
+                                self.pending_window_close = false;
+                                self.pending_shutdown_op_id = None;
+                                self.terminal_actionable_notice = None;
+                                self.terminal_notice = Some(format!(
+                                    "Shutdown did not complete cleanly: {error}. Waiting for browser initialization to stop before exiting..."
+                                ));
+                            }
+                            ShutdownFailureDisposition::ResumeInteractiveShutdown => {
+                                let message = format!("Shutdown did not complete cleanly: {error}");
+                                self.terminal_notice = Some(message.clone());
+                                self.terminal_actionable_notice =
+                                    Some(ActionableNotice::ForceQuit { message });
+                                self.pending_window_close = false;
+                                self.pending_shutdown_op_id = None;
+                                self.resume_browser_window_after_canceled_shutdown();
+                            }
+                        }
                     }
                     _ => {
                         self.terminal_notice = Some(error);
@@ -7382,6 +7456,7 @@ impl NativeShell {
     fn install_update_action(&mut self, cx: &mut Context<Self>) {
         match self.updater.install_update() {
             Ok(version) => {
+                promote_pending_app_termination_for_update(&mut self.pending_app_termination);
                 let _ = self.begin_browser_window_teardown();
                 self.save_session_state();
                 match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
@@ -17284,6 +17359,89 @@ mod tests {
             PendingAppTermination::ExitAfterUpdate.coalesce(PendingAppTermination::Quit),
             PendingAppTermination::ExitAfterUpdate
         );
+    }
+
+    #[test]
+    fn pending_app_termination_is_retained_until_native_window_teardown_drains() {
+        let mut pending = Some(PendingAppTermination::ExitAfterUpdate);
+
+        assert_eq!(take_ready_app_termination(&mut pending, false), None);
+        assert_eq!(pending, Some(PendingAppTermination::ExitAfterUpdate));
+        assert_eq!(
+            take_ready_app_termination(&mut pending, true),
+            Some(PendingAppTermination::ExitAfterUpdate)
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn shutdown_failures_ignore_stale_ops_and_preserve_forced_exit_authority() {
+        assert_eq!(
+            shutdown_failure_disposition(
+                Some(42),
+                41,
+                Some(PendingAppTermination::ExitAfterUpdate),
+            ),
+            ShutdownFailureDisposition::IgnoreStale
+        );
+        assert_eq!(
+            shutdown_failure_disposition(None, 42, Some(PendingAppTermination::Quit)),
+            ShutdownFailureDisposition::IgnoreStale
+        );
+        assert_eq!(
+            shutdown_failure_disposition(
+                Some(42),
+                42,
+                Some(PendingAppTermination::ExitAfterUpdate),
+            ),
+            ShutdownFailureDisposition::PreservePendingTermination
+        );
+        assert_eq!(
+            shutdown_failure_disposition(Some(42), 42, Some(PendingAppTermination::Quit)),
+            ShutdownFailureDisposition::PreservePendingTermination
+        );
+        assert_eq!(
+            shutdown_failure_disposition(Some(42), 42, None),
+            ShutdownFailureDisposition::ResumeInteractiveShutdown
+        );
+    }
+
+    #[test]
+    fn forced_termination_retires_the_shutdown_op_before_late_success_or_failure() {
+        let mut pending_shutdown_op_id = Some(42);
+        let mut pending_window_close = true;
+
+        retire_pending_shutdown_for_forced_termination(
+            &mut pending_shutdown_op_id,
+            &mut pending_window_close,
+        );
+
+        assert_eq!(pending_shutdown_op_id, None);
+        assert!(!pending_window_close);
+        assert!(!shutdown_completion_is_current(pending_shutdown_op_id, 42));
+        assert_eq!(
+            shutdown_failure_disposition(
+                pending_shutdown_op_id,
+                42,
+                Some(PendingAppTermination::ExitAfterUpdate),
+            ),
+            ShutdownFailureDisposition::IgnoreStale
+        );
+    }
+
+    #[test]
+    fn successful_update_install_promotes_only_an_existing_pending_termination() {
+        let mut quit = Some(PendingAppTermination::Quit);
+        promote_pending_app_termination_for_update(&mut quit);
+        assert_eq!(quit, Some(PendingAppTermination::ExitAfterUpdate));
+
+        let mut update = Some(PendingAppTermination::ExitAfterUpdate);
+        promote_pending_app_termination_for_update(&mut update);
+        assert_eq!(update, Some(PendingAppTermination::ExitAfterUpdate));
+
+        let mut no_pending_termination = None;
+        promote_pending_app_termination_for_update(&mut no_pending_termination);
+        assert_eq!(no_pending_termination, None);
     }
 
     fn sample_ai_tab() -> SessionTab {

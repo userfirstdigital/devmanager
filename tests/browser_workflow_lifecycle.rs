@@ -1099,6 +1099,73 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
 }
 
 #[test]
+fn shutdown_failure_is_fenced_by_op_id_and_cannot_cancel_forced_termination() {
+    let app = include_str!("../src/app/mod.rs").replace("\r\n", "\n");
+    let completions = source_section(
+        &app,
+        "fn handle_process_op_completions(",
+        "fn pump_remote_host_requests(",
+    );
+    let error_branch = completions
+        .find("} else if let Err(error) = completion.result {")
+        .expect("process completion error branch");
+    let shutdown = source_section(
+        &completions[error_branch..],
+        "ProcessOpKind::Shutdown => {",
+        "_ => {",
+    );
+
+    assert_before(
+        shutdown,
+        "shutdown_failure_disposition(",
+        "ShutdownFailureDisposition::ResumeInteractiveShutdown",
+    );
+    assert!(shutdown.contains("ShutdownFailureDisposition::IgnoreStale => continue"));
+    let preserve = source_section(
+        shutdown,
+        "ShutdownFailureDisposition::PreservePendingTermination",
+        "ShutdownFailureDisposition::ResumeInteractiveShutdown",
+    );
+    assert!(!preserve.contains("resume_browser_window_after_canceled_shutdown"));
+    assert!(!preserve.contains("pending_app_termination = None"));
+
+    let success_branch = &completions[..error_branch];
+    let success_shutdown = success_branch
+        .rfind("ProcessOpKind::Shutdown => {")
+        .map(|start| &success_branch[start..])
+        .expect("shutdown success branch");
+    assert!(success_shutdown.contains("shutdown_completion_is_current("));
+
+    let termination = source_section(
+        &app,
+        "fn request_app_termination(",
+        "fn try_finish_app_termination(",
+    );
+    assert_before(
+        termination,
+        "retire_pending_shutdown_for_forced_termination",
+        "begin_browser_window_teardown",
+    );
+
+    let install_update = source_section(&app, "fn install_update_action(", "fn force_quit_action(");
+    assert_before(
+        install_update,
+        "promote_pending_app_termination_for_update",
+        "schedule_shutdown",
+    );
+    let resume = source_section(
+        &app,
+        "fn resume_browser_window_after_canceled_shutdown(",
+        "fn request_app_termination(",
+    );
+    assert_before(
+        resume,
+        "pending_app_termination.is_some()",
+        "resume_native_window_after_canceled_teardown",
+    );
+}
+
+#[test]
 fn browser_bridge_inbox_and_controllers_share_one_replay_coordinator() {
     let first = workspace("shared-project", "first");
     let second = workspace("shared-project", "second");

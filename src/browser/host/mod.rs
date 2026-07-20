@@ -66,6 +66,19 @@ impl Default for BrowserNativeWindowLifetime {
 }
 
 impl BrowserNativeWindowLifetime {
+    pub(crate) fn guard_window_close(&self, handler: impl FnOnce() -> bool) -> bool {
+        if self.state.phase.get() == BrowserNativeWindowPhase::Closing {
+            return false;
+        }
+        let had_window_lease = self.state.lease_count.get() != 0;
+        let handler_result = handler();
+        if had_window_lease || self.window_close_must_be_deferred() {
+            false
+        } else {
+            handler_result
+        }
+    }
+
     pub(crate) fn bind_window(&self, window_identity: isize) -> Option<u64> {
         if self.state.phase.get() == BrowserNativeWindowPhase::Closing {
             return None;
@@ -174,6 +187,7 @@ impl Drop for BrowserNativeWindowBuildLease {
 #[cfg(test)]
 mod native_window_lifetime_tests {
     use super::{BrowserAppExitDisposition, BrowserNativeWindowLifetime};
+    use std::cell::Cell;
 
     #[test]
     fn active_and_queued_window_leases_defer_exit_until_the_last_completion_releases() {
@@ -247,6 +261,40 @@ mod native_window_lifetime_tests {
         assert!(lifetime.resume_after_canceled_teardown());
         assert!(!lifetime.window_close_must_be_deferred());
         assert!(lifetime.bind_window(505).is_some());
+    }
+
+    #[test]
+    fn open_leased_close_enters_teardown_once_and_repeated_close_is_idempotent() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+        let generation = lifetime.bind_window(606).unwrap();
+        let lease = lifetime.acquire(606, generation).unwrap();
+        let handler_calls = Cell::new(0);
+
+        let first_result = lifetime.guard_window_close(|| {
+            handler_calls.set(handler_calls.get() + 1);
+            assert_eq!(
+                lifetime.begin_teardown(),
+                BrowserAppExitDisposition::Deferred
+            );
+            true
+        });
+        assert!(!first_result, "an accepted HWND close must remain deferred");
+        assert_eq!(handler_calls.get(), 1);
+
+        let repeated_result = lifetime.guard_window_close(|| {
+            handler_calls.set(handler_calls.get() + 1);
+            true
+        });
+        assert!(!repeated_result);
+        assert_eq!(
+            handler_calls.get(),
+            1,
+            "Closing must reject repeat close requests without duplicating lifecycle work"
+        );
+        assert!(!lifetime.teardown_ready());
+
+        drop(lease);
+        assert!(lifetime.teardown_ready());
     }
 }
 

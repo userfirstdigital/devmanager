@@ -457,14 +457,15 @@ fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_e
         .map(|offset| should_close_start + offset)
         .expect("close guard end");
     let should_close = &app[should_close_start..should_close_end];
-    let preflight = should_close
-        .find("window_close_must_be_deferred")
-        .expect("close preflight");
+    let guarded_close = should_close
+        .find("guard_window_close")
+        .expect("native lifetime close guard");
     let shell_update = should_close
         .find("shell.handle_window_should_close")
         .expect("shell close handler");
-    assert!(preflight < shell_update);
-    assert!(should_close[preflight..shell_update].contains("return false"));
+    assert!(guarded_close < shell_update);
+    assert!(should_close[guarded_close..shell_update].contains("||"));
+    assert!(!should_close.contains("if closing_window_lifetime.window_close_must_be_deferred()"));
 
     let closed_start = app
         .find("cx.on_window_closed")
