@@ -528,6 +528,7 @@ struct BrowserReplayPrivateRepairState {
     recipe_target: BrowserReplayRecipeLocatorTarget,
     tab_id: String,
     revision: BrowserRevision,
+    #[cfg(test)]
     resume_cursor: BrowserReplayRepairResumeCursor,
     snapshot: Option<BrowserResourceHandle>,
     screenshot: Option<BrowserResourceHandle>,
@@ -1049,6 +1050,7 @@ impl BrowserReplayCoordinator {
             ),
             tab_id,
             revision,
+            #[cfg(test)]
             resume_cursor,
             snapshot: None,
             screenshot: None,
