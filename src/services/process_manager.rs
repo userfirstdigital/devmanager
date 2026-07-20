@@ -202,6 +202,12 @@ enum ProcessManagerDetachedWorkerTestPhase {
 #[cfg(test)]
 type ProcessManagerDetachedWorkerTestHook =
     Arc<dyn Fn(ProcessManagerDetachedWorkerTestPhase) + Send + Sync>;
+#[cfg(test)]
+type ProcessManagerServerSessionSpawnerTestHook = Arc<
+    dyn Fn(&Arc<ProcessManagerInner>, &ServerLaunchSpec, SessionDimensions) -> Result<(), String>
+        + Send
+        + Sync,
+>;
 
 trait CodexFallbackTerminalOps: Send + Sync {
     fn terminate_and_reap(
@@ -260,6 +266,8 @@ pub(crate) struct ProcessManagerInner {
     auto_restart_worker_test_hook: RwLock<Option<ProcessManagerDetachedWorkerTestHook>>,
     #[cfg(test)]
     codex_fallback_worker_test_hook: RwLock<Option<ProcessManagerDetachedWorkerTestHook>>,
+    #[cfg(test)]
+    server_session_spawner_test_hook: RwLock<Option<ProcessManagerServerSessionSpawnerTestHook>>,
 }
 
 #[derive(Debug, Clone)]
@@ -589,6 +597,8 @@ impl ProcessManager {
             auto_restart_worker_test_hook: RwLock::new(None),
             #[cfg(test)]
             codex_fallback_worker_test_hook: RwLock::new(None),
+            #[cfg(test)]
+            server_session_spawner_test_hook: RwLock::new(None),
         });
         let claude_overlay_owner = Arc::new(ClaudeOverlayOwner {
             inner: Arc::downgrade(&inner),
@@ -5853,20 +5863,38 @@ pub(crate) fn execute_process_op_inner(
             if activate {
                 manager.set_active_session(launch.command_id.clone());
             }
-            let result =
-                spawn_server_session_with_inner(inner, &launch, dimensions).map_err(|error| {
-                    manager.update_session_state(&launch.command_id, |state| {
-                        state.status = SessionStatus::Failed;
-                        state.exit = Some(SessionExitState {
-                            code: None,
-                            signal: None,
-                            closed_by_user: false,
-                            summary: error.clone(),
-                        });
-                        state.mark_dirty();
+            let result = {
+                #[cfg(test)]
+                {
+                    let spawner = inner
+                        .server_session_spawner_test_hook
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(spawner) = spawner {
+                        spawner(inner, &launch, dimensions)
+                    } else {
+                        spawn_server_session_with_inner(inner, &launch, dimensions)
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    spawn_server_session_with_inner(inner, &launch, dimensions)
+                }
+            }
+            .map_err(|error| {
+                manager.update_session_state(&launch.command_id, |state| {
+                    state.status = SessionStatus::Failed;
+                    state.exit = Some(SessionExitState {
+                        code: None,
+                        signal: None,
+                        closed_by_user: false,
+                        summary: error.clone(),
                     });
-                    error
+                    state.mark_dirty();
                 });
+                error
+            });
             if result.is_ok() {
                 manager.update_session_state(&launch.command_id, |state| {
                     state.configure_server(launch.clone());
@@ -9350,8 +9378,20 @@ mod tests {
 
     #[test]
     fn detached_auto_restart_worker_lease_defers_final_shutdown() {
+        const FIXTURE_SPAWN_ERROR: &str = "fixture invalid auto-restart launch";
+
         let manager = ProcessManager::new();
-        let _launch = configure_auto_restart_race(&manager, "admitted-auto-restart");
+        let launch = configure_auto_restart_race(&manager, "admitted-auto-restart");
+        let spawn_hits = Arc::new(AtomicU64::new(0));
+        let observed_spawn_hits = spawn_hits.clone();
+        *manager
+            .inner
+            .server_session_spawner_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |_, _, _| {
+            observed_spawn_hits.fetch_add(1, Ordering::SeqCst);
+            Err(FIXTURE_SPAWN_ERROR.to_string())
+        }));
 
         let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
         let (release_acquired_tx, release_acquired_rx) = std::sync::mpsc::sync_channel(1);
@@ -9414,14 +9454,43 @@ mod tests {
         assert_eq!(effect_hits.load(Ordering::SeqCst), 1);
         assert_eq!(op_queue.successful_submissions_for_test(), 1);
 
-        release_effect_tx
-            .send(())
-            .expect("release auto-restart worker after effect observation");
         let deadline = Instant::now() + Duration::from_secs(10);
         while op_queue.completed_operations_for_test() != 1 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(op_queue.completed_operations_for_test(), 1);
+
+        let mut completions = Vec::new();
+        while completions.is_empty() && Instant::now() < deadline {
+            completions.extend(op_queue.drain_completions());
+            if completions.is_empty() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(completions.len(), 1);
+        let completion = completions.pop().expect("one auto-restart completion");
+        assert_eq!(completion.kind, ProcessOpKind::StartServer);
+        assert_eq!(completion.target_id, launch.command_id);
+        assert_eq!(
+            completion.context.session_id,
+            Some(launch.command_id.clone())
+        );
+        assert!(!completion.context.focus);
+        assert!(completion.remote_response.is_none());
+        let error = completion
+            .result
+            .expect_err("the deliberately invalid auto-restart launch must fail");
+        assert_eq!(error, FIXTURE_SPAWN_ERROR);
+        assert!(!error.contains("Process manager is shutting down"));
+        assert_eq!(op_queue.successful_submissions_for_test(), 1);
+        assert_eq!(op_queue.completed_operations_for_test(), 1);
+        assert_eq!(spawn_hits.load(Ordering::SeqCst), 1);
+        assert!(op_queue.drain_completions().is_empty());
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+
+        release_effect_tx
+            .send(())
+            .expect("release auto-restart worker after completion observation");
         while lifecycle_state_for_test(&lifecycle) != (0, true) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -9432,6 +9501,7 @@ mod tests {
         assert!(inner.upgrade().is_none());
         assert_eq!(op_queue.successful_submissions_for_test(), 1);
         assert_eq!(op_queue.completed_operations_for_test(), 1);
+        assert_eq!(spawn_hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
