@@ -2416,9 +2416,26 @@ impl NativeShell {
         }
     }
 
-    fn begin_browser_window_teardown(&mut self) -> BrowserAppExitDisposition {
+    fn begin_browser_window_teardown(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> BrowserAppExitDisposition {
         self.interrupt_all_browser_replays_before_shutdown();
-        self.browser_host.begin_native_window_teardown()
+        let disposition = self.browser_host.begin_native_window_teardown();
+        if disposition == BrowserAppExitDisposition::Deferred {
+            self.schedule_browser_native_teardown_cleanup(cx);
+        }
+        disposition
+    }
+
+    fn schedule_browser_native_teardown_cleanup(&mut self, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |shell, cx| {
+                shell.browser_host.finish_native_window_teardown_cleanup();
+                let _ = shell.try_finish_app_termination(cx);
+            });
+        });
     }
 
     fn resume_browser_window_after_canceled_shutdown(&mut self) {
@@ -2443,7 +2460,7 @@ impl NativeShell {
             &mut self.pending_shutdown_op_id,
             &mut self.pending_window_close,
         );
-        match self.begin_browser_window_teardown() {
+        match self.begin_browser_window_teardown(cx) {
             BrowserAppExitDisposition::ExitNow => {
                 let _ = self.try_finish_app_termination(cx);
             }
@@ -7131,7 +7148,7 @@ impl NativeShell {
             }
         }
 
-        let _ = self.begin_browser_window_teardown();
+        let _ = self.begin_browser_window_teardown(cx);
         self.save_session_state();
         match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
             Ok(op_id) => {
@@ -7457,7 +7474,7 @@ impl NativeShell {
         match self.updater.install_update() {
             Ok(version) => {
                 promote_pending_app_termination_for_update(&mut self.pending_app_termination);
-                let _ = self.begin_browser_window_teardown();
+                let _ = self.begin_browser_window_teardown(cx);
                 self.save_session_state();
                 match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
                     Ok(op_id) => {

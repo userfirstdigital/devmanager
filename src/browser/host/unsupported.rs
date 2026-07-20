@@ -137,6 +137,8 @@ impl BrowserWebViewHost {
         self.native_window_lifetime.begin_teardown()
     }
 
+    pub(crate) fn finish_native_window_teardown_cleanup(&mut self) {}
+
     pub(crate) fn resume_native_window_after_canceled_teardown(&mut self) -> bool {
         self.native_window_lifetime.resume_after_canceled_teardown()
     }

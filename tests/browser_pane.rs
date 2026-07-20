@@ -408,6 +408,7 @@ fn native_webview_construction_never_runs_under_the_gpui_app_borrow() {
 fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_exit() {
     let lifetime = include_str!("../src/browser/host/mod.rs");
     let host = include_str!("../src/browser/host/windows.rs");
+    let unsupported = include_str!("../src/browser/host/unsupported.rs");
     let app = include_str!("../src/app/mod.rs");
 
     assert!(lifetime.contains("struct BrowserNativeWindowLifetime"));
@@ -500,11 +501,22 @@ fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_e
     assert!(app.contains("fn request_app_termination("));
     assert!(app.contains("fn try_finish_app_termination("));
     assert!(app.contains("fn execute_app_termination("));
+    assert!(app.contains("fn schedule_browser_native_teardown_cleanup("));
     assert!(app.contains("resume_native_window_after_canceled_teardown"));
     assert!(app.contains("BrowserAppExitDisposition::Deferred"));
     assert!(app.contains("BrowserAppExitDisposition::ExitNow"));
     assert_eq!(app.matches("cx.quit()").count(), 1);
     assert_eq!(app.matches("std::process::exit(0)").count(), 1);
+
+    let app_teardown_start = app
+        .find("fn begin_browser_window_teardown(")
+        .expect("browser window teardown entrypoint");
+    let app_teardown_end = app[app_teardown_start..]
+        .find("fn schedule_browser_native_teardown_cleanup(")
+        .map(|offset| app_teardown_start + offset)
+        .expect("app-level native teardown cleanup scheduler");
+    assert!(app[app_teardown_start..app_teardown_end]
+        .contains("self.schedule_browser_native_teardown_cleanup(cx)"));
 
     let should_close_start = app
         .find("window.on_window_should_close")
@@ -534,6 +546,44 @@ fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_e
     let closed = &app[closed_start..closed_end];
     assert!(closed.contains("assert_drained_after_window_close"));
     assert!(closed.contains("teardown_ready"));
+
+    let deferred_cleanup_start = app
+        .find("fn schedule_browser_native_teardown_cleanup(")
+        .expect("app-level native teardown cleanup scheduler");
+    let deferred_cleanup_end = app[deferred_cleanup_start..]
+        .find("fn resume_browser_window_after_canceled_shutdown(")
+        .map(|offset| deferred_cleanup_start + offset)
+        .expect("app-level native teardown cleanup scheduler end");
+    let deferred_cleanup = &app[deferred_cleanup_start..deferred_cleanup_end];
+    assert!(deferred_cleanup.contains("cx.defer(move |cx|"));
+    let native_cleanup = deferred_cleanup
+        .find("finish_native_window_teardown_cleanup")
+        .expect("cleanup must not depend on a closing window task");
+    let termination = deferred_cleanup
+        .find("try_finish_app_termination")
+        .expect("cleanup should retry deferred app termination");
+    assert!(native_cleanup < termination);
+
+    let host_cleanup_start = host
+        .find("fn finish_native_window_teardown_cleanup(")
+        .expect("window-independent native teardown cleanup");
+    let host_cleanup_end = host[host_cleanup_start..]
+        .find("fn finish_native_view_build_task_teardown(")
+        .map(|offset| host_cleanup_start + offset)
+        .expect("window-independent native teardown cleanup end");
+    let host_cleanup = &host[host_cleanup_start..host_cleanup_end];
+    let task_drop = host_cleanup
+        .find("self.finish_native_view_build_task_teardown()")
+        .expect("deferred native build tasks must be canceled");
+    let view_drop = host_cleanup
+        .find("self.finish_native_view_teardown()")
+        .expect("deferred native views must be destroyed on the GPUI thread");
+    let completion_drop = host_cleanup
+        .find("self.drop_native_view_build_completions()")
+        .expect("completed builds must release their parent-window leases");
+    assert!(task_drop < view_drop);
+    assert!(view_drop < completion_drop);
+    assert!(unsupported.contains("fn finish_native_window_teardown_cleanup("));
 
     let pump_start = app.find("fn pump_browser_events(").expect("browser pump");
     let pump_end = app[pump_start..]

@@ -1556,6 +1556,18 @@ impl BrowserWebViewHost {
         self.pump_repair_highlight_cleanups(window);
     }
 
+    pub(crate) fn finish_native_window_teardown_cleanup(&mut self) {
+        self.finish_native_view_build_task_teardown();
+        self.finish_native_view_teardown();
+        self.drop_native_view_build_completions();
+    }
+
+    fn drop_native_view_build_completions(&mut self) {
+        for completion in self.native_view_receiver.try_iter() {
+            drop(completion);
+        }
+    }
+
     fn finish_native_view_build_task_teardown(&mut self) {
         drop(std::mem::take(
             &mut self.pending_native_view_build_task_teardown,
