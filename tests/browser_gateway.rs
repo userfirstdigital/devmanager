@@ -110,6 +110,23 @@ fn raw_mcp_request_with_headers(
     response
 }
 
+fn raw_chunked_mcp_request(port: u16, host: &str, authorization: &str, body: &[u8]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect gateway");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let headers = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).expect("write headers");
+    let _ = stream.write_all(body);
+    let _ = stream.write_all(b"\r\n0\r\n\r\n");
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response
+}
+
 fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
     response.lines().find_map(|line| {
         let (header, value) = line.split_once(':')?;
@@ -993,6 +1010,41 @@ fn auth_and_host_are_rejected_before_rmcp_dispatch() {
         initialize_body(),
     );
     assert_eq!(status_code(&wrong_path), 404, "{wrong_path}");
+}
+
+#[test]
+fn authenticated_gateway_rejects_declared_and_chunked_oversized_bodies_without_losing_session_use()
+{
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+    let (bridge, _inbox) = browser_command_channel(8);
+    let gateway = BrowserGatewayHandle::start(bridge).expect("start gateway");
+    let registration = gateway
+        .registrar()
+        .register(
+            "bounded-body-process",
+            workspace("bounded-body-project", "bounded-body-conversation"),
+            BrowserWorkspaceSnapshot::default(),
+        )
+        .expect("register bounded body fixture");
+    let host = format!("127.0.0.1:{}", gateway.port());
+    let bearer = format!("Bearer {}", registration.access().bearer_token_for_launch());
+    let oversized = "x".repeat(MAX_REQUEST_BYTES + 1);
+
+    let declared = raw_mcp_request(gateway.port(), &host, Some(&bearer), "/mcp", &oversized);
+    assert_eq!(status_code(&declared), 413, "{declared}");
+
+    let chunked = raw_chunked_mcp_request(gateway.port(), &host, &bearer, oversized.as_bytes());
+    assert_eq!(status_code(&chunked), 413, "{chunked}");
+
+    let initialized = raw_mcp_request(
+        gateway.port(),
+        &host,
+        Some(&bearer),
+        "/mcp",
+        initialize_body(),
+    );
+    assert_eq!(status_code(&initialized), 200, "{initialized}");
 }
 
 #[test]

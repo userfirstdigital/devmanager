@@ -5,17 +5,19 @@ use super::{
     BrowserCommandBridge, BrowserProviderAccess, BrowserRegistrationLease, BrowserResourceLimits,
     BrowserResourceStore, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{header, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::Router;
 use base64::Engine as _;
+use http_body_util::LengthLimitError;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::fmt;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use std::time::{Duration, Instant};
 use tower::Service;
 
 const GATEWAY_THREAD_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_MCP_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 type RegistrationService = StreamableHttpService<BrowserMcpServer, LocalSessionManager>;
 
@@ -523,6 +526,14 @@ async fn dispatch_registration(
     if !lease.is_current(ticket) {
         return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    let request = bounded_mcp_request(request).await;
+    if !lease.is_current(ticket) {
+        return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let request = match request {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let response = match service.call(request).await {
         Ok(response) => response.map(Body::new),
         Err(never) => match never {},
@@ -531,6 +542,23 @@ async fn dispatch_registration(
         return plain_response(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     response
+}
+
+async fn bounded_mcp_request(request: Request<Body>) -> Result<Request<Body>, Response<Body>> {
+    let (parts, body) = request.into_parts();
+    let bytes = to_bytes(body, MAX_MCP_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|error| {
+            if error
+                .source()
+                .is_some_and(|source| source.is::<LengthLimitError>())
+            {
+                plain_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+            } else {
+                plain_response(StatusCode::BAD_REQUEST, "invalid request body")
+            }
+        })?;
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 fn validate_host(request: &Request<Body>, port: u16) -> Result<(), Response<Body>> {
