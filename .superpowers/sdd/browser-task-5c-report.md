@@ -167,22 +167,25 @@ responses so they cannot advance the retired instance.
   tests and every integration and example target green.
 - Final independent review of `de332e5..db8f08e`: **ready**, with 0 Critical,
   0 Important, and 0 Minor findings. `git diff --check de332e5..db8f08e` passed.
-- Browser-head `cargo fmt --all -- --check`: **passed**. The subsequent `0.4.0`
-  version-only release bump was verified with
-  `cargo check --locked --all-targets -j1`: **passed in 103.5 seconds with no
-  warnings**.
-- `cargo test --locked --all-targets -j1 -- --test-threads=1` at `0.4.0`:
-  **exit 0 in 1,078.2 seconds**, with 788/788 library tests and every integration,
-  binary, and example target green.
-- `cargo build --release --locked -j1`: **exit 0 in 369.4 seconds**. The `0.4.0`
+- Browser-head `cargo fmt --all -- --check`: **passed**. After the `0.4.0` version
+  bump and Codex hooks/Pwsh integration were combined on local `master` at
+  `78d916b`, the actual master worktree passed `cargo fmt --all -- --check` and
+  `cargo check --locked --all-targets -j1` afresh.
+- `cargo test --locked --all-targets -j1 -- --test-threads=1` on merged `master`:
+  **exit 0 in 1,028.6 seconds**, with 804 library tests passing, the intentional
+  real-Codex-binary test ignored, and every integration, binary, and example target
+  green.
+- `cargo build --release --locked -j1`: **exit 0 in 329.2 seconds**. The `0.4.0`
   release executable reports `FileVersion` and `ProductVersion` `0.4.0`, is
-  43,837,952 bytes, and has SHA-256
-  `AE961828CE319344FD73B27FBB1675CF0F7473997BEACF8D3BFA371B88CA499D`.
-- `cargo packager --release --formats nsis,wix`: **exit 0 in 37.4 seconds**. The
-  `devmanager_0.4.0_x64_en-US.msi` is 17,821,696 bytes with SHA-256
-  `01E0D070BC0534E97A94A8FBDB78EE5535368BC6226E637A3065FB3205A7595B`; the
-  `devmanager_0.4.0_x64-setup.exe` is 13,645,030 bytes with SHA-256
-  `46F89929D3176605551DB2A13F65CE142D1142717B5615B4A842735B6939FAFA`.
+  43,513,344 bytes, and has SHA-256
+  `74D119907D189B8A62907BB8A53A2364CA676B6DEF5C59CC5A697D7DD83065B8`.
+- `cargo packager --release --formats nsis,wix`: **exit 0 in 43.4 seconds**. The
+  NSIS installer reports `FileVersion` and `ProductVersion` `0.4.0`; the MSI
+  database reports `ProductVersion` `0.4.0`. The
+  `devmanager_0.4.0_x64_en-US.msi` is 17,702,912 bytes with SHA-256
+  `BE179F2A978EDFDE4B2DC4B5914A0BE4B560517192411A002882F435CB3D4EE2`; the
+  `devmanager_0.4.0_x64-setup.exe` is 13,581,809 bytes with SHA-256
+  `CC0449D89D9672638354796C221FA7F7F30766FD232317BA71FB452BBC1E20EA`.
 - The exact formerly stuck Quit-again/Quit-anyway browser-initialization path was
   exercised with temporary instrumentation and the release candidate exited in
   32 ms after its browser lease drained. A subsequent clean uninstrumented candidate

@@ -303,23 +303,26 @@ the source-diff check were green; and the fresh locked all-target test exited 0 
 green.
 
 At browser implementation head `db8f08e`, `cargo fmt --all -- --check` passed and
-the final browser-specific review was clean. The subsequent `0.4.0` release-version
-bump was verified afresh: `cargo check --locked --all-targets -j1` passed in 103.5
-seconds without warnings, and
-`cargo test --locked --all-targets -j1 -- --test-threads=1` exited 0 in 1,078.2
-seconds with 788/788 library tests plus every integration, binary, and example target
-green. `cargo build --release --locked -j1` exited 0 in 369.4 seconds, and the
-resulting Windows executable reports both `FileVersion` and `ProductVersion` as
-`0.4.0`.
+the final browser-specific review was clean. After the `0.4.0` release-version bump
+and the Codex hooks/Pwsh integration were combined on local `master` at `78d916b`,
+the actual master worktree was verified afresh: `cargo fmt --all -- --check` and
+`cargo check --locked --all-targets -j1` passed, and
+`cargo test --locked --all-targets -j1 -- --test-threads=1` exited 0 in 1,028.6
+seconds with 804 library tests passing, the intentional real-Codex-binary test
+ignored, and every integration, binary, and example target green.
+`cargo build --release --locked -j1` exited 0 in 329.2 seconds. The resulting
+Windows executable reports both `FileVersion` and `ProductVersion` as `0.4.0`.
 
-`cargo packager --release --formats nsis,wix` exited 0 in 37.4 seconds and produced:
+`cargo packager --release --formats nsis,wix` exited 0 in 43.4 seconds. The NSIS
+installer reports `FileVersion` and `ProductVersion` `0.4.0`, and the MSI database
+reports `ProductVersion` `0.4.0`. The merged-master artifacts are:
 
-- `target/release/devmanager.exe` — 43,837,952 bytes, SHA-256
-  `AE961828CE319344FD73B27FBB1675CF0F7473997BEACF8D3BFA371B88CA499D`.
-- `dist/packager/devmanager_0.4.0_x64_en-US.msi` — 17,821,696 bytes, SHA-256
-  `01E0D070BC0534E97A94A8FBDB78EE5535368BC6226E637A3065FB3205A7595B`.
-- `dist/packager/devmanager_0.4.0_x64-setup.exe` — 13,645,030 bytes, SHA-256
-  `46F89929D3176605551DB2A13F65CE142D1142717B5615B4A842735B6939FAFA`.
+- `target/release/devmanager.exe` — 43,513,344 bytes, SHA-256
+  `74D119907D189B8A62907BB8A53A2364CA676B6DEF5C59CC5A697D7DD83065B8`.
+- `dist/packager/devmanager_0.4.0_x64_en-US.msi` — 17,702,912 bytes, SHA-256
+  `BE179F2A978EDFDE4B2DC4B5914A0BE4B560517192411A002882F435CB3D4EE2`.
+- `dist/packager/devmanager_0.4.0_x64-setup.exe` — 13,581,809 bytes, SHA-256
+  `CC0449D89D9672638354796C221FA7F7F30766FD232317BA71FB452BBC1E20EA`.
 
 The exact formerly stuck Quit-again/Quit-anyway initialization path was exercised
 with temporary instrumentation and the candidate exited in 32 ms after the browser
