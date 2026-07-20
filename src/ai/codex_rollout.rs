@@ -61,7 +61,11 @@ impl CodexRolloutReducer {
     }
 
     /// One JSONL line (no trailing newline). Malformed/unknown lines yield no drafts.
-    pub fn observe_line(&mut self, line: &str, observed_at_epoch_ms: u64) -> Vec<SemanticEventDraft> {
+    pub fn observe_line(
+        &mut self,
+        line: &str,
+        observed_at_epoch_ms: u64,
+    ) -> Vec<SemanticEventDraft> {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
         };
@@ -281,10 +285,7 @@ impl CodexRolloutTailer {
                 tail_rollout_file(&path, stable_session_key, &on_event, &thread_shutdown);
             })
             .ok();
-        Self {
-            shutdown,
-            thread,
-        }
+        Self { shutdown, thread }
     }
 
     pub fn stop(mut self) {
@@ -449,8 +450,11 @@ mod tests {
         let started = r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#;
         let complete = r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#;
         let aborted = r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t1"}}"#;
-        for (line, expected) in [(started, "working"), (complete, "idle"), (aborted, "interrupted")]
-        {
+        for (line, expected) in [
+            (started, "working"),
+            (complete, "idle"),
+            (aborted, "interrupted"),
+        ] {
             let drafts = reducer.observe_line(line, 1);
             assert!(matches!(
                 &drafts[0].kind,
@@ -511,7 +515,9 @@ mod tests {
     fn malformed_and_unknown_lines_yield_nothing() {
         let mut reducer = test_reducer();
         assert!(reducer.observe_line("not json", 1).is_empty());
-        assert!(reducer.observe_line("{\"type\":\"session_meta\"}", 1).is_empty());
+        assert!(reducer
+            .observe_line("{\"type\":\"session_meta\"}", 1)
+            .is_empty());
         assert!(reducer
             .observe_line(r#"{"type":"world_state","payload":{"full":true}}"#, 1)
             .is_empty());
@@ -523,11 +529,17 @@ mod tests {
         let path = dir.path().join("rollout.jsonl");
         std::fs::write(&path, "").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let tailer =
-            CodexRolloutTailer::start(path.clone(), StableSessionKey::from_tab("t"), move |draft| {
+        let tailer = CodexRolloutTailer::start(
+            path.clone(),
+            StableSessionKey::from_tab("t"),
+            move |draft| {
                 let _ = tx.send(draft);
-            });
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            },
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         use std::io::Write as _;
         writeln!(
             file,
@@ -538,7 +550,10 @@ mod tests {
         let draft = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("tailer should emit for the appended line");
-        assert!(matches!(draft.kind, SemanticEventKind::AssistantMessage { .. }));
+        assert!(matches!(
+            draft.kind,
+            SemanticEventKind::AssistantMessage { .. }
+        ));
         tailer.stop();
     }
 
@@ -548,11 +563,17 @@ mod tests {
         let path = dir.path().join("rollout.jsonl");
         std::fs::write(&path, "").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let tailer =
-            CodexRolloutTailer::start(path.clone(), StableSessionKey::from_tab("t"), move |draft| {
+        let tailer = CodexRolloutTailer::start(
+            path.clone(),
+            StableSessionKey::from_tab("t"),
+            move |draft| {
                 let _ = tx.send(draft);
-            });
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            },
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         use std::io::Write as _;
         write!(
             file,
@@ -580,10 +601,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("late.jsonl");
         let (tx, rx) = std::sync::mpsc::channel();
-        let tailer =
-            CodexRolloutTailer::start(path.clone(), StableSessionKey::from_tab("t"), move |draft| {
+        let tailer = CodexRolloutTailer::start(
+            path.clone(),
+            StableSessionKey::from_tab("t"),
+            move |draft| {
                 let _ = tx.send(draft);
-            });
+            },
+        );
         std::thread::sleep(std::time::Duration::from_millis(300));
         std::fs::write(
             &path,
@@ -593,7 +617,10 @@ mod tests {
         let draft = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("file created after start should be tailed");
-        assert!(matches!(draft.kind, SemanticEventKind::AssistantMessage { .. }));
+        assert!(matches!(
+            draft.kind,
+            SemanticEventKind::AssistantMessage { .. }
+        ));
         tailer.stop();
     }
 
@@ -602,8 +629,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         std::fs::write(&path, "").unwrap();
-        let tailer =
-            CodexRolloutTailer::start(path, StableSessionKey::from_tab("t"), |_draft| {});
+        let tailer = CodexRolloutTailer::start(path, StableSessionKey::from_tab("t"), |_draft| {});
         tailer.stop();
     }
 

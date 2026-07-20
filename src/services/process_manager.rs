@@ -1508,7 +1508,9 @@ impl ProcessManager {
                     &browser_config,
                 )
                 .inspect_err(|_| {
-                    self.inner.codex_hook_registry.unregister(&registration.nonce);
+                    self.inner
+                        .codex_hook_registry
+                        .unregister(&registration.nonce);
                 })
                 .map(|startup_command| (registration, startup_command))
             });
@@ -1628,7 +1630,9 @@ impl ProcessManager {
         }) = removed
         {
             drop(tailer);
-            self.inner.codex_hook_registry.unregister(&registration.nonce);
+            self.inner
+                .codex_hook_registry
+                .unregister(&registration.nonce);
         }
         if let Some(identity) = removed_identity {
             emit_remote_session_event(
@@ -4989,15 +4993,11 @@ fn handle_codex_session_started(
         let tail_inner = Arc::downgrade(inner);
         let tail_session_id = session_id.to_string();
         let tail_identity = identity.clone();
-        CodexRolloutTailer::start(
-            path,
-            identity.stable_session_key.clone(),
-            move |draft| {
-                if let Some(inner) = tail_inner.upgrade() {
-                    emit_codex_semantic_if_current(&inner, &tail_session_id, &tail_identity, draft);
-                }
-            },
-        )
+        CodexRolloutTailer::start(path, identity.stable_session_key.clone(), move |draft| {
+            if let Some(inner) = tail_inner.upgrade() {
+                emit_codex_semantic_if_current(&inner, &tail_session_id, &tail_identity, draft);
+            }
+        })
     });
     let (replaced_tailer, newly_activated) = {
         let mut registry = inner
@@ -6734,8 +6734,10 @@ mod tests {
         assert!(launch.startup_command.contains(
             "mcp_servers.devmanager_browser.bearer_token_env_var=\"DEVMANAGER_BROWSER_TOKEN\""
         ));
-        assert!(launch.startup_command.contains("codex --full-auto")
-            || launch.startup_command.contains("'codex' '--full-auto'"));
+        assert!(
+            launch.startup_command.contains("codex --full-auto")
+                || launch.startup_command.contains("'codex' '--full-auto'")
+        );
         assert!(!launch.startup_command.contains("--remote"));
         assert!(launch.startup_command.contains("codex-hook-relay"));
         assert!(launch

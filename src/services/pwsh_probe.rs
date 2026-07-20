@@ -25,7 +25,9 @@ pub fn find_pwsh(path_var: Option<&OsStr>, program_files: Option<&Path>) -> Opti
 pub fn pwsh_program() -> Option<PathBuf> {
     find_pwsh(
         std::env::var_os("PATH").as_deref(),
-        std::env::var_os("ProgramFiles").map(PathBuf::from).as_deref(),
+        std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .as_deref(),
     )
 }
 

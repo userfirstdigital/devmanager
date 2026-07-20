@@ -134,16 +134,12 @@ impl CodexHookReducer {
                     session_binding: None,
                 }
             }
-            "PreToolUse" => self.tool_reduction(
-                payload,
-                occurred_at_epoch_ms,
-                SemanticToolState::Running,
-            ),
-            "PostToolUse" => self.tool_reduction(
-                payload,
-                occurred_at_epoch_ms,
-                SemanticToolState::Completed,
-            ),
+            "PreToolUse" => {
+                self.tool_reduction(payload, occurred_at_epoch_ms, SemanticToolState::Running)
+            }
+            "PostToolUse" => {
+                self.tool_reduction(payload, occurred_at_epoch_ms, SemanticToolState::Completed)
+            }
             "PermissionRequest" => {
                 let tool_name = string_field(payload, "tool_name").unwrap_or("a tool");
                 let tool_use_id = string_field(payload, "tool_use_id")
@@ -192,8 +188,7 @@ impl CodexHookReducer {
         occurred_at_epoch_ms: u64,
         requested: SemanticToolState,
     ) -> CodexHookReduction {
-        let Some(tool_use_id) = string_field(payload, "tool_use_id").map(bounded_identifier)
-        else {
+        let Some(tool_use_id) = string_field(payload, "tool_use_id").map(bounded_identifier) else {
             return CodexHookReduction::default();
         };
         let tool_name = string_field(payload, "tool_name").unwrap_or("Tool");
@@ -250,8 +245,7 @@ const MAX_CODEX_REGISTRATIONS: usize = 128;
 
 fn random_codex_nonce() -> Result<String, String> {
     let mut bytes = [0_u8; CODEX_NONCE_BYTES];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| format!("generate Codex hook nonce: {error}"))?;
+    getrandom::fill(&mut bytes).map_err(|error| format!("generate Codex hook nonce: {error}"))?;
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;
@@ -454,11 +448,7 @@ impl CodexHookRegistry {
                 session.reducer.apply_json(&payload, occurred_at_epoch_ms),
             )
         };
-        let handler = self
-            .event_handler
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let handler = self.event_handler.read().ok().and_then(|slot| slot.clone());
         if let Some(handler) = handler {
             if let Some(binding) = reduction.session_binding {
                 handler(
@@ -493,10 +483,7 @@ impl CodexHookRelayListener {
         let address = listener
             .local_addr()
             .map_err(|error| format!("read Codex hook relay address: {error}"))?;
-        let endpoint = format!(
-            "http://127.0.0.1:{}{CODEX_HOOK_RELAY_PATH}",
-            address.port()
-        );
+        let endpoint = format!("http://127.0.0.1:{}{CODEX_HOOK_RELAY_PATH}", address.port());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -746,7 +733,10 @@ mod reducer_tests {
         let out = reducer.apply_json(&payload, 1);
         let binding = out.session_binding.unwrap();
         assert_eq!(binding.session_id, "019f-abc");
-        assert!(binding.transcript_path.unwrap().ends_with("rollout-x.jsonl"));
+        assert!(binding
+            .transcript_path
+            .unwrap()
+            .ends_with("rollout-x.jsonl"));
         assert!(matches!(
             out.drafts[0].kind,
             SemanticEventKind::Status { ref state, .. } if state == "ready"
@@ -954,7 +944,12 @@ mod registry_tests {
         );
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(
-            registry.ingest(loopback_peer(), &second.nonce, &session_start_body("new"), 2),
+            registry.ingest(
+                loopback_peer(),
+                &second.nonce,
+                &session_start_body("new"),
+                2
+            ),
             CodexRelayIngestStatus::Accepted
         );
         let published = events.lock().unwrap();
@@ -993,7 +988,12 @@ mod registry_tests {
         let registration = registry.register(StableSessionKey::from_tab("t1")).unwrap();
         let remote_peer: std::net::SocketAddr = "10.0.0.9:5555".parse().unwrap();
         assert_eq!(
-            registry.ingest(remote_peer, &registration.nonce, &session_start_body("s"), 1),
+            registry.ingest(
+                remote_peer,
+                &registration.nonce,
+                &session_start_body("s"),
+                1
+            ),
             CodexRelayIngestStatus::Rejected
         );
     }
@@ -1037,8 +1037,10 @@ mod real_codex_tests {
     #[test]
     #[ignore = "invokes the real npx/codex binary"]
     fn real_codex_advertises_hook_capabilities() {
-        codex_supports_hooks("npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox")
-            .expect("current Codex must advertise --dangerously-bypass-hook-trust");
+        codex_supports_hooks(
+            "npx -y @openai/codex@latest --dangerously-bypass-approvals-and-sandbox",
+        )
+        .expect("current Codex must advertise --dangerously-bypass-hook-trust");
     }
 }
 
