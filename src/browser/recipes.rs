@@ -9,13 +9,28 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 pub const BROWSER_RECIPE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_BROWSER_RECIPE_WAIT_MS: u64 = 300_000;
+pub(crate) const MAX_BROWSER_RECIPE_FILE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BROWSER_RECIPE_DIRECTORY_ENTRIES: usize = 1_024;
+pub(crate) const MAX_BROWSER_RECIPES: usize = 256;
+pub(crate) const MAX_BROWSER_RECIPE_INPUTS: usize = 64;
+pub(crate) const MAX_BROWSER_RECIPE_STEPS: usize = 256;
+pub(crate) const MAX_BROWSER_RECIPE_ASSERTIONS_PER_STEP: usize = 16;
+pub(crate) const MAX_BROWSER_RECIPE_ASSERTIONS: usize = 256;
+pub(crate) const MAX_BROWSER_RECIPE_SELECT_VALUES: usize = 64;
+pub(crate) const MAX_BROWSER_RECIPE_LOCATOR_FALLBACKS: usize = 16;
+pub(crate) const MAX_BROWSER_RECIPE_LOCATOR_BYTES: usize = 2_048;
+const MAX_BROWSER_RECIPE_NAME_BYTES: usize = 256;
+const MAX_BROWSER_RECIPE_DESCRIPTION_BYTES: usize = 4_096;
+const MAX_BROWSER_RECIPE_INPUT_NAME_BYTES: usize = 128;
+const MAX_BROWSER_RECIPE_TEXT_BYTES: usize = 65_536;
+const MAX_BROWSER_RECIPE_URL_BYTES: usize = 8_192;
 const RECIPE_TEMP_PREFIX: &str = ".devmanager-browser-recipe.";
 const MAX_RECIPE_TEMP_ENTRIES_TO_SCAN: usize = 1_024;
 const MAX_RECIPE_TEMPS_TO_SCAVENGE: usize = 64;
@@ -240,12 +255,22 @@ impl BrowserRecipeV1 {
         if !is_safe_recipe_id(&self.id) {
             return Err(invalid_recipe("recipe id is not a safe slug"));
         }
-        require_nonblank(&self.name, "recipe name")?;
+        require_bounded_nonblank(&self.name, MAX_BROWSER_RECIPE_NAME_BYTES, "recipe name")?;
+        require_max_bytes(
+            &self.description,
+            MAX_BROWSER_RECIPE_DESCRIPTION_BYTES,
+            "recipe description",
+        )?;
         reject_obvious_secret(&self.name, "recipe name")?;
         reject_obvious_secret(&self.description, "recipe description")?;
         validate_safe_url(&self.start_url, "recipe start URL")?;
         self.viewport.validate()?;
 
+        if self.inputs.len() > MAX_BROWSER_RECIPE_INPUTS {
+            return Err(invalid_recipe(format!(
+                "recipe supports at most {MAX_BROWSER_RECIPE_INPUTS} inputs"
+            )));
+        }
         let mut input_names = HashSet::new();
         let mut inputs = HashMap::new();
         for input in &self.inputs {
@@ -258,6 +283,19 @@ impl BrowserRecipeV1 {
 
         if self.steps.is_empty() {
             return Err(invalid_recipe("recipe requires at least one step"));
+        }
+        if self.steps.len() > MAX_BROWSER_RECIPE_STEPS {
+            return Err(invalid_recipe(format!(
+                "recipe supports at most {MAX_BROWSER_RECIPE_STEPS} steps"
+            )));
+        }
+        let assertion_count = self.steps.iter().try_fold(0_usize, |total, step| {
+            total.checked_add(step.assertions.len())
+        });
+        if assertion_count.is_none_or(|count| count > MAX_BROWSER_RECIPE_ASSERTIONS) {
+            return Err(invalid_recipe(format!(
+                "recipe supports at most {MAX_BROWSER_RECIPE_ASSERTIONS} total assertions"
+            )));
         }
         let mut step_ids = HashSet::new();
         for step in &self.steps {
@@ -384,7 +422,11 @@ impl<'de> Deserialize<'de> for BrowserRecipeInput {
 
 impl BrowserRecipeInput {
     fn validate(&self) -> Result<(), BrowserError> {
-        require_nonblank(&self.name, "recipe input name")?;
+        require_bounded_nonblank(
+            &self.name,
+            MAX_BROWSER_RECIPE_INPUT_NAME_BYTES,
+            "recipe input name",
+        )?;
         if self.name.trim() != self.name {
             return Err(invalid_recipe(
                 "recipe input names cannot have surrounding whitespace",
@@ -414,6 +456,11 @@ impl BrowserRecipeInput {
             if self.kind == BrowserRecipeInputKind::Url {
                 validate_safe_url(default_value, "URL input default")?;
             } else {
+                require_max_bytes(
+                    default_value,
+                    MAX_BROWSER_RECIPE_TEXT_BYTES,
+                    "recipe input default",
+                )?;
                 reject_obvious_secret(default_value, "recipe input default")?;
             }
         }
@@ -492,7 +539,7 @@ impl<'de> Deserialize<'de> for BrowserRecipeLocator {
 }
 
 impl BrowserRecipeLocator {
-    fn validate(&self) -> Result<(), BrowserError> {
+    pub(crate) fn validate(&self) -> Result<(), BrowserError> {
         for value in [
             self.accessibility_role.as_deref(),
             self.accessibility_name.as_deref(),
@@ -501,7 +548,11 @@ impl BrowserRecipeLocator {
         .into_iter()
         .flatten()
         {
-            require_nonblank(value, "recipe locator fallback")?;
+            require_bounded_nonblank(
+                value,
+                MAX_BROWSER_RECIPE_LOCATOR_BYTES,
+                "recipe locator fallback",
+            )?;
             reject_obvious_secret(value, "recipe locator fallback")?;
             if value.trim() != value {
                 return Err(invalid_recipe(
@@ -514,9 +565,18 @@ impl BrowserRecipeLocator {
                 "recipe accessibility locator requires both role and name",
             ));
         }
+        if self.css_selectors.len() > MAX_BROWSER_RECIPE_LOCATOR_FALLBACKS {
+            return Err(invalid_recipe(format!(
+                "recipe locator supports at most {MAX_BROWSER_RECIPE_LOCATOR_FALLBACKS} CSS locators"
+            )));
+        }
         let mut selectors = HashSet::new();
         for selector in &self.css_selectors {
-            require_nonblank(selector, "recipe CSS locator")?;
+            require_bounded_nonblank(
+                selector,
+                MAX_BROWSER_RECIPE_LOCATOR_BYTES,
+                "recipe CSS locator",
+            )?;
             reject_obvious_secret(selector, "recipe CSS locator")?;
             if selector.trim() != selector || !selectors.insert(selector.as_str()) {
                 return Err(invalid_recipe(
@@ -664,6 +724,11 @@ impl<'de> Deserialize<'de> for BrowserRecipeStep {
         if !is_safe_recipe_id(&document.id) {
             return Err(D::Error::custom("recipe step id is not a safe slug"));
         }
+        if document.assertions.len() > MAX_BROWSER_RECIPE_ASSERTIONS_PER_STEP {
+            return Err(D::Error::custom(format!(
+                "recipe step supports at most {MAX_BROWSER_RECIPE_ASSERTIONS_PER_STEP} assertions"
+            )));
+        }
         Ok(Self {
             id: document.id,
             action: document.action,
@@ -675,6 +740,11 @@ impl<'de> Deserialize<'de> for BrowserRecipeStep {
 
 impl BrowserRecipeStep {
     fn validate(&self, inputs: &HashMap<&str, BrowserRecipeInputKind>) -> Result<(), BrowserError> {
+        if self.assertions.len() > MAX_BROWSER_RECIPE_ASSERTIONS_PER_STEP {
+            return Err(invalid_recipe(format!(
+                "recipe step supports at most {MAX_BROWSER_RECIPE_ASSERTIONS_PER_STEP} assertions"
+            )));
+        }
         self.action.validate(inputs)?;
         if let Some(wait) = &self.wait {
             wait.validate(inputs)?;
@@ -947,6 +1017,11 @@ impl BrowserRecipeAction {
                 if values.is_empty() {
                     return Err(invalid_recipe("recipe select action requires values"));
                 }
+                if values.len() > MAX_BROWSER_RECIPE_SELECT_VALUES {
+                    return Err(invalid_recipe(format!(
+                        "recipe select action supports at most {MAX_BROWSER_RECIPE_SELECT_VALUES} values"
+                    )));
+                }
                 for value in values {
                     validate_value_context_free(value, Some(LiteralKind::Text))?;
                 }
@@ -1050,6 +1125,11 @@ impl BrowserRecipeAction {
                 locator.validate()?;
                 if values.is_empty() {
                     return Err(invalid_recipe("recipe select action requires values"));
+                }
+                if values.len() > MAX_BROWSER_RECIPE_SELECT_VALUES {
+                    return Err(invalid_recipe(format!(
+                        "recipe select action supports at most {MAX_BROWSER_RECIPE_SELECT_VALUES} values"
+                    )));
                 }
                 for value in values {
                     validate_value(
@@ -1505,7 +1585,11 @@ fn validate_value_context_free(
 ) -> Result<(), BrowserError> {
     match value {
         BrowserRecipeValue::Input { name } => {
-            require_nonblank(name, "recipe input reference")?;
+            require_bounded_nonblank(
+                name,
+                MAX_BROWSER_RECIPE_INPUT_NAME_BYTES,
+                "recipe input reference",
+            )?;
             if name.trim() != name {
                 return Err(invalid_recipe(
                     "recipe input references cannot have surrounding whitespace",
@@ -1519,7 +1603,11 @@ fn validate_value_context_free(
             )),
             Some(LiteralKind::Url) => validate_safe_url(value, "recipe URL value"),
             Some(LiteralKind::Text) | None => {
-                require_nonblank(value, "recipe literal value")?;
+                require_bounded_nonblank(
+                    value,
+                    MAX_BROWSER_RECIPE_TEXT_BYTES,
+                    "recipe literal value",
+                )?;
                 reject_obvious_secret(value, "recipe literal value")
             }
         },
@@ -1539,13 +1627,21 @@ fn validate_value(
                 "recipe value must reference a typed input and cannot be literal",
             )),
             LiteralKind::Text => {
-                require_nonblank(value, "recipe literal value")?;
+                require_bounded_nonblank(
+                    value,
+                    MAX_BROWSER_RECIPE_TEXT_BYTES,
+                    "recipe literal value",
+                )?;
                 reject_obvious_secret(value, "recipe literal value")
             }
             LiteralKind::Url => validate_safe_url(value, "recipe URL value"),
         },
         BrowserRecipeValue::Input { name } => {
-            require_nonblank(name, "recipe input reference")?;
+            require_bounded_nonblank(
+                name,
+                MAX_BROWSER_RECIPE_INPUT_NAME_BYTES,
+                "recipe input reference",
+            )?;
             let Some(kind) = inputs.get(name.as_str()) else {
                 return Err(invalid_recipe("recipe input reference does not exist"));
             };
@@ -1574,6 +1670,23 @@ fn require_nonblank(value: &str, label: &str) -> Result<(), BrowserError> {
     } else {
         Ok(())
     }
+}
+
+fn require_max_bytes(value: &str, max_bytes: usize, label: &str) -> Result<(), BrowserError> {
+    if value.len() > max_bytes {
+        Err(invalid_recipe(format!("{label} is too large")))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_bounded_nonblank(
+    value: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), BrowserError> {
+    require_nonblank(value, label)?;
+    require_max_bytes(value, max_bytes, label)
 }
 
 fn validate_recipe_tab_alias(tab: &str) -> Result<(), BrowserError> {
@@ -1607,6 +1720,7 @@ fn reject_obvious_secret(value: &str, label: &str) -> Result<(), BrowserError> {
 }
 
 pub(crate) fn validate_safe_url(value: &str, label: &str) -> Result<(), BrowserError> {
+    require_max_bytes(value, MAX_BROWSER_RECIPE_URL_BYTES, label)?;
     if super::validate_browser_url(value).is_err() {
         return Err(invalid_recipe(format!("{label} is not a safe browser URL")));
     }
@@ -1767,6 +1881,11 @@ fn save_recipe_with_overwrite_policy_under_gate(
     let mut json = serde_json::to_vec_pretty(recipe)
         .map_err(|error| invalid_recipe(format!("could not serialize recipe: {error}")))?;
     json.push(b'\n');
+    if json.len() > MAX_BROWSER_RECIPE_FILE_BYTES {
+        return Err(invalid_recipe(format!(
+            "recipe file exceeds {MAX_BROWSER_RECIPE_FILE_BYTES} bytes"
+        )));
+    }
     if allow_overwrite {
         atomic_write_with_boundaries(&path, &json, &OsRecipeFileReplacer, &boundary_verifier)?;
     } else {
@@ -1808,8 +1927,15 @@ pub fn list_recipes(project_root: impl AsRef<Path>) -> Result<Vec<BrowserRecipeV
     let entries = std::fs::read_dir(&parent)
         .map_err(|error| io_error("list recipe directory", &parent, error))?;
     let mut recipes = Vec::new();
+    let mut entry_count = 0_usize;
     for entry in entries {
         let entry = entry.map_err(|error| io_error("list recipe directory", &parent, error))?;
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > MAX_BROWSER_RECIPE_DIRECTORY_ENTRIES {
+            return Err(invalid_recipe(format!(
+                "recipe directory exceeds {MAX_BROWSER_RECIPE_DIRECTORY_ENTRIES} entries"
+            )));
+        }
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
@@ -1819,6 +1945,11 @@ pub fn list_recipes(project_root: impl AsRef<Path>) -> Result<Vec<BrowserRecipeV
         };
         if !is_safe_recipe_id(recipe_id) {
             continue;
+        }
+        if recipes.len() >= MAX_BROWSER_RECIPES {
+            return Err(invalid_recipe(format!(
+                "recipe directory supports at most {MAX_BROWSER_RECIPES} recipes"
+            )));
         }
         let path = entry.path();
         recipes.push(load_recipe_path_with_boundary(
@@ -2165,7 +2296,7 @@ fn load_recipe_path_with_digest(
         .parent()
         .ok_or_else(|| invalid_recipe("recipe path has no parent"))?;
     boundary_verifier.verify(RecipeIoBoundary::BeforeRead, parent, path)?;
-    let json = std::fs::read(&path).map_err(|error| {
+    let file = OpenOptions::new().read(true).open(path).map_err(|error| {
         if error.kind() == ErrorKind::NotFound {
             BrowserError::MissingFile {
                 path: path.to_path_buf(),
@@ -2174,24 +2305,32 @@ fn load_recipe_path_with_digest(
             io_error("read recipe", &path, error)
         }
     })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_error("inspect recipe", path, error))?;
+    if metadata.len() > MAX_BROWSER_RECIPE_FILE_BYTES as u64 {
+        return Err(invalid_recipe(format!(
+            "recipe file exceeds {MAX_BROWSER_RECIPE_FILE_BYTES} bytes"
+        )));
+    }
+    let mut json = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_BROWSER_RECIPE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut json)
+        .map_err(|error| io_error("read recipe", path, error))?;
+    if json.len() > MAX_BROWSER_RECIPE_FILE_BYTES {
+        return Err(invalid_recipe(format!(
+            "recipe file exceeds {MAX_BROWSER_RECIPE_FILE_BYTES} bytes"
+        )));
+    }
     let value = serde_json::from_slice::<StrictJsonValue>(&json)
         .map(|value| value.0)
-        .map_err(|error| {
-            invalid_recipe(format!(
-                "could not read recipe schema {}: {error}",
-                path.display()
-            ))
-        })?;
+        .map_err(|error| invalid_recipe(format!("could not read recipe schema: {error}")))?;
     let version = schema_version_from_value(&value).map_err(|message| invalid_recipe(message))?;
     if version != BROWSER_RECIPE_SCHEMA_VERSION {
         return Err(BrowserError::UnsupportedRecipeVersion { version });
     }
-    let recipe: BrowserRecipeV1 = serde_json::from_value(value).map_err(|error| {
-        invalid_recipe(format!(
-            "could not parse recipe {}: {error}",
-            path.display()
-        ))
-    })?;
+    let recipe: BrowserRecipeV1 = serde_json::from_value(value)
+        .map_err(|error| invalid_recipe(format!("could not parse recipe: {error}")))?;
     if recipe.id != recipe_id {
         return Err(invalid_recipe(
             "recipe document id must match its repository file name",

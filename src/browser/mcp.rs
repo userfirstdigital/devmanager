@@ -1,12 +1,13 @@
+use super::recipes::{MAX_BROWSER_RECIPE_LOCATOR_BYTES, MAX_BROWSER_RECIPE_LOCATOR_FALLBACKS};
 use super::{
     classify_upload_path, effective_browser_risk, resource_id_from_uri,
     verified_authenticated_local_project_root, BrowserAction, BrowserActionTarget,
     BrowserAnnotationOperation, BrowserCommand, BrowserConsoleOperation, BrowserController,
     BrowserDownloadOperation, BrowserElementRef, BrowserError, BrowserInvocationContext,
     BrowserLocator, BrowserNetworkOperation, BrowserPerformanceOperation, BrowserRecipeInputKind,
-    BrowserRecordingOperation, BrowserReplayProjection, BrowserReplayPublicInput,
-    BrowserReplayRepairProjection, BrowserResourceStore, BrowserResponse, BrowserRevision,
-    BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
+    BrowserRecipeLocator, BrowserRecordingOperation, BrowserReplayProjection,
+    BrowserReplayPublicInput, BrowserReplayRepairProjection, BrowserResourceStore, BrowserResponse,
+    BrowserRevision, BrowserRisk, BrowserScreenshotMode, BrowserTabSnapshot, BrowserWaitCondition,
     BrowserWorkflowMcpService, BrowserWorkflowRepairApplyResult, BrowserWorkflowReplayStatus,
     BrowserWorkflowServiceError, BrowserWorkspaceSnapshot,
 };
@@ -135,9 +136,13 @@ struct BrowserWorkflowPublicInputWire {
 #[derive(Default, Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct BrowserWorkflowLocatorWire {
+    #[schemars(length(max = 2048))]
     accessibility_role: Option<String>,
+    #[schemars(length(max = 2048))]
     accessibility_name: Option<String>,
+    #[schemars(length(max = 2048))]
     test_id: Option<String>,
+    #[schemars(length(max = 16), inner(length(max = 2048)))]
     css_selectors: Vec<String>,
 }
 
@@ -1676,6 +1681,20 @@ fn validate_browser_workflow_operation(
                 ));
             }
         }
+    }
+
+    if let Some(candidate) = &request.candidate {
+        let locator = BrowserRecipeLocator {
+            accessibility_role: candidate.locator.accessibility_role.clone(),
+            accessibility_name: candidate.locator.accessibility_name.clone(),
+            test_id: candidate.locator.test_id.clone(),
+            css_selectors: candidate.locator.css_selectors.clone(),
+        };
+        locator.validate().map_err(|_| {
+            ToolFailure::invalid_request(format!(
+                "repair candidate requires a semantic locator with at most {MAX_BROWSER_RECIPE_LOCATOR_FALLBACKS} CSS fallbacks and {MAX_BROWSER_RECIPE_LOCATOR_BYTES} bytes per locator string"
+            ))
+        })?;
     }
 
     let recipe_id = request

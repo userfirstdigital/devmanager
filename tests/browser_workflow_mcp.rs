@@ -224,9 +224,21 @@ async fn browser_workflow_exposes_one_exact_seven_operation_tool() {
     let locator_definition = locator_ref
         .strip_prefix("#/$defs/")
         .expect("local workflow locator definition");
+    let locator_schema = &workflow.input_schema["$defs"][locator_definition];
+    assert_eq!(locator_schema["additionalProperties"], false);
     assert_eq!(
-        workflow.input_schema["$defs"][locator_definition]["additionalProperties"],
-        false
+        locator_schema["properties"]["accessibilityRole"]["maxLength"],
+        2_048
+    );
+    assert_eq!(
+        locator_schema["properties"]["accessibilityName"]["maxLength"],
+        2_048
+    );
+    assert_eq!(locator_schema["properties"]["testId"]["maxLength"], 2_048);
+    assert_eq!(locator_schema["properties"]["cssSelectors"]["maxItems"], 16);
+    assert_eq!(
+        locator_schema["properties"]["cssSelectors"]["items"]["maxLength"],
+        2_048
     );
     let schema_text = serde_json::to_string(&workflow.input_schema).unwrap();
     for forbidden in [
@@ -323,6 +335,11 @@ async fn browser_workflow_malformed_calls_are_typed_and_keep_the_session_alive()
             json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":0,"repairId":1,"candidate":candidate.clone()}),
             json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"testId":"replacement"},"token":"candidate-token-sentinel"}}),
             json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"testId":"replacement","password":"locator-password-sentinel","secret":"locator-secret-sentinel"}}}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{}}}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"accessibilityRole":"textbox"}}}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"testId":"x".repeat(2049)}}}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"cssSelectors":(0..17).map(|index| format!("[data-index='{index}']")).collect::<Vec<_>>()}}}),
+            json!({"intent":"preview repair","risk":"normal","operation":"repairPreview","replayInstanceId":1,"repairId":1,"candidate":{"revision":7,"locator":{"cssSelectors":["x".repeat(2049)]}}}),
             json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":false,"resume":true}),
             json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":true}),
             json!({"intent":"apply repair","risk":"destructive","operation":"repairApply","replayInstanceId":1,"repairId":1,"confirm":true,"resume":true,"candidate":candidate}),
