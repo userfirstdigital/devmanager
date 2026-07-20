@@ -848,7 +848,7 @@ pub(crate) struct BrowserRegistrationLease {
     cancellation: watch::Sender<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BrowserRegistrationLeaseTicket(u64);
 
 impl BrowserRegistrationLease {
@@ -1669,23 +1669,45 @@ impl BrowserController {
         let operation = command.operation_name().to_string();
         let deadline =
             tokio::time::Instant::now() + command_transport_timeout(self.timeout, &command);
+        if browser_lifecycle_control(&self.workspace_key, &command).is_some() {
+            return self
+                .request_with_context_and_local_project_root_until(
+                    command,
+                    context,
+                    local_project_root,
+                    None,
+                    None,
+                    None,
+                    None,
+                    deadline,
+                    None,
+                )
+                .await;
+        }
+        let logical_cancellation_ticket =
+            self.cancellation_ticket_for_command(&command, &context)?;
         loop {
-            let attempt = self.request_with_context_and_local_project_root(
-                command.clone(),
-                context.clone(),
-                local_project_root.clone(),
-                None,
-                None,
-                None,
-                None,
-            );
-            let result = tokio::time::timeout_at(deadline, attempt)
-                .await
-                .map_err(|_| BrowserError::Timeout {
-                    operation: operation.clone(),
-                })?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BrowserError::Timeout { operation });
+            }
+            let result = self
+                .request_with_context_and_local_project_root_until(
+                    command.clone(),
+                    context.clone(),
+                    local_project_root.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    deadline,
+                    Some(logical_cancellation_ticket),
+                )
+                .await;
             match result {
                 Err(BrowserError::InitializingView { .. }) => {
+                    if !self.cancellation_ticket_is_current(&command, logical_cancellation_ticket) {
+                        return Err(BrowserError::Interrupted);
+                    }
                     let retry_at = tokio::time::Instant::now()
                         .checked_add(Duration::from_millis(25))
                         .unwrap_or(deadline)
@@ -1694,6 +1716,9 @@ impl BrowserController {
                         return Err(BrowserError::Timeout { operation });
                     }
                     tokio::time::sleep_until(retry_at).await;
+                    if !self.cancellation_ticket_is_current(&command, logical_cancellation_ticket) {
+                        return Err(BrowserError::Interrupted);
+                    }
                 }
                 result => return result,
             }
@@ -2042,13 +2067,42 @@ impl BrowserController {
         replay_repair_preview_sidecar: Option<BrowserReplayRepairPreviewSidecar>,
         replay_lifecycle_sidecar: Option<BrowserReplayLifecycleAuthority>,
     ) -> Result<BrowserResponse, BrowserError> {
+        let deadline =
+            tokio::time::Instant::now() + command_transport_timeout(self.timeout, &command);
+        self.request_with_context_and_local_project_root_until(
+            command,
+            context,
+            local_project_root,
+            replay_secret_sidecar,
+            replay_repair_sidecar,
+            replay_repair_preview_sidecar,
+            replay_lifecycle_sidecar,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_context_and_local_project_root_until(
+        &self,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+        local_project_root: Option<PathBuf>,
+        replay_secret_sidecar: Option<BrowserReplaySecretSidecar>,
+        replay_repair_sidecar: Option<BrowserReplayRepairRetentionSidecar>,
+        replay_repair_preview_sidecar: Option<BrowserReplayRepairPreviewSidecar>,
+        replay_lifecycle_sidecar: Option<BrowserReplayLifecycleAuthority>,
+        deadline: tokio::time::Instant,
+        logical_cancellation_ticket: Option<CancellationTicket>,
+    ) -> Result<BrowserResponse, BrowserError> {
         context.validate()?;
         let operation = command.operation_name().to_string();
-        let transport_timeout = command_transport_timeout(self.timeout, &command);
         let is_lifecycle = browser_lifecycle_control(&self.workspace_key, &command).is_some();
+        debug_assert!(!is_lifecycle || logical_cancellation_ticket.is_none());
         let (response, mut receiver) = oneshot::channel();
         let (delivery, caller_guard) = BrowserRequestDeliveryAuthority::tracked();
-        let timeout = tokio::time::sleep(transport_timeout);
+        let timeout = tokio::time::sleep_until(deadline);
         tokio::pin!(timeout);
         let cancellations = if is_lifecycle {
             self.enqueue_lifecycle_command(
@@ -2060,8 +2114,11 @@ impl BrowserController {
                 response,
             )?
         } else {
-            let (cancellation_ticket, cancellations) =
-                self.cancellation_state_for_command(&command, &context)?;
+            let (cancellation_ticket, cancellations) = self.cancellation_state_for_command(
+                &command,
+                &context,
+                logical_cancellation_ticket,
+            )?;
             let send = self.sender.send(BrowserCommandEnvelope {
                 workspace_key: self.workspace_key.clone(),
                 command,
@@ -2309,13 +2366,23 @@ impl BrowserController {
         &self,
         command: &BrowserCommand,
         context: &BrowserInvocationContext,
+        logical_ticket: Option<CancellationTicket>,
     ) -> Result<(CancellationTicket, CancellationSubscriptions), BrowserError> {
         self.host_controls.with_locked(|| {
-            let mut ticket = self.cancellations.ticket(
-                &self.workspace_key,
-                command.tab_id(),
-                context.interaction_epoch,
-            );
+            let mut ticket = logical_ticket.unwrap_or_else(|| {
+                self.cancellations.ticket(
+                    &self.workspace_key,
+                    command.tab_id(),
+                    context.interaction_epoch,
+                )
+            });
+            if logical_ticket.is_some()
+                && !self
+                    .cancellations
+                    .is_current(&self.workspace_key, command.tab_id(), ticket)
+            {
+                return Err(BrowserError::Interrupted);
+            }
             let mut subscriptions = self.cancellations.subscribe(
                 &self.workspace_key,
                 command.tab_id(),
@@ -2325,10 +2392,33 @@ impl BrowserController {
             if let Some(registration_lease) = &self.registration_lease {
                 let (registration_ticket, registration_cancellation) =
                     registration_lease.capture()?;
-                ticket.registration = Some(registration_ticket);
+                if let Some(expected) = ticket.registration {
+                    if expected != registration_ticket {
+                        return Err(BrowserError::Interrupted);
+                    }
+                } else {
+                    ticket.registration = Some(registration_ticket);
+                }
                 subscriptions.registration = Some(registration_cancellation);
+            } else if ticket.registration.is_some() {
+                return Err(BrowserError::Interrupted);
             }
             Ok((ticket, subscriptions))
+        })
+    }
+
+    fn cancellation_ticket_is_current(
+        &self,
+        command: &BrowserCommand,
+        ticket: CancellationTicket,
+    ) -> bool {
+        self.host_controls.with_locked(|| {
+            self.cancellations
+                .is_current(&self.workspace_key, command.tab_id(), ticket)
+                && registration_ticket_is_current(
+                    self.registration_lease.as_ref(),
+                    ticket.registration,
+                )
         })
     }
 
@@ -3640,6 +3730,131 @@ mod secure_command_tests {
             "revoked retry must not reach the host inbox"
         );
         drop(controller);
+    }
+
+    #[tokio::test]
+    async fn user_input_during_view_initialization_retry_cannot_resurrect_the_request() {
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let workspace_key = workspace("view-initialization-user-input", "conversation-a");
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let task = tokio::spawn(async move {
+            controller
+                .request_with_context(
+                    BrowserCommand::Reload {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "reload after initialization",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+
+        let first = inbox.recv().await.expect("first request");
+        first.respond(Err(BrowserError::InitializingView {
+            tab_id: "tab-a".to_string(),
+        }));
+        bridge.observe_host_event(&BrowserHostEvent::user_input(
+            workspace_key,
+            "tab-a",
+            BrowserUserInputKind::Pointer,
+        ));
+
+        assert_eq!(task.await.unwrap(), Err(BrowserError::Interrupted));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), inbox.recv())
+                .await
+                .is_err(),
+            "pre-input logical request must not be admitted again"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_view_initialization_retry_cannot_resurrect_the_request() {
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let workspace_key = workspace("view-initialization-interrupt", "conversation-a");
+        let controller = bridge.bind(workspace_key.clone(), Duration::from_secs(1));
+        let task = tokio::spawn(async move {
+            controller
+                .request_with_context(
+                    BrowserCommand::Reload {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "reload after initialization",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+
+        let first = inbox.recv().await.expect("first request");
+        first.respond(Err(BrowserError::InitializingView {
+            tab_id: "tab-a".to_string(),
+        }));
+        bridge.interrupt_tab(&workspace_key, "tab-a");
+
+        assert_eq!(task.await.unwrap(), Err(BrowserError::Interrupted));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), inbox.recv())
+                .await
+                .is_err(),
+            "pre-interrupt logical request must not be admitted again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claimed_view_initialization_retry_cannot_timeout_ahead_of_host_completion() {
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let workspace_key = workspace("view-initialization-claimed", "conversation-a");
+        let controller = bridge.bind(workspace_key, Duration::from_millis(70));
+        let task = tokio::spawn(async move {
+            controller
+                .request_with_context(
+                    BrowserCommand::Reload {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "perform the destructive action after initialization",
+                        BrowserRisk::Destructive,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+
+        let first = inbox.recv().await.expect("first request");
+        first.respond(Err(BrowserError::InitializingView {
+            tab_id: "tab-a".to_string(),
+        }));
+        let retry = inbox.recv().await.expect("retry request");
+
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let route = std::thread::spawn(move || {
+            route_browser_request(true, retry, |request| {
+                claimed_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("release claimed retry");
+                request.respond(Ok(BrowserResponse::Acknowledged));
+            })
+        });
+        claimed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retry is claimed before its shared deadline");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "caller must not report Timeout while claimed host work can still complete"
+        );
+        release_tx.send(()).unwrap();
+        route.join().unwrap().unwrap();
+        assert_eq!(task.await.unwrap(), Ok(BrowserResponse::Acknowledged));
     }
 
     #[test]

@@ -8,15 +8,16 @@ use crate::browser::{
     browser_replay_repair_candidate_from_annotation, browser_response_sync, browser_settings_plan,
     browser_workflow_review_editor_for_field, browser_workflow_review_editor_mutation,
     calculate_browser_split, render_browser_pane, route_browser_request, BrowserActionPlan,
-    BrowserAnnotation, BrowserAttachmentBroker, BrowserAttachmentProjection, BrowserBounds,
-    BrowserCommand, BrowserCommandBridge, BrowserCommandInbox, BrowserCommandRequest, BrowserError,
-    BrowserGatewayHandle, BrowserHostVisibility, BrowserInvocationActor, BrowserInvocationContext,
-    BrowserPaneAction, BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan,
-    BrowserPaneModel, BrowserPaneSurface, BrowserPaneTransient, BrowserReplayInstance,
-    BrowserReplayPaneProjection, BrowserReplaySecretError, BrowserReplaySecretPromptEvent,
-    BrowserReplaySecretPromptVault, BrowserReplaySecretSubmission, BrowserReplayStatus,
-    BrowserResponse, BrowserRevision, BrowserRisk, BrowserSettingsAction, BrowserWebViewHost,
-    BrowserWorkflowReviewEditor, BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
+    BrowserAnnotation, BrowserAppExitDisposition, BrowserAttachmentBroker,
+    BrowserAttachmentProjection, BrowserBounds, BrowserCommand, BrowserCommandBridge,
+    BrowserCommandInbox, BrowserCommandRequest, BrowserError, BrowserGatewayHandle,
+    BrowserHostVisibility, BrowserInvocationActor, BrowserInvocationContext, BrowserPaneAction,
+    BrowserPaneActions, BrowserPaneContext, BrowserPaneEventPlan, BrowserPaneModel,
+    BrowserPaneSurface, BrowserPaneTransient, BrowserReplayInstance, BrowserReplayPaneProjection,
+    BrowserReplaySecretError, BrowserReplaySecretPromptEvent, BrowserReplaySecretPromptVault,
+    BrowserReplaySecretSubmission, BrowserReplayStatus, BrowserResponse, BrowserRevision,
+    BrowserRisk, BrowserSettingsAction, BrowserWebViewHost, BrowserWorkflowReviewEditor,
+    BrowserWorkspaceKey, BrowserWorkspaceSnapshot,
 };
 use crate::git::git_service;
 use crate::models::{
@@ -120,13 +121,6 @@ pub fn run() {
     Application::new()
         .with_assets(AppAssets::new())
         .run(|cx: &mut App| {
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-
             let saved_bounds = SessionManager::new()
                 .load_workspace()
                 .ok()
@@ -157,8 +151,22 @@ pub fn run() {
                 },
                 |window, cx| {
                     let shell = cx.new(NativeShell::new);
+                    let window_lifetime = shell.read(cx).browser_host.window_lifetime_fence();
+                    let closed_window_lifetime = window_lifetime.clone();
+                    cx.on_window_closed(move |cx| {
+                        let centralized_exit = closed_window_lifetime.teardown_ready();
+                        closed_window_lifetime.assert_drained_after_window_close();
+                        if !centralized_exit && cx.windows().is_empty() {
+                            execute_app_termination(PendingAppTermination::Quit, cx);
+                        }
+                    })
+                    .detach();
                     let close_handler = shell.clone();
+                    let closing_window_lifetime = window_lifetime;
                     window.on_window_should_close(cx, move |window, cx| {
+                        if closing_window_lifetime.window_close_must_be_deferred() {
+                            return false;
+                        }
                         close_handler
                             .update(cx, |shell, cx| shell.handle_window_should_close(window, cx))
                     });
@@ -177,6 +185,29 @@ pub fn run() {
 enum ActionableNotice {
     PortInUse { command_id: String, message: String },
     ForceQuit { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAppTermination {
+    Quit,
+    ExitAfterUpdate,
+}
+
+impl PendingAppTermination {
+    fn coalesce(self, requested: Self) -> Self {
+        if matches!(self, Self::ExitAfterUpdate) || matches!(requested, Self::ExitAfterUpdate) {
+            Self::ExitAfterUpdate
+        } else {
+            Self::Quit
+        }
+    }
+}
+
+fn execute_app_termination(termination: PendingAppTermination, cx: &App) {
+    match termination {
+        PendingAppTermination::Quit => cx.quit(),
+        PendingAppTermination::ExitAfterUpdate => std::process::exit(0),
+    }
 }
 
 struct NativeShell {
@@ -253,6 +284,7 @@ struct NativeShell {
     pending_shutdown_op_id: Option<u64>,
     pending_window_close: bool,
     pending_install_update: Option<String>,
+    pending_app_termination: Option<PendingAppTermination>,
     window_subscriptions: Vec<Subscription>,
 }
 
@@ -1229,6 +1261,7 @@ impl NativeShell {
             pending_shutdown_op_id: None,
             pending_window_close: false,
             pending_install_update: None,
+            pending_app_termination: None,
             window_subscriptions: Vec::new(),
         };
 
@@ -1576,6 +1609,9 @@ impl NativeShell {
             events.extend(completion_events);
             events
         });
+        if self.try_finish_app_termination(cx) {
+            return;
+        }
         let projected_attachments = self.reconcile_browser_attachment_projections(window);
         let replay_changed = self.reconcile_browser_replay_state(window, cx);
         if events.is_empty() {
@@ -2330,6 +2366,52 @@ impl NativeShell {
         for workspace_key in workspaces {
             self.discard_browser_workflow_state_after_replay_interrupt(&workspace_key);
         }
+    }
+
+    fn begin_browser_window_teardown(&mut self) -> BrowserAppExitDisposition {
+        self.interrupt_all_browser_replays_before_shutdown();
+        self.browser_host.begin_native_window_teardown()
+    }
+
+    fn resume_browser_window_after_canceled_shutdown(&mut self) {
+        self.pending_app_termination = None;
+        let _ = self
+            .browser_host
+            .resume_native_window_after_canceled_teardown();
+    }
+
+    fn request_app_termination(
+        &mut self,
+        requested: PendingAppTermination,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_app_termination = Some(
+            self.pending_app_termination
+                .map_or(requested, |current| current.coalesce(requested)),
+        );
+        match self.begin_browser_window_teardown() {
+            BrowserAppExitDisposition::ExitNow => {
+                let _ = self.try_finish_app_termination(cx);
+            }
+            BrowserAppExitDisposition::Deferred => {
+                self.terminal_notice = Some(
+                    "Waiting for browser initialization to stop before exiting...".to_string(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    fn try_finish_app_termination(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(termination) = self.pending_app_termination else {
+            return false;
+        };
+        if !self.browser_host.native_window_teardown_ready() {
+            return false;
+        }
+        self.pending_app_termination = None;
+        execute_app_termination(termination, cx);
+        true
     }
 
     fn sync_browser_host_visibility(&mut self, window: Option<&Window>) {
@@ -6006,12 +6088,12 @@ impl NativeShell {
                             self.pending_window_close = false;
                             self.pending_shutdown_op_id = None;
                             self.terminal_actionable_notice = None;
-                            self.interrupt_all_browser_replays_before_shutdown();
-                            if self.pending_install_update.take().is_some() {
-                                std::process::exit(0);
+                            let termination = if self.pending_install_update.take().is_some() {
+                                PendingAppTermination::ExitAfterUpdate
                             } else {
-                                cx.quit();
-                            }
+                                PendingAppTermination::Quit
+                            };
+                            self.request_app_termination(termination, cx);
                         }
                     }
                     ProcessOpKind::KillProcess | ProcessOpKind::KillProcessTree => {
@@ -6063,6 +6145,7 @@ impl NativeShell {
                             Some(ActionableNotice::ForceQuit { message });
                         self.pending_window_close = false;
                         self.pending_shutdown_op_id = None;
+                        self.resume_browser_window_after_canceled_shutdown();
                     }
                     _ => {
                         self.terminal_notice = Some(error);
@@ -6974,7 +7057,7 @@ impl NativeShell {
             }
         }
 
-        self.interrupt_all_browser_replays_before_shutdown();
+        let _ = self.begin_browser_window_teardown();
         self.save_session_state();
         match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
             Ok(op_id) => {
@@ -6985,6 +7068,7 @@ impl NativeShell {
                 false
             }
             Err(error) => {
+                self.resume_browser_window_after_canceled_shutdown();
                 self.terminal_notice = Some(format!("Failed to start shutdown: {error}"));
                 cx.notify();
                 false
@@ -7298,7 +7382,7 @@ impl NativeShell {
     fn install_update_action(&mut self, cx: &mut Context<Self>) {
         match self.updater.install_update() {
             Ok(version) => {
-                self.interrupt_all_browser_replays_before_shutdown();
+                let _ = self.begin_browser_window_teardown();
                 self.save_session_state();
                 match self.process_manager.schedule_shutdown(APP_SHUTDOWN_TIMEOUT) {
                     Ok(op_id) => {
@@ -7309,6 +7393,7 @@ impl NativeShell {
                         ));
                     }
                     Err(error) => {
+                        self.resume_browser_window_after_canceled_shutdown();
                         self.editor_notice =
                             Some(format!("Failed to start shutdown before update: {error}"));
                     }
@@ -7324,12 +7409,12 @@ impl NativeShell {
 
     fn force_quit_action(&mut self, cx: &mut Context<Self>) {
         self.terminal_actionable_notice = None;
-        self.interrupt_all_browser_replays_before_shutdown();
-        if self.pending_install_update.take().is_some() {
-            std::process::exit(0);
+        let termination = if self.pending_install_update.take().is_some() {
+            PendingAppTermination::ExitAfterUpdate
         } else {
-            cx.quit();
-        }
+            PendingAppTermination::Quit
+        };
+        self.request_app_termination(termination, cx);
     }
 
     fn terminal_font_size(&self) -> f32 {
@@ -17184,6 +17269,22 @@ mod tests {
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn update_exit_dominates_repeated_normal_quit_requests() {
+        assert_eq!(
+            PendingAppTermination::Quit.coalesce(PendingAppTermination::Quit),
+            PendingAppTermination::Quit
+        );
+        assert_eq!(
+            PendingAppTermination::Quit.coalesce(PendingAppTermination::ExitAfterUpdate),
+            PendingAppTermination::ExitAfterUpdate
+        );
+        assert_eq!(
+            PendingAppTermination::ExitAfterUpdate.coalesce(PendingAppTermination::Quit),
+            PendingAppTermination::ExitAfterUpdate
+        );
+    }
 
     fn sample_ai_tab() -> SessionTab {
         SessionTab {

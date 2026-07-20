@@ -72,6 +72,7 @@ pub use downloads::{
     BrowserDownloadStore,
 };
 pub use gateway::{BrowserGatewayHandle, BrowserGatewayRegistrar, BrowserGatewayRegistration};
+pub(crate) use host::BrowserAppExitDisposition;
 pub use host::{
     acknowledge_attachment_projection_and_reconcile_pins, browser_user_input_initialization_script,
     unique_download_path, unsupported_command_response, unsupported_host_status,

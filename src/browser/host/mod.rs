@@ -11,9 +11,11 @@ mod unsupported;
 mod windows;
 
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 #[cfg(not(target_os = "windows"))]
 pub use unsupported::BrowserWebViewHost;
 pub use unsupported::{
@@ -25,6 +27,228 @@ pub(crate) use unsupported::{
 };
 #[cfg(target_os = "windows")]
 pub use windows::BrowserWebViewHost;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowserAppExitDisposition {
+    ExitNow,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserNativeWindowPhase {
+    Open,
+    Closing,
+}
+
+struct BrowserNativeWindowLifetimeState {
+    phase: Cell<BrowserNativeWindowPhase>,
+    window_identity: Cell<Option<isize>>,
+    generation: Cell<u64>,
+    lease_count: Cell<usize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserNativeWindowLifetime {
+    state: Rc<BrowserNativeWindowLifetimeState>,
+}
+
+impl Default for BrowserNativeWindowLifetime {
+    fn default() -> Self {
+        Self {
+            state: Rc::new(BrowserNativeWindowLifetimeState {
+                phase: Cell::new(BrowserNativeWindowPhase::Open),
+                window_identity: Cell::new(None),
+                generation: Cell::new(0),
+                lease_count: Cell::new(0),
+            }),
+        }
+    }
+}
+
+impl BrowserNativeWindowLifetime {
+    pub(crate) fn bind_window(&self, window_identity: isize) -> Option<u64> {
+        if self.state.phase.get() == BrowserNativeWindowPhase::Closing {
+            return None;
+        }
+        match self.state.window_identity.get() {
+            Some(current) if current == window_identity => Some(self.state.generation.get()),
+            Some(_) if self.state.lease_count.get() != 0 => None,
+            _ => {
+                let generation = self.state.generation.get().checked_add(1)?;
+                self.state.window_identity.set(Some(window_identity));
+                self.state.generation.set(generation);
+                Some(generation)
+            }
+        }
+    }
+
+    pub(crate) fn acquire(
+        &self,
+        window_identity: isize,
+        generation: u64,
+    ) -> Option<BrowserNativeWindowBuildLease> {
+        if self.state.phase.get() != BrowserNativeWindowPhase::Open
+            || self.state.window_identity.get() != Some(window_identity)
+            || self.state.generation.get() != generation
+        {
+            return None;
+        }
+        let lease_count = self.state.lease_count.get().checked_add(1)?;
+        self.state.lease_count.set(lease_count);
+        Some(BrowserNativeWindowBuildLease {
+            state: Rc::clone(&self.state),
+            window_identity,
+            generation,
+        })
+    }
+
+    pub(crate) fn begin_teardown(&self) -> BrowserAppExitDisposition {
+        if self.state.phase.get() != BrowserNativeWindowPhase::Closing {
+            self.state.phase.set(BrowserNativeWindowPhase::Closing);
+            if let Some(generation) = self.state.generation.get().checked_add(1) {
+                self.state.generation.set(generation);
+            } else {
+                self.state.window_identity.set(None);
+            }
+        }
+        self.exit_disposition()
+    }
+
+    pub(crate) fn resume_after_canceled_teardown(&self) -> bool {
+        if self.state.phase.get() != BrowserNativeWindowPhase::Closing {
+            return false;
+        }
+        self.state.phase.set(BrowserNativeWindowPhase::Open);
+        true
+    }
+
+    pub(crate) fn exit_disposition(&self) -> BrowserAppExitDisposition {
+        if self.state.lease_count.get() == 0 {
+            BrowserAppExitDisposition::ExitNow
+        } else {
+            BrowserAppExitDisposition::Deferred
+        }
+    }
+
+    pub(crate) fn teardown_ready(&self) -> bool {
+        self.state.phase.get() == BrowserNativeWindowPhase::Closing
+            && self.state.lease_count.get() == 0
+    }
+
+    pub(crate) fn window_close_must_be_deferred(&self) -> bool {
+        self.state.phase.get() == BrowserNativeWindowPhase::Closing
+            || self.state.lease_count.get() != 0
+    }
+
+    pub(crate) fn assert_drained_after_window_close(&self) {
+        debug_assert_eq!(
+            self.state.lease_count.get(),
+            0,
+            "GPUI window closed while native browser builds retained its HWND"
+        );
+    }
+}
+
+pub(crate) struct BrowserNativeWindowBuildLease {
+    state: Rc<BrowserNativeWindowLifetimeState>,
+    window_identity: isize,
+    generation: u64,
+}
+
+impl BrowserNativeWindowBuildLease {
+    pub(crate) fn build_is_allowed(&self) -> bool {
+        self.state.phase.get() == BrowserNativeWindowPhase::Open
+            && self.state.window_identity.get() == Some(self.window_identity)
+            && self.state.generation.get() == self.generation
+    }
+}
+
+impl Drop for BrowserNativeWindowBuildLease {
+    fn drop(&mut self) {
+        let leases = self.state.lease_count.get();
+        debug_assert!(leases > 0, "native browser window lease underflow");
+        self.state.lease_count.set(leases.saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod native_window_lifetime_tests {
+    use super::{BrowserAppExitDisposition, BrowserNativeWindowLifetime};
+
+    #[test]
+    fn active_and_queued_window_leases_defer_exit_until_the_last_completion_releases() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+        let generation = lifetime.bind_window(101).unwrap();
+        let active = lifetime.acquire(101, generation).unwrap();
+        let queued = lifetime.acquire(101, generation).unwrap();
+
+        assert_eq!(
+            lifetime.begin_teardown(),
+            BrowserAppExitDisposition::Deferred
+        );
+        assert!(lifetime.window_close_must_be_deferred());
+        assert!(!active.build_is_allowed());
+        assert!(!queued.build_is_allowed());
+        assert!(!lifetime.teardown_ready());
+
+        drop(queued);
+        assert!(!lifetime.teardown_ready());
+        drop(active);
+        assert!(lifetime.teardown_ready());
+        assert_eq!(
+            lifetime.exit_disposition(),
+            BrowserAppExitDisposition::ExitNow
+        );
+    }
+
+    #[test]
+    fn canceled_shutdown_reopens_only_new_generation_admission() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+        let generation = lifetime.bind_window(202).unwrap();
+        let canceled = lifetime.acquire(202, generation).unwrap();
+        assert_eq!(
+            lifetime.begin_teardown(),
+            BrowserAppExitDisposition::Deferred
+        );
+        assert!(lifetime.acquire(202, generation).is_none());
+
+        assert!(lifetime.resume_after_canceled_teardown());
+        let resumed_generation = lifetime.bind_window(202).unwrap();
+        assert_ne!(resumed_generation, generation);
+        assert!(!canceled.build_is_allowed());
+        let replacement = lifetime.acquire(202, resumed_generation).unwrap();
+        assert!(replacement.build_is_allowed());
+        assert!(lifetime.window_close_must_be_deferred());
+
+        drop(canceled);
+        assert!(lifetime.window_close_must_be_deferred());
+        drop(replacement);
+        assert!(!lifetime.window_close_must_be_deferred());
+    }
+
+    #[test]
+    fn changing_the_actual_window_identity_requires_all_old_leases_to_drain() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+        let generation = lifetime.bind_window(303).unwrap();
+        let lease = lifetime.acquire(303, generation).unwrap();
+        assert!(lifetime.bind_window(404).is_none());
+        drop(lease);
+        assert!(lifetime.bind_window(404).is_some());
+    }
+
+    #[test]
+    fn canceled_shutdown_before_first_browser_build_reopens_window_admission() {
+        let lifetime = BrowserNativeWindowLifetime::default();
+        assert_eq!(
+            lifetime.begin_teardown(),
+            BrowserAppExitDisposition::ExitNow
+        );
+        assert!(lifetime.window_close_must_be_deferred());
+        assert!(lifetime.resume_after_canceled_teardown());
+        assert!(!lifetime.window_close_must_be_deferred());
+        assert!(lifetime.bind_window(505).is_some());
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

@@ -346,7 +346,8 @@ fn native_webview_construction_never_runs_under_the_gpui_app_borrow() {
         .expect("native completion should follow native scheduling");
     let spawn = &host[spawn_start..spawn_end];
     assert!(spawn.contains(".spawn(async move {"));
-    assert!(spawn.contains("job.build(parent_window)"));
+    assert!(spawn.contains("job.build()"));
+    assert!(spawn.contains("BrowserNativeViewBuildJob { spec, project }"));
     assert!(!spawn.contains("AsyncApp"));
     assert!(!spawn.contains("update_in("));
     assert!(!spawn.contains("with_locked_host_work"));
@@ -401,6 +402,94 @@ fn native_webview_construction_never_runs_under_the_gpui_app_borrow() {
     let readiness_branch = &request[readiness..recording];
     assert!(readiness_branch.contains("request.respond(Err(error))"));
     assert!(!readiness_branch.contains("self.respond_request"));
+}
+
+#[test]
+fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_exit() {
+    let lifetime = include_str!("../src/browser/host/mod.rs");
+    let host = include_str!("../src/browser/host/windows.rs");
+    let app = include_str!("../src/app/mod.rs");
+
+    assert!(lifetime.contains("struct BrowserNativeWindowLifetime"));
+    assert!(lifetime.contains("struct BrowserNativeWindowBuildLease"));
+    assert!(lifetime.contains("BrowserNativeWindowPhase::Closing"));
+    assert!(lifetime.contains("lease_count"));
+    assert!(host.contains("struct BrowserParentWindowLease"));
+    assert!(host.contains("parent_window: BrowserParentWindowLease"));
+    assert!(host.contains("parent_window.build_is_allowed()"));
+    assert!(host.contains("cancellation.is_canceled()"));
+    assert!(host.contains("fn begin_native_window_teardown("));
+    assert!(host.contains("fn resume_native_window_after_canceled_teardown("));
+    assert!(host.contains("self.native_view_builds.cancel_all()"));
+    assert!(host.contains("self.native_view_build_specs.clear()"));
+
+    let completion_start = host
+        .find("fn complete_native_view_build(")
+        .expect("native completion handler");
+    let completion_end = host[completion_start..]
+        .find("fn pump_native_view_build_completions(")
+        .map(|offset| completion_start + offset)
+        .expect("native completion pump");
+    let completion = &host[completion_start..completion_end];
+    let drop_result = completion
+        .find("drop(result)")
+        .expect("canceled WebView result must be dropped explicitly");
+    let release_window = completion
+        .find("drop(parent_window)")
+        .expect("window lease must be released explicitly");
+    assert!(drop_result < release_window);
+
+    assert!(app.contains("enum PendingAppTermination"));
+    assert!(app.contains("fn request_app_termination("));
+    assert!(app.contains("fn try_finish_app_termination("));
+    assert!(app.contains("fn execute_app_termination("));
+    assert!(app.contains("resume_native_window_after_canceled_teardown"));
+    assert!(app.contains("BrowserAppExitDisposition::Deferred"));
+    assert!(app.contains("BrowserAppExitDisposition::ExitNow"));
+    assert_eq!(app.matches("cx.quit()").count(), 1);
+    assert_eq!(app.matches("std::process::exit(0)").count(), 1);
+
+    let should_close_start = app
+        .find("window.on_window_should_close")
+        .expect("low-level GPUI close guard");
+    let should_close_end = app[should_close_start..]
+        .find("shell.register_focus_observers")
+        .map(|offset| should_close_start + offset)
+        .expect("close guard end");
+    let should_close = &app[should_close_start..should_close_end];
+    let preflight = should_close
+        .find("window_close_must_be_deferred")
+        .expect("close preflight");
+    let shell_update = should_close
+        .find("shell.handle_window_should_close")
+        .expect("shell close handler");
+    assert!(preflight < shell_update);
+    assert!(should_close[preflight..shell_update].contains("return false"));
+
+    let closed_start = app
+        .find("cx.on_window_closed")
+        .expect("post-close assertion");
+    let closed_end = app[closed_start..]
+        .find("let close_handler")
+        .map(|offset| closed_start + offset)
+        .expect("post-close assertion end");
+    let closed = &app[closed_start..closed_end];
+    assert!(closed.contains("assert_drained_after_window_close"));
+    assert!(closed.contains("teardown_ready"));
+
+    let pump_start = app.find("fn pump_browser_events(").expect("browser pump");
+    let pump_end = app[pump_start..]
+        .find("fn reconcile_browser_replay_state(")
+        .map(|offset| pump_start + offset)
+        .expect("browser pump end");
+    let pump = &app[pump_start..pump_end];
+    let completion = pump
+        .find("browser_host.pump_async_completions")
+        .expect("native completion pump");
+    let termination = pump
+        .find("self.try_finish_app_termination")
+        .expect("deferred termination retry");
+    assert!(completion < termination);
 }
 
 #[test]

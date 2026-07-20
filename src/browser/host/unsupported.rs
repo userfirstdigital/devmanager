@@ -15,7 +15,10 @@ use super::super::{
     BrowserError, BrowserHostStatus, BrowserResponse,
 };
 #[cfg(not(target_os = "windows"))]
-use super::{BrowserHostState, BrowserWorkspaceSnapshot};
+use super::{
+    BrowserAppExitDisposition, BrowserHostState, BrowserNativeWindowLifetime,
+    BrowserWorkspaceSnapshot,
+};
 #[cfg(not(target_os = "windows"))]
 use crate::browser::BrowserAttachmentProjection;
 #[cfg(not(target_os = "windows"))]
@@ -89,6 +92,7 @@ pub struct BrowserWebViewHost {
     #[allow(dead_code)]
     state: BrowserHostState,
     workflow_coordinator: BrowserWorkflowCoordinator,
+    native_window_lifetime: BrowserNativeWindowLifetime,
     _main_thread_only: PhantomData<Rc<()>>,
 }
 
@@ -99,6 +103,7 @@ impl BrowserWebViewHost {
             status: unsupported_host_status(std::env::consts::OS),
             state: BrowserHostState::new(app_config_dir),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
     }
@@ -113,6 +118,7 @@ impl BrowserWebViewHost {
             },
             state: BrowserHostState::new(PathBuf::new()),
             workflow_coordinator: BrowserWorkflowCoordinator::default(),
+            native_window_lifetime: BrowserNativeWindowLifetime::default(),
             _main_thread_only: PhantomData,
         }
     }
@@ -122,6 +128,22 @@ impl BrowserWebViewHost {
     }
 
     pub fn attach_foreground_executor(&mut self, _executor: gpui::ForegroundExecutor) {}
+
+    pub(crate) fn window_lifetime_fence(&self) -> BrowserNativeWindowLifetime {
+        self.native_window_lifetime.clone()
+    }
+
+    pub(crate) fn begin_native_window_teardown(&mut self) -> BrowserAppExitDisposition {
+        self.native_window_lifetime.begin_teardown()
+    }
+
+    pub(crate) fn resume_native_window_after_canceled_teardown(&mut self) -> bool {
+        self.native_window_lifetime.resume_after_canceled_teardown()
+    }
+
+    pub(crate) fn native_window_teardown_ready(&self) -> bool {
+        self.native_window_lifetime.teardown_ready()
+    }
 
     pub fn cancel_annotation_selection(
         &mut self,

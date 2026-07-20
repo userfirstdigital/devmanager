@@ -787,6 +787,16 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
         "interrupt_all_with_host_cleanup",
         "open_browser_workspace_keys()",
     );
+    let native_window_teardown = source_section(
+        &app,
+        "fn begin_browser_window_teardown(",
+        "fn resume_browser_window_after_canceled_shutdown(",
+    );
+    assert_before(
+        native_window_teardown,
+        "interrupt_all_browser_replays_before_shutdown",
+        "browser_host.begin_native_window_teardown",
+    );
 
     let command_dispatch = source_section(
         &app,
@@ -1045,18 +1055,21 @@ fn browser_provider_and_native_shell_lifecycle_boundaries_reach_the_shared_bridg
             "fn force_quit_action(",
             "schedule_shutdown",
         ),
-        (
-            "fn force_quit_action(",
-            "fn terminal_font_size(",
-            "std::process::exit",
-        ),
     ] {
         assert_before(
             source_section(&app, start, end),
-            "interrupt_all_browser_replays_before_shutdown",
+            "begin_browser_window_teardown",
             mutation,
         );
     }
+    let force_quit = source_section(&app, "fn force_quit_action(", "fn terminal_font_size(");
+    assert!(force_quit.contains("request_app_termination"));
+    let app_termination = source_section(
+        &app,
+        "fn request_app_termination(",
+        "fn try_finish_app_termination(",
+    );
+    assert!(app_termination.contains("begin_browser_window_teardown"));
 
     let terminal_exit = source_section(
         &process_manager,
