@@ -1,6 +1,6 @@
 [package]
 name = "devmanager"
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 description = "Native GPUI rewrite of DevManager"
 license = "Apache-2.0"

@@ -167,20 +167,22 @@ responses so they cannot advance the retired instance.
   tests and every integration and example target green.
 - Final independent review of `de332e5..db8f08e`: **ready**, with 0 Critical,
   0 Important, and 0 Minor findings. `git diff --check de332e5..db8f08e` passed.
-- Final-head `cargo fmt --all -- --check`: **passed**. Final-head
-  `cargo check --locked --all-targets -j1`: **passed in 101.7 seconds with no
+- Browser-head `cargo fmt --all -- --check`: **passed**. The subsequent `0.4.0`
+  version-only release bump was verified with
+  `cargo check --locked --all-targets -j1`: **passed in 103.5 seconds with no
   warnings**.
-- Final-head `cargo test --locked --all-targets -j1 -- --test-threads=1`:
-  **exit 0 in 778.8 seconds**, with 788/788 library tests and every integration,
+- `cargo test --locked --all-targets -j1 -- --test-threads=1` at `0.4.0`:
+  **exit 0 in 1,078.2 seconds**, with 788/788 library tests and every integration,
   binary, and example target green.
-- `cargo build --release --locked -j1`: **exit 0 in 352.8 seconds**. The release
-  executable is 43,836,928 bytes with SHA-256
-  `3D005567239D106292625642F116FFFD39E8BBBEC398B22D4BA8F671D8E5C3C0`.
-- `cargo packager --release --formats nsis,wix`: **exit 0 in 35 seconds**. The x64
-  MSI is 17,809,408 bytes with SHA-256
-  `A80C82A041702FCB222F0E44BAB7F75714AEF625C12413B5AAB84A1B2CE46880`; the x64
-  NSIS setup is 13,649,949 bytes with SHA-256
-  `B3B7B3AE84EBF55EF263E5B9F69DFF39C12A0D28A9E5E2B5D9552A6160027083`.
+- `cargo build --release --locked -j1`: **exit 0 in 369.4 seconds**. The `0.4.0`
+  release executable reports `FileVersion` and `ProductVersion` `0.4.0`, is
+  43,837,952 bytes, and has SHA-256
+  `AE961828CE319344FD73B27FBB1675CF0F7473997BEACF8D3BFA371B88CA499D`.
+- `cargo packager --release --formats nsis,wix`: **exit 0 in 37.4 seconds**. The
+  `devmanager_0.4.0_x64_en-US.msi` is 17,821,696 bytes with SHA-256
+  `01E0D070BC0534E97A94A8FBDB78EE5535368BC6226E637A3065FB3205A7595B`; the
+  `devmanager_0.4.0_x64-setup.exe` is 13,645,030 bytes with SHA-256
+  `46F89929D3176605551DB2A13F65CE142D1142717B5615B4A842735B6939FAFA`.
 - The exact formerly stuck Quit-again/Quit-anyway browser-initialization path was
   exercised with temporary instrumentation and the release candidate exited in
   32 ms after its browser lease drained. A subsequent clean uninstrumented candidate
