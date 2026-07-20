@@ -193,7 +193,15 @@ type ClaudeSemanticPublicationTestHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 type ProcessManagerBackgroundTestHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
-type ProcessManagerDetachedWorkerTestHook = Arc<dyn Fn() + Send + Sync>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessManagerDetachedWorkerTestPhase {
+    BeforeAcquire,
+    AfterAcquire,
+    AfterEffect,
+}
+#[cfg(test)]
+type ProcessManagerDetachedWorkerTestHook =
+    Arc<dyn Fn(ProcessManagerDetachedWorkerTestPhase) + Send + Sync>;
 
 trait CodexFallbackTerminalOps: Send + Sync {
     fn terminate_and_reap(
@@ -4425,25 +4433,36 @@ fn handle_auto_restart(inner: &Arc<ProcessManagerInner>) {
                 return;
             }
             #[cfg(test)]
-            if let Some(hook) = inner
+            let worker_test_hook = inner
                 .auto_restart_worker_test_hook
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-            {
-                hook();
-            }
-            let Ok(manager) = process_manager_from_inner(inner) else {
+                .clone();
+            #[cfg(test)]
+            let manager =
+                process_manager_from_inner_with_observer(inner, worker_test_hook.as_ref());
+            #[cfg(not(test))]
+            let manager = process_manager_from_inner(inner);
+            let Ok(manager) = manager else {
                 return;
             };
             let op_id = next_op_id();
-            let _ = manager.op_queue.submit(ProcessOp::StartServer {
-                op_id,
-                launch: launch_clone,
-                dimensions: SessionDimensions::default(),
-                activate: false,
-                response: None,
-            });
+            if manager
+                .op_queue
+                .submit(ProcessOp::StartServer {
+                    op_id,
+                    launch: launch_clone,
+                    dimensions: SessionDimensions::default(),
+                    activate: false,
+                    response: None,
+                })
+                .is_ok()
+            {
+                #[cfg(test)]
+                if let Some(hook) = worker_test_hook.as_ref() {
+                    hook(ProcessManagerDetachedWorkerTestPhase::AfterEffect);
+                }
+            }
         });
     }
 }
@@ -5370,15 +5389,16 @@ fn schedule_codex_original_fallback(
             return;
         };
         #[cfg(test)]
-        if let Some(hook) = inner
+        let worker_test_hook = inner
             .codex_fallback_worker_test_hook
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            hook();
-        }
-        let Ok(manager) = process_manager_from_inner(inner) else {
+            .clone();
+        #[cfg(test)]
+        let manager = process_manager_from_inner_with_observer(inner, worker_test_hook.as_ref());
+        #[cfg(not(test))]
+        let manager = process_manager_from_inner(inner);
+        let Ok(manager) = manager else {
             return;
         };
         let inner = manager.inner.clone();
@@ -5421,6 +5441,12 @@ fn schedule_codex_original_fallback(
         let fallback_result = terminal_ops
             .terminate_and_reap(&inner, &session_id)
             .and_then(|()| terminal_ops.spawn_original(&inner, &session_id, &launch, &environment));
+        #[cfg(test)]
+        if fallback_result.is_ok() {
+            if let Some(hook) = worker_test_hook.as_ref() {
+                hook(ProcessManagerDetachedWorkerTestPhase::AfterEffect);
+            }
+        }
         if fallback_result.is_err() {
             unbind_attachment_if_matches(&inner, attachment_binding.as_ref());
             manager.cleanup_browser_provider_session(&session_id);
@@ -5753,6 +5779,28 @@ fn next_ssh_session_id(connection_id: &str) -> String {
 }
 
 fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> Result<ProcessManager, String> {
+    #[cfg(test)]
+    {
+        process_manager_from_inner_with_observer(inner, None)
+    }
+    #[cfg(not(test))]
+    {
+        process_manager_from_inner_core(inner)
+    }
+}
+
+#[cfg(test)]
+fn process_manager_from_inner_with_observer(
+    inner: Arc<ProcessManagerInner>,
+    observer: Option<&ProcessManagerDetachedWorkerTestHook>,
+) -> Result<ProcessManager, String> {
+    process_manager_from_inner_core(inner, observer)
+}
+
+fn process_manager_from_inner_core(
+    inner: Arc<ProcessManagerInner>,
+    #[cfg(test)] observer: Option<&ProcessManagerDetachedWorkerTestHook>,
+) -> Result<ProcessManager, String> {
     let op_queue = inner
         .op_queue
         .lock()
@@ -5765,14 +5813,23 @@ fn process_manager_from_inner(inner: Arc<ProcessManagerInner>) -> Result<Process
         .ok()
         .and_then(|owner| owner.upgrade())
         .ok_or_else(|| "Claude overlay owner is unavailable.".to_string())?;
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        observer(ProcessManagerDetachedWorkerTestPhase::BeforeAcquire);
+    }
     inner.handle_lifecycle.acquire()?;
     let handle_lifecycle = inner.handle_lifecycle.clone();
-    Ok(ProcessManager {
+    let manager = ProcessManager {
         inner,
         op_queue,
         _claude_overlay_owner: claude_overlay_owner,
         handle_lifecycle,
-    })
+    };
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        observer(ProcessManagerDetachedWorkerTestPhase::AfterAcquire);
+    }
+    Ok(manager)
 }
 
 pub(crate) fn execute_process_op_inner(
@@ -6744,6 +6801,96 @@ mod tests {
         {
             handle.join().expect("background task stops cleanly");
         }
+    }
+
+    fn lifecycle_state_for_test(lifecycle: &ProcessManagerHandleLifecycle) -> (usize, bool) {
+        let state = lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.active_handles, state.shutting_down)
+    }
+
+    fn configure_auto_restart_race(manager: &ProcessManager, command_id: &str) -> ServerLaunchSpec {
+        stop_background_tasks_for_test(manager);
+        manager.inner.background_stop.store(false, Ordering::SeqCst);
+
+        let launch = ServerLaunchSpec {
+            command_id: command_id.to_string(),
+            project_id: "project".to_string(),
+            cwd: std::env::current_dir().unwrap(),
+            program: "definitely-not-a-devmanager-server".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            auto_restart: true,
+            log_file_path: None,
+        };
+        let mut session = SessionRuntimeState::new(
+            launch.command_id.clone(),
+            launch.cwd.clone(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Crashed;
+        session.configure_server(launch.clone());
+        manager.register_runtime_session(session);
+        manager
+            .inner
+            .restart_backoffs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                launch.command_id.clone(),
+                RestartBackoff {
+                    delay: Duration::ZERO,
+                    last_crash: Instant::now(),
+                },
+            );
+        launch
+    }
+
+    fn prepare_codex_fallback_race(
+        manager: &ProcessManager,
+        session_id: &str,
+    ) -> (
+        AiLaunchSpec,
+        HashMap<String, String>,
+        CodexAdapterIdentity,
+        BrowserAttachmentBroker,
+        BrowserAttachmentSessionBinding,
+    ) {
+        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        manager.prepare_browser_launch_for_session(
+            &mut launch,
+            session_id,
+            BrowserWorkspaceSnapshot::default(),
+        );
+        let broker = manager.browser_attachment_broker();
+        let original_binding = broker.binding(session_id).expect("initial browser binding");
+        let original_launch = launch.clone();
+        let environment = manager.prepare_codex_launch_for_session(&mut launch, session_id);
+        let identity = manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sessions
+            .get(session_id)
+            .expect("installed Codex adapter")
+            .identity()
+            .clone();
+        assert!(mark_codex_remote_command_injected(
+            &manager.inner,
+            session_id,
+            &identity,
+        ));
+        (
+            original_launch,
+            environment,
+            identity,
+            broker,
+            original_binding,
+        )
     }
 
     #[test]
@@ -9144,42 +9291,9 @@ mod tests {
     }
 
     #[test]
-    fn detached_auto_restart_cannot_launch_after_final_manager_shutdown() {
+    fn detached_auto_restart_shutdown_wins_at_lifecycle_admission() {
         let manager = ProcessManager::new();
-        stop_background_tasks_for_test(&manager);
-        manager.inner.background_stop.store(false, Ordering::SeqCst);
-
-        let launch = ServerLaunchSpec {
-            command_id: "shutdown-auto-restart".to_string(),
-            project_id: "project".to_string(),
-            cwd: std::env::current_dir().unwrap(),
-            program: "definitely-not-a-devmanager-server".to_string(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            auto_restart: true,
-            log_file_path: None,
-        };
-        let mut session = SessionRuntimeState::new(
-            launch.command_id.clone(),
-            launch.cwd.clone(),
-            SessionDimensions::default(),
-            TerminalBackend::PortablePtyFeedingAlacritty,
-        );
-        session.status = SessionStatus::Crashed;
-        session.configure_server(launch.clone());
-        manager.register_runtime_session(session);
-        manager
-            .inner
-            .restart_backoffs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                launch.command_id.clone(),
-                RestartBackoff {
-                    delay: Duration::ZERO,
-                    last_crash: Instant::now(),
-                },
-            );
+        let launch = configure_auto_restart_race(&manager, "shutdown-auto-restart");
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -9188,22 +9302,29 @@ mod tests {
             .inner
             .auto_restart_worker_test_hook
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
-            let _ = entered_tx.try_send(());
-            let _ = release_rx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recv();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |phase| {
+            if phase == ProcessManagerDetachedWorkerTestPhase::BeforeAcquire {
+                let _ = entered_tx.try_send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }
         }));
 
         let runtime_state = manager.inner.runtime_state.clone();
+        let lifecycle = manager.handle_lifecycle.clone();
+        let op_queue = manager.op_queue.clone();
         let inner = Arc::downgrade(&manager.inner);
         handle_auto_restart(&manager.inner);
         entered_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("auto-restart worker must reach the shutdown race barrier");
+            .expect("auto-restart worker must pause immediately before lifecycle admission");
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+        assert_eq!(op_queue.successful_submissions_for_test(), 0);
 
         drop(manager);
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
         release_tx.send(()).expect("release auto-restart worker");
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -9214,6 +9335,8 @@ mod tests {
             inner.upgrade().is_none(),
             "rejected auto-restart worker must release the manager inner"
         );
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        assert_eq!(op_queue.successful_submissions_for_test(), 0);
         let runtime = runtime_state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9226,11 +9349,97 @@ mod tests {
     }
 
     #[test]
-    fn detached_codex_fallback_cannot_mutate_or_launch_after_final_manager_shutdown() {
-        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
-        let gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+    fn detached_auto_restart_worker_lease_defers_final_shutdown() {
         let manager = ProcessManager::new();
-        manager.set_browser_gateway_registrar(Some(gateway.registrar()));
+        let _launch = configure_auto_restart_race(&manager, "admitted-auto-restart");
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_acquired_tx, release_acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let release_acquired_rx = Arc::new(Mutex::new(release_acquired_rx));
+        let (effect_tx, effect_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_effect_tx, release_effect_rx) = std::sync::mpsc::sync_channel(1);
+        let release_effect_rx = Arc::new(Mutex::new(release_effect_rx));
+        let acquired_hits = Arc::new(AtomicU64::new(0));
+        let observed_acquired_hits = acquired_hits.clone();
+        let effect_hits = Arc::new(AtomicU64::new(0));
+        let observed_effect_hits = effect_hits.clone();
+        *manager
+            .inner
+            .auto_restart_worker_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(move |phase| match phase {
+                ProcessManagerDetachedWorkerTestPhase::AfterAcquire => {
+                    observed_acquired_hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = acquired_tx.try_send(());
+                    let _ = release_acquired_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                }
+                ProcessManagerDetachedWorkerTestPhase::AfterEffect => {
+                    observed_effect_hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = effect_tx.try_send(());
+                    let _ = release_effect_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                }
+                ProcessManagerDetachedWorkerTestPhase::BeforeAcquire => {}
+            }));
+
+        let lifecycle = manager.handle_lifecycle.clone();
+        let op_queue = manager.op_queue.clone();
+        let inner = Arc::downgrade(&manager.inner);
+        handle_auto_restart(&manager.inner);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("auto-restart worker must pause after lifecycle admission");
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (2, false));
+        assert_eq!(op_queue.successful_submissions_for_test(), 0);
+
+        drop(manager);
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+        release_acquired_tx
+            .send(())
+            .expect("release admitted auto-restart worker");
+        effect_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("admitted auto-restart worker must submit exactly one operation");
+
+        let (active_handles, shutting_down) = lifecycle_state_for_test(&lifecycle);
+        assert!(active_handles >= 1);
+        assert!(!shutting_down);
+        assert_eq!(acquired_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(effect_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(op_queue.successful_submissions_for_test(), 1);
+
+        release_effect_tx
+            .send(())
+            .expect("release auto-restart worker after effect observation");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while op_queue.completed_operations_for_test() != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(op_queue.completed_operations_for_test(), 1);
+        while lifecycle_state_for_test(&lifecycle) != (0, true) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(inner.upgrade().is_none());
+        assert_eq!(op_queue.successful_submissions_for_test(), 1);
+        assert_eq!(op_queue.completed_operations_for_test(), 1);
+    }
+
+    #[test]
+    fn detached_codex_fallback_shutdown_wins_at_lifecycle_admission() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let _gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(_gateway.registrar()));
         manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
             Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
         }));
@@ -9246,31 +9455,8 @@ mod tests {
         })));
 
         let session_id = "shutdown-codex-fallback";
-        let mut launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
-        manager.prepare_browser_launch_for_session(
-            &mut launch,
-            session_id,
-            BrowserWorkspaceSnapshot::default(),
-        );
-        let broker = manager.browser_attachment_broker();
-        let original_binding = broker.binding(session_id).expect("initial browser binding");
-        let original_launch = launch.clone();
-        let environment = manager.prepare_codex_launch_for_session(&mut launch, session_id);
-        let identity = manager
-            .inner
-            .codex_adapter_registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .sessions
-            .get(session_id)
-            .expect("installed Codex adapter")
-            .identity()
-            .clone();
-        assert!(mark_codex_remote_command_injected(
-            &manager.inner,
-            session_id,
-            &identity,
-        ));
+        let (original_launch, environment, identity, broker, original_binding) =
+            prepare_codex_fallback_race(&manager, session_id);
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -9279,15 +9465,18 @@ mod tests {
             .inner
             .codex_fallback_worker_test_hook
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
-            let _ = entered_tx.try_send(());
-            let _ = release_rx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recv();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move |phase| {
+            if phase == ProcessManagerDetachedWorkerTestPhase::BeforeAcquire {
+                let _ = entered_tx.try_send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            }
         }));
 
         let runtime_state = manager.inner.runtime_state.clone();
+        let lifecycle = manager.handle_lifecycle.clone();
         let inner = Arc::downgrade(&manager.inner);
         schedule_codex_original_fallback(
             manager.inner.clone(),
@@ -9298,9 +9487,11 @@ mod tests {
         );
         entered_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("Codex fallback worker must reach the shutdown race barrier");
+            .expect("Codex fallback worker must pause immediately before lifecycle admission");
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
 
         drop(manager);
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
         release_tx.send(()).expect("release Codex fallback worker");
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -9311,6 +9502,7 @@ mod tests {
             inner.upgrade().is_none(),
             "rejected Codex fallback worker must release the manager inner"
         );
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
         assert!(steps.lock().unwrap().is_empty());
         assert_eq!(removed_events.load(Ordering::SeqCst), 0);
         assert_eq!(broker.binding(session_id), Some(original_binding));
@@ -9319,6 +9511,122 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sessions
             .contains_key(session_id));
+    }
+
+    #[test]
+    fn detached_codex_fallback_worker_lease_defers_final_shutdown() {
+        let (bridge, _inbox) = crate::browser::browser_command_channel(8);
+        let _gateway = crate::browser::BrowserGatewayHandle::start(bridge).unwrap();
+        let manager = ProcessManager::new();
+        manager.set_browser_gateway_registrar(Some(_gateway.registrar()));
+        manager.set_codex_adapter_preparer_for_test(Arc::new(|_| {
+            Ok(PreparedCodexAdapter::echo_sidecar_for_test(Vec::new()))
+        }));
+        let terminal_ops = Arc::new(RecordingCodexFallbackTerminalOps::default());
+        let steps = terminal_ops.steps.clone();
+        manager.set_codex_fallback_terminal_ops_for_test(terminal_ops);
+        let removed_events = Arc::new(AtomicU64::new(0));
+        let observed_removed_events = removed_events.clone();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            if matches!(event, RemoteSessionEvent::CodexAdapterRemoved { .. }) {
+                observed_removed_events.fetch_add(1, Ordering::SeqCst);
+            }
+        })));
+
+        let session_id = "admitted-codex-fallback";
+        let (original_launch, environment, identity, broker, original_binding) =
+            prepare_codex_fallback_race(&manager, session_id);
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_acquired_tx, release_acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let release_acquired_rx = Arc::new(Mutex::new(release_acquired_rx));
+        let (effect_tx, effect_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_effect_tx, release_effect_rx) = std::sync::mpsc::sync_channel(1);
+        let release_effect_rx = Arc::new(Mutex::new(release_effect_rx));
+        let acquired_hits = Arc::new(AtomicU64::new(0));
+        let observed_acquired_hits = acquired_hits.clone();
+        let effect_hits = Arc::new(AtomicU64::new(0));
+        let observed_effect_hits = effect_hits.clone();
+        *manager
+            .inner
+            .codex_fallback_worker_test_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(move |phase| match phase {
+                ProcessManagerDetachedWorkerTestPhase::AfterAcquire => {
+                    observed_acquired_hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = acquired_tx.try_send(());
+                    let _ = release_acquired_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                }
+                ProcessManagerDetachedWorkerTestPhase::AfterEffect => {
+                    observed_effect_hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = effect_tx.try_send(());
+                    let _ = release_effect_rx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                }
+                ProcessManagerDetachedWorkerTestPhase::BeforeAcquire => {}
+            }));
+
+        let lifecycle = manager.handle_lifecycle.clone();
+        let inner = Arc::downgrade(&manager.inner);
+        schedule_codex_original_fallback(
+            manager.inner.clone(),
+            session_id.to_string(),
+            identity,
+            original_launch,
+            environment,
+        );
+        acquired_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Codex fallback worker must pause after lifecycle admission");
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (2, false));
+
+        drop(manager);
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+        release_acquired_tx
+            .send(())
+            .expect("release admitted Codex fallback worker");
+        effect_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("admitted Codex fallback worker must complete its intended effects");
+
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (1, false));
+        assert_eq!(acquired_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(effect_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(removed_events.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![
+                format!("terminate-and-reap:{session_id}"),
+                format!("spawn-original:{session_id}:codex --full-auto"),
+            ]
+        );
+        let renewed_binding = broker
+            .binding(session_id)
+            .expect("admitted fallback renews its attachment binding");
+        assert_eq!(renewed_binding.session_id, original_binding.session_id);
+        assert_eq!(
+            renewed_binding.workspace_key,
+            original_binding.workspace_key
+        );
+        assert!(renewed_binding.generation > original_binding.generation);
+
+        release_effect_tx
+            .send(())
+            .expect("release Codex fallback worker after effect observation");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(inner.upgrade().is_none());
+        assert_eq!(lifecycle_state_for_test(&lifecycle), (0, true));
+        assert_eq!(removed_events.load(Ordering::SeqCst), 1);
+        assert_eq!(steps.lock().unwrap().len(), 2);
     }
 
     #[test]

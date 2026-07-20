@@ -266,6 +266,10 @@ pub struct ProcessOpQueue {
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<Mutex<HashMap<String, u64>>>,
+    #[cfg(test)]
+    successful_submissions: AtomicU64,
+    #[cfg(test)]
+    completed_operations: AtomicU64,
 }
 
 impl ProcessOpQueue {
@@ -299,6 +303,10 @@ impl ProcessOpQueue {
                 stop,
                 worker: Mutex::new(Some(worker)),
                 in_flight,
+                #[cfg(test)]
+                successful_submissions: AtomicU64::new(0),
+                #[cfg(test)]
+                completed_operations: AtomicU64::new(0),
             }
         })
     }
@@ -319,7 +327,19 @@ impl ProcessOpQueue {
         self.submit_tx
             .send(op)
             .map_err(|_| "Process operation queue is unavailable.".to_string())?;
+        #[cfg(test)]
+        self.successful_submissions.fetch_add(1, Ordering::SeqCst);
         Ok(op_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn successful_submissions_for_test(&self) -> u64 {
+        self.successful_submissions.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_operations_for_test(&self) -> u64 {
+        self.completed_operations.load(Ordering::SeqCst)
     }
 
     pub fn drain_completions(&self) -> Vec<ProcessOpCompletion> {
@@ -374,6 +394,10 @@ fn run_worker_loop(
                     break;
                 };
                 let completion = execute_process_op(&inner, op);
+                #[cfg(test)]
+                _queue_lease
+                    .completed_operations
+                    .fetch_add(1, Ordering::SeqCst);
                 if let Ok(mut map) = in_flight.lock() {
                     map.remove(&completion.target_id);
                 }
