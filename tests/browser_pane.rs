@@ -423,7 +423,7 @@ fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_e
     assert!(host.contains("self.native_view_builds.cancel_all()"));
     assert!(host.contains("self.native_view_build_specs.clear()"));
     assert!(host.contains("native_view_build_tasks: HashMap<u64, Task<()>>"));
-    assert!(host.contains("self.native_view_build_tasks.clear()"));
+    assert!(host.contains("pending_native_view_build_task_teardown: Vec<Task<()>>"));
 
     let spawn_start = host
         .find("fn spawn_native_view_build(")
@@ -435,6 +435,18 @@ fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_e
     let spawn = &host[spawn_start..spawn_end];
     assert!(spawn.contains("self.native_view_build_tasks.insert(build_id, task)"));
     assert!(!spawn.contains(".detach()"));
+
+    let cancel_start = host
+        .find("fn cancel_all_native_view_builds(")
+        .expect("native build cancellation");
+    let cancel_end = host[cancel_start..]
+        .find("fn evaluate_history(")
+        .map(|offset| cancel_start + offset)
+        .expect("native build cancellation end");
+    let cancel = &host[cancel_start..cancel_end];
+    assert!(cancel.contains("pending_native_view_build_task_teardown"));
+    assert!(cancel.contains("native_view_build_tasks.drain()"));
+    assert!(!cancel.contains("native_view_build_tasks.clear()"));
 
     let teardown_start = host
         .find("fn begin_native_window_teardown(")
@@ -456,12 +468,16 @@ fn native_webview_builds_are_fenced_by_the_actual_window_lifetime_and_deferred_e
         .map(|offset| host_pump_start + offset)
         .expect("native completion pump end");
     let host_pump = &host[host_pump_start..host_pump_end];
+    let deferred_task_drop = host_pump
+        .find("self.finish_native_view_build_task_teardown()")
+        .expect("deferred native build task cancellation");
     let deferred_drop = host_pump
         .find("self.finish_native_view_teardown()")
         .expect("deferred WebView destruction");
     let build_completion = host_pump
         .find("self.pump_native_view_build_completions(window)")
         .expect("native build completion");
+    assert!(deferred_task_drop < deferred_drop);
     assert!(deferred_drop < build_completion);
 
     let completion_start = host

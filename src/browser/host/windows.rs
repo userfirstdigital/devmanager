@@ -942,6 +942,7 @@ pub struct BrowserWebViewHost {
     native_view_build_specs: HashMap<u64, BrowserNativeViewBuildSpec>,
     native_view_build_cancellations: HashMap<u64, BrowserNativeViewBuildCancellation>,
     native_view_build_tasks: HashMap<u64, Task<()>>,
+    pending_native_view_build_task_teardown: Vec<Task<()>>,
     native_view_sender: Sender<BrowserNativeViewBuildCompletion>,
     native_view_receiver: Receiver<BrowserNativeViewBuildCompletion>,
     document_secret_states: HashMap<BrowserViewKey, Arc<BrowserDocumentSecretState>>,
@@ -1045,6 +1046,7 @@ impl BrowserWebViewHost {
             native_view_build_specs: HashMap::new(),
             native_view_build_cancellations: HashMap::new(),
             native_view_build_tasks: HashMap::new(),
+            pending_native_view_build_task_teardown: Vec::new(),
             native_view_sender,
             native_view_receiver,
             document_secret_states: HashMap::new(),
@@ -1540,6 +1542,7 @@ impl BrowserWebViewHost {
     }
 
     pub fn pump_async_completions(&mut self, window: &gpui::Window) {
+        self.finish_native_view_build_task_teardown();
         self.finish_native_view_teardown();
         self.pump_native_view_build_completions(window);
         let completions: Vec<_> = self.async_receiver.try_iter().collect();
@@ -1551,6 +1554,12 @@ impl BrowserWebViewHost {
             self.complete_annotation_capture(completion);
         }
         self.pump_repair_highlight_cleanups(window);
+    }
+
+    fn finish_native_view_build_task_teardown(&mut self) {
+        drop(std::mem::take(
+            &mut self.pending_native_view_build_task_teardown,
+        ));
     }
 
     fn finish_native_view_teardown(&mut self) {
@@ -6303,7 +6312,8 @@ impl BrowserWebViewHost {
         for cancellation in self.native_view_build_cancellations.values() {
             cancellation.cancel();
         }
-        self.native_view_build_tasks.clear();
+        self.pending_native_view_build_task_teardown
+            .extend(self.native_view_build_tasks.drain().map(|(_, task)| task));
         self.native_view_build_specs.clear();
         self.native_view_build_cancellations.clear();
         self.native_view_builds.cancel_all();
