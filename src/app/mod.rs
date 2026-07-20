@@ -926,7 +926,7 @@ impl BrowserAttachmentProjectionSink for NativeShellBrowserAttachmentProjectionS
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
-        let (browser_host, browser_app_config_dir, browser_config_diagnostic) =
+        let (mut browser_host, browser_app_config_dir, browser_config_diagnostic) =
             match crate::persistence::app_config_dir() {
                 Ok(app_config_dir) => {
                     let browser_host = BrowserWebViewHost::new(&app_config_dir);
@@ -946,6 +946,7 @@ impl NativeShell {
                     )
                 }
             };
+        browser_host.attach_foreground_executor(cx.foreground_executor().clone());
         let (browser_bridge, browser_inbox) = browser_command_channel(64);
         let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));

@@ -1494,6 +1494,7 @@ impl From<BrowserError> for ToolFailure {
             BrowserError::Interrupted => "user_interrupted",
             BrowserError::Timeout { .. } => "timeout",
             BrowserError::NavigationFailure { .. } => "navigation_failure",
+            BrowserError::InitializingView { .. } => "initializing_view",
             BrowserError::CrashedView { .. } => "crashed_view",
             BrowserError::LocatorNotFound { .. } => "locator_not_found",
             BrowserError::BlockedPermission { .. } => "blocked_permission",

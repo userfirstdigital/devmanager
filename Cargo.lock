@@ -1931,6 +1931,7 @@ dependencies = [
  "mime_guess",
  "portable-pty",
  "qrcode",
+ "raw-window-handle",
  "rcgen",
  "regex",
  "rfd",

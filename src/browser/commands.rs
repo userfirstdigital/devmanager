@@ -1615,10 +1615,8 @@ impl BrowserController {
         command: BrowserCommand,
         context: BrowserInvocationContext,
     ) -> Result<BrowserResponse, BrowserError> {
-        self.request_with_context_and_local_project_root(
-            command, context, None, None, None, None, None,
-        )
-        .await
+        self.request_with_view_initialization_retry(command, context, None)
+            .await
     }
 
     pub(crate) async fn request_replay_lifecycle_command(
@@ -1657,16 +1655,49 @@ impl BrowserController {
         local_project_root: &std::path::Path,
     ) -> Result<BrowserResponse, BrowserError> {
         let canonical = verified_authenticated_local_project_root(local_project_root)?;
-        self.request_with_context_and_local_project_root(
-            command,
-            context,
-            Some(canonical),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
+        self.request_with_view_initialization_retry(command, context, Some(canonical))
+            .await
+    }
+
+    async fn request_with_view_initialization_retry(
+        &self,
+        command: BrowserCommand,
+        context: BrowserInvocationContext,
+        local_project_root: Option<PathBuf>,
+    ) -> Result<BrowserResponse, BrowserError> {
+        context.validate()?;
+        let operation = command.operation_name().to_string();
+        let deadline =
+            tokio::time::Instant::now() + command_transport_timeout(self.timeout, &command);
+        loop {
+            let attempt = self.request_with_context_and_local_project_root(
+                command.clone(),
+                context.clone(),
+                local_project_root.clone(),
+                None,
+                None,
+                None,
+                None,
+            );
+            let result = tokio::time::timeout_at(deadline, attempt)
+                .await
+                .map_err(|_| BrowserError::Timeout {
+                    operation: operation.clone(),
+                })?;
+            match result {
+                Err(BrowserError::InitializingView { .. }) => {
+                    let retry_at = tokio::time::Instant::now()
+                        .checked_add(Duration::from_millis(25))
+                        .unwrap_or(deadline)
+                        .min(deadline);
+                    if retry_at >= deadline {
+                        return Err(BrowserError::Timeout { operation });
+                    }
+                    tokio::time::sleep_until(retry_at).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     #[allow(dead_code)] // The checkpoint-9 replay executor consumes this secure lane in Task 4.
@@ -3490,6 +3521,126 @@ mod secure_command_tests {
 
     const SECRET_INPUT: &str = "password";
     const SECRET_VALUE: &str = "value-sentinel-secure-sidecar";
+
+    #[tokio::test]
+    async fn controller_retries_the_exact_command_while_its_view_initializes() {
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let workspace_key = workspace("view-initialization-retry", "conversation-a");
+        let controller = bridge.bind(workspace_key, Duration::from_secs(2));
+        let command = BrowserCommand::Navigate {
+            tab_id: "tab-a".to_string(),
+            url: "https://example.test/ready".to_string(),
+        };
+        let context =
+            BrowserInvocationContext::agent("open the ready page", BrowserRisk::Normal).unwrap();
+        let requested_command = command.clone();
+        let requested_context = context.clone();
+        let task = tokio::spawn(async move {
+            controller
+                .request_with_context(requested_command, requested_context)
+                .await
+        });
+
+        let first = inbox.recv().await.expect("first command attempt");
+        assert_eq!(first.command(), &command);
+        assert_eq!(first.context(), &context);
+        first.respond(Err(BrowserError::InitializingView {
+            tab_id: "tab-a".to_string(),
+        }));
+
+        let retry = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .expect("controller should retry initializing views")
+            .expect("retry command");
+        assert_eq!(retry.command(), &command);
+        assert_eq!(retry.context(), &context);
+        retry.respond(Ok(BrowserResponse::Acknowledged));
+
+        assert_eq!(task.await.unwrap(), Ok(BrowserResponse::Acknowledged));
+    }
+
+    #[tokio::test]
+    async fn controller_view_initialization_retries_share_one_bounded_deadline() {
+        let (bridge, mut inbox) = browser_command_channel(4);
+        let workspace_key = workspace("view-initialization-timeout", "conversation-a");
+        let controller = bridge.bind(workspace_key, Duration::from_millis(70));
+        let task = tokio::spawn(async move {
+            controller
+                .request_with_context(
+                    BrowserCommand::Reload {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "reload after initialization",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+
+        for _ in 0..3 {
+            let request = tokio::time::timeout(Duration::from_millis(200), inbox.recv())
+                .await
+                .expect("initialization retry should arrive before the shared deadline")
+                .expect("retry request");
+            request.respond(Err(BrowserError::InitializingView {
+                tab_id: "tab-a".to_string(),
+            }));
+        }
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("initialization retries must be bounded")
+                .unwrap(),
+            Err(BrowserError::Timeout {
+                operation: "reload".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_revocation_interrupts_a_view_initialization_retry() {
+        let (bridge, mut inbox) = browser_command_channel(2);
+        let workspace_key = workspace("view-initialization-revoked", "conversation-a");
+        let registration = BrowserRegistrationLease::new();
+        let controller = bridge.bind_with_registration_lease(
+            workspace_key.clone(),
+            Duration::from_secs(1),
+            Some(registration.clone()),
+        );
+        let task_controller = controller.clone();
+        let task = tokio::spawn(async move {
+            task_controller
+                .request_with_context(
+                    BrowserCommand::Reload {
+                        tab_id: "tab-a".to_string(),
+                    },
+                    BrowserInvocationContext::agent(
+                        "reload after initialization",
+                        BrowserRisk::Normal,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+
+        let first = inbox.recv().await.expect("first registered request");
+        first.respond(Err(BrowserError::InitializingView {
+            tab_id: "tab-a".to_string(),
+        }));
+        bridge.revoke_registration(&workspace_key, &registration);
+
+        assert_eq!(task.await.unwrap(), Err(BrowserError::Interrupted));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox.recv())
+                .await
+                .is_err(),
+            "revoked retry must not reach the host inbox"
+        );
+        drop(controller);
+    }
 
     #[test]
     fn repair_capture_error_boundary_is_a_closed_value_free_allowlist() {

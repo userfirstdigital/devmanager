@@ -321,6 +321,89 @@ fn native_shell_awaits_browser_commands_in_a_window_local_main_thread_task() {
 }
 
 #[test]
+fn native_webview_construction_never_runs_under_the_gpui_app_borrow() {
+    let host = include_str!("../src/browser/host/windows.rs");
+    let ensure_start = host
+        .find("fn ensure_view(")
+        .expect("native host should have a single view admission point");
+    let ensure_end = host[ensure_start..]
+        .find("fn evaluate_history(")
+        .map(|offset| ensure_start + offset)
+        .expect("history helper should follow view admission");
+    let ensure = &host[ensure_start..ensure_end];
+    assert!(ensure.contains("spawn_native_view_build"));
+    assert!(
+        !ensure.contains("build_as_child"),
+        "synchronous host entry still holds GPUI AppCell and bridge borrows"
+    );
+
+    let spawn_start = host
+        .find("fn spawn_native_view_build(")
+        .expect("prepared builds should be scheduled outside the GPUI app borrow");
+    let spawn_end = host[spawn_start..]
+        .find("fn complete_native_view_build(")
+        .map(|offset| spawn_start + offset)
+        .expect("native completion should follow native scheduling");
+    let spawn = &host[spawn_start..spawn_end];
+    assert!(spawn.contains(".spawn(async move {"));
+    assert!(spawn.contains("job.build(parent_window)"));
+    assert!(!spawn.contains("AsyncApp"));
+    assert!(!spawn.contains("update_in("));
+    assert!(!spawn.contains("with_locked_host_work"));
+
+    let completion_start = host[spawn_start..]
+        .find("fn complete_native_view_build(")
+        .map(|offset| spawn_start + offset)
+        .expect("native build completion should restore the host lease");
+    let completion_end = host[completion_start..]
+        .find("fn pump_native_view_build_completions(")
+        .map(|offset| completion_start + offset)
+        .expect("completion pump should follow completion application");
+    let completion = &host[completion_start..completion_end];
+    let restore = completion
+        .find("self.projects.insert")
+        .expect("every result must restore its project WebContext");
+    let accept = completion
+        .find("self.native_view_builds.complete")
+        .expect("completion should retire the exact build lease");
+    assert!(restore < accept);
+    assert!(completion.contains("set_bounds(wry_bounds(self.bounds))"));
+    assert!(completion.contains("self.apply_visibility_plan()"));
+
+    let build_start = host
+        .find("impl BrowserNativeViewBuildJob")
+        .expect("foreground job should own WebView construction");
+    let build_end = host[build_start..]
+        .find("impl BrowserWebViewHost")
+        .map(|offset| build_start + offset)
+        .expect("host implementation should follow the detached build job");
+    let build = &host[build_start..build_end];
+    assert!(build.contains("builder.build_as_child(&parent_window)"));
+    assert_eq!(host.matches("build_as_child").count(), 1);
+    assert!(!build.contains("AsyncApp"));
+    assert!(!build.contains("WeakEntity"));
+
+    let request_start = host
+        .find("pub fn handle_request(")
+        .expect("native host should receive controller requests");
+    let request_end = host[request_start..]
+        .find("pub(crate) fn handle_repair_highlight_cleanup(")
+        .map(|offset| request_start + offset)
+        .expect("request handler should end before repair cleanup");
+    let request = &host[request_start..request_end];
+    let readiness = request
+        .find("require_command_view_ready")
+        .expect("view readiness must be established before agent side effects");
+    let recording = request
+        .find("reserve_agent_command")
+        .expect("agent workflow recording admission should remain present");
+    assert!(readiness < recording);
+    let readiness_branch = &request[readiness..recording];
+    assert!(readiness_branch.contains("request.respond(Err(error))"));
+    assert!(!readiness_branch.contains("self.respond_request"));
+}
+
+#[test]
 fn native_browser_storage_never_treats_the_process_cwd_as_trusted_config() {
     let source = include_str!("../src/app/mod.rs");
     assert!(!source.contains(

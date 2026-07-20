@@ -45,6 +45,7 @@ getrandom = "0.3.4"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
 wry = { version = "=0.55.1", default-features = false, features = ["devtools", "protocol", "os-webview"] }
 webview2-com = "=0.38.2"
 windows = { version = "=0.61.3", features = ["Win32_Storage_FileSystem"] }

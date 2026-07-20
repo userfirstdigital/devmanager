@@ -45,6 +45,11 @@ use crate::browser::{
     MAX_BROWSER_ACTIONS, MAX_BROWSER_RECIPE_WAIT_MS,
 };
 use base64::Engine as _;
+use gpui::ForegroundExecutor;
+use raw_window_handle::{
+    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle,
+    WindowHandle as BorrowedWindowHandle,
+};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -79,6 +84,149 @@ use zeroize::{Zeroize, Zeroizing};
 struct BrowserViewKey {
     workspace_key: BrowserWorkspaceKey,
     tab_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserNativeViewBuildAdmission {
+    Start { build_id: u64 },
+    Queued { build_id: u64 },
+    Pending { build_id: u64 },
+    Failed { message: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BrowserNativeViewBuildCompletionPlan {
+    accepted: bool,
+    next: Option<(BrowserViewKey, u64)>,
+}
+
+#[derive(Default)]
+struct BrowserNativeViewBuildQueue {
+    next_build_id: u64,
+    pending: HashMap<BrowserViewKey, u64>,
+    active_projects: HashMap<String, u64>,
+    waiting: VecDeque<(BrowserViewKey, u64)>,
+    failures: HashMap<BrowserViewKey, String>,
+}
+
+impl BrowserNativeViewBuildQueue {
+    fn admit(
+        &mut self,
+        key: BrowserViewKey,
+        retry_failed: bool,
+    ) -> BrowserNativeViewBuildAdmission {
+        if let Some(build_id) = self.pending.get(&key).copied() {
+            return BrowserNativeViewBuildAdmission::Pending { build_id };
+        }
+        if let Some(message) = self.failures.get(&key).cloned() {
+            if !retry_failed {
+                return BrowserNativeViewBuildAdmission::Failed { message };
+            }
+            self.failures.remove(&key);
+        }
+        let build_id = self.next_id();
+        self.pending.insert(key.clone(), build_id);
+        let project_id = key.workspace_key.project_id.clone();
+        if self.active_projects.contains_key(&project_id) {
+            self.waiting.push_back((key, build_id));
+            BrowserNativeViewBuildAdmission::Queued { build_id }
+        } else {
+            self.active_projects.insert(project_id, build_id);
+            BrowserNativeViewBuildAdmission::Start { build_id }
+        }
+    }
+
+    fn complete(
+        &mut self,
+        key: &BrowserViewKey,
+        build_id: u64,
+        result: Result<(), String>,
+    ) -> BrowserNativeViewBuildCompletionPlan {
+        let project_id = key.workspace_key.project_id.clone();
+        let owned_project_lease = self.active_projects.get(&project_id) == Some(&build_id);
+        if owned_project_lease {
+            self.active_projects.remove(&project_id);
+        }
+        let accepted = self.pending.get(key) == Some(&build_id);
+        if accepted {
+            self.pending.remove(key);
+            if let Err(message) = result {
+                self.failures.insert(key.clone(), message);
+            }
+        }
+        let next = owned_project_lease
+            .then(|| self.take_next_for_project(&project_id))
+            .flatten();
+        BrowserNativeViewBuildCompletionPlan { accepted, next }
+    }
+
+    fn is_pending(&self, key: &BrowserViewKey) -> bool {
+        self.pending.contains_key(key)
+    }
+
+    fn failure(&self, key: &BrowserViewKey) -> Option<&str> {
+        self.failures.get(key).map(String::as_str)
+    }
+
+    fn pending_for_project(&self, project_id: &str) -> Option<&BrowserViewKey> {
+        self.pending
+            .keys()
+            .find(|key| key.workspace_key.project_id == project_id)
+    }
+
+    fn cancel(&mut self, key: &BrowserViewKey) {
+        self.pending.remove(key);
+        self.failures.remove(key);
+        self.waiting.retain(|(waiting, _)| waiting != key);
+    }
+
+    fn cancel_workspace(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        let keys: Vec<_> = self
+            .pending
+            .keys()
+            .chain(self.failures.keys())
+            .filter(|key| key.workspace_key == *workspace_key)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.cancel(&key);
+        }
+    }
+
+    fn cancel_project(&mut self, project_id: &str) {
+        let keys: Vec<_> = self
+            .pending
+            .keys()
+            .chain(self.failures.keys())
+            .filter(|key| key.workspace_key.project_id == project_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.cancel(&key);
+        }
+    }
+
+    fn take_next_for_project(&mut self, project_id: &str) -> Option<(BrowserViewKey, u64)> {
+        let index = self.waiting.iter().position(|(key, build_id)| {
+            key.workspace_key.project_id == project_id && self.pending.get(key) == Some(build_id)
+        })?;
+        let next = self.waiting.remove(index)?;
+        self.active_projects.insert(project_id.to_string(), next.1);
+        Some(next)
+    }
+
+    fn next_id(&mut self) -> u64 {
+        loop {
+            self.next_build_id = self.next_build_id.wrapping_add(1).max(1);
+            if !self
+                .pending
+                .values()
+                .any(|build_id| *build_id == self.next_build_id)
+            {
+                return self.next_build_id;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -562,6 +710,133 @@ struct BrowserProjectRuntime {
     context: WebContext,
 }
 
+#[derive(Clone, Copy)]
+struct BrowserParentWindowHandle {
+    handle: Win32WindowHandle,
+}
+
+impl BrowserParentWindowHandle {
+    fn from_gpui(window: &gpui::Window) -> Result<Self, BrowserError> {
+        let handle = HasWindowHandle::window_handle(window).map_err(view_failure)?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return Err(BrowserError::CrashedView {
+                message: "GPUI did not expose a Win32 parent window handle".to_string(),
+            });
+        };
+        Ok(Self { handle })
+    }
+}
+
+impl HasWindowHandle for BrowserParentWindowHandle {
+    fn window_handle(&self) -> Result<BorrowedWindowHandle<'_>, HandleError> {
+        // SAFETY: GPUI owns this HWND for the lifetime of the foreground build task. The task is
+        // scheduled and polled only on the same Windows UI thread that supplied the handle.
+        Ok(unsafe { BorrowedWindowHandle::borrow_raw(RawWindowHandle::Win32(self.handle)) })
+    }
+}
+
+struct BrowserNativeViewBuildSpec {
+    build_id: u64,
+    key: BrowserViewKey,
+    trusted_app_config_dir: PathBuf,
+    downloads_dir: PathBuf,
+    url: String,
+    bounds: Rect,
+    event_sender: Sender<BrowserHostEvent>,
+    recording_ingress: BrowserPageRecordingIngress,
+    document_secret_state: Arc<BrowserDocumentSecretState>,
+    parent_window: BrowserParentWindowHandle,
+}
+
+struct BrowserNativeViewBuildJob {
+    spec: BrowserNativeViewBuildSpec,
+    project: BrowserProjectRuntime,
+}
+
+struct BrowserNativeViewBuildCompletion {
+    build_id: u64,
+    key: BrowserViewKey,
+    project: BrowserProjectRuntime,
+    recording_ingress: BrowserPageRecordingIngress,
+    document_secret_state: Arc<BrowserDocumentSecretState>,
+    result: Result<WebView, BrowserError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserViewReadiness {
+    Ready,
+    Initializing,
+}
+
+impl BrowserNativeViewBuildJob {
+    fn build(
+        mut self,
+        parent_window: BrowserParentWindowHandle,
+    ) -> BrowserNativeViewBuildCompletion {
+        let BrowserNativeViewBuildSpec {
+            build_id,
+            key,
+            trusted_app_config_dir,
+            downloads_dir,
+            url,
+            bounds,
+            event_sender,
+            recording_ingress,
+            document_secret_state,
+            parent_window: _,
+        } = self.spec;
+        let workspace_key = key.workspace_key.clone();
+        let tab_id = key.tab_id.clone();
+        let builder = configured_builder(
+            &mut self.project.context,
+            event_sender.clone(),
+            recording_ingress.clone(),
+            document_secret_state.clone(),
+            workspace_key.clone(),
+            tab_id.clone(),
+            trusted_app_config_dir,
+            downloads_dir,
+            url,
+            bounds,
+        );
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder.build_as_child(&parent_window)
+        })) {
+            Ok(Ok(webview)) => Ok(webview),
+            Ok(Err(error)) => Err(view_failure(error)),
+            Err(payload) => Err(BrowserError::CrashedView {
+                message: format!(
+                    "Wry panicked while creating a child WebView: {}",
+                    panic_message(payload)
+                ),
+            }),
+        }
+        .and_then(|webview| {
+            attach_document_lifecycle_handlers(&webview, document_secret_state.clone())?;
+            attach_permission_handler(
+                &webview,
+                event_sender,
+                document_secret_state.clone(),
+                workspace_key,
+                tab_id,
+            )?;
+            webview.set_visible(false).map_err(view_failure)?;
+            webview
+                .set_memory_usage_level(MemoryUsageLevel::Low)
+                .map_err(view_failure)?;
+            Ok(webview)
+        });
+        BrowserNativeViewBuildCompletion {
+            build_id,
+            key,
+            project: self.project,
+            recording_ingress,
+            document_secret_state,
+            result,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BrowserQueuedUserInputState {
     NotUserInput,
@@ -595,6 +870,11 @@ pub struct BrowserWebViewHost {
     state: BrowserHostState,
     projects: HashMap<String, BrowserProjectRuntime>,
     views: HashMap<BrowserViewKey, WebView>,
+    native_executor: Option<ForegroundExecutor>,
+    native_view_builds: BrowserNativeViewBuildQueue,
+    native_view_build_specs: HashMap<u64, BrowserNativeViewBuildSpec>,
+    native_view_sender: Sender<BrowserNativeViewBuildCompletion>,
+    native_view_receiver: Receiver<BrowserNativeViewBuildCompletion>,
     document_secret_states: HashMap<BrowserViewKey, Arc<BrowserDocumentSecretState>>,
     bounds: BrowserBounds,
     event_sender: Sender<BrowserHostEvent>,
@@ -673,6 +953,7 @@ impl BrowserWebViewHost {
         let (event_sender, event_receiver) = mpsc::channel();
         let (async_sender, async_receiver) = mpsc::channel();
         let (annotation_sender, annotation_receiver) = mpsc::channel();
+        let (native_view_sender, native_view_receiver) = mpsc::channel();
         let state_app_config_dir = trusted_app_config_dir
             .as_ref()
             .unwrap_or(&app_config_dir)
@@ -683,6 +964,11 @@ impl BrowserWebViewHost {
             trusted_app_config_dir,
             projects: HashMap::new(),
             views: HashMap::new(),
+            native_executor: None,
+            native_view_builds: BrowserNativeViewBuildQueue::default(),
+            native_view_build_specs: HashMap::new(),
+            native_view_sender,
+            native_view_receiver,
             document_secret_states: HashMap::new(),
             bounds: BrowserBounds {
                 x: 0,
@@ -716,6 +1002,10 @@ impl BrowserWebViewHost {
 
     pub fn status(&self) -> BrowserHostStatus {
         self.status.clone()
+    }
+
+    pub fn attach_foreground_executor(&mut self, executor: ForegroundExecutor) {
+        self.native_executor = Some(executor);
     }
 
     pub fn cancel_annotation_selection(
@@ -914,6 +1204,7 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         command: BrowserCommand,
     ) -> Result<BrowserResponse, BrowserError> {
+        self.pump_native_view_build_completions(window);
         validate_direct_secret_command(&command)?;
         validate_direct_repair_preview_command(&command)?;
         self.pump_page_recording_ipc();
@@ -1044,6 +1335,7 @@ impl BrowserWebViewHost {
     }
 
     pub fn handle_request(&mut self, window: &gpui::Window, request: BrowserCommandRequest) {
+        self.pump_native_view_build_completions(window);
         if let Err(error) = request.validate_secret_sidecar() {
             request.respond(Err(error));
             return;
@@ -1067,6 +1359,10 @@ impl BrowserWebViewHost {
         self.pump_page_recording_ipc();
         let workspace_key = request.workspace_key().clone();
         let command = request.command().clone();
+        if let Err(error) = self.require_command_view_ready(window, &workspace_key, &command) {
+            request.respond(Err(error));
+            return;
+        }
         if request.records_workflow_recipe_action() {
             if let Err(error) = self.workflow_coordinator.reserve_agent_command(
                 &workspace_key,
@@ -1129,6 +1425,7 @@ impl BrowserWebViewHost {
     }
 
     pub fn pump_async_completions(&mut self, window: &gpui::Window) {
+        self.pump_native_view_build_completions(window);
         let completions: Vec<_> = self.async_receiver.try_iter().collect();
         for completion in completions {
             self.complete_async_operation(window, completion);
@@ -1657,7 +1954,7 @@ impl BrowserWebViewHost {
         let tab_id = command
             .tab_id()
             .expect("automation commands always identify a logical tab");
-        if let Err(error) = self.ensure_existing_tab_view(window, workspace_key, tab_id) {
+        if let Err(error) = self.require_existing_tab_view(window, workspace_key, tab_id) {
             return BrowserStartResult::Complete(Err(error));
         }
         if matches!(
@@ -2420,7 +2717,7 @@ impl BrowserWebViewHost {
                 message: "is already pending for this tab".to_string(),
             });
         }
-        self.ensure_existing_tab_view(window, workspace_key, tab_id)?;
+        self.require_existing_tab_view(window, workspace_key, tab_id)?;
         let capture_id = random_annotation_capture_id()?;
         self.annotation_captures.insert(
             route.clone(),
@@ -5118,7 +5415,7 @@ impl BrowserWebViewHost {
                     .ensure_workspace(workspace_key.clone(), snapshot)?;
                 self.reconcile_annotation_pins(workspace_key)?;
                 self.retry_annotation_cleanups(workspace_key);
-                self.ensure_selected_view(window, workspace_key)?;
+                let _ = self.ensure_selected_view(window, workspace_key, true)?;
                 self.apply_visibility_plan()?;
                 Ok(BrowserResponse::Workspace { mutation })
             }
@@ -5149,7 +5446,7 @@ impl BrowserWebViewHost {
                     .ok_or_else(|| missing_tab(&tab_id))?;
                 let url = tab.url.clone();
                 let revision = snapshot.revision;
-                self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                self.require_existing_tab_view(window, workspace_key, &tab_id)?;
                 let context = json!({"url": url, "revision": revision.0});
                 self.view(workspace_key, &tab_id)?
                     .evaluate_script(&format!(
@@ -5343,14 +5640,14 @@ impl BrowserWebViewHost {
                 let mutation = self
                     .state
                     .create_tab(workspace_key, url.as_deref().unwrap_or("about:blank"))?;
-                self.ensure_selected_view(window, workspace_key)?;
+                let _ = self.ensure_selected_view(window, workspace_key, true)?;
                 self.apply_visibility_plan()?;
                 Ok(BrowserResponse::Workspace { mutation })
             }
             BrowserCommand::SelectTab { tab_id } => {
                 self.cancel_workspace_annotations(workspace_key);
                 let mutation = self.state.select_tab(workspace_key, &tab_id)?;
-                self.ensure_selected_view(window, workspace_key)?;
+                let _ = self.ensure_selected_view(window, workspace_key, true)?;
                 self.apply_visibility_plan()?;
                 Ok(BrowserResponse::Workspace { mutation })
             }
@@ -5360,12 +5657,13 @@ impl BrowserWebViewHost {
                 }
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
                 let key = view_key(workspace_key, &tab_id);
+                self.cancel_native_view_build(&key);
                 self.views.remove(&key);
                 self.recording_ingresses.remove(&key);
                 self.document_secret_states.remove(&key);
                 self.terminalize_repair_preview_target(workspace_key, &tab_id);
                 let mutation = self.state.close_tab(workspace_key, &tab_id)?;
-                self.ensure_selected_view(window, workspace_key)?;
+                let _ = self.ensure_selected_view(window, workspace_key, true)?;
                 self.apply_visibility_plan()?;
                 Ok(BrowserResponse::Workspace { mutation })
             }
@@ -5375,7 +5673,7 @@ impl BrowserWebViewHost {
                 }
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
                 let url = validate_browser_url(&url)?;
-                self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                self.require_existing_tab_view(window, workspace_key, &tab_id)?;
                 if let Some(state) = self
                     .document_secret_states
                     .get(&view_key(workspace_key, &tab_id))
@@ -5427,7 +5725,7 @@ impl BrowserWebViewHost {
                     self.cancel_annotation_route(&route);
                 }
                 let _ = self.remove_page_recording_view(workspace_key, &tab_id);
-                self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                self.require_existing_tab_view(window, workspace_key, &tab_id)?;
                 if let Some(state) = self
                     .document_secret_states
                     .get(&view_key(workspace_key, &tab_id))
@@ -5456,14 +5754,14 @@ impl BrowserWebViewHost {
                 Ok(BrowserResponse::Workspace { mutation })
             }
             BrowserCommand::OpenDevTools { tab_id } => {
-                self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                self.require_existing_tab_view(window, workspace_key, &tab_id)?;
                 self.ensure_document_content_available(workspace_key, &tab_id)?;
                 self.view(workspace_key, &tab_id)?.open_devtools();
                 Ok(BrowserResponse::Acknowledged)
             }
             BrowserCommand::Stop { tab_id } => {
                 if let Some(tab_id) = tab_id {
-                    self.ensure_existing_tab_view(window, workspace_key, &tab_id)?;
+                    self.require_existing_tab_view(window, workspace_key, &tab_id)?;
                     self.view(workspace_key, &tab_id)?
                         .evaluate_script("window.stop()")
                         .map_err(view_failure)?;
@@ -5480,6 +5778,7 @@ impl BrowserWebViewHost {
             BrowserCommand::ResetWorkspace => {
                 self.discard_workflow_state(workspace_key);
                 self.terminalize_repair_preview_workspace(workspace_key);
+                self.cancel_native_workspace_builds(workspace_key);
                 self.views
                     .retain(|key, _| key.workspace_key != *workspace_key);
                 self.recording_ingresses
@@ -5557,12 +5856,13 @@ impl BrowserWebViewHost {
         &mut self,
         window: &gpui::Window,
         workspace_key: &BrowserWorkspaceKey,
-    ) -> Result<(), BrowserError> {
+        retry_failed: bool,
+    ) -> Result<BrowserViewReadiness, BrowserError> {
         let plan = self
             .state
             .selected_view_plan(workspace_key)
             .ok_or_else(missing_workspace)?;
-        self.ensure_view(window, workspace_key, &plan.tab_id, &plan.url)
+        self.ensure_view(window, workspace_key, &plan.tab_id, &plan.url, retry_failed)
     }
 
     fn ensure_existing_tab_view(
@@ -5570,14 +5870,28 @@ impl BrowserWebViewHost {
         window: &gpui::Window,
         workspace_key: &BrowserWorkspaceKey,
         tab_id: &str,
-    ) -> Result<(), BrowserError> {
+    ) -> Result<BrowserViewReadiness, BrowserError> {
         let url = self
             .state
             .workspace(workspace_key)
             .and_then(|snapshot| snapshot.tabs.iter().find(|tab| tab.id == tab_id))
             .map(|tab| tab.url.clone())
             .ok_or_else(|| missing_tab(tab_id))?;
-        self.ensure_view(window, workspace_key, tab_id, &url)
+        self.ensure_view(window, workspace_key, tab_id, &url, false)
+    }
+
+    fn require_existing_tab_view(
+        &mut self,
+        window: &gpui::Window,
+        workspace_key: &BrowserWorkspaceKey,
+        tab_id: &str,
+    ) -> Result<(), BrowserError> {
+        match self.ensure_existing_tab_view(window, workspace_key, tab_id)? {
+            BrowserViewReadiness::Ready => Ok(()),
+            BrowserViewReadiness::Initializing => Err(BrowserError::InitializingView {
+                tab_id: tab_id.to_string(),
+            }),
+        }
     }
 
     fn ensure_view(
@@ -5586,11 +5900,29 @@ impl BrowserWebViewHost {
         workspace_key: &BrowserWorkspaceKey,
         tab_id: &str,
         url: &str,
-    ) -> Result<(), BrowserError> {
+        retry_failed: bool,
+    ) -> Result<BrowserViewReadiness, BrowserError> {
         let key = view_key(workspace_key, tab_id);
         if self.views.contains_key(&key) {
-            return Ok(());
+            return Ok(BrowserViewReadiness::Ready);
         }
+        if self.native_view_builds.is_pending(&key) {
+            return Ok(BrowserViewReadiness::Initializing);
+        }
+        if !retry_failed {
+            if let Some(message) = self.native_view_builds.failure(&key) {
+                return Err(BrowserError::CrashedView {
+                    message: message.to_string(),
+                });
+            }
+        }
+        let _executor = self
+            .native_executor
+            .as_ref()
+            .ok_or_else(|| BrowserError::CrashedView {
+                message: "browser foreground executor is unavailable".to_string(),
+            })?;
+        let parent_window = BrowserParentWindowHandle::from_gpui(window)?;
         let url = validate_browser_url(url)?;
         let retained_trust_root = self.verified_trusted_app_config_dir()?.to_path_buf();
         let (trusted_app_config_dir, layout) =
@@ -5600,83 +5932,204 @@ impl BrowserWebViewHost {
                 path: retained_trust_root,
             });
         }
-        let downloads_dir = layout.downloads_dir.clone();
-        self.projects
-            .entry(workspace_key.project_id.clone())
-            .or_insert_with(|| BrowserProjectRuntime {
-                context: WebContext::new(Some(layout.profile_dir.clone())),
-            });
-
-        let sender = self.event_sender.clone();
         let recording_ingress = self
             .recording_transport
             .ingress(workspace_key.clone(), tab_id.to_string());
         let document_secret_state = Arc::new(BrowserDocumentSecretState::default());
-        let callback_workspace = workspace_key.clone();
-        let callback_tab = tab_id.to_string();
-        let bounds = wry_bounds(self.bounds);
-        let webview = {
-            let project = self
-                .projects
-                .get_mut(&workspace_key.project_id)
-                .ok_or_else(|| BrowserError::CrashedView {
-                    message: "browser project context was not initialized".to_string(),
-                })?;
-            let builder = configured_builder(
-                &mut project.context,
-                sender,
-                recording_ingress.clone(),
-                document_secret_state.clone(),
-                callback_workspace,
-                callback_tab,
-                trusted_app_config_dir,
-                downloads_dir,
-                url,
-                bounds,
-            );
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                builder.build_as_child(window)
-            })) {
-                Ok(Ok(webview)) => webview,
-                Ok(Err(error)) => return Err(view_failure(error)),
-                Err(payload) => {
-                    return Err(BrowserError::CrashedView {
-                        message: format!(
-                            "Wry panicked while creating a child WebView: {}",
-                            panic_message(payload)
-                        ),
-                    })
-                }
+        let admission = self.native_view_builds.admit(key.clone(), retry_failed);
+        let build_id = match admission {
+            BrowserNativeViewBuildAdmission::Start { build_id }
+            | BrowserNativeViewBuildAdmission::Queued { build_id } => build_id,
+            BrowserNativeViewBuildAdmission::Pending { .. } => {
+                return Ok(BrowserViewReadiness::Initializing)
+            }
+            BrowserNativeViewBuildAdmission::Failed { message } => {
+                return Err(BrowserError::CrashedView { message })
             }
         };
-        attach_document_lifecycle_handlers(&webview, document_secret_state.clone())?;
-        attach_permission_handler(
-            &webview,
-            self.event_sender.clone(),
-            document_secret_state.clone(),
-            workspace_key.clone(),
-            tab_id.to_string(),
-        )?;
-        webview.set_visible(false).map_err(view_failure)?;
-        webview
-            .set_memory_usage_level(MemoryUsageLevel::Low)
-            .map_err(view_failure)?;
-        self.recording_ingresses
-            .insert(key.clone(), recording_ingress);
-        self.document_secret_states
-            .insert(key.clone(), document_secret_state);
-        self.views.insert(key, webview);
-        if self
-            .workflow_coordinator
-            .active_instance(workspace_key)
-            .is_some()
-        {
-            self.install_page_recording_view(workspace_key, tab_id)
-                .map_err(|_| BrowserError::CrashedView {
-                    message: "browser recording instrumentation could not be installed".to_string(),
-                })?;
+        let starts_now = matches!(admission, BrowserNativeViewBuildAdmission::Start { .. });
+        self.native_view_build_specs.insert(
+            build_id,
+            BrowserNativeViewBuildSpec {
+                build_id,
+                key: key.clone(),
+                trusted_app_config_dir,
+                downloads_dir: layout.downloads_dir,
+                url,
+                bounds: wry_bounds(self.bounds),
+                event_sender: self.event_sender.clone(),
+                recording_ingress,
+                document_secret_state,
+                parent_window,
+            },
+        );
+        if starts_now {
+            self.projects
+                .entry(workspace_key.project_id.clone())
+                .or_insert_with(|| BrowserProjectRuntime {
+                    context: WebContext::new(Some(layout.profile_dir)),
+                });
+            if let Err(error) = self.spawn_native_view_build(&key, build_id) {
+                self.native_view_build_specs.remove(&build_id);
+                self.native_view_builds
+                    .complete(&key, build_id, Err(error.to_string()));
+                return Err(error);
+            }
         }
+        Ok(BrowserViewReadiness::Initializing)
+    }
+
+    fn spawn_native_view_build(
+        &mut self,
+        key: &BrowserViewKey,
+        build_id: u64,
+    ) -> Result<(), BrowserError> {
+        let executor = self
+            .native_executor
+            .clone()
+            .ok_or_else(|| BrowserError::CrashedView {
+                message: "browser foreground executor is unavailable".to_string(),
+            })?;
+        if !self.native_view_build_specs.contains_key(&build_id)
+            || !self.projects.contains_key(&key.workspace_key.project_id)
+        {
+            return Err(BrowserError::CrashedView {
+                message: "browser native view build lease is unavailable".to_string(),
+            });
+        }
+        let spec = self
+            .native_view_build_specs
+            .remove(&build_id)
+            .expect("checked native build spec");
+        let parent_window = spec.parent_window;
+        let project = self
+            .projects
+            .remove(&key.workspace_key.project_id)
+            .expect("checked browser project context");
+        let job = BrowserNativeViewBuildJob { spec, project };
+        let sender = self.native_view_sender.clone();
+        executor
+            .spawn(async move {
+                let completion = job.build(parent_window);
+                let _ = sender.send(completion);
+            })
+            .detach();
         Ok(())
+    }
+
+    fn complete_native_view_build(
+        &mut self,
+        window: &gpui::Window,
+        completion: BrowserNativeViewBuildCompletion,
+    ) {
+        let BrowserNativeViewBuildCompletion {
+            build_id,
+            key,
+            project,
+            recording_ingress,
+            document_secret_state,
+            result,
+        } = completion;
+        let project_id = key.workspace_key.project_id.clone();
+        let replaced = self.projects.insert(project_id, project);
+        debug_assert!(replaced.is_none(), "leased WebContext was restored twice");
+        let result = result.and_then(|webview| {
+            webview
+                .set_bounds(wry_bounds(self.bounds))
+                .map_err(view_failure)?;
+            Ok(webview)
+        });
+        let completion_plan = self.native_view_builds.complete(
+            &key,
+            build_id,
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        );
+        if completion_plan.accepted {
+            match result {
+                Ok(webview) => {
+                    self.recording_ingresses
+                        .insert(key.clone(), recording_ingress);
+                    self.document_secret_states
+                        .insert(key.clone(), document_secret_state);
+                    self.views.insert(key.clone(), webview);
+                    if self
+                        .workflow_coordinator
+                        .active_instance(&key.workspace_key)
+                        .is_some()
+                    {
+                        if self
+                            .install_page_recording_view(&key.workspace_key, &key.tab_id)
+                            .is_err()
+                        {
+                            self.emit_diagnostic(
+                                &key.workspace_key,
+                                &key.tab_id,
+                                "browser recording instrumentation could not be installed"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if let Err(error) = self.apply_visibility_plan() {
+                        self.emit_diagnostic(&key.workspace_key, &key.tab_id, error.to_string());
+                    }
+                }
+                Err(error) => {
+                    self.emit_diagnostic(&key.workspace_key, &key.tab_id, error.to_string());
+                }
+            }
+        }
+        self.spawn_next_native_view_build(completion_plan.next);
+        let _ = window;
+    }
+
+    fn spawn_next_native_view_build(&mut self, mut next: Option<(BrowserViewKey, u64)>) {
+        while let Some((next_key, next_id)) = next {
+            if let Err(error) = self.spawn_native_view_build(&next_key, next_id) {
+                let failed =
+                    self.native_view_builds
+                        .complete(&next_key, next_id, Err(error.to_string()));
+                self.emit_diagnostic(&next_key.workspace_key, &next_key.tab_id, error.to_string());
+                next = failed.next;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn pump_native_view_build_completions(&mut self, window: &gpui::Window) {
+        let completions: Vec<_> = self.native_view_receiver.try_iter().collect();
+        for completion in completions {
+            self.complete_native_view_build(window, completion);
+        }
+    }
+
+    fn require_command_view_ready(
+        &mut self,
+        window: &gpui::Window,
+        workspace_key: &BrowserWorkspaceKey,
+        command: &BrowserCommand,
+    ) -> Result<(), BrowserError> {
+        if !browser_command_requires_ready_view(command) {
+            return Ok(());
+        }
+        let tab_id = command
+            .tab_id()
+            .map(ToOwned::to_owned)
+            .or_else(|| self.selected_tab_id(workspace_key))
+            .ok_or_else(|| missing_tab("selected"))?;
+        self.require_existing_tab_view(window, workspace_key, &tab_id)
+    }
+
+    fn cancel_native_view_build(&mut self, key: &BrowserViewKey) {
+        self.native_view_builds.cancel(key);
+        self.native_view_build_specs
+            .retain(|_, spec| spec.key != *key);
+    }
+
+    fn cancel_native_workspace_builds(&mut self, workspace_key: &BrowserWorkspaceKey) {
+        self.native_view_builds.cancel_workspace(workspace_key);
+        self.native_view_build_specs
+            .retain(|_, spec| spec.key.workspace_key != *workspace_key);
     }
 
     fn evaluate_history(
@@ -5686,7 +6139,7 @@ impl BrowserWebViewHost {
         tab_id: &str,
         script: &str,
     ) -> Result<(), BrowserError> {
-        self.ensure_existing_tab_view(window, workspace_key, tab_id)?;
+        self.require_existing_tab_view(window, workspace_key, tab_id)?;
         self.view(workspace_key, tab_id)?
             .evaluate_script(script)
             .map_err(view_failure)
@@ -5784,6 +6237,17 @@ impl BrowserWebViewHost {
         &mut self,
         workspace_key: &BrowserWorkspaceKey,
     ) -> Result<(), BrowserError> {
+        if let Some(key) = self
+            .native_view_builds
+            .pending_for_project(&workspace_key.project_id)
+        {
+            return Err(BrowserError::CrashedView {
+                message: format!(
+                    "cannot clear the browser profile while tab {} is initializing",
+                    key.tab_id
+                ),
+            });
+        }
         let trusted_app_config_dir =
             self.trusted_app_config_dir
                 .clone()
@@ -5804,6 +6268,10 @@ impl BrowserWebViewHost {
         self.document_secret_states
             .retain(|key, _| key.workspace_key.project_id != workspace_key.project_id);
         self.projects.remove(&workspace_key.project_id);
+        self.native_view_builds
+            .cancel_project(&workspace_key.project_id);
+        self.native_view_build_specs
+            .retain(|_, spec| spec.key.workspace_key.project_id != workspace_key.project_id);
         self.state
             .clear_project_workspaces(&workspace_key.project_id);
         remove_verified_profile(&trusted_app_config_dir, &plan.profile_dir)
@@ -6453,6 +6921,33 @@ fn browser_command_is_automation(command: &BrowserCommand) -> bool {
     )
 }
 
+fn browser_command_requires_ready_view(command: &BrowserCommand) -> bool {
+    matches!(
+        command,
+        BrowserCommand::Navigate { .. }
+            | BrowserCommand::Back { .. }
+            | BrowserCommand::Forward { .. }
+            | BrowserCommand::Reload { .. }
+            | BrowserCommand::OpenDevTools { .. }
+            | BrowserCommand::Stop { tab_id: Some(_) }
+            | BrowserCommand::SetAnnotationMode { enabled: true, .. }
+            | BrowserCommand::CaptureAnnotation { .. }
+            | BrowserCommand::Snapshot { .. }
+            | BrowserCommand::SecretType { .. }
+            | BrowserCommand::Screenshot { .. }
+            | BrowserCommand::Wait { .. }
+            | BrowserCommand::Act { .. }
+            | BrowserCommand::Console { .. }
+            | BrowserCommand::Network { .. }
+            | BrowserCommand::Performance { .. }
+            | BrowserCommand::Upload { .. }
+            | BrowserCommand::RepairHighlight { .. }
+            | BrowserCommand::RepairClearHighlight { .. }
+            | BrowserCommand::RepairValidate { .. }
+            | BrowserCommand::Cdp { .. }
+    )
+}
+
 fn required_annotation_id(annotation_id: Option<String>) -> Result<String, BrowserError> {
     annotation_id
         .filter(|id| !id.trim().is_empty())
@@ -6532,6 +7027,7 @@ fn browser_error_code(error: &BrowserError) -> &'static str {
         BrowserError::Interrupted => "user_interrupted",
         BrowserError::Timeout { .. } => "timeout",
         BrowserError::NavigationFailure { .. } => "navigation_failure",
+        BrowserError::InitializingView { .. } => "initializing_view",
         BrowserError::CrashedView { .. } => "crashed_view",
         BrowserError::LocatorNotFound { .. } => "locator_not_found",
         BrowserError::BlockedPermission { .. } => "blocked_permission",
@@ -6738,8 +7234,9 @@ mod secret_document_state_tests {
         finish_secret_exposure_on_error, fixed_secret_type_callback_result,
         repair_cleanup_disposition, repair_clear_acknowledgement, repair_highlight_failure,
         view_key, ActiveBrowserRequest, BrowserAsyncPhase, BrowserCaptureStoragePlan,
-        BrowserDocumentSecretState, BrowserQueuedWork, BrowserWebViewHost,
-        RepairCleanupDisposition, RepairCleanupEvent, WORKSPACE_OPERATION_TAB,
+        BrowserDocumentSecretState, BrowserNativeViewBuildAdmission, BrowserNativeViewBuildQueue,
+        BrowserQueuedWork, BrowserWebViewHost, RepairCleanupDisposition, RepairCleanupEvent,
+        WORKSPACE_OPERATION_TAB,
     };
     use crate::browser::commands::HostControlQueue;
     use crate::browser::{
@@ -6765,6 +7262,81 @@ mod secret_document_state_tests {
         CloseTab,
         ResetWorkspace,
         ClearProjectProfile,
+    }
+
+    #[test]
+    fn native_view_build_queue_serializes_shared_project_context_leases() {
+        let workspace_a = BrowserWorkspaceKey::new("shared-project", "conversation-a").unwrap();
+        let workspace_b = BrowserWorkspaceKey::new("shared-project", "conversation-b").unwrap();
+        let other_workspace = BrowserWorkspaceKey::new("other-project", "conversation-a").unwrap();
+        let first = view_key(&workspace_a, "tab-a");
+        let same_project = view_key(&workspace_b, "tab-b");
+        let other_project = view_key(&other_workspace, "tab-a");
+        let mut queue = BrowserNativeViewBuildQueue::default();
+
+        let first_id = match queue.admit(first.clone(), false) {
+            BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
+            admission => panic!("unexpected first admission: {admission:?}"),
+        };
+        let same_project_id = match queue.admit(same_project.clone(), false) {
+            BrowserNativeViewBuildAdmission::Queued { build_id } => build_id,
+            admission => panic!("same-project build was not serialized: {admission:?}"),
+        };
+        assert!(matches!(
+            queue.admit(other_project, false),
+            BrowserNativeViewBuildAdmission::Start { .. }
+        ));
+
+        let completed = queue.complete(&first, first_id, Ok(()));
+        assert!(completed.accepted);
+        assert_eq!(completed.next, Some((same_project, same_project_id)));
+    }
+
+    #[test]
+    fn native_view_build_failure_is_sticky_until_an_explicit_retry() {
+        let workspace = BrowserWorkspaceKey::new("retry-project", "conversation-a").unwrap();
+        let key = view_key(&workspace, "tab-a");
+        let mut queue = BrowserNativeViewBuildQueue::default();
+        let build_id = match queue.admit(key.clone(), false) {
+            BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
+            admission => panic!("unexpected first admission: {admission:?}"),
+        };
+
+        let failed = queue.complete(&key, build_id, Err("injected build failure".to_string()));
+        assert!(failed.accepted);
+        assert!(failed.next.is_none());
+        assert_eq!(
+            queue.admit(key.clone(), false),
+            BrowserNativeViewBuildAdmission::Failed {
+                message: "injected build failure".to_string(),
+            }
+        );
+        assert!(matches!(
+            queue.admit(key, true),
+            BrowserNativeViewBuildAdmission::Start { .. }
+        ));
+    }
+
+    #[test]
+    fn canceled_native_view_builds_release_the_project_lease_without_installing() {
+        let workspace_a = BrowserWorkspaceKey::new("cancel-project", "conversation-a").unwrap();
+        let workspace_b = BrowserWorkspaceKey::new("cancel-project", "conversation-b").unwrap();
+        let active = view_key(&workspace_a, "tab-a");
+        let waiting = view_key(&workspace_b, "tab-b");
+        let mut queue = BrowserNativeViewBuildQueue::default();
+        let active_id = match queue.admit(active.clone(), false) {
+            BrowserNativeViewBuildAdmission::Start { build_id } => build_id,
+            admission => panic!("unexpected active admission: {admission:?}"),
+        };
+        let waiting_id = match queue.admit(waiting.clone(), false) {
+            BrowserNativeViewBuildAdmission::Queued { build_id } => build_id,
+            admission => panic!("unexpected waiting admission: {admission:?}"),
+        };
+
+        queue.cancel(&active);
+        let completed = queue.complete(&active, active_id, Ok(()));
+        assert!(!completed.accepted);
+        assert_eq!(completed.next, Some((waiting, waiting_id)));
     }
 
     #[tokio::test]

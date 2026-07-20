@@ -237,6 +237,9 @@ pub enum BrowserError {
         url: String,
         message: String,
     },
+    InitializingView {
+        tab_id: String,
+    },
     CrashedView {
         message: String,
     },
@@ -327,6 +330,12 @@ impl fmt::Display for BrowserError {
             }
             Self::NavigationFailure { url, message } => {
                 write!(formatter, "browser navigation failed for {url}: {message}")
+            }
+            Self::InitializingView { tab_id } => {
+                write!(
+                    formatter,
+                    "browser view is still initializing for tab {tab_id}"
+                )
             }
             Self::CrashedView { message } => {
                 write!(formatter, "browser view crashed: {message}")

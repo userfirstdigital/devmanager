@@ -121,6 +121,8 @@ impl BrowserWebViewHost {
         self.status.clone()
     }
 
+    pub fn attach_foreground_executor(&mut self, _executor: gpui::ForegroundExecutor) {}
+
     pub fn cancel_annotation_selection(
         &mut self,
         _workspace_key: &BrowserWorkspaceKey,
