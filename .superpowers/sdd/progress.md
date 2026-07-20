@@ -28,4 +28,6 @@ Task 5 minor (triage): terminal_text_bounds gate change (line ~9685) was require
 Task 6: complete (3x full suite green, clippy clean; final whole-branch review "with fixes"; fix batch e798670 + docs 9d09825; re-review: ready for merge preparation)
 Wire-exposure decision (user, 2026-07-10): accept + document; redaction w/ keep-sentinel folded into encryption-at-rest follow-up.
 Outstanding before merge: interactive manual QA (7 steps from final review) — requires user's environment.
+Browser checkpoint 9 Task 1: complete (commits cac4ae8..11937fb, independent spec and quality review approved; exact zeroizing replay secret store and compiler capacity boundary).
+Browser checkpoint 9 Task 2: complete (commits df43754..aba7ea1, independent spec and security re-review approved; private sidecar is bound to the exact opaque replay instance and revalidated at ingress and approval resume).
 Known pre-existing flake (NOT this branch): remote::tests::native_client_connections_are_recorded_in_activity_log (src/remote/mod.rs:5031) — access-log persist race, reproduced 1/5 runs; src/remote/ and src/persistence/ untouched by branch (git diff empty). Suggest follow-up to deflake.
