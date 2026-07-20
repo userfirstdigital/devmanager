@@ -38,6 +38,7 @@ pub(crate) enum BrowserAppExitDisposition {
 enum BrowserNativeWindowPhase {
     Open,
     Closing,
+    Draining,
 }
 
 struct BrowserNativeWindowLifetimeState {
@@ -80,7 +81,7 @@ impl BrowserNativeWindowLifetime {
     }
 
     pub(crate) fn bind_window(&self, window_identity: isize) -> Option<u64> {
-        if self.state.phase.get() == BrowserNativeWindowPhase::Closing {
+        if self.state.phase.get() != BrowserNativeWindowPhase::Open {
             return None;
         }
         match self.state.window_identity.get() {
@@ -142,7 +143,11 @@ impl BrowserNativeWindowLifetime {
         if self.state.phase.get() != BrowserNativeWindowPhase::Closing {
             return false;
         }
-        self.state.phase.set(BrowserNativeWindowPhase::Open);
+        self.state.phase.set(if self.state.lease_count.get() == 0 {
+            BrowserNativeWindowPhase::Open
+        } else {
+            BrowserNativeWindowPhase::Draining
+        });
         true
     }
 
@@ -160,7 +165,7 @@ impl BrowserNativeWindowLifetime {
     }
 
     pub(crate) fn window_close_must_be_deferred(&self) -> bool {
-        self.state.phase.get() == BrowserNativeWindowPhase::Closing
+        self.state.phase.get() != BrowserNativeWindowPhase::Open
             || self.state.lease_count.get() != 0
     }
 
@@ -189,9 +194,7 @@ impl BrowserNativeWindowBuildLease {
 
 impl Drop for BrowserNativeWindowBuildLease {
     fn drop(&mut self) {
-        let leases = self.state.lease_count.get();
-        debug_assert!(leases > 0, "native browser window lease underflow");
-        self.state.lease_count.set(leases.saturating_sub(1));
+        release_native_window_lease(&self.state);
     }
 }
 
@@ -201,9 +204,17 @@ pub(crate) struct BrowserNativeWindowTeardownLease {
 
 impl Drop for BrowserNativeWindowTeardownLease {
     fn drop(&mut self) {
-        let leases = self.state.lease_count.get();
-        debug_assert!(leases > 0, "native browser teardown lease underflow");
-        self.state.lease_count.set(leases.saturating_sub(1));
+        release_native_window_lease(&self.state);
+    }
+}
+
+fn release_native_window_lease(state: &BrowserNativeWindowLifetimeState) {
+    let leases = state.lease_count.get();
+    debug_assert!(leases > 0, "native browser window lease underflow");
+    let remaining = leases.saturating_sub(1);
+    state.lease_count.set(remaining);
+    if remaining == 0 && state.phase.get() == BrowserNativeWindowPhase::Draining {
+        state.phase.set(BrowserNativeWindowPhase::Open);
     }
 }
 
@@ -239,7 +250,7 @@ mod native_window_lifetime_tests {
     }
 
     #[test]
-    fn canceled_shutdown_reopens_only_new_generation_admission() {
+    fn canceled_shutdown_waits_for_old_generation_to_drain_before_reopening_admission() {
         let lifetime = BrowserNativeWindowLifetime::default();
         let generation = lifetime.bind_window(202).unwrap();
         let canceled = lifetime.acquire(202, generation).unwrap();
@@ -250,15 +261,17 @@ mod native_window_lifetime_tests {
         assert!(lifetime.acquire(202, generation).is_none());
 
         assert!(lifetime.resume_after_canceled_teardown());
+        assert!(lifetime.bind_window(202).is_none());
+        assert!(lifetime.window_close_must_be_deferred());
+        assert!(!canceled.build_is_allowed());
+
+        drop(canceled);
         let resumed_generation = lifetime.bind_window(202).unwrap();
         assert_ne!(resumed_generation, generation);
-        assert!(!canceled.build_is_allowed());
         let replacement = lifetime.acquire(202, resumed_generation).unwrap();
         assert!(replacement.build_is_allowed());
         assert!(lifetime.window_close_must_be_deferred());
 
-        drop(canceled);
-        assert!(lifetime.window_close_must_be_deferred());
         drop(replacement);
         assert!(!lifetime.window_close_must_be_deferred());
     }
