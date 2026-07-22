@@ -32,6 +32,7 @@ import {
 } from "./pwa/notifications";
 import { SessionScreen } from "./sessions/SessionScreen";
 import { SessionsScreen } from "./sessions/SessionsScreen";
+import { countActionableAttention } from "./sessions/sessionModel";
 import { SettingsScreen } from "./settings/SettingsScreen";
 import { useStore } from "./store";
 
@@ -213,10 +214,7 @@ export function App() {
   }, [activeSessionKey, route, setActiveSession, workspace]);
 
   const attentionCount = useMemo(
-    () =>
-      workspace?.sessions.filter(
-        (session) => session.attention === "needsInput" || session.attention === "failed",
-      ).length ?? 0,
+    () => countActionableAttention(workspace),
     [workspace],
   );
 

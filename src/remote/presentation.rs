@@ -612,6 +612,9 @@ pub struct SemanticSessionMetadata {
     pub raw_required: bool,
     pub oldest_sequence: u64,
     pub latest_sequence: u64,
+    /// First substantive user message; sticky once set.
+    #[serde(default)]
+    pub task_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -830,6 +833,10 @@ impl SemanticJournalStore {
         let occurred_at_epoch_ms = draft.occurred_at_epoch_ms;
         let is_question = matches!(&draft.kind, SemanticEventKind::Question { .. });
         let is_user_message = matches!(&draft.kind, SemanticEventKind::UserMessage { .. });
+        let task_title_candidate = match &draft.kind {
+            SemanticEventKind::UserMessage { text } => normalize_task_title(text),
+            _ => None,
+        };
         let event = {
             let session = self.ensure_session(&key, false);
             let event = session.journal.push(draft);
@@ -851,6 +858,11 @@ impl SemanticJournalStore {
             {
                 session.metadata.attention = SemanticAttention::None;
                 session.metadata.attention_count = 0;
+            }
+            if session.metadata.task_title.is_none() {
+                if let Some(title) = task_title_candidate {
+                    session.metadata.task_title = Some(title);
+                }
             }
             event
         };
@@ -1129,6 +1141,33 @@ fn semantic_status(status: SessionStatus) -> &'static str {
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
     }
+}
+
+const TASK_TITLE_MAX_CHARS: usize = 96;
+
+fn normalize_task_title(text: &str) -> Option<String> {
+    let collapsed: String = text
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+    let char_count = trimmed.chars().count();
+    if char_count <= TASK_TITLE_MAX_CHARS {
+        return Some(trimmed.to_string());
+    }
+    let mut truncated: String = trimmed
+        .chars()
+        .take(TASK_TITLE_MAX_CHARS.saturating_sub(1))
+        .collect();
+    while truncated.ends_with(char::is_whitespace) {
+        truncated.pop();
+    }
+    truncated.push('…');
+    Some(truncated)
 }
 
 pub struct PlainTextProjector {
@@ -1928,6 +1967,112 @@ mod tests {
             SemanticAttention::None
         );
         assert_eq!(store.metadata(&key).unwrap().attention_count, 0);
+    }
+
+    #[test]
+    fn first_substantive_user_message_becomes_sticky_task_title() {
+        let mut store = SemanticJournalStore::default();
+        let key = StableSessionKey::from_tab("ai-tab");
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 1,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "  Investigate\u{00a0}  househunter\nlisting   sync  ".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        assert_eq!(
+            store.metadata(&key).unwrap().task_title.as_deref(),
+            Some("Investigate househunter listing sync")
+        );
+
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 2,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "/model opus".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        assert_eq!(
+            store.metadata(&key).unwrap().task_title.as_deref(),
+            Some("Investigate househunter listing sync")
+        );
+
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 3,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "A later prompt must not rename the task".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        assert_eq!(
+            store.metadata(&key).unwrap().task_title.as_deref(),
+            Some("Investigate househunter listing sync")
+        );
+    }
+
+    #[test]
+    fn slash_command_user_message_does_not_claim_task_title() {
+        let mut store = SemanticJournalStore::default();
+        let key = StableSessionKey::from_tab("ai-tab");
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 1,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "  /compact  ".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        assert_eq!(store.metadata(&key).unwrap().task_title, None);
+
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 2,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "Real work after the slash command".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        assert_eq!(
+            store.metadata(&key).unwrap().task_title.as_deref(),
+            Some("Real work after the slash command")
+        );
+    }
+
+    #[test]
+    fn task_title_truncates_unicode_safely_with_ellipsis() {
+        let mut store = SemanticJournalStore::default();
+        let key = StableSessionKey::from_tab("ai-tab");
+        let long = "字".repeat(100);
+        store.record(SemanticEventDraft {
+            stable_session_key: key.clone(),
+            occurred_at_epoch_ms: 1,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage { text: long },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        let title = store
+            .metadata(&key)
+            .unwrap()
+            .task_title
+            .expect("task title");
+        assert_eq!(title.chars().count(), 96);
+        assert!(title.ends_with('…'));
+        assert_eq!(title.chars().take(95).count(), 95);
+        assert!(!title.contains('\u{fffd}'));
     }
 
     #[test]

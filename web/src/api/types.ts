@@ -86,6 +86,7 @@ export interface WebTab {
 
 export type SemanticAttention = "none" | "unread" | "needsInput" | "failed";
 export type SemanticAdapterHealth = "healthy" | "degraded";
+export type WebAiActivity = "Idle" | "Thinking";
 
 export interface WebSessionSummary {
   sessionId: string;
@@ -102,6 +103,12 @@ export interface WebSessionSummary {
   adapterHealth: SemanticAdapterHealth;
   /** Additive host hint; absent older hosts are ordinary log-only servers. */
   interactiveShell?: boolean;
+  /** Additive host terminal/provider title; absent on older hosts. */
+  title?: string | null;
+  /** Additive host AI activity; absent on older hosts. */
+  aiActivity?: WebAiActivity | null;
+  /** Additive sticky semantic task title; absent on older hosts. */
+  taskTitle?: string | null;
   rawRequired: boolean;
   oldestSequence: number;
   latestSequence: number;

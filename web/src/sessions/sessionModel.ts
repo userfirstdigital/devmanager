@@ -17,8 +17,7 @@ export interface SessionListItem {
 }
 
 export interface SessionGroups {
-  needsAttention: SessionListItem[];
-  active: SessionListItem[];
+  live: SessionListItem[];
   recent: SessionListItem[];
 }
 
@@ -26,18 +25,57 @@ function titleCase(value: string): string {
   return value.length ? `${value[0]?.toUpperCase()}${value.slice(1)}` : value;
 }
 
+function isMeaningfulRuntimeTitle(title: string | null | undefined): title is string {
+  const trimmed = title?.trim() ?? "";
+  if (!trimmed) return false;
+  if (
+    trimmed.includes("\\system32\\") ||
+    trimmed.includes("/bin/") ||
+    trimmed.includes("/usr/")
+  ) {
+    return false;
+  }
+  if (trimmed.endsWith(".exe") && (trimmed.includes("\\") || trimmed.includes("/"))) {
+    return false;
+  }
+  return true;
+}
+
+/** Bare provider, session/numbered labels, and decorated provider chrome are not task titles. */
+function isGenericAiLabel(label: string, kind: WebSessionSummary["kind"]): boolean {
+  if (kind !== "claude" && kind !== "codex") return false;
+  const trimmed = label.trim();
+  if (kind === "claude") {
+    return /^(?:✳\s*)?claude(?:\s+code|\s+session|\s+\d+)?$/i.test(trimmed);
+  }
+  return /^(?:openai\s+)?codex(?:\s+session|\s+\d+)?$/i.test(trimmed);
+}
+
 function statePresentation(session: WebSessionSummary): Pick<
   SessionListItem,
   "stateLabel" | "statusTone"
 > {
-  if (session.attention === "failed" || session.status === "Failed" || session.status === "Crashed") {
-    return {
-      stateLabel: session.status === "Crashed" ? "Crashed" : "Needs attention",
-      statusTone: "danger",
-    };
+  if (!isLiveStatus(session.status)) {
+    if (session.status === "Failed") {
+      return { stateLabel: "Needs attention", statusTone: "danger" };
+    }
+    if (session.status === "Crashed") {
+      return { stateLabel: "Crashed", statusTone: "danger" };
+    }
+    if (session.kind === "ssh") {
+      return { stateLabel: "Disconnected", statusTone: "neutral" };
+    }
+    if (session.kind === "claude" || session.kind === "codex") {
+      return { stateLabel: "Ready to reopen", statusTone: "neutral" };
+    }
+    return { stateLabel: titleCase(session.status), statusTone: "neutral" };
   }
+
   if (session.attention === "needsInput") {
     return { stateLabel: "Needs input", statusTone: "attention" };
+  }
+  if (session.attention === "failed") {
+    return { stateLabel: "Needs attention", statusTone: "danger" };
   }
   if (session.kind === "ssh") {
     if (session.status === "Running") return { stateLabel: "Connected", statusTone: "active" };
@@ -45,9 +83,18 @@ function statePresentation(session: WebSessionSummary): Pick<
     return { stateLabel: "Disconnected", statusTone: "neutral" };
   }
   if (session.kind === "claude" || session.kind === "codex") {
+    if (session.attention === "unread") {
+      return { stateLabel: "Ready", statusTone: "attention" };
+    }
+    if (session.aiActivity === "Thinking") {
+      return { stateLabel: "Thinking", statusTone: "active" };
+    }
+    if (session.adapterHealth === "degraded") {
+      return { stateLabel: "Terminal fallback", statusTone: "attention" };
+    }
     if (session.status === "Starting") return { stateLabel: "Starting", statusTone: "active" };
-    if (session.status === "Running") return { stateLabel: "Open", statusTone: "active" };
     if (session.status === "Stopping") return { stateLabel: "Stopping", statusTone: "active" };
+    if (session.status === "Running") return { stateLabel: "Idle", statusTone: "active" };
     return { stateLabel: "Ready to reopen", statusTone: "neutral" };
   }
   if (session.status === "Running") return { stateLabel: "Running", statusTone: "active" };
@@ -90,13 +137,34 @@ export function describeSession(
   const connection = tab?.connectionId
     ? workspace.sshConnections.find((candidate) => candidate.id === tab.connectionId)
     : null;
-  const fallbackLabel =
-    session.kind === "ssh"
-      ? connection?.label ?? "SSH session"
-      : session.kind === "server" || session.kind === "shell"
-        ? command?.label ?? "Server session"
-        : `${titleCase(session.kind)} session`;
-  const label = tab?.label?.trim() || command?.label?.trim() || fallbackLabel;
+
+  let label: string;
+  if (session.kind === "ssh") {
+    label = connection?.label?.trim() || tab?.label?.trim() || "SSH session";
+  } else if (session.kind === "server" || session.kind === "shell") {
+    label = command?.label?.trim() || tab?.label?.trim() || "Server session";
+  } else {
+    const runtimeTitle = session.title?.trim() ?? "";
+    if (
+      isMeaningfulRuntimeTitle(runtimeTitle) &&
+      !isGenericAiLabel(runtimeTitle, session.kind)
+    ) {
+      label = runtimeTitle;
+    } else {
+      const taskTitle = session.taskTitle?.trim() ?? "";
+      if (taskTitle) {
+        label = taskTitle;
+      } else {
+        const tabLabel = tab?.label?.trim() ?? "";
+        if (tabLabel && !isGenericAiLabel(tabLabel, session.kind)) {
+          label = tabLabel;
+        } else {
+          label = `${titleCase(session.kind)} session`;
+        }
+      }
+    }
+  }
+
   const state = statePresentation(session);
 
   return {
@@ -126,27 +194,44 @@ function newestFirst(left: SessionListItem, right: SessionListItem): number {
   return activity || left.label.localeCompare(right.label);
 }
 
+function livePriority(item: SessionListItem): number {
+  if (item.attention === "needsInput") return 0;
+  if (item.attention === "failed") return 1;
+  if (item.attention === "unread") return 2;
+  if (item.session.aiActivity === "Thinking") return 3;
+  return 4;
+}
+
+function liveSort(left: SessionListItem, right: SessionListItem): number {
+  const priority = livePriority(left) - livePriority(right);
+  return priority || newestFirst(left, right);
+}
+
 export function groupSessions(workspace: WebWorkspaceSnapshot): SessionGroups {
   const groups: SessionGroups = {
-    needsAttention: [],
-    active: [],
+    live: [],
     recent: [],
   };
   for (const session of workspace.sessions) {
     if (!session.stableSessionKey) continue;
     const item = describeSession(workspace, session);
-    if (session.attention === "needsInput" || session.attention === "failed") {
-      groups.needsAttention.push(item);
-    } else if (isLiveStatus(session.status)) {
-      groups.active.push(item);
+    if (isLiveStatus(session.status)) {
+      groups.live.push(item);
     } else {
       groups.recent.push(item);
     }
   }
-  groups.needsAttention.sort(newestFirst);
-  groups.active.sort(newestFirst);
+  groups.live.sort(liveSort);
   groups.recent.sort(newestFirst);
   return groups;
+}
+
+/** Count live non-none attention — never ended/stale historical attention. */
+export function countActionableAttention(workspace: WebWorkspaceSnapshot | null | undefined): number {
+  if (!workspace) return 0;
+  return workspace.sessions.filter(
+    (session) => isLiveStatus(session.status) && session.attention !== "none",
+  ).length;
 }
 
 export function formatRelativeActivity(

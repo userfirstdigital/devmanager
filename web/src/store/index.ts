@@ -3,6 +3,7 @@ import { create } from "zustand";
 import {
   EMPTY_WRITER_LEASE,
   WEB_PROTOCOL_VERSION,
+  isLiveStatus,
   type ComposerAccepted,
   type ComposerAttachment,
   type LegacyWorkspaceProjection,
@@ -175,7 +176,7 @@ export function selectAggregateBadgeCount(
   if (state.compatibilityDiagnostic !== null) return 0;
   if (state.runtimeInstanceId === null) return null;
   return Object.values(state.sessions).reduce((total, session) => {
-    if (session.attention === "none") return total;
+    if (!isLiveStatus(session.status) || session.attention === "none") return total;
     return Math.min(99, total + Math.max(1, session.attentionCount));
   }, 0);
 }
