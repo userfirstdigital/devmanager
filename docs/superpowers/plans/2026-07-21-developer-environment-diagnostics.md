@@ -263,9 +263,9 @@ Add a compact Developer environment Settings row with summary and Open Diagnosti
 
 Open Diagnostics immediately with a running snapshot, spawn the scan on the background executor, update only if the panel still exists, and restore an idle/error state on every completion path. Confirmation dispatches one repair; bulk repair uses only `recommended_repairs`. Settings mutations update both the draft and persisted config through existing save paths.
 
-- [ ] **Step 5: Add a quiet startup summary**
+- [ ] **Step 5: Keep diagnostics on demand**
 
-Start a scan after the primary window is ready. Show a dismissible in-app banner only for required missing/broken checks or first-run setup. Add serde-defaulted diagnostics UX metadata only if required to prevent repeated first-run banners.
+Do not schedule diagnostics scanning or process probing during application startup. Show **Not scanned yet** before the first scan. Opening Diagnostics starts a fresh bounded scan unless a repair is active, and the page's **Rescan** action starts the same scan explicitly. Do not persist first-run or startup-scan metadata.
 
 - [ ] **Step 6: Pass workspace/app tests**
 

@@ -1240,7 +1240,7 @@ impl NativeShell {
         }
         Self::spawn_remote_refresh_task(native_dialog_blockers.clone(), cx);
 
-        let mut shell = Self {
+        let shell = Self {
             state,
             session_manager,
             process_manager,
@@ -1323,7 +1323,6 @@ impl NativeShell {
         };
 
         Self::spawn_splash_image_fetch(shell.native_dialog_blockers.clone(), cx);
-        shell.spawn_startup_diagnostics_scan(cx);
 
         shell
     }
@@ -1345,17 +1344,6 @@ impl NativeShell {
     fn apply_diagnostics_snapshot(&mut self, snapshot: crate::diagnostics::DiagnosticSnapshot) {
         self.diagnostics_snapshot = Some(snapshot);
         self.sync_settings_diagnostics_summary();
-    }
-
-    fn mark_diagnostics_first_run_completed(&mut self) {
-        if self.state.settings().diagnostics_first_run_completed {
-            return;
-        }
-        let mut settings = self.state.settings().clone();
-        settings.diagnostics_first_run_completed = true;
-        self.state.update_settings(settings.clone());
-        self.process_manager.set_settings(settings);
-        self.save_config_state();
     }
 
     fn apply_diagnostics_settings_delta(
@@ -1409,49 +1397,6 @@ impl NativeShell {
         }
     }
 
-    fn spawn_startup_diagnostics_scan(&mut self, cx: &mut Context<Self>) {
-        let generation = self.next_diagnostics_generation();
-        let settings = self.state.settings().clone();
-        let first_run_completed = settings.diagnostics_first_run_completed;
-        cx.spawn(
-            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let mut async_cx = cx.clone();
-                async move {
-                    let scan_result = diagnostics_background_scan(
-                        async_cx.background_executor(),
-                        settings,
-                    )
-                    .await;
-
-                    let _ = this.update(&mut async_cx, |shell, cx| {
-                        if !shell.diagnostics_accepts_generation(generation) {
-                            return;
-                        }
-                        match scan_result {
-                            Ok(snapshot) => {
-                                shell.apply_diagnostics_snapshot(snapshot.clone());
-                                if workspace::diagnostics_startup_notice_needed(
-                                    first_run_completed,
-                                    snapshot.required_failures,
-                                ) {
-                                    let notice = "Open Settings → Developer environment to review diagnostics.";
-                                    shell.startup_notice = Some(match shell.startup_notice.take() {
-                                        Some(existing) => format!("{existing}\n{notice}"),
-                                        None => notice.to_string(),
-                                    });
-                                }
-                                shell.mark_diagnostics_first_run_completed();
-                                cx.notify();
-                            }
-                            Err(_) => {}
-                        }
-                    });
-                }
-            },
-        )
-        .detach();
-    }
-
     fn spawn_diagnostics_scan(&mut self, cx: &mut Context<Self>) {
         let generation = self.next_diagnostics_generation();
         let settings = self.state.settings().clone();
@@ -1488,7 +1433,6 @@ impl NativeShell {
             return;
         }
         self.apply_diagnostics_snapshot(snapshot.clone());
-        self.mark_diagnostics_first_run_completed();
         if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
             draft.snapshot = snapshot;
             draft.active_operation = None;
@@ -1499,10 +1443,7 @@ impl NativeShell {
     }
 
     fn open_diagnostics_action(&mut self, cx: &mut Context<Self>) {
-        let decision = diagnostics_open_panel_decision(
-            self.diagnostics_repair_in_progress(),
-            self.diagnostics_snapshot.is_some(),
-        );
+        let decision = diagnostics_open_panel_decision(self.diagnostics_repair_in_progress());
         let mut draft = self
             .diagnostics_snapshot
             .as_ref()
@@ -17934,10 +17875,7 @@ struct DiagnosticsOpenPanelDecision {
     spawn_scan: bool,
 }
 
-fn diagnostics_open_panel_decision(
-    repair_in_progress: bool,
-    has_snapshot: bool,
-) -> DiagnosticsOpenPanelDecision {
+fn diagnostics_open_panel_decision(repair_in_progress: bool) -> DiagnosticsOpenPanelDecision {
     if repair_in_progress {
         return DiagnosticsOpenPanelDecision {
             active_operation: Some("Applying repair…".into()),
@@ -17945,7 +17883,7 @@ fn diagnostics_open_panel_decision(
         };
     }
     DiagnosticsOpenPanelDecision {
-        active_operation: has_snapshot.then(|| "Scanning…".into()),
+        active_operation: Some("Scanning…".into()),
         spawn_scan: true,
     }
 }
@@ -18102,17 +18040,6 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn diagnostics_startup_notice_helper_matches_settings_default() {
-        let settings = Settings::default();
-        assert!(!settings.diagnostics_first_run_completed);
-        assert!(workspace::diagnostics_startup_notice_needed(
-            settings.diagnostics_first_run_completed,
-            0,
-        ));
-        assert!(!workspace::diagnostics_startup_notice_needed(true, 0));
-    }
-
-    #[test]
     fn diagnostics_generation_accepts_only_current() {
         assert!(diagnostics_generation_is_current(3, 3));
         assert!(!diagnostics_generation_is_current(4, 3));
@@ -18139,11 +18066,11 @@ mod tests {
 
     #[test]
     fn diagnostics_close_reopen_during_repair_keeps_busy_without_scan() {
-        let open = diagnostics_open_panel_decision(true, true);
+        let open = diagnostics_open_panel_decision(true);
         assert_eq!(open.active_operation.as_deref(), Some("Applying repair…"));
         assert!(!open.spawn_scan);
 
-        let idle_open = diagnostics_open_panel_decision(false, true);
+        let idle_open = diagnostics_open_panel_decision(false);
         assert_eq!(idle_open.active_operation.as_deref(), Some("Scanning…"));
         assert!(idle_open.spawn_scan);
     }

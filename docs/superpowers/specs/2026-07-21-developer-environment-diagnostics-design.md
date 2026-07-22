@@ -2,7 +2,7 @@
 
 ## Purpose
 
-DevManager should help a developer recover a productive Windows workstation after a clean install without requiring them to remember every CLI, profile edit, or configuration step. The feature adds a dedicated Diagnostics page under Settings, a quiet startup health summary, and safe guided repairs for a curated DevManager development baseline.
+DevManager should help a developer recover a productive Windows workstation after a clean install without requiring them to remember every CLI, profile edit, or configuration step. The feature adds a dedicated Diagnostics page under Settings and safe guided repairs for a curated DevManager development baseline without adding work to normal application startup.
 
 The first release is intentionally not a general package manager or arbitrary setup-script runner. It diagnoses known tools and configuration, explains failures in plain language, previews every mutation, and verifies repairs after execution.
 
@@ -11,7 +11,8 @@ The first release is intentionally not a general package manager or arbitrary se
 ### Entry points
 
 - Settings contains a **Developer environment** row with the latest summary and an **Open Diagnostics** action.
-- DevManager starts a bounded background scan after the main window is ready. A dismissible banner appears only on first run or when a required check is missing or broken.
+- DevManager performs no diagnostics scan or process probing during application startup. Before the first on-demand scan, Settings shows **Not scanned yet**.
+- Opening Diagnostics starts a fresh bounded scan unless a repair is already active. **Rescan** starts the same scan explicitly.
 - The Diagnostics page has a back action, summary counts, **Rescan**, **Repair recommended**, and grouped check cards.
 - Each card shows status, detected version/path when safe, concise guidance, expandable sanitized details, and the actions relevant to that result.
 - Repair progress is visible. Only one repair runs at a time; closing the page does not corrupt a repair, and the affected checks refresh when it finishes.
@@ -87,7 +88,7 @@ Profile edits must:
 - write through a temporary file followed by an atomic replacement where Windows permits;
 - roll back from the backup when the post-write parse check fails.
 
-Repairs never persist tokens, passwords, complete environment dumps, or raw command output. The page keeps only the current in-memory snapshot and operation details. Configuration persistence is limited to serde-defaulted UX metadata such as banner dismissal or last successful scan time if needed.
+Repairs never persist tokens, passwords, complete environment dumps, or raw command output. The page keeps only the current in-memory snapshot and operation details. Diagnostics does not persist first-run or startup-scan metadata.
 
 ## Check catalog and actions
 
@@ -125,7 +126,7 @@ Windows receives the full catalog and repair support. macOS remains compile-safe
 
 ## Failure handling
 
-- A timed-out probe becomes `Broken` or `Unavailable` with a short timeout explanation; it cannot stall application startup.
+- A timed-out probe becomes `Broken` or `Unavailable` with a short timeout explanation; it cannot stall the Diagnostics page indefinitely.
 - A repair failure retains the original diagnostic, shows sanitized stderr, and offers the preview/manual alternative.
 - A canceled or interrupted batch stops before the next operation.
 - A profile backup failure prevents the edit.
@@ -143,7 +144,7 @@ Windows receives the full catalog and repair support. macOS remains compile-safe
 
 ## Acceptance criteria
 
-1. A clean Windows installation can discover the missing required toolchain without blocking DevManager startup.
+1. DevManager startup performs no diagnostics scan or diagnostics child-process work; a clean Windows installation discovers the missing required toolchain when Diagnostics is opened.
 2. A configured workstation reports detected versions and actionable warnings, including profile-load warnings, without exposing secrets.
 3. Users can preview and confirm supported repairs, see backups for profile edits, and receive verified outcomes.
 4. **Repair recommended** never installs the high-risk Claude permission-bypass shortcut.

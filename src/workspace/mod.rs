@@ -1330,13 +1330,6 @@ impl DiagnosticsDraft {
     }
 }
 
-pub fn diagnostics_startup_notice_needed(
-    first_run_completed: bool,
-    required_failures: usize,
-) -> bool {
-    !first_run_completed || required_failures > 0
-}
-
 pub fn diagnostics_summary_line(snapshot: &crate::diagnostics::DiagnosticSnapshot) -> String {
     format!(
         "{} required · {} warnings · {} healthy",
@@ -5058,13 +5051,6 @@ mod tests {
             diagnostics_summary_line(&snapshot),
             "0 required · 0 warnings · 0 healthy"
         );
-    }
-
-    #[test]
-    fn diagnostics_startup_notice_needed_on_first_run_and_required_failures() {
-        assert!(diagnostics_startup_notice_needed(false, 0));
-        assert!(!diagnostics_startup_notice_needed(true, 0));
-        assert!(diagnostics_startup_notice_needed(true, 2));
     }
 
     #[test]
