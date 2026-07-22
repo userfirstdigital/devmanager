@@ -44,3 +44,5 @@ Plan: `docs/superpowers/plans/2026-07-21-native-llm-chat-perfection.md`
 Task 1: complete — current Codex hook overrides use shell-safe Windows paths without changing POSIX paths; focused Rust tests pass and independent review is clean.
 
 Task 2: complete — AI fallback uses a replacing post-parse screen projection, preserves visible indentation, clears stale frames, and leaves non-AI/raw streaming unchanged; focused Rust tests pass and independent review is clean (empty-card rendering is assigned to Task 3).
+
+Task 3: complete — native chat groups a turn into one compact activity disclosure, exposes Stop only while thinking, keeps drafts editable across reconnects, preserves unsent text around one-shot question choices, and prefers stable semantic titles; 325 web tests, typecheck, production build, and independent review are clean.

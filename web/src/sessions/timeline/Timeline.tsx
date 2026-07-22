@@ -5,7 +5,7 @@ import {
   ConversationItemRenderer,
   type InterfaceDensity,
 } from "./eventRenderers";
-import { buildConversationItems } from "./timelineModel";
+import { buildConversationItems, type ConversationItem } from "./timelineModel";
 
 const FOLLOW_DISTANCE_PX = 96;
 
@@ -21,6 +21,21 @@ export function preserveTimelineAnchor({
   nextAnchorOffset,
 }: TimelineAnchorCalculation): number {
   return Math.max(0, scrollTop + nextAnchorOffset - previousAnchorOffset);
+}
+
+/** Latest question with no subsequent user message is the only interactive one. */
+export function actionableQuestionKey(items: ConversationItem[]): string | null {
+  let latest: string | null = null;
+  for (const item of items) {
+    if (item.kind === "message" && item.role === "user") {
+      latest = null;
+      continue;
+    }
+    if (item.kind === "question") {
+      latest = item.key;
+    }
+  }
+  return latest;
 }
 
 interface VisibleAnchor {
@@ -47,12 +62,16 @@ export function Timeline({
   includeFallbackOutput = true,
   emptyTitle = "Nothing here yet",
   emptyDetail = "New activity will appear here automatically.",
+  onQuestionChoice,
+  questionChoicesDisabled = false,
 }: {
   events: SemanticEvent[];
   density: InterfaceDensity;
   includeFallbackOutput?: boolean;
   emptyTitle?: string;
   emptyDetail?: string;
+  onQuestionChoice?(choice: string): void;
+  questionChoicesDisabled?: boolean;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
@@ -60,6 +79,10 @@ export function Timeline({
   const visibleItems = useMemo(
     () => buildConversationItems(events, density, includeFallbackOutput),
     [density, events, includeFallbackOutput],
+  );
+  const activeQuestionKey = useMemo(
+    () => actionableQuestionKey(visibleItems),
+    [visibleItems],
   );
 
   useLayoutEffect(() => {
@@ -106,7 +129,16 @@ export function Timeline({
       <div className="dm-timeline">
         {visibleItems.length ? (
           visibleItems.map((item) => (
-            <ConversationItemRenderer key={item.key} item={item} density={density} />
+            <ConversationItemRenderer
+              key={item.key}
+              item={item}
+              density={density}
+              onQuestionChoice={onQuestionChoice}
+              questionChoicesDisabled={
+                questionChoicesDisabled ||
+                (item.kind === "question" && item.key !== activeQuestionKey)
+              }
+            />
           ))
         ) : (
           <div className="dm-timeline-empty">

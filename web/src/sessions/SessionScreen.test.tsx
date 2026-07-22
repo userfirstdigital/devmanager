@@ -15,8 +15,25 @@ import { useStore } from "../store";
 import { SessionScreen } from "./SessionScreen";
 
 vi.mock("./views/AiSessionView", () => ({
-  AiSessionView: ({ composer }: { composer: React.ReactNode }) => (
-    <div aria-label="Native AI conversation">{composer}</div>
+  AiSessionView: ({
+    composer,
+    onQuestionChoice,
+    questionChoicesDisabled,
+  }: {
+    composer: React.ReactNode;
+    onQuestionChoice?(choice: string): void;
+    questionChoicesDisabled?: boolean;
+  }) => (
+    <div aria-label="Native AI conversation">
+      <button
+        type="button"
+        disabled={questionChoicesDisabled || !onQuestionChoice}
+        onClick={() => onQuestionChoice?.("Continue")}
+      >
+        Continue
+      </button>
+      {composer}
+    </div>
   ),
 }));
 
@@ -43,7 +60,11 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function workspace(kind: WebAiKind, id = "ai-a"): WebWorkspaceSnapshot {
+function workspace(
+  kind: WebAiKind,
+  id = "ai-a",
+  overrides: Partial<WebWorkspaceSnapshot["sessions"][number]> = {},
+): WebWorkspaceSnapshot {
   return {
     webProtocolVersion: WEB_PROTOCOL_VERSION,
     runtimeInstanceId: "runtime-a",
@@ -86,6 +107,7 @@ function workspace(kind: WebAiKind, id = "ai-a"): WebWorkspaceSnapshot {
         rawRequired: false,
         oldestSequence: 0,
         latestSequence: 0,
+        ...overrides,
       },
     ],
     portStatuses: [],
@@ -231,5 +253,164 @@ describe("session slash command integration", () => {
     await waitFor(() => expect(submitComposer).toHaveBeenCalledTimes(2));
     expect(screen.getByLabelText("Native AI conversation")).toBeTruthy();
     expect(screen.queryByLabelText("Raw provider interaction")).toBeNull();
+  });
+});
+
+describe("native AI session interactions", () => {
+  it("submits question choices through the composer path and disables while pending", async () => {
+    const user = userEvent.setup();
+    const submitComposer = vi.fn().mockResolvedValue({
+      mutationId: "mutation-choice",
+      stableSessionKey: "tab:ai-a",
+      acceptedSequence: 1,
+      leaseGeneration: 1,
+    });
+    useStore.setState({
+      submitComposer,
+      pendingMutations: {
+        "tab:ai-a": {
+          mutationId: "pending-a",
+          stableSessionKey: "tab:ai-a",
+          text: "busy",
+          attachments: [],
+        },
+      },
+    });
+    const { rerender } = render(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+    expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+
+    useStore.setState({ pendingMutations: {} });
+    rerender(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(submitComposer).toHaveBeenCalledWith("tab:ai-a", "Continue", []);
+  });
+
+  it("keeps historical question choices disabled unless attention is needsInput", () => {
+    render(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude", "ai-a", { attention: "none" })}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+    expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it("preserves an unsent composer draft when a quick choice is submitted", async () => {
+    const user = userEvent.setup();
+    const accepted = deferred<ComposerAccepted>();
+    const submitComposer = vi.fn((stableSessionKey: string, text: string) => {
+      useStore.setState((state) => ({
+        drafts: { ...state.drafts, [stableSessionKey]: text },
+        pendingMutations: {
+          ...state.pendingMutations,
+          [stableSessionKey]: {
+            mutationId: "mutation-choice",
+            stableSessionKey,
+            text,
+            attachments: [],
+          },
+        },
+      }));
+      return accepted.promise;
+    });
+    useStore.setState({
+      drafts: { "tab:ai-a": "unsent draft notes" },
+      submitComposer,
+    });
+
+    render(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude", "ai-a", { attention: "needsInput" })}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+
+    expect(
+      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement).value,
+    ).toBe("unsent draft notes");
+
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(submitComposer).toHaveBeenCalledWith("tab:ai-a", "Continue", []);
+    expect(
+      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement).value,
+    ).toBe("unsent draft notes");
+    expect(useStore.getState().drafts["tab:ai-a"]).toBe("unsent draft notes");
+
+    await act(async () => {
+      accepted.resolve({
+        mutationId: "mutation-choice",
+        stableSessionKey: "tab:ai-a",
+        acceptedSequence: 1,
+        leaseGeneration: 1,
+      });
+      await accepted.promise;
+    });
+
+    expect(
+      (screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement).value,
+    ).toBe("unsent draft notes");
+    expect(useStore.getState().drafts["tab:ai-a"]).toBe("unsent draft notes");
+  });
+
+  it("keeps the composer editable during a transient disconnect", () => {
+    render(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude")}
+        status={{ kind: "connecting" }}
+        onNavigate={() => {}}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(false);
+    expect(screen.getByText(/reconnecting/i).isConnected).toBe(true);
+    expect((screen.getByRole("button", { name: /send/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("shows Stop from Thinking activity, not merely because the PTY is live", () => {
+    const interruptSession = vi.fn();
+    useStore.setState({ interruptSession });
+    const { rerender } = render(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude")}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /send message/i }).isConnected).toBe(true);
+
+    rerender(
+      <SessionScreen
+        route={{ name: "session", kind: "tab", id: "ai-a" }}
+        workspace={workspace("claude", "ai-a", { aiActivity: "Thinking" })}
+        status={{ kind: "open" }}
+        onNavigate={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /stop/i }).isConnected).toBe(true);
   });
 });

@@ -52,11 +52,14 @@ function ActivityGroup({
   item: Extract<ConversationItem, { kind: "activity" }>;
   density: InterfaceDensity;
 }) {
-  const forcedOpen = density === "full" || item.state !== "success";
-  const [expanded, setExpanded] = useState(forcedOpen);
+  // Calm/minimal stay collapsed while work is active; failures open; full stays open.
+  const preferOpen = density === "full" || item.state === "failure";
+  const [expanded, setExpanded] = useState(preferOpen);
+  const [manual, setManual] = useState(false);
   useEffect(() => {
-    if (forcedOpen) setExpanded(true);
-  }, [forcedOpen]);
+    if (!manual && preferOpen) setExpanded(true);
+    if (!manual && !preferOpen && item.state === "active") setExpanded(false);
+  }, [item.state, manual, preferOpen]);
   const StatusIcon =
     item.state === "failure"
       ? CircleAlert
@@ -74,7 +77,10 @@ function ActivityGroup({
         type="button"
         className="dm-activity-toggle"
         aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
+        onClick={() => {
+          setManual(true);
+          setExpanded((current) => !current);
+        }}
       >
         <StatusIcon size={16} aria-hidden="true" />
         <span>{item.summary}</span>
@@ -97,9 +103,13 @@ function ActivityGroup({
 export function ConversationItemRenderer({
   item,
   density,
+  onQuestionChoice,
+  questionChoicesDisabled = false,
 }: {
   item: ConversationItem;
   density: InterfaceDensity;
+  onQuestionChoice?(choice: string): void;
+  questionChoicesDisabled?: boolean;
 }) {
   if (item.kind === "message") {
     if (item.role === "user") {
@@ -138,9 +148,18 @@ export function ConversationItemRenderer({
           <strong>Input needed</strong>
           <p>{item.event.prompt}</p>
           {item.event.choices.length > 0 ? (
-            <ul>
+            <ul className="dm-question-choices">
               {item.event.choices.map((choice) => (
-                <li key={choice}>{choice}</li>
+                <li key={choice}>
+                  <button
+                    type="button"
+                    className="dm-question-choice"
+                    disabled={questionChoicesDisabled || !onQuestionChoice}
+                    onClick={() => onQuestionChoice?.(choice)}
+                  >
+                    {choice}
+                  </button>
+                </li>
               ))}
             </ul>
           ) : null}

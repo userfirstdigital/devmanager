@@ -246,13 +246,75 @@ describe("native session composer", () => {
 
     const textarea = screen.getByRole("textbox", { name: /message/i });
     expect(textarea.tagName).toBe("TEXTAREA");
-    expect(textarea.getAttribute("enterkeyhint")).toBe("send");
+    expect(textarea.getAttribute("enterkeyhint")).toBe("enter");
 
     await user.type(textarea, "hello from dictation");
     expect(onChange).toHaveBeenLastCalledWith("hello from dictation");
     await user.click(screen.getByRole("button", { name: /send/i }));
 
     expect(onSubmit).toHaveBeenCalledWith("hello from dictation", []);
+  });
+
+  it("matches enterKeyHint to returnBehavior", () => {
+    const { rerender } = render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value=""
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        returnBehavior="newline"
+        onChange={() => {}}
+        onSubmit={async () => {}}
+      />,
+    );
+    expect(screen.getByRole("textbox", { name: /message/i }).getAttribute("enterkeyhint")).toBe(
+      "enter",
+    );
+
+    rerender(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value=""
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        returnBehavior="send"
+        onChange={() => {}}
+        onSubmit={async () => {}}
+      />,
+    );
+    expect(screen.getByRole("textbox", { name: /message/i }).getAttribute("enterkeyhint")).toBe(
+      "send",
+    );
+  });
+
+  it("offers Stop while thinking without locking the textarea", async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value="draft while thinking"
+        disabled={false}
+        pending={false}
+        supportsAttachments={false}
+        thinking
+        onStop={onStop}
+        onChange={() => {}}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(false);
+    expect(screen.getByRole("button", { name: /stop/i }).isConnected).toBe(true);
+    expect(screen.queryByRole("button", { name: /send message/i })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /stop/i }));
+    expect(onStop).toHaveBeenCalledTimes(1);
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 
   it("keeps Return multiline-safe and sends on modified Return", async () => {
@@ -294,6 +356,7 @@ describe("native session composer", () => {
 
     const picker = screen.getByLabelText(/attach image/i);
     expect(picker.getAttribute("accept")).toBe("image/png,image/jpeg");
+    expect(picker.hasAttribute("capture")).toBe(false);
     const file = new File([new Uint8Array([1, 2, 3])], "screen.png", { type: "image/png" });
     await user.upload(picker, file);
 
@@ -304,7 +367,7 @@ describe("native session composer", () => {
     expect(onSubmit.mock.calls[0][1][0]).toMatchObject({ mimeType: "image/png", fileName: "screen.png" });
   });
 
-  it("disables mutations while reconnecting without hiding the draft", () => {
+  it("keeps typing available while reconnecting and only blocks send", () => {
     render(
       <Composer
         scopeKey="runtime-a:tab:claude-a"
@@ -317,9 +380,29 @@ describe("native session composer", () => {
       />,
     );
 
-    expect((screen.getByDisplayValue("preserved draft") as HTMLTextAreaElement).disabled).toBe(true);
+    const textarea = screen.getByDisplayValue("preserved draft") as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(false);
     expect(screen.getByText(/reconnecting/i).isConnected).toBe(true);
     expect((screen.getByRole("button", { name: /send/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByLabelText(/attach image/i) as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("disables editing when the session has ended", () => {
+    render(
+      <Composer
+        scopeKey="runtime-a:tab:claude-a"
+        value="ended draft"
+        disabled
+        editingDisabled
+        pending={false}
+        supportsAttachments
+        onChange={() => {}}
+        onSubmit={async () => {}}
+      />,
+    );
+
+    expect((screen.getByDisplayValue("ended draft") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByLabelText(/attach image/i) as HTMLInputElement).disabled).toBe(true);
   });
 
   it("sends on plain Return only after the user chooses that preference", () => {

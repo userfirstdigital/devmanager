@@ -28,6 +28,14 @@ function titleCase(value: string): string {
 function isMeaningfulRuntimeTitle(title: string | null | undefined): title is string {
   const trimmed = title?.trim() ?? "";
   if (!trimmed) return false;
+  // Provider spinner glyphs / braille throbbers are not task titles.
+  if (/^[✳✻✓…·•●○◌⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]+$/u.test(trimmed)) return false;
+  if (/^[\u2800-\u28ff]/u.test(trimmed)) return false;
+  if (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳✻]/.test(trimmed) && /thinking|working|loading/i.test(trimmed)) {
+    return false;
+  }
+  // Shell prompt chrome: user@host:path$ or trailing shell markers.
+  if (/@[^:\s]+:/.test(trimmed) || /[%$#>]\s*$/.test(trimmed)) return false;
   if (
     trimmed.includes("\\system32\\") ||
     trimmed.includes("/bin/") ||
@@ -38,6 +46,10 @@ function isMeaningfulRuntimeTitle(title: string | null | undefined): title is st
   if (trimmed.endsWith(".exe") && (trimmed.includes("\\") || trimmed.includes("/"))) {
     return false;
   }
+  // Absolute/home path titles without a real task phrase.
+  if (/^(?:[A-Za-z]:\\|~\/|\/)/.test(trimmed) && !/\s/.test(trimmed)) return false;
+  // MSYS/Git Bash titles commonly look like `MINGW64:/c/Code/...`.
+  if (/^[^:\s]+:[/\\]/.test(trimmed)) return false;
   return true;
 }
 
@@ -144,16 +156,16 @@ export function describeSession(
   } else if (session.kind === "server" || session.kind === "shell") {
     label = command?.label?.trim() || tab?.label?.trim() || "Server session";
   } else {
-    const runtimeTitle = session.title?.trim() ?? "";
-    if (
-      isMeaningfulRuntimeTitle(runtimeTitle) &&
-      !isGenericAiLabel(runtimeTitle, session.kind)
-    ) {
-      label = runtimeTitle;
+    const taskTitle = session.taskTitle?.trim() ?? "";
+    if (taskTitle) {
+      label = taskTitle;
     } else {
-      const taskTitle = session.taskTitle?.trim() ?? "";
-      if (taskTitle) {
-        label = taskTitle;
+      const runtimeTitle = session.title?.trim() ?? "";
+      if (
+        isMeaningfulRuntimeTitle(runtimeTitle) &&
+        !isGenericAiLabel(runtimeTitle, session.kind)
+      ) {
+        label = runtimeTitle;
       } else {
         const tabLabel = tab?.label?.trim() ?? "";
         if (tabLabel && !isGenericAiLabel(tabLabel, session.kind)) {

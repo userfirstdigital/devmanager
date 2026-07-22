@@ -190,13 +190,26 @@ describe("session presentation", () => {
       ).label,
     ).toBe("Review auth middleware");
 
-    const meaningfulRuntimeWins = session("tab:claude-generic", {
-      title: "Ship live-first sessions",
-      taskTitle: "Ignored older prompt",
+    const taskTitleWinsOverRuntime = session("tab:claude-generic", {
+      title: "✳ Claude Code",
+      taskTitle: "Investigate househunter listing sync",
       tabId: "claude-generic",
     });
     expect(
-      describeSession(workspace([meaningfulRuntimeWins]), meaningfulRuntimeWins).label,
+      describeSession(workspace([taskTitleWinsOverRuntime]), taskTitleWinsOverRuntime)
+        .label,
+    ).toBe("Investigate househunter listing sync");
+
+    const taskTitleBeatsMeaningfulRuntime = session("tab:claude-generic", {
+      title: "Live provider chrome title",
+      taskTitle: "Ship live-first sessions",
+      tabId: "claude-generic",
+    });
+    expect(
+      describeSession(
+        workspace([taskTitleBeatsMeaningfulRuntime]),
+        taskTitleBeatsMeaningfulRuntime,
+      ).label,
     ).toBe("Ship live-first sessions");
 
     const customTabFallback = session("tab:claude-a", {
@@ -215,6 +228,64 @@ describe("session presentation", () => {
       describeSession(workspace([realTaskMentionsClaude]), realTaskMentionsClaude)
         .label,
     ).toBe("Ask Claude about the listing sync");
+  });
+
+  it("keeps meaningful runtime titles when no taskTitle exists, and rejects provider chrome fallbacks", () => {
+    const meaningfulRuntime = session("tab:claude-generic", {
+      title: "Ship live-first sessions",
+      tabId: "claude-generic",
+    });
+    expect(describeSession(workspace([meaningfulRuntime]), meaningfulRuntime).label).toBe(
+      "Ship live-first sessions",
+    );
+
+    const spinnerGlyph = session("tab:claude-generic", {
+      title: "✳",
+      tabId: "claude-generic",
+    });
+    expect(describeSession(workspace([spinnerGlyph]), spinnerGlyph).label).toBe(
+      "Claude session",
+    );
+
+    const shellPrompt = session("tab:claude-generic", {
+      title: "user@host:~/devmanager$",
+      tabId: "claude-generic",
+    });
+    expect(describeSession(workspace([shellPrompt]), shellPrompt).label).toBe(
+      "Claude session",
+    );
+
+    const pathLike = session("tab:claude-generic", {
+      title: "C:\\Windows\\system32\\cmd.exe",
+      tabId: "claude-generic",
+    });
+    expect(describeSession(workspace([pathLike]), pathLike).label).toBe("Claude session");
+
+    const mingwPrompt = session("tab:claude-generic", {
+      title: "MINGW64:/c/Code/personal/househunter",
+      tabId: "claude-generic",
+    });
+    expect(describeSession(workspace([mingwPrompt]), mingwPrompt).label).toBe(
+      "Claude session",
+    );
+
+    const brailleSpinner = session("tab:claude-generic", {
+      title: "⠐ Working",
+      tabId: "claude-generic",
+    });
+    expect(describeSession(workspace([brailleSpinner]), brailleSpinner).label).toBe(
+      "Claude session",
+    );
+
+    const spinnerDoesNotReplaceTask = session("tab:claude-generic", {
+      title: "⠋ Thinking…",
+      taskTitle: "Normalize session titles",
+      tabId: "claude-generic",
+    });
+    expect(
+      describeSession(workspace([spinnerDoesNotReplaceTask]), spinnerDoesNotReplaceTask)
+        .label,
+    ).toBe("Normalize session titles");
   });
 
   it("rejects bare, session-suffixed, and numbered generic AI labels for title and tab", () => {
