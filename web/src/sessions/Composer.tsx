@@ -1,4 +1,4 @@
-import { ImagePlus, Send, X } from "lucide-react";
+import { CircleStop, ImagePlus, Send, X } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -41,7 +41,10 @@ export interface ComposerProps {
   /** Runtime + stable-session identity. Local attachment state never crosses it. */
   scopeKey: string;
   value: string;
+  /** Blocks send (and shows reconnecting) without locking the draft textarea. */
   disabled: boolean;
+  /** Locks the textarea and attachments, e.g. ended sessions. */
+  editingDisabled?: boolean;
   pending: boolean;
   supportsAttachments: boolean;
   provider?: WebAiKind;
@@ -49,6 +52,8 @@ export interface ComposerProps {
   returnBehavior?: ReturnBehavior;
   placeholder?: string;
   note?: string | null;
+  thinking?: boolean;
+  onStop?(): void;
   onChange(value: string): void;
   onSubmit(text: string, attachments: ComposerAttachment[]): Promise<unknown>;
   onProviderCommandSubmitted?(command: SlashCommand): void;
@@ -67,6 +72,7 @@ export function Composer({
   scopeKey,
   value,
   disabled,
+  editingDisabled = false,
   pending,
   supportsAttachments,
   provider,
@@ -74,6 +80,8 @@ export function Composer({
   returnBehavior = "newline",
   placeholder = "Message",
   note = null,
+  thinking = false,
+  onStop,
   onChange,
   onSubmit,
   onProviderCommandSubmitted,
@@ -96,7 +104,13 @@ export function Composer({
   const onSafetyStateChangeRef = useRef(onSafetyStateChange);
   onSafetyStateChangeRef.current = onSafetyStateChange;
   const busy = pending || submitting || readingAttachments;
-  const canSend = !disabled && !busy && (localValue.trim().length > 0 || attachments.length > 0);
+  const canSend =
+    !disabled &&
+    !editingDisabled &&
+    !busy &&
+    !thinking &&
+    (localValue.trim().length > 0 || attachments.length > 0);
+  const canStop = thinking && Boolean(onStop) && !disabled && !editingDisabled && !busy;
   const slashEligible = Boolean(
     provider && localValue.startsWith("/") && !/\s/.test(localValue),
   );
@@ -111,6 +125,7 @@ export function Composer({
     [catalog.commands, localValue, provider],
   );
   const commandSheetOpen = slashEligible && dismissedCommandDraft !== localValue;
+  const enterKeyHint = returnBehavior === "send" ? "send" : "enter";
   const publishSafety = (
     nextAttachments = attachmentsRef.current,
     loading = attachmentReadPendingRef.current,
@@ -393,6 +408,7 @@ export function Composer({
               <button
                 type="button"
                 aria-label={`Remove ${attachment.fileName ?? "image"}`}
+                disabled={editingDisabled}
                 onClick={() => {
                   const next = attachmentsRef.current.filter(
                     (item) => item.id !== attachment.id,
@@ -426,6 +442,7 @@ export function Composer({
               key={suggestion.value}
               type="button"
               aria-label={`Use ${suggestion.label}`}
+              disabled={editingDisabled}
               onClick={() => applySuggestion(selectedCommand, suggestion.value)}
             >
               {suggestion.label}
@@ -441,9 +458,8 @@ export function Composer({
               type="file"
               aria-label="Attach image"
               accept="image/png,image/jpeg"
-              capture="environment"
               multiple
-              disabled={disabled || busy}
+              disabled={editingDisabled || busy}
               onChange={(event) => {
                 void addFiles(Array.from(event.currentTarget.files ?? []));
                 event.currentTarget.value = "";
@@ -456,20 +472,32 @@ export function Composer({
           aria-label="Message"
           autoCapitalize="sentences"
           autoCorrect="on"
-          enterKeyHint="send"
+          enterKeyHint={enterKeyHint}
           inputMode="text"
           rows={1}
           placeholder={placeholder}
           value={localValue}
-          disabled={disabled}
+          disabled={editingDisabled}
           onChange={(event) => updateValue(event.currentTarget.value)}
           onFocus={onFocus}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
         />
-        <button type="submit" className="dm-composer-send" aria-label="Send message" disabled={!canSend}>
-          <Send size={19} aria-hidden="true" />
-        </button>
+        {thinking ? (
+          <button
+            type="button"
+            className="dm-composer-send dm-composer-stop"
+            aria-label="Stop"
+            disabled={!canStop}
+            onClick={() => onStop?.()}
+          >
+            <CircleStop size={19} aria-hidden="true" />
+          </button>
+        ) : (
+          <button type="submit" className="dm-composer-send" aria-label="Send message" disabled={!canSend}>
+            <Send size={19} aria-hidden="true" />
+          </button>
+        )}
       </div>
       {error && <p className="dm-composer-error" role="alert">{error}</p>}
       <p className="dm-composer-hint">

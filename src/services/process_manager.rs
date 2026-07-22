@@ -31,7 +31,7 @@ use crate::state::{
 };
 use crate::terminal::session::{
     bash_shell_args, preferred_windows_bash_program, TerminalBackend, TerminalModeSnapshot,
-    TerminalSession, TerminalSessionView,
+    TerminalScreenSnapshot, TerminalSession, TerminalSessionView,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -153,6 +153,7 @@ pub enum RemoteSessionEvent {
         session_id: String,
         bytes: Vec<u8>,
         mode: TerminalModeSnapshot,
+        screen: Option<TerminalScreenSnapshot>,
     },
     Runtime {
         session_id: String,
@@ -5399,15 +5400,43 @@ fn session_output_notifier(
         let Some(inner) = inner.upgrade() else {
             return;
         };
+        let screen = ai_session_screen_snapshot(&inner, &session_id);
         emit_remote_session_event(
             &inner,
             RemoteSessionEvent::Output {
                 session_id: session_id.clone(),
                 bytes,
                 mode,
+                screen,
             },
         );
     })
+}
+
+fn ai_session_screen_snapshot(
+    inner: &ProcessManagerInner,
+    session_id: &str,
+) -> Option<TerminalScreenSnapshot> {
+    let is_ai = inner
+        .runtime_state
+        .read()
+        .ok()
+        .and_then(|runtime| {
+            runtime
+                .sessions
+                .get(session_id)
+                .map(|session| session.session_kind)
+        })
+        .is_some_and(|kind| matches!(kind, SessionKind::Claude | SessionKind::Codex));
+    if !is_ai {
+        return None;
+    }
+    let session = inner
+        .sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(session_id).cloned())?;
+    Some(session.snapshot())
 }
 
 fn emit_remote_session_event(inner: &ProcessManagerInner, event: RemoteSessionEvent) {
@@ -7594,6 +7623,100 @@ mod tests {
         notifier(b"output".to_vec(), mode);
 
         assert_eq!(rx.recv_timeout(Duration::from_millis(100)), Ok(mode));
+    }
+
+    #[test]
+    fn output_notifier_attaches_screen_snapshot_only_for_ai_sessions() {
+        let manager = ProcessManager::new();
+        let cwd = std::env::current_dir().unwrap();
+        manager
+            .spawn_shell_session("ai-session", &cwd, SessionDimensions::default(), None, None)
+            .expect("ai session");
+        manager
+            .spawn_shell_session(
+                "server-session",
+                &cwd,
+                SessionDimensions::default(),
+                None,
+                None,
+            )
+            .expect("server session");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let runtime = manager.inner.runtime_state.read().unwrap();
+            if runtime.sessions.contains_key("ai-session")
+                && runtime.sessions.contains_key("server-session")
+            {
+                break;
+            }
+            drop(runtime);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        {
+            let mut runtime = manager.inner.runtime_state.write().unwrap();
+            runtime
+                .sessions
+                .get_mut("ai-session")
+                .expect("ai runtime")
+                .session_kind = SessionKind::Claude;
+            runtime
+                .sessions
+                .get_mut("server-session")
+                .expect("server runtime")
+                .session_kind = SessionKind::Server;
+        }
+        manager
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .get("ai-session")
+            .expect("ai terminal")
+            .write_virtual_text("assistant visible text");
+
+        assert!(
+            ai_session_screen_snapshot(&manager.inner, "ai-session").is_some(),
+            "Claude sessions must attach a post-parse screen snapshot"
+        );
+        assert!(
+            ai_session_screen_snapshot(&manager.inner, "server-session").is_none(),
+            "non-AI sessions must not pay the snapshot cost"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        manager.set_remote_session_handler(Some(Arc::new(move |event| {
+            if let RemoteSessionEvent::Output {
+                session_id,
+                screen,
+                bytes,
+                ..
+            } = event
+            {
+                if bytes == b"probe-chunk" {
+                    let _ = tx.send((session_id, screen.is_some()));
+                }
+            }
+        })));
+
+        let ai_notifier = session_output_notifier(manager.inner.clone(), "ai-session".to_string());
+        let server_notifier =
+            session_output_notifier(manager.inner.clone(), "server-session".to_string());
+        let mode = TerminalModeSnapshot::default();
+        ai_notifier(b"probe-chunk".to_vec(), mode);
+        server_notifier(b"probe-chunk".to_vec(), mode);
+
+        let first = rx.recv_timeout(Duration::from_secs(1)).expect("ai event");
+        let second = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server event");
+        let events = [first, second];
+        assert!(events.contains(&("ai-session".to_string(), true)));
+        assert!(events.contains(&("server-session".to_string(), false)));
+
+        let _ = manager.close_session("ai-session");
+        let _ = manager.close_session("server-session");
     }
 
     #[test]

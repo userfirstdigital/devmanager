@@ -1,8 +1,8 @@
 import {
   Bot,
   ChevronRight,
-  CircleAlert,
   Clock3,
+  Radio,
   Server,
   TerminalSquare,
 } from "lucide-react";
@@ -22,11 +22,11 @@ interface SessionsScreenProps {
 }
 
 function SessionIcon({ item }: { item: SessionListItem }) {
-  if (item.session.kind === "server") return <Server size={19} />;
+  if (item.session.kind === "server") return <Server size={18} />;
   if (item.session.kind === "claude" || item.session.kind === "codex") {
-    return <Bot size={19} />;
+    return <Bot size={18} />;
   }
-  return <TerminalSquare size={19} />;
+  return <TerminalSquare size={18} />;
 }
 
 function SessionRow({
@@ -38,10 +38,21 @@ function SessionRow({
   now: number;
   onNavigate(route: AppRoute): void;
 }) {
+  const activity = formatRelativeActivity(item.lastActivityEpochMs, now);
+  const accessibleName = [
+    item.label,
+    item.projectName,
+    item.kindLabel,
+    item.stateLabel,
+    activity,
+  ].join(", ");
+  const showUnreadBadge = item.attention === "unread" && item.attentionCount > 0;
+
   return (
     <button
       type="button"
       className="dm-session-row"
+      aria-label={accessibleName}
       onClick={() => onNavigate(item.route)}
     >
       <span className="dm-session-kind-icon" data-tone={item.statusTone} aria-hidden="true">
@@ -50,17 +61,14 @@ function SessionRow({
       <span className="dm-session-copy">
         <span className="dm-session-primary">
           <strong>{item.label}</strong>
-          <span className="dm-session-time">
-            {formatRelativeActivity(item.lastActivityEpochMs, now)}
-          </span>
+          <span className="dm-session-time">{activity}</span>
         </span>
-        <span className="dm-session-project">
+        <span className="dm-session-secondary">
           {item.projectColor ? (
             <i style={{ backgroundColor: item.projectColor }} aria-hidden="true" />
           ) : null}
-          {item.projectName}
-        </span>
-        <span className="dm-session-meta">
+          <span>{item.projectName}</span>
+          <span aria-hidden="true">·</span>
           <span>{item.kindLabel}</span>
           <span aria-hidden="true">·</span>
           <span className="dm-session-state" data-tone={item.statusTone}>
@@ -68,7 +76,7 @@ function SessionRow({
           </span>
         </span>
       </span>
-      {item.attentionCount > 0 ? (
+      {showUnreadBadge ? (
         <span className="dm-attention-count" aria-label={`${item.attentionCount} unread updates`}>
           {Math.min(item.attentionCount, 99)}
         </span>
@@ -89,13 +97,17 @@ export function SessionsScreen({ workspace, onNavigate }: SessionsScreenProps) {
 
   const sections = [
     {
-      id: "attention",
-      title: "Needs attention",
-      icon: <CircleAlert size={15} aria-hidden="true" />,
-      items: groups.needsAttention,
+      id: "live",
+      title: "Live now",
+      icon: <Radio size={15} aria-hidden="true" />,
+      items: groups.live,
     },
-    { id: "active", title: "Active", icon: null, items: groups.active },
-    { id: "recent", title: "Recent", icon: <Clock3 size={15} aria-hidden="true" />, items: groups.recent },
+    {
+      id: "recent",
+      title: "Recent",
+      icon: <Clock3 size={15} aria-hidden="true" />,
+      items: groups.recent,
+    },
   ];
   const hasSessions = sections.some((section) => section.items.length > 0);
 
@@ -120,9 +132,12 @@ export function SessionsScreen({ workspace, onNavigate }: SessionsScreenProps) {
             </button>
           </div>
         ) : null}
-        {sections.map((section) =>
+        {sections.map((section, index) =>
           section.items.length ? (
-            <section className="dm-list-section" key={section.id}>
+            <section
+              className={`dm-list-section${index === 0 ? " dm-list-section-first" : ""}`}
+              key={section.id}
+            >
               <h2>
                 {section.icon}
                 {section.title}

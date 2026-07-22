@@ -102,8 +102,19 @@ function activityState(events: ActivityEvent[]): "active" | "success" | "failure
 }
 
 function activitySummary(events: ActivityEvent[]): string {
-  const labels = [...new Set(events.map(activityLabel))];
-  return `${events.length} action${events.length === 1 ? "" : "s"} · ${labels.join(" · ")}`;
+  const counts = new Map<string, number>();
+  for (const event of events) {
+    const label = activityLabel(event);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const parts = [...counts.entries()].map(([label, count]) =>
+    count > 1 ? `${label} ×${count}` : label,
+  );
+  return `${events.length} action${events.length === 1 ? "" : "s"} · ${parts.join(" · ")}`;
+}
+
+function isVisibleFallbackText(text: string): boolean {
+  return text.trim().length > 0;
 }
 
 function boundFallbackOutput(text: string): string {
@@ -154,7 +165,32 @@ export function buildConversationItems(
       continue;
     }
 
+    // Lifecycle noise and hidden/empty terminal redraws must not split activity.
     if (event.kind === "status" || event.kind === "terminalMode") continue;
+    if (event.kind === "output") {
+      const visibleFallback =
+        density !== "minimal" &&
+        includeFallbackOutput &&
+        isVisibleFallbackText(event.text);
+      if (!visibleFallback) continue;
+
+      flushActivity();
+      const previous = items[items.length - 1];
+      if (previous?.kind === "fallbackOutput" && previous.stream === event.stream) {
+        previous.text = boundFallbackOutput(`${previous.text}${event.text}`);
+        previous.sequence = event.sequence;
+      } else {
+        items.push({
+          kind: "fallbackOutput",
+          key: `fallback:${event.sequence}`,
+          sequence: event.sequence,
+          text: boundFallbackOutput(event.text),
+          stream: event.stream,
+        });
+      }
+      continue;
+    }
+
     flushActivity();
 
     if (event.kind === "userMessage") {
@@ -207,23 +243,6 @@ export function buildConversationItems(
         sequence: event.sequence,
         event,
       });
-      continue;
-    }
-
-    if (event.kind === "output" && density !== "minimal" && includeFallbackOutput) {
-      const previous = items[items.length - 1];
-      if (previous?.kind === "fallbackOutput" && previous.stream === event.stream) {
-        previous.text = boundFallbackOutput(`${previous.text}${event.text}`);
-        previous.sequence = event.sequence;
-      } else {
-        items.push({
-          kind: "fallbackOutput",
-          key: `fallback:${event.sequence}`,
-          sequence: event.sequence,
-          text: boundFallbackOutput(event.text),
-          stream: event.stream,
-        });
-      }
     }
   }
 

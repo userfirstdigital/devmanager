@@ -35,3 +35,18 @@ Outstanding before merge: interactive manual QA (7 steps from final review) — 
 Browser checkpoint 9 Task 1: complete (commits cac4ae8..11937fb, independent spec and quality review approved; exact zeroizing replay secret store and compiler capacity boundary).
 Browser checkpoint 9 Task 2: complete (commits df43754..aba7ea1, independent spec and security re-review approved; private sidecar is bound to the exact opaque replay instance and revalidated at ingress and approval resume).
 Known pre-existing flake (NOT this branch): remote::tests::native_client_connections_are_recorded_in_activity_log (src/remote/mod.rs:5031) — access-log persist race, reproduced 1/5 runs; src/remote/ and src/persistence/ untouched by branch (git diff empty). Suggest follow-up to deflake.
+
+# Native LLM Chat Perfection Progress
+
+Baseline: `7607efc feat(web): make remote sessions live-first`
+Plan: `docs/superpowers/plans/2026-07-21-native-llm-chat-perfection.md`
+
+Task 1: complete — current Codex hook overrides use shell-safe Windows paths without changing POSIX paths; focused Rust tests pass and independent review is clean.
+
+Task 2: complete — AI fallback uses a replacing post-parse screen projection, preserves visible indentation, clears stale frames, and leaves non-AI/raw streaming unchanged; focused Rust tests pass and independent review is clean (empty-card rendering is assigned to Task 3).
+
+Task 3: complete — native chat groups a turn into one compact activity disclosure, exposes Stop only while thinking, keeps drafts editable across reconnects, preserves unsent text around one-shot question choices, and prefers stable semantic titles; 325 web tests, typecheck, production build, and independent review are clean.
+
+Task 4: complete — native Windows Codex uses the supported PowerShell `command_windows` hook with an explicit call operator, enabling SessionStart, prompt, tool, response, and Stop semantics on Codex CLI 0.145.0. The degraded screen projector suppresses startup commands and relay nonces, and the web UI shows fallback guidance only when fallback text is actually visible.
+
+Acceptance: complete — phone-size hot reload passed fresh Claude and Codex conversations, compact multi-tool activity, exact streamed replies, unsent-draft return, native empty state, and zero hook-failure/fallback/nonce leakage in the final Codex run. Final gates: 325/325 web tests, web typecheck and production/PWA bundle, 830/830 runnable Rust library tests (1 explicit real-network probe ignored), formatting, locked all-target checks, diff checks, and a clean independent final review.

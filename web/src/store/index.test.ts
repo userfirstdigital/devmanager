@@ -297,6 +297,51 @@ describe("aggregate app badge", () => {
     ).toBe(7);
   });
 
+  it("excludes ended stale attention while summing live unread/needsInput/failed", () => {
+    const liveUnread = makeSnapshot().sessions[0]!;
+    const liveNeedsInput = {
+      ...liveUnread,
+      stableSessionKey: "tab:input",
+      attention: "needsInput" as const,
+      attentionCount: 3,
+    };
+    const liveFailed = {
+      ...liveUnread,
+      stableSessionKey: "tab:live-failed",
+      attention: "failed" as const,
+      attentionCount: 1,
+    };
+    const endedFailed = {
+      ...liveUnread,
+      stableSessionKey: "tab:ended-failed",
+      status: "Failed" as const,
+      attention: "failed" as const,
+      attentionCount: 9,
+    };
+    const endedUnread = {
+      ...liveUnread,
+      stableSessionKey: "tab:ended-unread",
+      status: "Stopped" as const,
+      attention: "unread" as const,
+      attentionCount: 4,
+    };
+
+    expect(
+      selectAggregateBadgeCount({
+        runtimeInstanceId: "runtime-1",
+        status: { kind: "open" },
+        compatibilityDiagnostic: null,
+        sessions: {
+          "tab:a": liveUnread,
+          "tab:input": liveNeedsInput,
+          "tab:live-failed": liveFailed,
+          "tab:ended-failed": endedFailed,
+          "tab:ended-unread": endedUnread,
+        },
+      }),
+    ).toBe(6);
+  });
+
   it("caps the aggregate attention count at 99", () => {
     expect(
       selectAggregateBadgeCount({

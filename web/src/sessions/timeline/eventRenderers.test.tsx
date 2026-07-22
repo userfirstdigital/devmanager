@@ -2,7 +2,7 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SemanticEvent } from "../../api/types";
 import { ConversationItemRenderer } from "./eventRenderers";
@@ -26,6 +26,20 @@ const successfulTool = event("tool", {
   summary: "Read package.json",
 });
 
+const runningTool = event("tool", {
+  tool_id: "tool-2",
+  name: "Bash",
+  state: "running",
+  summary: "Running tests",
+});
+
+const failedTool = event("tool", {
+  tool_id: "tool-3",
+  name: "Edit",
+  state: "failed",
+  summary: "Could not patch",
+});
+
 const question = event("question", {
   question_id: "question-1",
   prompt: "Continue with the migration?",
@@ -47,7 +61,63 @@ describe("native semantic event rendering", () => {
 
     rerender(<ConversationItemRenderer density="calm" item={questionItem} />);
     expect(screen.getByText("Continue with the migration?").isConnected).toBe(true);
-    expect(screen.getByText("Continue").isConnected).toBe(true);
+    expect(screen.getByRole("button", { name: "Continue" }).isConnected).toBe(true);
+  });
+
+  it("keeps active activity collapsed in calm mode and opens failures", () => {
+    const active = buildConversationItems([runningTool], "calm")[0];
+    const failed = buildConversationItems([failedTool], "calm")[0];
+    if (!active || !failed) throw new Error("fixture item missing");
+
+    const { rerender } = render(
+      <ConversationItemRenderer density="calm" item={active} />,
+    );
+    expect(screen.getByRole("button", { name: /1 action/i }).getAttribute("aria-expanded")).toBe(
+      "false",
+    );
+
+    rerender(<ConversationItemRenderer density="calm" item={failed} />);
+    expect(screen.getByRole("button", { name: /1 action/i }).getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+  });
+
+  it("expands active activity in full density", () => {
+    const active = buildConversationItems([runningTool], "full")[0];
+    if (!active) throw new Error("activity missing");
+    render(<ConversationItemRenderer density="full" item={active} />);
+    expect(screen.getByRole("button", { name: /1 action/i }).getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+  });
+
+  it("submits question choices through the optional callback", async () => {
+    const user = userEvent.setup();
+    const onChoice = vi.fn();
+    const questionItem = buildConversationItems([question], "calm")[0];
+    if (!questionItem) throw new Error("question missing");
+
+    const { rerender } = render(
+      <ConversationItemRenderer
+        density="calm"
+        item={questionItem}
+        onQuestionChoice={onChoice}
+        questionChoicesDisabled
+      />,
+    );
+    expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+
+    rerender(
+      <ConversationItemRenderer
+        density="calm"
+        item={questionItem}
+        onQuestionChoice={onChoice}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(onChoice).toHaveBeenCalledWith("Continue");
   });
 
   it("lets the user expand grouped activity without rendering HTML", async () => {

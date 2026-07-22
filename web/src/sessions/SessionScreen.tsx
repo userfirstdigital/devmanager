@@ -182,7 +182,8 @@ export function SessionScreen({
       key={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
       scopeKey={`${workspace.runtimeInstanceId}:${stableSessionKey}`}
       value={draft}
-      disabled={!connected || !live}
+      disabled={!connected}
+      editingDisabled={!live}
       pending={mutationPending}
       supportsAttachments={ai}
       provider={provider ?? undefined}
@@ -190,6 +191,8 @@ export function SessionScreen({
       returnBehavior={returnBehavior}
       placeholder={ai ? `Message ${summary.kind === "claude" ? "Claude" : "Codex"}` : "Enter a command"}
       note={controlNote}
+      thinking={ai && summary.aiActivity === "Thinking"}
+      onStop={() => interruptSession(stableSessionKey)}
       onFocus={prepareComposer}
       onSafetyStateChange={(safety) =>
         setComposerSafety(stableSessionKey, safety)
@@ -228,10 +231,28 @@ export function SessionScreen({
         adapterHealth={summary.adapterHealth}
         running={live}
         actionsDisabled={!connected}
+        questionChoicesDisabled={
+          !connected ||
+          !live ||
+          mutationPending ||
+          summary.attention !== "needsInput"
+        }
         composer={composer}
-        onInterrupt={() => interruptSession(stableSessionKey)}
         onRestart={() => {
           if (tab) void restartAiTab(tab.id);
+        }}
+        onQuestionChoice={(choice) => {
+          const draftSnapshot = latestDraft.current;
+          const submission = submitComposer(stableSessionKey, choice, []);
+          // Restore without setDraft: setDraft cancels a pending mutation when
+          // the restored text differs from the in-flight choice.
+          useStore.setState((state) => ({
+            drafts: { ...state.drafts, [stableSessionKey]: draftSnapshot },
+          }));
+          saveDraft(workspace.runtimeInstanceId, stableSessionKey, draftSnapshot);
+          void submission.catch(() => {
+            // Store already records lastError for the rejected submission.
+          });
         }}
       />
     );

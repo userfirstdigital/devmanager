@@ -637,19 +637,24 @@ pub fn build_codex_hooks_command(
     }
     // Codex runs hook commands through a shell; double quotes around the
     // executable path are safe on cmd, PowerShell, and sh alike.
-    let relay_command = format!(
-        "\"{}\" codex-hook-relay --url {endpoint} --nonce {nonce}",
-        devmanager_executable.to_string_lossy()
+    // Forward-slash the relay executable only: Windows backslashes become
+    // TOML `\\` escapes that Codex's native -c hooks parser rejects.
+    let relay_executable = codex_relay_executable_path(devmanager_executable);
+    let relay_command =
+        format!("\"{relay_executable}\" codex-hook-relay --url {endpoint} --nonce {nonce}");
+    // Native Windows Codex runs `command_windows` through PowerShell. A
+    // quoted executable path is only a string there; `&` is required to
+    // invoke it. Keep the generic command for POSIX shells.
+    let relay_command_windows = format!(
+        "& '{}' codex-hook-relay --url {endpoint} --nonce {nonce}",
+        relay_executable.replace('\'', "''")
     );
     for override_value in config {
         tokens.push("--config".to_string());
         tokens.push(override_value.argument());
     }
     for event in CODEX_HOOK_EVENTS {
-        let override_value = format!(
-            "hooks.{event}=[{{hooks=[{{type=\"command\",command={},async=true}}]}}]",
-            toml_basic_string(&relay_command)
-        );
+        let override_value = codex_hook_override(event, &relay_command, &relay_command_windows);
         tokens.push("-c".to_string());
         tokens.push(override_value);
     }
@@ -658,6 +663,33 @@ pub fn build_codex_hooks_command(
         &tokens,
         shell_program,
     ))
+}
+
+fn codex_hook_override(event: &str, command: &str, command_windows: &str) -> String {
+    format!(
+        "hooks.{event}=[{{hooks=[{{type=\"command\",command={},command_windows={}}}]}}]",
+        toml_basic_string(command),
+        toml_basic_string(command_windows)
+    )
+}
+
+fn codex_relay_executable_path(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        // Shells accept slash-separated drive and UNC paths. Drop the Win32
+        // extended-path spelling because `//?/` is not a portable shell path.
+        let path = path
+            .strip_prefix(r"\\?\UNC\")
+            .map(|tail| format!(r"\\{tail}"))
+            .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or_else(|| path.into_owned());
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.into_owned()
+    }
 }
 
 fn tool_input_summary(payload: &Value) -> String {
@@ -1117,22 +1149,12 @@ mod launch_builder_tests {
 
     #[test]
     fn override_value_is_parseable_toml() {
-        let command = build_codex_hooks_command(
-            "codex --yolo",
-            "bash",
-            std::path::Path::new(r"C:\Apps\dev manager.exe"),
-            "http://127.0.0.1:4321/internal/codex-hook",
-            "ff00",
-            &[],
-        )
-        .unwrap();
-        // Extract one -c value back out of the bash-quoted command line and
-        // confirm the value after `hooks.SessionStart=` parses as TOML.
-        let marker = "hooks.SessionStart=";
-        let start = command.find(marker).unwrap() + marker.len();
-        let rest = &command[start..];
-        let end = rest.find("]'").map(|index| index + 1).unwrap();
-        let toml_value = &rest[..end];
+        let override_value = codex_hook_override(
+            "SessionStart",
+            r#""C:/Apps/dev manager.exe" codex-hook-relay --url http://127.0.0.1:4321/internal/codex-hook --nonce ff00"#,
+            "& 'C:/Apps/dev manager.exe' codex-hook-relay --url http://127.0.0.1:4321/internal/codex-hook --nonce ff00",
+        );
+        let toml_value = override_value.strip_prefix("hooks.SessionStart=").unwrap();
         let parsed: toml::Value = toml::from_str(&format!("value = {toml_value}")).unwrap();
         let handler = &parsed["value"][0]["hooks"][0];
         assert_eq!(handler["type"].as_str(), Some("command"));
@@ -1140,7 +1162,66 @@ mod launch_builder_tests {
             .as_str()
             .unwrap()
             .contains("codex-hook-relay"));
-        assert_eq!(handler["async"].as_bool(), Some(true));
+        assert!(
+            handler["command_windows"]
+                .as_str()
+                .unwrap()
+                .starts_with("& 'C:/Apps/dev manager.exe' codex-hook-relay"),
+            "Codex runs command_windows through PowerShell, so executable paths require its call operator"
+        );
+        assert!(
+            handler.get("async").is_none(),
+            "current Codex rejects async command hooks; relay hooks must use the supported synchronous form"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relay_path_uses_forward_slashes_in_hook_override() {
+        // Codex's native -c hooks parser rejects TOML-escaped Windows
+        // backslashes in the relay command; forward slashes keep the value a
+        // sequence. Paths with spaces must stay quoted.
+        let relay_path =
+            codex_relay_executable_path(std::path::Path::new(r"C:\Apps\dev manager.exe"));
+        let override_value = codex_hook_override(
+            "SessionStart",
+            &format!(r#""{relay_path}" codex-hook-relay --url http://127.0.0.1:4321/internal/codex-hook --nonce ff00"#),
+            &format!("& '{relay_path}' codex-hook-relay --url http://127.0.0.1:4321/internal/codex-hook --nonce ff00"),
+        );
+        let toml_value = override_value.strip_prefix("hooks.SessionStart=").unwrap();
+        assert!(
+            toml_value.contains(r#"\"C:/Apps/dev manager.exe\""#),
+            "hook override must quote a forward-slash relay path: {toml_value}"
+        );
+        assert!(
+            !toml_value.contains(r"C:\\"),
+            "hook override must not TOML-escape a backslash Windows path: {toml_value}"
+        );
+        let parsed: toml::Value = toml::from_str(&format!("value = {toml_value}")).unwrap();
+        let command_text = parsed["value"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            command_text.starts_with(r#""C:/Apps/dev manager.exe""#),
+            "relay command must keep quotes around the spaced path: {command_text}"
+        );
+        assert_eq!(
+            codex_relay_executable_path(std::path::Path::new(r"\\server\share\devmanager.exe")),
+            "//server/share/devmanager.exe"
+        );
+        assert_eq!(
+            codex_relay_executable_path(std::path::Path::new(r"\\?\C:\Apps\devmanager.exe")),
+            "C:/Apps/devmanager.exe"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_relay_path_preserves_literal_backslashes() {
+        assert_eq!(
+            codex_relay_executable_path(std::path::Path::new(
+                r"/Applications/Dev\Manager/devmanager"
+            )),
+            r"/Applications/Dev\Manager/devmanager"
+        );
     }
 }
 

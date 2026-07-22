@@ -1164,8 +1164,9 @@ impl NativeShell {
                 session_id,
                 bytes,
                 mode,
+                screen,
             } => {
-                event_host_service.push_session_output_with_mode(&session_id, bytes, mode);
+                event_host_service.push_session_output_with_mode(&session_id, bytes, mode, screen);
             }
             RemoteSessionEvent::Runtime {
                 session_id,

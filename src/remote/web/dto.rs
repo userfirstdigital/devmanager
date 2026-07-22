@@ -3,7 +3,8 @@ use crate::remote::presentation::{
     SemanticAdapterHealth, SemanticAttention, SemanticSessionMetadata, StableSessionKey,
 };
 use crate::state::{
-    AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
+    AiActivity, AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState,
+    SessionStatus,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -142,6 +143,12 @@ pub struct WebSessionSummary {
     pub tab_id: Option<String>,
     pub dimensions: SessionDimensions,
     pub interactive_shell: bool,
+    /// Host terminal/provider title already tracked for the native sidebar.
+    pub title: Option<String>,
+    /// Host AI activity already tracked for the native sidebar.
+    pub ai_activity: Option<AiActivity>,
+    /// Sticky semantic task title from the first substantive user message.
+    pub task_title: Option<String>,
     pub last_activity_epoch_ms: Option<u64>,
     pub attention: SemanticAttention,
     pub attention_count: u64,
@@ -172,6 +179,9 @@ impl WebSessionSummary {
             tab_id: session.tab_id.clone(),
             dimensions: session.dimensions,
             interactive_shell: session.interactive_shell,
+            title: session.title.clone(),
+            ai_activity: session.ai_activity,
+            task_title: metadata.task_title.clone(),
             last_activity_epoch_ms: metadata.last_activity_epoch_ms,
             attention: metadata.attention,
             attention_count: metadata.attention_count,
@@ -315,7 +325,8 @@ mod tests {
         PortStatus, Project, ProjectFolder, RunCommand, SSHConnection, SessionTab, TabType,
     };
     use crate::remote::presentation::{
-        SemanticAdapterHealth, SemanticAttention, SemanticJournalStore, StableSessionKey,
+        SemanticAdapterHealth, SemanticAttention, SemanticEventDraft, SemanticEventKind,
+        SemanticJournalStore, SemanticRetention, SemanticSource, StableSessionKey,
     };
     use crate::state::{
         AiLaunchSpec, AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState,
@@ -506,5 +517,66 @@ mod tests {
         .unwrap();
 
         assert_eq!(value["sessions"][0]["interactiveShell"], true);
+    }
+
+    #[test]
+    fn browser_session_summary_projects_runtime_title_and_ai_activity() {
+        use crate::state::AiActivity;
+
+        let mut fixture = host_fixture_with_sentinels();
+        {
+            let session = fixture.runtime.sessions.get_mut("session-1").unwrap();
+            session.title = Some("Fix mobile sessions ordering".to_string());
+            session.ai_activity = Some(AiActivity::Thinking);
+        }
+        let value = serde_json::to_value(WebWorkspaceSnapshot::from_host(
+            "runtime-1",
+            7,
+            &fixture.app,
+            &fixture.runtime,
+            &fixture.ports,
+            &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            value["sessions"][0]["title"],
+            "Fix mobile sessions ordering"
+        );
+        assert_eq!(value["sessions"][0]["aiActivity"], "Thinking");
+        assert_eq!(WEB_PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
+    fn browser_session_summary_projects_semantic_task_title() {
+        let mut fixture = host_fixture_with_sentinels();
+        let key = StableSessionKey::from_tab("tab-1");
+        fixture.journals.record(SemanticEventDraft {
+            stable_session_key: key,
+            occurred_at_epoch_ms: 10,
+            source: SemanticSource::Claude,
+            kind: SemanticEventKind::UserMessage {
+                text: "  Investigate   househunter listing sync  ".to_string(),
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: None,
+        });
+        let value = serde_json::to_value(WebWorkspaceSnapshot::from_host(
+            "runtime-1",
+            7,
+            &fixture.app,
+            &fixture.runtime,
+            &fixture.ports,
+            &fixture.lease,
+            &fixture.journals.metadata_snapshot(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            value["sessions"][0]["taskTitle"],
+            "Investigate househunter listing sync"
+        );
+        assert_eq!(WEB_PROTOCOL_VERSION, 3);
     }
 }
