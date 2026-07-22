@@ -42,3 +42,5 @@ Baseline: `7607efc feat(web): make remote sessions live-first`
 Plan: `docs/superpowers/plans/2026-07-21-native-llm-chat-perfection.md`
 
 Task 1: complete — current Codex hook overrides use shell-safe Windows paths without changing POSIX paths; focused Rust tests pass and independent review is clean.
+
+Task 2: complete — AI fallback uses a replacing post-parse screen projection, preserves visible indentation, clears stale frames, and leaves non-AI/raw streaming unchanged; focused Rust tests pass and independent review is clean (empty-card rendering is assigned to Task 3).

@@ -2257,7 +2257,7 @@ impl RemoteHostService {
     }
 
     pub fn push_session_output(&self, session_id: &str, bytes: Vec<u8>) {
-        self.push_session_output_inner(session_id, bytes, None);
+        self.push_session_output_inner(session_id, bytes, None, None);
     }
 
     pub fn push_claude_adapter_registered(&self, identity: ClaudeSemanticIdentity) {
@@ -2745,8 +2745,9 @@ impl RemoteHostService {
         session_id: &str,
         bytes: Vec<u8>,
         mode: TerminalModeSnapshot,
+        screen: Option<TerminalScreenSnapshot>,
     ) {
-        self.push_session_output_inner(session_id, bytes, Some(mode));
+        self.push_session_output_inner(session_id, bytes, Some(mode), screen);
     }
 
     fn push_session_output_inner(
@@ -2754,6 +2755,7 @@ impl RemoteHostService {
         session_id: &str,
         bytes: Vec<u8>,
         mode: Option<TerminalModeSnapshot>,
+        screen: Option<TerminalScreenSnapshot>,
     ) {
         if bytes.is_empty() {
             return;
@@ -2778,7 +2780,8 @@ impl RemoteHostService {
             let mode_changed = mode.is_some_and(|mode| {
                 journals.observe_native_terminal_mode(session_id, mode, emitted_at_epoch_ms)
             });
-            let output_changed = journals.observe_output(session_id, &bytes, emitted_at_epoch_ms);
+            let output_changed =
+                journals.observe_output(session_id, &bytes, screen.as_ref(), emitted_at_epoch_ms);
             runtime_changed || mode_changed || output_changed
         });
         self.mark_subscribed_clients_bootstrap_pending(session_id);
@@ -7612,8 +7615,13 @@ mod tests {
             ..TerminalModeSnapshot::default()
         };
 
-        service.push_session_output_with_mode("ai-runtime", b"ai".to_vec(), alternate_screen);
-        service.push_session_output_with_mode("shell-runtime", b"shell".to_vec(), alternate_screen);
+        service.push_session_output_with_mode("ai-runtime", b"ai".to_vec(), alternate_screen, None);
+        service.push_session_output_with_mode(
+            "shell-runtime",
+            b"shell".to_vec(),
+            alternate_screen,
+            None,
+        );
 
         assert!(
             !service
@@ -7628,6 +7636,88 @@ mod tests {
                 .raw_required
         );
         assert!(service.inner.clients.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ai_push_session_output_projects_screen_snapshot_instead_of_byte_dumps() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        let mut app = AppState::default();
+        app.open_tabs.push(SessionTab {
+            id: "ai-tab".to_string(),
+            tab_type: TabType::Claude,
+            pty_session_id: Some("ai-runtime".to_string()),
+            ..SessionTab::default()
+        });
+        let mut ai_runtime = SessionRuntimeState::new(
+            "ai-runtime",
+            PathBuf::new(),
+            SessionDimensions::default(),
+            TerminalBackend::default(),
+        );
+        ai_runtime.session_kind = SessionKind::Claude;
+        ai_runtime.tab_id = Some("ai-tab".to_string());
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .sessions
+            .insert(ai_runtime.session_id.clone(), ai_runtime);
+        service.update_snapshot(app, runtime_state, HashMap::new());
+
+        let screen = |text: &str| {
+            let mut snapshot = TerminalScreenSnapshot::default();
+            snapshot.lines = vec![text
+                .chars()
+                .map(|character| crate::terminal::session::TerminalCellSnapshot {
+                    character,
+                    zero_width: Vec::new(),
+                    foreground: 0,
+                    background: 0,
+                    bold: false,
+                    dim: false,
+                    italic: false,
+                    underline: false,
+                    undercurl: false,
+                    strike: false,
+                    hidden: false,
+                    has_hyperlink: false,
+                    default_background: true,
+                })
+                .collect()];
+            snapshot.rows = 1;
+            snapshot.cols = text.chars().count();
+            snapshot
+        };
+
+        service.push_session_output_with_mode(
+            "ai-runtime",
+            b"frame-1".to_vec(),
+            TerminalModeSnapshot::default(),
+            Some(screen("frame one")),
+        );
+        service.push_session_output_with_mode(
+            "ai-runtime",
+            b"frame-2".to_vec(),
+            TerminalModeSnapshot::default(),
+            Some(screen("frame two")),
+        );
+        // Missing screen must not fall back to appending raw AI bytes.
+        service.push_session_output("ai-runtime", b"raw-dump-should-not-append".to_vec());
+
+        let replay = service
+            .semantic_replay(&StableSessionKey::from_tab("ai-tab"), 0)
+            .expect("AI replay");
+        let outputs = replay
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, vec!["frame two"]);
+        assert!(replay.events.iter().any(|event| {
+            matches!(event.kind, SemanticEventKind::Output { .. })
+                && event.replaces_sequence.is_some()
+        }));
     }
 
     #[test]
@@ -7654,10 +7744,39 @@ mod tests {
             .insert(runtime.session_id.clone(), runtime);
         service.update_snapshot(app, runtime_state, HashMap::new());
 
+        let screen = {
+            let mut snapshot = TerminalScreenSnapshot::default();
+            snapshot.lines = vec!["projected"
+                .chars()
+                .map(|character| crate::terminal::session::TerminalCellSnapshot {
+                    character,
+                    zero_width: Vec::new(),
+                    foreground: 0,
+                    background: 0,
+                    bold: false,
+                    dim: false,
+                    italic: false,
+                    underline: false,
+                    undercurl: false,
+                    strike: false,
+                    hidden: false,
+                    has_hyperlink: false,
+                    default_background: true,
+                })
+                .collect()];
+            snapshot.rows = 1;
+            snapshot.cols = 9;
+            snapshot
+        };
         let snapshot_guard = service.inner.snapshot_state_lock.lock().unwrap();
         let background = service.clone();
         let worker = thread::spawn(move || {
-            background.push_session_output("pty-ephemeral", b"projected".to_vec());
+            background.push_session_output_with_mode(
+                "pty-ephemeral",
+                b"projected".to_vec(),
+                TerminalModeSnapshot::default(),
+                Some(screen),
+            );
         });
 
         wait_for(

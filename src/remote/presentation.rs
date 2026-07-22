@@ -1,6 +1,6 @@
 use crate::models::{SessionTab, TabType};
 use crate::state::{SessionKind, SessionRuntimeState, SessionStatus};
-use crate::terminal::session::TerminalModeSnapshot;
+use crate::terminal::session::{TerminalModeSnapshot, TerminalScreenSnapshot};
 use alacritty_terminal::vte::{Parser, Perform};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -14,6 +14,8 @@ const DEFAULT_VERBOSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_STORE_SESSIONS: usize = 256;
 const DEFAULT_STORE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_SEMANTIC_EVENT_BYTES: usize = 64 * 1024;
+const AI_FALLBACK_SCREEN_DEDUP_KEY: &str = "ai-screen-fallback";
+const AI_FALLBACK_MAX_CHARS: usize = 12_288;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -640,6 +642,7 @@ pub struct SemanticJournalStore {
     sessions: HashMap<StableSessionKey, StoredSessionJournal>,
     session_bindings: HashMap<String, SessionBinding>,
     projectors: HashMap<String, PlainTextProjector>,
+    screen_projectors: HashMap<String, AiScreenProjector>,
 }
 
 impl Default for SemanticJournalStore {
@@ -665,6 +668,7 @@ impl SemanticJournalStore {
             sessions: HashMap::new(),
             session_bindings: HashMap::new(),
             projectors: HashMap::new(),
+            screen_projectors: HashMap::new(),
         }
     }
 
@@ -753,19 +757,44 @@ impl SemanticJournalStore {
         &mut self,
         session_id: &str,
         bytes: &[u8],
+        screen: Option<&TerminalScreenSnapshot>,
         occurred_at_epoch_ms: u64,
     ) -> bool {
         let Some(binding) = self.session_bindings.get(session_id).cloned() else {
             return false;
         };
-        let text = self
-            .projectors
-            .entry(session_id.to_string())
-            .or_default()
-            .push(bytes);
-        if text.is_empty() {
-            return false;
-        }
+        let uses_screen_projection = matches!(
+            binding.source,
+            SemanticSource::Claude | SemanticSource::Codex
+        );
+        // Always project AI screens when a snapshot is available. Visibility is
+        // gated in AiSessionView via includeFallbackOutput={adapterHealth !==
+        // "healthy"}; keeping the replacing snapshot current means a health drop
+        // immediately has a fresh fallback rather than waiting for the next chunk.
+        let (text, deduplication_key) = if uses_screen_projection {
+            let Some(screen) = screen else {
+                return false;
+            };
+            let Some(text) = self
+                .screen_projectors
+                .entry(session_id.to_string())
+                .or_default()
+                .project(screen)
+            else {
+                return false;
+            };
+            (text, Some(AI_FALLBACK_SCREEN_DEDUP_KEY.to_string()))
+        } else {
+            let text = self
+                .projectors
+                .entry(session_id.to_string())
+                .or_default()
+                .push(bytes);
+            if text.is_empty() {
+                return false;
+            }
+            (text, None)
+        };
         self.record(SemanticEventDraft {
             stable_session_key: binding.key,
             occurred_at_epoch_ms,
@@ -775,7 +804,7 @@ impl SemanticJournalStore {
                 text,
             },
             retention: SemanticRetention::Verbose,
-            deduplication_key: None,
+            deduplication_key,
         });
         true
     }
@@ -957,6 +986,7 @@ impl SemanticJournalStore {
 
     pub fn remove_session_binding(&mut self, session_id: &str) -> Option<StableSessionKey> {
         self.projectors.remove(session_id);
+        self.screen_projectors.remove(session_id);
         let key = self
             .session_bindings
             .remove(session_id)
@@ -1109,6 +1139,7 @@ impl SemanticJournalStore {
         for session_id in removed_session_ids {
             self.session_bindings.remove(&session_id);
             self.projectors.remove(&session_id);
+            self.screen_projectors.remove(&session_id);
         }
     }
 }
@@ -1195,6 +1226,156 @@ impl PlainTextProjector {
     }
 }
 
+#[derive(Debug, Default)]
+struct AiScreenProjector {
+    last_projection: Option<String>,
+}
+
+impl AiScreenProjector {
+    fn project(&mut self, screen: &TerminalScreenSnapshot) -> Option<String> {
+        let text = project_terminal_screen(screen);
+        if self.last_projection.as_deref() == Some(text.as_str()) {
+            return None;
+        }
+        // Initial blank/cleared frames stay silent; a later clear after content
+        // emits one empty replacement so clients can drop the prior fallback.
+        if text.is_empty() && self.last_projection.is_none() {
+            return None;
+        }
+        self.last_projection = Some(text.clone());
+        Some(text)
+    }
+}
+
+pub(crate) fn project_terminal_screen(screen: &TerminalScreenSnapshot) -> String {
+    let mut lines = screen
+        .lines
+        .iter()
+        .map(|line| render_screen_line(line))
+        .collect::<Vec<_>>();
+    trim_blank_edge_lines(&mut lines);
+    lines = lines
+        .into_iter()
+        .filter_map(|line| filter_provider_chrome_line(&line))
+        .collect();
+    trim_blank_edge_lines(&mut lines);
+    bound_fallback_text(&lines.join("\n"))
+}
+
+fn render_screen_line(cells: &[crate::terminal::session::TerminalCellSnapshot]) -> String {
+    let mut text = String::with_capacity(cells.len());
+    for cell in cells {
+        let character = if cell.character == '\u{00a0}' {
+            ' '
+        } else {
+            cell.character
+        };
+        text.push(character);
+        for &extra in &cell.zero_width {
+            text.push(extra);
+        }
+    }
+    while text.ends_with(' ') {
+        text.pop();
+    }
+    text
+}
+
+fn trim_blank_edge_lines(lines: &mut Vec<String>) {
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+}
+
+fn filter_provider_chrome_line(line: &str) -> Option<String> {
+    let unwrapped = unwrap_box_margins(line);
+    if unwrapped.is_empty() {
+        return if line.trim().is_empty() {
+            Some(String::new())
+        } else {
+            None
+        };
+    }
+    if is_decorative_chrome_line(&unwrapped) || is_recognized_provider_chrome(&unwrapped) {
+        return None;
+    }
+    Some(unwrapped)
+}
+
+fn unwrap_box_margins(line: &str) -> String {
+    let mut chars = line.chars().collect::<Vec<_>>();
+    if chars.len() < 2 {
+        return line.to_string();
+    }
+    let starts_boxed = is_box_drawing(chars[0]);
+    let ends_boxed = chars
+        .last()
+        .is_some_and(|character| is_box_drawing(*character));
+    if !(starts_boxed && ends_boxed) {
+        // Preserve meaningful leading indentation on ordinary (unboxed) lines.
+        return line.to_string();
+    }
+    chars.remove(0);
+    chars.pop();
+    // Provider boxes typically insert one padding space beside each border.
+    // Strip only that deliberate pad; keep any remaining indentation/content.
+    if chars.first() == Some(&' ') {
+        chars.remove(0);
+    }
+    if chars.last() == Some(&' ') {
+        chars.pop();
+    }
+    chars.into_iter().collect()
+}
+
+fn is_decorative_chrome_line(line: &str) -> bool {
+    !line.is_empty() && line.chars().all(is_box_drawing_or_space)
+}
+
+fn is_box_drawing_or_space(character: char) -> bool {
+    character.is_whitespace() || is_box_drawing(character)
+}
+
+fn is_box_drawing(character: char) -> bool {
+    matches!(character, '\u{2500}'..='\u{257F}' | '\u{2580}'..='\u{259F}')
+}
+
+fn is_recognized_provider_chrome(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let without_ornament = lower
+        .trim_start_matches(['✳', '*', '◆', '●', '•', '›', '»'])
+        .trim();
+    matches!(
+        without_ornament,
+        "claude code"
+            | "codex"
+            | "openai codex"
+            | "ctrl+c to interrupt"
+            | "esc to interrupt"
+            | "press ctrl+c to interrupt"
+            | "press esc to interrupt"
+    ) || (without_ornament.starts_with("claude code ") && without_ornament.chars().count() < 48)
+}
+
+fn bound_fallback_text(text: &str) -> String {
+    let char_count = text.chars().count();
+    if char_count <= AI_FALLBACK_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut truncated: String = text
+        .chars()
+        .take(AI_FALLBACK_MAX_CHARS.saturating_sub(1))
+        .collect();
+    while truncated.ends_with(char::is_whitespace) {
+        truncated.pop();
+    }
+    truncated.push('…');
+    truncated
+}
+
 struct PlainTextCollector<'a> {
     output: String,
     pending_carriage_return: &'a mut bool,
@@ -1235,7 +1416,10 @@ mod tests {
     use super::*;
     use crate::models::{SessionTab, TabType};
     use crate::state::{SessionKind, SessionRuntimeState};
-    use crate::terminal::session::{TerminalBackend, TerminalModeSnapshot};
+    use crate::terminal::session::{
+        TerminalBackend, TerminalCellSnapshot, TerminalModeSnapshot, TerminalReplica,
+        TerminalScreenSnapshot,
+    };
     use std::path::PathBuf;
 
     fn output_draft(
@@ -1255,6 +1439,88 @@ mod tests {
             retention,
             deduplication_key: deduplication_key.map(str::to_string),
         }
+    }
+
+    fn snapshot_cell(character: char) -> TerminalCellSnapshot {
+        TerminalCellSnapshot {
+            character,
+            zero_width: Vec::new(),
+            foreground: 0,
+            background: 0,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+        }
+    }
+
+    fn screen_from_lines(lines: &[&str]) -> TerminalScreenSnapshot {
+        let rendered_lines: Vec<Vec<TerminalCellSnapshot>> = lines
+            .iter()
+            .map(|line| line.chars().map(snapshot_cell).collect())
+            .collect();
+        let cols = rendered_lines
+            .iter()
+            .map(|line| line.len())
+            .max()
+            .unwrap_or(0);
+        TerminalScreenSnapshot {
+            lines: rendered_lines,
+            cols,
+            rows: lines.len(),
+            ..Default::default()
+        }
+    }
+
+    fn bind_ai_session(store: &mut SemanticJournalStore, session_id: &str, tab_id: &str) {
+        let mut runtime = SessionRuntimeState::new(
+            session_id,
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Claude;
+        runtime.tab_id = Some(tab_id.to_string());
+        assert!(store.observe_runtime(&runtime, &[], 1));
+    }
+
+    fn screen_after_bytes(chunks: &[&[u8]]) -> TerminalScreenSnapshot {
+        let dimensions = crate::state::SessionDimensions {
+            cols: 40,
+            rows: 12,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let mut runtime = SessionRuntimeState::new(
+            "projector",
+            PathBuf::new(),
+            dimensions,
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Claude;
+        let replica = TerminalReplica::from_bootstrap("projector", runtime, &[]);
+        for chunk in chunks {
+            replica.apply_output_bytes(chunk);
+        }
+        replica.view().expect("replica view").screen
+    }
+
+    fn output_texts(store: &SemanticJournalStore, key: &StableSessionKey) -> Vec<String> {
+        store
+            .replay_after(key, 0)
+            .expect("replay")
+            .events
+            .into_iter()
+            .filter_map(|event| match &event.kind {
+                SemanticEventKind::Output { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -1890,7 +2156,8 @@ mod tests {
         let mut store = SemanticJournalStore::default();
 
         assert!(store.observe_runtime(&runtime, &tabs, 100));
-        assert!(store.observe_output("pty-ephemeral", b"\x1b[31mhello\x1b[0m", 101));
+        let screen = screen_from_lines(&["hello"]);
+        assert!(store.observe_output("pty-ephemeral", b"\x1b[31mhello\x1b[0m", Some(&screen), 101));
 
         let metadata = store.metadata(&key).expect("session metadata");
         assert_eq!(metadata.last_activity_epoch_ms, Some(101));
@@ -1902,6 +2169,10 @@ mod tests {
             &event.kind,
             SemanticEventKind::Output { text, .. } if text == "hello"
         )));
+        assert!(replay.events.iter().any(|event| {
+            matches!(&event.kind, SemanticEventKind::Output { .. })
+                && event.replaces_sequence.is_none()
+        }));
     }
 
     #[test]
@@ -2104,6 +2375,7 @@ mod tests {
             assert!(store.observe_output(
                 &session_id,
                 format!("payload-{index}-{}", "x".repeat(256)).as_bytes(),
+                None,
                 index * 10 + 1,
             ));
             assert_eq!(
@@ -2116,6 +2388,7 @@ mod tests {
         assert!(store.retained_bytes() <= 2 * 1024);
         assert!(store.session_bindings.is_empty());
         assert!(store.projectors.is_empty());
+        assert!(store.screen_projectors.is_empty());
         assert!(store
             .metadata(&StableSessionKey::from_server("command-23"))
             .is_some());
@@ -2208,7 +2481,7 @@ mod tests {
         assert_eq!(store.retained_session_count(), 1);
         assert_eq!(store.stable_key_for_session("pty-a"), Some(key_a.clone()));
         assert_eq!(store.stable_key_for_session("pty-b"), Some(key_b));
-        assert!(store.observe_output("pty-a", b"after eviction\n", 30));
+        assert!(store.observe_output("pty-a", b"after eviction\n", None, 30));
 
         let replay = store
             .capture_replay_after(&key_a, previous_latest)
@@ -2327,5 +2600,265 @@ mod tests {
                 .expect("shell metadata")
                 .raw_required
         );
+    }
+
+    #[test]
+    fn screen_projector_trims_cell_padding_and_blank_edges() {
+        let screen = screen_from_lines(&["   ", "hello world     ", "", "next", "   "]);
+        assert_eq!(project_terminal_screen(&screen), "hello world\n\nnext");
+    }
+
+    #[test]
+    fn screen_projector_preserves_unicode_and_internal_whitespace() {
+        let screen = screen_from_lines(&["café 日本語", "keep  spaced"]);
+        assert_eq!(
+            project_terminal_screen(&screen),
+            "café 日本語\nkeep  spaced"
+        );
+    }
+
+    #[test]
+    fn screen_projector_preserves_unboxed_leading_indentation() {
+        let screen = screen_from_lines(&["    let x = 1;", "fn main() {}"]);
+        assert_eq!(
+            project_terminal_screen(&screen),
+            "    let x = 1;\nfn main() {}"
+        );
+    }
+
+    #[test]
+    fn screen_projector_preserves_indented_content_inside_box_borders() {
+        let screen = screen_from_lines(&[
+            "╭──────────────────────╮",
+            "│    let x = 1; │",
+            "│        nested │",
+            "╰──────────────────────╯",
+        ]);
+        assert_eq!(
+            project_terminal_screen(&screen),
+            "   let x = 1;\n       nested"
+        );
+    }
+
+    #[test]
+    fn screen_projector_suppresses_box_chrome_but_keeps_prose() {
+        let screen = screen_from_lines(&[
+            "╭──────────────────────────────╮",
+            "│ Assistant answer lives here │",
+            "│ Do not delete prose chrome │",
+            "╰──────────────────────────────╯",
+            "✳ Claude Code",
+            "ctrl+c to interrupt",
+        ]);
+        let projected = project_terminal_screen(&screen);
+        assert_eq!(
+            projected,
+            "Assistant answer lives here\nDo not delete prose chrome"
+        );
+        assert!(!projected.contains("Claude Code"));
+        assert!(!projected.contains("interrupt"));
+    }
+
+    #[test]
+    fn screen_projector_does_not_drop_prose_that_mentions_interrupt() {
+        let screen =
+            screen_from_lines(&["Explain how ctrl+c to interrupt interacts with long builds."]);
+        assert_eq!(
+            project_terminal_screen(&screen),
+            "Explain how ctrl+c to interrupt interacts with long builds."
+        );
+    }
+
+    #[test]
+    fn screen_projector_bounds_oversized_output() {
+        let long = "x".repeat(AI_FALLBACK_MAX_CHARS + 64);
+        let screen = screen_from_lines(&[&long]);
+        let projected = project_terminal_screen(&screen);
+        assert!(projected.chars().count() <= AI_FALLBACK_MAX_CHARS);
+        assert!(projected.ends_with('…'));
+    }
+
+    #[test]
+    fn degraded_ai_screen_redraw_replaces_in_progress_output() {
+        let mut store = SemanticJournalStore::default();
+        bind_ai_session(&mut store, "ai-pty", "ai-tab");
+        let key = StableSessionKey::from_tab("ai-tab");
+
+        let first = screen_after_bytes(&[b"draft answer v1"]);
+        assert!(store.observe_output("ai-pty", b"draft answer v1", Some(&first), 10));
+        let second = screen_after_bytes(&[b"draft answer v1", b"\rdraft answer v2"]);
+        assert!(store.observe_output("ai-pty", b"\rdraft answer v2", Some(&second), 11));
+        let third = screen_after_bytes(&[
+            b"draft answer v1",
+            b"\rdraft answer v2",
+            b"\x1b[2J\x1b[Hfinal answer",
+        ]);
+        assert!(store.observe_output("ai-pty", b"\x1b[2J\x1b[Hfinal answer", Some(&third), 12));
+
+        let replay = store.replay_after(&key, 0).expect("replay");
+        let output_events = replay
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, SemanticEventKind::Output { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            output_events.len() <= 2,
+            "fallback redraws must stay replacement-chained, got {}",
+            output_events.len()
+        );
+        let mut visible = std::collections::BTreeSet::new();
+        for event in &output_events {
+            if let Some(replaced) = event.replaces_sequence {
+                visible.remove(&replaced);
+            }
+            visible.insert(event.sequence);
+        }
+        assert_eq!(visible.len(), 1);
+        let final_text = output_events
+            .iter()
+            .find(|event| visible.contains(&event.sequence))
+            .and_then(|event| match &event.kind {
+                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("final fallback");
+        assert!(final_text.contains("final answer"));
+        assert!(!final_text.contains("draft answer v1"));
+    }
+
+    #[test]
+    fn degraded_ai_cursor_up_redraw_replaces_instead_of_appending() {
+        let mut store = SemanticJournalStore::default();
+        bind_ai_session(&mut store, "ai-pty", "ai-tab");
+        let key = StableSessionKey::from_tab("ai-tab");
+
+        let first = screen_after_bytes(&[b"line-one\nline-two"]);
+        assert!(store.observe_output("ai-pty", b"line-one\nline-two", Some(&first), 10));
+        let redraw = screen_after_bytes(&[b"line-one\nline-two", b"\x1b[1A\rline-ONE"]);
+        assert!(store.observe_output("ai-pty", b"\x1b[1A\rline-ONE", Some(&redraw), 11));
+
+        let outputs = output_texts(&store, &key);
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].contains("line-ONE"));
+        assert!(outputs[0].contains("line-two"));
+        assert_eq!(outputs[0].matches("line-one").count(), 0);
+    }
+
+    #[test]
+    fn degraded_ai_carriage_return_progress_keeps_latest_frame() {
+        let mut store = SemanticJournalStore::default();
+        bind_ai_session(&mut store, "ai-pty", "ai-tab");
+        let key = StableSessionKey::from_tab("ai-tab");
+
+        let first = screen_after_bytes(&[b"progress 10%"]);
+        assert!(store.observe_output("ai-pty", b"progress 10%", Some(&first), 10));
+        let second = screen_after_bytes(&[b"progress 10%", b"\rprogress 100%\n"]);
+        assert!(store.observe_output("ai-pty", b"\rprogress 100%\n", Some(&second), 11));
+
+        let outputs = output_texts(&store, &key);
+        assert_eq!(outputs, vec!["progress 100%".to_string()]);
+    }
+
+    #[test]
+    fn degraded_ai_blank_or_unchanged_screen_emits_no_event() {
+        let mut store = SemanticJournalStore::default();
+        bind_ai_session(&mut store, "ai-pty", "ai-tab");
+        let key = StableSessionKey::from_tab("ai-tab");
+
+        let blank = screen_from_lines(&["", "   ", ""]);
+        assert!(!store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 10));
+        assert!(output_texts(&store, &key).is_empty());
+
+        let screen = screen_from_lines(&["stable"]);
+        assert!(store.observe_output("ai-pty", b"stable", Some(&screen), 11));
+        assert!(!store.observe_output("ai-pty", b"stable", Some(&screen), 12));
+        assert_eq!(output_texts(&store, &key), vec!["stable".to_string()]);
+    }
+
+    #[test]
+    fn cleared_ai_screen_replaces_prior_fallback_with_empty_output() {
+        let mut store = SemanticJournalStore::default();
+        bind_ai_session(&mut store, "ai-pty", "ai-tab");
+        let key = StableSessionKey::from_tab("ai-tab");
+
+        let screen = screen_from_lines(&["visible fallback"]);
+        assert!(store.observe_output("ai-pty", b"visible fallback", Some(&screen), 10));
+        let blank = screen_from_lines(&["", "   ", ""]);
+        assert!(store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 11));
+        assert!(!store.observe_output("ai-pty", b"\x1b[2J", Some(&blank), 12));
+
+        let replay = store.replay_after(&key, 0).expect("replay");
+        let output_events = replay
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, SemanticEventKind::Output { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut visible = std::collections::BTreeSet::new();
+        for event in &output_events {
+            if let Some(replaced) = event.replaces_sequence {
+                visible.remove(&replaced);
+            }
+            visible.insert(event.sequence);
+        }
+        assert_eq!(visible.len(), 1);
+        let final_text = output_events
+            .iter()
+            .find(|event| visible.contains(&event.sequence))
+            .and_then(|event| match &event.kind {
+                SemanticEventKind::Output { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("final fallback");
+        assert_eq!(final_text, "");
+        assert!(!final_text.contains("visible fallback"));
+    }
+
+    #[test]
+    fn ai_output_without_screen_does_not_append_byte_dumps() {
+        let mut store = SemanticJournalStore::default();
+        bind_ai_session(&mut store, "ai-pty", "ai-tab");
+        let key = StableSessionKey::from_tab("ai-tab");
+
+        assert!(!store.observe_output("ai-pty", b"\x1b[31mraw dump\x1b[0m", None, 10));
+        assert!(output_texts(&store, &key).is_empty());
+    }
+
+    #[test]
+    fn shell_output_still_appends_via_plain_text_projector() {
+        let mut store = SemanticJournalStore::default();
+        let mut runtime = SessionRuntimeState::new(
+            "shell-pty",
+            PathBuf::new(),
+            Default::default(),
+            TerminalBackend::default(),
+        );
+        runtime.session_kind = SessionKind::Shell;
+        runtime.command_id = Some("shell-command".to_string());
+        assert!(store.observe_runtime(&runtime, &[], 1));
+        let key = StableSessionKey::from_server("shell-command");
+
+        assert!(store.observe_output("shell-pty", b"first\n", None, 2));
+        assert!(store.observe_output("shell-pty", b"second\n", None, 3));
+        assert_eq!(
+            output_texts(&store, &key),
+            vec!["first\n".to_string(), "second\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn removing_ai_session_clears_screen_projector_state() {
+        let mut store = SemanticJournalStore::default();
+        bind_ai_session(&mut store, "ai-pty", "ai-tab");
+        let screen = screen_from_lines(&["one"]);
+        assert!(store.observe_output("ai-pty", b"one", Some(&screen), 2));
+        assert!(store.screen_projectors.contains_key("ai-pty"));
+
+        assert_eq!(
+            store.remove_session_binding("ai-pty"),
+            Some(StableSessionKey::from_tab("ai-tab"))
+        );
+        assert!(!store.screen_projectors.contains_key("ai-pty"));
     }
 }
