@@ -43,9 +43,9 @@ use crate::state::{
 use crate::terminal::{self, view};
 use crate::updater::UpdaterService;
 use crate::workspace::{
-    self, apply_browser_enabled_preference, CommandDraft, EditorAction, EditorField,
-    EditorPaneModel, EditorPanel, FolderDraft, FolderField, ProjectDraft, RemotePortForwardDraft,
-    RemoteTopTab, SettingsDraft, SshDraft, UiPreviewDraft,
+    self, apply_browser_enabled_preference, CommandDraft, DiagnosticsDraft, EditorAction,
+    EditorField, EditorPaneModel, EditorPanel, FolderDraft, FolderField, ProjectDraft,
+    RemotePortForwardDraft, RemoteTopTab, SettingsDraft, SshDraft, UiPreviewDraft,
 };
 use crate::{icons, theme};
 use gpui::{
@@ -315,6 +315,11 @@ struct NativeShell {
     pending_terminal_display_offset: Option<usize>,
     terminal_search: TerminalSearchState,
     editor_panel: Option<EditorPanel>,
+    diagnostics_snapshot: Option<crate::diagnostics::DiagnosticSnapshot>,
+    diagnostics_scan_generation: u64,
+    /// Active mutating diagnostics repair id, if any (survives panel close/reopen).
+    diagnostics_repair_owner: Option<u64>,
+    diagnostics_repair_owner_seq: u64,
     editor_active_field: Option<EditorField>,
     editor_cursor: usize,
     editor_selection_anchor: Option<usize>,
@@ -1235,7 +1240,7 @@ impl NativeShell {
         }
         Self::spawn_remote_refresh_task(native_dialog_blockers.clone(), cx);
 
-        let shell = Self {
+        let mut shell = Self {
             state,
             session_manager,
             process_manager,
@@ -1292,6 +1297,10 @@ impl NativeShell {
             pending_terminal_display_offset: None,
             terminal_search: TerminalSearchState::default(),
             editor_panel: None,
+            diagnostics_snapshot: None,
+            diagnostics_scan_generation: 0,
+            diagnostics_repair_owner: None,
+            diagnostics_repair_owner_seq: 0,
             editor_active_field: None,
             editor_cursor: 0,
             editor_selection_anchor: None,
@@ -1314,8 +1323,499 @@ impl NativeShell {
         };
 
         Self::spawn_splash_image_fetch(shell.native_dialog_blockers.clone(), cx);
+        shell.spawn_startup_diagnostics_scan(cx);
 
         shell
+    }
+
+    fn diagnostics_summary_text(&self) -> String {
+        self.diagnostics_snapshot
+            .as_ref()
+            .map(workspace::diagnostics_summary_line)
+            .unwrap_or_else(|| "Not scanned yet".to_string())
+    }
+
+    fn sync_settings_diagnostics_summary(&mut self) {
+        let summary = self.diagnostics_summary_text();
+        if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
+            draft.diagnostics_summary = summary;
+        }
+    }
+
+    fn apply_diagnostics_snapshot(&mut self, snapshot: crate::diagnostics::DiagnosticSnapshot) {
+        self.diagnostics_snapshot = Some(snapshot);
+        self.sync_settings_diagnostics_summary();
+    }
+
+    fn mark_diagnostics_first_run_completed(&mut self) {
+        if self.state.settings().diagnostics_first_run_completed {
+            return;
+        }
+        let mut settings = self.state.settings().clone();
+        settings.diagnostics_first_run_completed = true;
+        self.state.update_settings(settings.clone());
+        self.process_manager.set_settings(settings);
+        self.save_config_state();
+    }
+
+    fn apply_diagnostics_settings_delta(
+        &mut self,
+        delta: &crate::diagnostics::DiagnosticsSettingsDelta,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+        let mut settings = self.state.settings().clone();
+        delta.apply_to(&mut settings);
+        self.state.update_settings(settings.clone());
+        self.process_manager.set_settings(settings);
+        self.save_config_state();
+    }
+
+    fn next_diagnostics_generation(&mut self) -> u64 {
+        self.diagnostics_scan_generation = self.diagnostics_scan_generation.saturating_add(1);
+        self.diagnostics_scan_generation
+    }
+
+    fn diagnostics_accepts_generation(&self, generation: u64) -> bool {
+        diagnostics_generation_is_current(self.diagnostics_scan_generation, generation)
+    }
+
+    fn diagnostics_repair_in_progress(&self) -> bool {
+        self.diagnostics_repair_owner.is_some()
+    }
+
+    fn try_begin_diagnostics_repair(&mut self) -> Option<u64> {
+        let (owner, next_seq) = diagnostics_try_begin_repair(
+            self.diagnostics_repair_owner,
+            self.diagnostics_repair_owner_seq,
+        )?;
+        self.diagnostics_repair_owner = Some(owner);
+        self.diagnostics_repair_owner_seq = next_seq;
+        Some(owner)
+    }
+
+    fn clear_diagnostics_repair_owner(&mut self, owner: u64) {
+        self.diagnostics_repair_owner =
+            diagnostics_clear_repair_owner(self.diagnostics_repair_owner, owner);
+    }
+
+    fn end_diagnostics_repair(&mut self, owner: u64) {
+        self.clear_diagnostics_repair_owner(owner);
+        if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+            if draft.active_operation.as_deref() == Some("Applying repair…") {
+                draft.active_operation = None;
+            }
+        }
+    }
+
+    fn spawn_startup_diagnostics_scan(&mut self, cx: &mut Context<Self>) {
+        let generation = self.next_diagnostics_generation();
+        let settings = self.state.settings().clone();
+        let first_run_completed = settings.diagnostics_first_run_completed;
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let scan_result = diagnostics_background_scan(
+                        async_cx.background_executor(),
+                        settings,
+                    )
+                    .await;
+
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        if !shell.diagnostics_accepts_generation(generation) {
+                            return;
+                        }
+                        match scan_result {
+                            Ok(snapshot) => {
+                                shell.apply_diagnostics_snapshot(snapshot.clone());
+                                if workspace::diagnostics_startup_notice_needed(
+                                    first_run_completed,
+                                    snapshot.required_failures,
+                                ) {
+                                    let notice = "Open Settings → Developer environment to review diagnostics.";
+                                    shell.startup_notice = Some(match shell.startup_notice.take() {
+                                        Some(existing) => format!("{existing}\n{notice}"),
+                                        None => notice.to_string(),
+                                    });
+                                }
+                                shell.mark_diagnostics_first_run_completed();
+                                cx.notify();
+                            }
+                            Err(_) => {}
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn spawn_diagnostics_scan(&mut self, cx: &mut Context<Self>) {
+        let generation = self.next_diagnostics_generation();
+        let settings = self.state.settings().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let scan_result =
+                        diagnostics_background_scan(async_cx.background_executor(), settings).await;
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        if !shell.diagnostics_accepts_generation(generation) {
+                            return;
+                        }
+                        match scan_result {
+                            Ok(snapshot) => {
+                                shell.finish_diagnostics_scan(generation, snapshot, cx);
+                            }
+                            Err(error) => shell.set_diagnostics_error(error, cx),
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn finish_diagnostics_scan(
+        &mut self,
+        generation: u64,
+        snapshot: crate::diagnostics::DiagnosticSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.diagnostics_accepts_generation(generation) {
+            return;
+        }
+        self.apply_diagnostics_snapshot(snapshot.clone());
+        self.mark_diagnostics_first_run_completed();
+        if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+            draft.snapshot = snapshot;
+            draft.active_operation = None;
+            // Preserve last_notice / last_error — a still-Missing snapshot must not hide
+            // winget restart instructions.
+        }
+        cx.notify();
+    }
+
+    fn open_diagnostics_action(&mut self, cx: &mut Context<Self>) {
+        let decision = diagnostics_open_panel_decision(
+            self.diagnostics_repair_in_progress(),
+            self.diagnostics_snapshot.is_some(),
+        );
+        let mut draft = self
+            .diagnostics_snapshot
+            .as_ref()
+            .map(|snapshot| DiagnosticsDraft::from_snapshot(snapshot.clone()))
+            .unwrap_or_else(DiagnosticsDraft::scanning);
+        draft.active_operation = decision.active_operation;
+        self.open_editor(EditorPanel::Diagnostics(draft), cx);
+        if decision.spawn_scan {
+            self.spawn_diagnostics_scan(cx);
+        }
+    }
+
+    fn diagnostics_back_action(&mut self, cx: &mut Context<Self>) {
+        self.open_settings_panel(false, cx);
+    }
+
+    fn diagnostics_rescan_action(&mut self, cx: &mut Context<Self>) {
+        if self.diagnostics_repair_in_progress() {
+            return;
+        }
+        let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() else {
+            return;
+        };
+        if !draft.can_rescan() {
+            return;
+        }
+        draft.active_operation = Some("Scanning…".into());
+        draft.pending_repair = None;
+        draft.pending_bulk = None;
+        draft.last_error = None;
+        cx.notify();
+        self.spawn_diagnostics_scan(cx);
+    }
+
+    fn diagnostics_preview_recommended_action(&mut self, cx: &mut Context<Self>) {
+        if self.diagnostics_repair_in_progress() {
+            return;
+        }
+        let plans = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Diagnostics(draft)) if draft.can_repair_recommended() => draft
+                .snapshot
+                .recommended_repairs()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            _ => return,
+        };
+        match crate::diagnostics::format_pending_repairs_preview(&plans) {
+            Ok(_) => {
+                if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+                    draft.pending_bulk = Some(plans);
+                    draft.pending_repair = None;
+                    draft.last_error = None;
+                    cx.notify();
+                }
+            }
+            Err(error) => self.set_diagnostics_error(error, cx),
+        }
+    }
+
+    fn diagnostics_cancel_pending_action(&mut self, cx: &mut Context<Self>) {
+        if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+            draft.pending_repair = None;
+            draft.pending_bulk = None;
+            cx.notify();
+        }
+    }
+
+    fn diagnostics_confirm_pending_action(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+
+        let (pending_repair, pending_bulk) = match self.editor_panel.as_ref() {
+            Some(EditorPanel::Diagnostics(draft))
+                if diagnostics_may_start_mutating_action(
+                    self.diagnostics_repair_in_progress(),
+                    draft.is_busy(),
+                ) =>
+            {
+                (draft.pending_repair.clone(), draft.pending_bulk.clone())
+            }
+            _ => return,
+        };
+
+        let plans: Vec<crate::diagnostics::RepairPlan> = if let Some(bulk) = pending_bulk {
+            bulk
+        } else if let Some(plan) = pending_repair {
+            vec![plan]
+        } else {
+            return;
+        };
+
+        if let Err(error) = crate::diagnostics::format_pending_repairs_preview(&plans) {
+            self.set_diagnostics_error(error, cx);
+            return;
+        }
+
+        for plan in &plans {
+            if let Err(error) = crate::diagnostics::validate_plan(plan) {
+                self.set_diagnostics_error(error, cx);
+                return;
+            }
+        }
+
+        for plan in &plans {
+            match &plan.operation {
+                crate::diagnostics::RepairOperation::OpenUrl(url) => {
+                    if let Err(error) = crate::services::platform_service::open_url(url) {
+                        self.set_diagnostics_error(error, cx);
+                        return;
+                    }
+                }
+                crate::diagnostics::RepairOperation::RevealPath(path) => {
+                    if let Err(error) = crate::services::platform_service::open_path(path) {
+                        self.set_diagnostics_error(error, cx);
+                        return;
+                    }
+                }
+                crate::diagnostics::RepairOperation::CopyCommand(command) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        let mutation_plans: Vec<crate::diagnostics::RepairPlan> = plans
+            .into_iter()
+            .filter(|plan| {
+                !matches!(
+                    plan.operation,
+                    crate::diagnostics::RepairOperation::OpenUrl(_)
+                        | crate::diagnostics::RepairOperation::RevealPath(_)
+                        | crate::diagnostics::RepairOperation::CopyCommand(_)
+                )
+            })
+            .collect();
+
+        if mutation_plans.is_empty() {
+            if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+                draft.pending_repair = None;
+                draft.pending_bulk = None;
+                draft.last_error = None;
+                draft.active_operation = None;
+            }
+            cx.notify();
+            self.spawn_diagnostics_scan(cx);
+            return;
+        }
+
+        let Some(repair_owner) = self.try_begin_diagnostics_repair() else {
+            return;
+        };
+        let generation = self.next_diagnostics_generation();
+
+        if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+            draft.active_operation = Some("Applying repair…".into());
+            draft.pending_repair = None;
+            draft.pending_bulk = None;
+            draft.last_error = None;
+        }
+        cx.notify();
+
+        let settings = self.state.settings().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let repair_result = diagnostics_background_repairs(
+                        async_cx.background_executor(),
+                        settings.clone(),
+                        mutation_plans,
+                    )
+                    .await;
+                    let follow_up_payload = match repair_result {
+                        Err(error) => Err(error),
+                        Ok(batch) => {
+                            let scan_result = if batch.completed.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    diagnostics_background_scan(
+                                        async_cx.background_executor(),
+                                        batch.settings.clone(),
+                                    )
+                                    .await,
+                                )
+                            };
+                            Ok((batch, scan_result))
+                        }
+                    };
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        // Always release this repair owner on any terminal path.
+                        shell.end_diagnostics_repair(repair_owner);
+                        match follow_up_payload {
+                            Err(error) => {
+                                if shell.diagnostics_accepts_generation(generation) {
+                                    shell.set_diagnostics_error(error, cx);
+                                }
+                            }
+                            Ok((batch, scan_result)) => {
+                                let delta =
+                                    crate::diagnostics::diagnostics_settings_delta_from_plans(
+                                        &batch.completed,
+                                        &batch.settings,
+                                    );
+                                let batch_failure = batch.failure.clone();
+                                if batch.completed.is_empty() {
+                                    if let Some(error) = batch_failure {
+                                        if shell.diagnostics_accepts_generation(generation) {
+                                            shell.set_diagnostics_error(error, cx);
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                let scan_error =
+                                    scan_result.as_ref().and_then(|r| r.as_ref().err().cloned());
+                                let follow_up = diagnostics_repair_follow_up(
+                                    shell.diagnostics_accepts_generation(generation),
+                                    scan_error,
+                                );
+                                match follow_up {
+                                    DiagnosticsRepairFollowUp::ApplyDeltaAndSnapshot => {
+                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        if let Some(Ok(snapshot)) = scan_result {
+                                            shell.finish_diagnostics_scan(generation, snapshot, cx);
+                                        }
+                                        shell.surface_diagnostics_restart_notice(&batch);
+                                        if let Some(error) = batch_failure {
+                                            shell.set_diagnostics_error(error, cx);
+                                        }
+                                    }
+                                    DiagnosticsRepairFollowUp::ApplyDeltaAndRescan => {
+                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        shell.surface_diagnostics_restart_notice(&batch);
+                                        if let Some(EditorPanel::Diagnostics(draft)) =
+                                            shell.editor_panel.as_mut()
+                                        {
+                                            draft.active_operation = Some("Scanning…".into());
+                                            draft.last_error = batch_failure;
+                                        } else if let Some(error) = batch_failure {
+                                            // Restart notice may already occupy editor_notice.
+                                            if shell.editor_notice.is_none() {
+                                                shell.editor_notice = Some(error);
+                                            } else {
+                                                let notice = shell.editor_notice.take().unwrap();
+                                                shell.editor_notice =
+                                                    Some(format!("{notice} — {error}"));
+                                            }
+                                        }
+                                        shell.spawn_diagnostics_scan(cx);
+                                    }
+                                    DiagnosticsRepairFollowUp::ApplyDeltaAndScanError(
+                                        scan_error,
+                                    ) => {
+                                        shell.apply_diagnostics_settings_delta(&delta);
+                                        shell.surface_diagnostics_restart_notice(&batch);
+                                        if let Some(error) = diagnostics_repair_soft_error(
+                                            batch_failure,
+                                            Some(scan_error),
+                                        ) {
+                                            shell.set_diagnostics_error(error, cx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn set_diagnostics_error(&mut self, error: String, cx: &mut Context<Self>) {
+        if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+            draft.active_operation = None;
+            draft.last_error = Some(error);
+            // Preserve last_notice (restart instructions outlive soft errors).
+        } else {
+            // Keep a restart notice visible alongside the error when the page is closed.
+            self.editor_notice = match self.editor_notice.take() {
+                Some(existing) if existing.to_ascii_lowercase().contains("restart devmanager") => {
+                    Some(format!("{existing} — {error}"))
+                }
+                _ => Some(error),
+            };
+        }
+        cx.notify();
+    }
+
+    /// Surface winget restart-required notices on the open Diagnostics page, or via
+    /// `editor_notice` when the page is closed / navigated away.
+    fn surface_diagnostics_restart_notice(
+        &mut self,
+        batch: &crate::diagnostics::DiagnosticsRepairBatchResult,
+    ) {
+        let Some(notice) = diagnostics_batch_restart_notice(batch) else {
+            return;
+        };
+        let diagnostics_open = matches!(self.editor_panel, Some(EditorPanel::Diagnostics(_)));
+        match diagnostics_follow_up_notice_target(diagnostics_open, notice) {
+            DiagnosticsFollowUpNoticeTarget::Draft(notice) => {
+                if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+                    draft.last_notice = Some(notice);
+                }
+            }
+            DiagnosticsFollowUpNoticeTarget::Editor(notice) => {
+                self.editor_notice = Some(notice);
+            }
+            DiagnosticsFollowUpNoticeTarget::None => {}
+        }
     }
 
     fn start_browser_tasks(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -7731,6 +8231,7 @@ impl NativeShell {
                     .clone(),
                 remote_access_activity_log: self.remote_machine_state.host.web.activity_log.clone(),
                 open_picker: None,
+                diagnostics_summary: self.diagnostics_summary_text(),
             }),
             cx,
         );
@@ -8933,6 +9434,9 @@ impl NativeShell {
             EditorPanel::Settings(_) => {
                 self.close_editor(cx);
             }
+            EditorPanel::Diagnostics(_) => {
+                self.diagnostics_back_action(cx);
+            }
             EditorPanel::UiPreview(_) => {
                 self.close_editor(cx);
             }
@@ -9263,6 +9767,7 @@ impl NativeShell {
 
         match panel {
             EditorPanel::Settings(_) => {}
+            EditorPanel::Diagnostics(_) => {}
             EditorPanel::UiPreview(_) => {}
             EditorPanel::Project(draft) => {
                 let Some(project_id) = draft.existing_id else {
@@ -9816,6 +10321,51 @@ impl NativeShell {
             EditorAction::DownloadUpdate => self.download_update_action(cx),
             EditorAction::InstallUpdate => self.install_update_action(cx),
             EditorAction::OpenUiPreview => self.open_ui_preview_action(cx),
+            EditorAction::OpenDiagnostics => self.open_diagnostics_action(cx),
+            EditorAction::DiagnosticsBack => self.diagnostics_back_action(cx),
+            EditorAction::DiagnosticsRescan => self.diagnostics_rescan_action(cx),
+            EditorAction::DiagnosticsToggleExpand(id) => {
+                if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+                    if draft.expanded.contains(&id) {
+                        draft.expanded.remove(&id);
+                    } else {
+                        draft.expanded.insert(id);
+                    }
+                    cx.notify();
+                }
+            }
+            EditorAction::DiagnosticsPreviewRepair(plan) => {
+                if self.diagnostics_repair_in_progress() {
+                    return;
+                }
+                if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+                    if draft.is_busy()
+                        || draft.pending_repair.is_some()
+                        || draft.pending_bulk.is_some()
+                    {
+                        return;
+                    }
+                }
+                match crate::diagnostics::format_pending_repairs_preview(std::slice::from_ref(
+                    &plan,
+                )) {
+                    Ok(_) => {
+                        if let Some(EditorPanel::Diagnostics(draft)) = self.editor_panel.as_mut() {
+                            draft.pending_repair = Some(plan);
+                            draft.last_error = None;
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => self.set_diagnostics_error(error, cx),
+                }
+            }
+            EditorAction::DiagnosticsPreviewRecommended => {
+                self.diagnostics_preview_recommended_action(cx);
+            }
+            EditorAction::DiagnosticsConfirmPending => {
+                self.diagnostics_confirm_pending_action(window, cx);
+            }
+            EditorAction::DiagnosticsCancelPending => self.diagnostics_cancel_pending_action(cx),
             EditorAction::CycleDefaultTerminal => {
                 if let Some(EditorPanel::Settings(draft)) = self.editor_panel.as_mut() {
                     draft.default_terminal = workspace::next_default_terminal_with_availability(
@@ -10372,7 +10922,11 @@ impl NativeShell {
             return;
         }
         if key == "escape" {
-            self.close_editor(cx);
+            if matches!(self.editor_panel, Some(EditorPanel::Diagnostics(_))) {
+                self.diagnostics_back_action(cx);
+            } else {
+                self.close_editor(cx);
+            }
             window.prevent_default();
             return;
         }
@@ -17354,6 +17908,183 @@ fn route_browser_request_for_active_workspace(
     route_browser_request(route_is_open, request, dispatch_open)
 }
 
+fn diagnostics_generation_is_current(current: u64, callback: u64) -> bool {
+    current == callback
+}
+
+/// Begin a repair owner if none is active. Returns `(owner_id, next_seq)`.
+fn diagnostics_try_begin_repair(current_owner: Option<u64>, seq: u64) -> Option<(u64, u64)> {
+    if current_owner.is_some() {
+        return None;
+    }
+    let owner = seq.saturating_add(1);
+    Some((owner, owner))
+}
+
+fn diagnostics_clear_repair_owner(current_owner: Option<u64>, owner: u64) -> Option<u64> {
+    match current_owner {
+        Some(active) if active == owner => None,
+        other => other,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticsOpenPanelDecision {
+    active_operation: Option<String>,
+    spawn_scan: bool,
+}
+
+fn diagnostics_open_panel_decision(
+    repair_in_progress: bool,
+    has_snapshot: bool,
+) -> DiagnosticsOpenPanelDecision {
+    if repair_in_progress {
+        return DiagnosticsOpenPanelDecision {
+            active_operation: Some("Applying repair…".into()),
+            spawn_scan: false,
+        };
+    }
+    DiagnosticsOpenPanelDecision {
+        active_operation: has_snapshot.then(|| "Scanning…".into()),
+        spawn_scan: true,
+    }
+}
+
+/// Whether a mutating diagnostics action may start given shell ownership and draft busy state.
+fn diagnostics_may_start_mutating_action(repair_in_progress: bool, draft_busy: bool) -> bool {
+    !repair_in_progress && !draft_busy
+}
+
+/// Lifecycle outcome after repairs succeeded (delta already derived).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiagnosticsRepairFollowUp {
+    /// Generation current and follow-up scan succeeded: apply delta + publish snapshot.
+    ApplyDeltaAndSnapshot,
+    /// Generation stale: apply delta then start a fresh scan from authoritative settings.
+    ApplyDeltaAndRescan,
+    /// Generation current but follow-up scan failed: apply delta + soft scan error.
+    ApplyDeltaAndScanError(String),
+}
+
+fn diagnostics_repair_follow_up(
+    generation_current: bool,
+    scan_error: Option<String>,
+) -> DiagnosticsRepairFollowUp {
+    if !generation_current {
+        return DiagnosticsRepairFollowUp::ApplyDeltaAndRescan;
+    }
+    match scan_error {
+        None => DiagnosticsRepairFollowUp::ApplyDeltaAndSnapshot,
+        Some(error) => DiagnosticsRepairFollowUp::ApplyDeltaAndScanError(error),
+    }
+}
+
+fn diagnostics_repair_soft_error(
+    batch_failure: Option<String>,
+    scan_error: Option<String>,
+) -> Option<String> {
+    batch_failure.or(scan_error)
+}
+
+/// First bounded restart notice from a successful batch (if any).
+fn diagnostics_batch_restart_notice(
+    batch: &crate::diagnostics::DiagnosticsRepairBatchResult,
+) -> Option<String> {
+    batch.notices.first().cloned().or_else(|| {
+        batch
+            .restart_outcomes
+            .iter()
+            .find(|outcome| outcome.success && outcome.requires_restart)
+            .map(|outcome| outcome.summary.clone())
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiagnosticsFollowUpNoticeTarget {
+    None,
+    Draft(String),
+    Editor(String),
+}
+
+/// Route a non-error repair notice to the Diagnostics draft or editor_notice fallback.
+fn diagnostics_follow_up_notice_target(
+    diagnostics_page_open: bool,
+    notice: String,
+) -> DiagnosticsFollowUpNoticeTarget {
+    if notice.is_empty() {
+        return DiagnosticsFollowUpNoticeTarget::None;
+    }
+    if diagnostics_page_open {
+        DiagnosticsFollowUpNoticeTarget::Draft(notice)
+    } else {
+        DiagnosticsFollowUpNoticeTarget::Editor(notice)
+    }
+}
+
+fn map_diagnostics_thread_result<T>(
+    join: std::thread::Result<Result<T, String>>,
+) -> Result<T, String> {
+    match join {
+        Ok(inner) => inner,
+        Err(_) => Err("diagnostics worker panicked".to_string()),
+    }
+}
+
+async fn diagnostics_background_scan(
+    executor: &gpui::BackgroundExecutor,
+    settings: crate::models::Settings,
+) -> Result<crate::diagnostics::DiagnosticSnapshot, String> {
+    executor
+        .spawn(async move {
+            let join = std::thread::spawn(
+                move || -> Result<crate::diagnostics::DiagnosticSnapshot, String> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|err| format!("failed to start diagnostics runtime: {err}"))?;
+                    Ok(rt.block_on(async {
+                        use crate::diagnostics::{DiagnosticProbe, TokioCommandRunner};
+                        DiagnosticProbe::new(TokioCommandRunner)
+                            .scan(&settings)
+                            .await
+                    }))
+                },
+            )
+            .join();
+            map_diagnostics_thread_result(join)
+        })
+        .await
+}
+
+async fn diagnostics_background_repairs(
+    executor: &gpui::BackgroundExecutor,
+    settings: crate::models::Settings,
+    plans: Vec<crate::diagnostics::RepairPlan>,
+) -> Result<crate::diagnostics::DiagnosticsRepairBatchResult, String> {
+    executor
+        .spawn(async move {
+            let join = std::thread::spawn(
+                move || -> Result<crate::diagnostics::DiagnosticsRepairBatchResult, String> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|err| format!("failed to start diagnostics runtime: {err}"))?;
+                    Ok(rt.block_on(async {
+                        use crate::diagnostics::{
+                            execute_repair_batch, DiagnosticProbe, TokioCommandRunner,
+                        };
+                        let runner = TokioCommandRunner;
+                        let probe = DiagnosticProbe::new(TokioCommandRunner);
+                        execute_repair_batch(&runner, &probe, settings, plans).await
+                    }))
+                },
+            )
+            .join();
+            map_diagnostics_thread_result(join)
+        })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17369,6 +18100,176 @@ mod tests {
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn diagnostics_startup_notice_helper_matches_settings_default() {
+        let settings = Settings::default();
+        assert!(!settings.diagnostics_first_run_completed);
+        assert!(workspace::diagnostics_startup_notice_needed(
+            settings.diagnostics_first_run_completed,
+            0,
+        ));
+        assert!(!workspace::diagnostics_startup_notice_needed(true, 0));
+    }
+
+    #[test]
+    fn diagnostics_generation_accepts_only_current() {
+        assert!(diagnostics_generation_is_current(3, 3));
+        assert!(!diagnostics_generation_is_current(4, 3));
+    }
+
+    #[test]
+    fn diagnostics_repair_owner_rejects_double_begin_and_clears_only_matching() {
+        let mut owner = None;
+        let mut seq = 0;
+        let (first, next_seq) = diagnostics_try_begin_repair(owner, seq).unwrap();
+        owner = Some(first);
+        seq = next_seq;
+        assert!(diagnostics_try_begin_repair(owner, seq).is_none());
+
+        owner = diagnostics_clear_repair_owner(owner, first.wrapping_add(9));
+        assert_eq!(owner, Some(first));
+        owner = diagnostics_clear_repair_owner(owner, first);
+        assert_eq!(owner, None);
+        // Stale clear must not affect a newer owner.
+        owner = Some(first + 1);
+        owner = diagnostics_clear_repair_owner(owner, first);
+        assert_eq!(owner, Some(first + 1));
+    }
+
+    #[test]
+    fn diagnostics_close_reopen_during_repair_keeps_busy_without_scan() {
+        let open = diagnostics_open_panel_decision(true, true);
+        assert_eq!(open.active_operation.as_deref(), Some("Applying repair…"));
+        assert!(!open.spawn_scan);
+
+        let idle_open = diagnostics_open_panel_decision(false, true);
+        assert_eq!(idle_open.active_operation.as_deref(), Some("Scanning…"));
+        assert!(idle_open.spawn_scan);
+    }
+
+    #[test]
+    fn diagnostics_double_confirm_rejected_while_owned() {
+        assert!(diagnostics_may_start_mutating_action(false, false));
+        assert!(!diagnostics_may_start_mutating_action(true, false));
+        assert!(!diagnostics_may_start_mutating_action(false, true));
+        assert!(!diagnostics_may_start_mutating_action(true, true));
+    }
+
+    #[test]
+    fn diagnostics_owner_clearing_is_independent_of_scan_generation_fencing() {
+        // Terminal repair paths always clear matching owner even when scan generation is stale.
+        let mut owner = Some(7);
+        let generation_current = diagnostics_generation_is_current(4, 3);
+        assert!(!generation_current);
+        owner = diagnostics_clear_repair_owner(owner, 7);
+        assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn diagnostics_stale_successful_repair_requires_fresh_scan() {
+        assert_eq!(
+            diagnostics_repair_follow_up(false, None),
+            DiagnosticsRepairFollowUp::ApplyDeltaAndRescan
+        );
+        assert_eq!(
+            diagnostics_repair_follow_up(false, Some("scan failed".into())),
+            DiagnosticsRepairFollowUp::ApplyDeltaAndRescan
+        );
+        assert_eq!(
+            diagnostics_repair_follow_up(true, None),
+            DiagnosticsRepairFollowUp::ApplyDeltaAndSnapshot
+        );
+        assert_eq!(
+            diagnostics_repair_follow_up(true, Some("scan failed".into())),
+            DiagnosticsRepairFollowUp::ApplyDeltaAndScanError("scan failed".into())
+        );
+    }
+
+    #[test]
+    fn diagnostics_partial_batch_failure_preferred_over_scan_error() {
+        assert_eq!(
+            diagnostics_repair_soft_error(Some("plan failed".into()), Some("scan failed".into())),
+            Some("plan failed".into())
+        );
+        assert_eq!(
+            diagnostics_repair_soft_error(None, Some("scan failed".into())),
+            Some("scan failed".into())
+        );
+        assert_eq!(diagnostics_repair_soft_error(None, None), None);
+    }
+
+    #[test]
+    fn diagnostics_winget_restart_notice_traces_batch_to_follow_up_surfaces() {
+        use crate::diagnostics::{
+            DiagnosticsRepairBatchResult, RepairOutcome, WINGET_RESTART_NOTICE,
+        };
+
+        let restart_outcome = RepairOutcome {
+            plan_id: "winget-git".into(),
+            success: true,
+            requires_restart: true,
+            summary: WINGET_RESTART_NOTICE.to_string(),
+            details: vec![WINGET_RESTART_NOTICE.to_string()],
+        };
+        let batch = DiagnosticsRepairBatchResult {
+            notices: vec![WINGET_RESTART_NOTICE.to_string()],
+            restart_outcomes: vec![restart_outcome],
+            ..DiagnosticsRepairBatchResult::default()
+        };
+        assert_eq!(
+            diagnostics_batch_restart_notice(&batch).as_deref(),
+            Some(WINGET_RESTART_NOTICE)
+        );
+        assert!(diagnostics_batch_restart_notice(&batch)
+            .unwrap()
+            .contains("restart DevManager"));
+        assert!(diagnostics_batch_restart_notice(&batch)
+            .unwrap()
+            .contains("PATH"));
+
+        assert_eq!(
+            diagnostics_follow_up_notice_target(true, WINGET_RESTART_NOTICE.to_string()),
+            DiagnosticsFollowUpNoticeTarget::Draft(WINGET_RESTART_NOTICE.to_string())
+        );
+        assert_eq!(
+            diagnostics_follow_up_notice_target(false, WINGET_RESTART_NOTICE.to_string()),
+            DiagnosticsFollowUpNoticeTarget::Editor(WINGET_RESTART_NOTICE.to_string())
+        );
+
+        // Draft notice survives follow-up scan assignment (Missing snapshot must not erase it).
+        let mut draft = DiagnosticsDraft::from_snapshot(
+            crate::diagnostics::DiagnosticSnapshot::from_results(vec![]),
+        );
+        draft.last_notice = diagnostics_batch_restart_notice(&batch);
+        draft.active_operation = Some("Scanning…".into());
+        draft.snapshot = crate::diagnostics::DiagnosticSnapshot::from_results(vec![]);
+        draft.active_operation = None;
+        assert_eq!(draft.last_notice.as_deref(), Some(WINGET_RESTART_NOTICE));
+
+        // Normal success produces no restart notice.
+        let normal = DiagnosticsRepairBatchResult {
+            completed: Vec::new(),
+            failure: None,
+            notices: Vec::new(),
+            restart_outcomes: Vec::new(),
+            ..DiagnosticsRepairBatchResult::default()
+        };
+        assert!(diagnostics_batch_restart_notice(&normal).is_none());
+        assert_eq!(
+            diagnostics_follow_up_notice_target(true, String::new()),
+            DiagnosticsFollowUpNoticeTarget::None
+        );
+    }
+
+    #[test]
+    fn diagnostics_thread_panic_maps_to_error() {
+        let result: std::thread::Result<Result<(), String>> =
+            std::thread::spawn(|| -> Result<(), String> { panic!("boom") }).join();
+        let mapped = map_diagnostics_thread_result(result);
+        assert!(mapped.is_err());
+        assert!(mapped.unwrap_err().contains("panicked"));
+    }
 
     #[test]
     fn update_exit_dominates_repeated_normal_quit_requests() {

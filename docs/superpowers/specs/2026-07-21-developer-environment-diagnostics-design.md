@@ -50,14 +50,14 @@ The GPUI layer owns a diagnostics controller/state object containing the latest 
 
 ## Probe behavior
 
-Every process probe has an explicit timeout, executable plus argument vector, bounded stdout/stderr, and a sanitized display representation. Basic detection never invokes a user shell profile. Commands are resolved using the current process environment and, where appropriate, platform-specific known locations.
+Every process probe has an explicit timeout, executable plus argument vector, bounded stdout/stderr, and a sanitized display representation. Basic detection never invokes a user shell profile. Commands are resolved using the current process environment and, where appropriate, platform-specific known locations. On Windows, catalog probes that own redirected child-process pipes run serially inside the overall scan budget; concurrent `wait_with_output` calls can remain blocked after their child exits in a GUI process.
 
 The PowerShell profile check has separate phases:
 
 1. Resolve the PowerShell 7 current-user/current-host profile path using `pwsh -NoProfile`.
 2. Check whether the file exists and can be parsed by PowerShell's parser without executing it.
 3. Run a bounded non-interactive load probe and report warnings or errors. Output such as the PSReadLine redirected-terminal warning becomes a warning with targeted guidance rather than making the whole scan fail.
-4. Inspect only the parsed function definition needed to recognize `cc`; do not capture unrelated profile contents in logs or persisted state.
+4. After the bounded load, inspect the effective function returned by `Get-Command cc -CommandType Function` and classify its `ScriptBlock.Ast`; textual source order is not runtime truth because definitions can appear in dead branches or uninvoked script blocks. Emit only fixed metadata fields and never capture unrelated profile contents in logs or persisted state. The profile and `cc` checks share this one runtime load for a scan.
 
 The `cc` recipe is recommended but opt-in. The safe default recipe updates Claude and then launches it normally. A recipe containing `--dangerously-skip-permissions` is classified as high risk, never installed by **Repair recommended**, and requires a separate explicit confirmation describing that it bypasses Claude Code permission prompts.
 

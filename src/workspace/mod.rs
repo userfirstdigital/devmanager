@@ -5,9 +5,9 @@ use self::editor_ui::{
     render_editor_section, render_editor_toolbar, render_form_fields, render_form_sections,
     render_info_row, render_notice_row, render_preview_stories, render_selection_row,
     render_static_form_fields, render_static_form_sections, render_surface_action_button,
-    FormAction, FormActionGroup, FormField, FormInfoField, FormSection, FormSelectionList,
-    FormSelectionRow, PreviewState, PreviewStory, SurfaceActionButtonStyle, SurfaceBadge,
-    SurfaceTone,
+    render_surface_badge, FormAction, FormActionGroup, FormField, FormInfoField, FormSection,
+    FormSelectionList, FormSelectionRow, PreviewState, PreviewStory, SurfaceActionButtonStyle,
+    SurfaceBadge, SurfaceTone,
 };
 use crate::models::{
     DefaultTerminal, DependencyStatus, MacTerminalProfile, RootScanEntry, ScanResult, ScannedPort,
@@ -686,6 +686,7 @@ fn render_wizard_folder_config(
 #[derive(Debug, Clone)]
 pub enum EditorPanel {
     Settings(SettingsDraft),
+    Diagnostics(DiagnosticsDraft),
     UiPreview(UiPreviewDraft),
     Project(ProjectDraft),
     Folder(FolderDraft),
@@ -703,6 +704,7 @@ impl EditorPanel {
                     "Settings"
                 }
             }
+            Self::Diagnostics(_) => "Diagnostics",
             Self::UiPreview(_) => "UI Preview",
             Self::Project(_) => "Edit Project",
             Self::Folder(draft) => {
@@ -738,6 +740,9 @@ impl EditorPanel {
                     "Workspace defaults for terminals, AI tools, and data handling."
                 }
             }
+            Self::Diagnostics(_) => {
+                "Review local toolchain checks and apply safe repairs to recover Claude, Codex, and terminal tooling."
+            }
             Self::UiPreview(_) => {
                 "Read-only stories for iterating on native UI without touching live data."
             }
@@ -751,6 +756,7 @@ impl EditorPanel {
     pub fn accent_color(&self) -> u32 {
         match self {
             Self::Settings(_) => theme::PRIMARY,
+            Self::Diagnostics(_) => theme::PRIMARY,
             Self::UiPreview(_) => 0x14b8a6,
             Self::Project(draft) => {
                 theme::parse_hex_color(Some(draft.color.as_str()), theme::PROJECT_DOT)
@@ -770,6 +776,7 @@ impl EditorPanel {
                     "Workspace settings".to_string()
                 }
             }
+            Self::Diagnostics(draft) => diagnostics_summary_line(&draft.snapshot),
             Self::UiPreview(_) => "Native UI preview lab".to_string(),
             Self::Project(draft) => fallback_editor_label(draft.name.as_str(), "Untitled project"),
             Self::Folder(draft) => fallback_editor_label(
@@ -802,6 +809,7 @@ impl EditorPanel {
     pub fn context_line(&self) -> Option<String> {
         match self {
             Self::Settings(_) => None,
+            Self::Diagnostics(_) => None,
             Self::UiPreview(_) => Some(
                 "Seeded states only. Actions are intentionally disabled in this surface."
                     .to_string(),
@@ -835,6 +843,14 @@ impl EditorPanel {
     pub fn summary_items(&self) -> Vec<(String, String)> {
         match self {
             Self::Settings(_) => Vec::new(),
+            Self::Diagnostics(draft) => vec![
+                (
+                    "Required".to_string(),
+                    draft.snapshot.required_failures.to_string(),
+                ),
+                ("Warnings".to_string(), draft.snapshot.warnings.to_string()),
+                ("Healthy".to_string(), draft.snapshot.healthy.to_string()),
+            ],
             Self::UiPreview(_) => vec![
                 ("Stories".to_string(), "6".to_string()),
                 ("Mode".to_string(), "Design".to_string()),
@@ -957,6 +973,7 @@ impl EditorPanel {
     pub fn save_label(&self) -> &'static str {
         match self {
             Self::Settings(_) => "Close",
+            Self::Diagnostics(_) => "Close",
             Self::UiPreview(_) => "Close",
             Self::Project(_) => "Save Project",
             Self::Folder(draft) => {
@@ -986,6 +1003,7 @@ impl EditorPanel {
     pub fn show_delete(&self) -> bool {
         match self {
             Self::Settings(_) => false,
+            Self::Diagnostics(_) => false,
             Self::UiPreview(_) => false,
             Self::Project(draft) => draft.existing_id.is_some(),
             Self::Folder(draft) => draft.existing_id.is_some(),
@@ -1256,6 +1274,117 @@ pub struct SettingsDraft {
     pub remote_web_paired_clients_detail: Vec<PairedWebClient>,
     pub remote_access_activity_log: Vec<RemoteAccessActivityEvent>,
     pub open_picker: Option<SettingsPicker>,
+    pub diagnostics_summary: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagnosticsDraft {
+    pub snapshot: crate::diagnostics::DiagnosticSnapshot,
+    pub expanded: std::collections::HashSet<crate::diagnostics::DiagnosticId>,
+    pub pending_repair: Option<crate::diagnostics::RepairPlan>,
+    pub pending_bulk: Option<Vec<crate::diagnostics::RepairPlan>>,
+    pub active_operation: Option<String>,
+    pub last_error: Option<String>,
+    /// Non-error notice (e.g. winget install requires DevManager restart).
+    pub last_notice: Option<String>,
+}
+
+impl DiagnosticsDraft {
+    pub fn from_snapshot(snapshot: crate::diagnostics::DiagnosticSnapshot) -> Self {
+        Self {
+            snapshot,
+            expanded: std::collections::HashSet::new(),
+            pending_repair: None,
+            pending_bulk: None,
+            active_operation: None,
+            last_error: None,
+            last_notice: None,
+        }
+    }
+
+    pub fn scanning() -> Self {
+        Self {
+            snapshot: crate::diagnostics::DiagnosticSnapshot::from_results(Vec::new()),
+            expanded: std::collections::HashSet::new(),
+            pending_repair: None,
+            pending_bulk: None,
+            active_operation: Some("Scanning…".into()),
+            last_error: None,
+            last_notice: None,
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.active_operation.is_some()
+    }
+
+    pub fn can_rescan(&self) -> bool {
+        !self.is_busy() && self.pending_repair.is_none() && self.pending_bulk.is_none()
+    }
+
+    pub fn can_repair_recommended(&self) -> bool {
+        !self.is_busy()
+            && self.pending_repair.is_none()
+            && self.pending_bulk.is_none()
+            && !self.snapshot.recommended_repairs().is_empty()
+    }
+}
+
+pub fn diagnostics_startup_notice_needed(
+    first_run_completed: bool,
+    required_failures: usize,
+) -> bool {
+    !first_run_completed || required_failures > 0
+}
+
+pub fn diagnostics_summary_line(snapshot: &crate::diagnostics::DiagnosticSnapshot) -> String {
+    format!(
+        "{} required · {} warnings · {} healthy",
+        snapshot.required_failures, snapshot.warnings, snapshot.healthy
+    )
+}
+
+pub fn diagnostics_high_risk_notice() -> &'static str {
+    "This repair bypasses Claude Code permission prompts."
+}
+
+/// Concrete confirmation preview for pending repairs.
+/// Returns Err when a typed preview cannot be built safely (caller must not offer Confirm).
+pub fn diagnostics_pending_preview(
+    pending_repair: Option<&crate::diagnostics::RepairPlan>,
+    pending_bulk: Option<&[crate::diagnostics::RepairPlan]>,
+) -> Result<Vec<String>, String> {
+    let plans: Vec<crate::diagnostics::RepairPlan> = if let Some(bulk) = pending_bulk {
+        bulk.to_vec()
+    } else if let Some(plan) = pending_repair {
+        vec![plan.clone()]
+    } else {
+        return Err("no pending repairs".into());
+    };
+    crate::diagnostics::format_pending_repairs_preview(&plans)
+}
+
+/// Group snapshot results into Required / Recommended / Optional while preserving
+/// the snapshot's failure-first ordering within each importance bucket.
+pub fn group_diagnostics_results(
+    results: &[crate::diagnostics::DiagnosticResult],
+) -> (
+    Vec<&crate::diagnostics::DiagnosticResult>,
+    Vec<&crate::diagnostics::DiagnosticResult>,
+    Vec<&crate::diagnostics::DiagnosticResult>,
+) {
+    use crate::diagnostics::DiagnosticImportance;
+    let mut required = Vec::new();
+    let mut recommended = Vec::new();
+    let mut optional = Vec::new();
+    for result in results {
+        match result.importance {
+            DiagnosticImportance::Required => required.push(result),
+            DiagnosticImportance::Recommended => recommended.push(result),
+            DiagnosticImportance::Optional => optional.push(result),
+        }
+    }
+    (required, recommended, optional)
 }
 
 pub fn apply_browser_enabled_preference(settings: &mut Settings, enabled: bool) {
@@ -1458,6 +1587,14 @@ pub enum EditorAction {
     DownloadUpdate,
     InstallUpdate,
     OpenUiPreview,
+    OpenDiagnostics,
+    DiagnosticsBack,
+    DiagnosticsRescan,
+    DiagnosticsToggleExpand(crate::diagnostics::DiagnosticId),
+    DiagnosticsPreviewRepair(crate::diagnostics::RepairPlan),
+    DiagnosticsPreviewRecommended,
+    DiagnosticsConfirmPending,
+    DiagnosticsCancelPending,
     CycleDefaultTerminal,
     CycleMacTerminalProfile,
     CycleNotificationSound,
@@ -1519,6 +1656,9 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions) ->
     if let EditorPanel::Settings(draft) = &model.panel {
         return render_settings_editor_surface(draft, model, &actions).into_any_element();
     }
+    if let EditorPanel::Diagnostics(draft) = &model.panel {
+        return render_diagnostics_editor_surface(draft, model, &actions).into_any_element();
+    }
 
     let title = model.panel.title();
     let subtitle = model.panel.subtitle();
@@ -1529,6 +1669,7 @@ pub fn render_editor_surface(model: &EditorPaneModel, actions: EditorActions) ->
         EditorPanel::Settings(draft) => {
             render_settings_panel(draft, model, &actions).into_any_element()
         }
+        EditorPanel::Diagnostics(_) => unreachable!("handled by dedicated diagnostics surface"),
         EditorPanel::UiPreview(draft) => {
             render_ui_preview_panel(draft, model, &actions).into_any_element()
         }
@@ -1746,6 +1887,7 @@ fn render_settings_panel(
         SettingsPicker::DataActions,
     ));
     let on_open_ui_preview = (actions.on_action)(EditorAction::OpenUiPreview);
+    let on_open_diagnostics = (actions.on_action)(EditorAction::OpenDiagnostics);
     let terminal_options: Vec<AnyElement> = if is_mac {
         [
             MacTerminalProfile::System,
@@ -2083,15 +2225,31 @@ fn render_settings_panel(
     }
 
     if !draft.remote_focus_only {
-        sections.push(
-            FormSection::new("Developer").field(FormField::action(
-                FormAction::new("Open UI preview", "Open", on_open_ui_preview)
-                    .description(
-                        "Inspect seeded editor and settings states without touching live data.",
+        sections.push(FormSection::new("Developer").fields(vec![
+                FormField::info(
+                    "Environment",
+                    draft.diagnostics_summary.clone(),
+                    Some(
+                        "Scan Claude, Codex, PowerShell, and other local toolchain dependencies."
+                            .into(),
+                    ),
+                ),
+                FormField::action(
+                    FormAction::new(
+                        "Developer environment",
+                        "Open Diagnostics",
+                        on_open_diagnostics,
                     )
-                    .badge(SurfaceBadge::new("Read-only", SurfaceTone::Muted)),
-            )),
-        );
+                    .description("Review checks and apply safe repairs."),
+                ),
+                FormField::action(
+                    FormAction::new("Open UI preview", "Open", on_open_ui_preview)
+                        .description(
+                            "Inspect seeded editor and settings states without touching live data.",
+                        )
+                        .badge(SurfaceBadge::new("Read-only", SurfaceTone::Muted)),
+                ),
+            ]));
     }
 
     render_form_sections(sections, model, actions)
@@ -3312,6 +3470,320 @@ fn render_settings_close_button(
         .on_mouse_down(MouseButton::Left, on_click)
 }
 
+fn render_diagnostics_editor_surface(
+    draft: &DiagnosticsDraft,
+    model: &EditorPaneModel,
+    actions: &EditorActions,
+) -> impl IntoElement {
+    let on_back = (actions.on_action)(EditorAction::DiagnosticsBack);
+
+    div()
+        .flex_1()
+        .h_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(theme::APP_BG))
+        .child(
+            div()
+                .h(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px(px(6.0))
+                .bg(rgb(theme::TOPBAR_BG))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_PRIMARY))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(render_surface_action_button(
+                            "Back",
+                            SurfaceActionButtonStyle::Ghost,
+                            on_back,
+                        ))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .child("Diagnostics"),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .id("diagnostics-panel-scroll")
+                .overflow_y_scroll()
+                .scrollbar_width(px(6.0))
+                .child(
+                    div().w_full().flex().justify_center().child(
+                        div()
+                            .w_full()
+                            .max_w(px(540.0))
+                            .pt(px(24.0))
+                            .pb(px(40.0))
+                            .px(px(20.0))
+                            .child(render_diagnostics_panel(draft, model, actions)),
+                    ),
+                ),
+        )
+}
+
+fn diagnostic_status_tone(status: crate::diagnostics::DiagnosticStatus) -> SurfaceTone {
+    use crate::diagnostics::DiagnosticStatus;
+    match status {
+        DiagnosticStatus::Healthy => SurfaceTone::Success,
+        DiagnosticStatus::Warning => SurfaceTone::Warning,
+        DiagnosticStatus::Missing | DiagnosticStatus::Broken => SurfaceTone::Danger,
+        DiagnosticStatus::Running => SurfaceTone::Accent,
+        DiagnosticStatus::Unavailable => SurfaceTone::Muted,
+    }
+}
+
+fn diagnostic_status_label(status: crate::diagnostics::DiagnosticStatus) -> &'static str {
+    use crate::diagnostics::DiagnosticStatus;
+    match status {
+        DiagnosticStatus::Healthy => "Healthy",
+        DiagnosticStatus::Warning => "Warning",
+        DiagnosticStatus::Missing => "Missing",
+        DiagnosticStatus::Broken => "Broken",
+        DiagnosticStatus::Running => "Running",
+        DiagnosticStatus::Unavailable => "Unavailable",
+    }
+}
+
+fn diagnostic_importance_label(
+    importance: crate::diagnostics::DiagnosticImportance,
+) -> &'static str {
+    use crate::diagnostics::DiagnosticImportance;
+    match importance {
+        DiagnosticImportance::Required => "Required",
+        DiagnosticImportance::Recommended => "Recommended",
+        DiagnosticImportance::Optional => "Optional",
+    }
+}
+
+fn render_diagnostics_panel(
+    draft: &DiagnosticsDraft,
+    model: &EditorPaneModel,
+    actions: &EditorActions,
+) -> impl IntoElement {
+    let on_rescan = (actions.on_action)(EditorAction::DiagnosticsRescan);
+    let on_repair_recommended = (actions.on_action)(EditorAction::DiagnosticsPreviewRecommended);
+    let on_confirm = (actions.on_action)(EditorAction::DiagnosticsConfirmPending);
+    let on_cancel = (actions.on_action)(EditorAction::DiagnosticsCancelPending);
+    let busy = draft.is_busy();
+    let can_rescan = draft.can_rescan();
+    let can_repair = draft.can_repair_recommended();
+    let summary = diagnostics_summary_line(&draft.snapshot);
+
+    let mut sections =
+        vec![FormSection::new("Summary").fields(vec![FormField::info("Status", summary, None)])];
+
+    if let Some(operation) = draft.active_operation.as_ref() {
+        sections[0]
+            .fields
+            .push(FormField::notice(operation.clone(), SurfaceTone::Accent));
+    }
+    if let Some(notice) = draft.last_notice.as_ref() {
+        sections[0]
+            .fields
+            .push(FormField::notice(notice.clone(), SurfaceTone::Warning));
+    }
+    if let Some(error) = draft.last_error.as_ref() {
+        sections[0]
+            .fields
+            .push(FormField::notice(error.clone(), SurfaceTone::Danger));
+    }
+
+    sections[0].fields.push(FormField::custom(
+        div()
+            .flex()
+            .gap(px(8.0))
+            .children(can_rescan.then(|| {
+                render_settings_inline_button("Rescan", false, on_rescan).into_any_element()
+            }))
+            .children(can_repair.then(|| {
+                render_settings_inline_button("Repair recommended", false, on_repair_recommended)
+                    .into_any_element()
+            }))
+            .into_any_element(),
+    ));
+
+    if draft.pending_repair.is_some() || draft.pending_bulk.is_some() {
+        match diagnostics_pending_preview(
+            draft.pending_repair.as_ref(),
+            draft.pending_bulk.as_deref(),
+        ) {
+            Ok(preview_lines) => {
+                let mut preview_fields = preview_lines
+                    .into_iter()
+                    .map(|line| FormField::notice(line, SurfaceTone::Warning))
+                    .collect::<Vec<_>>();
+                preview_fields.push(FormField::custom(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(render_settings_inline_button("Confirm", false, on_confirm))
+                        .child(render_settings_inline_button("Cancel", false, on_cancel))
+                        .into_any_element(),
+                ));
+                sections.push(FormSection::new("Pending repair").fields(preview_fields));
+            }
+            Err(error) => {
+                sections.push(FormSection::new("Pending repair").fields(vec![
+                    FormField::notice(error, SurfaceTone::Danger),
+                    FormField::custom(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(render_settings_inline_button("Cancel", false, on_cancel))
+                            .into_any_element(),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    let mut check_sections = Vec::new();
+    let (required, recommended, optional) = group_diagnostics_results(&draft.snapshot.results);
+    for (title, group) in [
+        ("Required", required),
+        ("Recommended", recommended),
+        ("Optional", optional),
+    ] {
+        let mut check_fields = Vec::new();
+        for result in group {
+            let expanded = draft.expanded.contains(&result.id);
+            let tone = diagnostic_status_tone(result.status);
+            let status_label = diagnostic_status_label(result.status);
+            let importance = diagnostic_importance_label(result.importance);
+            let on_toggle = (actions.on_action)(EditorAction::DiagnosticsToggleExpand(result.id));
+            let header = format!("{} · {} · {}", result.title, importance, status_label);
+            check_fields.push(FormField::custom(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, on_toggle)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(theme::TEXT_PRIMARY))
+                                            .child(header),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .child(result.summary.clone()),
+                                    ),
+                            )
+                            .child(render_surface_badge(SurfaceBadge::new(status_label, tone))),
+                    )
+                    .children(expanded.then(|| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .pl(px(8.0))
+                            .children(result.details.iter().map(|detail| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child(detail.clone())
+                                    .into_any_element()
+                            }))
+                            .children(result.detected_version.as_ref().map(|version| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child(format!("Version: {version}"))
+                                    .into_any_element()
+                            }))
+                            .children(result.detected_path.as_ref().map(|path| {
+                                let elided = crate::diagnostics::elide_home_paths(
+                                    &path.display().to_string(),
+                                );
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child(format!("Path: {elided}"))
+                                    .into_any_element()
+                            }))
+                            .children(
+                                (!busy
+                                    && draft.pending_repair.is_none()
+                                    && draft.pending_bulk.is_none()
+                                    && !result.repairs.is_empty())
+                                .then(|| {
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap(px(6.0))
+                                        .mt(px(4.0))
+                                        .children(result.repairs.iter().map(|plan| {
+                                            let on_preview = (actions.on_action)(
+                                                EditorAction::DiagnosticsPreviewRepair(
+                                                    plan.clone(),
+                                                ),
+                                            );
+                                            render_settings_inline_button(
+                                                plan.title.as_str(),
+                                                false,
+                                                on_preview,
+                                            )
+                                            .into_any_element()
+                                        }))
+                                        .into_any_element()
+                                }),
+                            )
+                            .into_any_element()
+                    }))
+                    .into_any_element(),
+            ));
+        }
+
+        if check_fields.is_empty() && draft.active_operation.is_some() && title == "Required" {
+            check_fields.push(FormField::notice(
+                "Scanning local toolchain…".to_string(),
+                SurfaceTone::Muted,
+            ));
+        } else if check_fields.is_empty() && draft.active_operation.is_none() && title == "Required"
+        {
+            check_fields.push(FormField::notice(
+                "No checks recorded yet.".to_string(),
+                SurfaceTone::Muted,
+            ));
+        }
+
+        if !check_fields.is_empty() {
+            check_sections.push(FormSection::new(title).fields(check_fields));
+        }
+    }
+
+    sections.extend(check_sections);
+
+    render_form_sections(sections, model, actions)
+}
+
 fn settings_font_size_value(draft: &SettingsDraft) -> u16 {
     draft
         .terminal_font_size
@@ -3984,6 +4456,7 @@ fn sample_settings_draft(open_picker: Option<SettingsPicker>) -> SettingsDraft {
         remote_web_paired_clients_detail: Vec::new(),
         remote_access_activity_log: Vec::new(),
         open_picker,
+        diagnostics_summary: "2 required · 1 warnings · 8 healthy".to_string(),
     }
 }
 
@@ -4498,6 +4971,210 @@ mod tests {
             FormField::Info(field) => field.label == label,
             _ => false,
         })
+    }
+
+    #[test]
+    fn diagnostics_panel_title_is_diagnostics() {
+        let draft = DiagnosticsDraft::from_snapshot(
+            crate::diagnostics::DiagnosticSnapshot::from_results(Vec::new()),
+        );
+        assert_eq!(EditorPanel::Diagnostics(draft).title(), "Diagnostics");
+    }
+
+    #[test]
+    fn diagnostics_group_helper_preserves_failure_first_order_within_importance() {
+        use crate::diagnostics::{
+            DiagnosticId, DiagnosticImportance, DiagnosticResult, DiagnosticSnapshot,
+            DiagnosticStatus,
+        };
+        let snapshot = DiagnosticSnapshot::from_results(vec![
+            DiagnosticResult {
+                id: DiagnosticId::Python,
+                title: "Python".into(),
+                importance: DiagnosticImportance::Optional,
+                status: DiagnosticStatus::Missing,
+                summary: "missing".into(),
+                details: Vec::new(),
+                detected_version: None,
+                detected_path: None,
+                repairs: Vec::new(),
+            },
+            DiagnosticResult {
+                id: DiagnosticId::ClaudeCli,
+                title: "Claude".into(),
+                importance: DiagnosticImportance::Required,
+                status: DiagnosticStatus::Missing,
+                summary: "missing".into(),
+                details: Vec::new(),
+                detected_version: None,
+                detected_path: None,
+                repairs: Vec::new(),
+            },
+            DiagnosticResult {
+                id: DiagnosticId::PowerShell7,
+                title: "PowerShell".into(),
+                importance: DiagnosticImportance::Required,
+                status: DiagnosticStatus::Healthy,
+                summary: "ok".into(),
+                details: Vec::new(),
+                detected_version: None,
+                detected_path: None,
+                repairs: Vec::new(),
+            },
+            DiagnosticResult {
+                id: DiagnosticId::Git,
+                title: "Git".into(),
+                importance: DiagnosticImportance::Recommended,
+                status: DiagnosticStatus::Warning,
+                summary: "warn".into(),
+                details: Vec::new(),
+                detected_version: None,
+                detected_path: None,
+                repairs: Vec::new(),
+            },
+        ]);
+        let (required, recommended, optional) = group_diagnostics_results(&snapshot.results);
+        assert_eq!(required[0].id, DiagnosticId::ClaudeCli);
+        assert_eq!(required[1].id, DiagnosticId::PowerShell7);
+        assert_eq!(recommended[0].id, DiagnosticId::Git);
+        assert_eq!(optional[0].id, DiagnosticId::Python);
+        // Within Required, failure-first snapshot order is preserved.
+        let required_ids: Vec<_> = snapshot
+            .results
+            .iter()
+            .filter(|r| r.importance == DiagnosticImportance::Required)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            required.iter().map(|r| r.id).collect::<Vec<_>>(),
+            required_ids
+        );
+    }
+
+    #[test]
+    fn diagnostics_summary_line_formats_counts() {
+        let snapshot = crate::diagnostics::DiagnosticSnapshot::from_results(vec![]);
+        assert_eq!(
+            diagnostics_summary_line(&snapshot),
+            "0 required · 0 warnings · 0 healthy"
+        );
+    }
+
+    #[test]
+    fn diagnostics_startup_notice_needed_on_first_run_and_required_failures() {
+        assert!(diagnostics_startup_notice_needed(false, 0));
+        assert!(!diagnostics_startup_notice_needed(true, 0));
+        assert!(diagnostics_startup_notice_needed(true, 2));
+    }
+
+    #[test]
+    fn diagnostics_busy_state_suppresses_actions() {
+        let mut draft = DiagnosticsDraft::scanning();
+        assert!(!draft.can_rescan());
+        assert!(!draft.can_repair_recommended());
+        draft.active_operation = None;
+        draft.snapshot = crate::diagnostics::DiagnosticSnapshot::from_results(vec![]);
+        assert!(draft.can_rescan());
+    }
+
+    #[test]
+    fn diagnostics_last_notice_is_non_error_and_survives_missing_snapshot() {
+        let mut draft = DiagnosticsDraft::from_snapshot(
+            crate::diagnostics::DiagnosticSnapshot::from_results(Vec::new()),
+        );
+        draft.last_notice = Some(crate::diagnostics::WINGET_RESTART_NOTICE.to_string());
+        draft.last_error = Some("scan failed".into());
+        // Follow-up scan assigning a still-empty/Missing snapshot must not clear the notice.
+        draft.snapshot = crate::diagnostics::DiagnosticSnapshot::from_results(Vec::new());
+        draft.active_operation = None;
+        assert_eq!(
+            draft.last_notice.as_deref(),
+            Some(crate::diagnostics::WINGET_RESTART_NOTICE)
+        );
+        assert_eq!(draft.last_error.as_deref(), Some("scan failed"));
+    }
+
+    #[test]
+    fn diagnostics_high_risk_preview_includes_permission_notice() {
+        let plan = crate::diagnostics::RepairPlan {
+            id: "unsafe-cc".into(),
+            title: "Unsafe cc".into(),
+            risk: crate::diagnostics::RepairRisk::High,
+            operation: crate::diagnostics::RepairOperation::OpenUrl("https://example.com".into()),
+            preview: "Open docs".into(),
+            verifies: Vec::new(),
+        };
+        let lines = diagnostics_pending_preview(Some(&plan), None).unwrap();
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("bypasses Claude Code permission prompts")));
+        assert!(lines.iter().any(|line| line.contains("Open URL:")));
+    }
+
+    #[test]
+    fn diagnostics_invalid_preview_blocks_confirmation_payload() {
+        let plan = crate::diagnostics::RepairPlan {
+            id: "bad".into(),
+            title: "Bad winget".into(),
+            risk: crate::diagnostics::RepairRisk::Normal,
+            operation: crate::diagnostics::RepairOperation::InstallWingetPackage {
+                package_id: "Not.Allowlisted".into(),
+            },
+            preview: "generic".into(),
+            verifies: Vec::new(),
+        };
+        assert!(diagnostics_pending_preview(Some(&plan), None).is_err());
+    }
+
+    #[test]
+    fn diagnostics_bulk_preview_is_concrete_and_bounded() {
+        let plans = vec![
+            crate::diagnostics::RepairPlan {
+                id: "one".into(),
+                title: "Set Claude".into(),
+                risk: crate::diagnostics::RepairRisk::Normal,
+                operation: crate::diagnostics::RepairOperation::SetClaudeCommand("claude".into()),
+                preview: "generic".into(),
+                verifies: Vec::new(),
+            },
+            crate::diagnostics::RepairPlan {
+                id: "two".into(),
+                title: "Docs".into(),
+                risk: crate::diagnostics::RepairRisk::High,
+                operation: crate::diagnostics::RepairOperation::OpenUrl(
+                    "https://example.com".into(),
+                ),
+                preview: "generic".into(),
+                verifies: Vec::new(),
+            },
+        ];
+        let lines = diagnostics_pending_preview(None, Some(&plans)).unwrap();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Apply 2 recommended repairs:"));
+        assert!(joined.contains("Setting: claude_command"));
+        assert!(joined.contains("Open URL:"));
+        assert!(joined.contains("bypasses Claude Code permission prompts"));
+        assert!(!joined.contains("generic"));
+    }
+
+    #[test]
+    fn diagnostics_expand_toggle_tracks_ids() {
+        let mut draft = DiagnosticsDraft::from_snapshot(
+            crate::diagnostics::DiagnosticSnapshot::from_results(Vec::new()),
+        );
+        assert!(!draft
+            .expanded
+            .contains(&crate::diagnostics::DiagnosticId::Git));
+        draft.expanded.insert(crate::diagnostics::DiagnosticId::Git);
+        assert!(draft
+            .expanded
+            .contains(&crate::diagnostics::DiagnosticId::Git));
+        draft
+            .expanded
+            .remove(&crate::diagnostics::DiagnosticId::Git);
+        assert!(!draft
+            .expanded
+            .contains(&crate::diagnostics::DiagnosticId::Git));
     }
 }
 

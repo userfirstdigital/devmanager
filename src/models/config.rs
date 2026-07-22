@@ -138,6 +138,7 @@ pub struct Settings {
     pub terminal_read_only: bool,
     pub github_token: Option<String>,
     pub browser_enabled: bool,
+    pub diagnostics_first_run_completed: bool,
 }
 
 impl Default for Settings {
@@ -163,6 +164,7 @@ impl Default for Settings {
             terminal_read_only: false,
             github_token: None,
             browser_enabled: cfg!(windows),
+            diagnostics_first_run_completed: false,
         }
     }
 }
@@ -343,6 +345,24 @@ pub struct EnvEntry {
     pub key: Option<String>,
     pub value: Option<String>,
     pub raw: String,
+}
+
+#[cfg(test)]
+mod diagnostics_settings_tests {
+    use super::Settings;
+
+    #[test]
+    fn diagnostics_first_run_completed_defaults_false_when_missing() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.diagnostics_first_run_completed);
+    }
+
+    #[test]
+    fn diagnostics_first_run_completed_deserializes_true() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"diagnosticsFirstRunCompleted":true}"#).unwrap();
+        assert!(settings.diagnostics_first_run_completed);
+    }
 }
 
 #[cfg(test)]
