@@ -637,10 +637,11 @@ pub fn build_codex_hooks_command(
     }
     // Codex runs hook commands through a shell; double quotes around the
     // executable path are safe on cmd, PowerShell, and sh alike.
-    let relay_command = format!(
-        "\"{}\" codex-hook-relay --url {endpoint} --nonce {nonce}",
-        devmanager_executable.to_string_lossy()
-    );
+    // Forward-slash the relay executable only: Windows backslashes become
+    // TOML `\\` escapes that Codex's native -c hooks parser rejects.
+    let relay_executable = codex_relay_executable_path(devmanager_executable);
+    let relay_command =
+        format!("\"{relay_executable}\" codex-hook-relay --url {endpoint} --nonce {nonce}");
     for override_value in config {
         tokens.push("--config".to_string());
         tokens.push(override_value.argument());
@@ -658,6 +659,25 @@ pub fn build_codex_hooks_command(
         &tokens,
         shell_program,
     ))
+}
+
+fn codex_relay_executable_path(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        // Shells accept slash-separated drive and UNC paths. Drop the Win32
+        // extended-path spelling because `//?/` is not a portable shell path.
+        let path = path
+            .strip_prefix(r"\\?\UNC\")
+            .map(|tail| format!(r"\\{tail}"))
+            .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or_else(|| path.into_owned());
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.into_owned()
+    }
 }
 
 fn tool_input_summary(payload: &Value) -> String {
@@ -1141,6 +1161,61 @@ mod launch_builder_tests {
             .unwrap()
             .contains("codex-hook-relay"));
         assert_eq!(handler["async"].as_bool(), Some(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relay_path_uses_forward_slashes_in_hook_override() {
+        // Codex's native -c hooks parser rejects TOML-escaped Windows
+        // backslashes in the relay command; forward slashes keep the value a
+        // sequence. Paths with spaces must stay quoted.
+        let command = build_codex_hooks_command(
+            "codex --yolo",
+            "bash",
+            std::path::Path::new(r"C:\Apps\dev manager.exe"),
+            "http://127.0.0.1:4321/internal/codex-hook",
+            "ff00",
+            &[],
+        )
+        .unwrap();
+        let marker = "hooks.SessionStart=";
+        let start = command.find(marker).unwrap() + marker.len();
+        let rest = &command[start..];
+        let end = rest.find("]'").map(|index| index + 1).unwrap();
+        let toml_value = &rest[..end];
+        assert!(
+            toml_value.contains(r#"\"C:/Apps/dev manager.exe\""#),
+            "hook override must quote a forward-slash relay path: {toml_value}"
+        );
+        assert!(
+            !toml_value.contains(r"C:\\"),
+            "hook override must not TOML-escape a backslash Windows path: {toml_value}"
+        );
+        let parsed: toml::Value = toml::from_str(&format!("value = {toml_value}")).unwrap();
+        let command_text = parsed["value"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            command_text.starts_with(r#""C:/Apps/dev manager.exe""#),
+            "relay command must keep quotes around the spaced path: {command_text}"
+        );
+        assert_eq!(
+            codex_relay_executable_path(std::path::Path::new(r"\\server\share\devmanager.exe")),
+            "//server/share/devmanager.exe"
+        );
+        assert_eq!(
+            codex_relay_executable_path(std::path::Path::new(r"\\?\C:\Apps\devmanager.exe")),
+            "C:/Apps/devmanager.exe"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_relay_path_preserves_literal_backslashes() {
+        assert_eq!(
+            codex_relay_executable_path(std::path::Path::new(
+                r"/Applications/Dev\Manager/devmanager"
+            )),
+            r"/Applications/Dev\Manager/devmanager"
+        );
     }
 }
 
