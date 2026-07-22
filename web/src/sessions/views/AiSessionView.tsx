@@ -26,9 +26,12 @@ export function AiSessionView({
   onRestart(): void;
   onQuestionChoice?(choice: string): void;
 }) {
+  const hasVisibleFallback = events.some(
+    (event) => event.kind === "output" && event.text.trim().length > 0,
+  );
   return (
     <div className="dm-session-body">
-      {adapterHealth === "degraded" && (
+      {adapterHealth === "degraded" && hasVisibleFallback && (
         <div className="dm-native-notice" role="status">
           <Sparkles size={15} aria-hidden="true" />
           <span>Live text remains available · activity detail is simplified for now.</span>

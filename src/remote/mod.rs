@@ -6154,7 +6154,8 @@ mod tests {
         AppState, RuntimeState, SessionDimensions, SessionKind, SessionRuntimeState, SessionStatus,
     };
     use crate::terminal::session::{
-        TerminalBackend, TerminalModeSnapshot, TerminalScreenSnapshot, TerminalSessionView,
+        TerminalBackend, TerminalCellSnapshot, TerminalModeSnapshot, TerminalScreenSnapshot,
+        TerminalSessionView,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use std::collections::{HashMap, HashSet};
@@ -6165,6 +6166,35 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex, RwLock};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    fn test_terminal_screen(text: &str) -> TerminalScreenSnapshot {
+        let mut snapshot = TerminalScreenSnapshot::default();
+        snapshot.lines = text
+            .split('\n')
+            .map(|line| {
+                line.chars()
+                    .map(|character| TerminalCellSnapshot {
+                        character,
+                        zero_width: Vec::new(),
+                        foreground: 0,
+                        background: 0,
+                        bold: false,
+                        dim: false,
+                        italic: false,
+                        underline: false,
+                        undercurl: false,
+                        strike: false,
+                        hidden: false,
+                        has_hyperlink: false,
+                        default_background: true,
+                    })
+                    .collect()
+            })
+            .collect();
+        snapshot.rows = snapshot.lines.len();
+        snapshot.cols = text.lines().map(str::len).max().unwrap_or_default();
+        snapshot
+    }
 
     #[test]
     fn pairing_token_uses_eight_unambiguous_characters() {
@@ -7557,8 +7587,18 @@ mod tests {
         service.update_snapshot(app, runtime_state, HashMap::new());
 
         let before_revision = service.inner.snapshot_revision.load(Ordering::Relaxed);
-        service.push_session_output("pty-ephemeral", b"ok\x1b[3".to_vec());
-        service.push_session_output("pty-ephemeral", b"1mred\x1b[0m\rnext\n".to_vec());
+        service.push_session_output_with_mode(
+            "pty-ephemeral",
+            b"ok\x1b[3".to_vec(),
+            TerminalModeSnapshot::default(),
+            Some(test_terminal_screen("ok")),
+        );
+        service.push_session_output_with_mode(
+            "pty-ephemeral",
+            b"1mred\x1b[0m\rnext\n".to_vec(),
+            TerminalModeSnapshot::default(),
+            Some(test_terminal_screen("red\nnext")),
+        );
 
         let replay = service
             .semantic_replay(&StableSessionKey::from_tab("tab-stable"), 0)
@@ -7571,7 +7611,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(output, vec!["ok", "red\nnext\n"]);
+        assert_eq!(output, vec!["red\nnext"]);
         assert!(service.inner.clients.lock().unwrap().is_empty());
         assert!(service.inner.snapshot_revision.load(Ordering::Relaxed) > before_revision);
     }

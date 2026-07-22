@@ -417,8 +417,8 @@ describe("session presentation", () => {
     expect(
       describeSession(workspace([terminalFallback]), terminalFallback),
     ).toMatchObject({
-      stateLabel: "Terminal fallback",
-      statusTone: "attention",
+      stateLabel: "Live text",
+      statusTone: "active",
     });
 
     const liveFailed = session("tab:claude-a", { attention: "failed" });

@@ -4477,7 +4477,10 @@ mod tests {
         RemoteHostService, RemoteSessionBootstrap, PROTOCOL_VERSION,
     };
     use crate::state::{AiLaunchSpec, SessionDimensions, SessionKind, SessionRuntimeState};
-    use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
+    use crate::terminal::session::{
+        TerminalBackend, TerminalCellSnapshot, TerminalModeSnapshot, TerminalScreenSnapshot,
+        TerminalSessionView,
+    };
     use futures_util::Sink;
     use std::collections::HashMap;
     use std::future::Future;
@@ -4493,6 +4496,31 @@ mod tests {
         // fanout exercises try_send without treating the fixture as dead.
         std::mem::forget(receiver);
         sender
+    }
+
+    fn test_terminal_screen(text: &str) -> TerminalScreenSnapshot {
+        let mut snapshot = TerminalScreenSnapshot::default();
+        snapshot.lines = vec![text
+            .chars()
+            .map(|character| TerminalCellSnapshot {
+                character,
+                zero_width: Vec::new(),
+                foreground: 0,
+                background: 0,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                undercurl: false,
+                strike: false,
+                hidden: false,
+                has_hyperlink: false,
+                default_background: true,
+            })
+            .collect()];
+        snapshot.rows = 1;
+        snapshot.cols = text.chars().count();
+        snapshot
     }
 
     fn test_web_channel() -> (BrowserOutboundSender, BrowserOutboundReceiver) {
@@ -5668,9 +5696,12 @@ mod tests {
 
         let publisher_service = service.clone();
         let publisher = std::thread::spawn(move || match case {
-            SemanticPublicationCase::Output => {
-                publisher_service.push_session_output("semantic-runtime", b"new output".to_vec())
-            }
+            SemanticPublicationCase::Output => publisher_service.push_session_output_with_mode(
+                "semantic-runtime",
+                b"new output".to_vec(),
+                TerminalModeSnapshot::default(),
+                Some(test_terminal_screen("new output")),
+            ),
             SemanticPublicationCase::Runtime => {
                 runtime.status = crate::state::SessionStatus::Running;
                 runtime.unseen_ready = true;
@@ -5783,7 +5814,12 @@ mod tests {
             .set_next_sequence_for_test(&StableSessionKey::from_tab("exhausted-tab"), u64::MAX);
 
         let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            service.push_session_output("exhausted-runtime", b"exhaust sequence".to_vec());
+            service.push_session_output_with_mode(
+                "exhausted-runtime",
+                b"exhaust sequence".to_vec(),
+                TerminalModeSnapshot::default(),
+                Some(test_terminal_screen("exhaust sequence")),
+            );
         }));
         assert!(
             publication.is_err(),
@@ -5819,7 +5855,12 @@ mod tests {
             "panic recovery must preserve previously published metadata"
         );
 
-        service.push_session_output("healthy-runtime", b"publication still works".to_vec());
+        service.push_session_output_with_mode(
+            "healthy-runtime",
+            b"publication still works".to_vec(),
+            TerminalModeSnapshot::default(),
+            Some(test_terminal_screen("publication still works")),
+        );
         let subsequent = capture_web_snapshot(&service.inner, 1, "web-client");
         assert!(subsequent.revision > recovered.revision);
         assert!(

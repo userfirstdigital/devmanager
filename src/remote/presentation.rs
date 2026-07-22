@@ -1254,12 +1254,39 @@ pub(crate) fn project_terminal_screen(screen: &TerminalScreenSnapshot) -> String
         .map(|line| render_screen_line(line))
         .collect::<Vec<_>>();
     trim_blank_edge_lines(&mut lines);
+    strip_provider_startup_preamble(&mut lines);
     lines = lines
         .into_iter()
         .filter_map(|line| filter_provider_chrome_line(&line))
         .collect();
     trim_blank_edge_lines(&mut lines);
     bound_fallback_text(&lines.join("\n"))
+}
+
+fn strip_provider_startup_preamble(lines: &mut Vec<String>) {
+    let banner_index = lines
+        .iter()
+        .rposition(|line| is_provider_startup_banner(line));
+    let Some(banner_index) = banner_index else {
+        if lines.iter().any(|line| is_codex_launch_command_line(line)) {
+            lines.clear();
+        }
+        return;
+    };
+    lines.drain(..=banner_index);
+}
+
+fn is_provider_startup_banner(line: &str) -> bool {
+    let normalized = line.trim().to_ascii_lowercase();
+    normalized.starts_with(">_ openai codex (")
+}
+
+fn is_codex_launch_command_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("codex-hook-relay")
+        || lower.contains("hooks.sessionstart=")
+        || lower.contains("--dangerously-bypass-hook-trust")
+        || lower.contains("--nonce")
 }
 
 fn render_screen_line(cells: &[crate::terminal::session::TerminalCellSnapshot]) -> String {
@@ -2667,6 +2694,36 @@ mod tests {
             project_terminal_screen(&screen),
             "Explain how ctrl+c to interrupt interacts with long builds."
         );
+    }
+
+    #[test]
+    fn screen_projector_drops_codex_launch_preamble_and_relay_nonce() {
+        let screen = screen_from_lines(&[
+            "npx codex -c hooks.SessionStart=[{command=devmanager.exe",
+            "codex-hook-relay --url http://127.0.0.1:4321 --nonce deadbeef}]",
+            ">_ OpenAI Codex (v0.145.0)",
+            "model: gpt-5.6-sol high",
+            "actual degraded answer",
+        ]);
+        let projected = project_terminal_screen(&screen);
+        assert_eq!(projected, "model: gpt-5.6-sol high\nactual degraded answer");
+        assert!(!projected.contains("deadbeef"));
+        assert!(!projected.contains("codex-hook-relay"));
+    }
+
+    #[test]
+    fn screen_projector_suppresses_incomplete_codex_launch_before_banner() {
+        let screen = screen_from_lines(&[
+            "npx codex -c hooks.SessionStart=[{command=devmanager.exe",
+            "codex-hook-relay --nonce deadbeef",
+        ]);
+        assert!(project_terminal_screen(&screen).is_empty());
+    }
+
+    #[test]
+    fn screen_projector_suppresses_nonce_only_launch_continuation() {
+        let screen = screen_from_lines(&["--nonce deadbeef"]);
+        assert!(project_terminal_screen(&screen).is_empty());
     }
 
     #[test]

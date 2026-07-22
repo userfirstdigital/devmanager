@@ -102,7 +102,7 @@ function statePresentation(session: WebSessionSummary): Pick<
       return { stateLabel: "Thinking", statusTone: "active" };
     }
     if (session.adapterHealth === "degraded") {
-      return { stateLabel: "Terminal fallback", statusTone: "attention" };
+      return { stateLabel: "Live text", statusTone: "active" };
     }
     if (session.status === "Starting") return { stateLabel: "Starting", statusTone: "active" };
     if (session.status === "Stopping") return { stateLabel: "Stopping", statusTone: "active" };

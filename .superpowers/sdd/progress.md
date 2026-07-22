@@ -46,3 +46,7 @@ Task 1: complete — current Codex hook overrides use shell-safe Windows paths w
 Task 2: complete — AI fallback uses a replacing post-parse screen projection, preserves visible indentation, clears stale frames, and leaves non-AI/raw streaming unchanged; focused Rust tests pass and independent review is clean (empty-card rendering is assigned to Task 3).
 
 Task 3: complete — native chat groups a turn into one compact activity disclosure, exposes Stop only while thinking, keeps drafts editable across reconnects, preserves unsent text around one-shot question choices, and prefers stable semantic titles; 325 web tests, typecheck, production build, and independent review are clean.
+
+Task 4: complete — native Windows Codex uses the supported PowerShell `command_windows` hook with an explicit call operator, enabling SessionStart, prompt, tool, response, and Stop semantics on Codex CLI 0.145.0. The degraded screen projector suppresses startup commands and relay nonces, and the web UI shows fallback guidance only when fallback text is actually visible.
+
+Acceptance: complete — phone-size hot reload passed fresh Claude and Codex conversations, compact multi-tool activity, exact streamed replies, unsent-draft return, native empty state, and zero hook-failure/fallback/nonce leakage in the final Codex run. Final gates: 325/325 web tests, web typecheck and production/PWA bundle, 830/830 runnable Rust library tests (1 explicit real-network probe ignored), formatting, locked all-target checks, diff checks, and a clean independent final review.

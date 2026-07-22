@@ -59,10 +59,24 @@ describe("native AI session view", () => {
     expect(screen.queryByRole("button", { name: /interrupt/i })).toBeNull();
   });
 
-  it("keeps the degraded adapter notice compact and non-alarming", () => {
-    render(
+  it("only shows the degraded notice when live fallback text is actually visible", () => {
+    const { rerender } = render(
       <AiSessionView
         events={[]}
+        density="calm"
+        adapterHealth="degraded"
+        running
+        actionsDisabled={false}
+        composer={<div>composer</div>}
+        onRestart={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("status")).toBeNull();
+
+    rerender(
+      <AiSessionView
+        events={[event(1, "output", { stream: "stdout", text: "fallback response" })]}
         density="calm"
         adapterHealth="degraded"
         running
