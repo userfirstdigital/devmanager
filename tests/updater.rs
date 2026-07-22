@@ -106,7 +106,59 @@ fn release_verify_installs_rustfmt_before_running_cargo_fmt() {
 }
 
 #[test]
-fn release_build_reuses_the_cross_platform_verified_web_bundle() {
+fn release_packaging_runs_independently_of_verify_but_publish_requires_verify() {
+    let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
+    let prepare_job = workflow
+        .split("\n  prepare:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  build:").next())
+        .expect("prepare job should precede build");
+    let build_job = workflow
+        .split("\n  build:")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  release:").next())
+        .expect("build job should precede release");
+    let release_job = workflow
+        .split("\n  release:")
+        .nth(1)
+        .expect("release job should exist");
+    let release_header = release_job
+        .split("\n    steps:")
+        .next()
+        .expect("release job should declare steps");
+
+    assert!(
+        !prepare_job.contains("needs: verify") && !prepare_job.contains("needs: [verify"),
+        "prepare must not wait on verify so packaging still runs when verification fails"
+    );
+    assert!(
+        !build_job.contains("needs: verify") && !build_job.contains("needs: [verify"),
+        "build must not wait on verify so packaging still runs when verification fails"
+    );
+    assert!(
+        build_job.contains("needs: prepare") || build_job.contains("needs: [prepare"),
+        "build must still wait for version preparation"
+    );
+    assert!(
+        release_header.contains("needs: [verify, prepare, build]")
+            || release_header.contains("needs: [prepare, build, verify]")
+            || release_header.contains("needs: [build, verify, prepare]")
+            || release_header.contains("needs: [verify, build, prepare]")
+            || release_header.contains("needs: [prepare, verify, build]")
+            || release_header.contains("needs: [build, prepare, verify]"),
+        "release publication must require verify, prepare, and build together"
+    );
+    assert!(
+        build_job.contains("platform: windows-x86_64")
+            && build_job.contains("formats: nsis,wix")
+            && release_job.contains("\"*_x64-setup.exe\"")
+            && release_job.contains("\"*.msi\""),
+        "Windows x64 NSIS EXE and WiX MSI assets must remain mandatory in packaging and publish"
+    );
+}
+
+#[test]
+fn release_build_reuses_the_tracked_fingerprinted_web_bundle() {
     let workflow = fs::read_to_string(release_workflow_path()).expect("read release workflow");
     let build_job = workflow
         .split("\n  build:")
@@ -117,7 +169,7 @@ fn release_build_reuses_the_cross_platform_verified_web_bundle() {
     assert!(build_job.contains("cargo test remote::web::assets --lib"));
     assert!(
         !build_job.contains("npm --prefix web") && !build_job.contains("rm -rf web/bundle"),
-        "platform packaging must reuse the bundle already verified by the verify job"
+        "platform packaging must reuse the tracked fingerprinted bundle and must not rebuild it"
     );
 }
 

@@ -102,7 +102,7 @@ The GitHub-hosted updater flow assumes public release assets. If releases are pr
 
 `.github/workflows/release.yml` packages the native crate and publishes a public GitHub Release on every non-`[skip ci]` push to `master`.
 
-- A Windows verification job runs the complete locked Rust test suite plus the web tests, typecheck, audit, production build, embedded-bundle check, and Rust formatting check before the workflow can change a version or package an installer.
+- A Windows verification job runs the complete locked Rust test suite plus the web tests, typecheck, audit, production build, embedded-bundle check, and Rust formatting check in parallel with release preparation and packaging. Installer artifacts are still built when verification fails, but publication remains blocked until verification and every platform build succeed.
 - Release builds use the supported Node `24` LTS line and pin Rust `1.94.0`, `cargo-packager` `0.11.8`, NSIS `3.12.0`, and WiX `3.14.1.20250415`; manual dispatches outside `master` are refused and all release runs share one concurrency lock.
 - The workflow uses `Cargo.toml` when it is newer than the latest stable `vX.Y.Z` tag; otherwise it selects the next patch version.
 - The prepare job writes the release version into `Cargo.toml` and `Cargo.lock`, then commits that bump back to `master` with `[skip ci]`.
