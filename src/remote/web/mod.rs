@@ -1403,6 +1403,7 @@ mod tests {
 
     #[test]
     fn slash_command_route_requires_pairing_and_returns_safe_live_provider_metadata() {
+        let _profile = TestProfileGuard::new("web-slash-command-route");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let service = test_service("slash-route");
         let fixture_root = slash_command_fixture(&service, SessionKind::Claude);
@@ -1445,6 +1446,7 @@ mod tests {
 
     #[test]
     fn slash_command_route_rejects_unknown_and_non_ai_sessions() {
+        let _profile = TestProfileGuard::new("web-slash-command-invalid-route");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let service = test_service("slash-invalid-route");
         let fixture_root = slash_command_fixture(&service, SessionKind::Server);
