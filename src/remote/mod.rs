@@ -7242,6 +7242,64 @@ mod tests {
     }
 
     #[test]
+    fn regenerating_browser_invite_preserves_existing_browser_authority() {
+        let _profile = TestProfileGuard::new("regenerate-web-invite-preserves-clients");
+        let mut config = RemoteHostConfig::default();
+        let original_token = config.web.pairing_token.clone();
+        config.web.paired_clients.push(PairedWebClient {
+            client_id: "web-client-1".to_string(),
+            browser_install_id: "browser-install-1".to_string(),
+            label: "Phone".to_string(),
+            ..PairedWebClient::default()
+        });
+        let subscription = validate_registration(PushRegistrationRequest {
+            mode: PushRegistrationMode::Reconcile,
+            endpoint: "https://web.push.apple.com/QM-regenerate".to_string(),
+            keys: PushRegistrationKeys {
+                p256dh: config.web.push.vapid_public_key_base64.clone(),
+                auth: URL_SAFE_NO_PAD.encode([7_u8; 16]),
+            },
+        })
+        .expect("valid push subscription");
+        config
+            .web
+            .push
+            .enable_and_replace_subscription("web-client-1", subscription, 1)
+            .expect("enable push subscription");
+        config.web.activity_log.push(RemoteAccessActivityEvent {
+            client_id: "web-client-1".to_string(),
+            source: RemoteAccessSource::Browser,
+            event_kind: RemoteAccessActivityKind::Connected,
+            label: "Phone".to_string(),
+            ip_address: Some("127.0.0.1".to_string()),
+            event_at_epoch_ms: Some(1),
+            browser_family: Some("Safari".to_string()),
+            browser_version: Some("18".to_string()),
+            os_family: Some("iOS".to_string()),
+            device_class: Some("phone".to_string()),
+        });
+        let original_secret = config.web.cookie_secret_hex.clone();
+        let original_push = config.web.push.clone();
+        let original_activity = config.web.activity_log.clone();
+        let service = RemoteHostService::new(config);
+
+        let new_token = service
+            .regenerate_web_pairing_token()
+            .expect("regenerate browser invite");
+        let saved = service.config();
+        let persisted =
+            load_remote_machine_state().expect("load persisted regenerated browser invite");
+
+        assert_ne!(new_token, original_token);
+        assert_eq!(saved.web.pairing_token, new_token);
+        assert_eq!(saved.web.paired_clients.len(), 1);
+        assert_eq!(saved.web.cookie_secret_hex, original_secret);
+        assert_eq!(saved.web.push, original_push);
+        assert_eq!(saved.web.activity_log, original_activity);
+        assert_eq!(persisted.host.web, saved.web);
+    }
+
+    #[test]
     fn reset_browser_access_rotates_cookie_and_disconnects_live_browsers() {
         let _profile = TestProfileGuard::new("reset-web-access");
         let mut config = RemoteHostConfig::default();
@@ -7367,6 +7425,8 @@ mod tests {
         assert!(!web_tombstone.is_active());
         assert_eq!(service.status().connected_web_clients, 0);
         assert_eq!(service.status().connected_native_clients, 1);
+        let persisted = load_remote_machine_state().expect("load persisted browser reset");
+        assert_eq!(persisted.host.web, saved.web);
     }
 
     #[test]

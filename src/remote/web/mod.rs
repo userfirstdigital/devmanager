@@ -595,7 +595,6 @@ async fn pair_handler(
         &state.inner,
         |config| config.web.enabled && provided == config.web.pairing_token,
         |config| {
-            config.web.pairing_token = generate_web_pairing_token();
             let client_id = if let Some(browser_install_id) = browser_install_id.as_deref() {
                 if let Some(existing) = config
                     .web
@@ -2329,7 +2328,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let saved = load_remote_machine_state().expect("load persisted remote state");
         assert_eq!(saved.host.web.paired_clients.len(), 1);
-        assert_ne!(saved.host.web.pairing_token, "PAIR1234");
+        assert_eq!(saved.host.web.pairing_token, "PAIR1234");
         assert_eq!(
             saved.host.web.paired_clients[0].nickname.as_deref(),
             Some("Phone")
@@ -2379,8 +2378,8 @@ mod tests {
     }
 
     #[test]
-    fn pair_handler_rejects_sequential_reuse_of_consumed_invitation() {
-        let _profile = TestProfileGuard::new("web-pair-single-use-sequential");
+    fn pair_handler_reuses_stable_invitation_for_multiple_browsers() {
+        let _profile = TestProfileGuard::new("web-pair-stable-sequential");
         let service = test_service("host-a");
         let state = test_state(&service);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2411,15 +2410,15 @@ mod tests {
         drop(runtime);
 
         assert_eq!(first.status(), StatusCode::SEE_OTHER);
-        assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(reused.status(), StatusCode::SEE_OTHER);
         let config = service.config();
-        assert_eq!(config.web.paired_clients.len(), 1);
-        assert_ne!(config.web.pairing_token, "PAIR1234");
+        assert_eq!(config.web.paired_clients.len(), 2);
+        assert_eq!(config.web.pairing_token, "PAIR1234");
     }
 
     #[test]
-    fn pair_handler_atomically_consumes_invitation_for_concurrent_requests() {
-        let _profile = TestProfileGuard::new("web-pair-single-use-concurrent");
+    fn pair_handler_accepts_concurrent_reuse_for_unique_browsers() {
+        let _profile = TestProfileGuard::new("web-pair-stable-concurrent");
         let service = test_service("host-a");
         let state = test_state(&service);
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -2462,10 +2461,10 @@ mod tests {
         drop(runtime);
 
         statuses.sort_unstable();
-        assert_eq!(statuses, [StatusCode::SEE_OTHER, StatusCode::UNAUTHORIZED]);
+        assert_eq!(statuses, [StatusCode::SEE_OTHER, StatusCode::SEE_OTHER]);
         let config = service.config();
-        assert_eq!(config.web.paired_clients.len(), 1);
-        assert_ne!(config.web.pairing_token, "PAIR1234");
+        assert_eq!(config.web.paired_clients.len(), 2);
+        assert_eq!(config.web.pairing_token, "PAIR1234");
     }
 
     #[test]
