@@ -30,7 +30,7 @@ AI presentation density defaults to **Calm**. Settings also offers **Minimal** a
 
 ## Pairing and addresses
 
-Enable **Settings → Remote → Host → Browser Access** in the native app. The listener defaults to `0.0.0.0:43872` for direct LAN use. Set **Browser bind address** to `127.0.0.1` when the trusted HTTPS proxy runs on the same computer. A successful invite is atomically single-use: it pairs one browser, rotates the future-pairing token, stores a signed host-specific cookie, and redirects into the app. Existing paired browsers remain valid until **Reset access** or an individual revoke invalidates them.
+Enable **Settings → Remote → Host → Browser Access** in the native app. The listener defaults to `0.0.0.0:43872` for direct LAN use. Set **Browser bind address** to `127.0.0.1` when the trusted HTTPS proxy runs on the same computer. A successful invite pairs the browser, stores a signed host-specific cookie, and redirects into the app. The browser pair code remains valid for pairing additional devices until **Generate new code** or **Reset access** changes it. Generating a new code affects future pairings only; existing paired browsers remain valid. Reset access revokes every browser and creates new pairing and cookie-signing secrets.
 
 Plain LAN HTTP remains useful for diagnostics and control, but modern iPhone platform features require a secure context. Use a trusted HTTPS tunnel or reverse proxy for the installed experience. The proxy must preserve WebSocket upgrades and forward `/api/**`, `/pair`, the app shell, the manifest, and the service worker to the same DevManager listener.
 
@@ -60,7 +60,7 @@ Before pairing a phone, verify all of the following:
 - the proxy removes client-supplied `Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and related forwarding headers, then supplies the single canonical values documented above
 - WebSocket upgrades and long-lived connections are enabled; idle timeouts are long enough that ordinary phone backgrounding is handled by DevManager's reconnect path rather than a rapid proxy reconnect loop
 - `/api/**`, `/pair`, and authenticated responses are never cached; the proxy does not rewrite the service worker, manifest, hashed assets, cookies, or CSP headers
-- access logs omit or redact the `/pair` query string because it contains the one-time invitation; application/error logs must not record cookies, authorization values, request bodies, prompt text, or attachment content
+- access logs omit or redact the `/pair` query string because it contains the invitation secret; application/error logs must not record cookies, authorization values, request bodies, prompt text, or attachment content
 - the origin is dedicated to this DevManager host; do not multiplex another app under the same authority and path space
 
 The native app's `remote.json` contains cookie, pairing, TLS, and push credentials. DevManager writes it with current-user-only file permissions. Backups and diagnostic bundles must preserve that confidentiality and must not publish the file.
@@ -115,7 +115,7 @@ Do not restart the workstation's active DevManager host merely to test the artif
 
 1. `https://<public-host>/api/health` returns `{"ok":true}` without a cache hit.
 2. The HTTPS app shell and manifest load, while an unpaired `/api/me` returns `401`.
-3. One public-origin invitation succeeds, immediate reuse of that same invitation returns `401`, and the new invite shown by the host is different.
+3. Use one public-origin invitation to pair two different browser installations. Both pair successfully and the code shown by the host remains unchanged. Generate a new code and confirm both paired browsers remain authorized while the old code no longer pairs a third browser.
 4. The installed Home Screen app connects its WebSocket, lists the expected projects/sessions, and sends one real prompt.
 5. Lock/background the phone, change state from the desktop, and return. The phone reconnects to the same runtime and current state without a Resume or Reconnect action.
 6. Drop and restore the phone network. Pending acknowledged input is not duplicated and current output catches up automatically.
@@ -133,6 +133,8 @@ Do not restart the workstation's active DevManager host merely to test the artif
 Installing an update restarts the native host and therefore intentionally creates a new web runtime. Schedule that restart; pushing and publishing alone do not disturb the currently running process.
 
 ## Develop and verify the web app
+
+Installed release builds use the production profile. Unprofiled debug builds use `dev-debug`, `dev-watch.ps1` uses `dev-watch`, and Rust unit tests use process-unique temporary storage. Development and tests must never read or write the installed profile.
 
 Install exact dependencies and run the local Vite surface:
 

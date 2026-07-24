@@ -1,7 +1,7 @@
 # Persistent Browser Pairing and Storage Isolation Design
 
 **Date:** 2026-07-24
-**Status:** Approved design pending written-spec review
+**Status:** Implemented and verified
 **Scope:** Keep the browser invite code stable until the user changes it, preserve paired browsers across releases, prevent development and test binaries from touching the installed DevManager profile, and recover the currently running production identity before restart.
 
 ## 1. Problem
@@ -132,3 +132,33 @@ This is the strongest long-term architecture, but it expands the change across w
 ### Selected: execution-scoped central resolver plus explicit test guards
 
 This protects every existing caller of `app_config_dir()`, keeps the current development-profile workflow, fixes the known tests, and creates a fail-closed boundary with a bounded implementation.
+
+## 8. Implemented outcome
+
+Implemented and verified on 2026-07-24:
+
+- `cargo fmt -- --check` passed.
+- Focused persistence, remote-web, remote-service, and app suites passed:
+  9 persistence tests, 230 remote-web tests, 86 remote-service tests, and
+  92 app tests.
+- `cargo test --lib --quiet -- --test-threads=1` passed with 974 tests,
+  1 ignored test, and 0 failures.
+- `cargo clippy --all-targets --all-features --message-format=short` exited 0
+  with the repository's existing warning baseline and no new warning in the
+  changed implementation.
+- `cargo build --all-features` passed.
+- The production `remote.json` SHA-256 hash matched before and after the two
+  formerly contaminating route tests, every focused suite, and both complete
+  serial library runs.
+- The installed DevManager remained PID 44880 at
+  `C:\Users\micro\AppData\Local\DevManager\devmanager.exe`, with start time
+  `2026-07-23T21:20:16.0081856Z`. No GUI interaction, restart, update, or
+  identity recovery was performed while the user was working.
+
+Live identity recovery remains intentionally pending explicit user readiness.
+
+The consolidated project rule is: release, debug, and test persistence scopes
+must be structurally disjoint; tests prove production naming as pure data and
+never write the installed profile. Persisted authentication identity loads
+fail closed, and pairing or cookie secrets rotate only through an explicit
+user action.
