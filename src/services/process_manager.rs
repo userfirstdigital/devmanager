@@ -3749,7 +3749,34 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         return;
     }
 
+    // Snapshot TerminalSession Arcs without holding the sessions lock across OS queries.
+    let terminal_sessions: HashMap<String, Arc<TerminalSession>> = inner
+        .sessions
+        .lock()
+        .ok()
+        .map(|guard| {
+            sessions
+                .iter()
+                .filter_map(|(session_id, _, _)| {
+                    guard
+                        .get(session_id)
+                        .cloned()
+                        .map(|session| (session_id.clone(), session))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut job_member_pids: HashMap<String, Vec<u32>> = HashMap::new();
+    for (session_id, session) in &terminal_sessions {
+        if let Some(process_ids) = session.managed_process_ids() {
+            job_member_pids.insert(session_id.clone(), process_ids);
+        }
+    }
+    drop(terminal_sessions);
+
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let logical_cpu_count = resolve_logical_cpu_count();
 
     let tracked_processes: HashMap<String, pid_file::ManagedProcessRecord> =
         pid_file::tracked_processes()
@@ -3759,129 +3786,40 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
     let sampled_at = Instant::now();
     let mut snapshots = Vec::with_capacity(sessions.len());
 
-    for (session_id, pid, is_ai_session) in sessions {
+    for (session_id, runtime_pid, is_ai_session) in sessions {
+        let job_pids = job_member_pids
+            .get(&session_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let sample_ctx = ResourceSampleContext {
+            is_ai_session,
+            logical_cpu_count,
+            sampled_at,
+        };
         let (snapshot, awaiting_external_editor) = tracked_processes
             .get(&session_id)
-            .filter(|entry| {
-                entry.pid == pid
-                    || entry
-                        .descendant_processes
-                        .iter()
-                        .any(|descendant| descendant.pid == pid)
-            })
+            .filter(|entry| ledger_compatible_with_runtime(system, entry, runtime_pid))
             .and_then(|entry| {
-                let sample_root = if platform_service::process_matches_identity_with_system(
+                sample_session_resources(
                     system,
-                    entry.pid,
-                    entry.started_at_unix_secs,
-                    entry.process_name.as_deref(),
-                ) {
-                    entry.pid
-                } else if entry.pid == pid {
-                    return None;
-                } else {
-                    pid
-                };
-                let root_pid = sysinfo::Pid::from_u32(sample_root);
-                let _root_process = system.process(root_pid)?;
-                let process_tree_ids = collect_process_tree_ids(system, root_pid);
-                let descendant_processes = process_tree_ids
-                    .iter()
-                    .skip(1)
-                    .filter_map(|tree_pid| {
-                        platform_service::process_identity_with_system(system, tree_pid.as_u32())
-                    })
-                    .collect::<Vec<_>>();
-                let awaiting_external_editor =
-                    is_ai_session && is_blocking_external_editor(&descendant_processes);
-                if sample_root == entry.pid {
-                    let _ = pid_file::sync_session_descendant_processes(
-                        session_id.as_str(),
-                        entry.pid,
-                        descendant_processes,
-                    );
-                }
-                let mut cpu_percent = 0.0;
-                let mut memory_bytes = 0;
-                let mut processes = Vec::with_capacity(process_tree_ids.len());
-
-                for tree_pid in &process_tree_ids {
-                    if let Some(process) = system.process(*tree_pid) {
-                        let process_cpu = process.cpu_usage();
-                        let process_memory = process.memory();
-                        cpu_percent += process_cpu;
-                        memory_bytes += process_memory;
-                        let name = platform_service::process_identity_with_system(
-                            system,
-                            tree_pid.as_u32(),
-                        )
-                        .and_then(|identity| identity.process_name)
-                        .unwrap_or_else(|| format!("pid-{}", tree_pid.as_u32()));
-                        processes.push(crate::state::ProcessResourceNode {
-                            pid: tree_pid.as_u32(),
-                            parent_pid: process.parent().map(|parent| parent.as_u32()),
-                            name,
-                            cpu_percent: process_cpu,
-                            memory_bytes: process_memory,
-                        });
-                    }
-                }
-
-                Some((
-                    ResourceSnapshot {
-                        cpu_percent,
-                        memory_bytes,
-                        process_count: processes.len() as u32,
-                        process_ids: processes.iter().map(|process| process.pid).collect(),
-                        processes,
-                        last_sample_at: Some(sampled_at),
-                    },
-                    awaiting_external_editor,
-                ))
+                    &session_id,
+                    entry,
+                    runtime_pid,
+                    job_pids,
+                    sample_ctx,
+                )
             })
-            .or_else(|| {
-                // Live runtime root without a matching ledger entry yet.
-                let root_pid = sysinfo::Pid::from_u32(pid);
-                let process = system.process(root_pid)?;
-                let process_tree_ids = collect_process_tree_ids(system, root_pid);
-                let mut cpu_percent = 0.0;
-                let mut memory_bytes = 0;
-                let mut processes = Vec::with_capacity(process_tree_ids.len());
-                for tree_pid in &process_tree_ids {
-                    if let Some(tree_process) = system.process(*tree_pid) {
-                        let process_cpu = tree_process.cpu_usage();
-                        let process_memory = tree_process.memory();
-                        cpu_percent += process_cpu;
-                        memory_bytes += process_memory;
-                        let name = platform_service::process_identity_with_system(
-                            system,
-                            tree_pid.as_u32(),
-                        )
-                        .and_then(|identity| identity.process_name)
-                        .unwrap_or_else(|| format!("pid-{}", tree_pid.as_u32()));
-                        processes.push(crate::state::ProcessResourceNode {
-                            pid: tree_pid.as_u32(),
-                            parent_pid: tree_process.parent().map(|parent| parent.as_u32()),
-                            name,
-                            cpu_percent: process_cpu,
-                            memory_bytes: process_memory,
-                        });
-                    }
-                }
-                let _ = process;
-                Some((
+            .or_else(|| sample_runtime_only_resources(system, runtime_pid, job_pids, sample_ctx))
+            .unwrap_or_else(|| {
+                (
                     ResourceSnapshot {
-                        cpu_percent,
-                        memory_bytes,
-                        process_count: processes.len() as u32,
-                        process_ids: processes.iter().map(|node| node.pid).collect(),
-                        processes,
+                        logical_cpu_count,
                         last_sample_at: Some(sampled_at),
+                        ..ResourceSnapshot::default()
                     },
                     false,
-                ))
-            })
-            .unwrap_or_default();
+                )
+            });
         snapshots.push((session_id, snapshot, awaiting_external_editor));
     }
 
@@ -3918,6 +3856,302 @@ fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo:
         let _ = pid_file::prune_inactive_entries();
         emit_tracked_remote_runtime_snapshot(inner, &session_id);
     }
+}
+
+fn sample_session_resources(
+    system: &mut sysinfo::System,
+    session_id: &str,
+    entry: &pid_file::ManagedProcessRecord,
+    runtime_pid: u32,
+    job_pids: &[u32],
+    ctx: ResourceSampleContext,
+) -> Option<(ResourceSnapshot, bool)> {
+    let root_verified = platform_service::process_matches_identity_with_system(
+        system,
+        entry.pid,
+        entry.started_at_unix_secs,
+        entry.process_name.as_deref(),
+    );
+    let ledger_pids = verified_ledger_descendant_pids(system, entry);
+
+    // Never include or walk from entry.pid unless its stored identity still matches.
+    // A different runtime_pid may anchor ancestry only when it is a verified ledger
+    // descendant. Job-only matches fall through to sample_runtime_only_resources.
+    let sample_root = if root_verified {
+        Some(entry.pid)
+    } else if runtime_pid != entry.pid
+        && ledger_pids.contains(&runtime_pid)
+        && system
+            .process(sysinfo::Pid::from_u32(runtime_pid))
+            .is_some()
+    {
+        Some(runtime_pid)
+    } else {
+        None
+    };
+
+    let ancestry_pids = sample_root
+        .map(|root| collect_ancestry_pids(system, root))
+        .unwrap_or_default();
+    let owned_pids = merge_owned_process_ids(sample_root, &ancestry_pids, job_pids, &ledger_pids);
+    if owned_pids.is_empty()
+        || owned_pids
+            .iter()
+            .all(|pid| system.process(sysinfo::Pid::from_u32(*pid)).is_none())
+    {
+        return None;
+    }
+
+    refresh_command_metadata_for_pids(system, &owned_pids);
+
+    let descendant_identities = owned_pids
+        .iter()
+        .copied()
+        .filter(|pid| Some(*pid) != sample_root)
+        .filter_map(|pid| platform_service::process_identity_with_system(system, pid))
+        .collect::<Vec<_>>();
+    let awaiting_external_editor =
+        ctx.is_ai_session && is_blocking_external_editor(&descendant_identities);
+
+    if root_verified {
+        let _ = pid_file::sync_session_descendant_processes_with_system(
+            session_id,
+            entry.pid,
+            descendant_identities,
+            system,
+        );
+    }
+
+    let snapshot =
+        build_resource_snapshot(system, &owned_pids, ctx.logical_cpu_count, ctx.sampled_at);
+    Some((snapshot, awaiting_external_editor))
+}
+
+fn sample_runtime_only_resources(
+    system: &mut sysinfo::System,
+    runtime_pid: u32,
+    job_pids: &[u32],
+    ctx: ResourceSampleContext,
+) -> Option<(ResourceSnapshot, bool)> {
+    let ancestry_pids = collect_ancestry_pids(system, runtime_pid);
+    let owned_pids = merge_owned_process_ids(Some(runtime_pid), &ancestry_pids, job_pids, &[]);
+    if owned_pids
+        .iter()
+        .all(|pid| system.process(sysinfo::Pid::from_u32(*pid)).is_none())
+    {
+        return None;
+    }
+    refresh_command_metadata_for_pids(system, &owned_pids);
+    Some((
+        build_resource_snapshot(system, &owned_pids, ctx.logical_cpu_count, ctx.sampled_at),
+        false,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct ResourceSampleContext {
+    is_ai_session: bool,
+    logical_cpu_count: u32,
+    sampled_at: Instant,
+}
+
+fn ledger_compatible_with_runtime(
+    system: &sysinfo::System,
+    entry: &pid_file::ManagedProcessRecord,
+    runtime_pid: u32,
+) -> bool {
+    if entry.pid == runtime_pid {
+        // Allow the sampler to see a reused/dead ledger root so it can omit that
+        // PID while still retaining verified detached descendants.
+        return true;
+    }
+    entry.descendant_processes.iter().any(|descendant| {
+        descendant.pid == runtime_pid
+            && platform_service::process_matches_identity_with_system(
+                system,
+                descendant.pid,
+                descendant.started_at_unix_secs,
+                descendant.process_name.as_deref(),
+            )
+    })
+}
+
+fn collect_ancestry_pids(system: &sysinfo::System, root_pid: u32) -> Vec<u32> {
+    let root = sysinfo::Pid::from_u32(root_pid);
+    if system.process(root).is_none() {
+        return vec![root_pid];
+    }
+    collect_process_tree_ids(system, root)
+        .into_iter()
+        .map(|pid| pid.as_u32())
+        .collect()
+}
+
+fn verified_ledger_descendant_pids(
+    system: &sysinfo::System,
+    entry: &pid_file::ManagedProcessRecord,
+) -> Vec<u32> {
+    entry
+        .descendant_processes
+        .iter()
+        .filter(|identity| {
+            platform_service::process_matches_identity_with_system(
+                system,
+                identity.pid,
+                identity.started_at_unix_secs,
+                identity.process_name.as_deref(),
+            )
+        })
+        .map(|identity| identity.pid)
+        .collect()
+}
+
+fn refresh_command_metadata_for_pids(system: &mut sysinfo::System, process_ids: &[u32]) {
+    if process_ids.is_empty() {
+        return;
+    }
+    let pids: Vec<sysinfo::Pid> = process_ids
+        .iter()
+        .copied()
+        .map(sysinfo::Pid::from_u32)
+        .collect();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&pids),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
+    );
+}
+
+fn build_resource_snapshot(
+    system: &sysinfo::System,
+    owned_pids: &[u32],
+    logical_cpu_count: u32,
+    sampled_at: Instant,
+) -> ResourceSnapshot {
+    let mut cpu_percent = 0.0;
+    let mut memory_bytes = 0;
+    let mut processes = Vec::with_capacity(owned_pids.len());
+
+    for pid in owned_pids {
+        let Some(process) = system.process(sysinfo::Pid::from_u32(*pid)) else {
+            continue;
+        };
+        let process_cpu =
+            crate::state::normalized_cpu_percent(process.cpu_usage(), logical_cpu_count);
+        let process_memory = process.memory();
+        cpu_percent += process_cpu;
+        memory_bytes += process_memory;
+        let os_name = platform_service::process_identity_with_system(system, *pid)
+            .and_then(|identity| identity.process_name)
+            .unwrap_or_else(|| format!("pid-{pid}"));
+        let cmd: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        let name = classify_process_display_name(&os_name, &cmd);
+        processes.push(crate::state::ProcessResourceNode {
+            pid: *pid,
+            parent_pid: process.parent().map(|parent| parent.as_u32()),
+            name,
+            cpu_percent: process_cpu,
+            memory_bytes: process_memory,
+        });
+    }
+
+    ResourceSnapshot {
+        cpu_percent: cpu_percent.clamp(0.0, 100.0),
+        memory_bytes,
+        process_count: processes.len() as u32,
+        process_ids: processes.iter().map(|process| process.pid).collect(),
+        processes,
+        logical_cpu_count,
+        last_sample_at: Some(sampled_at),
+    }
+}
+
+fn resolve_logical_cpu_count() -> u32 {
+    platform_service::logical_processor_count()
+}
+
+fn merge_owned_process_ids(
+    root_pid: Option<u32>,
+    ancestry_pids: &[u32],
+    job_pids: &[u32],
+    ledger_pids: &[u32],
+) -> Vec<u32> {
+    let mut extras = BTreeSet::new();
+    for pid in ancestry_pids
+        .iter()
+        .chain(job_pids.iter())
+        .chain(ledger_pids.iter())
+        .copied()
+    {
+        if root_pid != Some(pid) {
+            extras.insert(pid);
+        }
+    }
+    match root_pid {
+        Some(root) => {
+            let mut process_ids = Vec::with_capacity(extras.len() + 1);
+            process_ids.push(root);
+            process_ids.extend(extras);
+            process_ids
+        }
+        None => extras.into_iter().collect(),
+    }
+}
+
+fn classify_process_display_name(process_name: &str, cmd: &[String]) -> String {
+    let args_lower: Vec<String> = cmd.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+
+    let matches_token = |arg: &str, token: &str| -> bool {
+        arg == token
+            || arg.ends_with(&format!("/{token}"))
+            || arg.ends_with(&format!("\\{token}"))
+            || arg.contains(&format!("/{token}/"))
+            || arg.contains(&format!("\\{token}\\"))
+    };
+
+    if args_lower
+        .iter()
+        .any(|arg| arg.contains("tinypool") && arg.contains("entry"))
+    {
+        return "Vitest worker".to_string();
+    }
+    if args_lower.iter().any(|arg| {
+        let basename = Path::new(arg)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        basename.starts_with("vitest") || matches_token(arg, "vitest")
+    }) {
+        return "Vitest".to_string();
+    }
+    if args_lower
+        .iter()
+        .any(|arg| arg.contains("@upstash/context7-mcp") || arg.contains("context7-mcp"))
+    {
+        return "Context7 MCP".to_string();
+    }
+    if args_lower.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .map(|name| name.to_string_lossy().eq_ignore_ascii_case("npm-cli.js"))
+            .unwrap_or(false)
+    }) {
+        return "npm".to_string();
+    }
+    if args_lower.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .map(|name| name.to_string_lossy().eq_ignore_ascii_case("npx-cli.js"))
+            .unwrap_or(false)
+    }) {
+        return "npx".to_string();
+    }
+
+    process_name.to_string()
 }
 
 fn is_blocking_external_editor(descendants: &[platform_service::ProcessIdentity]) -> bool {
@@ -4027,6 +4261,7 @@ fn force_reap_session_processes(inner: &Arc<ProcessManagerInner>, session_id: &s
 
 fn collect_session_reap_pids(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Vec<u32> {
     let mut pids = BTreeSet::new();
+    let job_pids = session_managed_process_ids(inner, session_id);
 
     for entry in pid_file::active_tracked_processes_for_session(session_id) {
         let root_verified = platform_service::process_matches_identity(
@@ -4060,7 +4295,24 @@ fn collect_session_reap_pids(inner: &Arc<ProcessManagerInner>, session_id: &str)
         }
     }
 
+    for pid in job_pids {
+        if platform_service::is_pid_running(pid) {
+            pids.insert(pid);
+        }
+    }
+
     pids.into_iter().collect()
+}
+
+fn session_managed_process_ids(inner: &ProcessManagerInner, session_id: &str) -> Vec<u32> {
+    let session = inner
+        .sessions
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(session_id).cloned());
+    session
+        .and_then(|session| session.managed_process_ids())
+        .unwrap_or_default()
 }
 
 fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> Option<u32> {
@@ -6081,6 +6333,15 @@ fn verified_session_process_identity(
             if descendant.pid == pid {
                 return Some(descendant);
             }
+        }
+    }
+
+    // Job membership survives broken parent links. Capture identity, then re-check
+    // membership so a PID that left the job between the two OS queries is rejected.
+    if session_managed_process_ids(inner, session_id).contains(&pid) {
+        let identity = platform_service::capture_process_identity(pid)?;
+        if session_managed_process_ids(inner, session_id).contains(&pid) {
+            return Some(identity);
         }
     }
     None
@@ -9873,9 +10134,137 @@ mod tests {
                 },
             ],
             last_sample_at: Some(Instant::now()),
+            ..Default::default()
         });
         assert_eq!(session.resources.processes.len(), 2);
         assert_eq!(session.resources.processes[1].name, "node");
+    }
+
+    #[test]
+    fn owned_process_ids_keep_detached_job_and_verified_ledger_members() {
+        let process_ids =
+            merge_owned_process_ids(Some(10), &[10, 11, 12], &[10, 12, 21], &[12, 31]);
+
+        assert_eq!(process_ids, vec![10, 11, 12, 21, 31]);
+    }
+
+    #[test]
+    fn owned_process_ids_do_not_force_an_unverified_root_into_the_sample() {
+        let process_ids = merge_owned_process_ids(None, &[], &[21], &[31]);
+
+        assert_eq!(process_ids, vec![21, 31]);
+    }
+
+    #[test]
+    fn ledger_compatibility_requires_a_verified_runtime_identity() {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let runtime_identity =
+            platform_service::process_identity_with_system(&system, std::process::id())
+                .expect("test process identity");
+        let mut entry = pid_file::ManagedProcessRecord {
+            session_id: "session-1".to_string(),
+            pid: u32::MAX,
+            started_at_unix_secs: 100,
+            process_name: Some("old-shell".to_string()),
+            session_kind: "shell".to_string(),
+            program: "old-shell".to_string(),
+            project_id: None,
+            command_id: None,
+            tab_id: None,
+            descendant_processes: Vec::new(),
+        };
+
+        assert!(!ledger_compatible_with_runtime(
+            &system,
+            &entry,
+            runtime_identity.pid
+        ));
+
+        entry.descendant_processes = vec![pid_file::TrackedProcessIdentity {
+            pid: runtime_identity.pid,
+            started_at_unix_secs: runtime_identity.started_at_unix_secs,
+            process_name: runtime_identity.process_name.clone(),
+        }];
+        assert!(ledger_compatible_with_runtime(
+            &system,
+            &entry,
+            runtime_identity.pid
+        ));
+
+        entry.descendant_processes[0].started_at_unix_secs =
+            runtime_identity.started_at_unix_secs.saturating_add(1);
+        assert!(!ledger_compatible_with_runtime(
+            &system,
+            &entry,
+            runtime_identity.pid
+        ));
+    }
+
+    #[test]
+    fn logical_cpu_count_uses_the_platform_machine_count() {
+        let logical_cpu_count = resolve_logical_cpu_count();
+
+        assert_eq!(
+            logical_cpu_count,
+            platform_service::logical_processor_count()
+        );
+    }
+
+    #[test]
+    fn process_classifier_uses_safe_known_roles_without_leaking_arguments() {
+        assert_eq!(
+            classify_process_display_name(
+                "node.exe",
+                &[
+                    "node.exe".to_string(),
+                    r"C:\repo\node_modules\tinypool\dist\entry\process.js".to_string(),
+                ],
+            ),
+            "Vitest worker"
+        );
+        assert_eq!(
+            classify_process_display_name(
+                "node.exe",
+                &[
+                    "node.exe".to_string(),
+                    r"C:\repo\node_modules\vitest\vitest.mjs".to_string(),
+                ],
+            ),
+            "Vitest"
+        );
+        assert_eq!(
+            classify_process_display_name(
+                "node.exe",
+                &["node.exe".to_string(), "@upstash/context7-mcp".to_string(),],
+            ),
+            "Context7 MCP"
+        );
+        assert_eq!(
+            classify_process_display_name(
+                "node.exe",
+                &["node.exe".to_string(), "npm-cli.js".to_string()],
+            ),
+            "npm"
+        );
+        assert_eq!(
+            classify_process_display_name(
+                "node.exe",
+                &["node.exe".to_string(), "npx-cli.js".to_string()],
+            ),
+            "npx"
+        );
+
+        let unknown = classify_process_display_name(
+            "node.exe",
+            &[
+                "node.exe".to_string(),
+                "custom-runner.js".to_string(),
+                "--token=do-not-render-this".to_string(),
+            ],
+        );
+        assert_eq!(unknown, "node.exe");
+        assert!(!unknown.contains("do-not-render-this"));
     }
 
     fn wait_for_live_session(manager: &ProcessManager, session_id: &str) {

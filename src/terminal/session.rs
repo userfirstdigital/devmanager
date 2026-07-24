@@ -1852,12 +1852,37 @@ fn drop_managed_process_job(process_job: &Arc<Mutex<Option<platform_service::Man
     }
 }
 
+impl TerminalSession {
+    /// Returns active PIDs from the session's managed Job Object, if any.
+    ///
+    /// Does not expose the raw Job handle. Query failures degrade to `None`
+    /// after emitting a concise diagnostic.
+    pub fn managed_process_ids(&self) -> Option<Vec<u32>> {
+        let job_slot = self.process_job.lock().ok()?;
+        let job = job_slot.as_ref()?;
+        match job.active_process_ids() {
+            Ok(process_ids) => Some(process_ids),
+            Err(error) => {
+                eprintln!(
+                    "[terminal:{}] managed job query failed: {error}",
+                    self.session_id
+                );
+                None
+            }
+        }
+    }
+}
+
 fn attach_managed_process_job(pid: Option<u32>) -> Option<platform_service::ManagedProcessJob> {
-    pid.and_then(|pid| {
-        platform_service::attach_process_to_managed_job(pid)
-            .ok()
-            .flatten()
-    })
+    pid.and_then(
+        |pid| match platform_service::attach_process_to_managed_job(pid) {
+            Ok(job) => job,
+            Err(error) => {
+                eprintln!("[terminal] managed job attach failed for pid {pid}: {error}");
+                None
+            }
+        },
+    )
 }
 
 fn open_log_writer(log_file_path: Option<PathBuf>) -> Option<LogWriter> {

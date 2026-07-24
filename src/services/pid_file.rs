@@ -431,20 +431,113 @@ pub fn track_session_process(record: ManagedProcessRecord) -> Result<(), String>
     .map(|_| ())
 }
 
+fn retain_verified_descendant_identities(
+    root_pid: u32,
+    mut current: Vec<TrackedProcessIdentity>,
+    prior: &[TrackedProcessIdentity],
+    mut is_verified: impl FnMut(&TrackedProcessIdentity) -> bool,
+) -> Vec<TrackedProcessIdentity> {
+    for identity in prior {
+        if identity.pid == root_pid || current.iter().any(|entry| entry.pid == identity.pid) {
+            continue;
+        }
+        if is_verified(identity) {
+            current.push(identity.clone());
+        }
+    }
+    current.sort_by_key(|identity| identity.pid);
+    current.dedup_by(|left, right| left.pid == right.pid);
+    current
+}
+
+fn merge_descendants_with_verified_priors(
+    root_pid: u32,
+    descendants: Vec<platform_service::ProcessIdentity>,
+    prior: &[TrackedProcessIdentity],
+    system: &sysinfo::System,
+) -> Vec<TrackedProcessIdentity> {
+    let normalized = normalize_descendant_processes(root_pid, descendants);
+    retain_verified_descendant_identities(root_pid, normalized, prior, |identity| {
+        platform_service::process_matches_identity_with_system(
+            system,
+            identity.pid,
+            identity.started_at_unix_secs,
+            identity.process_name.as_deref(),
+        )
+    })
+}
+
+/// Sync descendants using an already-refreshed process snapshot.
+///
+/// Merges against the ledger entry under the PID-file lock so a concurrent sync
+/// cannot lose newly recorded verified descendants.
+pub fn sync_session_descendant_processes_with_system(
+    session_id: &str,
+    root_pid: u32,
+    descendants: Vec<platform_service::ProcessIdentity>,
+    system: &sysinfo::System,
+) -> Result<(), String> {
+    mutate_ledger_if_changed(|ledger| {
+        let Some(entry) = ledger.sessions.get_mut(session_id) else {
+            return false;
+        };
+        if entry.pid != root_pid {
+            return false;
+        }
+        let merged = merge_descendants_with_verified_priors(
+            root_pid,
+            descendants.clone(),
+            &entry.descendant_processes,
+            system,
+        );
+        if entry.descendant_processes == merged {
+            return false;
+        }
+        entry.descendant_processes = merged;
+        true
+    })
+    .map(|_| ())
+}
+
 pub fn sync_session_descendant_processes(
     session_id: &str,
     root_pid: u32,
     descendants: Vec<platform_service::ProcessIdentity>,
 ) -> Result<(), String> {
-    let normalized = normalize_descendant_processes(root_pid, descendants);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sync_session_descendant_processes_with_system(session_id, root_pid, descendants, &system)
+}
+
+/// Release the session root while retaining verified survivors from the current
+/// ledger entry under the PID-file lock.
+pub fn release_session_root_with_system(
+    session_id: &str,
+    root_pid: u32,
+    surviving_descendants: Vec<platform_service::ProcessIdentity>,
+    system: &sysinfo::System,
+) -> Result<(), String> {
     mutate_ledger_if_changed(|ledger| {
-        let Some(entry) = ledger.sessions.get_mut(session_id) else {
+        let Some(entry) = ledger.sessions.get(session_id) else {
             return false;
         };
-        if entry.pid != root_pid || entry.descendant_processes == normalized {
+        if entry.pid != root_pid {
             return false;
         }
-        entry.descendant_processes = normalized;
+        let survivors = merge_descendants_with_verified_priors(
+            root_pid,
+            surviving_descendants.clone(),
+            &entry.descendant_processes,
+            system,
+        );
+        if survivors.is_empty() {
+            ledger.sessions.remove(session_id);
+        } else if let Some(entry) = ledger.sessions.get_mut(session_id) {
+            if entry.descendant_processes == survivors {
+                return false;
+            }
+            entry.descendant_processes = survivors;
+        }
         true
     })
     .map(|_| ())
@@ -455,22 +548,9 @@ pub fn release_session_root(
     root_pid: u32,
     surviving_descendants: Vec<platform_service::ProcessIdentity>,
 ) -> Result<(), String> {
-    let normalized = normalize_descendant_processes(root_pid, surviving_descendants);
-    mutate_ledger_if_changed(|ledger| {
-        let Some(entry) = ledger.sessions.get(session_id) else {
-            return false;
-        };
-        if entry.pid != root_pid {
-            return false;
-        }
-        if normalized.is_empty() {
-            ledger.sessions.remove(session_id);
-        } else if let Some(entry) = ledger.sessions.get_mut(session_id) {
-            entry.descendant_processes = normalized;
-        }
-        true
-    })
-    .map(|_| ())
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    release_session_root_with_system(session_id, root_pid, surviving_descendants, &system)
 }
 
 pub fn untrack_session_process(session_id: &str, pid: u32) -> Result<(), String> {
@@ -911,5 +991,93 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![21]
         );
+    }
+
+    #[test]
+    fn sync_retains_verified_detached_descendants_and_rejects_stale_identities() {
+        let prior = vec![
+            TrackedProcessIdentity {
+                pid: 21,
+                started_at_unix_secs: 210,
+                process_name: Some("worker".to_string()),
+            },
+            TrackedProcessIdentity {
+                pid: 22,
+                started_at_unix_secs: 220,
+                process_name: Some("stale".to_string()),
+            },
+        ];
+        let current = vec![TrackedProcessIdentity {
+            pid: 11,
+            started_at_unix_secs: 110,
+            process_name: Some("shell-child".to_string()),
+        }];
+
+        let retained = retain_verified_descendant_identities(10, current, &prior, |identity| {
+            identity.pid == 21
+                && identity.started_at_unix_secs == 210
+                && identity.process_name.as_deref() == Some("worker")
+        });
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![11, 21]
+        );
+        assert!(!retained.iter().any(|identity| identity.pid == 22));
+    }
+
+    #[test]
+    fn sync_with_system_merges_against_current_ledger_entry_under_lock() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "devmanager-pid-sync-atomic-tests-{}",
+            std::process::id()
+        ));
+        let path = temp_dir.join("running-pids.json");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let _guard = use_test_pid_file(path);
+
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let live = platform_service::process_identity_with_system(&system, std::process::id())
+            .expect("test process identity");
+
+        let mut entry = record("session-1", 10, 100);
+        entry.descendant_processes = vec![TrackedProcessIdentity {
+            pid: live.pid,
+            started_at_unix_secs: live.started_at_unix_secs,
+            process_name: live.process_name.clone(),
+        }];
+        track_session_process(entry).unwrap();
+
+        // Empty live walk must still retain the verified prior read under the lock.
+        sync_session_descendant_processes_with_system("session-1", 10, Vec::new(), &system)
+            .unwrap();
+
+        let remaining = tracked_processes();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0]
+                .descendant_processes
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![live.pid]
+        );
+
+        // Stale start-time must not be retained.
+        let mut stale = record("session-1", 10, 100);
+        stale.descendant_processes = vec![TrackedProcessIdentity {
+            pid: live.pid,
+            started_at_unix_secs: live.started_at_unix_secs.saturating_add(1),
+            process_name: live.process_name.clone(),
+        }];
+        track_session_process(stale).unwrap();
+        sync_session_descendant_processes_with_system("session-1", 10, Vec::new(), &system)
+            .unwrap();
+        assert!(tracked_processes()[0].descendant_processes.is_empty());
     }
 }

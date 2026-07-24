@@ -184,6 +184,7 @@ fn render_session_card(
     let memory = entry.memory_bytes;
     let process_count = entry.process_count;
     let unreaped = entry.unreaped;
+    let logical_cpu_count = entry.logical_cpu_count;
     let processes = entry.processes;
 
     div()
@@ -327,8 +328,14 @@ fn render_session_card(
                     processes
                         .into_iter()
                         .map(|node| {
-                            render_process_row(&session_id, node, root_pid, actions)
-                                .into_any_element()
+                            render_process_row(
+                                &session_id,
+                                node,
+                                root_pid,
+                                logical_cpu_count,
+                                actions,
+                            )
+                            .into_any_element()
                         })
                         .collect()
                 })
@@ -339,6 +346,7 @@ fn render_process_row(
     session_id: &str,
     node: ProcessResourceNode,
     root_pid: Option<u32>,
+    logical_cpu_count: u32,
     actions: &ProcessMonitorActions<'_>,
 ) -> impl IntoElement {
     let is_root = root_pid == Some(node.pid);
@@ -375,8 +383,8 @@ fn render_process_row(
                 )
                 .child(div().text_xs().text_color(rgb(theme::TEXT_SUBTLE)).child(
                     SharedString::from(format!(
-                        "{:.1}% · {}",
-                        node.cpu_percent,
+                        "{} · {}",
+                        format_cpu_detail(node.cpu_percent, logical_cpu_count),
                         format_memory(node.memory_bytes)
                     )),
                 )),
@@ -469,6 +477,7 @@ fn process_monitor_entries(
                 memory_bytes: session.resources.memory_bytes,
                 process_count,
                 unreaped: session.reap_incomplete,
+                logical_cpu_count: session.resources.logical_cpu_count.max(1),
                 processes: ordered_process_nodes(&session),
             }
         })
@@ -615,11 +624,16 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
+fn format_cpu_detail(system_cpu_percent: f32, logical_cpu_count: u32) -> String {
+    let cores = crate::state::equivalent_cpu_cores(system_cpu_percent, logical_cpu_count);
+    format!("{system_cpu_percent:.1}% system · {cores:.2} cores")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        monitor_sessions, ordered_process_nodes, pointer_disposition, process_monitor_entries,
-        session_label, PointerDisposition, PointerTarget,
+        format_cpu_detail, monitor_sessions, ordered_process_nodes, pointer_disposition,
+        process_monitor_entries, session_label, PointerDisposition, PointerTarget,
     };
     use crate::models::Project;
     use crate::state::{
@@ -809,6 +823,12 @@ mod tests {
             PointerDisposition::Consume
         );
     }
+
+    #[test]
+    fn cpu_detail_explains_system_percent_and_equivalent_cores() {
+        assert_eq!(format_cpu_detail(1.953_125, 64), "2.0% system · 1.25 cores");
+        assert_eq!(format_cpu_detail(0.0, 1), "0.0% system · 0.00 cores");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -824,6 +844,7 @@ struct ProcessMonitorEntry {
     memory_bytes: u64,
     process_count: u32,
     unreaped: bool,
+    logical_cpu_count: u32,
     processes: Vec<ProcessResourceNode>,
 }
 

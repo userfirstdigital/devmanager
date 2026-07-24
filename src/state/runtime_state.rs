@@ -132,7 +132,29 @@ pub struct ProcessResourceNode {
     pub memory_bytes: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_logical_cpu_count() -> u32 {
+    1
+}
+
+/// Convert a sysinfo core-scaled CPU percentage into a whole-machine (Task Manager)
+/// percentage in `0..=100`.
+pub fn normalized_cpu_percent(core_scaled_cpu_percent: f32, logical_cpu_count: u32) -> f32 {
+    if !core_scaled_cpu_percent.is_finite() || core_scaled_cpu_percent < 0.0 {
+        return 0.0;
+    }
+    let divisor = logical_cpu_count.max(1) as f32;
+    (core_scaled_cpu_percent / divisor).clamp(0.0, 100.0)
+}
+
+/// Derive equivalent logical cores from a whole-machine CPU percentage.
+pub fn equivalent_cpu_cores(system_cpu_percent: f32, logical_cpu_count: u32) -> f32 {
+    if !system_cpu_percent.is_finite() || system_cpu_percent < 0.0 {
+        return 0.0;
+    }
+    system_cpu_percent * logical_cpu_count.max(1) as f32 / 100.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     pub cpu_percent: f32,
     pub memory_bytes: u64,
@@ -140,8 +162,32 @@ pub struct ResourceSnapshot {
     pub process_ids: Vec<u32>,
     #[serde(default)]
     pub processes: Vec<ProcessResourceNode>,
+    /// Logical CPU count used to normalize `cpu_percent`. Defaults to 1 for
+    /// snapshots produced before this field existed.
+    #[serde(default = "default_logical_cpu_count")]
+    pub logical_cpu_count: u32,
     #[serde(skip, default)]
     pub last_sample_at: Option<Instant>,
+}
+
+impl Default for ResourceSnapshot {
+    fn default() -> Self {
+        Self {
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            process_count: 0,
+            process_ids: Vec::new(),
+            processes: Vec::new(),
+            logical_cpu_count: 1,
+            last_sample_at: None,
+        }
+    }
+}
+
+impl ResourceSnapshot {
+    pub fn equivalent_cpu_cores(&self) -> f32 {
+        equivalent_cpu_cores(self.cpu_percent, self.logical_cpu_count)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,6 +916,7 @@ mod tests {
             process_ids: vec![11, 22, 33],
             processes: Vec::new(),
             last_sample_at: Some(Instant::now()),
+            ..Default::default()
         };
 
         session.note_start(Some(44));
@@ -885,6 +932,7 @@ mod tests {
             process_ids: vec![44, 55],
             processes: Vec::new(),
             last_sample_at: Some(Instant::now()),
+            ..Default::default()
         };
         session.note_exit(
             SessionExitState {
@@ -1065,5 +1113,33 @@ mod tests {
         assert_eq!(session.previous_prompt_line(Some(13)), Some(8));
         assert_eq!(session.next_prompt_line(Some(4)), Some(8));
         assert_eq!(session.next_prompt_line(Some(8)), None);
+    }
+
+    #[test]
+    fn task_manager_cpu_percent_uses_whole_machine_capacity() {
+        let system_percent = normalized_cpu_percent(125.0, 64);
+
+        assert!((system_percent - 1.953_125).abs() < f32::EPSILON);
+        assert!((equivalent_cpu_cores(system_percent, 64) - 1.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn task_manager_cpu_percent_sanitizes_invalid_samples() {
+        assert_eq!(normalized_cpu_percent(-1.0, 64), 0.0);
+        assert_eq!(normalized_cpu_percent(f32::NAN, 64), 0.0);
+        assert_eq!(normalized_cpu_percent(f32::INFINITY, 64), 0.0);
+        assert_eq!(normalized_cpu_percent(250.0, 0), 100.0);
+        assert_eq!(normalized_cpu_percent(12_800.0, 64), 100.0);
+    }
+
+    #[test]
+    fn resource_snapshot_deserializes_without_logical_cpu_count() {
+        let snapshot: ResourceSnapshot = serde_json::from_str(
+            r#"{"cpu_percent":1.5,"memory_bytes":10,"process_count":1,"process_ids":[42],"processes":[]}"#,
+        )
+        .expect("legacy resource snapshot");
+
+        assert_eq!(snapshot.logical_cpu_count, 1);
+        assert!((snapshot.equivalent_cpu_cores() - 0.015).abs() < f32::EPSILON);
     }
 }

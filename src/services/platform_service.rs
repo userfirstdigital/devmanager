@@ -257,11 +257,19 @@ extern "system" {
         job_object_info_length: u32,
     ) -> i32;
     fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn QueryInformationJobObject(
+        job: *mut c_void,
+        job_object_info_class: u32,
+        job_object_info: *mut c_void,
+        job_object_info_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
     fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
     fn Thread32First(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
     fn Thread32Next(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
     fn OpenThread(desired_access: u32, inherit_handle: i32, thread_id: u32) -> *mut c_void;
     fn ResumeThread(thread: *mut c_void) -> u32;
+    fn GetActiveProcessorCount(group_number: u16) -> u32;
 }
 
 #[cfg(windows)]
@@ -271,9 +279,17 @@ const PROCESS_SET_QUOTA: u32 = 0x0100;
 #[cfg(windows)]
 const SYNCHRONIZE: u32 = 0x00100000;
 #[cfg(windows)]
+const JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS: u32 = 3;
+#[cfg(windows)]
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
 #[cfg(windows)]
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
+#[cfg(windows)]
+const ERROR_MORE_DATA: i32 = 234;
+#[cfg(windows)]
+const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
+#[cfg(windows)]
+const MAX_JOB_PROCESS_ID_CAPACITY: usize = 16_384;
 #[cfg(windows)]
 const TH32CS_SNAPTHREAD: u32 = 0x00000004;
 #[cfg(windows)]
@@ -355,6 +371,147 @@ impl Drop for ManagedProcessJob {
                 self.handle = std::ptr::null_mut();
             }
         }
+    }
+}
+
+impl ManagedProcessJob {
+    /// Returns the active process IDs currently assigned to this job.
+    ///
+    /// On non-Windows platforms this always returns an empty list.
+    pub fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+        #[cfg(windows)]
+        {
+            query_job_active_process_ids(self.handle)
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(Vec::new())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn query_job_active_process_ids(job: *mut c_void) -> Result<Vec<u32>, String> {
+    if job.is_null() {
+        return Err("managed job handle is null".to_string());
+    }
+
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST:
+    //   DWORD NumberOfAssignedProcesses;
+    //   DWORD NumberOfProcessIdsInList;
+    //   ULONG_PTR ProcessIdList[ANYSIZE_ARRAY];
+    let header_bytes = std::mem::size_of::<u32>()
+        .checked_mul(2)
+        .ok_or_else(|| "job process list header size overflow".to_string())?;
+    let mut capacity = 16usize;
+
+    loop {
+        if capacity > MAX_JOB_PROCESS_ID_CAPACITY {
+            return Err(format!(
+                "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+            ));
+        }
+        let list_bytes = capacity
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| "job process list size overflow".to_string())?;
+        let total_bytes = header_bytes
+            .checked_add(list_bytes)
+            .ok_or_else(|| "job process list buffer size overflow".to_string())?;
+        if total_bytes > u32::MAX as usize {
+            return Err(
+                "job process list buffer exceeds QueryInformationJobObject limit".to_string(),
+            );
+        }
+        let align = std::mem::align_of::<usize>().max(std::mem::align_of::<u32>());
+        let storage_len = total_bytes
+            .checked_add(align)
+            .ok_or_else(|| "job process list storage size overflow".to_string())?;
+        let mut storage = vec![0u8; storage_len];
+        let offset = storage.as_ptr().align_offset(align);
+        let end = offset
+            .checked_add(total_bytes)
+            .ok_or_else(|| "job process list aligned range overflow".to_string())?;
+        let buffer = storage
+            .get_mut(offset..end)
+            .ok_or_else(|| "job process list aligned buffer out of range".to_string())?;
+
+        let mut return_length = 0u32;
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job,
+                JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS,
+                buffer.as_mut_ptr() as *mut c_void,
+                total_bytes as u32,
+                &mut return_length,
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_MORE_DATA) {
+                let assigned = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+                let needed = (assigned as usize).max(1);
+                if needed > MAX_JOB_PROCESS_ID_CAPACITY || capacity >= MAX_JOB_PROCESS_ID_CAPACITY {
+                    return Err(format!(
+                        "QueryInformationJobObject process list exceeds {MAX_JOB_PROCESS_ID_CAPACITY} members"
+                    ));
+                }
+                let next_capacity = needed
+                    .max(capacity.saturating_mul(2))
+                    .min(MAX_JOB_PROCESS_ID_CAPACITY);
+                if next_capacity <= capacity {
+                    return Err(format!(
+                        "QueryInformationJobObject returned ERROR_MORE_DATA but capacity {capacity} cannot grow"
+                    ));
+                }
+                capacity = next_capacity;
+                continue;
+            }
+            return Err(format!("QueryInformationJobObject failed: {error}"));
+        }
+
+        let count = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
+        if count > capacity {
+            if count > MAX_JOB_PROCESS_ID_CAPACITY {
+                return Err(format!(
+                    "QueryInformationJobObject returned {count} members (max {MAX_JOB_PROCESS_ID_CAPACITY})"
+                ));
+            }
+            capacity = count;
+            continue;
+        }
+
+        let list_ptr = unsafe { buffer.as_ptr().add(header_bytes) as *const usize };
+        let mut process_ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let pid = unsafe { *list_ptr.add(index) } as u32;
+            if pid != 0 {
+                process_ids.push(pid);
+            }
+        }
+        process_ids.sort_unstable();
+        process_ids.dedup();
+        return Ok(process_ids);
+    }
+}
+
+/// Logical processors visible to the whole machine (Task Manager denominator).
+///
+/// On Windows this uses `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)` so
+/// machines with more than 64 logical processors are counted correctly.
+pub fn logical_processor_count() -> u32 {
+    #[cfg(windows)]
+    {
+        let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        count.max(1)
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::thread::available_parallelism()
+            .map(|count| count.get() as u32)
+            .unwrap_or(1)
+            .max(1)
     }
 }
 
@@ -727,6 +884,11 @@ mod tests {
     }
 
     #[test]
+    fn logical_processor_count_is_never_zero() {
+        assert!(super::logical_processor_count() > 0);
+    }
+
+    #[test]
     fn suspended_process_claim_releases_job_when_resume_fails() {
         #[derive(Debug)]
         struct DropMarker(Arc<AtomicBool>);
@@ -786,6 +948,76 @@ mod tests {
 
         drop(job);
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_managed_job_reports_worker_after_intermediate_launcher_exits() {
+        use super::attach_process_to_managed_job;
+
+        let unique = format!(
+            "devmanager-job-members-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let harness_dir = std::env::temp_dir().join(unique);
+        let launcher_script = harness_dir.join("launcher.ps1");
+        let worker_script = harness_dir.join("worker.ps1");
+        let worker_pid_file = harness_dir.join("worker.pid");
+        std::fs::create_dir_all(&harness_dir).expect("create job harness directory");
+        std::fs::write(&worker_script, "Start-Sleep -Seconds 30").expect("write worker script");
+        std::fs::write(
+            &launcher_script,
+            "$worker = Start-Process -NoNewWindow -FilePath powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File',$env:DEVMANAGER_JOB_WORKER_SCRIPT -PassThru\n[IO.File]::WriteAllText($env:DEVMANAGER_JOB_WORKER_PID, [string]$worker.Id)\n",
+        )
+        .expect("write launcher script");
+
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 750; $launcher = Start-Process -NoNewWindow -FilePath powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File',$env:DEVMANAGER_JOB_LAUNCHER_SCRIPT -PassThru; $launcher.WaitForExit(); Start-Sleep -Seconds 30",
+            ])
+            .env("DEVMANAGER_JOB_LAUNCHER_SCRIPT", &launcher_script)
+            .env("DEVMANAGER_JOB_WORKER_SCRIPT", &worker_script)
+            .env("DEVMANAGER_JOB_WORKER_PID", &worker_pid_file)
+            .spawn()
+            .expect("spawn managed process");
+        let child_pid = child.id();
+        let job = attach_process_to_managed_job(child_pid)
+            .expect("attach job")
+            .expect("windows managed job");
+
+        let started = std::time::Instant::now();
+        while !worker_pid_file.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let worker_pid: u32 = std::fs::read_to_string(&worker_pid_file)
+            .expect("launcher should record worker PID")
+            .trim()
+            .parse()
+            .expect("worker PID should be numeric");
+        // The launcher exits immediately after recording the worker.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let process_ids = job.active_process_ids().expect("query managed job");
+        assert!(
+            process_ids.contains(&child_pid),
+            "job members {process_ids:?} did not contain assigned pid {child_pid}"
+        );
+        assert!(
+            process_ids.contains(&worker_pid),
+            "job members {process_ids:?} lost worker {worker_pid} after its launcher exited"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(job);
+        let _ = std::fs::remove_dir_all(harness_dir);
     }
 
     #[test]
