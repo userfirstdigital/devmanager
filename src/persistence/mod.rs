@@ -5,6 +5,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::OnceLock;
 
 const APP_CONFIG_DIR: &str = "com.userfirst.devmanager";
 const APP_PROFILE_ENV: &str = "DEVMANAGER_PROFILE";
@@ -69,13 +71,21 @@ impl Error for PersistenceError {
 pub type Result<T> = std::result::Result<T, PersistenceError>;
 
 pub fn app_config_dir() -> Result<PathBuf> {
-    dirs::config_dir()
-        .map(|path| path.join(app_config_dir_name()))
-        .ok_or(PersistenceError::ConfigDirectoryUnavailable)
+    #[cfg(test)]
+    {
+        let path = app_config_dir_for(test_config_root(), configured_profile().as_deref());
+        return ensure_test_config_dir_is_isolated(path);
+    }
+    #[cfg(not(test))]
+    {
+        dirs::config_dir()
+            .map(|base| app_config_dir_for(&base, app_instance_profile().as_deref()))
+            .ok_or(PersistenceError::ConfigDirectoryUnavailable)
+    }
 }
 
 pub fn app_display_name() -> String {
-    match app_instance_label() {
+    match app_instance_label().or_else(app_instance_profile) {
         Some(label) => format!("DevManager [{label}]"),
         None => "DevManager".to_string(),
     }
@@ -86,18 +96,60 @@ pub fn app_instance_label() -> Option<String> {
 }
 
 pub fn app_instance_profile() -> Option<String> {
-    sanitize_scope_segment(std::env::var(APP_PROFILE_ENV).ok())
+    configured_profile().or_else(default_debug_profile)
 }
 
 pub fn runtime_session_scope() -> String {
     app_instance_profile().unwrap_or_else(|| format!("pid-{:x}", std::process::id()))
 }
 
-fn app_config_dir_name() -> String {
-    match app_instance_profile() {
-        Some(profile) => format!("{APP_CONFIG_DIR}-{profile}"),
-        None => APP_CONFIG_DIR.to_string(),
+fn configured_profile() -> Option<String> {
+    sanitize_scope_segment(std::env::var(APP_PROFILE_ENV).ok())
+}
+
+fn default_debug_profile() -> Option<String> {
+    #[cfg(all(debug_assertions, not(test)))]
+    {
+        return Some("dev-debug".to_string());
     }
+    #[cfg(any(not(debug_assertions), test))]
+    {
+        None
+    }
+}
+
+fn app_config_dir_for(base: &Path, profile: Option<&str>) -> PathBuf {
+    match profile {
+        Some(profile) => base.join(format!("{APP_CONFIG_DIR}-{profile}")),
+        None => base.join(APP_CONFIG_DIR),
+    }
+}
+
+#[cfg(test)]
+fn test_config_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "devmanager-unit-tests-{}-{nonce}",
+            std::process::id()
+        ))
+    })
+    .as_path()
+}
+
+#[cfg(test)]
+fn ensure_test_config_dir_is_isolated(path: PathBuf) -> Result<PathBuf> {
+    if let Some(production) = dirs::config_dir().map(|base| app_config_dir_for(&base, None)) {
+        assert!(
+            !path.starts_with(&production),
+            "unit-test config path must not use installed DevManager storage"
+        );
+    }
+    Ok(path)
 }
 
 fn sanitize_scope_segment(raw: Option<String>) -> Option<String> {
@@ -417,9 +469,59 @@ mod tests {
     }
 
     #[test]
-    fn app_config_dir_name_defaults_without_profile() {
+    fn unprofiled_unit_tests_never_resolve_the_production_directory() {
         let _profile = TestProfileEnvGuard::without_profile();
-        assert_eq!(app_config_dir_name(), "com.userfirst.devmanager");
+        let active = app_config_dir().expect("test config directory");
+        let production = dirs::config_dir()
+            .expect("production config parent")
+            .join(APP_CONFIG_DIR);
+
+        assert!(active.starts_with(std::env::temp_dir()));
+        assert!(!active.starts_with(&production));
+    }
+
+    #[test]
+    fn named_unit_test_profiles_remain_beneath_the_test_root() {
+        let _profile = TestProfileEnvGuard::new("pairing-isolation");
+        let active = app_config_dir().expect("test config directory");
+
+        assert!(active.starts_with(test_config_root()));
+        assert!(active
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("pairing-isolation")));
+    }
+
+    #[test]
+    fn production_and_debug_directory_names_are_explicit() {
+        let base = Path::new("config-root");
+        assert_eq!(
+            app_config_dir_for(base, None),
+            base.join("com.userfirst.devmanager")
+        );
+        assert_eq!(
+            app_config_dir_for(base, Some("dev-debug")),
+            base.join("com.userfirst.devmanager-dev-debug")
+        );
+    }
+
+    #[test]
+    fn app_display_name_falls_back_to_the_active_profile() {
+        let _profile = TestProfileEnvGuard::new("display-profile");
+        let profile = app_instance_profile().expect("active test profile");
+
+        assert_eq!(app_display_name(), format!("DevManager [{profile}]"));
+    }
+
+    #[test]
+    #[should_panic(expected = "unit-test config path must not use installed DevManager storage")]
+    fn unit_test_path_guard_rejects_the_production_tree() {
+        let production = dirs::config_dir()
+            .expect("production config parent")
+            .join(APP_CONFIG_DIR);
+
+        ensure_test_config_dir_is_isolated(production.join("nested"))
+            .expect("unsafe test path must be rejected");
     }
 
     #[test]
