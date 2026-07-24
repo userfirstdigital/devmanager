@@ -74,7 +74,7 @@ pub fn app_config_dir() -> Result<PathBuf> {
     #[cfg(test)]
     {
         let path = app_config_dir_for(test_config_root(), configured_profile().as_deref());
-        return ensure_test_config_dir_is_isolated(path);
+        ensure_test_config_dir_is_isolated(path)
     }
     #[cfg(not(test))]
     {
@@ -110,7 +110,7 @@ fn configured_profile() -> Option<String> {
 fn default_debug_profile() -> Option<String> {
     #[cfg(all(debug_assertions, not(test)))]
     {
-        return Some("dev-debug".to_string());
+        Some("dev-debug".to_string())
     }
     #[cfg(any(not(debug_assertions), test))]
     {
