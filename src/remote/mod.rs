@@ -6716,6 +6716,43 @@ mod tests {
     }
 
     #[test]
+    fn missing_remote_state_remains_first_run_without_persisting() {
+        let _profile = TestProfileGuard::new("remote-state-missing");
+        let path = super::remote_state_path().expect("remote state path");
+        assert!(!path.exists());
+
+        let state = load_remote_machine_state().expect("missing state is first run");
+
+        assert!(!state.host.enabled);
+        assert!(!state.host.web.enabled);
+        assert!(
+            !path.exists(),
+            "first-run load must not persist automatically"
+        );
+    }
+
+    #[test]
+    fn malformed_remote_state_returns_error_without_replacing_bytes() {
+        let _profile = TestProfileGuard::new("remote-state-malformed");
+        let path = super::remote_state_path().expect("remote state path");
+        std::fs::create_dir_all(path.parent().expect("remote state directory"))
+            .expect("create remote state directory");
+        let malformed = b"{ not valid remote json";
+        std::fs::write(&path, malformed).expect("write malformed remote state");
+
+        let error = load_remote_machine_state().expect_err("malformed state must fail");
+
+        assert!(matches!(
+            error,
+            crate::persistence::PersistenceError::Parse { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved malformed state"),
+            malformed
+        );
+    }
+
+    #[test]
     fn remote_machine_state_round_trips_web_pairing_fields() {
         let _profile = TestProfileGuard::new("remote-web-config");
         let mut state = RemoteMachineState::default();

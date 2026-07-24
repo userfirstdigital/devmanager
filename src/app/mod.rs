@@ -1008,6 +1008,34 @@ impl BrowserAttachmentProjectionSink for NativeShellBrowserAttachmentProjectionS
     }
 }
 
+struct RemoteStateStartup {
+    state: RemoteMachineState,
+    diagnostic: Option<String>,
+}
+
+fn resolve_remote_state_startup(
+    result: Result<RemoteMachineState, crate::persistence::PersistenceError>,
+) -> RemoteStateStartup {
+    match result {
+        Ok(state) => RemoteStateStartup {
+            state,
+            diagnostic: None,
+        },
+        Err(error) => {
+            let mut state = RemoteMachineState::default();
+            state.host.enabled = false;
+            state.host.web.enabled = false;
+            RemoteStateStartup {
+                state,
+                diagnostic: Some(format!(
+                    "Remote access is disabled because its saved identity could not be loaded: \
+                     {error}. DevManager did not replace the existing remote state."
+                )),
+            }
+        }
+    }
+}
+
 impl NativeShell {
     fn new(cx: &mut Context<Self>) -> Self {
         let session_manager = SessionManager::new();
@@ -1033,7 +1061,10 @@ impl NativeShell {
             };
         browser_host.attach_foreground_executor(cx.foreground_executor().clone());
         let (browser_bridge, browser_inbox) = browser_command_channel(64);
-        let remote_machine_state = remote::load_remote_machine_state().unwrap_or_default();
+        let RemoteStateStartup {
+            state: remote_machine_state,
+            diagnostic: remote_config_diagnostic,
+        } = resolve_remote_state_startup(remote::load_remote_machine_state());
         let native_dialog_blockers = Arc::new(AtomicUsize::new(0));
         let (mut state, mut startup_notice) = match session_manager.load_workspace() {
             Ok(snapshot) => (AppState::from_workspace(snapshot), None),
@@ -1045,6 +1076,12 @@ impl NativeShell {
             ),
         };
         if let Some(diagnostic) = browser_config_diagnostic {
+            startup_notice = Some(match startup_notice {
+                Some(existing) => format!("{existing}\n{diagnostic}"),
+                None => diagnostic,
+            });
+        }
+        if let Some(diagnostic) = remote_config_diagnostic {
             startup_notice = Some(match startup_notice {
                 Some(existing) => format!("{existing}\n{diagnostic}"),
                 None => diagnostic,
@@ -18039,6 +18076,30 @@ mod tests {
     use gpui::point;
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    #[test]
+    fn remote_state_load_failure_disables_remote_and_surfaces_diagnostic() {
+        let startup = resolve_remote_state_startup(Err(
+            crate::persistence::PersistenceError::ConfigDirectoryUnavailable,
+        ));
+
+        assert!(!startup.state.host.enabled);
+        assert!(!startup.state.host.web.enabled);
+        let diagnostic = startup.diagnostic.expect("load diagnostic");
+        assert!(diagnostic.contains("Remote access is disabled"));
+        assert!(diagnostic.contains("could not determine the user config directory"));
+    }
+
+    #[test]
+    fn valid_remote_state_has_no_startup_diagnostic() {
+        let mut state = RemoteMachineState::default();
+        state.host.web.enabled = true;
+
+        let startup = resolve_remote_state_startup(Ok(state.clone()));
+
+        assert_eq!(startup.state, state);
+        assert!(startup.diagnostic.is_none());
+    }
 
     #[test]
     fn diagnostics_generation_accepts_only_current() {
