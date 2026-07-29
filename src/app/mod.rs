@@ -311,6 +311,7 @@ struct NativeShell {
     terminal_scroll_px: Pixels,
     is_selecting_terminal: bool,
     last_terminal_mouse_report: Option<(TerminalGridPosition, Option<MouseButton>)>,
+    terminal_mouse_press_owner: Option<TerminalMousePressOwner>,
     terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
     pending_terminal_display_offset: Option<usize>,
     terminal_search: TerminalSearchState,
@@ -508,6 +509,12 @@ struct TerminalScrollbarDrag {
     grab_offset_px: f32,
     thumb_top_ratio: f32,
     last_display_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalMousePressOwner {
+    session_id: String,
+    button: MouseButton,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1331,6 +1338,7 @@ impl NativeShell {
             terminal_scroll_px: px(0.0),
             is_selecting_terminal: false,
             last_terminal_mouse_report: None,
+            terminal_mouse_press_owner: None,
             terminal_scrollbar_drag: None,
             pending_terminal_display_offset: None,
             terminal_search: TerminalSearchState::default(),
@@ -4582,6 +4590,7 @@ impl NativeShell {
             }
         } else {
             self.last_terminal_mouse_report = None;
+            self.terminal_mouse_press_owner = None;
             self.is_selecting_terminal = false;
         }
 
@@ -4608,6 +4617,7 @@ impl NativeShell {
         }
         self.did_focus_terminal = false;
         self.last_terminal_mouse_report = None;
+        self.terminal_mouse_press_owner = None;
         self.is_selecting_terminal = false;
         cx.notify();
     }
@@ -13444,6 +13454,7 @@ impl NativeShell {
             self.terminal_selection = None;
             self.is_selecting_terminal = false;
             self.last_terminal_mouse_report = None;
+            self.terminal_mouse_press_owner = None;
             if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
                 if let Some(sequence) = mouse_button_report(
                     session_mode.unwrap_or_default(),
@@ -13472,6 +13483,10 @@ impl NativeShell {
                             .process_manager
                             .write_bytes_to_session(&session_id, &sequence);
                     }
+                    self.terminal_mouse_press_owner = Some(TerminalMousePressOwner {
+                        session_id,
+                        button: event.button,
+                    });
                     self.last_terminal_mouse_report = Some((cell, Some(event.button)));
                     window.prevent_default();
                 }
@@ -13685,35 +13700,39 @@ impl NativeShell {
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
             && !terminal_input_blocked
         {
-            if let Some(cell) = self.grid_position_for_mouse(event.position, window, true) {
-                if let Some(sequence) = mouse_button_report(
-                    session_mode.unwrap_or_default(),
-                    cell,
-                    event.button,
-                    event.modifiers,
-                    false,
-                ) {
-                    let Some(session_id) =
-                        self.resolved_terminal_session_id(active_session.as_ref())
-                    else {
-                        return;
-                    };
-                    if self.remote_mode.is_some() {
-                        self.remote_send_terminal_input(RemoteTerminalInput::Control {
-                            session_id,
-                            bytes: sequence.to_vec(),
-                        });
-                    } else {
-                        let _ = self
-                            .process_manager
-                            .write_bytes_to_session(&session_id, &sequence);
-                    }
-                    window.prevent_default();
+            let session_id = self.resolved_terminal_session_id(active_session.as_ref());
+            let sequence = self
+                .grid_position_for_mouse(event.position, window, true)
+                .and_then(|cell| {
+                    terminal_mouse_release_report(
+                        &mut self.terminal_mouse_press_owner,
+                        session_id.as_deref(),
+                        session_mode.unwrap_or_default(),
+                        cell,
+                        event.button,
+                        event.modifiers,
+                    )
+                });
+            if sequence.is_none() {
+                self.terminal_mouse_press_owner = None;
+            }
+            if let (Some(sequence), Some(session_id)) = (sequence, session_id) {
+                if self.remote_mode.is_some() {
+                    self.remote_send_terminal_input(RemoteTerminalInput::Control {
+                        session_id,
+                        bytes: sequence,
+                    });
+                } else {
+                    let _ = self
+                        .process_manager
+                        .write_bytes_to_session(&session_id, &sequence);
                 }
             }
             self.last_terminal_mouse_report = None;
+            window.prevent_default();
             return;
         }
+        self.terminal_mouse_press_owner = None;
         if event.button != MouseButton::Left {
             return;
         }
@@ -13749,35 +13768,35 @@ impl NativeShell {
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
             && !terminal_input_blocked
         {
+            let session_id = self.resolved_terminal_session_id(active_session.as_ref());
             let cell = self
                 .grid_position_for_mouse(event.position, window, true)
                 .unwrap_or(TerminalGridPosition { row: 0, column: 0 });
-            if let Some(sequence) = mouse_button_report(
+            let sequence = terminal_mouse_release_report(
+                &mut self.terminal_mouse_press_owner,
+                session_id.as_deref(),
                 session_mode.unwrap_or_default(),
                 cell,
                 event.button,
                 event.modifiers,
-                false,
-            ) {
-                let Some(session_id) = self.resolved_terminal_session_id(active_session.as_ref())
-                else {
-                    return;
-                };
+            );
+            if let (Some(sequence), Some(session_id)) = (sequence, session_id) {
                 if self.remote_mode.is_some() {
                     self.remote_send_terminal_input(RemoteTerminalInput::Control {
                         session_id,
-                        bytes: sequence.to_vec(),
+                        bytes: sequence,
                     });
                 } else {
                     let _ = self
                         .process_manager
                         .write_bytes_to_session(&session_id, &sequence);
                 }
-                window.prevent_default();
             }
             self.last_terminal_mouse_report = None;
+            window.prevent_default();
             return;
         }
+        self.terminal_mouse_press_owner = None;
         if event.button != MouseButton::Left {
             return;
         }
@@ -16276,6 +16295,24 @@ fn mouse_button_report(
         modifiers,
         TerminalMouseFormat::from_mode(mode),
     )
+}
+
+fn terminal_mouse_release_report(
+    owner: &mut Option<TerminalMousePressOwner>,
+    session_id: Option<&str>,
+    mode: crate::terminal::session::TerminalModeSnapshot,
+    cell: TerminalGridPosition,
+    button: MouseButton,
+    modifiers: Modifiers,
+) -> Option<Vec<u8>> {
+    let matches = owner.as_ref().is_some_and(|owner| {
+        Some(owner.session_id.as_str()) == session_id && owner.button == button
+    });
+    *owner = None;
+    if !matches {
+        return None;
+    }
+    mouse_button_report(mode, cell, button, modifiers, false)
 }
 
 fn mouse_scroll_report(
@@ -20097,6 +20134,88 @@ mod tests {
         .unwrap();
 
         assert_eq!(report, b"\x1b[<12;5;4M".to_vec());
+    }
+
+    #[test]
+    fn terminal_mouse_release_rejects_orphaned_or_mismatched_press_owner() {
+        let mode = crate::terminal::session::TerminalModeSnapshot {
+            mouse_report_click: true,
+            sgr_mouse: true,
+            ..Default::default()
+        };
+        let cell = TerminalGridPosition { row: 3, column: 4 };
+
+        let mut owner = None;
+        assert_eq!(
+            terminal_mouse_release_report(
+                &mut owner,
+                Some("claude-2"),
+                mode,
+                cell,
+                MouseButton::Left,
+                Modifiers::default(),
+            ),
+            None
+        );
+
+        owner = Some(TerminalMousePressOwner {
+            session_id: "claude-1".to_string(),
+            button: MouseButton::Left,
+        });
+        assert_eq!(
+            terminal_mouse_release_report(
+                &mut owner,
+                Some("claude-2"),
+                mode,
+                cell,
+                MouseButton::Left,
+                Modifiers::default(),
+            ),
+            None
+        );
+        assert!(owner.is_none());
+
+        owner = Some(TerminalMousePressOwner {
+            session_id: "claude-2".to_string(),
+            button: MouseButton::Right,
+        });
+        assert_eq!(
+            terminal_mouse_release_report(
+                &mut owner,
+                Some("claude-2"),
+                mode,
+                cell,
+                MouseButton::Left,
+                Modifiers::default(),
+            ),
+            None
+        );
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn terminal_mouse_release_accepts_matching_press_owner_once() {
+        let mode = crate::terminal::session::TerminalModeSnapshot {
+            mouse_report_click: true,
+            sgr_mouse: true,
+            ..Default::default()
+        };
+        let mut owner = Some(TerminalMousePressOwner {
+            session_id: "claude-2".to_string(),
+            button: MouseButton::Left,
+        });
+
+        let report = terminal_mouse_release_report(
+            &mut owner,
+            Some("claude-2"),
+            mode,
+            TerminalGridPosition { row: 3, column: 4 },
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        assert_eq!(report, Some(b"\x1b[<0;5;4m".to_vec()));
+        assert!(owner.is_none());
     }
 
     #[test]
