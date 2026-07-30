@@ -11691,8 +11691,7 @@ impl NativeShell {
     }
 
     fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
-        let (tracked_ports, refresh_interval) =
-            server_port_snapshot_plan(&self.state, runtime);
+        let (tracked_ports, refresh_interval) = server_port_snapshot_plan(&self.state, runtime);
         if tracked_ports.is_empty() {
             self.server_port_snapshot = ServerPortSnapshotState::default();
             return;
@@ -11713,9 +11712,7 @@ impl NativeShell {
             || self
                 .server_port_snapshot
                 .last_checked_at
-                .map(|checked_at| {
-                    checked_at.elapsed() >= refresh_interval
-                })
+                .map(|checked_at| checked_at.elapsed() >= refresh_interval)
                 .unwrap_or(true);
         if !should_refresh || self.server_port_snapshot.refresh_in_flight {
             return;
@@ -16575,20 +16572,41 @@ fn derive_server_indicator(
     port: Option<u16>,
     port_statuses: &HashMap<u16, PortStatus>,
 ) -> sidebar::ServerIndicatorState {
+    let port_status = port.and_then(|port| port_statuses.get(&port));
+    let external_listener = port_status.is_some_and(|status| {
+        status.in_use
+            && session
+                .map(|session| !runtime_owns_port(session, status))
+                .unwrap_or(true)
+    });
+
     let Some(session) = session else {
-        return sidebar::ServerIndicatorState::Stopped;
+        return if external_listener {
+            sidebar::ServerIndicatorState::External
+        } else {
+            sidebar::ServerIndicatorState::Stopped
+        };
     };
 
     match session.status {
+        SessionStatus::Stopped
+        | SessionStatus::Crashed
+        | SessionStatus::Exited
+        | SessionStatus::Failed
+            if external_listener =>
+        {
+            sidebar::ServerIndicatorState::External
+        }
         SessionStatus::Stopped => sidebar::ServerIndicatorState::Stopped,
         SessionStatus::Starting => sidebar::ServerIndicatorState::Unready,
         SessionStatus::Running => match port {
             Some(port) => {
-                if port_statuses
-                    .get(&port)
-                    .is_some_and(|status| status.in_use && runtime_owns_port(session, status))
+                let status = port_statuses.get(&port);
+                if status.is_some_and(|status| status.in_use && runtime_owns_port(session, status))
                 {
                     sidebar::ServerIndicatorState::Ready
+                } else if external_listener {
+                    sidebar::ServerIndicatorState::External
                 } else {
                     sidebar::ServerIndicatorState::Unready
                 }
@@ -19963,8 +19981,105 @@ mod tests {
         let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
         assert_eq!(
             indicators.get("server-cmd"),
+            Some(&sidebar::ServerIndicatorState::External)
+        );
+
+        port_statuses.insert(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: false,
+                pid: None,
+                process_name: None,
+            },
+        );
+        let indicators = derive_server_indicator_states(&state, &runtime, &port_statuses);
+        assert_eq!(
+            indicators.get("server-cmd"),
             Some(&sidebar::ServerIndicatorState::Unready)
         );
+    }
+
+    #[test]
+    fn derive_server_indicator_detects_external_listener_without_session() {
+        let statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(99),
+                process_name: None,
+            },
+        )]);
+
+        assert_eq!(
+            derive_server_indicator(None, Some(5174), &statuses),
+            sidebar::ServerIndicatorState::External
+        );
+    }
+
+    #[test]
+    fn derive_server_indicator_preserves_active_transitions_over_external_listener() {
+        let statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(99),
+                process_name: None,
+            },
+        )]);
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        session.status = SessionStatus::Starting;
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            sidebar::ServerIndicatorState::Unready
+        );
+
+        session.status = SessionStatus::Stopping;
+        assert_eq!(
+            derive_server_indicator(Some(&session), Some(5174), &statuses),
+            sidebar::ServerIndicatorState::Stopping
+        );
+    }
+
+    #[test]
+    fn derive_server_indicator_prefers_external_listener_for_inactive_sessions() {
+        let statuses = HashMap::from([(
+            5174,
+            PortStatus {
+                port: 5174,
+                in_use: true,
+                pid: Some(99),
+                process_name: None,
+            },
+        )]);
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+
+        for status in [
+            SessionStatus::Stopped,
+            SessionStatus::Exited,
+            SessionStatus::Crashed,
+            SessionStatus::Failed,
+        ] {
+            session.status = status;
+            assert_eq!(
+                derive_server_indicator(Some(&session), Some(5174), &statuses),
+                sidebar::ServerIndicatorState::External,
+                "status {status:?}"
+            );
+        }
     }
 
     #[test]
