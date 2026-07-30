@@ -11691,7 +11691,8 @@ impl NativeShell {
     }
 
     fn sync_server_port_snapshot(&mut self, runtime: &RuntimeState, cx: &mut Context<Self>) {
-        let tracked_ports = live_server_ports(&self.state, runtime);
+        let (tracked_ports, refresh_interval) =
+            server_port_snapshot_plan(&self.state, runtime);
         if tracked_ports.is_empty() {
             self.server_port_snapshot = ServerPortSnapshotState::default();
             return;
@@ -11713,12 +11714,7 @@ impl NativeShell {
                 .server_port_snapshot
                 .last_checked_at
                 .map(|checked_at| {
-                    checked_at.elapsed()
-                        >= server_port_refresh_interval(
-                            runtime,
-                            &self.state,
-                            &self.server_port_snapshot,
-                        )
+                    checked_at.elapsed() >= refresh_interval
                 })
                 .unwrap_or(true);
         if !should_refresh || self.server_port_snapshot.refresh_in_flight {
@@ -16422,12 +16418,16 @@ fn alt_scroll_bytes(scroll_lines: i32) -> Vec<u8> {
     content
 }
 
-fn server_port_refresh_interval(
-    _runtime: &RuntimeState,
-    _state: &AppState,
-    _snapshot: &ServerPortSnapshotState,
-) -> std::time::Duration {
-    std::time::Duration::from_secs(1)
+fn server_port_snapshot_plan(
+    state: &AppState,
+    runtime: &RuntimeState,
+) -> (Vec<u16>, std::time::Duration) {
+    let refresh_interval = if live_server_ports(state, runtime).is_empty() {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(1)
+    };
+    (tracked_server_ports(state), refresh_interval)
 }
 
 fn live_server_ports(state: &AppState, runtime: &RuntimeState) -> Vec<u16> {
@@ -19877,6 +19877,42 @@ mod tests {
         assert_eq!(folder.commands[0].command, "npm");
         assert_eq!(folder.commands[0].args, vec!["run", "dev"]);
         assert_eq!(folder.commands[0].port, Some(4555));
+    }
+
+    #[test]
+    fn server_port_snapshot_plan_tracks_inactive_ports_once_and_adapts_cadence() {
+        let mut state = AppState::default();
+        let mut project = sample_project();
+        project.folders[0].commands[0].port = Some(5174);
+        project.folders[0].commands.push(RunCommand {
+            id: "server-cmd-2".to_string(),
+            port: Some(5174),
+            ..Default::default()
+        });
+        project.folders[0].commands.push(RunCommand {
+            id: "server-cmd-3".to_string(),
+            port: Some(4321),
+            ..Default::default()
+        });
+        state.config.projects.push(project);
+        let mut runtime = RuntimeState::new(false);
+
+        let (ports, interval) = server_port_snapshot_plan(&state, &runtime);
+        assert_eq!(ports, vec![4321, 5174]);
+        assert_eq!(interval, Duration::from_secs(3));
+
+        let mut session = SessionRuntimeState::new(
+            "server-cmd",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.status = SessionStatus::Running;
+        runtime.sessions.insert("server-cmd".to_string(), session);
+
+        let (ports, interval) = server_port_snapshot_plan(&state, &runtime);
+        assert_eq!(ports, vec![4321, 5174]);
+        assert_eq!(interval, Duration::from_secs(1));
     }
 
     #[test]
