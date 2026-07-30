@@ -22,3 +22,11 @@
   after verification and confirm the installed DevManager PID and start time
   are unchanged. Treat `session.json` separately because the running installed
   app may legitimately update its active/open-tab state.
+
+## LLM conversation identity
+
+- Treat provider conversation identity (`providerSessionId`) as distinct from
+  disposable PTY identity. Capture it only from correlated, current-generation
+  Claude/Codex `SessionStart` hooks, preserve it while its tab remains open, and
+  never infer it from cwd, timestamps, or transcript ordering. An exact-resume
+  failure must remain visible and must not fall back to a fresh conversation.
