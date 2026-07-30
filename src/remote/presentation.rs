@@ -1570,6 +1570,7 @@ mod tests {
             id: "tab-stable".to_string(),
             tab_type: TabType::Claude,
             pty_session_id: Some("pty-ephemeral".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         };
 
@@ -2177,6 +2178,7 @@ mod tests {
             id: "tab-stable".to_string(),
             tab_type: TabType::Claude,
             pty_session_id: Some("pty-ephemeral".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         }];
         let key = StableSessionKey::from_tab("tab-stable");
@@ -2210,6 +2212,7 @@ mod tests {
             id: "ai-tab".to_string(),
             tab_type: TabType::Claude,
             pty_session_id: Some("ai-pty".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         };
         let mut runtime = SessionRuntimeState::new(

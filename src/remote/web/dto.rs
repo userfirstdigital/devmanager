@@ -383,6 +383,7 @@ mod tests {
             tab_type: TabType::Claude,
             project_id: "project-1".to_string(),
             pty_session_id: Some("session-1".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         });
 

@@ -1618,6 +1618,7 @@ mod tests {
             project_id: "project-1".to_string(),
             command_id: None,
             pty_session_id: Some("session-1".to_string()),
+            provider_session_id: None,
             label: Some("Claude".to_string()),
             ssh_connection_id: None,
             browser_workspace: None,

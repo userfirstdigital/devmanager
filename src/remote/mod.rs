@@ -7667,6 +7667,7 @@ mod tests {
             tab_type: TabType::Claude,
             project_id: "project-1".to_string(),
             pty_session_id: Some("pty-ephemeral".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         });
         let mut runtime = SessionRuntimeState::new(
@@ -7721,6 +7722,7 @@ mod tests {
             id: "ai-tab".to_string(),
             tab_type: TabType::Claude,
             pty_session_id: Some("ai-runtime".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         });
         let mut ai_runtime = SessionRuntimeState::new(
@@ -7783,6 +7785,7 @@ mod tests {
             id: "ai-tab".to_string(),
             tab_type: TabType::Claude,
             pty_session_id: Some("ai-runtime".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         });
         let mut ai_runtime = SessionRuntimeState::new(
@@ -7865,6 +7868,7 @@ mod tests {
             id: "tab-stable".to_string(),
             tab_type: TabType::Claude,
             pty_session_id: Some("pty-ephemeral".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         });
         let mut runtime = SessionRuntimeState::new(
@@ -7946,6 +7950,7 @@ mod tests {
             tab_type: TabType::Codex,
             project_id: "project-1".to_string(),
             pty_session_id: Some("pty-ephemeral".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         });
         service.update_snapshot(app, RuntimeState::default(), HashMap::new());
@@ -8811,6 +8816,7 @@ mod tests {
                     tab_type: TabType::Claude,
                     project_id: "project-1".to_string(),
                     pty_session_id: Some("ai-session".to_string()),
+                    provider_session_id: None,
                     ..SessionTab::default()
                 },
             ];
@@ -9719,6 +9725,7 @@ mod tests {
             id: "semantic-tab".to_string(),
             tab_type: TabType::Claude,
             pty_session_id: Some("semantic-runtime".to_string()),
+            provider_session_id: None,
             ..SessionTab::default()
         });
         let mut runtime = RuntimeState::default();

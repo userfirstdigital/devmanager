@@ -1,6 +1,6 @@
 use crate::ai::claude_hooks::{
-    prepare_claude_launch_overlay, ClaudeHookRegistration, ClaudeHookRegistry,
-    ClaudeHookRelayListener, ClaudeRegistryEvent, ClaudeShellKind,
+    prepare_claude_launch_overlay, quote_shell_argument, ClaudeHookRegistration,
+    ClaudeHookRegistry, ClaudeHookRelayListener, ClaudeRegistryEvent, ClaudeShellKind,
 };
 use crate::ai::codex_hooks::{
     build_codex_hooks_command, codex_supports_hooks, CodexHookRegistration, CodexHookRegistry,
@@ -590,6 +590,22 @@ impl ProcessManager {
                             emit_remote_session_event(
                                 &inner,
                                 RemoteSessionEvent::Semantic { draft },
+                            );
+                        }
+                    });
+                }
+                ClaudeRegistryEvent::SessionStarted {
+                    provider_session_id,
+                } => {
+                    let registry = inner.claude_hook_registry.clone();
+                    registry.publish_if_current(&registration, || {
+                        if let Some(identity) =
+                            claude_semantic_identity_for_registration(&inner, &registration)
+                        {
+                            bind_runtime_provider_session_id(
+                                &inner,
+                                &identity.pty_session_id,
+                                provider_session_id,
                             );
                         }
                     });
@@ -2494,6 +2510,7 @@ impl ProcessManager {
                 project_id: session.project_id.clone().unwrap_or_default(),
                 command_id: None,
                 pty_session_id: Some(session.session_id.clone()),
+                provider_session_id: session.provider_session_id.clone(),
                 label: Some(label),
                 ssh_connection_id: None,
                 browser_workspace: None,
@@ -2809,6 +2826,7 @@ impl ProcessManager {
                 project_id: session.project_id.clone().unwrap_or_default(),
                 command_id: None,
                 pty_session_id: Some(session.session_id.clone()),
+                provider_session_id: None,
                 label: Some(connection.label.clone()),
                 ssh_connection_id: Some(connection_id),
                 browser_workspace: None,
@@ -3126,6 +3144,7 @@ impl ProcessManager {
                     project_id: lookup.project.id.clone(),
                     command_id: Some(command_id.to_string()),
                     pty_session_id: Some(command_id.to_string()),
+                    provider_session_id: None,
                     label: Some(lookup.command.label.clone()),
                     ssh_connection_id: None,
                     browser_workspace: None,
@@ -4858,7 +4877,9 @@ fn build_ai_launch_spec(
         std::env::current_dir().unwrap_or_else(|_| ".".into())
     };
     let (shell_program, shell_args) = build_interactive_shell_command(settings);
-    let startup_command = resolve_ai_startup_command(settings, tab.tab_type.clone())?;
+    let configured = resolve_ai_startup_command(settings, tab.tab_type.clone())?;
+    let shell = claude_shell_kind(&shell_program);
+    let startup_command = adapt_ai_startup_command(configured, tab, shell)?;
 
     let launch = AiLaunchSpec {
         tab_id: tab.id.clone(),
@@ -4879,6 +4900,87 @@ fn build_ai_launch_spec(
     }
 
     Ok(launch)
+}
+
+const MAX_PROVIDER_SESSION_ID_LEN: usize = 256;
+
+enum AiResume<'a> {
+    Fresh,
+    Exact(&'a str),
+    Picker,
+}
+
+fn validate_provider_session_id(id: &str) -> Result<&str, String> {
+    if id.is_empty()
+        || id.len() > MAX_PROVIDER_SESSION_ID_LEN
+        || !id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return Err("provider session id is invalid".to_string());
+    }
+    Ok(id)
+}
+
+fn adapt_ai_startup_command(
+    configured: String,
+    tab: &SessionTab,
+    shell: ClaudeShellKind,
+) -> Result<String, String> {
+    let resume = match (
+        tab.provider_session_id.as_deref(),
+        tab.pty_session_id.as_deref(),
+    ) {
+        (Some(id), _) => AiResume::Exact(validate_provider_session_id(id)?),
+        (None, None) => AiResume::Picker,
+        (None, Some(_)) => AiResume::Fresh,
+    };
+
+    match resume {
+        AiResume::Fresh => Ok(configured),
+        AiResume::Picker => Ok(append_ai_resume_args(
+            &configured,
+            tab.tab_type.clone(),
+            None,
+            shell,
+        )),
+        AiResume::Exact(id) => Ok(append_ai_resume_args(
+            &configured,
+            tab.tab_type.clone(),
+            Some(id),
+            shell,
+        )),
+    }
+}
+
+fn append_ai_resume_args(
+    configured: &str,
+    tab_type: TabType,
+    provider_session_id: Option<&str>,
+    shell: ClaudeShellKind,
+) -> String {
+    let mut command = configured.to_string();
+    if !command.ends_with(char::is_whitespace) {
+        command.push(' ');
+    }
+    match tab_type {
+        TabType::Claude => {
+            command.push_str("--resume");
+            if let Some(id) = provider_session_id {
+                command.push(' ');
+                command.push_str(&quote_shell_argument(id, shell));
+            }
+        }
+        TabType::Codex => {
+            command.push_str("resume");
+            if let Some(id) = provider_session_id {
+                command.push(' ');
+                command.push_str(&quote_shell_argument(id, shell));
+            }
+        }
+        _ => {}
+    }
+    command
 }
 
 fn windows_shell_for(
@@ -5439,6 +5541,7 @@ fn handle_codex_session_started(
     identity: &CodexAdapterIdentity,
     binding: CodexSessionBinding,
 ) {
+    bind_runtime_provider_session_id(inner, session_id, binding.session_id.clone());
     let new_tailer = binding.transcript_path.map(|path| {
         let tail_inner = Arc::downgrade(inner);
         let tail_session_id = session_id.to_string();
@@ -5485,6 +5588,32 @@ fn handle_codex_session_started(
                 health: SemanticAdapterHealth::Healthy,
             },
         );
+    }
+}
+
+fn bind_runtime_provider_session_id(
+    inner: &ProcessManagerInner,
+    pty_session_id: &str,
+    provider_session_id: String,
+) {
+    let changed = {
+        let Ok(mut runtime) = inner.runtime_state.write() else {
+            return;
+        };
+        let Some(session) = runtime.sessions.get_mut(pty_session_id) else {
+            return;
+        };
+        if session.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
+            false
+        } else {
+            session.provider_session_id = Some(provider_session_id);
+            session.mark_dirty();
+            true
+        }
+    };
+    if changed {
+        bump_runtime_revision(inner);
+        emit_tracked_remote_runtime_snapshot(inner, pty_session_id);
     }
 }
 
@@ -6713,6 +6842,380 @@ mod tests {
         }
     }
 
+    fn ai_launch_test_project() -> Project {
+        Project {
+            id: "project-1".to_string(),
+            name: "Project".to_string(),
+            root_path: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            folders: Vec::new(),
+            color: None,
+            pinned: Some(false),
+            notes: None,
+            save_log_files: Some(false),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn ai_launch_test_tab(
+        tab_type: TabType,
+        provider_session_id: Option<&str>,
+        pty_session_id: Option<&str>,
+    ) -> SessionTab {
+        SessionTab {
+            id: "ai-tab".to_string(),
+            tab_type,
+            project_id: "project-1".to_string(),
+            command_id: None,
+            pty_session_id: pty_session_id.map(str::to_string),
+            provider_session_id: provider_session_id.map(str::to_string),
+            label: Some("AI".to_string()),
+            ssh_connection_id: None,
+            browser_workspace: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_saved_ai_tabs_preserves_runtime_provider_session_id() {
+        let manager = ProcessManager::new();
+        let mut runtime = SessionRuntimeState::new(
+            "runtime-1",
+            std::env::current_dir().unwrap(),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        runtime.configure_ai(AiLaunchSpec {
+            tab_id: "tab-1".to_string(),
+            project_id: "project-1".to_string(),
+            tool: SessionKind::Claude,
+            cwd: std::env::current_dir().unwrap(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        });
+        runtime.status = SessionStatus::Running;
+        runtime.provider_session_id = Some("provider-123".to_string());
+        manager.register_runtime_session(runtime);
+        let mut state = AppState::default();
+
+        assert_eq!(manager.reconcile_saved_ai_tabs(&mut state), 1);
+        assert_eq!(
+            state
+                .find_ai_tab("tab-1")
+                .and_then(|tab| tab.provider_session_id.as_deref()),
+            Some("provider-123")
+        );
+    }
+
+    #[test]
+    fn ai_launch_fresh_tabs_keep_configured_command_unchanged() {
+        let project = ai_launch_test_project();
+        let mut settings = Settings::default();
+        settings.claude_command = Some("my-claude-wrapper --flag".to_string());
+        settings.codex_command = Some("my-codex-wrapper --flag".to_string());
+
+        let claude = build_ai_launch_spec(
+            &settings,
+            &project,
+            &ai_launch_test_tab(TabType::Claude, None, Some("pty-1")),
+            "pty-1",
+        )
+        .expect("fresh claude");
+        let codex = build_ai_launch_spec(
+            &settings,
+            &project,
+            &ai_launch_test_tab(TabType::Codex, None, Some("pty-1")),
+            "pty-1",
+        )
+        .expect("fresh codex");
+
+        assert_eq!(claude.startup_command, "my-claude-wrapper --flag");
+        assert_eq!(codex.startup_command, "my-codex-wrapper --flag");
+    }
+
+    #[test]
+    fn ai_launch_exact_resume_appends_provider_id_for_claude_and_codex() {
+        let project = ai_launch_test_project();
+        let mut settings = Settings::default();
+        settings.claude_command = Some("claude".to_string());
+        settings.codex_command = Some("codex --full-auto".to_string());
+
+        let claude_exact = build_ai_launch_spec(
+            &settings,
+            &project,
+            &ai_launch_test_tab(TabType::Claude, Some("provider-123"), None),
+            "pty-1",
+        )
+        .expect("exact claude");
+        let codex_exact = build_ai_launch_spec(
+            &settings,
+            &project,
+            &ai_launch_test_tab(TabType::Codex, Some("provider-123"), None),
+            "pty-1",
+        )
+        .expect("exact codex");
+
+        assert!(claude_exact.startup_command.contains("--resume"));
+        assert!(claude_exact.startup_command.contains("provider-123"));
+        assert!(codex_exact.startup_command.contains("resume"));
+        assert!(codex_exact.startup_command.contains("provider-123"));
+        assert!(!codex_exact.startup_command.contains("--remote"));
+    }
+
+    #[test]
+    fn ai_launch_legacy_restored_tabs_open_provider_resume_picker() {
+        let project = ai_launch_test_project();
+        let mut settings = Settings::default();
+        settings.claude_command = Some("claude".to_string());
+        settings.codex_command = Some("codex --full-auto".to_string());
+
+        let claude_legacy = build_ai_launch_spec(
+            &settings,
+            &project,
+            &ai_launch_test_tab(TabType::Claude, None, None),
+            "pty-1",
+        )
+        .expect("legacy claude");
+        let codex_legacy = build_ai_launch_spec(
+            &settings,
+            &project,
+            &ai_launch_test_tab(TabType::Codex, None, None),
+            "pty-1",
+        )
+        .expect("legacy codex");
+
+        assert!(claude_legacy.startup_command.ends_with("--resume"));
+        assert!(codex_legacy.startup_command.ends_with("resume"));
+    }
+
+    #[test]
+    fn ai_launch_codex_exact_resume_composes_with_hook_injection() {
+        let project = ai_launch_test_project();
+        let mut settings = Settings::default();
+        settings.codex_command = Some("codex --full-auto".to_string());
+        let mut launch = build_ai_launch_spec(
+            &settings,
+            &project,
+            &ai_launch_test_tab(TabType::Codex, Some("provider-123"), None),
+            "pty-1",
+        )
+        .expect("exact codex launch");
+        assert!(launch.startup_command.contains("resume"));
+        assert!(launch.startup_command.contains("provider-123"));
+
+        let manager = ProcessManager::new();
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
+        manager.prepare_codex_launch_for_session(&mut launch, "codex-exact-resume");
+
+        assert!(launch.startup_command.contains("resume"));
+        assert!(launch.startup_command.contains("provider-123"));
+        assert!(launch.startup_command.contains("codex-hook-relay"));
+        assert!(launch
+            .startup_command
+            .contains("--dangerously-bypass-hook-trust"));
+        assert!(!launch.startup_command.contains("--remote"));
+        for event in crate::ai::codex_hooks::CODEX_HOOK_EVENTS {
+            assert!(
+                launch.startup_command.contains(&format!("hooks.{event}=")),
+                "missing {event} in {}",
+                launch.startup_command
+            );
+        }
+        manager.cleanup_codex_adapter_session("codex-exact-resume");
+    }
+
+    #[test]
+    fn ai_launch_rejects_malformed_provider_session_ids() {
+        let project = ai_launch_test_project();
+        let mut settings = Settings::default();
+        settings.claude_command = Some("claude".to_string());
+
+        for bad in ["bad\nid", "bad\rid", "bad;id", "%PATH%", &"x".repeat(257)] {
+            let error = build_ai_launch_spec(
+                &settings,
+                &project,
+                &ai_launch_test_tab(TabType::Claude, Some(bad), None),
+                "pty-1",
+            )
+            .expect_err("malformed provider id");
+            assert!(
+                error.to_lowercase().contains("provider session id"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_session_id_binds_from_claude_and_codex_session_start_without_duplicate_revision() {
+        let temp = temp_test_dir("provider-session-bind");
+        let manager = ProcessManager::new();
+        manager.set_codex_hooks_support_probe_for_test(Arc::new(|_| Ok(())));
+
+        let mut claude_launch = AiLaunchSpec {
+            tab_id: "claude-tab".to_string(),
+            project_id: "project".to_string(),
+            tool: SessionKind::Claude,
+            cwd: temp.clone(),
+            shell_program: "powershell.exe".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        };
+        manager.prepare_claude_launch_for_session(&mut claude_launch, "claude-runtime", &temp);
+        manager.ensure_runtime_entry("claude-runtime", temp.clone(), SessionDimensions::default());
+        manager.update_session_state("claude-runtime", |state| {
+            state.configure_ai(claude_launch.clone());
+            state.status = SessionStatus::Running;
+        });
+        let claude_registration = manager
+            .inner
+            .claude_hook_sessions
+            .lock()
+            .unwrap()
+            .get("claude-runtime")
+            .map(|session| session.registration.clone())
+            .expect("claude registration");
+        let before_claude = manager.runtime_revision();
+        let endpoint = manager.claude_hook_endpoint().unwrap();
+        ureq::post(&endpoint)
+            .header(
+                "x-devmanager-claude-nonce",
+                &claude_registration.nonce,
+            )
+            .send(
+                br#"{"hook_event_name":"SessionStart","session_id":"claude-provider","source":"startup"}"#,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && manager
+                .runtime_state()
+                .sessions
+                .get("claude-runtime")
+                .and_then(|session| session.provider_session_id.clone())
+                .is_none()
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            manager
+                .runtime_state()
+                .sessions
+                .get("claude-runtime")
+                .and_then(|session| session.provider_session_id.clone())
+                .as_deref(),
+            Some("claude-provider")
+        );
+        assert!(
+            !note_runtime_generation_change(&manager.inner, "claude-runtime"),
+            "binding should consume the runtime generation change"
+        );
+        let after_claude = manager.runtime_revision();
+        assert!(after_claude > before_claude);
+        ureq::post(&endpoint)
+            .header(
+                "x-devmanager-claude-nonce",
+                &claude_registration.nonce,
+            )
+            .send(
+                br#"{"hook_event_name":"SessionStart","session_id":"claude-provider","source":"startup"}"#,
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(manager.runtime_revision(), after_claude);
+
+        let mut codex_launch = browser_test_launch(SessionKind::Codex, "codex --full-auto");
+        manager.prepare_codex_launch_for_session(&mut codex_launch, "codex-runtime");
+        manager.ensure_runtime_entry("codex-runtime", temp.clone(), SessionDimensions::default());
+        manager.update_session_state("codex-runtime", |state| {
+            state.configure_ai(codex_launch.clone());
+            state.status = SessionStatus::Running;
+        });
+        let codex_registration = match manager
+            .inner
+            .codex_adapter_registry
+            .lock()
+            .unwrap()
+            .sessions
+            .get("codex-runtime")
+            .expect("codex session")
+        {
+            CodexAdapterSession::Running { registration, .. } => registration.clone(),
+            other => panic!("expected running codex session, got {other:?}"),
+        };
+        let before_codex = manager.runtime_revision();
+        let body = serde_json::json!({
+            "session_id": "codex-provider",
+            "cwd": temp.to_string_lossy(),
+            "transcript_path": null,
+            "hook_event_name": "SessionStart"
+        })
+        .to_string();
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &codex_registration.nonce,
+                body.as_bytes(),
+                1,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Accepted
+        );
+        assert_eq!(
+            manager
+                .runtime_state()
+                .sessions
+                .get("codex-runtime")
+                .and_then(|session| session.provider_session_id.clone())
+                .as_deref(),
+            Some("codex-provider")
+        );
+        assert!(
+            !note_runtime_generation_change(&manager.inner, "codex-runtime"),
+            "binding should consume the runtime generation change"
+        );
+        let after_codex = manager.runtime_revision();
+        assert!(after_codex > before_codex);
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &codex_registration.nonce,
+                body.as_bytes(),
+                2,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Accepted
+        );
+        assert_eq!(manager.runtime_revision(), after_codex);
+
+        let changed = serde_json::json!({
+            "session_id": "codex-provider-2",
+            "cwd": temp.to_string_lossy(),
+            "transcript_path": null,
+            "hook_event_name": "SessionStart"
+        })
+        .to_string();
+        assert_eq!(
+            manager.inner.codex_hook_registry.ingest(
+                "127.0.0.1:9999".parse().unwrap(),
+                &codex_registration.nonce,
+                changed.as_bytes(),
+                3,
+            ),
+            crate::ai::codex_hooks::CodexRelayIngestStatus::Accepted
+        );
+        assert_eq!(
+            manager
+                .runtime_state()
+                .sessions
+                .get("codex-runtime")
+                .and_then(|session| session.provider_session_id.clone())
+                .as_deref(),
+            Some("codex-provider-2")
+        );
+        assert!(manager.runtime_revision() > after_codex);
+    }
+
     fn browser_provider_replay_plan(
         label: &str,
         with_secret: bool,
@@ -6872,6 +7375,7 @@ mod tests {
             project_id: "restart-project".to_string(),
             command_id: None,
             pty_session_id: Some("existing-session".to_string()),
+            provider_session_id: None,
             label: Some("Claude".to_string()),
             ssh_connection_id: None,
             browser_workspace: None,
@@ -6994,6 +7498,7 @@ mod tests {
                 project_id: "project".to_string(),
                 command_id: None,
                 pty_session_id: None,
+                provider_session_id: None,
                 label: None,
                 ssh_connection_id: None,
                 browser_workspace: Some(browser_attachment_snapshot(annotation_id)),
@@ -9509,6 +10014,7 @@ mod tests {
             project_id: "project-1".to_string(),
             command_id: None,
             pty_session_id: Some("ssh-session".to_string()),
+            provider_session_id: None,
             label: Some("SSH".to_string()),
             ssh_connection_id: Some("ssh-1".to_string()),
             browser_workspace: None,

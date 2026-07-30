@@ -912,6 +912,9 @@ pub type ClaudeRegistryEventHandler =
 #[derive(Debug, Clone)]
 pub enum ClaudeRegistryEvent {
     Semantic(SemanticEventDraft),
+    SessionStarted {
+        provider_session_id: String,
+    },
     AdapterHealth {
         stable_session_key: StableSessionKey,
         health: SemanticAdapterHealth,
@@ -1166,20 +1169,29 @@ impl ClaudeHookRegistry {
                 status: RelayIngestStatus::Accepted(ClaudeReduceOutcome::ignored()),
                 context: Some(context),
                 promoted_healthy: false,
+                provider_session_id: None,
             };
         }
-        let is_session_start = serde_json::from_slice::<Value>(body)
-            .ok()
-            .is_some_and(|value| {
-                value.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart")
-                    && official_identifier(&value, "session_id").is_some()
-            });
+        let official_session_start_id =
+            serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|value| {
+                    (value.get("hook_event_name").and_then(Value::as_str) == Some("SessionStart"))
+                        .then(|| official_identifier(&value, "session_id"))
+                        .flatten()
+                });
+        let is_session_start = official_session_start_id.is_some();
         let registration = state
             .registrations
             .get_mut(&context.nonce)
             .expect("current registration exists");
         let outcome = registration.reducer.apply_json(body, occurred_at_epoch_ms);
         let promoted_healthy = is_session_start && !outcome.degraded && !registration.activated;
+        let provider_session_id = if outcome.degraded {
+            None
+        } else {
+            official_session_start_id
+        };
         if promoted_healthy {
             registration.activated = true;
             registration.expires_at = context.admitted_at + self.limits.registration_ttl;
@@ -1188,6 +1200,7 @@ impl ClaudeHookRegistry {
             status: RelayIngestStatus::Accepted(outcome),
             context: Some(context),
             promoted_healthy,
+            provider_session_id,
         }
     }
 
@@ -1222,6 +1235,7 @@ impl ClaudeHookRegistry {
             status,
             context,
             promoted_healthy,
+            provider_session_id,
         } = captured;
         let RelayIngestStatus::Accepted(outcome) = &status else {
             return status;
@@ -1245,6 +1259,15 @@ impl ClaudeHookRegistry {
                     handler,
                     registration.clone(),
                     ClaudeRegistryEvent::Semantic(draft.clone()),
+                );
+            }
+            if let Some(provider_session_id) = provider_session_id {
+                invoke_registry_handler(
+                    handler,
+                    registration.clone(),
+                    ClaudeRegistryEvent::SessionStarted {
+                        provider_session_id,
+                    },
                 );
             }
             if outcome.degraded {
@@ -1555,6 +1578,7 @@ struct CapturedClaudeIngest {
     status: RelayIngestStatus,
     context: Option<ClaudeRegistrationContext>,
     promoted_healthy: bool,
+    provider_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1581,6 +1605,7 @@ impl CapturedClaudeIngest {
             status,
             context: None,
             promoted_healthy: false,
+            provider_session_id: None,
         }
     }
 }
@@ -2643,6 +2668,59 @@ pub(crate) fn is_safe_cmd_settings_root(path: &Path) -> bool {
 mod registry_race_tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn session_start_publishes_official_provider_session_id_for_current_generation_only() {
+        let registry = ClaudeHookRegistry::default();
+        let registration = registry
+            .register_at(StableSessionKey::from_tab("claude-tab"), Instant::now())
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        registry.set_event_handler(Some(Arc::new(move |_registration, event| {
+            observed.lock().unwrap().push(event);
+        })));
+
+        let captured = registry.ingest_captured_at(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45000),
+            &registration.nonce,
+            br#"{"hook_event_name":"SessionStart","session_id":"provider-123","source":"startup"}"#,
+            Instant::now(),
+            1_800_000_000_000,
+        );
+        let status = registry.dispatch_captured(captured);
+        assert!(matches!(status, RelayIngestStatus::Accepted(_)));
+        let published: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ClaudeRegistryEvent::SessionStarted {
+                    provider_session_id,
+                } => Some(provider_session_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published, vec!["provider-123".to_string()]);
+
+        events.lock().unwrap().clear();
+        let captured = registry.ingest_captured_at(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45001),
+            &registration.nonce,
+            br#"{"hook_event_name":"SessionStart","session_id":"stale-provider","source":"startup"}"#,
+            Instant::now(),
+            1_800_000_000_001,
+        );
+        let _replacement = registry
+            .register_at(StableSessionKey::from_tab("claude-tab"), Instant::now())
+            .unwrap();
+        let _ = registry.dispatch_captured(captured);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| { matches!(event, ClaudeRegistryEvent::SessionStarted { .. }) }));
+    }
 
     #[test]
     fn accepted_old_ingest_cannot_dispatch_after_replacement_registration() {

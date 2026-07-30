@@ -5314,6 +5314,9 @@ impl NativeShell {
 
     fn refresh_remote_host_maintenance(&mut self, cx: &mut Context<Self>) {
         let runtime_state = self.process_manager.runtime_state();
+        if sync_ai_provider_sessions(&mut self.state, &runtime_state) {
+            self.save_session_state();
+        }
         self.sync_server_port_snapshot(&runtime_state, cx);
         self.sync_remote_host_live_sessions(&runtime_state);
         self.sync_remote_host_snapshot_if_due(&runtime_state);
@@ -16838,6 +16841,25 @@ fn retain_startup_restorable_tabs(
     }
 }
 
+fn sync_ai_provider_sessions(state: &mut AppState, runtime: &RuntimeState) -> bool {
+    let mut changed = false;
+    for session in runtime.sessions.values() {
+        if !session.session_kind.is_ai() {
+            continue;
+        }
+        let Some(tab_id) = session.tab_id.as_deref() else {
+            continue;
+        };
+        let Some(provider_session_id) = session.provider_session_id.clone() else {
+            continue;
+        };
+        if state.update_ai_tab_provider_session(tab_id, provider_session_id) {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn persisted_session_state(state: &AppState) -> SessionState {
     let mut session = state.session_state();
     if state.settings().restore_session_on_start == Some(false) {
@@ -18421,6 +18443,7 @@ mod tests {
             project_id: "project-1".to_string(),
             command_id: Some("stale-ai-command".to_string()),
             pty_session_id: Some("session-1".to_string()),
+            provider_session_id: Some("provider-preserved".to_string()),
             label: Some("Claude 1".to_string()),
             ssh_connection_id: None,
             browser_workspace: Some(
@@ -19011,6 +19034,7 @@ mod tests {
             project_id: "project-1".to_string(),
             command_id: Some("server-cmd".to_string()),
             pty_session_id: Some("server-cmd".to_string()),
+            provider_session_id: None,
             label: Some("Server".to_string()),
             ssh_connection_id: None,
             browser_workspace: None,
@@ -19024,6 +19048,7 @@ mod tests {
             project_id: "project-1".to_string(),
             command_id: None,
             pty_session_id: Some("ssh-session".to_string()),
+            provider_session_id: None,
             label: Some("SSH".to_string()),
             ssh_connection_id: Some("ssh-1".to_string()),
             browser_workspace: None,
@@ -19753,6 +19778,10 @@ mod tests {
         let ai_tab = &session.open_tabs[0];
         assert_eq!(ai_tab.command_id, None);
         assert_eq!(ai_tab.pty_session_id, None);
+        assert_eq!(
+            ai_tab.provider_session_id.as_deref(),
+            Some("provider-preserved")
+        );
         assert_eq!(ai_tab.project_id, "project-1");
         let browser_json =
             serde_json::to_value(ai_tab.browser_workspace.as_ref().unwrap()).unwrap();
@@ -19761,6 +19790,51 @@ mod tests {
             serde_json::json!(["annotation-1"])
         );
         assert!(session.sidebar_collapsed);
+    }
+
+    #[test]
+    fn sync_ai_provider_sessions_projects_only_matching_runtime_tabs() {
+        let mut state = AppState::default();
+        state.open_tabs.push(sample_ai_tab());
+        let mut second = sample_ai_tab();
+        second.id = "tab-2".to_string();
+        second.provider_session_id = None;
+        state.open_tabs.push(second);
+
+        let mut runtime = RuntimeState::default();
+        let mut session = SessionRuntimeState::new(
+            "runtime-1",
+            std::path::PathBuf::from("."),
+            SessionDimensions::default(),
+            crate::terminal::session::TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        session.configure_ai(crate::state::AiLaunchSpec {
+            tab_id: "tab-1".to_string(),
+            project_id: "project-1".to_string(),
+            tool: SessionKind::Claude,
+            cwd: std::path::PathBuf::from("."),
+            shell_program: "bash".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        });
+        session.provider_session_id = Some("provider-123".to_string());
+        runtime.sessions.insert("runtime-1".to_string(), session);
+
+        assert!(sync_ai_provider_sessions(&mut state, &runtime));
+        assert_eq!(
+            state
+                .find_tab("tab-1")
+                .and_then(|tab| tab.provider_session_id.clone())
+                .as_deref(),
+            Some("provider-123")
+        );
+        assert_eq!(
+            state
+                .find_tab("tab-2")
+                .and_then(|tab| tab.provider_session_id.clone()),
+            None
+        );
+        assert!(!sync_ai_provider_sessions(&mut state, &runtime));
     }
 
     #[test]
@@ -20525,6 +20599,7 @@ mod tests {
             project_id: "project-1".to_string(),
             command_id: Some("server-command".to_string()),
             pty_session_id: Some("server-command".to_string()),
+            provider_session_id: None,
             label: Some("Server".to_string()),
             ssh_connection_id: None,
             browser_workspace: None,

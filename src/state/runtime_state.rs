@@ -299,6 +299,8 @@ pub struct SessionRuntimeState {
     pub ai_launch: Option<AiLaunchSpec>,
     pub ssh_launch: Option<SshLaunchSpec>,
     pub ai_activity: Option<AiActivity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
     #[serde(skip, default)]
     pub last_output_at: Option<Instant>,
     #[serde(skip, default)]
@@ -365,6 +367,7 @@ impl SessionRuntimeState {
             ai_launch: None,
             ssh_launch: None,
             ai_activity: None,
+            provider_session_id: None,
             last_output_at: None,
             thinking_since: None,
             unseen_ready: false,
@@ -629,6 +632,7 @@ impl SessionRuntimeState {
         self.ai_launch = Some(launch);
         self.ssh_launch = None;
         self.ai_activity = Some(AiActivity::Idle);
+        self.provider_session_id = None;
         self.last_output_at = None;
         self.thinking_since = None;
         self.unseen_ready = false;
@@ -899,6 +903,29 @@ mod tests {
         });
         session.status = SessionStatus::Running;
         session
+    }
+
+    #[test]
+    fn provider_session_id_starts_absent_and_configure_ai_clears_stale_identity() {
+        let mut session = SessionRuntimeState::new(
+            "session-1",
+            PathBuf::from("."),
+            SessionDimensions::default(),
+            TerminalBackend::PortablePtyFeedingAlacritty,
+        );
+        assert_eq!(session.provider_session_id, None);
+
+        session.provider_session_id = Some("stale-provider".to_string());
+        session.configure_ai(AiLaunchSpec {
+            tab_id: "tab-1".to_string(),
+            project_id: "project-1".to_string(),
+            tool: SessionKind::Claude,
+            cwd: PathBuf::from("."),
+            shell_program: "bash".to_string(),
+            shell_args: Vec::new(),
+            startup_command: "claude".to_string(),
+        });
+        assert_eq!(session.provider_session_id, None);
     }
 
     #[test]

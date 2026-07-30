@@ -5656,6 +5656,7 @@ mod tests {
             id: "semantic-tab".to_string(),
             tab_type: crate::models::TabType::Claude,
             pty_session_id: Some("semantic-runtime".to_string()),
+            provider_session_id: None,
             ..crate::models::SessionTab::default()
         });
         let mut runtime = SessionRuntimeState::new(
@@ -5772,6 +5773,7 @@ mod tests {
                 id: tab_id.to_string(),
                 tab_type: crate::models::TabType::Claude,
                 pty_session_id: Some(session_id.to_string()),
+                provider_session_id: None,
                 ..crate::models::SessionTab::default()
             });
             let mut runtime = SessionRuntimeState::new(
@@ -5926,6 +5928,7 @@ mod tests {
             id: tab_id.to_string(),
             tab_type: crate::models::TabType::Claude,
             pty_session_id: Some(session_id.to_string()),
+            provider_session_id: None,
             ..crate::models::SessionTab::default()
         });
         let mut runtime = SessionRuntimeState::new(
@@ -5949,6 +5952,7 @@ mod tests {
             id: tab_id.to_string(),
             tab_type: crate::models::TabType::Codex,
             pty_session_id: Some(session_id.to_string()),
+            provider_session_id: None,
             ..crate::models::SessionTab::default()
         });
         let mut runtime = SessionRuntimeState::new(
@@ -7577,6 +7581,7 @@ mod tests {
                 id: tab_id.to_string(),
                 tab_type: crate::models::TabType::Claude,
                 pty_session_id: Some(session_id.to_string()),
+                provider_session_id: None,
                 ..crate::models::SessionTab::default()
             });
             let mut runtime = SessionRuntimeState::new(

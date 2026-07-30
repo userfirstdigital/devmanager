@@ -305,6 +305,7 @@ impl AppState {
                 project_id: project_id.to_string(),
                 command_id: Some(command_id.to_string()),
                 pty_session_id: Some(command_id.to_string()),
+                provider_session_id: None,
                 label,
                 ssh_connection_id: None,
                 browser_workspace: None,
@@ -373,6 +374,7 @@ impl AppState {
                 project_id: project_id.to_string(),
                 command_id: None,
                 pty_session_id: Some(pty_session_id),
+                provider_session_id: None,
                 label,
                 ssh_connection_id: None,
                 browser_workspace: None,
@@ -400,6 +402,24 @@ impl AppState {
         }
     }
 
+    pub fn update_ai_tab_provider_session(
+        &mut self,
+        tab_id: &str,
+        provider_session_id: String,
+    ) -> bool {
+        let Some(tab) = self.open_tabs.iter_mut().find(|tab| {
+            tab.id == tab_id && matches!(tab.tab_type, TabType::Claude | TabType::Codex)
+        }) else {
+            return false;
+        };
+        if tab.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
+            return false;
+        }
+        tab.provider_session_id = Some(provider_session_id);
+        self.mark_dirty();
+        true
+    }
+
     pub fn open_ssh_tab(
         &mut self,
         project_id: &str,
@@ -425,6 +445,7 @@ impl AppState {
                 project_id: project_id.to_string(),
                 command_id: None,
                 pty_session_id: None,
+                provider_session_id: None,
                 label,
                 ssh_connection_id: Some(connection_id.to_string()),
                 browser_workspace: None,
@@ -865,6 +886,7 @@ mod tests {
             project_id: "project-1".to_string(),
             command_id: None,
             pty_session_id: Some("claude-session".to_string()),
+            provider_session_id: None,
             label: Some("Claude".to_string()),
             ssh_connection_id: None,
             browser_workspace: None,
@@ -922,5 +944,36 @@ mod tests {
 
         state.ensure_server_tab("project-1", "server-cmd", Some("Web".to_string()));
         assert!(state.revision() > after_toggle);
+    }
+
+    #[test]
+    fn update_ai_tab_provider_session_updates_llm_tabs_only() {
+        let mut state = AppState::default();
+        state.open_tabs.push(sample_shell_tab());
+        state.ensure_server_tab("project-1", "server-cmd", Some("Web".to_string()));
+        let before = state.revision();
+
+        assert!(state.update_ai_tab_provider_session("shell-tab", "provider-123".to_string()));
+        assert_eq!(
+            state
+                .find_tab("shell-tab")
+                .and_then(|tab| tab.provider_session_id.clone())
+                .as_deref(),
+            Some("provider-123")
+        );
+        assert!(state.revision() > before);
+
+        let after_change = state.revision();
+        assert!(!state.update_ai_tab_provider_session("shell-tab", "provider-123".to_string()));
+        assert_eq!(state.revision(), after_change);
+
+        assert!(!state.update_ai_tab_provider_session("server-cmd", "provider-456".to_string()));
+        assert_eq!(
+            state
+                .find_tab("server-cmd")
+                .and_then(|tab| tab.provider_session_id.clone()),
+            None
+        );
+        assert_eq!(state.revision(), after_change);
     }
 }

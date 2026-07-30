@@ -246,6 +246,8 @@ pub struct SessionTab {
     pub project_id: String,
     pub command_id: Option<String>,
     pub pty_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
     pub label: Option<String>,
     pub ssh_connection_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,6 +345,22 @@ pub struct EnvEntry {
     pub key: Option<String>,
     pub value: Option<String>,
     pub raw: String,
+}
+
+#[cfg(test)]
+mod session_tab_provider_identity_tests {
+    use super::SessionTab;
+
+    #[test]
+    fn session_tab_provider_identity_is_backward_compatible() {
+        let mut tab: SessionTab =
+            serde_json::from_str(r#"{"id":"ai","type":"claude","projectId":"p"}"#).unwrap();
+        assert_eq!(tab.provider_session_id, None);
+
+        tab.provider_session_id = Some("provider-123".to_string());
+        let encoded = serde_json::to_string(&tab).unwrap();
+        assert!(encoded.contains(r#""providerSessionId":"provider-123""#));
+    }
 }
 
 #[cfg(test)]
