@@ -38,6 +38,7 @@ pub enum ServerIndicatorState {
     Stopped,
     Unready,
     Ready,
+    External,
     Stopping,
     Crashed,
     Exited,
@@ -1383,7 +1384,8 @@ fn server_status_label(state: ServerIndicatorState) -> &'static str {
     match state {
         ServerIndicatorState::Stopped
         | ServerIndicatorState::Unready
-        | ServerIndicatorState::Ready => "",
+        | ServerIndicatorState::Ready
+        | ServerIndicatorState::External => "",
         ServerIndicatorState::Stopping => "stopping",
         ServerIndicatorState::Crashed => "crashed",
         ServerIndicatorState::Exited => "exited",
@@ -1394,7 +1396,10 @@ fn server_status_label(state: ServerIndicatorState) -> &'static str {
 fn server_status_indicator(state: ServerIndicatorState) -> Div {
     if matches!(
         state,
-        ServerIndicatorState::Stopped | ServerIndicatorState::Unready | ServerIndicatorState::Ready
+        ServerIndicatorState::Stopped
+            | ServerIndicatorState::Unready
+            | ServerIndicatorState::Ready
+            | ServerIndicatorState::External
     ) {
         div()
             .size(px(6.0))
@@ -1411,6 +1416,7 @@ fn server_status_indicator(state: ServerIndicatorState) -> Div {
 fn server_status_color(state: ServerIndicatorState) -> u32 {
     match state {
         ServerIndicatorState::Ready => theme::SUCCESS_TEXT,
+        ServerIndicatorState::External => theme::EXTERNAL_TEXT,
         ServerIndicatorState::Unready | ServerIndicatorState::Stopping => theme::WARNING_TEXT,
         ServerIndicatorState::Crashed | ServerIndicatorState::Failed => theme::DANGER_TEXT,
         ServerIndicatorState::Stopped | ServerIndicatorState::Exited => theme::TEXT_SUBTLE,
@@ -1663,6 +1669,11 @@ mod tests {
         assert_eq!(
             server_status_color(ServerIndicatorState::Ready),
             theme::SUCCESS_TEXT
+        );
+        assert_eq!(server_status_label(ServerIndicatorState::External), "");
+        assert_eq!(
+            server_status_color(ServerIndicatorState::External),
+            theme::EXTERNAL_TEXT
         );
         assert_eq!(server_status_label(ServerIndicatorState::Failed), "failed");
     }
