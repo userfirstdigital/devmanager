@@ -714,8 +714,51 @@ fn compare_versions(left: &str, right: &str) -> Result<Ordering, String> {
 }
 
 fn parse_version(value: &str) -> Result<Version, String> {
-    Version::parse(value.trim().trim_start_matches('v'))
-        .map_err(|error| format!("Invalid version `{value}`: {error}"))
+    for candidate in split_version_tokens(value) {
+        let candidate = candidate
+            .trim_matches(|character| {
+                matches!(
+                    character,
+                    '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+                )
+            })
+            .trim_start_matches(|character| matches!(character, 'v' | 'V'));
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Ok(version) = Version::parse(candidate) {
+            return Ok(version);
+        }
+    }
+
+    Err(format!(
+        "Invalid version `{value}`: no valid semantic version found"
+    ))
+}
+
+fn split_version_tokens(value: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = None;
+
+    for (index, character) in value.char_indices() {
+        let is_token_char =
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+');
+        if is_token_char {
+            if start.is_none() && (character.is_ascii_digit() || matches!(character, 'v' | 'V')) {
+                start = Some(index);
+            }
+        } else if let Some(token_start) = start.take() {
+            if token_start < index {
+                result.push(&value[token_start..index]);
+            }
+        }
+    }
+
+    if let Some(token_start) = start {
+        result.push(&value[token_start..]);
+    }
+
+    result
 }
 
 fn read_runtime_or_embedded(name: &str) -> Option<String> {
@@ -810,6 +853,43 @@ mod tests {
                 ready_update: None,
             }),
         }
+    }
+
+    #[test]
+    fn parse_version_accepts_plain_semver() {
+        assert_eq!(
+            parse_version("0.4.2").expect("parse"),
+            Version::new(0, 4, 2)
+        );
+    }
+
+    #[test]
+    fn parse_version_accepts_prefixed_semver() {
+        assert_eq!(
+            parse_version("v0.4.2").expect("parse"),
+            Version::new(0, 4, 2)
+        );
+    }
+
+    #[test]
+    fn parse_version_extracts_version_from_noisy_text() {
+        assert_eq!(
+            parse_version("Release v0.4.2 is now available").expect("parse"),
+            Version::new(0, 4, 2)
+        );
+        assert_eq!(
+            parse_version("tag=v0.4.2").expect("parse"),
+            Version::new(0, 4, 2)
+        );
+        assert_eq!(
+            parse_version("0.4.2 (beta)").expect("parse"),
+            Version::new(0, 4, 2)
+        );
+    }
+
+    #[test]
+    fn parse_version_rejects_invalid_input() {
+        assert!(parse_version("not a version").is_err());
     }
 
     #[test]

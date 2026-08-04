@@ -25,6 +25,7 @@ use crate::models::{
     RunCommand, SSHConnection, SessionState, SessionTab, TabType,
 };
 use crate::notifications;
+use crate::remote::presentation::{SemanticEventKind, StableSessionKey};
 use crate::remote::{
     self, ClientAuth, LocalPortForwardManager, PendingRemoteRequest, RemoteAction,
     RemoteActionPayload, RemoteActionResult, RemoteClientHandle, RemoteClientPool, RemoteGitRepo,
@@ -56,6 +57,7 @@ use gpui::{
     WindowOptions,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -68,6 +70,8 @@ const META_TEXT_HEIGHT_PX: f32 = 0.0;
 const NOTICE_HEIGHT_PX: f32 = 26.0;
 const PENDING_ANNOTATION_STRIP_HEIGHT_PX: f32 = 28.0;
 const PENDING_ANNOTATION_ACTION_NOTICE_DURATION: Duration = Duration::from_secs(8);
+const AI_QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const AI_QUOTA_VISIBILITY_TTL: Duration = Duration::from_secs(60 * 60);
 const SEARCH_BAR_HEIGHT_PX: f32 = 34.0;
 const FOOTER_HEIGHT_PX: f32 = 0.0;
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -334,6 +338,7 @@ struct NativeShell {
     splash_fetch_in_flight: bool,
     native_dialog_blockers: Arc<AtomicUsize>,
     remote_connect_request_id: u64,
+    ai_quota_states: HashMap<String, AiQuotaState>,
     remote_status_notice: Option<RemoteStatusNotice>,
     pending_shutdown_op_id: Option<u64>,
     pending_window_close: bool,
@@ -533,6 +538,16 @@ struct ActivePortState {
     kill_feedback: Option<PortKillFeedback>,
     kill_feedback_until: Option<Instant>,
     refresh_in_flight: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AiQuotaState {
+    tab_id: String,
+    tab_type: TabType,
+    provider_session_id: String,
+    cursor: u64,
+    latest_usage: Option<String>,
+    latest_usage_seen_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1284,6 +1299,11 @@ impl NativeShell {
             Self::spawn_updater_refresh_task(updater.clone(), native_dialog_blockers.clone(), cx);
         }
         Self::spawn_remote_refresh_task(native_dialog_blockers.clone(), cx);
+        Self::spawn_ai_quota_refresh_task(
+            remote_host_service.clone(),
+            native_dialog_blockers.clone(),
+            cx,
+        );
 
         let shell = Self {
             state,
@@ -1333,6 +1353,7 @@ impl NativeShell {
             ssh_password_prompt_state: None,
             editor_needs_focus: false,
             synced_session_id,
+            ai_quota_states: HashMap::new(),
             last_dimensions: None,
             terminal_selection: None,
             terminal_scroll_px: px(0.0),
@@ -4769,6 +4790,246 @@ impl NativeShell {
             },
         )
         .detach();
+    }
+
+    fn spawn_ai_quota_refresh_task(
+        remote_host_service: RemoteHostService,
+        native_dialog_blockers: Arc<AtomicUsize>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let background_executor = cx.background_executor().clone();
+                let mut async_cx = cx.clone();
+                let remote_host_service = remote_host_service.clone();
+                let native_dialog_blockers = native_dialog_blockers.clone();
+                async move {
+                    loop {
+                        background_executor.timer(AI_QUOTA_REFRESH_INTERVAL).await;
+                        while native_dialog_blockers.load(Ordering::Acquire) > 0 {
+                            background_executor.timer(Duration::from_millis(50)).await;
+                        }
+                        if this
+                            .update(&mut async_cx, |shell, cx: &mut Context<'_, Self>| {
+                                if shell.refresh_ai_quota_states(&remote_host_service) {
+                                    cx.notify();
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn refresh_ai_quota_states(&mut self, remote_host_service: &RemoteHostService) -> bool {
+        let mut selected_ai_tabs = Vec::new();
+        let mut selected_provider_names = HashSet::new();
+
+        if let Some(active_tab) = self.state.active_tab().and_then(|tab| {
+            Self::ai_provider_name(&tab.tab_type).and_then(|provider_name| {
+                tab.provider_session_id.as_ref().map(|provider_session_id| {
+                    (
+                        provider_name,
+                        tab.id.clone(),
+                        tab.tab_type.clone(),
+                        provider_session_id.clone(),
+                    )
+                })
+            })
+        }) {
+            let (provider_name, tab_id, tab_type, provider_session_id) = active_tab;
+            selected_ai_tabs.push((provider_name, tab_id, tab_type, provider_session_id));
+            selected_provider_names.insert(provider_name);
+        }
+
+        for tab in self.state.ai_tabs() {
+            let Some(provider_name) = Self::ai_provider_name(&tab.tab_type) else {
+                continue;
+            };
+            if selected_provider_names.contains(provider_name) {
+                continue;
+            }
+            let Some(provider_session_id) = tab.provider_session_id.clone() else {
+                continue;
+            };
+            selected_ai_tabs.push((
+                provider_name,
+                tab.id.clone(),
+                tab.tab_type.clone(),
+                provider_session_id,
+            ));
+            selected_provider_names.insert(provider_name);
+        }
+
+        let active_provider_names = selected_ai_tabs
+            .iter()
+            .map(|(provider_name, _, _, _)| provider_name.to_string())
+            .collect::<HashSet<_>>();
+
+        let active_ai_tabs = selected_ai_tabs
+            .into_iter()
+            .map(|(_provider_name, tab_id, tab_type, provider_session_id)| {
+                (tab_id, tab_type, provider_session_id)
+            })
+            .collect::<Vec<_>>();
+
+        let now_epoch_ms = Self::app_now_epoch_ms();
+        let mut changed = false;
+
+        for (tab_id, tab_type, provider_session_id) in active_ai_tabs {
+            let provider_name = Self::ai_provider_name(&tab_type).expect("only ai tabs");
+            let entry = self
+                .ai_quota_states
+                .entry(provider_name.to_string())
+                .or_insert_with(|| AiQuotaState {
+                    tab_id: tab_id.clone(),
+                    tab_type: tab_type.clone(),
+                    provider_session_id: provider_session_id.clone(),
+                    cursor: 0,
+                    latest_usage: None,
+                    latest_usage_seen_at_epoch_ms: 0,
+                });
+
+            if entry.provider_session_id != provider_session_id {
+                entry.provider_session_id = provider_session_id.clone();
+                entry.tab_id = tab_id;
+                entry.cursor = 0;
+                changed = true;
+                if entry.latest_usage.is_some() || entry.latest_usage_seen_at_epoch_ms != 0 {
+                    entry.latest_usage = None;
+                    entry.latest_usage_seen_at_epoch_ms = 0;
+                    changed = true;
+                }
+            }
+            if entry.tab_type != tab_type {
+                entry.tab_type = tab_type;
+                changed = true;
+            }
+
+            if let Some(replay) = remote_host_service
+                .semantic_replay(&StableSessionKey::from_tab(&entry.tab_id), entry.cursor)
+            {
+                let next_cursor = replay.through_sequence;
+                let cursor_advanced = next_cursor > entry.cursor;
+                entry.cursor = next_cursor;
+                changed = changed || cursor_advanced;
+
+                if let Some((next_usage, next_usage_seen_at_epoch_ms)) =
+                    Self::latest_quota_usage_from_replay(&replay.events)
+                {
+                    let usage_changed = entry
+                        .latest_usage
+                        .as_deref()
+                        .is_none_or(|usage| usage != next_usage.as_str())
+                        || entry.latest_usage_seen_at_epoch_ms != next_usage_seen_at_epoch_ms;
+                    if usage_changed {
+                        entry.latest_usage = Some(next_usage);
+                        entry.latest_usage_seen_at_epoch_ms = next_usage_seen_at_epoch_ms;
+                        changed = true;
+                    }
+                }
+            }
+
+            if Self::is_ai_quota_stale(entry, now_epoch_ms) {
+                entry.latest_usage = None;
+                entry.latest_usage_seen_at_epoch_ms = 0;
+                changed = true;
+            }
+        }
+
+        let stale_tabs: Vec<_> = self
+            .ai_quota_states
+            .keys()
+            .filter(|provider| !active_provider_names.contains(provider.as_str()))
+            .cloned()
+            .collect();
+
+        for tab_id in stale_tabs {
+            let _ = self.ai_quota_states.remove(&tab_id);
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn ai_quota_statuses(&self) -> Vec<chrome::QuotaStatus> {
+        let now_epoch_ms = Self::app_now_epoch_ms();
+        let mut latest_by_provider = HashMap::<&'static str, (String, u64)>::new();
+
+        for state in self.ai_quota_states.values() {
+            if Self::is_ai_quota_stale(state, now_epoch_ms) {
+                continue;
+            }
+            let Some(usage) = &state.latest_usage else {
+                continue;
+            };
+            let provider = Self::ai_provider_name(&state.tab_type).expect("only ai tabs");
+            let replace = latest_by_provider
+                .get(provider)
+                .is_none_or(|(_, seen_at)| state.latest_usage_seen_at_epoch_ms > *seen_at);
+            if replace {
+                latest_by_provider.insert(
+                    provider,
+                    (usage.clone(), state.latest_usage_seen_at_epoch_ms),
+                );
+            }
+        }
+
+        ["Claude", "Codex"]
+            .into_iter()
+            .filter_map(|provider| {
+                latest_by_provider
+                    .get(provider)
+                    .map(|(detail, _)| chrome::QuotaStatus {
+                        provider,
+                        detail: detail.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    fn ai_provider_name(tab_type: &TabType) -> Option<&'static str> {
+        match tab_type {
+            TabType::Claude => Some("Claude"),
+            TabType::Codex => Some("Codex"),
+            _ => None,
+        }
+    }
+
+    fn app_now_epoch_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    fn latest_quota_usage_from_replay(
+        events: &[std::sync::Arc<crate::remote::presentation::SemanticEvent>],
+    ) -> Option<(String, u64)> {
+        events.iter().rev().find_map(|event| {
+            let kind = &event.kind;
+            match kind {
+                SemanticEventKind::Status {
+                    state,
+                    detail: Some(detail),
+                } if state.eq_ignore_ascii_case("usage") => {
+                    Some((detail.clone(), event.occurred_at_epoch_ms))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    fn is_ai_quota_stale(entry: &AiQuotaState, now_epoch_ms: u64) -> bool {
+        entry.latest_usage.is_some()
+            && entry.latest_usage_seen_at_epoch_ms != 0
+            && now_epoch_ms.saturating_sub(entry.latest_usage_seen_at_epoch_ms)
+                > AI_QUOTA_VISIBILITY_TTL.as_millis() as u64
     }
 
     fn pause_for_native_dialog(&self) -> NativeDialogPauseGuard {
@@ -14504,6 +14765,7 @@ impl Render for NativeShell {
             &self.current_port_statuses(),
         );
         let updater_snapshot = self.updater.snapshot();
+        let quota_statuses = self.ai_quota_statuses();
         let remote_status_bar = self.remote_status_bar_state();
         self.sync_settings_remote_draft();
         let allow_editor_mutation = self.remote_mode.is_none() || self.remote_has_control();
@@ -15587,6 +15849,7 @@ impl Render for NativeShell {
                         &runtime_snapshot,
                         &updater_snapshot,
                         Some(&remote_status_bar.model),
+                        &quota_statuses,
                         chrome::StatusBarActions {
                             on_open_process_monitor: &make_open_process_monitor_handler,
                             on_install_update: &make_install_update_handler,
