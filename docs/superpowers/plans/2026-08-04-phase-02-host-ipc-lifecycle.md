@@ -4,7 +4,7 @@
 
 **Goal:** Move the kernel into one durable per-profile host process and prove that multiple presentation clients can attach, issue idempotent commands, consume realtime state, detach, reconnect, resynchronize, and recover without owning execution.
 
-**Architecture:** `devmanager-host` exclusively owns the writable kernel and accepts current-user clients over an authenticated Windows named pipe. `devmanager-next` is a development-only GPUI shell that starts or attaches to the host. Each connection negotiates capabilities, receives a snapshot plus ordered events, has bounded priority queues, and may detach without stopping the host. Full quit is an explicit host command that drains and reconciles owned resources.
+**Architecture:** `devmanager-host` exclusively owns the writable kernel and accepts current-user clients over an authenticated Windows named pipe. `devmanager-next` is a development-only GPUI shell that starts or attaches to the host. Each connection negotiates capabilities/limits, receives chunked snapshot pages plus ordered durable events and droppable ephemeral streams, has bounded priority queues, and may detach without stopping the host. Full quit first closes admission, then drains and reconciles owned resources through one idempotent lifecycle barrier.
 
 **Tech Stack:** Rust/Tokio, Windows named pipes and security descriptors, MessagePack protocol from Phase 1, SQLite kernel, process-level integration tests.
 
@@ -15,7 +15,9 @@
 - The GPUI client never opens the writable SQLite database and never holds runtime ownership.
 - Window close means detach. Full quit is a separate explicit command with a visible dirty/active-resource summary.
 - Reconnection uses sequence cursors; any gap or overflow forces a fresh snapshot.
+- An accepted receipt resolves command admission only. Clients retain `OperationId` until a durable outcome event or an explicit status query proves success/failure/cancellation/uncertainty.
 - Control and approval messages outrank bulk terminal/browser updates; every queue is bounded.
+- Initial snapshots are paged/chunked; child transcripts, terminal history, diffs, recordings, and artifacts load incrementally on demand.
 - Host recovery reports facts honestly. It may reconcile a resource recipe, but may not claim a prior process survived unless Windows identity checks prove it.
 - `devmanager-next` and its profile remain development-only and are deleted/renamed at final cutover.
 - Host diagnostics are structured, bounded, and redacted before enqueue. Raw content capture is an explicit time-bounded local diagnostic mode, never a default log level.
@@ -28,6 +30,7 @@
 - Create: `src/host/lock.rs`
 - Create: `src/host/ipc.rs`
 - Create: `src/host/connection.rs`
+- Create: `src/host/admission.rs`
 - Create: `src/host/shutdown.rs`
 - Create: `src/host/update.rs`
 - Create: `src/client/mod.rs`
@@ -47,6 +50,7 @@
 - Create: `tests/ipc_protocol.rs`
 - Create: `tests/host_lifecycle.rs`
 - Create: `tests/host_recovery.rs`
+- Create: `tests/host_admission.rs`
 - Create: `tests/diagnostic_logging.rs`
 - Create: `tests/cli_client.rs`
 
@@ -56,7 +60,7 @@
 
 - [ ] **Step 1: Write failing multiprocess tests** `second_host_is_rejected`, `stale_pid_record_is_recovered`, `live_unrelated_pid_is_not_killed`, `different_profiles_can_coexist`, and `lock_records_executable_and_start_time`.
 - [ ] **Step 2: Run** `cargo test --test host_lock -- --nocapture` through the Phase 0 wrapper and record the missing binary/module result.
-- [ ] **Step 3: Add the `devmanager-host` binary** with explicit `--profile`, `--instance-label`, `--parent-pid` (development launcher only), and `--foreground` arguments. It must reject an empty or production profile in debug builds unless an explicit release invocation satisfies Phase 10.
+- [ ] **Step 3: Add the `devmanager-host` binary** with explicit `--profile`, `--instance-label`, `--parent-pid` (development launcher only), and `--foreground` arguments. It must reject an empty or production profile in debug builds unless an explicit release invocation satisfies Phase 11.
 - [ ] **Step 4: Implement `HostLock`** using an exclusive file handle plus a JSON identity record containing PID, Windows process creation time, canonical executable path, profile, protocol major, and random boot ID.
 - [ ] **Step 5: Recover stale metadata only** after comparing PID, creation time, and executable path. Never terminate a process to acquire the lock.
 - [ ] **Step 6: Run** `cargo test --test host_lock -- --nocapture`; inspect spawned child cleanup; commit as `feat(host): enforce one host per profile`.
@@ -67,10 +71,10 @@
 
 **Contract:** pipe name is derived from an invariant profile hash and boot-independent product namespace; access is limited to the current user SID and SYSTEM. The first valid frame must be `ClientHello`.
 
-- [ ] **Step 1: Write failing tests** for same-user connection, wrong-profile rejection, pre-hello command rejection, oversized frame closure, malformed frame closure, and five concurrent client handshakes.
+- [ ] **Step 1: Write failing tests** for same-user connection, wrong-profile rejection, pre-hello command rejection, negotiated lower frame/page/chunk limits, oversized four-byte header rejection before allocation, malformed frame closure, unknown optional extension tolerance, and five concurrent client handshakes.
 - [ ] **Step 2: Run** `cargo test --test ipc_protocol pipe_ -- --nocapture` and save the red output.
 - [ ] **Step 3: Create the named pipe** with an explicit security descriptor for current user SID plus SYSTEM, reject remote clients, and use byte mode with protocol framing independent of pipe message boundaries.
-- [ ] **Step 4: Add a per-connection nonce** to `ServerHello`; bind the connection to the profile, negotiated major/minor, client ID, and host boot ID.
+- [ ] **Step 4: Add a per-connection nonce and negotiated `FrameLimits`** to `ServerHello`; bind the connection to the profile, negotiated major/minor, client ID, host boot ID, and per-field minimum limits.
 - [ ] **Step 5: Set read/write/handshake deadlines** and close without decoding additional frames after any protocol violation. Log error category and connection ID but not command payloads.
 - [ ] **Step 6: Run** the focused pipe tests and commit as `feat(host): add authenticated named pipe transport`.
 
@@ -78,10 +82,10 @@
 
 **Files:** `src/client/{mod,connection,model}.rs`, `src/protocol/capabilities.rs`, `tests/ipc_protocol.rs`
 
-- [ ] **Step 1: Add failing tests** `compatible_minor_negotiates_intersection`, `incompatible_major_is_visible`, `request_receipt_is_correlated`, `disconnect_fails_pending_requests`, and `client_never_opens_kernel_db`.
+- [ ] **Step 1: Add failing tests** `compatible_minor_negotiates_intersection`, `incompatible_major_is_visible`, `request_receipt_is_correlated`, `accepted_receipt_keeps_operation_pending`, `operation_settlement_survives_reconnect`, `disconnect_preserves_unknown_operation_for_status_query`, and `client_never_opens_kernel_db`.
 - [ ] **Step 2: Run** `cargo test --test ipc_protocol client_ -- --nocapture` and retain the red result.
 - [ ] **Step 3: Implement `HostClient::connect`** with profile-derived endpoint, handshake deadline, explicit client build, stable `ClientId`, and requested capability set.
-- [ ] **Step 4: Split one connection into a single writer task and reader task**; correlate receipts by `CommandId`, reject duplicate in-flight IDs, and deliver unsolicited server messages to a bounded subscription channel.
+- [ ] **Step 4: Split one connection into a single writer task and reader task**; correlate mutation receipts by `CommandId`, query replies by `RequestId`, track accepted work by `OperationId`, reject duplicate in-flight IDs, and deliver outcome/unsolicited server messages to a bounded subscription channel. Transport loss fails only the query/receipt wait; it does not relabel an accepted operation failed, settled, cancelled, or uncertain.
 - [ ] **Step 5: Expose typed states** `Disconnected`, `Connecting`, `Synchronizing`, `Ready`, `Incompatible`, and `Failed`. UI callers receive state changes rather than transport errors or retry loops.
 - [ ] **Step 6: Add a test filesystem observer** proving the client never opens `kernel.sqlite`; run tests and commit as `feat(client): add host connection and negotiation`.
 
@@ -93,34 +97,38 @@
 
 - [ ] **Step 1: Write failing process tests** `ctl_does_not_acquire_host_lock`, `ctl_uses_same_user_pipe`, `actions_are_unique_and_capability_filtered`, `invoke_builds_same_command_as_ui`, `json_output_is_stable`, `nonzero_exit_maps_rejection`, `dangerous_action_requires_current_target_confirmation`, and `automation_reconnects_without_duplicate_command`.
 - [ ] **Step 2: Run** `cargo test --test cli_client -- --nocapture` through the isolation wrapper and retain the red missing subcommand/action result.
-- [ ] **Step 3: Define `ActionCatalog`** with stable ActionId, title/description, keywords, scope, argument schema, required capability, risk class, availability predicate, and a pure factory from validated arguments plus current client projection to `CommandEnvelope`. Start with host status, Task list/show/create/rename/archive/reopen, and host-quit inspection/confirmation.
+- [ ] **Step 3: Define `ActionCatalog`** with stable ActionId, title/description, keywords, scope, argument schema, required capability, risk class, availability predicate, and a pure factory from validated arguments plus current client projection to `ClientRequest::{Query(QueryEnvelope), Mutation(CommandEnvelope)}`. Start with host status, Task list/show/create/rename/archive/reopen, and host-quit inspection/confirmation; read-only actions never allocate operations.
 - [ ] **Step 4: Dispatch `ctl` before normal host startup** and attach through `HostClient`; emit versioned JSON to stdout, human-readable diagnostics to stderr, and documented exit codes for success, validation, rejection, unavailable host, incompatible protocol, and transport failure.
 - [ ] **Step 5: Require dangerous CLI invocations** to include the exact Task/resource target and current expected revision/generation returned by a prior inspection. No `--yes` flag can bypass local host authorization or stale-target checks.
 - [ ] **Step 6: Make later phases extend this catalog** when they add provider, terminal, browser, Git, service, Connect, or management commands; GPUI/menus/shortcuts and CLI reference the same ActionIds rather than reimplementing factories.
 - [ ] **Step 7: Run** `cargo test --test cli_client -- --nocapture`; commit as `feat(client): add shared actions and host ctl client`.
 
-### Task 2.5: Wire commands, subscriptions, snapshots, and replay
+### Task 2.5: Wire commands, layered subscriptions, paged snapshots, and replay
 
 **Files:** `src/host/connection.rs`, `src/client/{model,subscription}.rs`, `src/kernel/command_bus.rs`, `tests/host_lifecycle.rs`
 
-- [ ] **Step 1: Write failing tests** where two clients attach, both see one initial snapshot, client A creates a task, client B receives the ordered event, A retries the command without a duplicate, and B reconnects from its last cursor.
+- [ ] **Step 1: Write failing tests** where two clients attach, both assemble the same multi-page initial snapshot, client A creates a task, client B receives the ordered event, A retries the command without a duplicate, an ephemeral stream frame is coalesced under pressure, a large child transcript is omitted until requested, and B reconnects from its last cursor. Add corrupted/expired snapshot cursor, interrupted chunk resume, slow bulk reader, and operation-settlement-after-reconnect cases.
 - [ ] **Step 2: Run** `cargo test --test host_lifecycle realtime_ -- --nocapture` and record the red output.
-- [ ] **Step 3: Give the host one `CommandBus` executor** and route every `ClientCommand` through it. Transport tasks may never mutate projections directly.
-- [ ] **Step 4: On subscribe**, capture a snapshot through sequence N, register the subscriber, then deliver events after N without a race. Persist client cursors only in the client, not as task truth.
-- [ ] **Step 5: Use three bounded outbound lanes:** critical receipts/approvals, state events, and bulk deltas. On state overflow send `ResyncRequired`; on bulk overflow coalesce to the newest snapshot marker.
-- [ ] **Step 6: Ensure one slow client cannot block command execution or another client.** Add a deterministic slow-reader test with small test-only queue limits.
-- [ ] **Step 7: Run** the realtime tests and commit as `feat(host): stream snapshots and ordered events`.
+- [ ] **Step 3: Give the host one `CommandBus` executor** and route every mutation `CommandEnvelope` through it; route side-effect-free `QueryEnvelope`s through the read boundary. Transport tasks may never mutate projections directly.
+- [ ] **Step 4: On subscribe**, freeze a snapshot through sequence N, register the subscriber, deliver bounded pages under the negotiated item/byte limits, then deliver durable events after N without a race. Snapshot/chunk cursors are opaque and resumable; persist applied cursors only in the client, not as task truth.
+- [ ] **Step 5: Use three explicit bounded server-to-client layers:** critical receipts/query replies/settlements/interactive requests, durable ordered state events, and ephemeral resource streams. Critical traffic may disconnect a non-reading client but is never silently dropped; state overflow sends `ResyncRequired`; ephemeral progress/status may coalesce to the newest generation/sequence marker.
+- [ ] **Step 6: Add on-demand subscriptions** for child transcripts, terminal scrollback, diffs, recordings, and artifacts. Each starts from a typed resource cursor and negotiated page/chunk limit; none is embedded wholesale in the Task snapshot.
+- [ ] **Step 7: Ensure one slow client cannot block command execution or another client.** Add a deterministic slow-reader test with small test-only queue limits.
+- [ ] **Step 8: Record the snapshot/replay/backpressure cases through the shared conformance runner**, including page/chunk counts, dropped/coalesced ephemeral frames, forced resyncs, acknowledgement latency, and settlement convergence.
+- [ ] **Step 9: Run** the realtime tests and commit as `feat(host): stream paged snapshots durable events and ephemeral state`.
 
-### Task 2.6: Make UI close a detach and full quit explicit
+### Task 2.6: Make detach explicit and close through one admission barrier
 
-**Files:** `src/host/shutdown.rs`, `src/client/connection.rs`, `src/bin/devmanager-next.rs`, `src/protocol/envelope.rs`, `tests/host_lifecycle.rs`
+**Files:** `src/host/{admission,shutdown}.rs`, `src/client/connection.rs`, `src/bin/devmanager-next.rs`, `src/protocol/envelope.rs`, `tests/{host_admission,host_lifecycle}.rs`
 
-- [ ] **Step 1: Add failing tests** `client_disconnect_leaves_host_running`, `last_client_detach_leaves_task_open`, `request_quit_returns_active_resource_summary`, `confirmed_quit_drains_then_exits`, and `cancelled_quit_changes_nothing`.
+- [ ] **Step 1: Add failing tests** `client_disconnect_leaves_host_running`, `last_client_detach_leaves_task_open`, `begin_close_rejects_new_side_effects_before_drain`, `accepted_pre_close_effect_settles_or_cancels`, `duplicate_close_returns_same_operation`, `request_quit_returns_active_resource_summary`, `confirmed_quit_drains_then_exits`, `cleanup_failure_prevents_closed_claim`, and `cancelled_quit_changes_nothing`.
 - [ ] **Step 2: Run** `cargo test --test host_lifecycle detach_ -- --nocapture` and save the expected failures.
-- [ ] **Step 3: Add commands** `RequestHostQuit` and `ConfirmHostQuit { inspection_id }`; the request returns counts and names of active agents, terminals, browsers, and services plus dirty worktrees without mutating state.
-- [ ] **Step 4: Treat EOF, window close, and client crash as detach only.** Remove any client-owned shutdown guard capable of killing host resources.
-- [ ] **Step 5: On confirmed quit**, stop accepting mutating commands, drain receipts/outbox state, ask resource supervisors to close, persist final facts, release the lock, and exit with a typed result. Phase 2 uses fake supervisors; Phase 3 supplies real ones.
-- [ ] **Step 6: Run** the detach/full-quit tests and commit as `feat(host): separate detach from full quit`.
+- [ ] **Step 3: Define `AdmissionState::{Open, Closing { operation_id, action_epoch }, Closed}`** for Task and host scope. `BeginCloseTask`/confirmed host quit atomically enter `Closing`, advance the action epoch, publish it, and reject every later provider send/launch, terminal/browser/service command, background-job registration, and side-effect retry with `Closing` before teardown begins.
+- [ ] **Step 4: Add side-effect-free query** `InspectHostQuit` and mutation command `ConfirmHostQuit { inspection_id }`; inspection returns counts and names of active agents, terminals, browsers, and services plus dirty worktrees without allocating an operation or mutating state. Confirmation returns `Accepted { operation_id }`; it does not report success until the shutdown operation settles.
+- [ ] **Step 5: Treat EOF, window close, and client crash as detach only.** Remove any client-owned shutdown guard capable of killing host resources.
+- [ ] **Step 6: On confirmed quit**, cancel or drain previously accepted fake supervisor work under bounded deadlines, persist an explicit result for each branch, flush final durable events/outbox, and settle the quit operation before releasing the lock. A failed branch yields `CleanupFailed` and residue evidence; it never publishes `Closed`. Phase 3 replaces fake supervisors with Job/PTy ownership while keeping this barrier.
+- [ ] **Step 7: Make close/dispose idempotent** by caching the scope's operation ID/state. Concurrent Task close/full quit share the existing operation and cannot launch duplicate cleanup futures.
+- [ ] **Step 8: Run** the admission/detach/full-quit tests and commit as `feat(host): gate close with durable admission barrier`.
 
 ### Task 2.7: Auto-start and reconnect without duplicate hosts
 
@@ -137,10 +145,10 @@
 
 **Files:** `src/host/mod.rs`, `src/kernel/runtime.rs`, `src/host/shutdown.rs`, `tests/host_recovery.rs`
 
-- [ ] **Step 1: Write failing crash tests:** kill the host after accepting a command, reopen and return the same receipt; leave stored resource recipes, reopen them as `Recovering`; reconcile a missing process to `StoppedUnexpectedly`; reject a stale generation completion.
+- [ ] **Step 1: Write failing crash tests:** kill the host after accepting but before settling a command, reopen and return the same receipt/operation state; finish an outbox effect then crash before outcome recording and reconcile without duplicate effect; when proof is unavailable, transition a non-retry-safe effect to `Uncertain` without redispatch; leave stored resource recipes, reopen them as `Recovering`; preserve `Closing` admission and reject new work after restart; reconcile a missing process to `StoppedUnexpectedly`; reject a stale generation/action-epoch completion.
 - [ ] **Step 2: Run** `cargo test --test host_recovery -- --nocapture` and capture the red result.
 - [ ] **Step 3: Bootstrap in order:** acquire lock, open/migrate/integrity-check store, rebuild runtime registry from durable facts, reconcile resources, bind pipe, then publish `Ready`. Clients must not connect to a partially recovered host.
-- [ ] **Step 4: Persist shutdown intent and boot ID** so recovery distinguishes clean full quit, process crash, and machine interruption. Never infer that a provider/PTY/browser is alive from a prior `Running` event alone.
+- [ ] **Step 4: Persist shutdown intent, admission state, accepted operation state, and boot ID** so recovery distinguishes clean full quit, in-progress close, process crash, and machine interruption. Never infer that a provider/PTY/browser is alive from a prior `Running` event alone.
 - [ ] **Step 5: Make reconciliation idempotent** and generation fenced. Later supervisors implement platform identity checks; Phase 2 fake probes exercise every transition.
 - [ ] **Step 6: Run** recovery tests three times to expose ordering races; commit as `feat(host): recover durable state honestly`.
 
@@ -176,17 +184,20 @@
 - [ ] **Step 2: Run** the test before the soak script exists and record the red missing-script/coverage result.
 - [ ] **Step 3: Create `Invoke-HostSoak.ps1`** to repeat attach/detach/reconnect 100 times, randomly interrupt clients, sample host handle/thread/memory counts, and fail on monotonic leaks beyond explicit tolerance.
 - [ ] **Step 4: Assert after full quit** that the named pipe is gone, the lock is released, the host PID is dead, the SQLite integrity check passes, and no development child process remains.
-- [ ] **Step 5: Update the deletion ledger** with the temporary `devmanager-next` entry and any bridge/re-export introduced so far.
-- [ ] **Step 6: Run** the soak plus all Phase 2 tests; commit as `test(host): prove durable multiprocess lifecycle`.
+- [ ] **Step 5: Run the shared conformance cases** for initial snapshot, durable replay, ephemeral coalescing, forced resync, operation settlement after reconnect, admission-close race, and host/client attach latency. Write immutable baseline manifests/traces and rebuild the query index.
+- [ ] **Step 6: Update the deletion ledger** with the temporary `devmanager-next` entry and any bridge/re-export introduced so far.
+- [ ] **Step 7: Run** the soak plus all Phase 2 tests; commit as `test(host): prove durable multiprocess lifecycle`.
 
 ## Phase 2 verification gate
 
 - [ ] Capture production baseline and announce the multiprocess Rust gate.
-- [ ] Run `cargo test --test host_lock --test ipc_protocol --test host_lifecycle --test host_recovery --test diagnostic_logging --test cli_client -- --nocapture` through `Invoke-PhaseGate.ps1`.
+- [ ] Run `cargo test --test host_lock --test ipc_protocol --test host_admission --test host_lifecycle --test host_recovery --test diagnostic_logging --test cli_client -- --nocapture` through `Invoke-PhaseGate.ps1`.
 - [ ] Run `pwsh scripts/native-next/Invoke-HostSoak.ps1 -Iterations 100`.
 - [ ] Run `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`.
 - [ ] Verify a client process has no open handle to `kernel.sqlite` and killing it does not stop the host.
 - [ ] Verify a slow client cannot delay another client's command receipt by more than the defined integration-test bound.
+- [ ] Verify paged snapshots/chunks resume under interruption, unknown optional extensions degrade safely, and no accepted operation is displayed settled before its event/status proves it.
+- [ ] Rebuild the conformance query index and compare snapshot/replay/admission baseline and variant arms.
 - [ ] Confirm all development PIDs are gone after explicit full quit and no named pipe/lock remains.
 - [ ] Compare production `config.json`/`remote.json` hashes and installed PID/start time.
 - [ ] Review the complete Phase 2 diff and deletion ledger.
@@ -196,8 +207,9 @@
 - One and only one host owns each profile, with safe stale-lock recovery.
 - Same-user clients attach through a bounded, versioned named-pipe protocol and never own the writable database.
 - `devmanager-host ctl` and GPUI use the same capability-aware ActionIds/command factories; automation gains JSON output without a third product binary.
-- Two clients observe the same command receipts, snapshots, and ordered events in realtime.
-- UI close, crash, and reconnect do not end task execution; explicit full quit drains and exits.
+- Two clients converge through paged initial state, ordered durable events, coalescible ephemeral streams, and on-demand resource history in realtime.
+- Accepted operations remain pending until a correlated outcome, survive reconnect/restart, and are queryable by OperationId; uncertain external delivery remains visible and is never silently retried.
+- UI close, crash, and reconnect do not end task execution; Task/full-host close rejects new work first, is idempotent, and cannot claim success while cleanup residue remains.
 - Host crash recovery preserves committed facts and receipts while representing live-resource uncertainty honestly.
 - Structured diagnostics remain bounded/redacted and cannot backpressure execution or persist raw content by default.
 - The host/client soak shows no unbounded handle, memory, connection, or process growth.

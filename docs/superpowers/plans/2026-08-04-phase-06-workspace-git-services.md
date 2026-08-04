@@ -12,6 +12,7 @@
 
 - Preserve the user's left-sidebar project/folder/command/SSH configuration from `config.json`; fresh-start applies only to task/session state.
 - New AI coding Tasks default to an isolated Git worktree. Main checkout requires an explicit task choice; Ask does not create until answered.
+- Git worktrees are the only shipped isolation backend in this program. Do not add Oh My Pi `pi-iso`, ProjFS, block-clone, copy-on-write, or an isolation abstraction during initial implementation; revisit only in a separate design after dirty-state, crash-recovery, cleanup, and Git-equivalence proof.
 - Resolve every filesystem/destructive target to an absolute canonical path and prove it stays within the Task workspace or an explicitly selected artifact export target.
 - Do not reset, clean, checkout over, overwrite, delete, commit, push, or open a PR without an explicit typed command and preview where consequences are material.
 - Existing dirty changes belong to the user. Checkpoints capture state; restore is file/hunk scoped and never uses `git reset --hard`.
@@ -87,10 +88,10 @@
 
 **Files:** `src/workspace/worktree.rs`, `src/git/command.rs`, `tests/worktree_service.rs`
 
-- [ ] **Step 1: Write failing tests** for branch naming, existing branch/path, dirty main checkout, nested repo, linked worktree discovery, concurrent creation, cancellation, and safe cleanup refusal with dirty/unpushed work.
+- [ ] **Step 1: Write failing tests** for branch naming, existing branch/path, dirty main checkout, nested repo, linked worktree discovery, concurrent creation, cancellation, safe cleanup refusal with dirty/unpushed work, and `only_git_worktree_backend_is_exposed`.
 - [ ] **Step 2: Run** `cargo test --test worktree_service -- --nocapture` and save the red result.
 - [ ] **Step 3: Execute Git with argument arrays** and `GIT_TERMINAL_PROMPT=0`; parse `git worktree list --porcelain` and `git status --porcelain=v2 -z`, never human-localized output.
-- [ ] **Step 4: Generate branches under `codex/` by default** with collision-safe task suffixes and worktrees under the repository-approved worktree root. Record exact branch/path/base commit in Task facts after Git succeeds.
+- [ ] **Step 4: Generate branches under `codex/` by default** with collision-safe task suffixes and worktrees under the repository-approved worktree root. Record exact branch/path/base commit in Task facts after Git succeeds. Expose `WorkspaceChoice::NewWorktree`, not a generic backend selector or dormant ProjFS flag.
 - [ ] **Step 5: On cleanup request**, preview dirty/untracked/unpushed status; refuse destructive removal by default. A confirmed force path targets the exact canonical worktree and remains recoverable where possible.
 - [ ] **Step 6: Run** tests against temporary real Git repos and commit as `feat(workspace): manage isolated task worktrees`.
 
@@ -165,14 +166,15 @@
 
 ### Task 6.10: Prove the complete local coding workspace
 
-**Files:** `scripts/native-next/Invoke-WorkspaceSmoke.ps1`, all Phase 6 integration tests, `docs/replacement-deletion-ledger.md`
+**Files:** `scripts/native-next/Invoke-WorkspaceSmoke.ps1`, all Phase 6 integration tests, `tests/fixtures/conformance/workspace/v1/*`, `docs/replacement-deletion-ledger.md`
 
 - [ ] **Step 1: Create a temporary fixture repository** with a configured project, command, service, external listener, dirty file, untracked file, and remote bare repo.
 - [ ] **Step 2: Through real host commands**, create a worktree Task, open/read/edit a file, capture checkpoints, launch/health-check service, view terminal/process/port status, inspect diff, stage/commit/push, and close.
 - [ ] **Step 3: Verify** main checkout user changes remain untouched, external listener remains alive/blue, pushed work exists in fixture remote, artifacts hash correctly, and every managed Job reaches zero.
 - [ ] **Step 4: Reopen the isolated host** and prove `config.json` sidebar configuration persists while task/workspace facts restore from SQLite, not `session.json`.
-- [ ] **Step 5: Update the deletion ledger** for old workspace/sidebar/Git/service/SSH ownership and UI paths.
-- [ ] **Step 6: Run** smoke plus focused tests; commit as `test(workspace): prove complete safe coding workspace`.
+- [ ] **Step 5: Run shared conformance baseline/variant cases** for worktree creation/cleanup refusal, checkpoint/restore, bounded file/diff access, Git mutation settlement, service health, external-port safety, and zero Job residue. Use temporary repositories/fake services only and record declared latency/result/residue metrics without source bodies.
+- [ ] **Step 6: Update the deletion ledger** for old workspace/sidebar/Git/service/SSH ownership and UI paths.
+- [ ] **Step 7: Run** smoke plus focused tests; commit as `test(workspace): prove complete safe coding workspace`.
 
 ## Phase 6 verification gate
 
@@ -183,6 +185,7 @@
 - [ ] Search destructive Git/process calls and manually audit every resolved target/confirmation: `rg -n "reset --hard|clean -fd|Remove-Item|TerminateJobObject|kill\(" src/workspace src/git src/services src/ssh`.
 - [ ] Visually inspect configuration, Changes, Files, Services, Artifacts, Review, and Command Center in both themes/high DPI.
 - [ ] Confirm external listeners and main-checkout fixture changes remain untouched; confirm every managed Job reaches zero.
+- [ ] Rebuild the conformance query index and compare workspace/Git/service baseline and variant arms.
 - [ ] Confirm no test/Cargo/rustc/helper/development host remains; compare production hashes and installed PID/start time.
 - [ ] Review the Phase 6 diff and deletion ledger.
 

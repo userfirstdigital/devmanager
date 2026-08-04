@@ -1,4 +1,4 @@
-# Phase 7: Task Browser and LLM Validation Implementation Plan
+# Phase 8: Task Browser and LLM Validation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -16,9 +16,10 @@
 - Browser contexts use isolated WebView2 user-data directories beneath the active profile. Production browser data is never copied, opened, migrated, or shared.
 - Provider browser tools are Task-scoped and expose only capabilities granted to that Task; no global “current browser” lookup.
 - Page input requires an active browser focus epoch and bounds generation. Task-switch pointer gestures are consumed and never forwarded into page content.
-- Desktop and a transport-neutral projection client observe the same tabs/navigation/automation state in this phase. Phase 8 carries that exact projection through direct and hosted Connect; no client creates a second browser.
+- Desktop and a transport-neutral projection client observe the same tabs/navigation/automation state in this phase. Phase 9 carries that exact projection through direct and hosted Connect; no client creates a second browser.
 - Raw page content, screenshots, downloads, recordings, secrets, and clipboard data remain local/E2E-only by default.
 - Browser completeness requires authenticated stock-provider control of a real deterministic page, visible desktop proof, realtime remote proof, failure recovery, and zero helper processes after every close path.
+- Deterministic fixture/fake-provider browser cases run in ordinary gates. Authenticated provider control is a separate explicit, isolated, low-volume conformance arm and never uses production DevManager/provider/browser profiles.
 
 ---
 
@@ -57,7 +58,7 @@
 - Create: `scripts/native-next/Invoke-BrowserProviderE2E.ps1`
 - Create: `docs/adr/0001-host-owned-webview2-surface.md`
 
-### Task 7.1: Prove the host-owned WebView2 surface boundary before refactoring
+### Task 8.1: Prove the host-owned WebView2 surface boundary before refactoring
 
 **Files:** `src/browser/surface.rs`, `src/browser/host/windows.rs`, `src/bin/{devmanager-host,devmanager-next,browser-fixture-server}.rs`, `src/ui/task_cockpit/browser_panel.rs`, `tests/browser_surface.rs`, `scripts/native-next/Invoke-BrowserSurfaceProof.ps1`, `docs/adr/0001-host-owned-webview2-surface.md`
 
@@ -69,10 +70,10 @@
 - [ ] **Step 4: Implement the smallest surface bridge** using validated process/window identity and generation-fenced attach commands. All SetParent/style/bounds/focus calls run on the owning UI/COM thread required by WebView2; no raw HWND is trusted without host-issued nonce/generation.
 - [ ] **Step 5: Consume task-switch pointer input** before changing the attached surface. Hide the outgoing surface first, advance focus/bounds epoch, attach/show the incoming surface, and require a later pointer gesture inside it for page input.
 - [ ] **Step 6: Run the proof across the DPI/window matrix** and deliberately terminate the GPUI client. The host/browser context must remain alive and reattach to a new client; context close/full quit must yield zero WebView2 helper members.
-- [ ] **Step 7: Record the measured result in ADR 0001.** If any required ownership/focus/DPI/reattach/cleanup invariant fails, stop Phase 7 and revise the surface architecture before touching the rest of `src/browser`; do not hide failure behind screenshots.
+- [ ] **Step 7: Record the measured result in ADR 0001.** If any required ownership/focus/DPI/reattach/cleanup invariant fails, stop Phase 8 and revise the surface architecture before touching the rest of `src/browser`; do not hide failure behind screenshots.
 - [ ] **Step 8: Commit the passing proof** as `feat(browser): prove host-owned webview2 surface`.
 
-### Task 7.2: Define Task-owned browser identities, facts, and commands
+### Task 8.2: Define Task-owned browser identities, facts, and commands
 
 **Files:** `src/browser/{domain,protocol}.rs`, `src/domain/{resource,command,event,snapshot}.rs`, `tests/browser_service.rs`
 
@@ -96,7 +97,7 @@ pub struct BrowserRequest {
 - [ ] **Step 5: Add privacy classes** and required permissions to every action/result; reject a cross-Task ID even when tab/context IDs are otherwise valid.
 - [ ] **Step 6: Run** domain tests and commit as `feat(browser): define task scoped browser contract`.
 
-### Task 7.3: Move WebView2 environment and operation ownership into the host
+### Task 8.3: Move WebView2 environment and operation ownership into the host
 
 **Files:** `src/browser/{service,host/mod,host/initialization,host/windows,storage,operation_queue,teardown}.rs`, `src/host/mod.rs`, `tests/{browser_service,browser_recovery}.rs`
 
@@ -108,7 +109,7 @@ pub struct BrowserRequest {
 - [ ] **Step 6: On host recovery**, create a new generation from durable tab/navigation recipes and mark prior runtime interrupted; do not claim JS heap, form state, or in-flight downloads survived.
 - [ ] **Step 7: Run** service/recovery tests and commit as `refactor(browser): move browser runtime ownership to host`.
 
-### Task 7.4: Refactor automation and operation queues behind the kernel service
+### Task 8.4: Refactor automation and operation queues behind the kernel service
 
 **Files:** `src/browser/{automation,commands,operation_queue,provider,annotations,attachments}.rs`, `tests/browser_service.rs`
 
@@ -119,7 +120,7 @@ pub struct BrowserRequest {
 - [ ] **Step 5: Bound DOM/accessibility/screenshot payloads** and store large results as Task artifacts. Redact password fields and configured secret selectors before journal/Connect projection.
 - [ ] **Step 6: Run** automation tests against the real local fixture site, not only mocks; commit as `refactor(browser): sequence visible browser automation in host`.
 
-### Task 7.5: Make browser MCP lifecycle Task-scoped and permissioned
+### Task 8.5: Make browser MCP lifecycle Task-scoped and permissioned
 
 **Files:** `src/browser/{gateway,mcp,workflow_mcp,recording_mcp}.rs`, `src/providers/session.rs`, `src/domain/{command,event}.rs`, `tests/browser_gateway.rs`
 
@@ -130,7 +131,7 @@ pub struct BrowserRequest {
 - [ ] **Step 5: Emit semantic tool progress/results** to the same provider journal while keeping raw page data local by default. Cancellation from provider/user/Task close terminates the exact operation.
 - [ ] **Step 6: Stop and verify the MCP listener/resource** when the AgentSession closes; commit as `feat(browser): scope browser tools to provider tasks`.
 
-### Task 7.6: Attach the browser safely in the GPUI context dock
+### Task 8.6: Attach the browser safely in the GPUI context dock
 
 **Files:** `src/ui/task_cockpit/browser_panel.rs`, `src/browser/{surface,projection}.rs`, `src/client/model.rs`, `tests/{browser_surface,browser_projection}.rs`
 
@@ -141,7 +142,7 @@ pub struct BrowserRequest {
 - [ ] **Step 5: Advance both shell focus epoch and browser surface epoch** on Task/dock/tab changes. A navigation gesture cannot become a page click, keypress, drag, file choice, or permission answer.
 - [ ] **Step 6: Walk the fixture focus page at all DPI scales** with mouse/keyboard/IME and commit as `feat(ui): embed task browser in gpui dock`.
 
-### Task 7.7: Define the transport-neutral browser projection and web renderer
+### Task 8.7: Define the transport-neutral browser projection and web renderer
 
 **Files:** `src/browser/projection.rs`, `src/protocol/envelope.rs`, `web/src/browser/{model,BrowserView,InputOverlay}.tsx`, `web/src/browser/*.test.tsx`, `tests/browser_projection.rs`
 
@@ -152,7 +153,7 @@ pub struct BrowserRequest {
 - [ ] **Step 5: Render the web fixture client full-screen at phone sizes** with tab/navigation/progress and a visible interaction mode. Never pretend projected screenshot pixels are a local DOM.
 - [ ] **Step 6: Prove no manual refresh** on navigate/tool action/task switch/direct-fixture reconnect; commit as `feat(browser): add realtime browser projection`.
 
-### Task 7.8: Complete downloads, clipboard, file chooser, and secret handling
+### Task 8.8: Complete downloads, clipboard, file chooser, and secret handling
 
 **Files:** `src/browser/{downloads,attachments,policy,replay_secrets}.rs`, `src/workspace/artifacts.rs`, `tests/browser_service.rs`
 
@@ -163,7 +164,7 @@ pub struct BrowserRequest {
 - [ ] **Step 5: Gate clipboard and secret use** by source client/role/action. Secret values are fetched host-side from vault references, injected directly into exact fields, zeroized where possible, and absent from event/log/screenshot metadata.
 - [ ] **Step 6: Run** real fixture download/upload/clipboard/secret scenarios and commit as `feat(browser): secure browser io and secrets`.
 
-### Task 7.9: Preserve recordings, recipes, replay, repair, and cancellation
+### Task 8.9: Preserve recordings, recipes, replay, repair, and cancellation
 
 **Files:** `src/browser/{recording,recording_coordinator,recording_ipc,recipes,replay,replay_executor,replay_repair,replay_secrets}.rs`, `tests/browser_recording.rs`
 
@@ -175,7 +176,7 @@ pub struct BrowserRequest {
 - [ ] **Step 6: Propagate cancellation** from provider/user/task/host into navigation, waits, capture, repair, and replay; verify no queued action resumes after a new generation.
 - [ ] **Step 7: Run** tests and commit as `refactor(browser): retain durable recording and replay workflows`.
 
-### Task 7.10: Recover from navigation, renderer, sleep, and client failures
+### Task 8.10: Recover from navigation, renderer, sleep, and client failures
 
 **Files:** `src/browser/{service,teardown,host/windows}.rs`, `src/process/teardown.rs`, `tests/browser_recovery.rs`
 
@@ -186,37 +187,39 @@ pub struct BrowserRequest {
 - [ ] **Step 5: Teardown in order:** cancel operations, deny new input, detach/park surface, close controllers/tabs/environment, await helper disappearance, reconcile ports/files, then mark closed. Any remaining helper becomes a visible leak fault.
 - [ ] **Step 6: Run** recovery tests repeatedly and commit as `feat(browser): recover and teardown browser generations`.
 
-### Task 7.11: Prove real LLM-controlled browser operation end to end
+### Task 8.11: Prove fixture and real LLM-controlled browser operation end to end
 
 **Files:** `tests/browser_provider_e2e.rs`, `scripts/native-next/Invoke-BrowserProviderE2E.ps1`, `docs/browser-e2e-matrix.md`, `docs/replacement-deletion-ledger.md`
 
 - [ ] **Step 1: Define deterministic provider prompts** whose success can be machine-verified on the fixture site: navigate, inspect a value, fill non-secret form, choose an option, submit, open a tab, download an artifact, upload it, handle a permission, and report the final verification token.
-- [ ] **Step 2: Add fixture-only protocol tests** and run them red before authenticated execution to prove that mocked adapters cannot satisfy the final acceptance marker.
-- [ ] **Step 3: For each installed/authenticated Claude, Codex, and Cursor capability**, launch the stock provider with its Task-scoped browser tools and execute the real prompt. Record provider/version/session ID, browser/Task/generation, journal tool events, page audit events, screenshots, result token, and process tree.
-- [ ] **Step 4: While the provider works**, switch desktop Tasks, detach/reattach the GPUI client, connect the direct projection fixture at phone width, resize/change DPI, minimize/restore, and cancel one run. Require realtime progress without refresh and no focus/input leakage. Phase 8 repeats this through real direct/hosted Connect.
+- [ ] **Step 2: Add fixture/fake-provider protocol tests** and shared conformance cases for every action/recovery/cleanup path. Run baseline/variant arms red before implementation, then green without network/auth; a fake provider cannot satisfy the separately labeled authenticated acceptance arm.
+- [ ] **Step 3: For each installed/authenticated Claude, Codex, and Cursor capability and only after explicit operator opt-in**, launch the stock provider with its Task-scoped browser tools and execute the real prompt under isolated development profiles. Record provider/version/session ID, browser/Task/generation, journal tool events, page audit events, screenshots, result token, and process tree as redacted conformance artifact references—not prompt/page bodies in the manifest.
+- [ ] **Step 4: While the provider works**, switch desktop Tasks, detach/reattach the GPUI client, connect the direct projection fixture at phone width, resize/change DPI, minimize/restore, and cancel one run. Require realtime progress without refresh and no focus/input leakage. Phase 9 repeats this through real direct/hosted Connect.
 - [ ] **Step 5: Execute recovery cases** for navigation error, renderer crash, provider crash, host full quit, and failed browser launch. Every case must settle in the kernel with truthful status.
 - [ ] **Step 6: Close each Task and require zero** provider, MCP, browser, WebView2, fixture-server, downloader, recorder, and test helper members/listeners. Hash the isolated browser profile and verify production browser/profile paths were never opened.
-- [ ] **Step 7: Document the full matrix** with pass/fail evidence; any unsupported provider capability is labeled as such and cannot be counted as a passing controlled-browser case.
-- [ ] **Step 8: Update the deletion ledger** for all old browser ownership/bridge paths; commit as `test(browser): validate real provider controlled browsing`.
+- [ ] **Step 7: Document the full matrix** with pass/fail evidence; any unsupported provider capability is labeled as such and cannot be counted as a passing controlled-browser case. Metrics are browser command success, visible-state convergence, cancellation/recovery settlement, latency, and residue only—not model intelligence.
+- [ ] **Step 8: Finalize immutable fixture and real-run manifests/traces**, resume one interrupted case, rebuild the conformance index, and prove seeded secrets/raw content are absent from manifest/index/logs.
+- [ ] **Step 9: Update the deletion ledger** for all old browser ownership/bridge paths; commit as `test(browser): validate real provider controlled browsing`.
 
-## Phase 7 verification gate
+## Phase 8 verification gate
 
 - [ ] Capture production hashes/PID/start time and announce the long WebView2/provider test gate.
 - [ ] Run `cargo test --test browser_surface --test browser_service --test browser_gateway --test browser_projection --test browser_recording --test browser_recovery --test browser_provider_e2e -- --nocapture`.
 - [ ] Run the web browser tests and `npm --prefix web run typecheck && npm --prefix web run build`.
 - [ ] Run `pwsh scripts/native-next/Invoke-BrowserSurfaceProof.ps1 -AllDpi -ClientCrash -HostRecovery`.
-- [ ] Run `pwsh scripts/native-next/Invoke-BrowserProviderE2E.ps1 -Providers Available -IncludeProjectionFixture -IncludeRecovery` with explicit authenticated-smoke confirmation.
+- [ ] Run `pwsh scripts/native-next/Invoke-BrowserProviderE2E.ps1 -Fixture -IncludeProjectionFixture -IncludeRecovery` for the ordinary gate. Run a separate `-Authenticated -Provider <explicit allowlist>` arm only with explicit user authority in that implementation session; never interpret `Available` as permission to launch every subscription CLI.
 - [ ] Run `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`.
 - [ ] Review every surface/E2E screenshot, process tree, event trace, cancellation trace, and cleanup assertion.
+- [ ] Rebuild the conformance index and compare fixture baseline/variant plus explicitly authorized real-provider arms for browser success, latency, resync, and residue.
 - [ ] Confirm no Cargo/rustc/test/provider/MCP/fixture/WebView2/development host remains and all owned ports are free.
 - [ ] Compare production config/remote hashes, installed PID/start time, and production browser-data metadata.
-- [ ] Review the complete Phase 7 diff and deletion ledger.
+- [ ] Review the complete Phase 8 diff and deletion ledger.
 
-## Phase 7 exit criteria
+## Phase 8 exit criteria
 
 - A host-owned WebView2 context visibly attaches/parks/reattaches across GPUI client lifecycle and all supported DPI/focus transitions.
 - Browser identity, operations, automation, MCP, downloads, secrets, recordings, and replay are Task/generation scoped and host owned.
-- Desktop and the transport-neutral/direct fixture observe/control the same browser in realtime without creating a second browser; Phase 8 must prove the same contract over direct and hosted Connect.
+- Desktop and the transport-neutral/direct fixture observe/control the same browser in realtime without creating a second browser; Phase 9 must prove the same contract over direct and hosted Connect.
 - At least Claude and Codex complete the deterministic real browser scenario when their installed stock CLIs expose the required browser-tool capability; Cursor is tested to its truthful probed capability.
 - Crash/cancel/sleep/navigation/focus cases reconcile honestly and every close path leaves zero owned browser/provider/tool helpers.
 - Production DevManager and browser data remain untouched.

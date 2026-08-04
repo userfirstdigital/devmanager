@@ -1,6 +1,6 @@
 # DevManager Native GPUI Session Kernel and Connect Design
 
-**Status:** Approved product direction; selective-adoption revision awaiting written-spec review
+**Status:** Approved written specification; phase plans ready for implementation
 
 **Date:** 2026-08-04
 
@@ -108,13 +108,13 @@ Every mutating operation follows the same route regardless of where it originate
 
 ```text
 client intent
-  -> typed command { request_id, client_id, expected_revision }
+  -> typed command { command_id, client_id, expected_revision }
   -> authorization and invariant checks
   -> per-task serialized command queue
   -> one durable transaction, idempotency receipt, and side-effect outbox
-  -> Accepted { request_id, operation_id, revision }
+  -> Accepted { command_id, operation_id, task_revision }
   -> bounded side effect
-  -> Settled or Failed event correlated to operation_id
+  -> Settled, Failed, Cancelled, or Uncertain event correlated to operation_id
   -> projections pushed to every subscribed client
 ```
 
@@ -138,7 +138,7 @@ The protocol includes:
 
 Interactive traffic such as keystrokes, send, stop, answers, and approvals pre-empts screenshots, scrollback, diffs, and file transfers. A slow remote client can lose transient progress and receive a fresh snapshot; it must never stall a provider PTY or the host.
 
-Command acceptance and operation settlement are different facts. An `Accepted` receipt means the command passed authorization, was durably recorded, and will be attempted once; it does not claim that a provider started, a process stopped, or an artifact finished. Long-running effects settle through a correlated success or failure event and remain queryable by operation ID after a client reconnects. Pure in-database commands may be accepted and settled in one transaction while preserving the same public semantics.
+Command acceptance and operation outcome are different facts. An `Accepted` receipt means the command passed authorization and was durably recorded; it does not claim that a provider started, a process stopped, or an artifact finished. Each outbox effect declares one of three retry policies: retry-safe with a stable external idempotency key, reconcile-before-retry through stable external identity, or no-automatic-retry. If the host can prove neither delivery nor non-delivery after a crash/timeout, the operation becomes visibly `Uncertain` and is not dispatched again automatically. Only verified reconciliation may later resolve that outcome. This avoids an impossible exactly-once promise and prevents a duplicated provider input from being disguised as reliability. Pure in-database commands may be accepted and settled in one transaction while preserving the same public semantics.
 
 No client sends or receives one unbounded history frame. The peers negotiate conservative physical-frame and reassembled-message limits at connection time. Large state is chunked with item and byte bounds, checksummed where integrity matters, and resumable from a cursor. Exceeding a declared limit returns a closed protocol error rather than allocating until failure.
 
@@ -196,11 +196,12 @@ The kernel stores facts, not a second collection of UI badges. Visible state is 
 
 1. Host or required runtime disconnected
 2. Failed
-3. Needs approval
-4. Needs answer
-5. Working or settling
-6. Ready for review
-7. Idle
+3. Uncertain outcome
+4. Needs approval
+5. Needs answer
+6. Working or settling
+7. Ready for review
+8. Idle
 
 Lifecycle (`Open`, `Archived`), connectivity, attention, and activity remain separate axes. Status colors always have icons and text; color alone is never the meaning.
 

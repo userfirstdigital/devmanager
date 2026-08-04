@@ -4,7 +4,7 @@
 
 **Goal:** Give the durable host exclusive ownership of native PTYs and every managed process tree, with lossless terminal state, bounded client projection, truthful Task Manager-style resource accounting, safe input focus, and zero-orphan teardown.
 
-**Architecture:** A host-owned `ProcessSupervisor` launches every managed root suspended, assigns it to a kill-on-close Windows Job Object, records ownership and generation, then resumes it. A host-owned `TerminalService` reads each PTY once into a canonical `alacritty_terminal` grid and fans snapshots/deltas to clients. Process inventory and resource sampling are background projections over Job membership; UI paint/input paths perform no OS enumeration.
+**Architecture:** A host-owned `ProcessSupervisor` launches every managed root suspended, assigns it to a kill-on-close Windows Job Object, records ownership and generation, then resumes it. A host-owned `TerminalService` reads each PTY once into a canonical `alacritty_terminal` grid and fans snapshots/deltas to clients. Close enters the Phase 2 admission barrier before bounded concurrent teardown, and succeeds only after every owned Job proves zero members. Process inventory and resource sampling are background projections over Job membership; UI paint/input paths perform no OS enumeration.
 
 **Tech Stack:** Rust/Tokio, portable-pty, alacritty_terminal, Windows Job Objects/completion ports/process APIs, sysinfo only where it has verified semantics, existing port probes.
 
@@ -16,6 +16,7 @@
 - A managed root must be created suspended, assigned to its Job Object, and only then resumed. If assignment fails, terminate the still-suspended process and report failure.
 - Child membership comes from the Job Object, not a one-time parent-PID walk. Parent-PID enumeration may enrich labels but is not ownership truth.
 - Closing a terminal view or desktop client does not close its PTY. Closing a task or full quit invokes explicit supervisor teardown.
+- Once Task/host admission is `Closing`, no new root, PTY, input, service operation, or retry may enter that scope. Every completion is fenced by owner, action epoch, resource ID, generation, PID, and creation time.
 - One PTY read feeds one canonical grid. Semantic and raw views do not create extra readers or provider processes.
 - CPU shown by default is process-tree CPU divided by logical processor count and clamped to `0..=100`, matching Task Manager's whole-machine convention. Raw core-equivalent percent stays diagnostics-only.
 - Process enumeration, job queries, port probes, quota probes, and resource aggregation execute on scheduled workers outside terminal reads, input, layout, and paint.
@@ -42,7 +43,7 @@
 - Refactor: `src/services/ports_service.rs`
 - Modify: `src/domain/{resource,command,event,snapshot}.rs`
 - Modify: `src/kernel/runtime.rs`
-- Modify: `src/host/{mod,shutdown}.rs`
+- Modify: `src/host/{mod,admission,shutdown}.rs`
 - Modify: `src/protocol/{capabilities,envelope}.rs`
 - Modify: `src/client/action.rs`
 - Modify: `Cargo.toml`
@@ -168,14 +169,16 @@ impl TerminalService {
 
 ### Task 3.7: Implement graceful, escalating, verifiable teardown
 
-**Files:** `src/process/teardown.rs`, `src/terminal/service.rs`, `src/host/shutdown.rs`, `tests/process_supervisor.rs`
+**Files:** `src/process/teardown.rs`, `src/terminal/service.rs`, `src/host/{admission,shutdown}.rs`, `tests/process_supervisor.rs`
 
-- [ ] **Step 1: Add failing tests** for cooperative exit, ignored close request, child surviving root exit, cancellation during teardown, simultaneous task close/full quit, and timeout resulting in active-process-zero after Job termination.
+- [ ] **Step 1: Add failing tests** for admission closing before cooperative exit, launch/input race after close begins, cooperative exit, ignored close request, child surviving root exit, cancellation during teardown, simultaneous task close/full quit, duplicate dispose, bounded concurrent teardown, timeout resulting in active-process-zero after Job termination, and residue preventing a `Closed` event.
 - [ ] **Step 2: Run** `cargo test --test process_supervisor teardown_ -- --nocapture` and save the red output.
-- [ ] **Step 3: Implement distinct shared ActionCatalog entries and teardown stages:** foreground interrupt, terminal close, and terminate managed tree remain separate commands. For close/tree termination, mark `Stopping`, close stdin/send provider-specific cooperative close where applicable, wait bounded grace, request console/process close when safe, wait again, terminate the Job, then wait for `ACTIVE_PROCESS_ZERO`.
-- [ ] **Step 4: Keep Job/port/process handles alive** until zero-members confirmation. A timeout after forced termination becomes `Leaked` with PIDs/identities and blocks a success claim.
-- [ ] **Step 5: Make teardown idempotent** and merge concurrent close reasons. Full quit awaits all Task-owned and Host-owned supervisor futures before releasing the host lock.
-- [ ] **Step 6: Run** teardown tests and verify helper PIDs are absent; commit as `feat(process): add zero-member teardown`.
+- [ ] **Step 3: Preserve distinct shared ActionCatalog entries:** foreground interrupt, terminal close, and terminate managed tree remain separate commands. Task/full-host close first calls the Phase 2 admission barrier; only the winning operation schedules cleanup.
+- [ ] **Step 4: Implement teardown stages in dependency order:** cancel/drain terminal writers and supervisor jobs; send provider-specific cooperative close/close stdin where applicable; wait bounded grace; request console/process close when safe; wait again; terminate each Job; wait for `ACTIVE_PROCESS_ZERO`; detach listeners/PTY handles; reconcile ports; persist branch reports; settle the close operation.
+- [ ] **Step 5: Run independent resource branches through a fixed-size executor** (default four, configurable only in tests), not one unbounded future per process. Preserve deterministic settlement ordering by resource ID even when branches complete concurrently.
+- [ ] **Step 6: Keep Job/port/process handles alive** until zero-members confirmation. A timeout after forced termination becomes `CleanupFailed`/`Leaked` with Task/resource, Job name, PID plus creation time, executable/command label, last lifecycle event, and attempted stages; it blocks `Closed`.
+- [ ] **Step 7: Make teardown idempotent** and merge concurrent close reasons onto the original OperationId. Full quit awaits all Task-owned and Host-owned reports before releasing the host lock.
+- [ ] **Step 8: Run** teardown tests and verify helper PIDs are absent; commit as `feat(process): add admission first zero member teardown`.
 
 ### Task 3.8: Report complete process trees and Task Manager-style CPU
 
@@ -216,8 +219,9 @@ tree_cpu = sum(unique Job-member deltas once per process identity)
 - [ ] **Step 2: Create a red soak assertion** that checks Job member count, host handles, terminal sequences, and exact helper identities after 100 launch/write/resize/detach/reattach/close cycles.
 - [ ] **Step 3: Implement `Invoke-ProcessSoak.ps1`** around the real host/client binaries and Phase 0 production guards. Randomize client disconnects and task-close timing with a recorded seed.
 - [ ] **Step 4: Require at the end:** zero Job members, zero helper/provider children, zero owned listeners, no named pipes except the active host pipe before full quit, no leaked PTY handles, and bounded host memory/handle growth.
-- [ ] **Step 5: Update the deletion ledger** for every old process/terminal ownership path now superseded; do not delete them until parity/cutover gates say so.
-- [ ] **Step 6: Run** the soak and all focused tests; commit as `test(process): prove terminal tree cleanup under stress`.
+- [ ] **Step 5: Run shared conformance baseline/variant cases** for launch-to-first-output, input acknowledgement, stop/close settlement latency, task-switch input fencing, process/port residue, CPU denominator, and terminal resync. Record only sanitized commands/helper identities and declared metrics.
+- [ ] **Step 6: Update the deletion ledger** for every old process/terminal ownership path now superseded; do not delete them until parity/cutover gates say so.
+- [ ] **Step 7: Run** the soak and all focused tests; commit as `test(process): prove terminal tree cleanup under stress`.
 
 ## Phase 3 verification gate
 
@@ -228,6 +232,7 @@ tree_cpu = sum(unique Job-member deltas once per process identity)
 - [ ] Run the committed ANSI/VT/Unicode/OSC/clipboard/scrollback corpus and record PTY-byte-to-grid latency plus long-scrollback memory against `docs/performance-budgets.md`.
 - [ ] Compare controlled CPU helper output with Task Manager and retain evidence of logical processor count, interval, raw core equivalent, and displayed percentage.
 - [ ] Inspect every managed Job after close and require active process count zero.
+- [ ] Rebuild the conformance query index and compare process/terminal baseline/variant arms; no dashboard-specific metric may appear without a case definition.
 - [ ] Confirm externally occupied test ports were never assigned, signaled, or closed.
 - [ ] Confirm no Cargo, rustc, test harness, helper, development provider, browser helper, or host remains.
 - [ ] Compare production hashes and installed PID/start time; review the complete Phase 3 diff/deletion ledger.
@@ -237,6 +242,6 @@ tree_cpu = sum(unique Job-member deltas once per process identity)
 - Every managed root is assigned to its owner Job before execution and every descendant remains accounted for.
 - The host owns one PTY read and canonical grid per terminal; clients reproduce it through snapshots/deltas.
 - Switching tasks or views cannot turn a navigation click into terminal/provider input.
-- Closing a task/full host yields Job `ACTIVE_PROCESS_ZERO`; any failure is explicit and evidence-rich.
+- Closing a task/full host rejects new work first, performs bounded idempotent teardown, yields Job `ACTIVE_PROCESS_ZERO`, and reports any residue without claiming `Closed`.
 - CPU and memory totals cover unique complete process trees, and default CPU matches whole-machine Task Manager math.
 - Managed/external port state is accurate without adding hot-path enumeration or affecting external processes.

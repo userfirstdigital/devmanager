@@ -4,7 +4,7 @@
 
 **Goal:** Replace the terminal-tab-centric desktop with a polished native GPUI Task Cockpit whose default surface is a semantic conversation, while retaining a first-class raw terminal and making every task's files, changes, browser, services, artifacts, and review state immediately reachable.
 
-**Architecture:** `devmanager-next` renders an immutable client projection supplied by `HostClient`; UI actions issue typed commands and never mutate kernel/runtime truth directly. A small tokenized component system built on pinned GPUI/gpui-component primitives supports dark/light themes, density, keyboard navigation, contrast, and deterministic preview fixtures. The shell has a Task Inbox, task header, central timeline/composer, and one context dock—no arbitrary pane canvas and no embedded web UI.
+**Architecture:** `devmanager-next` renders an immutable client projection supplied by `HostClient`; UI actions issue typed commands and never mutate kernel/runtime truth directly. A small tokenized component system built on pinned GPUI/gpui-component primitives supports dark/light themes, density, keyboard navigation, contrast, and deterministic preview fixtures. The central timeline uses one provider-neutral semantic renderer registry plus a safe generic fallback; Rust contracts/golden fixtures remain authoritative for later Connect web renderers. The shell has a Task Inbox, task header, central timeline/composer, and one context dock—no arbitrary pane canvas and no embedded web UI.
 
 **Tech Stack:** GPUI 0.2.2, gpui-component 0.5.1 pinned exactly, Rust, existing terminal renderer, Markdown/code rendering using audited native crates, Windows screenshot/accessibility tooling.
 
@@ -20,6 +20,8 @@
 - Every action is defined once in `client::action::ActionCatalog`; GPUI contributes presentation bindings/shortcuts and the command palette shows disabled reasons from capabilities/current state.
 - Navigation clicks are consumed and focus epochs from Phase 3 prevent click-through into questions, approvals, or terminal mouse reporting.
 - Provider text, Markdown, tool labels, paths, URLs, terminal titles/links, browser titles, and remote display names are untrusted input: bound them, sanitize them, never execute embedded markup, and require confirmation for external links/actions.
+- Unknown or malformed optional provider events render a bounded generic card with source/type/schema/status/redacted details. They never disappear, crash the Task, or become an approval/question/settlement/task transition.
+- Renderer semantics live in Rust protocol/domain fixtures. TypeScript clients consume generated or fixture-verified decoders rather than redefining event meaning by hand.
 - UI preview/visual tests use only the isolated `native-next-dev` host/profile and never attach to the installed app.
 
 ---
@@ -35,6 +37,7 @@
 - Create: `src/ui/components/{button,icon_button,badge,status_light,text_field,menu,tooltip,dialog,toast,splitter,virtual_list,empty_state,error_boundary}.rs`
 - Create: `src/ui/task_cockpit/mod.rs`
 - Create: `src/ui/task_cockpit/{inbox,header,timeline,message,tool_card,question,approval,composer,context_dock,terminal_panel}.rs`
+- Create: `src/ui/renderers/{mod,registry,generic,message,tool,question,approval,operation,plan,artifact,agent}.rs`
 - Create: `src/ui/command_center/mod.rs`
 - Create: `src/ui/configuration/mod.rs`
 - Modify: `src/bin/devmanager-next.rs`
@@ -48,6 +51,8 @@
 - Create: `tests/ui_projection.rs`
 - Create: `tests/ui_focus.rs`
 - Create: `tests/ui_accessibility.rs`
+- Create: `tests/renderer_registry.rs`
+- Create: `tests/fixtures/semantic/v1/*`
 - Create: `tests/fixtures/ui/*.json`
 - Create: `scripts/native-next/Capture-UiPreviews.ps1`
 - Create: `docs/ui/task-cockpit.md`
@@ -107,7 +112,7 @@
 
 **Files:** `src/ui/task_cockpit/inbox.rs`, `src/client/model.rs`, `tests/ui_projection.rs`, `tests/fixtures/ui/task-inbox.json`
 
-- [ ] **Step 1: Write failing projection tests** for Needs Me/Running/Ready/Recent sections, archived-task search, disconnected/failed/approval/answer/working/settling/ready/idle precedence, Primary provider icon, unread semantic event count, external service status, long project names, missing provider, and 5,000 virtualized tasks.
+- [ ] **Step 1: Write failing projection tests** for Needs Me/Running/Ready/Recent sections, archived-task search, disconnected/failed/uncertain-outcome/approval/answer/working/settling/ready/idle precedence, Primary provider icon, unread semantic event count, external service status, long project names, missing provider, and 5,000 virtualized tasks.
 - [ ] **Step 2: Run** `cargo test --test ui_projection inbox_ -- --nocapture` and save the red result.
 - [ ] **Step 3: Derive `TaskRowModel`** entirely from the separate lifecycle/connectivity/attention/activity/review axes plus client-local unread cursor. Sections are Needs Me, Running, Ready, and Recent; Archived is reachable through search/history. Sorting is deterministic within a section: recent activity, title, TaskId.
 - [ ] **Step 4: Render compact rows** with title, project/worktree, Primary/provider state, one semantic status, and optional resource indicators. Do not expose verbose ownership language or terminal IDs in normal rows.
@@ -125,17 +130,41 @@
 - [ ] **Step 5: Use whole-machine `0..=100` CPU** in normal UI. Put raw core-equivalent percentage behind a diagnostics disclosure with explicit label.
 - [ ] **Step 6: Use responsive priority rules** to collapse labels into accessible icon/menu items without clipping; commit as `feat(ui): add truthful task header and top bar`.
 
-### Task 5.7: Render a virtualized semantic timeline
+### Task 5.7: Build the semantic renderer registry and virtualized timeline
 
-**Files:** `src/ui/task_cockpit/{timeline,message,tool_card,question,approval}.rs`, `src/client/model.rs`, `tests/{ui_projection,ui_accessibility}.rs`, `tests/fixtures/ui/timeline-*.json`
+**Files:** `src/ui/renderers/{mod,registry,generic,message,tool,question,approval,operation,plan,artifact,agent}.rs`, `src/ui/task_cockpit/{timeline,message,tool_card,question,approval}.rs`, `src/client/model.rs`, `tests/{renderer_registry,ui_projection,ui_accessibility}.rs`, `tests/fixtures/semantic/v1/*`, `tests/fixtures/ui/timeline-*.json`
 
-- [ ] **Step 1: Write failing tests** for user/assistant Markdown, code blocks, tool calls/results, progress, plans, errors, question choices, approvals, specialist lineage, artifacts, unknown extension events, 20,000 events, streaming updates, and anchored scroll.
-- [ ] **Step 2: Run** `cargo test --test ui_projection timeline_ -- --nocapture` and save the red output.
-- [ ] **Step 3: Convert journal events into stable `TimelineItemModel`s** keyed by event ID; group only by explicit turn/tool relationships. Unknown types render a safe diagnostic card and never disappear silently.
-- [ ] **Step 4: Render Markdown/code natively** with bounded parsing, selectable/copyable text, wrapped prose, horizontally scrollable code, link confirmation, and no HTML execution.
-- [ ] **Step 5: Virtualize variable-height items** while preserving the visible anchor when earlier events load or streaming items grow. Auto-follow only when the user is at the bottom; show a `Jump to latest` control otherwise.
-- [ ] **Step 6: Make questions/approvals explicit controls** with question/approval IDs and first-answer-wins receipts. Switching into the task never activates a choice.
-- [ ] **Step 7: Capture fixtures for all states/themes/scales**, measure update latency and memory, and commit as `feat(ui): add semantic task timeline`.
+- [ ] **Step 1: Write failing tests** for user/assistant Markdown, code blocks, tool calls/results, progress, plans, errors, operation pending/success/failure/cancellation/uncertainty, question choices, approvals, specialist lineage, artifacts, known renderer registration, duplicate kind rejection, unknown extension events, malformed known events, bounded generic payload, Rust semantic golden fixtures, 20,000 events, streaming updates, and anchored scroll.
+- [ ] **Step 2: Run** `cargo test --test renderer_registry --test ui_projection timeline_ -- --nocapture` and save the red output.
+- [ ] **Step 3: Define the registry boundary**
+
+```rust
+pub trait SemanticRenderer: Send + Sync {
+    fn kind(&self) -> SemanticKind;
+    fn project(&self, event: &SemanticEvent) -> Result<TimelineItemModel, RenderModelError>;
+}
+
+pub struct GenericSemanticCard {
+    pub event_id: EventId,
+    pub provider: ProviderKind,
+    pub source_type: String,
+    pub schema_version: u16,
+    pub status: GenericStatus,
+    pub title: String,
+    pub redacted_fields: Vec<(String, String)>,
+    pub raw_terminal_available: bool,
+}
+```
+
+Register exactly one specialized renderer for known message/tool/question/approval/operation/plan/artifact/agent kinds. Convert journal events into stable `TimelineItemModel`s keyed by event ID and group only by explicit turn/tool relationships.
+- [ ] **Step 4: Route unknown/malformed optional events through `GenericSemanticCard`.** Limit title to 160 Unicode scalar values, 32 fields, keys to 64, values to 512, and total encoded card data to 16 KiB. Never expose secret-class fields or interpret generic data as an interactive control/domain transition. Always offer the same-generation raw terminal when available.
+- [ ] **Step 5: Render `OperationUncertain` as a known Needs Me warning**, not as success, ordinary failure, or generic data. Show the operation/effect evidence and an inspect/reconcile path; any explicit new attempt warns that the earlier effect may already have happened and creates a new CommandId. Never provide an implicit resend.
+- [ ] **Step 6: Render Markdown/code natively** with bounded parsing, selectable/copyable text, wrapped prose, horizontally scrollable code, link confirmation, and no HTML execution.
+- [ ] **Step 7: Virtualize variable-height items** while preserving the visible anchor when earlier events load or streaming items grow. Auto-follow only when the user is at the bottom; show a `Jump to latest` control otherwise.
+- [ ] **Step 8: Make questions/approvals explicit controls** with request ID, action epoch, runtime generation, capability, and first-answer-wins settlement. Switching into the task never activates a choice.
+- [ ] **Step 9: Generate/verify cross-client semantic fixtures** from the Rust schema and make a fixture check fail if a later TypeScript decoder changes a discriminant or interactive meaning by hand.
+- [ ] **Step 10: Run shared conformance baseline/variant arms** across every known, unknown, and malformed semantic fixture. Record renderer selection, generic fallback, interaction eligibility, update latency, and bounded output size; never record raw provider content or score model output.
+- [ ] **Step 11: Capture fixtures for all states/themes/scales**, measure update latency and memory, and commit as `feat(ui): add shared semantic renderer registry`.
 
 ### Task 5.8: Build the composer, attachments, and turn-mode controls
 
@@ -175,12 +204,14 @@
 ## Phase 5 verification gate
 
 - [ ] Capture production baseline and start only `devmanager-next`/isolated host with `native-next-dev`.
-- [ ] Run `cargo test --test ui_tokens --test ui_actions --test ui_projection --test ui_focus --test ui_accessibility -- --nocapture`.
+- [ ] Run `cargo test --test ui_tokens --test ui_actions --test renderer_registry --test ui_projection --test ui_focus --test ui_accessibility -- --nocapture`.
 - [ ] Run `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`.
 - [ ] Run `pwsh scripts/native-next/Capture-UiPreviews.ps1 -AllFixtures -AllThemes -AllScales` and visually inspect every generated image.
 - [ ] Perform keyboard-only and 200% Windows-scale walkthrough of Task Inbox, timeline, question, approval, composer, dock, terminal, menus, and dialogs.
 - [ ] Record performance traces for large inbox/timeline and prove no OS/filesystem/network probe occurs on UI paint/input threads.
 - [ ] Switch semantic/raw views 100 times and assert provider process count and PTY reader count never change.
+- [ ] Feed every known/unknown/malformed semantic fixture through the registry and verify GPUI meaning matches the Rust golden contract; generic fallback must remain bounded and non-interactive.
+- [ ] Rebuild the conformance query index and compare semantic-renderer baseline/variant arms.
 - [ ] Confirm all preview/client/host/test processes are closed; compare production hashes and installed PID/start time.
 - [ ] Review the Phase 5 diff and deletion ledger.
 
@@ -188,6 +219,7 @@
 
 - The native desktop reads as a Task Cockpit rather than a pile of terminals and remains usable at all approved sizes/scales/themes.
 - Semantic conversation is the default, raw terminal is one click/shortcut away, and both views share one live provider session.
+- Known semantic events use specialized accessible renderers; unknown/malformed optional events remain visible through a bounded safe generic card and never invent task state.
 - Task navigation, questions, approvals, and terminal input cannot receive click-through.
 - Every operation is reachable by mouse and keyboard, has an accessible name/state, and uses contrast-compliant tokens.
 - Large task/timeline fixtures meet the defined latency/idle budgets without hot-path probes.
