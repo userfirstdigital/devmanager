@@ -1,0 +1,510 @@
+# Phase 0: Isolation and Baseline Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Establish a fail-closed replacement-development environment and reproducible evidence proving that builds, tests, preview binaries, browsers, ports, and cleanup cannot touch the installed DevManager.
+
+**Architecture:** All replacement work runs from `.worktrees/native-gpui-kernel` on `codex/native-gpui-kernel`, with the explicit profile `native-next-dev`, instance label `Next`, dedicated target/live directories, and ignored evidence files. Shared PowerShell guards capture and compare production hashes and process identity around every risky gate; Rust path resolution remains fail-closed in tests.
+
+**Tech Stack:** PowerShell 7, Rust 1.94.0, existing `dirs`/persistence code, Windows CIM/process APIs, SHA-256, Git worktrees.
+
+## Global Constraints
+
+- Do not start, stop, restart, install over, attach a debugger to, or send input to the installed DevManager.
+- Production storage is the unprofiled `%APPDATA%\com.userfirst.devmanager` tree; tests must never resolve beneath it.
+- `config.json` and `remote.json` hashes plus installed PID/start time are the protected invariants. `session.json` is observed only as a path and never read or hashed because the installed app may legitimately update it.
+- Use `DEVMANAGER_PROFILE=native-next-dev` and `DEVMANAGER_INSTANCE_LABEL=Next` for every replacement binary.
+- Use `target-native-next` and `target-live-native-next`; never copy a development executable into the installed location.
+- Full Rust library verification remains `cargo test --lib -- --test-threads=1` and must be announced before execution.
+- Every script fails closed on unresolved paths, ambiguous executable identity, malformed evidence, or missing expected profile variables.
+- This phase changes development tooling and path policy only; it does not introduce the new kernel or launch provider/browser work.
+
+---
+
+## Phase entry
+
+- Design commit `01812eb` is present.
+- Main worktree is clean except for committed plan documents.
+- Use `superpowers:using-git-worktrees` to create `.worktrees/native-gpui-kernel` on `codex/native-gpui-kernel`.
+- Record `git worktree list --porcelain` before and after creation.
+
+## File map
+
+- Create: `src/config/mod.rs` — replacement configuration namespace.
+- Create: `src/config/paths.rs` — profile parsing and resolved storage/build identity.
+- Modify: `src/lib.rs` — export `config`.
+- Modify: `src/persistence/mod.rs` — delegate path calculation to `config::paths` without changing production behavior.
+- Create: `tests/development_isolation.rs` — path/profile fail-closed contract.
+- Create: `scripts/native-next/Isolation.ps1` — shared path, process, hash, and evidence functions.
+- Create: `scripts/native-next/Capture-ProductionBaseline.ps1` — read-only baseline JSON.
+- Create: `scripts/native-next/Assert-ProductionUnchanged.ps1` — fail-closed comparator.
+- Create: `scripts/native-next/Start-NativeNext.ps1` — isolated build/copy/start launcher.
+- Create: `scripts/native-next/Stop-NativeNext.ps1` — terminate only exact development executable paths and descendants.
+- Create: `scripts/native-next/Invoke-PhaseGate.ps1` — announced command execution plus before/after evidence and cleanup.
+- Create: `scripts/native-next/Capture-PerformanceBaseline.ps1` — read-only machine/installed idle and isolated cold-start baseline.
+- Create: `docs/replacement-deletion-ledger.md` — old-path ownership and deletion criteria.
+- Create: `docs/performance-budgets.md` — stable measurement definitions and initial acceptance budgets.
+- Modify: `.gitignore` — ignore development output/evidence.
+- Modify: `AGENTS.md` — make the replacement isolation command authoritative.
+
+### Task 0.1: Introduce one typed profile/path contract
+
+**Files:**
+- Create: `src/config/mod.rs`
+- Create: `src/config/paths.rs`
+- Modify: `src/lib.rs`
+- Modify: `src/persistence/mod.rs`
+- Test: `tests/development_isolation.rs`
+
+**Interfaces:**
+- Produces: `AppProfile`, `ResolvedAppPaths`, `resolve_app_paths(base, profile, build_kind)`.
+- Preserves: unprofiled production path and current named-profile path spelling.
+- Consumed by: every later binary, database, browser profile, log, and evidence location.
+
+- [ ] **Step 1: Write the failing path contract tests**
+
+```rust
+use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind};
+
+#[test]
+fn native_next_profile_cannot_alias_production() {
+    let base = std::path::Path::new(r"C:\Users\tester\AppData\Roaming");
+    let production = resolve_app_paths(base, AppProfile::Production, BuildKind::Release).unwrap();
+    let next = resolve_app_paths(
+        base,
+        AppProfile::named("native-next-dev").unwrap(),
+        BuildKind::Debug,
+    )
+    .unwrap();
+
+    assert_eq!(production.root, base.join("com.userfirst.devmanager"));
+    assert_eq!(next.root, base.join("com.userfirst.devmanager-native-next-dev"));
+    assert!(!next.root.starts_with(&production.root));
+    assert_eq!(next.database, next.root.join("kernel.sqlite3"));
+    assert_eq!(next.browser_root, next.root.join("browser"));
+}
+
+#[test]
+fn named_profile_rejects_empty_or_path_shaped_values() {
+    for invalid in ["", "..", r"a\b", "a/b", "native next"] {
+        assert!(AppProfile::named(invalid).is_err(), "accepted {invalid:?}");
+    }
+}
+```
+
+- [ ] **Step 2: Run the focused test and observe the intended failure**
+
+Run: `cargo test --test development_isolation -- --test-threads=1`
+
+Expected: compilation fails because `devmanager::config::paths` does not exist.
+
+- [ ] **Step 3: Implement the typed path contract**
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppProfile {
+    Production,
+    Named(String),
+    UnitTest(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildKind {
+    Debug,
+    Release,
+    Test,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAppPaths {
+    pub root: std::path::PathBuf,
+    pub config: std::path::PathBuf,
+    pub remote: std::path::PathBuf,
+    pub database: std::path::PathBuf,
+    pub browser_root: std::path::PathBuf,
+    pub logs: std::path::PathBuf,
+}
+```
+
+`AppProfile::named` accepts only ASCII alphanumeric characters, `-`, and `_`, lowercases them, and rejects rather than rewrites every other character. `resolve_app_paths` must assert that `BuildKind::Test` receives `UnitTest`, and that `Debug` never receives `Production` unless the caller passes an explicit `allow_production_debug` test-only seam unavailable to normal binaries.
+
+Update `persistence::app_config_dir()` to call this contract. Preserve the current production/named directory names exactly.
+
+- [ ] **Step 4: Run focused and persistence tests**
+
+Run:
+
+```powershell
+cargo test --test development_isolation -- --test-threads=1
+cargo test --lib persistence:: -- --test-threads=1
+```
+
+Expected: both commands pass; test paths are beneath a process-unique temp root.
+
+- [ ] **Step 5: Review and commit**
+
+```powershell
+git diff --check
+git add src/config src/lib.rs src/persistence/mod.rs tests/development_isolation.rs
+git commit -m "refactor: centralize isolated app paths"
+```
+
+### Task 0.2: Add read-only production baseline and comparison scripts
+
+**Files:**
+- Create: `scripts/native-next/Isolation.ps1`
+- Create: `scripts/native-next/Capture-ProductionBaseline.ps1`
+- Create: `scripts/native-next/Assert-ProductionUnchanged.ps1`
+- Test: `tests/development_isolation.rs`
+
+**Interfaces:**
+- Produces: `.devmanager-next/evidence/current/baseline.json`.
+- Produces: `Get-DevManagerProductionState`, `Write-DevManagerBaseline`, `Assert-DevManagerProductionState`.
+- Consumes: exact production root from `dirs`-equivalent Windows Roaming AppData and exact installed executable path discovered through CIM.
+
+- [ ] **Step 1: Add a failing script-contract test**
+
+```rust
+#[test]
+fn isolation_scripts_protect_only_the_unprofiled_installation() {
+    let library = std::fs::read_to_string("scripts/native-next/Isolation.ps1").unwrap();
+    assert!(library.contains("Get-DevManagerProductionState"));
+    assert!(library.contains("config.json"));
+    assert!(library.contains("remote.json"));
+    assert!(!library.contains("Get-FileHash $sessionPath"));
+    assert!(library.contains("Win32_Process"));
+    assert!(library.contains("CreationDate"));
+}
+```
+
+- [ ] **Step 2: Run the test and confirm it fails because the script is absent**
+
+Run: `cargo test --test development_isolation isolation_scripts_protect_only_the_unprofiled_installation -- --exact`
+
+- [ ] **Step 3: Implement the scripts with fail-closed JSON evidence**
+
+`Get-DevManagerProductionState` returns this exact shape:
+
+```powershell
+[pscustomobject]@{
+    schemaVersion = 1
+    capturedAtUtc = [DateTime]::UtcNow.ToString("o")
+    productionRoot = $productionRoot
+    config = Get-ProtectedFileState -LiteralPath (Join-Path $productionRoot "config.json")
+    remote = Get-ProtectedFileState -LiteralPath (Join-Path $productionRoot "remote.json")
+    sessionPath = Join-Path $productionRoot "session.json"
+    installedProcesses = @($installedProcesses | ForEach-Object {
+        [pscustomobject]@{
+            processId = [uint32]$_.ProcessId
+            executablePath = [string]$_.ExecutablePath
+            creationDate = [string]$_.CreationDate
+        }
+    })
+}
+```
+
+`Get-ProtectedFileState` records `exists`, `length`, and SHA-256 when present. It never reads `session.json`. Installed process matching must compare resolved executable paths against Windows installed locations, never process name alone. Comparison fails on any hash, PID/start-time, ambiguity, missing baseline field, or root mismatch.
+
+- [ ] **Step 4: Exercise the scripts without mutating production**
+
+Run:
+
+```powershell
+pwsh -NoProfile -File scripts/native-next/Capture-ProductionBaseline.ps1 -OutputPath .devmanager-next/evidence/current/baseline.json
+pwsh -NoProfile -File scripts/native-next/Assert-ProductionUnchanged.ps1 -BaselinePath .devmanager-next/evidence/current/baseline.json
+cargo test --test development_isolation isolation_scripts_protect_only_the_unprofiled_installation -- --exact
+```
+
+Expected: baseline capture reports the protected paths; comparison passes immediately; Rust contract test passes.
+
+- [ ] **Step 5: Review and commit**
+
+```powershell
+git add scripts/native-next tests/development_isolation.rs
+git commit -m "chore: guard installed DevManager during development"
+```
+
+### Task 0.3: Add the isolated build/start/stop launcher
+
+**Files:**
+- Create: `scripts/native-next/Start-NativeNext.ps1`
+- Create: `scripts/native-next/Stop-NativeNext.ps1`
+- Modify: `.gitignore`
+- Test: `tests/development_isolation.rs`
+
+**Interfaces:**
+- Produces: development binaries only beneath `target-native-next` and `target-live-native-next`.
+- Sets: `DEVMANAGER_PROFILE=native-next-dev`, `DEVMANAGER_INSTANCE_LABEL=Next`, `DEVMANAGER_RUNTIME_KIND=native-next`.
+- Stop authority: executable path under the resolved worktree's `target-live-native-next`; never process name alone.
+
+- [ ] **Step 1: Add failing launcher contract tests**
+
+```rust
+#[test]
+fn next_launcher_uses_an_explicit_profile_and_private_targets() {
+    let source = std::fs::read_to_string("scripts/native-next/Start-NativeNext.ps1").unwrap();
+    for required in [
+        "native-next-dev",
+        "target-native-next",
+        "target-live-native-next",
+        "DEVMANAGER_INSTANCE_LABEL",
+        "Capture-ProductionBaseline.ps1",
+        "Assert-ProductionUnchanged.ps1",
+    ] {
+        assert!(source.contains(required), "missing {required}");
+    }
+    assert!(!source.contains("Stop-Process -Name"));
+}
+```
+
+- [ ] **Step 2: Run the focused test and observe the absent-script failure**
+
+Run: `cargo test --test development_isolation next_launcher_uses_an_explicit_profile_and_private_targets -- --exact`
+
+- [ ] **Step 3: Implement exact-path launch and stop behavior**
+
+`Start-NativeNext.ps1` must:
+
+1. Capture the production baseline.
+2. Build `--bin devmanager-next` and `--bin devmanager-host` into `target-native-next`.
+3. Copy only those build artifacts and PDBs to `target-live-native-next` after exact-path stale-process cleanup.
+4. Set the three required environment variables on both processes.
+5. Launch the host hidden, wait for its readiness command, then launch the desktop.
+6. Record both exact executable paths and process identities beneath `.devmanager-next/runtime.json`.
+7. Compare production state before returning.
+
+Until the binaries exist in Phase 2/5, `-ValidateOnly` performs steps 1, path validation, environment construction, and comparison without building or starting anything.
+
+`Stop-NativeNext.ps1` reads `runtime.json`, verifies each resolved executable remains inside this worktree's live directory, terminates the development desktop first, requests host shutdown when available, escalates only against recorded development PIDs, verifies zero descendants, and removes only the runtime evidence file.
+
+- [ ] **Step 4: Validate without launching binaries**
+
+Run:
+
+```powershell
+pwsh -NoProfile -File scripts/native-next/Start-NativeNext.ps1 -ValidateOnly
+pwsh -NoProfile -File scripts/native-next/Stop-NativeNext.ps1 -ValidateOnly
+cargo test --test development_isolation next_launcher_uses_an_explicit_profile_and_private_targets -- --exact
+```
+
+Expected: all pass; no process is started.
+
+- [ ] **Step 5: Review and commit**
+
+```powershell
+git add .gitignore scripts/native-next tests/development_isolation.rs
+git commit -m "chore: add isolated native-next launcher"
+```
+
+### Task 0.4: Add one guarded phase-gate runner
+
+**Files:**
+- Create: `scripts/native-next/Invoke-PhaseGate.ps1`
+- Modify: `scripts/native-next/Isolation.ps1`
+- Test: `tests/development_isolation.rs`
+
+**Interfaces:**
+- Produces: phase evidence with command, arguments, exit code, duration, before/after process inventories, and cleanup result.
+- Accepts: `-Phase`, `-Command`, `-Arguments`, `-LongRustRun`, `-AllowDevelopmentProcesses`.
+- Never accepts a production profile or broad kill target.
+
+- [ ] **Step 1: Write the failing gate contract test**
+
+```rust
+#[test]
+fn phase_gate_wraps_commands_with_baseline_and_cleanup_checks() {
+    let source = std::fs::read_to_string("scripts/native-next/Invoke-PhaseGate.ps1").unwrap();
+    for required in [
+        "Capture-ProductionBaseline.ps1",
+        "Assert-ProductionUnchanged.ps1",
+        "processes-before.json",
+        "processes-after.json",
+        "verification.json",
+        "LongRustRun",
+    ] {
+        assert!(source.contains(required), "missing {required}");
+    }
+}
+```
+
+- [ ] **Step 2: Run the test and observe the expected failure**
+
+Run: `cargo test --test development_isolation phase_gate_wraps_commands_with_baseline_and_cleanup_checks -- --exact`
+
+- [ ] **Step 3: Implement the phase wrapper**
+
+The wrapper captures a baseline, prints an explicit warning before `-LongRustRun`, executes one command through `System.Diagnostics.ProcessStartInfo` without a second shell, records the exit code and elapsed milliseconds, waits for Cargo/rustc/test executables whose paths belong to the worktree, runs exact-path development cleanup, compares production state, writes `verification.json`, and exits with the original nonzero result or any guard failure.
+
+- [ ] **Step 4: Self-test the wrapper with a harmless command**
+
+Run:
+
+```powershell
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-self-test -Command pwsh -Arguments @('-NoProfile','-Command','exit 0')
+cargo test --test development_isolation phase_gate_wraps_commands_with_baseline_and_cleanup_checks -- --exact
+```
+
+Expected: the command exits 0, evidence files are written, production comparison passes, and process-after evidence has no disposable development processes.
+
+- [ ] **Step 5: Review and commit**
+
+```powershell
+git add scripts/native-next tests/development_isolation.rs
+git commit -m "chore: add guarded phase verification"
+```
+
+### Task 0.5: Capture the replacement inventory and deletion ledger
+
+**Files:**
+- Create: `docs/replacement-deletion-ledger.md`
+- Modify: `AGENTS.md`
+
+**Interfaces:**
+- Produces: one list of current source owners, replacement phase, temporary seam, and deletion proof.
+- Consumed by: Phase 10; every temporary re-export added later must be appended in its creating commit.
+
+- [ ] **Step 1: Generate a read-only current inventory**
+
+Run:
+
+```powershell
+rg --files src tests web zz-archive | Sort-Object | Set-Content .devmanager-next/evidence/phase-00/source-files.txt
+Get-ChildItem src -Recurse -Filter *.rs | Sort-Object Length -Descending | Select-Object FullName,Length | ConvertTo-Json | Set-Content .devmanager-next/evidence/phase-00/rust-file-sizes.json
+```
+
+Expected: ignored evidence identifies the largest coupled files without modifying them.
+
+- [ ] **Step 2: Write the ledger with these mandatory owners**
+
+```markdown
+| Current path | Current responsibility | Replacement phase | Delete only after |
+|---|---|---:|---|
+| `src/app/mod.rs` | Window, orchestration, UI, background polling | 2–9 | New GPUI client passes full feature gate |
+| `src/services/process_manager.rs` | PTY/provider/server/process monolith | 3–7 | Host services pass zero-orphan gate |
+| `src/state/` | Tab/runtime read models | 1–6 | Task projections serve all clients |
+| `src/models/SessionState` | Old open-tab persistence | 1, 10 | New host proves empty-start behavior |
+| `src/remote/mod.rs` old snapshot bridge | Window-owned remote authority | 2, 8 | Connect protocol/realtime gate passes |
+| `src/remote/web/bridge.rs` old bridge | Old web mutation/snapshot transport | 8 | New web client passes reconnect gate |
+| `src/sidebar/` | Old GPUI navigation | 5 | Task navigation/configuration passes UI gate |
+| `src/workspace/editor_ui.rs` | Old form primitives | 5–6 | New semantic components cover configuration |
+| `tests/legacy_loader.rs` | Old config/session migration | 10 | Supported config/remote tests pass without session reader |
+| `tests/fixtures/legacy-session.json` | Old tab-state fixture | 10 | Empty task DB cutover test passes |
+| `zz-archive/tauri-react-v0.1.11` | Archived old desktop | 10 | Release docs no longer reference it |
+```
+
+Also list every old browser/UI/provider compatibility seam discovered by `rg -n "legacy|compat|migrate|SessionState|RemoteWorkspaceSnapshot" src tests`.
+
+- [ ] **Step 3: Strengthen `AGENTS.md` with the exact replacement gate command**
+
+Add one consolidated project rule: all native-kernel implementation and verification uses `scripts/native-next/Invoke-PhaseGate.ps1`; direct long/full Rust runs are prohibited for this program because the wrapper owns production evidence and cleanup.
+
+- [ ] **Step 4: Review the ledger against the approved specification**
+
+Run:
+
+```powershell
+rg -n "src/app/mod.rs|process_manager.rs|session.json|remote.json|zz-archive" docs/replacement-deletion-ledger.md
+git diff --check
+```
+
+Expected: every mandatory owner appears and the diff is clean.
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add docs/replacement-deletion-ledger.md AGENTS.md
+git commit -m "docs: define replacement isolation and deletion gates"
+```
+
+### Task 0.6: Capture the performance reference and measurement contract
+
+**Files:**
+- Create: `scripts/native-next/Capture-PerformanceBaseline.ps1`
+- Create: `docs/performance-budgets.md`
+- Modify: `tests/development_isolation.rs`
+
+**Interfaces:**
+- Produces ignored `performance.json` with reference hardware, idle samples, and isolated cold-start measurements.
+- Produces committed metric definitions/budgets used unchanged by Phases 3, 5, 7, 8, and 10.
+- Never sends input, changes priority/affinity, opens configuration files, restarts the installed process, or launches against the production profile.
+
+- [ ] **Step 1: Write the failing safety/shape tests**
+
+Add `performance_baseline_is_read_only_and_profile_guarded` and `performance_budget_defines_every_program_metric`. Assert the script exposes only `-InstalledReadOnly`, `-IsolatedColdStart`, `-DurationSeconds`, and `-EvidenceDirectory`; the isolated mode requires `native-next-dev`; the installed mode contains no stop/kill/input/window-message/file-content operations.
+
+- [ ] **Step 2: Run and observe the expected failure**
+
+```powershell
+cargo test --test development_isolation performance_ -- --nocapture
+```
+
+Expected: missing script/budget contract.
+
+- [ ] **Step 3: Implement read-only measurement**
+
+Record Windows/build, CPU model/logical processor count, physical memory, active display sizes/scales, sample interval, and monotonic timestamps. For an already-running installed DevManager, sample only cumulative CPU time, working/private bytes, handles, and threads for 120 seconds by PID plus creation time. For the isolated mode, use `Start-NativeNext.ps1`, measure process start to first responsive top-level window and host-ready handshake, then stop only the exact isolated executable tree.
+
+- [ ] **Step 4: Lock metric definitions and initial budgets**
+
+`docs/performance-budgets.md` defines input-to-paint, PTY-byte-to-grid, local/remote command acknowledgement, event propagation, cold/warm startup, task-open, idle CPU/memory, background wakeups, long-session growth, scrollback bounds, provider/browser process counts, 4K frame time, and slow-client isolation. Record baseline values only in ignored evidence; commit measurement methods, reference percentile/sample sizes, and the initial Phase 5/8 targets.
+
+- [ ] **Step 5: Run the baseline without disturbing production**
+
+```powershell
+pwsh -NoProfile -File scripts/native-next/Capture-PerformanceBaseline.ps1 -InstalledReadOnly -DurationSeconds 120 -EvidenceDirectory .devmanager-next/evidence/phase-00-performance
+pwsh -NoProfile -File scripts/native-next/Capture-PerformanceBaseline.ps1 -IsolatedColdStart -EvidenceDirectory .devmanager-next/evidence/phase-00-performance
+cargo test --test development_isolation performance_ -- --nocapture
+```
+
+Expected: the installed PID/start time remain unchanged, production files are unopened/unchanged, the isolated process is gone, and `performance.json` contains all metric keys plus availability/evidence rather than invented zeroes.
+
+- [ ] **Step 6: Commit**
+
+```powershell
+git add scripts/native-next/Capture-PerformanceBaseline.ps1 docs/performance-budgets.md tests/development_isolation.rs
+git commit -m "test: define replacement performance baseline"
+```
+
+### Task 0.7: Run the Phase 0 gate
+
+**Files:** none beyond ignored evidence.
+
+- [ ] **Step 1: Announce the long Rust verification and capture a fresh baseline**
+
+Use the wrapper so the user sees that Rust test executables will run and be cleaned up.
+
+- [ ] **Step 2: Run formatting and focused isolation tests**
+
+```powershell
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-fmt -Command cargo -Arguments @('fmt','--all','--','--check')
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-isolation -Command cargo -Arguments @('test','--test','development_isolation','--','--test-threads=1') -LongRustRun
+```
+
+- [ ] **Step 3: Run the complete library baseline serially**
+
+```powershell
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-lib -Command cargo -Arguments @('test','--lib','--','--test-threads=1') -LongRustRun
+```
+
+- [ ] **Step 4: Inspect evidence and repository state**
+
+Run:
+
+```powershell
+Get-Content .devmanager-next/evidence/phase-00-lib/verification.json
+Get-Content .devmanager-next/evidence/phase-00-lib/processes-after.json
+git status --short --branch
+```
+
+Expected: commands pass, production comparison is unchanged, no disposable process remains, and the worktree contains no uncommitted source changes.
+
+## Phase 0 exit gate
+
+- Named path tests prove `native-next-dev` cannot alias production.
+- Baseline/comparison scripts pass on the real machine without reading `session.json`.
+- `-ValidateOnly` launch/stop checks start no processes.
+- Guarded command evidence records exit codes and cleanup.
+- Deletion ledger covers every old architecture owner.
+- Performance measurement definitions and a read-only/isolated baseline are captured before replacement implementation.
+- Full serial library baseline is green or any pre-existing failure is recorded before Phase 1.
+- Installed DevManager PID/start time and production `config.json`/`remote.json` remain unchanged.
