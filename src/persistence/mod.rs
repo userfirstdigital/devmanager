@@ -34,6 +34,7 @@ impl Default for WorkspaceSnapshot {
 #[derive(Debug)]
 pub enum PersistenceError {
     ConfigDirectoryUnavailable,
+    InvalidAppProfile,
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -50,6 +51,12 @@ impl Display for PersistenceError {
             Self::ConfigDirectoryUnavailable => {
                 write!(f, "could not determine the user config directory")
             }
+            Self::InvalidAppProfile => {
+                write!(
+                    f,
+                    "DEVMANAGER_PROFILE is set to an invalid value; use ASCII letters, digits, '-' or '_'"
+                )
+            }
             Self::Io { path, source } => {
                 write!(f, "failed to read or write {}: {}", path.display(), source)
             }
@@ -63,7 +70,7 @@ impl Display for PersistenceError {
 impl Error for PersistenceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ConfigDirectoryUnavailable => None,
+            Self::ConfigDirectoryUnavailable | Self::InvalidAppProfile => None,
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
         }
@@ -75,13 +82,15 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 pub fn app_config_dir() -> Result<PathBuf> {
     #[cfg(test)]
     {
-        let path = app_config_dir_for(test_config_root(), configured_profile().as_deref());
+        let profile = configured_storage_profile()?;
+        let path = app_config_dir_for(test_config_root(), profile.as_deref());
         ensure_test_config_dir_is_isolated(path)
     }
     #[cfg(not(test))]
     {
+        let profile = configured_storage_profile()?.or_else(default_debug_profile);
         dirs::config_dir()
-            .map(|base| app_config_dir_for(&base, app_instance_profile().as_deref()))
+            .map(|base| app_config_dir_for(&base, profile.as_deref()))
             .ok_or(PersistenceError::ConfigDirectoryUnavailable)
     }
 }
@@ -107,6 +116,17 @@ pub fn runtime_session_scope() -> String {
 
 fn configured_profile() -> Option<String> {
     sanitize_scope_segment(std::env::var(APP_PROFILE_ENV).ok())
+}
+
+fn configured_storage_profile() -> Result<Option<String>> {
+    match std::env::var(APP_PROFILE_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(PersistenceError::InvalidAppProfile),
+        Ok(value) => match AppProfile::named(&value) {
+            Ok(AppProfile::Named(name)) => Ok(Some(name)),
+            _ => Err(PersistenceError::InvalidAppProfile),
+        },
+    }
 }
 
 fn default_debug_profile() -> Option<String> {
@@ -515,6 +535,44 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains("pairing-isolation")));
+    }
+
+    #[test]
+    fn invalid_explicit_profile_env_cannot_resolve_app_config_dir() {
+        let _profile = TestProfileEnvGuard::without_profile();
+
+        std::env::set_var(APP_PROFILE_ENV, "native next");
+        let aliased = app_config_dir();
+        assert!(
+            matches!(aliased, Err(PersistenceError::InvalidAppProfile)),
+            "space-containing profile must not alias to a normalized name: {aliased:?}"
+        );
+        if let Ok(path) = &aliased {
+            assert!(
+                !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("native-next")),
+                "invalid explicit profile aliased to normalized storage path {}",
+                path.display()
+            );
+        }
+
+        for invalid in ["", "   ", "/", "..", r"a\b", "a/b"] {
+            std::env::set_var(APP_PROFILE_ENV, invalid);
+            let result = app_config_dir();
+            assert!(
+                matches!(result, Err(PersistenceError::InvalidAppProfile)),
+                "explicit invalid profile {invalid:?} must not resolve storage: {result:?}"
+            );
+            if let Ok(path) = result {
+                assert_ne!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(APP_CONFIG_DIR),
+                    "invalid explicit profile {invalid:?} fell back to unprofiled production spelling"
+                );
+            }
+        }
     }
 
     #[test]
