@@ -182,6 +182,179 @@ Write-Output 'EVIDENCE_RESOLVER_OK'
 }
 
 #[test]
+fn isolation_guards_reject_coercive_types_and_non_fully_qualified_paths() {
+    let fixture = SyntheticIsolationFixture::create();
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. '{isolation}'
+
+$productionRoot = '{root}'
+$installExe = '{install}'
+
+$valid = Get-DevManagerProductionState `
+    -ProductionRoot $productionRoot `
+    -SupportedExecutablePaths @($installExe) `
+    -CimProcesses @(
+        [pscustomobject]@{{
+            ProcessId = [uint32]4242
+            ExecutablePath = $installExe
+            CreationDate = '20260101120000.000000-000'
+            Name = 'devmanager.exe'
+        }}
+    )
+
+function Expect-ShapeRejection([scriptblock]$Mutate, [string]$Pattern) {{
+    $probe = $valid | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    & $Mutate $probe
+    $rejected = $false
+    try {{
+        Assert-DevManagerEvidenceShape -Evidence $probe -Label 'probe'
+    }} catch {{
+        $rejected = $true
+        if ("$($_.Exception.Message)" -notmatch $Pattern) {{
+            throw "unexpected shape error (wanted /$Pattern/): $($_.Exception.Message)"
+        }}
+    }}
+    if (-not $rejected) {{
+        throw "expected malformed rejection matching /$Pattern/"
+    }}
+}}
+
+# Coercive numeric / bool values must not pass.
+Expect-ShapeRejection {{ param($e) $e.schemaVersion = $true }} 'schemaVersion'
+Expect-ShapeRejection {{ param($e) $e.schemaVersion = '1' }} 'schemaVersion'
+Expect-ShapeRejection {{ param($e) $e.config.length = '12' }} 'length'
+Expect-ShapeRejection {{ param($e) $e.config.length = 1.5 }} 'length'
+Expect-ShapeRejection {{ param($e) $e.installedProcesses[0].processId = '4242' }} 'processId'
+Expect-ShapeRejection {{ param($e) $e.installedProcesses[0].processId = $true }} 'processId'
+
+# Null / scalar installedProcesses must not normalize to an empty/valid inventory.
+Expect-ShapeRejection {{ param($e) $e.installedProcesses = $null }} 'installedProcesses|null|array'
+Expect-ShapeRejection {{
+    param($e)
+    $e.installedProcesses = [pscustomobject]@{{
+        processId = [int]4242
+        executablePath = $installExe
+        creationDate = '20260101120000.000000-000'
+    }}
+}} 'installedProcesses|array|scalar'
+
+# Zero- and one-element arrays remain valid through live state and JSON roundtrip.
+$emptyLive = Get-DevManagerProductionState `
+    -ProductionRoot $productionRoot `
+    -SupportedExecutablePaths @($installExe) `
+    -CimProcesses @()
+Assert-DevManagerEvidenceShape -Evidence $emptyLive -Label 'empty-live'
+$emptyRoundTrip = $emptyLive | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+Assert-DevManagerEvidenceShape -Evidence $emptyRoundTrip -Label 'empty-json'
+Assert-DevManagerEvidenceShape -Evidence $valid -Label 'one-live'
+$oneRoundTrip = $valid | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+Assert-DevManagerEvidenceShape -Evidence $oneRoundTrip -Label 'one-json'
+if ($null -eq $oneRoundTrip.installedProcesses) {{ throw 'one-element JSON inventory became null' }}
+if ($oneRoundTrip.installedProcesses -is [System.Management.Automation.PSCustomObject]) {{
+    throw 'one-element JSON inventory collapsed to scalar PSCustomObject'
+}}
+
+# Drive-relative paths must fail at the guard boundary / normalizer.
+if (Test-DevManagerAbsolutePath -LiteralPath 'C:relative') {{
+    throw 'C:relative must not count as fully qualified'
+}}
+$normalizeRejected = $false
+try {{
+    $null = Normalize-DevManagerPath -LiteralPath 'C:relative'
+}} catch {{
+    $normalizeRejected = $true
+    if ("$($_.Exception.Message)" -notmatch 'fully.?qualified|relative|normalize|identity') {{
+        throw "unexpected C:relative normalize error: $($_.Exception.Message)"
+    }}
+}}
+if (-not $normalizeRejected) {{ throw 'expected Normalize-DevManagerPath to reject C:relative' }}
+Expect-ShapeRejection {{ param($e) $e.productionRoot = 'C:relative' }} 'productionRoot|fully.?qualified|absolute'
+
+# Relative APPDATA / production root must fail closed.
+$appDataRejected = $false
+try {{
+    $null = Get-DevManagerProductionRoot -AppDataRoot 'relative-appdata'
+}} catch {{
+    $appDataRejected = $true
+    if ("$($_.Exception.Message)" -notmatch 'APPDATA|fully.?qualified|absolute') {{
+        throw "unexpected relative APPDATA error: $($_.Exception.Message)"
+    }}
+}}
+if (-not $appDataRejected) {{ throw 'expected Get-DevManagerProductionRoot to reject relative APPDATA' }}
+
+# Supported install roots: required defaults must not be silently omitted; malformed values fail.
+$missingLocalRejected = $false
+try {{
+    $null = Get-DevManagerSupportedInstallPaths `
+        -LocalAppDataRoot '' `
+        -ProgramFilesRoot 'C:\Program Files' `
+        -ProgramFilesX86Root ''
+}} catch {{
+    $missingLocalRejected = $true
+    if ("$($_.Exception.Message)" -notmatch 'LOCALAPPDATA|LocalAppData|required|missing') {{
+        throw "unexpected missing LocalAppData error: $($_.Exception.Message)"
+    }}
+}}
+if (-not $missingLocalRejected) {{ throw 'expected missing LocalAppData to fail' }}
+
+$malformedPfRejected = $false
+try {{
+    $null = Get-DevManagerSupportedInstallPaths `
+        -LocalAppDataRoot 'C:\Users\tester\AppData\Local' `
+        -ProgramFilesRoot 'relative-program-files' `
+        -ProgramFilesX86Root ''
+}} catch {{
+    $malformedPfRejected = $true
+    if ("$($_.Exception.Message)" -notmatch 'ProgramFiles|fully.?qualified|absolute') {{
+        throw "unexpected malformed ProgramFiles error: $($_.Exception.Message)"
+    }}
+}}
+if (-not $malformedPfRejected) {{ throw 'expected malformed ProgramFiles to fail' }}
+
+$malformedX86Rejected = $false
+try {{
+    $null = Get-DevManagerSupportedInstallPaths `
+        -LocalAppDataRoot 'C:\Users\tester\AppData\Local' `
+        -ProgramFilesRoot 'C:\Program Files' `
+        -ProgramFilesX86Root 'relative-x86'
+}} catch {{
+    $malformedX86Rejected = $true
+    if ("$($_.Exception.Message)" -notmatch 'ProgramFiles\(x86\)|x86|fully.?qualified|absolute') {{
+        throw "unexpected malformed ProgramFiles(x86) error: $($_.Exception.Message)"
+    }}
+}}
+if (-not $malformedX86Rejected) {{ throw 'expected malformed ProgramFiles(x86) to fail rather than omit' }}
+
+$okPaths = Get-DevManagerSupportedInstallPaths `
+    -LocalAppDataRoot 'C:\Users\tester\AppData\Local' `
+    -ProgramFilesRoot 'C:\Program Files' `
+    -ProgramFilesX86Root ''
+if (@($okPaths).Count -lt 2) {{ throw "expected LocalAppData and ProgramFiles paths, got $($okPaths.Count)" }}
+
+Write-Output 'COERCION_PATH_GUARDS_OK'
+"#,
+        isolation = ps_literal(&fixture.isolation_ps1),
+        root = ps_literal(&fixture.production_root),
+        install = ps_literal(&fixture.install_exe),
+    );
+
+    let output = run_pwsh(&script);
+    assert!(
+        output.status.success(),
+        "pwsh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("COERCION_PATH_GUARDS_OK"),
+        "missing success marker"
+    );
+}
+
+#[test]
 fn isolation_evidence_shape_rejects_materially_malformed_values() {
     let fixture = SyntheticIsolationFixture::create();
     let script = format!(
@@ -224,7 +397,7 @@ function Expect-ShapeRejection([scriptblock]$Mutate, [string]$Pattern) {{
 
 Expect-ShapeRejection {{ param($e) $e.capturedAtUtc = '' }} 'capturedAtUtc'
 Expect-ShapeRejection {{ param($e) $e.capturedAtUtc = 'not-a-timestamp' }} 'capturedAtUtc'
-Expect-ShapeRejection {{ param($e) $e.productionRoot = 'relative-root' }} 'productionRoot|absolute|normalize'
+Expect-ShapeRejection {{ param($e) $e.productionRoot = 'relative-root' }} 'productionRoot|absolute|fully.?qualified|normalize'
 Expect-ShapeRejection {{ param($e) $e.sessionPath = (Join-Path $productionRoot 'other.json') }} 'sessionPath'
 Expect-ShapeRejection {{ param($e) $e.config.exists = 'yes' }} 'exists'
 Expect-ShapeRejection {{ param($e) $e.config.length = -1 }} 'length'
@@ -242,7 +415,7 @@ Expect-ShapeRejection {{
 }} 'sha256|absent|exists'
 Expect-ShapeRejection {{ param($e) $e.config.sha256 = 'abc' }} 'sha256|hex'
 Expect-ShapeRejection {{ param($e) $e.installedProcesses[0].processId = 0 }} 'processId'
-Expect-ShapeRejection {{ param($e) $e.installedProcesses[0].executablePath = 'not-absolute' }} 'executable|normalize|identity'
+Expect-ShapeRejection {{ param($e) $e.installedProcesses[0].executablePath = 'not-absolute' }} 'executable|normalize|identity|fully.?qualified'
 Expect-ShapeRejection {{ param($e) $e.installedProcesses[0].creationDate = '' }} 'creationDate'
 
 # Empty inventory remains schema-valid (zero installed processes allowed).

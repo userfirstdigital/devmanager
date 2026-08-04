@@ -13,8 +13,35 @@ function Get-DevManagerProductionRoot {
     if ([string]::IsNullOrWhiteSpace($AppDataRoot)) {
         throw "APPDATA is missing; cannot resolve unprofiled production root."
     }
+    if (-not (Test-DevManagerAbsolutePath -LiteralPath $AppDataRoot)) {
+        throw "APPDATA must be a fully qualified path ('$AppDataRoot')."
+    }
 
-    return [string](Join-Path $AppDataRoot 'com.userfirst.devmanager')
+    $canonicalAppData = [System.IO.Path]::GetFullPath($AppDataRoot.Trim())
+    return [System.IO.Path]::GetFullPath((Join-Path $canonicalAppData 'com.userfirst.devmanager'))
+}
+
+function Assert-DevManagerKnownFolderRoot {
+    param(
+        [AllowEmptyString()]
+        [string]$Root,
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [switch]$Required
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        if ($Required) {
+            throw "$Name is missing or empty; a fully qualified root is required."
+        }
+        return $null
+    }
+
+    if (-not (Test-DevManagerAbsolutePath -LiteralPath $Root)) {
+        throw "$Name must be a fully qualified path ('$Root')."
+    }
+
+    return [System.IO.Path]::GetFullPath($Root.Trim())
 }
 
 function Get-DevManagerSupportedInstallPaths {
@@ -24,22 +51,24 @@ function Get-DevManagerSupportedInstallPaths {
         [string]$ProgramFilesX86Root = ${env:ProgramFiles(x86)}
     )
 
+    # LOCALAPPDATA and ProgramFiles are required when resolving defaults.
+    # ProgramFiles(x86) is optional only when genuinely absent; if present it must validate.
+    $localAppData = Assert-DevManagerKnownFolderRoot -Root $LocalAppDataRoot -Name 'LOCALAPPDATA' -Required
+    $programFiles = Assert-DevManagerKnownFolderRoot -Root $ProgramFilesRoot -Name 'ProgramFiles' -Required
+    $programFilesX86 = Assert-DevManagerKnownFolderRoot -Root $ProgramFilesX86Root -Name 'ProgramFiles(x86)'
+
     $paths = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($LocalAppDataRoot)) {
-        $paths.Add((Join-Path $LocalAppDataRoot 'DevManager\devmanager.exe'))
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ProgramFilesRoot)) {
-        $paths.Add((Join-Path $ProgramFilesRoot 'DevManager\devmanager.exe'))
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ProgramFilesX86Root)) {
-        $paths.Add((Join-Path $ProgramFilesX86Root 'DevManager\devmanager.exe'))
+    $paths.Add((Join-Path $localAppData 'DevManager\devmanager.exe'))
+    $paths.Add((Join-Path $programFiles 'DevManager\devmanager.exe'))
+    if (-not [string]::IsNullOrWhiteSpace($programFilesX86)) {
+        $paths.Add((Join-Path $programFilesX86 'DevManager\devmanager.exe'))
     }
 
-    if ($paths.Count -eq 0) {
-        throw "No supported DevManager install locations could be resolved."
-    }
-
-    return @($paths | ForEach-Object { Normalize-DevManagerPath -LiteralPath $_ } | Select-Object -Unique)
+    return ,([string[]]@(
+            $paths |
+                ForEach-Object { Normalize-DevManagerPath -LiteralPath $_ } |
+                Select-Object -Unique
+        ))
 }
 
 function Normalize-DevManagerPath {
@@ -54,11 +83,19 @@ function Normalize-DevManagerPath {
     }
 
     $expanded = [Environment]::ExpandEnvironmentVariables($LiteralPath.Trim())
+    if (-not (Test-DevManagerAbsolutePath -LiteralPath $expanded)) {
+        throw "Path is not fully qualified (drive-relative and relative paths are rejected): '$LiteralPath'."
+    }
+
     try {
         $full = [System.IO.Path]::GetFullPath($expanded)
     }
     catch {
         throw "Ambiguous executable identity: cannot normalize path '$LiteralPath'."
+    }
+
+    if (-not (Test-DevManagerAbsolutePath -LiteralPath $full)) {
+        throw "Normalized path is not fully qualified: '$full'."
     }
 
     return $full.TrimEnd('\', '/').ToLowerInvariant()
@@ -172,6 +209,9 @@ function Get-DevManagerProductionState {
         $ProductionRoot = Get-DevManagerProductionRoot
     }
     else {
+        if (-not (Test-DevManagerAbsolutePath -LiteralPath $ProductionRoot)) {
+            throw "ProductionRoot must be a fully qualified path ('$ProductionRoot')."
+        }
         $ProductionRoot = [System.IO.Path]::GetFullPath($ProductionRoot).TrimEnd('\', '/')
     }
 
@@ -179,20 +219,23 @@ function Get-DevManagerProductionState {
         -SupportedExecutablePaths $SupportedExecutablePaths `
         -CimProcesses $CimProcesses
 
+    $processList = New-Object System.Collections.Generic.List[object]
+    foreach ($proc in @($installedProcesses)) {
+        $processList.Add([pscustomobject]@{
+                processId      = [uint32]$proc.processId
+                executablePath = [string]$proc.executablePath
+                creationDate   = [string]$proc.creationDate
+            })
+    }
+
     return [pscustomobject]@{
-        schemaVersion      = 1
+        schemaVersion      = [int]1
         capturedAtUtc      = [DateTime]::UtcNow.ToString('o')
         productionRoot     = $ProductionRoot
         config             = Get-ProtectedFileState -LiteralPath (Join-Path $ProductionRoot 'config.json')
         remote             = Get-ProtectedFileState -LiteralPath (Join-Path $ProductionRoot 'remote.json')
         sessionPath        = Join-Path $ProductionRoot 'session.json'
-        installedProcesses = @($installedProcesses | ForEach-Object {
-                [pscustomobject]@{
-                    processId      = [uint32]$_.processId
-                    executablePath = [string]$_.executablePath
-                    creationDate   = [string]$_.creationDate
-                }
-            })
+        installedProcesses = [object[]]$processList.ToArray()
     }
 }
 
@@ -373,6 +416,9 @@ function Write-DevManagerBaseline {
         -LiteralPath $OutputPath `
         -ProtectedProductionRoot ([string]$State.productionRoot)
 
+    # Preserve zero-/one-element inventories as JSON arrays (never scalar objects).
+    $State.installedProcesses = [object[]](Get-DevManagerInstalledProcessArray -Value $State.installedProcesses -Label 'baseline state')
+
     $directory = Split-Path -Parent $OutputPath
     if (-not [string]::IsNullOrWhiteSpace($directory)) {
         # Existing ancestors were already checked for reparse points; only then create missing dirs.
@@ -429,7 +475,65 @@ function Test-DevManagerAbsolutePath {
         return $false
     }
 
-    return [System.IO.Path]::IsPathRooted($LiteralPath.Trim())
+    # Reject drive-relative forms such as C:relative; require a fully qualified path.
+    return [System.IO.Path]::IsPathFullyQualified($LiteralPath.Trim())
+}
+
+function Test-DevManagerIntegralNumber {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $false
+    }
+    if ($Value -is [bool] -or $Value -is [string] -or $Value -is [char]) {
+        return $false
+    }
+    if ($Value -is [float] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+        return $false
+    }
+
+    return (
+        $Value -is [byte] -or
+        $Value -is [sbyte] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [int32] -or
+        $Value -is [uint32] -or
+        $Value -is [int64] -or
+        $Value -is [uint64]
+    )
+}
+
+function Get-DevManagerInstalledProcessArray {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value,
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    if ($null -eq $Value) {
+        throw "Malformed ${Label}: installedProcesses must be a non-null array."
+    }
+    if ($Value -is [string] -or $Value -is [bool] -or $Value -is [hashtable]) {
+        throw "Malformed ${Label}: installedProcesses must be an array (got $($Value.GetType().FullName))."
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        throw "Malformed ${Label}: installedProcesses must be an array, not a scalar object."
+    }
+    if ($Value -is [System.Array]) {
+        return ,([object[]]$Value)
+    }
+    if ($Value -is [System.Collections.IList]) {
+        return ,([object[]]@($Value))
+    }
+
+    throw "Malformed ${Label}: installedProcesses must be an array (got $($Value.GetType().FullName))."
 }
 
 function Assert-DevManagerEvidenceShape {
@@ -458,11 +562,27 @@ function Assert-DevManagerEvidenceShape {
         }
     }
 
-    if ([int]$Evidence.schemaVersion -ne 1) {
+    if (-not (Test-DevManagerIntegralNumber -Value $Evidence.schemaVersion)) {
+        throw "Malformed ${Label}: schemaVersion must be an integral number (got '$($Evidence.schemaVersion)' / $($Evidence.schemaVersion.GetType().Name))."
+    }
+    # Compare without boolean/string coercion: already proven integral above.
+    if ([int64]$Evidence.schemaVersion -ne 1) {
         throw "Malformed ${Label}: unsupported schemaVersion '$($Evidence.schemaVersion)'."
     }
 
-    $capturedAtUtc = [string]$Evidence.capturedAtUtc
+    # Live state keeps a string; ConvertFrom-Json may promote ISO-8601 to DateTime/DateTimeOffset.
+    if ($Evidence.capturedAtUtc -is [string]) {
+        $capturedAtUtc = [string]$Evidence.capturedAtUtc
+    }
+    elseif ($Evidence.capturedAtUtc -is [datetimeoffset]) {
+        $capturedAtUtc = ([datetimeoffset]$Evidence.capturedAtUtc).ToString('o')
+    }
+    elseif ($Evidence.capturedAtUtc -is [datetime]) {
+        $capturedAtUtc = ([datetime]$Evidence.capturedAtUtc).ToUniversalTime().ToString('o')
+    }
+    else {
+        throw "Malformed ${Label}: capturedAtUtc must be a string (got $($Evidence.capturedAtUtc.GetType().Name))."
+    }
     if ([string]::IsNullOrWhiteSpace($capturedAtUtc)) {
         throw "Malformed ${Label}: capturedAtUtc is empty."
     }
@@ -477,12 +597,15 @@ function Assert-DevManagerEvidenceShape {
         throw "Malformed ${Label}: capturedAtUtc is unparseable ('$capturedAtUtc')."
     }
 
+    if ($Evidence.productionRoot -isnot [string]) {
+        throw "Malformed ${Label}: productionRoot must be a string."
+    }
     $productionRoot = [string]$Evidence.productionRoot
     if ([string]::IsNullOrWhiteSpace($productionRoot)) {
         throw "Malformed ${Label}: productionRoot is empty."
     }
     if (-not (Test-DevManagerAbsolutePath -LiteralPath $productionRoot)) {
-        throw "Malformed ${Label}: productionRoot must be absolute ('$productionRoot')."
+        throw "Malformed ${Label}: productionRoot must be fully qualified ('$productionRoot')."
     }
     try {
         $null = Normalize-DevManagerPath -LiteralPath $productionRoot
@@ -491,6 +614,9 @@ function Assert-DevManagerEvidenceShape {
         throw "Malformed ${Label}: productionRoot is unnormalizable ('$productionRoot')."
     }
 
+    if ($Evidence.sessionPath -isnot [string]) {
+        throw "Malformed ${Label}: sessionPath must be a string."
+    }
     $sessionPath = [string]$Evidence.sessionPath
     if ([string]::IsNullOrWhiteSpace($sessionPath)) {
         throw "Malformed ${Label}: sessionPath is empty."
@@ -509,16 +635,14 @@ function Assert-DevManagerEvidenceShape {
     Assert-ProtectedFileEvidenceShape -FileState $Evidence.config -Label "$Label.config"
     Assert-ProtectedFileEvidenceShape -FileState $Evidence.remote -Label "$Label.remote"
 
-    # Avoid `@($null)` → 1-element array; empty/missing inventories are zero-length.
-    $processes = @(
-        if ($null -eq $Evidence.installedProcesses) {
-            @()
-        }
-        else {
-            $Evidence.installedProcesses
-        }
-    )
+    $processes = Get-DevManagerInstalledProcessArray -Value $Evidence.installedProcesses -Label $Label
     foreach ($proc in $processes) {
+        if ($null -eq $proc -or $proc -isnot [System.Management.Automation.PSCustomObject]) {
+            # Live state and ConvertFrom-Json both surface objects; also accept Hashtable-like only if PSObject.
+            if ($null -eq $proc -or $null -eq $proc.PSObject) {
+                throw "Malformed ${Label}: installed process entry must be an object."
+            }
+        }
         foreach ($field in @('processId', 'executablePath', 'creationDate')) {
             if (-not ($proc.PSObject.Properties.Name -contains $field)) {
                 throw "Malformed ${Label}: installed process missing '$field'."
@@ -526,22 +650,23 @@ function Assert-DevManagerEvidenceShape {
         }
 
         $processIdRaw = $proc.processId
-        try {
-            $processId = [uint64]$processIdRaw
+        if (-not (Test-DevManagerIntegralNumber -Value $processIdRaw)) {
+            throw "Malformed ${Label}: installed process processId must be an integral number (got '$processIdRaw')."
         }
-        catch {
-            throw "Malformed ${Label}: installed process processId is invalid ('$processIdRaw')."
-        }
-        if ($processId -eq 0 -or $processId -gt [uint32]::MaxValue) {
+        # Range check only after exact integral-type validation.
+        if ([int64]$processIdRaw -le 0 -or [uint64]$processIdRaw -gt [uint32]::MaxValue) {
             throw "Malformed ${Label}: installed process processId must be a non-zero uint32 ('$processIdRaw')."
         }
 
+        if ($proc.executablePath -isnot [string]) {
+            throw "Malformed ${Label}: installed process executablePath must be a string."
+        }
         $executablePath = [string]$proc.executablePath
         if ([string]::IsNullOrWhiteSpace($executablePath)) {
             throw "Malformed ${Label}: installed process executablePath is empty."
         }
         if (-not (Test-DevManagerAbsolutePath -LiteralPath $executablePath)) {
-            throw "Malformed ${Label}: installed process executablePath must be absolute ('$executablePath')."
+            throw "Malformed ${Label}: installed process executablePath must be fully qualified ('$executablePath')."
         }
         try {
             $null = Normalize-DevManagerPath -LiteralPath $executablePath
@@ -550,6 +675,9 @@ function Assert-DevManagerEvidenceShape {
             throw "Malformed ${Label}: installed process executablePath is unnormalizable ('$executablePath')."
         }
 
+        if ($proc.creationDate -isnot [string]) {
+            throw "Malformed ${Label}: installed process creationDate must be a string."
+        }
         if ([string]::IsNullOrWhiteSpace([string]$proc.creationDate)) {
             throw "Malformed ${Label}: installed process creationDate is empty."
         }
@@ -574,21 +702,22 @@ function Assert-ProtectedFileEvidenceShape {
         throw "Malformed ${Label}: exists must be a boolean (got '$($FileState.exists)')."
     }
 
-    $exists = [bool]$FileState.exists
+    $exists = $FileState.exists
     if ($exists) {
         if ($null -eq $FileState.length) {
             throw "Malformed ${Label}: length is required when exists=true."
         }
-        try {
-            $length = [int64]$FileState.length
+        if (-not (Test-DevManagerIntegralNumber -Value $FileState.length)) {
+            throw "Malformed ${Label}: length must be an integral number (got '$($FileState.length)')."
         }
-        catch {
-            throw "Malformed ${Label}: length is invalid ('$($FileState.length)')."
-        }
+        $length = [int64]$FileState.length
         if ($length -lt 0) {
             throw "Malformed ${Label}: length must not be negative ('$length')."
         }
 
+        if ($FileState.sha256 -isnot [string]) {
+            throw "Malformed ${Label}: sha256 must be a string."
+        }
         $sha = [string]$FileState.sha256
         if ($sha -notmatch '^[0-9a-fA-F]{64}$') {
             throw "Malformed ${Label}: sha256 must be exactly 64 hex characters."
@@ -671,12 +800,8 @@ function Assert-DevManagerProductionState {
         throw "Protected file remote.json mismatch (exists/length/hash): baseline=[$baselineRemote] current=[$currentRemote]."
     }
 
-    $baselineProcessObjects = @(
-        if ($null -eq $Baseline.installedProcesses) { @() } else { $Baseline.installedProcesses }
-    )
-    $currentProcessObjects = @(
-        if ($null -eq $Current.installedProcesses) { @() } else { $Current.installedProcesses }
-    )
+    $baselineProcessObjects = Get-DevManagerInstalledProcessArray -Value $Baseline.installedProcesses -Label 'baseline'
+    $currentProcessObjects = Get-DevManagerInstalledProcessArray -Value $Current.installedProcesses -Label 'current'
     $baselineProcesses = @($baselineProcessObjects | ForEach-Object { Get-InstalledProcessCompareKey -Process $_ } | Sort-Object)
     $currentProcesses = @($currentProcessObjects | ForEach-Object { Get-InstalledProcessCompareKey -Process $_ } | Sort-Object)
     if ($baselineProcesses.Count -ne $currentProcesses.Count) {
