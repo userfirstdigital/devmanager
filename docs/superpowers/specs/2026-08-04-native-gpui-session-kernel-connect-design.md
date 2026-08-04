@@ -1,6 +1,6 @@
 # DevManager Native GPUI Session Kernel and Connect Design
 
-**Status:** Approved product direction; implementation plan pending review
+**Status:** Approved product direction; selective-adoption revision awaiting written-spec review
 
 **Date:** 2026-08-04
 
@@ -21,6 +21,8 @@ The approved decisions are:
 - Semantic conversation and raw terminal are two native views of the same live provider session, never two provider processes.
 - DevManager Connect is an optional hosted product and realtime transport. It never becomes the execution authority and cannot decrypt raw task content by default.
 - Organization accounts and management features may live in Connect. Personal work remains local-only unless deliberately enrolled.
+- DevManager selectively adopts proven infrastructure patterns from Oh My Pi around compatibility testing, bounded protocols, semantic rendering, lifecycle cleanup, and collaboration. It does not embed or fork Oh My Pi's model harness.
+- Saved prompts are durable, versioned local assets. Prompt chains are visible manual sequences, not an automation engine. Organization prompts are deliberately published through Connect and execute locally through the stock provider CLIs.
 - The replacement starts with no open tasks, terminals, or provider conversations. There is no one-time session migrator.
 - Existing left-sidebar project configuration and paired-device identity remain supported durable formats. Reusing those formats is the new system's contract, not legacy compatibility.
 - The old desktop runtime, old UI paths, `session.json` loader, and compatibility shims are removed at cutover. No old/new runtime feature flag ships.
@@ -50,6 +52,10 @@ The approved decisions are:
 - No claim that arbitrary processes can be resurrected after a host reboot.
 - No indefinite old-schema readers, dual writes, legacy desktop mode, or old/new runtime switch.
 - No attempt to port an entire upstream product or terminal implementation when a narrow adapter or independently implemented invariant is sufficient.
+- No embedded or forked Oh My Pi harness, unrestricted in-host plugin runtime, or alternate provider-control loop.
+- No DevManager agent bus, recursive cross-provider scheduler, YAML/DAG swarm engine, or attempt to reserve capacity for provider-native child agents that the stock CLI does not expose.
+- No automatic execution, branching, conditions, or completion workflow in prompt chains.
+- No emotion, sentiment, profanity, blame, repetition, or inferred worker-behavior scoring from user or provider text.
 
 ## System boundary
 
@@ -105,9 +111,10 @@ client intent
   -> typed command { request_id, client_id, expected_revision }
   -> authorization and invariant checks
   -> per-task serialized command queue
-  -> one durable transaction and idempotency receipt
+  -> one durable transaction, idempotency receipt, and side-effect outbox
+  -> Accepted { request_id, operation_id, revision }
   -> bounded side effect
-  -> ordered domain events
+  -> Settled or Failed event correlated to operation_id
   -> projections pushed to every subscribed client
 ```
 
@@ -121,12 +128,19 @@ The protocol includes:
 - snapshots plus cursor-based replay;
 - explicit runtime generations so late output from replaced processes is rejected;
 - bounded queues and priority lanes;
-- capability negotiation independent of marketing version numbers;
+- wire-version and capability negotiation independent of marketing version numbers;
+- negotiated limits for physical frames and fully reassembled messages;
+- chunking and cursor pagination for snapshots, transcripts, artifacts, and other large payloads;
 - an explicit forced-resync response when a client is too far behind;
 - closed error codes plus safe user-facing context;
+- safe handling of unknown future frames and events without inventing domain facts;
 - schema fixture tests for every shipped client.
 
 Interactive traffic such as keystrokes, send, stop, answers, and approvals pre-empts screenshots, scrollback, diffs, and file transfers. A slow remote client can lose transient progress and receive a fresh snapshot; it must never stall a provider PTY or the host.
+
+Command acceptance and operation settlement are different facts. An `Accepted` receipt means the command passed authorization, was durably recorded, and will be attempted once; it does not claim that a provider started, a process stopped, or an artifact finished. Long-running effects settle through a correlated success or failure event and remain queryable by operation ID after a client reconnects. Pure in-database commands may be accepted and settled in one transaction while preserving the same public semantics.
+
+No client sends or receives one unbounded history frame. The peers negotiate conservative physical-frame and reassembled-message limits at connection time. Large state is chunked with item and byte bounds, checksummed where integrity matters, and resumable from a cursor. Exceeding a declared limit returns a closed protocol error rather than allocating until failure.
 
 Capability negotiation is not a legacy desktop mode. It is the bounded wire contract required for independently reconnecting clients and in-progress desktop updates. Unsupported features remain unavailable with an explicit explanation. The product will not carry alternate domain models or unbounded historical protocol implementations.
 
@@ -215,7 +229,7 @@ The UI uses precise language for four different guarantees:
 
 The replacement directly supports the current durable project/sidebar configuration in `config.json`. It becomes the initial version of the new configuration contract; it is not loaded through a deprecated adapter and is not dual-written.
 
-The replacement also directly supports the current device identity, pairing secret, manually changeable invite code, and authorized-device records in `remote.json`. Application upgrades must not rotate the invite code or invalidate a previously paired device. Rotation and revocation are explicit user actions.
+The replacement also directly supports the current device identity, pairing secret, long-lived device pairing code (the current invite code), and authorized-device records in `remote.json`. Application upgrades must not rotate that pairing code or invalidate a previously paired device. Rotation and revocation are explicit user actions.
 
 Both files use atomic replacement, validation before activation, and recoverable backups as ordinary persistence safety—not migration machinery.
 
@@ -248,6 +262,26 @@ New task state uses one SQLite database in WAL mode with:
 Schema migrations inside the new system are normal long-term maintenance. There is no migration from the old tab/session representation into the new task representation.
 
 Secrets live in the OS credential vault. Logs and diagnostics refer to secret handles, never secret values.
+
+## Prompt library and guided prompt chains
+
+The prompt library is part of the local task product, but it is not provider memory and does not replace provider-native slash commands.
+
+Three surfaces remain distinct:
+
+- **Saved prompts:** durable user-authored templates with metadata and immutable versions.
+- **Recent prompt history:** searchable prompts the user actually submitted, retained under an explicit local retention policy.
+- **Provider commands:** live slash commands and other controls discovered from the active stock CLI.
+
+The host SQLite database is authoritative for personal saved prompts, versions, ordered chains, and recent history. Local full-text search may use SQLite FTS. History indexing and retention writes are deferred and batched outside input, PTY, and render hot paths.
+
+A prompt has a stable ID, title, optional description/tags, an immutable version sequence, and a current-version pointer. The UI shows a readable diff between versions. A chain is only an ordered list of links to exact prompt versions. Users can add any number of links, see previous and next prompts, insert a link between two existing links, reorder or remove links, and explicitly update a link to a newer prompt version.
+
+Using a chain is deliberately manual. **Put in composer** copies the selected version into the current task composer, where the user can edit and send it normally. Sending does not automatically advance, execute another prompt, evaluate a condition, branch, or mark a workflow complete. The chain simply makes the recommended next prompt and surrounding sequence easy to understand.
+
+Paired remote clients access the owning host's personal library through the existing end-to-end encrypted Connect channel. This does not create a cleartext Connect copy or cross-host replication system. Cross-host personal prompt replication is deferred until it can reuse the ordinary Connect content envelope without a prompt-specific crypto or conflict-resolution subsystem.
+
+Organization prompts are a separate Connect-authoritative publishing surface. Maintainers publish an exact immutable version, may supersede or deprecate it, and can place published versions in shared manual chains. Publication is an explicit decision to share that prompt with the organization under its access and retention policy. Execution still occurs locally through the user's authenticated stock CLI; Connect never becomes a model harness. Published organization prompts use the existing Connect authorization and encrypted transport rather than a prompt-specific cryptographic protocol.
 
 ## Provider-native architecture
 
@@ -283,11 +317,14 @@ The launch path is deliberately simpler than the semantic enhancement path:
 - A provider update that changes optional event output may reduce the session to **Terminal only**.
 - It must not prevent the user's configured stock CLI from opening.
 - Unknown events are retained only as bounded safe diagnostics; they do not invent task state.
+- Unknown or malformed semantic events render through a bounded generic fallback instead of disappearing or crashing the task view.
 - Exact resume remains strict. If the provider rejects the known ID, DevManager shows the failure and offers an explicit new-session action.
 - Capability probes run outside startup and input hot paths and are cached by binary path plus version.
 - Adapters target documented hooks, commands, and protocols. Private transcript scraping is diagnostic-only and never canonical.
 
 Codex initially remains the stock CLI with its supported hooks. DevManager will not restore a proxy architecture that launches a second Codex process or changes native `/resume` behavior. Claude Code remains its stock CLI/PTY plus supported hooks. Cursor uses its stock authenticated CLI and advertised stream/hooks/resume capabilities. Pi may later use its documented RPC mode as another provider adapter; it does not dictate the kernel protocol.
+
+DevManager's append-only task events, semantic projections, and agent-lineage facts describe DevManager activity; they are not a reconstructed provider context tree. The provider session ID captured from the correlated current runtime generation remains the sole exact-resume key. DevManager never guesses, rewrites, forks, or claims ownership of the provider's private conversation context, and a failed exact resume never silently becomes a fresh session.
 
 Within the new system, an open agent session resumes its exact previous provider conversation by default whenever its runtime must be recreated. Provider actions are named **Stop turn**, **Close agent**, **Resume**, and **Start new conversation**. A generic server-style **Restart** action is not shown for an agent.
 
@@ -295,18 +332,20 @@ Within the new system, an open agent session resumes its exact previous provider
 
 A new task creates one Primary agent and hides agent hierarchy until another agent exists.
 
-The Primary owns the user-facing synthesis and integration. Its native harness may create its own provider-native child agents without DevManager reproducing that logic. When exact child identity is available, the Task Cockpit renders it; otherwise it shows truthful aggregated activity.
+The Primary owns the user-facing synthesis and integration. Its native harness may create its own provider-native child agents without DevManager reproducing that logic. DevManager records parent, child, provider, role, status, transcript reference, artifacts, resource use, and provider-reported usage only when the stock harness exposes those facts. When exact child identity is unavailable, the Task Cockpit shows truthful aggregated activity rather than fabricating a child conversation.
 
 A cross-provider specialist is exceptional and explicit:
 
 1. The user or Primary requests a bounded role and outcome.
 2. The kernel applies provider preference, concurrency, permission, duration, and workspace policy.
 3. A stock subscribed provider runtime performs the work.
-4. The specialist returns a typed artifact, commit, diff, or finding to the Primary.
+4. The specialist returns a `SpecialistResult` envelope containing its role, status, summary, evidence references, produced artifacts, workspace/commit facts, and any requested follow-up.
 
-Cross-provider specialists are read-only by default. A writable specialist receives an isolated worktree. No two autonomous agents write to the same worktree, no specialist recursively starts another cross-provider specialist in the initial release, and DevManager does not copy entire private transcripts between providers.
+The envelope is validated when the provider can produce reliable structured output. A bounded raw artifact remains the truthful fallback when a stock CLI cannot guarantee that shape; DevManager never invents missing structured fields. Cross-provider specialists are read-only by default. A writable specialist receives an isolated worktree. No two autonomous agents write to the same worktree, no specialist recursively starts another cross-provider specialist in the initial release, and DevManager does not copy entire private transcripts between providers.
 
 Automatic cross-provider delegation is off by default because it consumes another subscription quota and starts another supervised runtime. A user may enable bounded automatic **read-only** specialists per project or task. Writable access, a new permission boundary, or a provider not already allowed by that policy always requires explicit approval.
+
+Concurrency policy applies only to top-level provider runtimes that DevManager launches. A provider's opaque native children remain inside that provider runtime and Job tree. DevManager neither reserves speculative capacity for them nor holds a top-level capacity slot merely because a parent is waiting on a native child. If a provider exposes independently addressable child runtimes in the future, the adapter must first prove their identity and lifecycle semantics before they can become separately scheduled resources.
 
 The bridge uses MCP ingress and A2A-aligned task/message/artifact/status semantics where useful, but remains a thin local task handoff. It is not a universal DevManager agent harness.
 
@@ -327,6 +366,14 @@ The design system includes:
 - no feature-local color constants or ad hoc interaction rules.
 
 Native UI does not mean terminal-shaped UI. Messages, tools, approvals, questions, diffs, and browser activity are semantic GPUI components. The raw terminal remains a first-class native mode one action away.
+
+### Semantic renderer registry
+
+Provider adapters normalize supported output into a small provider-neutral event/card contract. A renderer registry maps known semantic kinds to specialized GPUI components for messages, tools, questions, approvals, plans, diffs, files, browser actions, usage, agents, and artifacts. Every entry has stable identity, ordering, lifecycle, accessibility text, and a bounded plain-data representation.
+
+Unknown, newly introduced, or malformed provider events use a safe generic renderer that shows source, status, title, and bounded redacted details. It never interprets unknown data as an approval, question, completed operation, or task-state transition. The user can always switch to the raw terminal for the exact provider surface.
+
+The native desktop and Connect web client consume the same semantic contract. Rust protocol definitions and golden fixtures are authoritative; generated bindings or fixture-verified decoders prevent a separately hand-maintained TypeScript meaning from drifting. Presentation is client-native, but semantics, fallbacks, and ordering are shared.
 
 ### Desktop anatomy: Task Cockpit
 
@@ -411,6 +458,21 @@ Unexpected detached descendants, PID reuse, an unowned provider child, or a supp
 
 Unix backends later use process groups, sessions, or cgroups with the same public semantics.
 
+### Closing admission barrier
+
+Close is a durable lifecycle operation, not a sequence of best-effort UI callbacks. Its first step atomically moves the target to `Closing`, advances its action epoch/runtime generation as applicable, and rejects new launches, sends, browser commands, background jobs, and side-effect retries. Previously accepted operations either settle within their bounded drain policy or are cancelled with an explicit result.
+
+Teardown is idempotent and proceeds in dependency order:
+
+1. stop admission and publish `Closing`;
+2. cancel or drain provider turns, browser automation, terminal writers, service operations, and background jobs;
+3. request graceful shutdown of owned resources;
+4. escalate after bounded deadlines and terminate the relevant Job trees;
+5. detach listeners, close PTY/IPC/WebView2 handles, flush final durable events, and reconcile ports;
+6. prove every owned Job has zero members and publish `Closed`, or publish `CleanupFailed` with residue evidence.
+
+Independent teardown branches may run concurrently within a fixed limit, but closing never creates an unbounded task fan-out. Repeating close or dispose returns the original or current settlement instead of launching duplicate cleanup. Residue diagnostics include the task/resource identity, Job name, PID plus process creation time, last known executable/command, ownership evidence, and attempted cleanup steps.
+
 ### Process identity in Windows tools
 
 DevManager-owned binaries use clear product/file descriptions such as **DevManager Host** and **DevManager Browser Host**. Each managed launch also records a human task label, role, task ID, provider, command line, Job Object name, PID, creation time, and descendant tree in Command Center diagnostics.
@@ -476,6 +538,14 @@ Desktop and phone behave as two views of one task. There is no visible “take c
 
 All subscribed clients receive immediate local echo followed by authoritative acknowledgement and ordered updates. There is no manual refresh. A missed event triggers cursor replay or a snapshot.
 
+Realtime transport has three explicit layers:
+
+- a bounded, chunked initial snapshot with a resume cursor;
+- durable ordered domain entries/events used for replay and convergence;
+- ephemeral streaming/status frames that may be coalesced or dropped under backpressure.
+
+Large child transcripts, terminal history, diffs, recordings, and artifacts are fetched incrementally on demand rather than included in every task snapshot. The host remains authoritative when optimistic local echo differs from the settled operation.
+
 ### Collaboration
 
 Collaboration controls appear only after an invite exists:
@@ -484,7 +554,9 @@ Collaboration controls appear only after an invite exists:
 - **Collaborator:** may interact within one granted task and permission envelope.
 - **Watcher:** realtime read-only access for pairing, demos, review, or management.
 
-Dangerous approvals are owner-only by default. Task-scoped guests use device-key identities, nickname, expiry, and individual revocation. They do not require organization membership. Durable employees and managers use Connect accounts and organization memberships.
+Dangerous approvals are owner-only by default. A valid response to an interactive request is fenced by request ID, action epoch, runtime generation, and granted capability. The first host-accepted response wins; every other presentation dismisses when it receives the settlement and cannot leak its stale click or keystroke into the terminal.
+
+Persistent paired owner devices and task invitations are different mechanisms. Paired owner devices retain durable, individually revocable identity across upgrades. Task invitations are simple scoped grants with nickname, expiry, individual revocation, and separate **view** and **collaborate/write** capabilities. They never reuse or reveal the long-lived pairing code. They do not inherit full owner authority, replace personal pairing, or require organization membership. Durable employees and managers use Connect accounts and organization memberships.
 
 ## DevManager Connect
 
@@ -497,7 +569,8 @@ Connect may own:
 - accounts, organizations, membership, roles, policy, billing, and retention;
 - device registration, presence, revocation, routing tickets, push notification routing, and encrypted relay;
 - project/task metadata, assignment, Kanban, dependencies, comments, handoffs, and review state for deliberately managed tasks;
-- honest management summaries for provider-reported usage, message counts/timing, active DevManager session time, Git summaries, and host health;
+- published organization prompts, immutable versions, shared manual chains, deprecation, and access policy;
+- objective management summaries for provider-reported usage, message counts/timing, active DevManager session time, Git summaries, file-change metadata, task events, and host health;
 - later DB Flow, ENV, and DevAgent EvidenceBundle modules behind explicit contracts.
 
 ### Local responsibilities
@@ -514,11 +587,20 @@ The host always owns:
 
 - **Personal:** local-only by default, even when signed into Connect.
 - **Managed metadata:** task title/state/assignment/timestamps, provider-reported usage, approved activity summaries, and Git summaries according to organization policy.
-- **Raw content:** prompts, responses, terminal, browser, recordings, file bodies, and full diffs. End-to-end encrypted and shared only with explicitly authorized viewers.
+- **Published organization content:** prompt templates/versions, shared chains, comments, policy, and similar assets deliberately published to the organization. Connect stores and serves them under organization authorization and retention rules.
+- **Raw task content:** submitted prompts, responses, terminal, browser, recordings, file bodies, and full diffs. End-to-end encrypted and shared only with explicitly authorized viewers.
 
 The relay routes opaque encrypted frames and cannot decrypt raw content. Push notifications contain only sanitized attention metadata.
 
-Management telemetry is coordination evidence, not a worker productivity score. “Active DevManager session time” uses a visible idle rule and is never presented as payroll hours worked.
+Management telemetry is coordination evidence, not a worker productivity score. It contains only explicit, auditable task/provider/session facts and their documented derivations:
+
+- stable event IDs deduplicate inherited, replayed, or copied lineage;
+- synthetic status, automation, and provider-internal messages are excluded from **messages sent**;
+- provider-reported tokens, quota, or cost remain distinct from local estimates and unavailable values;
+- Git/file summaries identify observable changes without uploading file bodies or full diffs by default;
+- **Active DevManager session time** uses a visible idle rule and is never presented as payroll hours worked.
+
+DevManager does not infer employee mood, effort, intent, quality, or risk from yelling, profanity, anguish, negation, repetition, blame, or other textual behavior heuristics. Raw prompts and responses remain local or end-to-end encrypted by default and are not an analytics input.
 
 ## Quota and provider status
 
@@ -534,7 +616,7 @@ The top bar may show at most one fresh quota/status summary per provider type, n
 
 Update detection uses signed release metadata and compares semantic versions against the installed build identity, not development files or stale cached web assets.
 
-Updating the desktop must not rotate pairing secrets, replace `remote.json`, invalidate device keys, or require a new invite code. A Connect client whose cached bundle is incompatible receives an explicit reload/update flow while its device identity remains valid.
+Updating the desktop must not rotate pairing secrets, replace `remote.json`, invalidate device keys, or require a new device pairing code. A Connect client whose cached bundle is incompatible receives an explicit reload/update flow while its device identity remains valid.
 
 The desktop and host use capability negotiation during a staged binary replacement. Compatibility is bounded to the active update handoff, not maintained as a permanent alternate product path. If a safe handoff is impossible, the updater waits for an explicit full restart rather than killing live tasks or silently starting a second host.
 
@@ -566,7 +648,9 @@ src/
   terminal/                # PTY ownership, canonical grid, scrollback
   browser/                 # WebView2 host, automation, MCP, artifacts
   workspace/               # projects, worktrees, files, Git, checkpoints
+  prompts/                 # saved prompts, versions, chains, local search
   connect/                 # E2E host client, presence, managed metadata
+  conformance/             # provider/protocol cases, manifests, traces, metrics
   ui/                      # GPUI shell, design system, task cockpit
   config/                  # supported config.json and remote.json contracts
 ```
@@ -597,8 +681,31 @@ Git history is the archive. The release does not contain a hidden old mode or ro
 - deterministic command/event transition tests;
 - idempotency, expected-revision, generation fencing, and duplicate-answer tests;
 - snapshot/replay, dropped-event, backpressure, reconnect, and forced-resync tests;
+- negotiated frame limits, chunk boundaries, resumable pagination, unknown-frame tolerance, and oversized-message rejection;
+- accepted-versus-settled receipts and operation-status recovery after reconnect;
 - schema fixtures for desktop, Connect, CLI, and version handoff;
 - corrupt database, interrupted transaction, outbox retry, and recovery tests.
+
+### Provider compatibility and conformance lab
+
+Provider compatibility is a maintained product boundary, not an informal manual check after an upstream CLI breaks. The repository contains one deterministic case matrix that adapters run against recorded fixtures or controlled runtimes. Each run writes an immutable manifest containing the case and arm IDs, DevManager/adapter revision, provider binary identity and version, advertised capabilities, platform, sanitized launch configuration, fixture/input hashes, negotiated protocol limits, timing source, and trace schema version.
+
+The lab supports baseline and variant arms so a provider version, adapter change, protocol change, or fallback can be compared against the same cases. Interrupted cases retain durable progress and can resume without repeating settled steps. Native append-only trace artifacts are the source of truth; a local SQLite index or other query mirror may be rebuilt from them and is never the canonical result.
+
+Metrics belong to versioned adapter/case definitions, not hard-coded dashboard assumptions. The initial seam metrics are:
+
+- exact resume success and correctly visible resume failure;
+- provider-session identity correlation and runtime-generation fencing;
+- semantic event fidelity, ordering, unknown-event fallback, and raw-terminal fallback;
+- launch-to-first-usable-output, first-update, command acknowledgement, settlement, stop, and close latency;
+- dropped/coalesced events, forced resyncs, queue pressure, and trace truncation;
+- descendant/process residue and owned-port residue after close or failure;
+- LLM-controlled browser command success and cleanup;
+- Connect snapshot, replay, resync, and first-response convergence.
+
+The lab measures seams DevManager owns; it does not rank model intelligence, recreate provider benchmark suites, or turn nondeterministic model output into a release gate. Sanitized shapes from real compatibility failures may be promoted into deterministic regression cases without retaining prompts, responses, credentials, user paths, or proprietary source.
+
+Ordinary CI uses recorded fixtures, fake runtimes, and process/browser harnesses under process-unique development roots. Real Claude Code, Codex, Cursor, or optional future provider checks are explicit operator-gated E2E runs using isolated development profiles, low-volume cases, and authenticated subscription CLIs. They never use the installed DevManager production profile or production browser data, and ordinary tests never consume provider quota or alter provider authentication.
 
 ### Providers
 
@@ -607,12 +714,14 @@ Git history is the archive. The release does not contain a hidden old mode or ro
 - unknown-event and terminal-only degradation tests;
 - one-process proof for conversation/raw-terminal switching;
 - native child-agent lineage when advertised and truthful aggregation otherwise;
+- validated `SpecialistResult` plus bounded raw-artifact fallback fixtures;
+- top-level concurrency accounting that does not guess or reserve slots for opaque provider-native children;
 - subscription authentication and quota staleness tests without API keys.
 
 ### Process and resources
 
 - descendant process trees, rapid exit, detached-child attempts, PID reuse, and crash tests;
-- graceful stop, escalation, Job closure, zero-member proof, and port reconciliation;
+- admission-barrier races, duplicate close/dispose, bounded drain, graceful stop, escalation, Job closure, zero-member proof, and port reconciliation;
 - CPU comparison against Task Manager semantics;
 - owned versus external listener classification;
 - repeated start/stop and application update soak tests with zero orphan processes.
@@ -641,11 +750,21 @@ Git history is the archive. The release does not contain a hidden old mode or ro
 ### Connect
 
 - desktop/phone alternating sends without visible ownership ceremony;
-- first-answer-wins and duplicate-command reconciliation;
+- first-answer-wins across request ID/action epoch/runtime generation and duplicate-command reconciliation;
 - disconnect/reconnect without refresh;
-- task-scoped watcher and collaborator permissions;
+- persistent paired owner devices plus expiring task-scoped view/collaborate invitations;
+- chunked snapshots, durable replay, ephemeral coalescing, on-demand child history, and slow-client backpressure;
 - E2E opacity proof at relay storage/log boundaries;
-- update without re-pairing and manual invite-code rotation/revocation.
+- update without re-pairing and manual device-pairing-code rotation/revocation.
+
+### Prompts
+
+- immutable personal prompt versions, readable diffs, current-version updates, search, and retention;
+- ordered manual chains with insert-between, reorder, remove, exact-version pinning, and explicit update-to-latest;
+- **Put in composer** without automatic send, advance, branching, or provider-command confusion;
+- paired-client E2E access to the host-authoritative personal library;
+- organization publish/supersede/deprecate permissions and immutable shared versions;
+- background indexing/write load that never enters input, PTY, or render hot paths.
 
 ### Installed-app isolation
 
@@ -678,17 +797,20 @@ No quota, resource, port, update, browser, Git, or management polling runs in th
 
 The implementation plan should preserve these dependency boundaries:
 
-1. **Baseline and isolation:** capture behavior/performance fixtures, production-isolation proof, and deletion inventory.
-2. **Domain and store:** durable IDs, task/agent/artifact model, command/event protocol, SQLite authority.
-3. **Host ownership:** split the kernel process, PTY/process Job ownership, local client reconnect, resource truth.
-4. **Provider adapters:** stock subscription runtimes, exact identity, semantic projection, one Primary and native children.
-5. **GPUI system:** tokens, components, preview gallery, navigation shell, Task Cockpit conversation and context dock.
-6. **Task resources:** files/diffs/checkpoints, services/ports, terminal perfection, browser ownership and full LLM validation.
-7. **Connect realtime:** pairing continuity, E2E transport, mobile task projection, invisible solo handoff, guests.
-8. **Organization plane:** accounts, managed tasks, Kanban/assignment, honest analytics, Portal module contracts.
-9. **Cutover:** complete acceptance suite, empty runtime-state start, delete replaced code, update docs/packaging, ship one architecture.
+1. **Baseline and isolation:** capture behavior/performance fixtures, production-isolation proof, deletion inventory, and the initial conformance manifest/trace runner.
+2. **Domain, store, and protocol:** durable IDs, task/agent/artifact model, accepted/settled operations, bounded framing, SQLite authority, and replay fixtures.
+3. **Kernel and realtime lanes:** split the host, serialize commands, publish chunked snapshots/durable events/ephemeral frames, and prove reconnect/backpressure.
+4. **Process ownership:** PTY/Job ownership, action epochs, closing admission barriers, resource truth, zero-member proof, and residue diagnostics.
+5. **Provider adapters:** stock subscription runtimes, exact identity, capability/version fixtures, semantic projection, one Primary, native child lineage, and explicit specialists.
+6. **GPUI system:** tokens, components, preview gallery, semantic renderer registry, safe generic fallback, navigation shell, Task Cockpit, and context dock.
+7. **Workspace and task resources:** files/diffs/checkpoints, Git/worktrees, services/ports, terminal completeness, artifacts, and review.
+8. **Prompt library and guided chains:** local saved/versioned prompts, diffs/search/history, manual chains, remote host access, and provider-command separation.
+9. **Browser:** owned WebView2 contexts, provider tool bridge, visible automation, artifacts, full real-LLM validation, and cleanup proof.
+10. **Connect realtime:** pairing continuity, E2E transport, responsive task projection, invisible solo handoff, expiring task invites, and realtime convergence.
+11. **Organization plane:** accounts, managed tasks, Kanban/assignment, published org prompts, objective analytics, privacy exclusions, and Portal module contracts.
+12. **Cutover:** full compatibility/replay/browser/process soak gates, empty runtime-state start, delete replaced code, update docs/packaging, and ship one architecture.
 
-Each slice ends with focused proof at its boundary and a complete-diff review. The implementation plan may subdivide slices but may not introduce a temporary shipped architecture that contradicts this design.
+The compatibility/conformance lab is woven through these slices rather than built as a separate user-facing subsystem. Each slice extends the shared case matrix and ends with focused proof at its boundary plus a complete-diff review. The implementation plan may subdivide slices but may not introduce a temporary shipped architecture that contradicts this design.
 
 ## Research incorporated
 
@@ -698,6 +820,36 @@ The design selectively adopts ideas rather than upstream product stacks:
 - Pi's event-driven provider surface, explicit steering/follow-up queues, session identity separation, and documented RPC boundary; DevManager does not port its TypeScript TUI or experimental server.
 - T3 Code's single execution authority, typed contracts, project/thread/turn separation, connection supervision, checkpoints, and remote-control-plane lessons; DevManager does not adopt Electron/Node as its runtime.
 - Traycer's task/agent/artifact hierarchy, conversation navigation, queued prompts, artifact review, and collaboration patterns; DevManager keeps the stronger local Rust authority and private-by-default raw-content boundary.
+- Oh My Pi's conformance experiments, bounded RPC, renderer registry, task cleanup, collaboration transport, provider lineage, and local search patterns; DevManager borrows these infrastructure patterns around stock provider CLIs rather than adopting Oh My Pi as its harness.
+
+### Oh My Pi selective-adoption boundary
+
+The reviewed source is [Oh My Pi at commit `5af71dc9cf132538e072806424f71f43f734d9ae`](https://github.com/can1357/oh-my-pi/tree/5af71dc9cf132538e072806424f71f43f734d9ae), under its [MIT license](https://github.com/can1357/oh-my-pi/blob/5af71dc9cf132538e072806424f71f43f734d9ae/LICENSE). The rule is **borrow the frame, not the engine**.
+
+Adopt now as independently implemented DevManager infrastructure:
+
+- immutable experiment/run manifests, comparable arms, deterministic cases, resumable runs, native trace truth, and adapter-owned metrics from [metaharness](https://github.com/can1357/oh-my-pi/blob/5af71dc9cf132538e072806424f71f43f734d9ae/packages/metaharness/README.md);
+- bounded framing, chunked large results, capability negotiation, accepted-versus-completed operations, and forward-compatible unknown-message handling from its [RPC design](https://github.com/can1357/oh-my-pi/blob/5af71dc9cf132538e072806424f71f43f734d9ae/docs/rpc.md);
+- known semantic renderers with a safe generic fallback from its collaboration UI, expressed once in DevManager's Rust-owned protocol;
+- explicit task/child lineage and typed result artifacts when providers expose them, without taking over the stock provider's subagent scheduler;
+- lifecycle admission barriers, idempotent disposal, bounded cleanup, and durable ownership evidence, strengthened on Windows with PID plus process creation time and Job Object zero-member proof;
+- layered collaboration transport: chunked initial state, durable replayable events, ephemeral streams, backpressure, and incremental child/artifact retrieval;
+- local full-text prompt history and batched background persistence, while keeping saved prompts, recent history, and provider-native commands separate.
+
+Defer behind evidence and a later explicit design decision:
+
+- Oh My Pi as an optional provider through its documented RPC or ACP boundary;
+- copy-on-write/ProjFS workspace isolation inspired by [`pi-iso`](https://github.com/can1357/oh-my-pi/tree/5af71dc9cf132538e072806424f71f43f734d9ae/crates/pi-iso). Ordinary visible Git worktrees remain the default until dirty-state semantics, crash recovery, cleanup, and Git-equivalent behavior are proven;
+- advisor presentation, advanced LSP/DAP surfaces, desktop-control/browser relays beyond the owned browser design, and cross-host personal prompt replication.
+
+Reject from DevManager's core architecture:
+
+- embedding or forking Oh My Pi's harness, direct model API control, or replacing stock authenticated Claude Code, Codex, or Cursor CLIs;
+- a DevManager-native subagent scheduler, unrestricted plugin runtime inside the trusted host, general agent-to-agent bus, or swarm/DAG workflow engine;
+- provider-specific edit/hashline tools, retries, compaction, memory, and planning already owned by the official harnesses;
+- behavioral or emotional scoring of user text for management analytics.
+
+Any substantial source copied from Oh My Pi must preserve its copyright and MIT license notices. Its TypeScript/Bun/React packages are not a natural fit for the Rust/GPUI product, so architectural and test semantics are preferred over whole-package ports. The Rust `pi-iso` crate is the closest direct code candidate, but it is not on the initial critical path.
 
 Useful primary references include:
 
@@ -705,6 +857,10 @@ Useful primary references include:
 - [Pi coding agent RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
 - [Pi session format](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md)
 - [T3 Code architecture overview](https://github.com/pingdotgg/t3code/blob/main/docs/internals/overview.md)
+- [Oh My Pi SDK lifecycle](https://github.com/can1357/oh-my-pi/blob/5af71dc9cf132538e072806424f71f43f734d9ae/docs/sdk.md)
+- [Oh My Pi task coordination](https://github.com/can1357/oh-my-pi/blob/5af71dc9cf132538e072806424f71f43f734d9ae/docs/tools/task.md)
+- [Oh My Pi collaboration protocol](https://github.com/can1357/oh-my-pi/blob/5af71dc9cf132538e072806424f71f43f734d9ae/docs/collab.md)
+- [Oh My Pi session model](https://github.com/can1357/oh-my-pi/blob/5af71dc9cf132538e072806424f71f43f734d9ae/docs/session.md)
 
 ## Final invariants
 
@@ -720,3 +876,6 @@ Useful primary references include:
 10. An update never rotates pairing identity or silently sacrifices live work.
 11. The desktop has one native GPUI design system and one Task Cockpit.
 12. The cutover ships one architecture and deletes the replaced one.
+13. Protocol payloads, queues, snapshots, and histories are bounded and resumable.
+14. Prompt chains guide a human; they never become a hidden automation harness.
+15. Compatibility measurements cover DevManager-owned seams, not model intelligence or employee behavior.
