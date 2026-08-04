@@ -2,6 +2,7 @@ pub mod ai;
 pub mod app;
 pub mod assets;
 pub mod browser;
+pub mod config;
 pub mod diagnostics;
 pub mod git;
 pub mod icons;

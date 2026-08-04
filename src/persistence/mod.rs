@@ -1,3 +1,4 @@
+use crate::config::paths::{resolve_app_paths, AppProfile, BuildKind};
 use crate::models::{AppConfig, SessionState, Settings, CURRENT_CONFIG_VERSION};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::OnceLock;
 
+#[cfg(test)]
 const APP_CONFIG_DIR: &str = "com.userfirst.devmanager";
 const APP_PROFILE_ENV: &str = "DEVMANAGER_PROFILE";
 const APP_INSTANCE_LABEL_ENV: &str = "DEVMANAGER_INSTANCE_LABEL";
@@ -119,9 +121,32 @@ fn default_debug_profile() -> Option<String> {
 }
 
 fn app_config_dir_for(base: &Path, profile: Option<&str>) -> PathBuf {
-    match profile {
-        Some(profile) => base.join(format!("{APP_CONFIG_DIR}-{profile}")),
-        None => base.join(APP_CONFIG_DIR),
+    #[cfg(test)]
+    {
+        let app_profile = match profile {
+            Some(name) => AppProfile::UnitTest(name.to_string()),
+            None => AppProfile::UnitTest(String::new()),
+        };
+        resolve_app_paths(base, app_profile, BuildKind::Test)
+            .expect("unit-test app path resolution")
+            .root
+    }
+    #[cfg(not(test))]
+    {
+        let (app_profile, build_kind) = match profile {
+            Some(name) => {
+                let build_kind = if cfg!(debug_assertions) {
+                    BuildKind::Debug
+                } else {
+                    BuildKind::Release
+                };
+                (AppProfile::Named(name.to_string()), build_kind)
+            }
+            None => (AppProfile::Production, BuildKind::Release),
+        };
+        resolve_app_paths(base, app_profile, build_kind)
+            .expect("app path resolution")
+            .root
     }
 }
 
