@@ -4637,41 +4637,98 @@ fn load_artifacts(
     let rows = stmt.query_map([task_id.as_bytes().as_slice()], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
+            ArtifactProjectionFields {
+                kind: row.get(1)?,
+                label: row.get(2)?,
+                content_ref: row.get(3)?,
+                sha256: row.get(4)?,
+                privacy_class: row.get(5)?,
+                created_at_ms: row.get(6)?,
+            },
         ))
     })?;
     let mut artifacts = BTreeMap::new();
     for row in rows {
-        let (id_bytes, kind, label, content_ref, sha256, privacy_class, created_at_ms) = row?;
+        let (id_bytes, fields) = row?;
         let id = id16::<ArtifactId>("artifacts.artifact_id", &id_bytes)?;
-        let sha256_array: [u8; 32] =
-            sha256
-                .as_slice()
-                .try_into()
-                .map_err(|_| StoreError::CodecMismatch {
-                    detail: "artifacts.sha256 must be 32 bytes".into(),
-                })?;
-        let artifact = ArtifactFacts {
-            id,
-            task_id,
-            kind: parse_artifact_kind(&kind)?,
-            label,
-            content_ref: unpack_projection_blob("artifacts.content_ref", &content_ref)?,
-            sha256: sha256_array,
-            privacy_class: parse_privacy(&privacy_class)?,
-            created_at_ms,
-        };
-        artifact
-            .validate()
-            .map_err(|err| StoreError::Projection(err.to_string()))?;
+        let artifact = decode_artifact_projection(id, task_id, fields)?;
         artifacts.insert(id, artifact);
     }
     Ok(artifacts)
+}
+
+struct ArtifactProjectionFields {
+    kind: String,
+    label: String,
+    content_ref: Vec<u8>,
+    sha256: Vec<u8>,
+    privacy_class: String,
+    created_at_ms: i64,
+}
+
+pub(crate) fn load_artifact(
+    conn: &Connection,
+    artifact_id: ArtifactId,
+) -> Result<Option<ArtifactFacts>, StoreError> {
+    let row: Option<(Vec<u8>, ArtifactProjectionFields)> = conn
+        .query_row(
+            "SELECT task_id, kind, label, content_ref, sha256, privacy_class, created_at_ms
+             FROM artifacts WHERE artifact_id = ?1",
+            [artifact_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    ArtifactProjectionFields {
+                        kind: row.get(1)?,
+                        label: row.get(2)?,
+                        content_ref: row.get(3)?,
+                        sha256: row.get(4)?,
+                        privacy_class: row.get(5)?,
+                        created_at_ms: row.get(6)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    let Some((task_id, fields)) = row else {
+        return Ok(None);
+    };
+    let task_id = id16::<TaskId>("artifacts.task_id", &task_id)?;
+    load_task_row(conn, task_id)?.ok_or(StoreError::Corruption)?;
+    Ok(Some(decode_artifact_projection(
+        artifact_id,
+        task_id,
+        fields,
+    )?))
+}
+
+fn decode_artifact_projection(
+    id: ArtifactId,
+    task_id: TaskId,
+    fields: ArtifactProjectionFields,
+) -> Result<ArtifactFacts, StoreError> {
+    let sha256: [u8; 32] =
+        fields
+            .sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::CodecMismatch {
+                detail: "artifacts.sha256 must be 32 bytes".into(),
+            })?;
+    let artifact = ArtifactFacts {
+        id,
+        task_id,
+        kind: parse_artifact_kind(&fields.kind)?,
+        label: fields.label,
+        content_ref: unpack_projection_blob("artifacts.content_ref", &fields.content_ref)?,
+        sha256,
+        privacy_class: parse_privacy(&fields.privacy_class)?,
+        created_at_ms: fields.created_at_ms,
+    };
+    artifact
+        .validate()
+        .map_err(|err| StoreError::Projection(err.to_string()))?;
+    Ok(artifact)
 }
 
 fn load_resources(
