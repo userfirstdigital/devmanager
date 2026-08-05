@@ -966,6 +966,37 @@ fn protocol_command_receipt_preserves_command_and_accepted_operation_correlation
             receipt
         );
     }
+
+    for (index, (code, wire_name)) in [
+        (RejectionCode::NotFound, "not_found"),
+        (RejectionCode::AlreadyExists, "already_exists"),
+        (RejectionCode::RevisionConflict, "revision_conflict"),
+        (RejectionCode::InvalidTransition, "invalid_transition"),
+        (RejectionCode::OwnershipConflict, "ownership_conflict"),
+        (
+            RejectionCode::UnsupportedCapability,
+            "unsupported_capability",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let receipt = CommandReceipt::Rejected {
+            command_id: protocol_command_id(0xA0 + u8::try_from(index).unwrap()),
+            code,
+            current_revision: Some(3),
+        };
+        assert_eq!(
+            codec
+                .decode::<CommandReceipt>(&codec.encode(&receipt).unwrap())
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            rmp_serde::to_vec(&code).unwrap(),
+            rmp_serde::to_vec(&wire_name).unwrap()
+        );
+    }
 }
 
 fn push_messagepack<T: serde::Serialize + ?Sized>(bytes: &mut Vec<u8>, value: &T) {
@@ -1087,6 +1118,22 @@ fn protocol_command_receipt_rejects_alternate_or_open_shapes() {
         codec.decode::<CommandReceipt>(&unknown_code),
         Err(MessagePackError::Decode)
     );
+
+    for numeric in 0_u8..=5 {
+        let mut numeric_code = vec![0x81];
+        push_messagepack(&mut numeric_code, "rejected");
+        numeric_code.push(0x83);
+        push_messagepack(&mut numeric_code, "command_id");
+        push_messagepack(&mut numeric_code, &protocol_command_id(0x6b));
+        push_messagepack(&mut numeric_code, "code");
+        push_messagepack(&mut numeric_code, &numeric);
+        push_messagepack(&mut numeric_code, "current_revision");
+        push_messagepack(&mut numeric_code, &Option::<u64>::None);
+        assert_eq!(
+            codec.decode::<CommandReceipt>(&numeric_code),
+            Err(MessagePackError::Decode)
+        );
+    }
 
     let mut trailing = accepted_receipt_bytes(4);
     trailing.push(0xc0);
@@ -1296,6 +1343,18 @@ fn protocol_query_envelope_rejects_alternate_or_open_shapes() {
 #[test]
 fn protocol_operation_state_preserves_every_closed_named_shape() {
     let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    assert_eq!(
+        rmp_serde::to_vec(&OperationErrorCode::SideEffectFailed).unwrap(),
+        rmp_serde::to_vec(&"side_effect_failed").unwrap()
+    );
+    assert_eq!(
+        rmp_serde::to_vec(&CancellationReason::Superseded).unwrap(),
+        rmp_serde::to_vec(&"superseded").unwrap()
+    );
+    assert_eq!(
+        rmp_serde::to_vec(&OperationUncertaintyCode::AmbiguousDispatch).unwrap(),
+        rmp_serde::to_vec(&"ambiguous_dispatch").unwrap()
+    );
     let states = [
         OperationState::Accepted,
         OperationState::Settled {
@@ -1485,6 +1544,35 @@ fn protocol_operation_state_rejects_alternate_or_open_shapes() {
     ] {
         assert_eq!(
             codec.decode::<OperationState>(&unknown_code),
+            Err(MessagePackError::Decode)
+        );
+    }
+
+    for numeric_code in [
+        operation_state_map(
+            "failed",
+            &RawCodeState {
+                settled_at_ms: 1,
+                code: 0_u8,
+            },
+        ),
+        operation_state_map(
+            "cancelled",
+            &RawReasonState {
+                settled_at_ms: 1,
+                reason: 0_u8,
+            },
+        ),
+        operation_state_map(
+            "uncertain",
+            &RawUncertainState {
+                observed_at_ms: 1,
+                code: 0_u8,
+            },
+        ),
+    ] {
+        assert_eq!(
+            codec.decode::<OperationState>(&numeric_code),
             Err(MessagePackError::Decode)
         );
     }

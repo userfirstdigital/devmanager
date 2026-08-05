@@ -16,7 +16,7 @@ use crate::domain::task::{
     TaskLifecycle, WorkspaceRef,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectionCode {
     NotFound,
@@ -25,6 +25,50 @@ pub enum RejectionCode {
     InvalidTransition,
     OwnershipConflict,
     UnsupportedCapability,
+}
+
+impl<'de> Deserialize<'de> for RejectionCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RejectionCodeVisitor;
+
+        impl Visitor<'_> for RejectionCodeVisitor {
+            type Value = RejectionCode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named RejectionCode")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "not_found" => Ok(RejectionCode::NotFound),
+                    "already_exists" => Ok(RejectionCode::AlreadyExists),
+                    "revision_conflict" => Ok(RejectionCode::RevisionConflict),
+                    "invalid_transition" => Ok(RejectionCode::InvalidTransition),
+                    "ownership_conflict" => Ok(RejectionCode::OwnershipConflict),
+                    "unsupported_capability" => Ok(RejectionCode::UnsupportedCapability),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &[
+                            "not_found",
+                            "already_exists",
+                            "revision_conflict",
+                            "invalid_transition",
+                            "ownership_conflict",
+                            "unsupported_capability",
+                        ],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(RejectionCodeVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
