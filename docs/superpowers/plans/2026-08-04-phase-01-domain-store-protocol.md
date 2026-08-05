@@ -346,6 +346,8 @@ Safe dispatch/reconciliation callback APIs do not accept durable event timestamp
 
 ### Task 1.6: Define capability negotiation and bounded MessagePack framing
 
+**Lean checkpoint:** Phase 1 establishes only the handshake, physical/message bounds, and command/query envelopes required to start the first Phase 2 host/client path. Subscription details, large-message chunk transfer, and golden fixtures are implemented alongside that first real consumer rather than perfected speculatively here.
+
 **Files:** `src/protocol/{mod,capabilities,envelope,frame,chunk}.rs`, `tests/protocol_contract.rs`, `tests/fixtures/protocol/v1/*`
 
 **Wire handshake:**

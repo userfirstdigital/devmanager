@@ -10,6 +10,14 @@
 
 ## Global Constraints
 
+### Lean execution contract
+
+- Aim for a useful, reviewable vertical slice in roughly 30 minutes. This is a cadence target, not a quality deadline.
+- If one slice reaches 60 minutes, stop and reassess the process before continuing: narrow the slice, reuse an existing implementation, defer detail until a real consumer needs it, or change the approach.
+- Detailed phase bullets describe the finished architecture, not permission to perfect an unused subsystem in isolation. Implement the smallest production-quality boundary needed by the next end-to-end path, then advance.
+- Each slice gets one focused proof, one bounded review, and one commit. Batch broad Rust and phase gates at coherent integration checkpoints instead of rerunning them after every small type or wire shape.
+- Preserve safety, data durability, exact-resume behavior, and process ownership throughout. Lean execution removes speculative work; it does not weaken these product invariants.
+
 - Desktop UI is native GPUI only; do not add Tauri, Electron, React, DOM, or an embedded web shell to the desktop.
 - Keep one Rust application package. Phase 9 may add only the narrowly scoped `connect-crypto` Rust/WASM leaf after its dual-target proof demonstrates that one shared security implementation is safer than divergent native/browser code; this does not authorize a general workspace split.
 - Ship one desktop architecture. Development may use a separately named preview binary/profile, but no old/new runtime switch or compatibility mode may ship.
