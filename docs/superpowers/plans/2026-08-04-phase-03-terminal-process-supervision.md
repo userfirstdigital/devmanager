@@ -15,6 +15,7 @@
 - `Unknown`/untracked is a reconciliation fault, not a fourth steady ownership class; steady observations are Task-owned, Host-owned, or External.
 - A managed root must be created suspended, assigned to its Job Object, and only then resumed. If assignment fails, terminate the still-suspended process and report failure.
 - Child membership comes from the Job Object, not a one-time parent-PID walk. Parent-PID enumeration may enrich labels but is not ownership truth.
+- A cached, cycle-safe Toolhelp snapshot and per-resource environment marker may enrich foreground-process labels and recover attribution through shells, following Herdr's Windows approach; neither may grant ownership, kill authority, or override Job membership.
 - Closing a terminal view or desktop client does not close its PTY. Closing a task or full quit invokes explicit supervisor teardown.
 - Once Task/host admission is `Closing`, no new root, PTY, input, service operation, or retry may enter that scope. Every completion is fenced by owner, action epoch, resource ID, generation, PID, and creation time.
 - One PTY read feeds one canonical grid. Semantic and raw views do not create extra readers or provider processes.

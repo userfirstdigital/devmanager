@@ -16,6 +16,7 @@
 - `providerSessionId` is accepted only from a correlated, current-generation provider event/hook. Never infer it from cwd, newest transcript, timestamps, filenames, or terminal text.
 - DevManager task events/lineage are DevManager facts, not a reconstructed provider conversation tree. Never rewrite, fork, or claim ownership of provider-private context.
 - Exact resume is the default for an open remembered session. Resume failure remains visible and must not fall back to a new conversation.
+- Each provider pane has one lifecycle authority. Complete provider hooks own lifecycle; incomplete hooks may contribute exact session identity only, while versioned detection manifests supply lifecycle fallback. Competing signals never overwrite each other opportunistically.
 - User actions are `Stop turn`, `Close`, `Resume`, and `New conversation`; there is no generic LLM `Restart` action.
 - Provider upgrades should degrade to terminal-only operation when semantic hooks change, while keeping the provider process usable and visibly marking unsupported features.
 - Primary/specialist orchestration never invents a second planner. A stock Primary may use its native child-agent feature; cross-provider specialists receive explicit bounded work and return artifacts.
