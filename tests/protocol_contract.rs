@@ -3,8 +3,8 @@
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::domain::{
-    ClientId, Command, CommandEnvelope, CommandId, CommandReceipt, EventId, OperationId,
-    RejectionCode, TaskId,
+    ClientId, Command, CommandEnvelope, CommandId, CommandReceipt, EventId, OperationId, Query,
+    QueryEnvelope, RejectionCode, RequestId, TaskId,
 };
 use devmanager::protocol::{
     Capability, CapabilitySet, ClientBuildError, ClientHello, ClientHelloError, FrameLimitField,
@@ -539,6 +539,10 @@ fn protocol_operation_id(tail: u8) -> OperationId {
 
 fn protocol_event_id(tail: u8) -> EventId {
     EventId::from_bytes(protocol_uuid_v7(tail)).expect("event id")
+}
+
+fn protocol_request_id(tail: u8) -> RequestId {
+    RequestId::from_bytes(protocol_uuid_v7(tail)).expect("request id")
 }
 
 #[test]
@@ -1086,6 +1090,201 @@ fn protocol_command_receipt_rejects_alternate_or_open_shapes() {
     trailing.push(0xc0);
     assert_eq!(
         codec.decode::<CommandReceipt>(&trailing),
+        Err(MessagePackError::TrailingBytes {
+            offset: u32::try_from(trailing.len() - 1).unwrap(),
+        })
+    );
+}
+
+#[test]
+fn protocol_query_envelope_is_one_strict_named_correlation_map() {
+    let expected = QueryEnvelope {
+        request_id: protocol_request_id(0x71),
+        client_id: protocol_client_id(0x72),
+        task_id: Some(protocol_task_id(0x73)),
+        query: Query::OperationStatus {
+            operation_id: protocol_operation_id(0x74),
+        },
+    };
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+
+    let encoded = codec.encode(&expected).expect("encode query envelope");
+    assert_eq!(encoded[0], 0x84, "QueryEnvelope is a four-field map");
+    assert_eq!(
+        rmp_serde::to_vec(&expected).expect("direct query envelope serialization")[0],
+        0x84,
+        "compact serializers cannot create a positional query shape"
+    );
+    assert_eq!(
+        codec
+            .decode::<QueryEnvelope>(&encoded)
+            .expect("decode query envelope"),
+        expected
+    );
+
+    let unscoped = QueryEnvelope {
+        request_id: protocol_request_id(0x75),
+        client_id: protocol_client_id(0x76),
+        task_id: None,
+        query: Query::OperationStatus {
+            operation_id: protocol_operation_id(0x77),
+        },
+    };
+    assert_eq!(
+        codec
+            .decode::<QueryEnvelope>(&codec.encode(&unscoped).expect("encode null task scope"))
+            .expect("decode explicit null task scope"),
+        unscoped
+    );
+}
+
+#[derive(serde::Serialize)]
+struct RawQueryEnvelope<Q> {
+    request_id: RequestId,
+    client_id: ClientId,
+    task_id: Option<TaskId>,
+    query: Q,
+}
+
+fn raw_query_envelope<Q>(query: Q) -> RawQueryEnvelope<Q> {
+    RawQueryEnvelope {
+        request_id: protocol_request_id(0x78),
+        client_id: protocol_client_id(0x79),
+        task_id: Some(protocol_task_id(0x7a)),
+        query,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawUnknownQuery {
+    FutureQuery,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawPositionalQuery {
+    OperationStatus((OperationId,)),
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawOpenQuery {
+    OperationStatus {
+        operation_id: OperationId,
+        future_field: bool,
+    },
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawMissingQuery {
+    OperationStatus {},
+}
+
+#[derive(serde::Serialize)]
+struct RawOperationStatusPayload {
+    operation_id: OperationId,
+}
+
+struct RawMultipleQuery;
+
+impl serde::Serialize for RawMultipleQuery {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry(
+            "operation_status",
+            &RawOperationStatusPayload {
+                operation_id: protocol_operation_id(0x7b),
+            },
+        )?;
+        map.serialize_entry("future_query", &())?;
+        map.end()
+    }
+}
+
+#[test]
+fn protocol_query_envelope_rejects_alternate_or_open_shapes() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let valid = raw_query_envelope(Query::OperationStatus {
+        operation_id: protocol_operation_id(0x7b),
+    });
+    let valid_bytes = rmp_serde::to_vec_named(&valid).expect("valid raw query");
+
+    let positional = (
+        valid.request_id,
+        valid.client_id,
+        valid.task_id,
+        Query::OperationStatus {
+            operation_id: protocol_operation_id(0x7b),
+        },
+    );
+    assert_eq!(
+        codec.decode::<QueryEnvelope>(&rmp_serde::to_vec(&positional).unwrap()),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut duplicate = valid_bytes.clone();
+    duplicate[0] = 0x85;
+    push_messagepack(&mut duplicate, "request_id");
+    push_messagepack(&mut duplicate, &valid.request_id);
+    assert_eq!(
+        codec.decode::<QueryEnvelope>(&duplicate),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut unknown = valid_bytes.clone();
+    unknown[0] = 0x85;
+    push_messagepack(&mut unknown, "future_field");
+    unknown.push(0xc0);
+    assert_eq!(
+        codec.decode::<QueryEnvelope>(&unknown),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut missing = valid_bytes.clone();
+    let query_suffix = [
+        rmp_serde::to_vec(&"query").unwrap(),
+        rmp_serde::to_vec_named(&valid.query).unwrap(),
+    ]
+    .concat();
+    assert!(missing.ends_with(&query_suffix));
+    missing[0] = 0x83;
+    missing.truncate(missing.len() - query_suffix.len());
+    assert_eq!(
+        codec.decode::<QueryEnvelope>(&missing),
+        Err(MessagePackError::Decode)
+    );
+
+    for malformed_query in [
+        rmp_serde::to_vec_named(&raw_query_envelope(RawUnknownQuery::FutureQuery)).unwrap(),
+        rmp_serde::to_vec_named(&raw_query_envelope(RawPositionalQuery::OperationStatus((
+            protocol_operation_id(0x7b),
+        ))))
+        .unwrap(),
+        rmp_serde::to_vec_named(&raw_query_envelope(RawOpenQuery::OperationStatus {
+            operation_id: protocol_operation_id(0x7b),
+            future_field: true,
+        }))
+        .unwrap(),
+        rmp_serde::to_vec_named(&raw_query_envelope(RawMissingQuery::OperationStatus {})).unwrap(),
+        rmp_serde::to_vec_named(&raw_query_envelope(RawMultipleQuery)).unwrap(),
+    ] {
+        assert_eq!(
+            codec.decode::<QueryEnvelope>(&malformed_query),
+            Err(MessagePackError::Decode)
+        );
+    }
+
+    let mut trailing = valid_bytes;
+    trailing.push(0xc0);
+    assert_eq!(
+        codec.decode::<QueryEnvelope>(&trailing),
         Err(MessagePackError::TrailingBytes {
             offset: u32::try_from(trailing.len() - 1).unwrap(),
         })
