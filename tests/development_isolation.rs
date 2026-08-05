@@ -817,6 +817,336 @@ Write-Output 'SYNTHETIC_ISOLATION_OK'
 }
 
 #[test]
+fn phase_gate_wraps_commands_with_baseline_and_cleanup_checks() {
+    let source = std::fs::read_to_string("scripts/native-next/Invoke-PhaseGate.ps1").unwrap();
+    let phase_gate = std::fs::read_to_string("scripts/native-next/PhaseGate.ps1").unwrap();
+    let isolation = std::fs::read_to_string("scripts/native-next/Isolation.ps1").unwrap();
+
+    for required in [
+        "Capture-ProductionBaseline.ps1",
+        "Assert-ProductionUnchanged.ps1",
+        "processes-before.json",
+        "processes-after.json",
+        "verification.json",
+        "LongRustRun",
+        "cleanupResult",
+        "ProcessStartInfo",
+        "ArgumentList",
+        "Resolve-DevManagerPhaseGateRecipe",
+        "Stopwatch",
+        "runId",
+        "runDirectory",
+        "CARGO_TARGET_DIR",
+        "WorkingDirectory",
+        "native-next-dev",
+        "PhaseGate.ps1",
+        "cargo-version",
+        "cargo-fmt-check",
+        "development-isolation-tests",
+        "library-tests-serial",
+        "Get-Command",
+        "-All",
+        "evidenceWriteFailed",
+        "unavailable",
+    ] {
+        assert!(
+            source.contains(required) || phase_gate.contains(required),
+            "missing {required}"
+        );
+    }
+
+    let tokens = phase_gate_public_param_names();
+    assert_eq!(
+        tokens,
+        vec![
+            "Phase".to_string(),
+            "Recipe".to_string(),
+            "LongRustRun".to_string(),
+        ],
+        "public params must be exactly Phase/Recipe/LongRustRun; got {tokens:?}"
+    );
+
+    for forbidden in [
+        "Stop-Process",
+        "taskkill",
+        "Kill($true)",
+        "ProductionProfile",
+        "KillTarget",
+        "BroadKill",
+        "Resolve-DevManagerPhaseGateExecutionPlan",
+        "pwsh-file",
+        "AllowDevelopmentProcesses",
+        "phase-00-tests",
+        "conformance_manifest",
+        ".cargo\\bin",
+        "originalGuardFailure -match",
+        "'allowed'",
+    ] {
+        assert!(
+            !source.contains(forbidden) && !phase_gate.contains(forbidden),
+            "phase gate must not contain {forbidden}"
+        );
+    }
+
+    assert!(
+        source.contains(
+            "$evidenceWriteFailed = $true\n        $observationFailure = [string]$_.Exception.Message"
+        ),
+        "a failed real after-inventory publication must stay an evidence failure even if the fallback envelope publishes"
+    );
+    assert!(
+        !isolation.contains("AllowOverwrite"),
+        "shared evidence publication must infer the mutable current namespace and expose no generic overwrite switch"
+    );
+
+    let param_region = source
+        .split("param(")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .unwrap_or("");
+    assert!(
+        !param_region.contains("$Command") && !param_region.contains("$Arguments"),
+        "Invoke-PhaseGate must not expose Command/Arguments parameters"
+    );
+    assert!(
+        !source.contains("verificationWriteFailure  ="),
+        "verification object must not publish verificationWriteFailure"
+    );
+}
+
+fn phase_gate_public_param_names() -> Vec<String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('scripts/native-next/Invoke-PhaseGate.ps1', [ref]$tokens, [ref]$errors)
+if ($errors -and $errors.Count -gt 0) { throw (($errors | ForEach-Object { $_.ToString() }) -join '; ') }
+(@($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) -join ',')
+"#;
+    let output = run_pwsh(script);
+    assert!(
+        output.status.success(),
+        "param parse failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+#[test]
+fn phase_gate_recipes_and_synthetic_runner_contracts() {
+    let fixture = SyntheticIsolationFixture::create();
+    let script_path = fixture.evidence_dir.join("phase-gate-recipe-test.ps1");
+    let body = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$harness = Join-Path '{evidence}' 'phase-gate-recipe'
+$scriptRoot = Join-Path $harness 'scripts\native-next'
+$evidenceRoot = Join-Path $harness '.devmanager-next\evidence'
+New-Item -ItemType Directory -Force -Path $scriptRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
+Set-Content -LiteralPath (Join-Path $harness 'Cargo.toml') -Value "[package]`nname='x'`nversion='0.0.0'`nedition='2021'`n" -Encoding utf8
+New-Item -ItemType Directory -Force -Path (Join-Path $harness 'src') | Out-Null
+Set-Content -LiteralPath (Join-Path $harness 'src\lib.rs') -Value 'pub fn x()->i32{{1}}' -Encoding utf8
+Copy-Item 'scripts/native-next/Isolation.ps1' (Join-Path $scriptRoot 'Isolation.ps1') -Force
+Copy-Item 'scripts/native-next/PhaseGate.ps1' (Join-Path $scriptRoot 'PhaseGate.ps1') -Force
+Copy-Item 'scripts/native-next/Invoke-PhaseGate.ps1' (Join-Path $scriptRoot 'Invoke-PhaseGate.ps1') -Force
+@'
+param([Parameter(Mandatory=$true)][string]$OutputPath)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'Isolation.ps1')
+$resolved = Resolve-DevManagerEvidenceArgument -Path $OutputPath -ScriptRoot $PSScriptRoot
+$root = Get-DevManagerNativeNextWorktreeRoot -ScriptRoot $PSScriptRoot
+$evidenceRoot = Get-DevManagerNativeNextEvidenceRoot -ScriptRoot $PSScriptRoot
+$fakeProduction = Join-Path $root '.devmanager-next\fake-production'
+New-Item -ItemType Directory -Force -Path $fakeProduction | Out-Null
+$config = Join-Path $fakeProduction 'config.json'
+$remote = Join-Path $fakeProduction 'remote.json'
+if (-not (Test-Path -LiteralPath $config)) {{
+  Set-Content -LiteralPath $config -Value '{{"theme":"dark"}}' -Encoding utf8
+  Set-Content -LiteralPath $remote -Value '{{"hostId":"x"}}' -Encoding utf8
+}}
+$state = [pscustomobject]@{{
+  schemaVersion = [int]1
+  capturedAtUtc = [DateTime]::UtcNow.ToString('o')
+  productionRoot = $fakeProduction
+  config = Get-ProtectedFileState -LiteralPath $config
+  remote = Get-ProtectedFileState -LiteralPath $remote
+  sessionPath = (Join-Path $fakeProduction 'session.json')
+  installedProcesses = [object[]]@()
+}}
+Assert-DevManagerEvidencePathSafeForIO -LiteralPath $resolved -ProtectedProductionRoot $fakeProduction -AllowedEvidenceRoot $evidenceRoot
+Write-DevManagerBaseline -State $state -OutputPath $resolved -AllowedEvidenceRoot $evidenceRoot
+'@ | Set-Content (Join-Path $scriptRoot 'Capture-ProductionBaseline.ps1') -Encoding utf8
+@'
+param([Parameter(Mandatory=$true)][string]$BaselinePath)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'Isolation.ps1')
+$resolved = Resolve-DevManagerEvidenceArgument -Path $BaselinePath -ScriptRoot $PSScriptRoot
+if (-not (Test-Path -LiteralPath $resolved)) {{ throw "missing baseline $resolved" }}
+'@ | Set-Content (Join-Path $scriptRoot 'Assert-ProductionUnchanged.ps1') -Encoding utf8
+. (Join-Path $scriptRoot 'Isolation.ps1')
+. (Join-Path $scriptRoot 'PhaseGate.ps1')
+$expected = [ordered]@{{
+  'cargo-version' = @('--version')
+  'cargo-fmt-check' = @('fmt','--all','--','--check')
+  'development-isolation-tests' = @('test','--test','development_isolation','--','--test-threads=1')
+  'library-tests-serial' = @('test','--lib','--','--test-threads=1')
+}}
+$recipes = Get-DevManagerPhaseGateRecipeTable
+foreach ($name in $expected.Keys) {{
+  if (-not $recipes.Contains($name)) {{ throw "missing recipe $name" }}
+  $got = @($recipes[$name]); $want = @($expected[$name])
+  if (($got -join '|') -cne ($want -join '|')) {{ throw "args mismatch $name : got=$($got -join ' ') want=$($want -join ' ')" }}
+}}
+if (@($recipes.Keys).Count -ne 4) {{ throw 'exactly four recipes' }}
+if ($recipes.Contains('phase-00-tests')) {{ throw 'phase-00-tests must be removed' }}
+$originalPath = [string]$env:Path
+$realCargo = @(Get-Command -Name 'cargo' -All -CommandType Application -ErrorAction SilentlyContinue |
+  Where-Object {{ [System.IO.Path]::GetFileName([string]$_.Source) -ieq 'cargo.exe' }} |
+  ForEach-Object {{ [System.IO.Path]::GetFullPath([string]$_.Source) }} |
+  Select-Object -Unique)
+if ($realCargo.Count -lt 1) {{ throw 'need at least one real cargo.exe on PATH for harness' }}
+$cargoA = Join-Path $harness 'cargo-a'
+$cargoB = Join-Path $harness 'cargo-b'
+New-Item -ItemType Directory -Force -Path $cargoA,$cargoB | Out-Null
+Copy-Item -LiteralPath $realCargo[0] -Destination (Join-Path $cargoA 'cargo.exe') -Force
+Copy-Item -LiteralPath $realCargo[0] -Destination (Join-Path $cargoB 'cargo.exe') -Force
+$env:Path = "$cargoA;$cargoB"
+$ambiguous = $false
+try {{ $null = Resolve-DevManagerPhaseGateRecipe -Recipe 'cargo-version' -WorktreeRoot $harness }} catch {{ $ambiguous = $true }}
+if (-not $ambiguous) {{ throw 'ambiguous cargo must fail closed' }}
+$pinnedCargoDir = Split-Path -Parent $realCargo[0]
+$filteredPath = @(
+  foreach ($part in ($originalPath -split ';')) {{
+    if ([string]::IsNullOrWhiteSpace($part)) {{ continue }}
+    $probe = Join-Path $part.TrimEnd('\') 'cargo.exe'
+    if (Test-Path -LiteralPath $probe) {{ continue }}
+    $part
+  }}
+)
+$env:Path = (@($pinnedCargoDir) + $filteredPath) -join ';'
+$plan = Resolve-DevManagerPhaseGateRecipe -Recipe 'cargo-version' -WorktreeRoot $harness
+if (([System.IO.Path]::GetFileName($plan.executable)) -ine 'cargo.exe') {{ throw 'cargo.exe required' }}
+if (($plan.arguments -join ',') -ne '--version') {{ throw 'args' }}
+foreach ($bad in @('cargo-build','pwsh-file','../escape','phase-00-tests')) {{
+  $rej = $false; try {{ $null = Resolve-DevManagerPhaseGateRecipe -Recipe $bad -WorktreeRoot $harness }} catch {{ $rej = $true }}
+  if (-not $rej) {{ throw "reject $bad" }}
+}}
+$observed = New-Object 'System.Collections.Generic.Dictionary[string, object]'
+$tracked = New-Object 'System.Collections.Generic.HashSet[uint32]'
+[void]$tracked.Add([uint32]10)
+$root = [pscustomobject]@{{ processId=[uint32]10; executablePath=(Join-Path $harness 'target\root.exe'); creationDate='20260101120000.000000-000'; parentProcessId=[uint32]1 }}
+$observed[(Get-DevManagerProcessInventoryIdentityKey -Process $root)] = $root
+$cim1 = @(
+  [pscustomobject]@{{ ProcessId=[uint32]10; ParentProcessId=[uint32]1; ExecutablePath=$root.executablePath; CreationDate=$root.creationDate }},
+  [pscustomobject]@{{ ProcessId=[uint32]20; ParentProcessId=[uint32]10; ExecutablePath=(Join-Path $harness 'target\child.exe'); CreationDate='20260101120100.000000-000' }}
+)
+Update-DevManagerObservedProcessTree -ObservedByKey $observed -TrackedPids $tracked -CimProcesses $cim1
+$outside = Join-Path '{evidence}' 'outside\rustc.exe'
+New-Item -ItemType Directory -Force -Path (Split-Path $outside -Parent) | Out-Null
+Set-Content -LiteralPath $outside -Value 'x' -Encoding utf8
+$cim2 = @(
+  $cim1[1],
+  [pscustomobject]@{{ ProcessId=[uint32]30; ParentProcessId=[uint32]20; ExecutablePath=$outside; CreationDate='20260101120200.000000-000' }}
+)
+Update-DevManagerObservedProcessTree -ObservedByKey $observed -TrackedPids $tracked -CimProcesses $cim2
+if (-not $tracked.Contains([uint32]30)) {{ throw 'grandchild attribution failed' }}
+$residue = Get-DevManagerPhaseGateResidueProcesses -WorktreeRoot $harness -ObservedByKey $observed -BeforeProcesses @() -CimProcesses $cim2
+if (@($residue | Where-Object {{ $_.processId -eq 30 }}).Count -ne 1) {{ throw 'grandchild residue' }}
+if ((Classify-DevManagerPhaseCleanupResult -AfterProcesses @()) -ne 'clean') {{ throw 'clean' }}
+if ((Classify-DevManagerPhaseCleanupResult -AfterProcesses @($residue)) -ne 'residue') {{ throw 'residue' }}
+$unavailable = New-DevManagerPhaseGateUnavailableAfterInventory `
+  -WorktreeRoot $harness `
+  -RunId 'run-unavailable' `
+  -RootIdentity $root `
+  -ObservationFailure 'synthetic observation failure'
+if ($unavailable.status -ne 'unavailable') {{ throw 'unavailable status' }}
+if (@($unavailable.processes).Count -ne 0) {{ throw 'unavailable processes empty' }}
+if ($unavailable.runId -ne 'run-unavailable') {{ throw 'unavailable runId' }}
+if ("$($unavailable.observationFailure)" -notmatch 'synthetic observation failure') {{ throw 'unavailable observationFailure' }}
+$current = Join-Path $evidenceRoot 'current\start-baseline.json'
+$capture = Join-Path $scriptRoot 'Capture-ProductionBaseline.ps1'
+& $capture -OutputPath $current
+& $capture -OutputPath $current
+$unique = Join-Path $evidenceRoot 'phase-00\runs\abc\baseline.json'
+New-Item -ItemType Directory -Force -Path (Split-Path $unique -Parent) | Out-Null
+& $capture -OutputPath $unique
+$ow = $false; try {{ & $capture -OutputPath $unique }} catch {{ $ow = $true }}
+if (-not $ow) {{ throw 'unique overwrite refused' }}
+if ((Get-DevManagerPhaseGateFinalExitCode -ChildExitCode 7 -ProductionAssertFailed) -ne 1) {{ throw 'prod priority' }}
+if ((Get-DevManagerPhaseGateFinalExitCode -ChildExitCode 7 -VerificationWriteFailed) -ne 1) {{ throw 'ver priority' }}
+if ((Get-DevManagerPhaseGateFinalExitCode -ChildExitCode 7 -EvidenceWriteFailed) -ne 1) {{ throw 'ev write priority over nonzero child' }}
+if ((Get-DevManagerPhaseGateFinalExitCode -ChildExitCode 7) -ne 7) {{ throw 'child keep' }}
+if ((Get-DevManagerPhaseGateFinalExitCode -ChildExitCode 0 -OriginalGuardFailure 'residue') -ne 1) {{ throw 'residue exit' }}
+function Invoke-PhaseGateChild {{
+  param([string]$GatePath,[string]$Phase,[string]$Recipe,[switch]$LongRustRun)
+  $outFile = Join-Path $harness ("out-{{0}}.txt" -f [guid]::NewGuid().ToString('N'))
+  $errFile = Join-Path $harness ("err-{{0}}.txt" -f [guid]::NewGuid().ToString('N'))
+  $launcher = Join-Path $harness 'invoke-gate-once.ps1'
+  @'
+param([Parameter(Mandatory=$true)][string]$GatePath,[Parameter(Mandatory=$true)][string]$Phase,[Parameter(Mandatory=$true)][string]$Recipe,[switch]$LongRustRun)
+$ErrorActionPreference='Stop'
+if ($LongRustRun) {{ & $GatePath -Phase $Phase -Recipe $Recipe -LongRustRun }} else {{ & $GatePath -Phase $Phase -Recipe $Recipe }}
+exit $LASTEXITCODE
+'@ | Set-Content $launcher -Encoding utf8
+  $procArgs = @('-NoProfile','-File',$launcher,'-GatePath',$GatePath,'-Phase',$Phase,'-Recipe',$Recipe)
+  if ($LongRustRun) {{ $procArgs += '-LongRustRun' }}
+  $p = Start-Process pwsh -ArgumentList $procArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+  [pscustomobject]@{{ ExitCode=[int]$p.ExitCode; Output=((Get-Content $outFile -Raw -ErrorAction SilentlyContinue) + (Get-Content $errFile -Raw -ErrorAction SilentlyContinue)) }}
+}}
+$gate = Join-Path $scriptRoot 'Invoke-PhaseGate.ps1'
+$bypass = & pwsh -NoProfile -File $gate -Phase 'phase-00-bypass' -Command 'cargo' -Arguments @('--version') *>&1 | Out-String
+if ($LASTEXITCODE -eq 0) {{ throw 'old Command must fail' }}
+$ok = Invoke-PhaseGateChild -GatePath $gate -Phase 'phase-00-e2e-ok' -Recipe 'cargo-version' -LongRustRun
+if ($ok.ExitCode -ne 0) {{ throw "cargo-version failed $($ok.Output)" }}
+$runDir = @(Get-ChildItem (Join-Path $evidenceRoot 'phase-00-e2e-ok\runs') -Directory)[0].FullName
+$v = Get-Content (Join-Path $runDir 'verification.json') -Raw | ConvertFrom-Json
+if ($v.recipe -ne 'cargo-version' -or -not [bool]$v.longRustRun -or $v.cleanupResult -ne 'clean') {{ throw 'verification ok fields' }}
+if ($null -ne $v.PSObject.Properties['verificationWriteFailure']) {{ throw 'verificationWriteFailure must stay local-only' }}
+if ($null -ne $v.PSObject.Properties['allowDevelopmentProcesses']) {{ throw 'allowDevelopmentProcesses must be removed' }}
+if (-not (Test-Path -LiteralPath (Join-Path $runDir 'processes-after.json'))) {{ throw 'after artifact required' }}
+$pub = Join-Path $evidenceRoot 'phase-00\runs\pub\verification.json'
+New-Item -ItemType Directory -Force -Path (Split-Path $pub -Parent) | Out-Null
+Set-Content $pub -Value '{{"x":1}}' -Encoding utf8
+$pr = $false
+try {{ Write-DevManagerJsonEvidence -Value (@{{a=1}}) -OutputPath $pub -ProtectedProductionRoot (Join-Path $harness '.devmanager-next\fake-production') -AllowedEvidenceRoot $evidenceRoot }} catch {{ $pr = $true }}
+if (-not $pr) {{ throw 'immutable refuse' }}
+$env:Path = $originalPath
+Write-Output 'PHASE_GATE_RECIPE_OK'
+"#,
+        evidence = ps_literal(&fixture.evidence_dir),
+    );
+    fs::write(&script_path, &body).expect("write recipe test script");
+    let output = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            script_path.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("pwsh");
+    assert!(
+        output.status.success(),
+        "pwsh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("PHASE_GATE_RECIPE_OK"),
+        "missing success marker"
+    );
+}
+
+
+#[test]
 fn next_launcher_validation_scaffold_is_lean_and_forbids_lifecycle() {
     let library = std::fs::read_to_string("scripts/native-next/NativeNext.ps1").unwrap();
     let start = std::fs::read_to_string("scripts/native-next/Start-NativeNext.ps1").unwrap();

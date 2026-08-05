@@ -4,6 +4,7 @@
 # Always targets the real unprofiled production root (no ProductionRoot override).
 # OutputPath must resolve under this worktree's .devmanager-next\evidence tree.
 # Relative OutputPath values resolve against the worktree root (from PSScriptRoot), not process cwd.
+# Atomic replacement is automatic only for immediate evidence/current/*.json children.
 
 [CmdletBinding()]
 param(
@@ -24,7 +25,10 @@ Assert-DevManagerEvidencePathSafeForIO `
     -AllowedEvidenceRoot $evidenceRoot
 
 $state = Get-DevManagerProductionState
-Write-DevManagerBaseline -State $state -OutputPath $resolvedOutputPath
+Write-DevManagerBaseline `
+    -State $state `
+    -OutputPath $resolvedOutputPath `
+    -AllowedEvidenceRoot $evidenceRoot
 
 Write-Host ("Captured production baseline -> {0}" -f $resolvedOutputPath)
 Write-Host ("productionRoot={0}" -f $state.productionRoot)

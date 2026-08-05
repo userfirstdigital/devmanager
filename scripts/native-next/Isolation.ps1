@@ -408,25 +408,60 @@ function Write-DevManagerBaseline {
         [Parameter(Mandatory = $true)]
         [object]$State,
         [Parameter(Mandatory = $true)]
-        [string]$OutputPath
+        [string]$OutputPath,
+        [string]$AllowedEvidenceRoot
     )
 
     Assert-DevManagerEvidenceShape -Evidence $State -Label 'baseline state'
     Assert-DevManagerEvidencePathSafeForIO `
         -LiteralPath $OutputPath `
-        -ProtectedProductionRoot ([string]$State.productionRoot)
+        -ProtectedProductionRoot ([string]$State.productionRoot) `
+        -AllowedEvidenceRoot $AllowedEvidenceRoot
 
     # Preserve zero-/one-element inventories as JSON arrays (never scalar objects).
     $State.installedProcesses = [object[]](Get-DevManagerInstalledProcessArray -Value $State.installedProcesses -Label 'baseline state')
 
-    $directory = Split-Path -Parent $OutputPath
-    if (-not [string]::IsNullOrWhiteSpace($directory)) {
-        # Existing ancestors were already checked for reparse points; only then create missing dirs.
-        New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    Publish-DevManagerAtomicJsonFile `
+        -Value $State `
+        -OutputPath $OutputPath `
+        -ProtectedProductionRoot ([string]$State.productionRoot) `
+        -AllowedEvidenceRoot $AllowedEvidenceRoot
+}
+
+function Test-DevManagerCurrentEvidenceBaselineOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath,
+        [Parameter(Mandatory = $true)]
+        [string]$EvidenceRoot
+    )
+
+    if (-not (Test-DevManagerAbsolutePath -LiteralPath $LiteralPath)) {
+        return $false
+    }
+    if (-not (Test-DevManagerAbsolutePath -LiteralPath $EvidenceRoot)) {
+        return $false
     }
 
-    $json = $State | ConvertTo-Json -Depth 8
-    Set-Content -LiteralPath $OutputPath -Value $json -Encoding utf8
+    $normalizedPath = Normalize-DevManagerPath -LiteralPath $LiteralPath
+    $normalizedEvidence = Normalize-DevManagerPath -LiteralPath $EvidenceRoot
+    $currentDir = Normalize-DevManagerPath -LiteralPath ([System.IO.Path]::GetFullPath((Join-Path $normalizedEvidence 'current')))
+    $parent = Normalize-DevManagerPath -LiteralPath ([System.IO.Path]::GetFullPath((Split-Path -Parent $normalizedPath)))
+    if ($parent -ne $currentDir) {
+        return $false
+    }
+
+    $leaf = [System.IO.Path]::GetFileName($normalizedPath)
+    if ([string]::IsNullOrWhiteSpace($leaf)) {
+        return $false
+    }
+    if ($leaf -notmatch '(?i)\.json$') {
+        return $false
+    }
+    if ($leaf -match '[\\/]') {
+        return $false
+    }
+    return $true
 }
 
 function Read-DevManagerBaseline {
@@ -814,4 +849,103 @@ function Assert-DevManagerProductionState {
     }
 
     return $true
+}
+
+function Publish-DevManagerAtomicJsonFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Value,
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+        [Parameter(Mandatory = $true)]
+        [string]$ProtectedProductionRoot,
+        [string]$AllowedEvidenceRoot
+    )
+
+    Assert-DevManagerEvidencePathSafeForIO `
+        -LiteralPath $OutputPath `
+        -ProtectedProductionRoot $ProtectedProductionRoot `
+        -AllowedEvidenceRoot $AllowedEvidenceRoot
+
+    $directory = Split-Path -Parent $OutputPath
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        throw "Output path has no directory component: '$OutputPath'."
+    }
+
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    }
+
+    Assert-DevManagerEvidencePathSafeForIO `
+        -LiteralPath $directory `
+        -ProtectedProductionRoot $ProtectedProductionRoot `
+        -AllowedEvidenceRoot $AllowedEvidenceRoot
+    Assert-DevManagerEvidencePathSafeForIO `
+        -LiteralPath $OutputPath `
+        -ProtectedProductionRoot $ProtectedProductionRoot `
+        -AllowedEvidenceRoot $AllowedEvidenceRoot
+
+    $replaceCurrentEvidence = $false
+    if (-not [string]::IsNullOrWhiteSpace($AllowedEvidenceRoot)) {
+        $replaceCurrentEvidence = Test-DevManagerCurrentEvidenceBaselineOutput `
+            -LiteralPath $OutputPath `
+            -EvidenceRoot $AllowedEvidenceRoot
+    }
+
+    if ((Test-Path -LiteralPath $OutputPath) -and -not $replaceCurrentEvidence) {
+        throw "Refusing to overwrite existing evidence file '$OutputPath'."
+    }
+
+    $tempName = '.pending-{0}.json' -f ([guid]::NewGuid().ToString('N'))
+    $tempPath = Join-Path $directory $tempName
+    Assert-DevManagerEvidencePathSafeForIO `
+        -LiteralPath $tempPath `
+        -ProtectedProductionRoot $ProtectedProductionRoot `
+        -AllowedEvidenceRoot $AllowedEvidenceRoot
+
+    $json = $Value | ConvertTo-Json -Depth 8
+    try {
+        Set-Content -LiteralPath $tempPath -Value $json -Encoding utf8
+        Assert-DevManagerEvidencePathSafeForIO `
+            -LiteralPath $OutputPath `
+            -ProtectedProductionRoot $ProtectedProductionRoot `
+            -AllowedEvidenceRoot $AllowedEvidenceRoot
+        if ((Test-Path -LiteralPath $OutputPath) -and -not $replaceCurrentEvidence) {
+            throw "Refusing to overwrite existing evidence file '$OutputPath'."
+        }
+        if ((Test-Path -LiteralPath $OutputPath) -and $replaceCurrentEvidence) {
+            $backupName = '.backup-{0}.json' -f ([guid]::NewGuid().ToString('N'))
+            $backupPath = Join-Path $directory $backupName
+            [System.IO.File]::Replace($tempPath, $OutputPath, $backupPath)
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            [System.IO.File]::Move($tempPath, $OutputPath)
+        }
+    }
+    catch {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+}
+
+function Write-DevManagerJsonEvidence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Value,
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+        [Parameter(Mandatory = $true)]
+        [string]$ProtectedProductionRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$AllowedEvidenceRoot
+    )
+
+    Publish-DevManagerAtomicJsonFile `
+        -Value $Value `
+        -OutputPath $OutputPath `
+        -ProtectedProductionRoot $ProtectedProductionRoot `
+        -AllowedEvidenceRoot $AllowedEvidenceRoot
 }

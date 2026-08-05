@@ -42,7 +42,8 @@
 - Create: `scripts/native-next/Start-NativeNext.ps1` — Phase 0 ValidateOnly isolation scaffold (real launch deferred to Phase 2).
 - Create: `scripts/native-next/Stop-NativeNext.ps1` — Phase 0 ValidateOnly isolation scaffold (real stop deferred to Phase 2; zero-orphan to Phase 3).
 - Create: `scripts/native-next/NativeNext.ps1` — shared path/env validation library for the scaffold.
-- Create: `scripts/native-next/Invoke-PhaseGate.ps1` — announced command execution plus before/after evidence and cleanup.
+- Create: `scripts/native-next/Invoke-PhaseGate.ps1` — exact recipe execution plus before/after evidence; observe/fail-closed residue (no kill).
+- Create: `scripts/native-next/PhaseGate.ps1` — recipe table, observation, and phase-gate helpers.
 - Create: `scripts/native-next/Capture-PerformanceBaseline.ps1` — read-only machine/installed idle reference; isolated cold-start keys deferred until Phase 2 Start/Stop exist.
 - Create: `scripts/native-next/Invoke-Conformance.ps1` — shared case/arm runner under the Phase 0 production guard.
 - Create: `src/conformance/mod.rs` — conformance API exports.
@@ -281,13 +282,15 @@ git commit -m "chore: add isolated native-next validation scaffold"
 
 **Files:**
 - Create: `scripts/native-next/Invoke-PhaseGate.ps1`
+- Create: `scripts/native-next/PhaseGate.ps1`
 - Modify: `scripts/native-next/Isolation.ps1`
 - Test: `tests/development_isolation.rs`
 
 **Interfaces:**
-- Produces: phase evidence with command, arguments, exit code, duration, before/after process inventories, and cleanup result.
-- Accepts: `-Phase`, `-Command`, `-Arguments`, `-LongRustRun`, `-AllowDevelopmentProcesses`.
-- Never accepts a production profile or broad kill target.
+- Produces: unique per-run phase evidence with recipe, exit code, duration, before/after process inventories, and cleanup result.
+- Accepts: `-Phase`, `-Recipe`, `-LongRustRun`.
+- Never accepts `-Command`/`-Arguments`, a production profile, or broad kill target.
+- Phase 0 recipes are an exact closed Cargo set: `cargo-version`, `cargo-fmt-check`, `development-isolation-tests`, `library-tests-serial`.
 
 - [ ] **Step 1: Write the failing gate contract test**
 
@@ -314,18 +317,20 @@ Run: `cargo test --test development_isolation phase_gate_wraps_commands_with_bas
 
 - [ ] **Step 3: Implement the phase wrapper**
 
-The wrapper captures a baseline, prints an explicit warning before `-LongRustRun`, executes one command through `System.Diagnostics.ProcessStartInfo` without a second shell, records the exit code and elapsed milliseconds, waits for Cargo/rustc/test executables whose paths belong to the worktree, runs exact-path development cleanup, compares production state, writes `verification.json`, and exits with the original nonzero result or any guard failure.
+The wrapper resolves one exact recipe to PATH `cargo.exe` + fixed argument vector, allocates a unique run directory, captures a baseline, prints an explicit warning before `-LongRustRun`, executes through `ProcessStartInfo` (`ArgumentList`, worktree `WorkingDirectory`, isolated env including `CARGO_TARGET_DIR`), observes the admitted process tree without kill authority (quiet window refreshes descendants each poll), always publishes `processes-after.json` after admission (real inventory or bounded `status=unavailable` envelope), always asserts production unchanged after admission, writes immutable atomic `verification.json`, and exits with production/evidence/verification-publication priority over the child exit.
 
-- [ ] **Step 4: Self-test the wrapper with a harmless command**
+**Phase 0 process boundary:** this gate observes and fails closed; it does not kill. Record `cleanupResult` as `clean` or `residue`. Never use process-name selection, `Stop-Process`, `taskkill`, a PID kill, or a production profile/kill parameter. Phase 3 supplies the first authoritative cleanup gate.
+
+- [ ] **Step 4: Self-test the wrapper with a harmless recipe**
 
 Run:
 
 ```powershell
-pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-self-test -Command pwsh -Arguments @('-NoProfile','-Command','exit 0')
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-self-test -Recipe cargo-version
 cargo test --test development_isolation phase_gate_wraps_commands_with_baseline_and_cleanup_checks -- --exact
 ```
 
-Expected: the command exits 0, evidence files are written, production comparison passes, and process-after evidence has no disposable development processes.
+Expected: the recipe exits 0, a unique run evidence bundle is written, production comparison passes, and process-after evidence has no disposable development processes. Codex alone runs this real harmless self-test and rechecks protected hashes plus installed PID/start time.
 
 - [ ] **Step 5: Review and commit**
 
@@ -566,14 +571,14 @@ Use the wrapper so the user sees that Rust test executables will run and be clea
 - [ ] **Step 2: Run formatting and focused isolation tests**
 
 ```powershell
-pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-fmt -Command cargo -Arguments @('fmt','--all','--','--check')
-pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-isolation -Command cargo -Arguments @('test','--test','development_isolation','--test','conformance_manifest','--','--test-threads=1') -LongRustRun
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-fmt -Recipe cargo-fmt-check
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-isolation -Recipe development-isolation-tests -LongRustRun
 ```
 
 - [ ] **Step 3: Run the complete library baseline serially**
 
 ```powershell
-pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-lib -Command cargo -Arguments @('test','--lib','--','--test-threads=1') -LongRustRun
+pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-00-lib -Recipe library-tests-serial -LongRustRun
 ```
 
 - [ ] **Step 4: Inspect evidence and repository state**
