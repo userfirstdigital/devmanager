@@ -3,7 +3,8 @@
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use devmanager::domain::{
-    ClientId, Command, CommandEnvelope, CommandId, CommandReceipt, EventId, OperationId, Query,
+    CancellationReason, ClientId, Command, CommandEnvelope, CommandId, CommandReceipt, EventId,
+    OperationErrorCode, OperationId, OperationState, OperationUncertaintyCode, Query,
     QueryEnvelope, RejectionCode, RequestId, TaskId,
 };
 use devmanager::protocol::{
@@ -1285,6 +1286,212 @@ fn protocol_query_envelope_rejects_alternate_or_open_shapes() {
     trailing.push(0xc0);
     assert_eq!(
         codec.decode::<QueryEnvelope>(&trailing),
+        Err(MessagePackError::TrailingBytes {
+            offset: u32::try_from(trailing.len() - 1).unwrap(),
+        })
+    );
+}
+
+#[test]
+fn protocol_operation_state_preserves_every_closed_named_shape() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let states = [
+        OperationState::Accepted,
+        OperationState::Settled {
+            settled_at_ms: -1,
+            result_event_ids: vec![protocol_event_id(0x81), protocol_event_id(0x82)],
+        },
+        OperationState::Failed {
+            settled_at_ms: 1_725_000_000_300,
+            code: OperationErrorCode::SideEffectFailed,
+        },
+        OperationState::Cancelled {
+            settled_at_ms: 1_725_000_000_301,
+            reason: CancellationReason::Superseded,
+        },
+        OperationState::Uncertain {
+            observed_at_ms: 1_725_000_000_302,
+            code: OperationUncertaintyCode::AmbiguousDispatch,
+        },
+    ];
+
+    for state in states {
+        let encoded = codec.encode(&state).expect("encode operation state");
+        assert_eq!(
+            rmp_serde::to_vec(&state).expect("direct operation-state serialization"),
+            encoded,
+            "compact serializers must preserve the named state shape"
+        );
+        assert_eq!(
+            codec
+                .decode::<OperationState>(&encoded)
+                .expect("decode operation state"),
+            state
+        );
+        let json = serde_json::to_vec(&state).expect("encode operation state as JSON");
+        assert_eq!(
+            serde_json::from_slice::<OperationState>(&json)
+                .expect("decode operation state from JSON"),
+            state
+        );
+    }
+}
+
+fn operation_state_map<T: serde::Serialize + ?Sized>(variant: &str, payload: &T) -> Vec<u8> {
+    let mut bytes = vec![0x81];
+    push_messagepack(&mut bytes, variant);
+    bytes.extend(rmp_serde::to_vec_named(payload).expect("encode named state payload"));
+    bytes
+}
+
+#[derive(serde::Serialize)]
+struct RawSettledState {
+    settled_at_ms: i64,
+    result_event_ids: Vec<EventId>,
+}
+
+#[derive(serde::Serialize)]
+struct RawSettledStateMissingField {
+    settled_at_ms: i64,
+}
+
+#[derive(serde::Serialize)]
+struct RawCodeState<C> {
+    settled_at_ms: i64,
+    code: C,
+}
+
+#[derive(serde::Serialize)]
+struct RawReasonState<R> {
+    settled_at_ms: i64,
+    reason: R,
+}
+
+#[derive(serde::Serialize)]
+struct RawUncertainState<C> {
+    observed_at_ms: i64,
+    code: C,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RawFutureCode {
+    FutureCode,
+}
+
+#[test]
+fn protocol_operation_state_rejects_alternate_or_open_shapes() {
+    let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+    let settled = RawSettledState {
+        settled_at_ms: 1_725_000_000_310,
+        result_event_ids: vec![protocol_event_id(0x83)],
+    };
+    let valid = operation_state_map("settled", &settled);
+    let payload_offset = 1 + rmp_serde::to_vec(&"settled").unwrap().len();
+    assert_eq!(valid[payload_offset], 0x82);
+
+    let positional = operation_state_map(
+        "settled",
+        &(settled.settled_at_ms, vec![protocol_event_id(0x83)]),
+    );
+    assert_eq!(
+        codec.decode::<OperationState>(&positional),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut duplicate = valid.clone();
+    duplicate[payload_offset] = 0x83;
+    push_messagepack(&mut duplicate, "settled_at_ms");
+    push_messagepack(&mut duplicate, &settled.settled_at_ms);
+    assert_eq!(
+        codec.decode::<OperationState>(&duplicate),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut unknown = valid.clone();
+    unknown[payload_offset] = 0x83;
+    push_messagepack(&mut unknown, "future_field");
+    unknown.push(0xc0);
+    assert_eq!(
+        codec.decode::<OperationState>(&unknown),
+        Err(MessagePackError::Decode)
+    );
+
+    assert_eq!(
+        codec.decode::<OperationState>(&operation_state_map(
+            "settled",
+            &RawSettledStateMissingField {
+                settled_at_ms: settled.settled_at_ms,
+            },
+        )),
+        Err(MessagePackError::Decode)
+    );
+
+    assert_eq!(
+        codec.decode::<OperationState>(&operation_state_map("accepted", &())),
+        Err(MessagePackError::Decode)
+    );
+    assert_eq!(
+        codec.decode::<OperationState>(&operation_state_map("future_state", &())),
+        Err(MessagePackError::Decode)
+    );
+    assert_eq!(
+        codec.decode::<OperationState>(&rmp_serde::to_vec(&"future_state").unwrap()),
+        Err(MessagePackError::Decode)
+    );
+    assert_eq!(
+        codec.decode::<OperationState>(&rmp_serde::to_vec(&("accepted",)).unwrap()),
+        Err(MessagePackError::Decode)
+    );
+
+    let mut multiple = valid.clone();
+    multiple[0] = 0x82;
+    push_messagepack(&mut multiple, "failed");
+    multiple.extend(
+        rmp_serde::to_vec_named(&RawCodeState {
+            settled_at_ms: settled.settled_at_ms,
+            code: OperationErrorCode::SideEffectFailed,
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        codec.decode::<OperationState>(&multiple),
+        Err(MessagePackError::Decode)
+    );
+
+    for unknown_code in [
+        operation_state_map(
+            "failed",
+            &RawCodeState {
+                settled_at_ms: 1,
+                code: RawFutureCode::FutureCode,
+            },
+        ),
+        operation_state_map(
+            "cancelled",
+            &RawReasonState {
+                settled_at_ms: 1,
+                reason: RawFutureCode::FutureCode,
+            },
+        ),
+        operation_state_map(
+            "uncertain",
+            &RawUncertainState {
+                observed_at_ms: 1,
+                code: RawFutureCode::FutureCode,
+            },
+        ),
+    ] {
+        assert_eq!(
+            codec.decode::<OperationState>(&unknown_code),
+            Err(MessagePackError::Decode)
+        );
+    }
+
+    let mut trailing = valid;
+    trailing.push(0xc0);
+    assert_eq!(
+        codec.decode::<OperationState>(&trailing),
         Err(MessagePackError::TrailingBytes {
             offset: u32::try_from(trailing.len() - 1).unwrap(),
         })

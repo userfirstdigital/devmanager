@@ -1,5 +1,7 @@
-use serde::de::{self, Deserializer};
-use serde::ser::{self, Serializer};
+use std::marker::PhantomData;
+
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, Visitor};
+use serde::ser::{self, SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::canonical;
@@ -332,8 +334,7 @@ impl<'de> Deserialize<'de> for OperationOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationState {
     Accepted,
     Settled {
@@ -352,6 +353,351 @@ pub enum OperationState {
         observed_at_ms: i64,
         code: OperationUncertaintyCode,
     },
+}
+
+struct OperationStatePayloadRef<'a, A: ?Sized, B: ?Sized> {
+    first_name: &'static str,
+    first: &'a A,
+    second_name: &'static str,
+    second: &'a B,
+}
+
+impl<A, B> Serialize for OperationStatePayloadRef<'_, A, B>
+where
+    A: Serialize + ?Sized,
+    B: Serialize + ?Sized,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry(self.first_name, self.first)?;
+        map.serialize_entry(self.second_name, self.second)?;
+        map.end()
+    }
+}
+
+fn serialize_operation_state_variant<S, A, B>(
+    serializer: S,
+    variant: &'static str,
+    first_name: &'static str,
+    first: &A,
+    second_name: &'static str,
+    second: &B,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    A: Serialize + ?Sized,
+    B: Serialize + ?Sized,
+{
+    let mut map = serializer.serialize_map(Some(1))?;
+    map.serialize_entry(
+        variant,
+        &OperationStatePayloadRef {
+            first_name,
+            first,
+            second_name,
+            second,
+        },
+    )?;
+    map.end()
+}
+
+impl Serialize for OperationState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Accepted => serializer.serialize_str("accepted"),
+            Self::Settled {
+                settled_at_ms,
+                result_event_ids,
+            } => serialize_operation_state_variant(
+                serializer,
+                "settled",
+                "settled_at_ms",
+                settled_at_ms,
+                "result_event_ids",
+                result_event_ids,
+            ),
+            Self::Failed {
+                settled_at_ms,
+                code,
+            } => serialize_operation_state_variant(
+                serializer,
+                "failed",
+                "settled_at_ms",
+                settled_at_ms,
+                "code",
+                code,
+            ),
+            Self::Cancelled {
+                settled_at_ms,
+                reason,
+            } => serialize_operation_state_variant(
+                serializer,
+                "cancelled",
+                "settled_at_ms",
+                settled_at_ms,
+                "reason",
+                reason,
+            ),
+            Self::Uncertain {
+                observed_at_ms,
+                code,
+            } => serialize_operation_state_variant(
+                serializer,
+                "uncertain",
+                "observed_at_ms",
+                observed_at_ms,
+                "code",
+                code,
+            ),
+        }
+    }
+}
+
+enum OperationStateMapVariant {
+    Settled,
+    Failed,
+    Cancelled,
+    Uncertain,
+}
+
+impl<'de> Deserialize<'de> for OperationStateMapVariant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VariantVisitor;
+
+        impl Visitor<'_> for VariantVisitor {
+            type Value = OperationStateMapVariant;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("settled, failed, cancelled, or uncertain")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "settled" => Ok(OperationStateMapVariant::Settled),
+                    "failed" => Ok(OperationStateMapVariant::Failed),
+                    "cancelled" => Ok(OperationStateMapVariant::Cancelled),
+                    "uncertain" => Ok(OperationStateMapVariant::Uncertain),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &["settled", "failed", "cancelled", "uncertain"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(VariantVisitor)
+    }
+}
+
+struct OperationStatePayloadSeed<A, B> {
+    first_name: &'static str,
+    second_name: &'static str,
+    marker: PhantomData<fn() -> (A, B)>,
+}
+
+impl<A, B> OperationStatePayloadSeed<A, B> {
+    const fn new(first_name: &'static str, second_name: &'static str) -> Self {
+        Self {
+            first_name,
+            second_name,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'de, A, B> DeserializeSeed<'de> for OperationStatePayloadSeed<A, B>
+where
+    A: Deserialize<'de>,
+    B: Deserialize<'de>,
+{
+    type Value = (A, B);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(OperationStatePayloadVisitor {
+            first_name: self.first_name,
+            second_name: self.second_name,
+            marker: PhantomData,
+        })
+    }
+}
+
+struct OperationStatePayloadVisitor<A, B> {
+    first_name: &'static str,
+    second_name: &'static str,
+    marker: PhantomData<fn() -> (A, B)>,
+}
+
+impl<'de, A, B> Visitor<'de> for OperationStatePayloadVisitor<A, B>
+where
+    A: Deserialize<'de>,
+    B: Deserialize<'de>,
+{
+    type Value = (A, B);
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "a named operation-state payload map with {} and {}",
+            self.first_name, self.second_name
+        )
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut first = None;
+        let mut second = None;
+
+        while let Some(field) = map.next_key::<String>()? {
+            if field == self.first_name {
+                if first.is_some() {
+                    return Err(de::Error::custom(format_args!(
+                        "duplicate field `{}`",
+                        self.first_name
+                    )));
+                }
+                first = Some(map.next_value()?);
+            } else if field == self.second_name {
+                if second.is_some() {
+                    return Err(de::Error::custom(format_args!(
+                        "duplicate field `{}`",
+                        self.second_name
+                    )));
+                }
+                second = Some(map.next_value()?);
+            } else {
+                return Err(de::Error::custom(format_args!(
+                    "unknown field `{field}`, expected `{}` or `{}`",
+                    self.first_name, self.second_name
+                )));
+            }
+        }
+
+        Ok((
+            first.ok_or_else(|| {
+                de::Error::custom(format_args!("missing field `{}`", self.first_name))
+            })?,
+            second.ok_or_else(|| {
+                de::Error::custom(format_args!("missing field `{}`", self.second_name))
+            })?,
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OperationStateVisitor;
+
+        impl<'de> Visitor<'de> for OperationStateVisitor {
+            type Value = OperationState;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("accepted or a one-entry named operation-state map")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "accepted" => Ok(OperationState::Accepted),
+                    _ => Err(de::Error::unknown_variant(
+                        value,
+                        &["accepted", "settled", "failed", "cancelled", "uncertain"],
+                    )),
+                }
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let variant = map
+                    .next_key()?
+                    .ok_or_else(|| de::Error::custom("OperationState map variant is missing"))?;
+                let state = match variant {
+                    OperationStateMapVariant::Settled => {
+                        let (settled_at_ms, result_event_ids) = map.next_value_seed(
+                            OperationStatePayloadSeed::<i64, Vec<EventId>>::new(
+                                "settled_at_ms",
+                                "result_event_ids",
+                            ),
+                        )?;
+                        OperationState::Settled {
+                            settled_at_ms,
+                            result_event_ids,
+                        }
+                    }
+                    OperationStateMapVariant::Failed => {
+                        let (settled_at_ms, code) =
+                            map.next_value_seed(OperationStatePayloadSeed::<
+                                i64,
+                                OperationErrorCode,
+                            >::new(
+                                "settled_at_ms", "code"
+                            ))?;
+                        OperationState::Failed {
+                            settled_at_ms,
+                            code,
+                        }
+                    }
+                    OperationStateMapVariant::Cancelled => {
+                        let (settled_at_ms, reason) =
+                            map.next_value_seed(OperationStatePayloadSeed::<
+                                i64,
+                                CancellationReason,
+                            >::new(
+                                "settled_at_ms", "reason"
+                            ))?;
+                        OperationState::Cancelled {
+                            settled_at_ms,
+                            reason,
+                        }
+                    }
+                    OperationStateMapVariant::Uncertain => {
+                        let (observed_at_ms, code) =
+                            map.next_value_seed(OperationStatePayloadSeed::<
+                                i64,
+                                OperationUncertaintyCode,
+                            >::new(
+                                "observed_at_ms", "code"
+                            ))?;
+                        OperationState::Uncertain {
+                            observed_at_ms,
+                            code,
+                        }
+                    }
+                };
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "OperationState must contain exactly one variant",
+                    ));
+                }
+                Ok(state)
+            }
+        }
+
+        deserializer.deserialize_any(OperationStateVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
