@@ -111,7 +111,7 @@
 - [ ] **Step 3: Implement `HostClient::connect`** with profile-derived endpoint, handshake deadline, explicit client build, stable `ClientId`, and requested capability set.
 - [ ] **Step 4: Split one connection into a single writer task and reader task**; correlate mutation receipts by `CommandId`, query replies by `RequestId`, track accepted work by `OperationId`, reject duplicate in-flight IDs, and deliver outcome/unsolicited server messages to a bounded subscription channel. Transport loss fails only the query/receipt wait; it does not relabel an accepted operation failed, settled, cancelled, or uncertain.
 - [ ] **Step 5: Expose typed states** `Disconnected`, `Connecting`, `Synchronizing`, `Ready`, `Incompatible`, and `Failed`. UI callers receive state changes rather than transport errors or retry loops.
-- [ ] **Step 6: Add a test filesystem observer** proving the client never opens `kernel.sqlite`; run tests and commit as `feat(client): add host connection and negotiation`.
+- [ ] **Step 6: Add a test filesystem observer** proving the client never opens the canonical `ResolvedAppPaths::database` path (`kernel.sqlite3`); run tests and commit as `feat(client): add host connection and negotiation`.
 
 ### Task 2.4: Add one action catalog and a scriptable CLI client
 
@@ -247,7 +247,7 @@
 - [ ] Run `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-02-host-soak -Recipe phase-02-host-soak -LongRustRun`; never launch `Invoke-HostSoak.ps1` directly.
 - [ ] Run `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-02-fmt -Recipe cargo-fmt-check` and `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-02-clippy -Recipe phase-02-clippy -LongRustRun`.
 - [ ] Run `pwsh -NoProfile -File scripts/native-next/Invoke-PhaseGate.ps1 -Phase phase-02-host-conformance -Recipe phase-02-host-conformance -LongRustRun`.
-- [ ] Verify a client process has no open handle to `kernel.sqlite` and killing it does not stop the host.
+- [ ] Verify a client process has no open handle to the canonical `ResolvedAppPaths::database` path (`kernel.sqlite3`) and killing it does not stop the host.
 - [ ] Verify a slow client cannot delay another client's command receipt by more than the defined integration-test bound.
 - [ ] Verify paged snapshots/chunks resume under interruption, unknown optional extensions degrade safely, and no accepted operation is displayed settled before its event/status proves it.
 - [ ] Rebuild the conformance query index and compare snapshot/replay/admission baseline and variant arms.
