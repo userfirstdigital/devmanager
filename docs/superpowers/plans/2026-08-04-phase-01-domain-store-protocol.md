@@ -189,7 +189,7 @@ pub struct DomainEvent {
 
 ### Task 1.3: Create SQLite schema v1 and deterministic projections
 
-**Files:** `src/kernel/{mod,schema,projector}.rs`, `tests/kernel_store.rs`
+**Files:** `src/kernel/{mod,schema,store,projector}.rs`, `tests/kernel_store.rs`
 
 **Schema:**
 
@@ -222,6 +222,7 @@ CREATE TABLE operations (
   operation_id BLOB PRIMARY KEY CHECK(length(operation_id) = 16),
   command_id BLOB NOT NULL UNIQUE REFERENCES command_receipts(command_id) DEFERRABLE INITIALLY DEFERRED,
   task_id BLOB,
+  resource_id BLOB CHECK(resource_id IS NULL OR length(resource_id) = 16),
   action_epoch INTEGER,
   runtime_generation INTEGER,
   state TEXT NOT NULL,
@@ -245,6 +246,7 @@ CREATE TABLE tasks (
   attention TEXT NOT NULL,
   activity TEXT NOT NULL,
   review_readiness TEXT NOT NULL,
+  primary_agent_session_id BLOB CHECK(primary_agent_session_id IS NULL OR length(primary_agent_session_id) = 16),
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL
 );
@@ -280,7 +282,7 @@ CREATE TABLE resources (
 );
 CREATE TABLE outbox (
   outbox_id BLOB PRIMARY KEY CHECK(length(outbox_id) = 16),
-  operation_id BLOB NOT NULL REFERENCES operations(operation_id),
+  operation_id BLOB NOT NULL REFERENCES operations(operation_id) DEFERRABLE INITIALLY DEFERRED,
   effect_index INTEGER NOT NULL CHECK(effect_index >= 0),
   event_sequence INTEGER NOT NULL REFERENCES events(sequence),
   destination_class TEXT NOT NULL,
@@ -296,12 +298,12 @@ CREATE TABLE outbox (
 );
 ```
 
-- [ ] **Step 1: Add failing store tests** for an empty migration, WAL mode, foreign-key enforcement, schema-version rejection, projection rebuild, corrupt/truncated database, interrupted transaction, and integrity-check failure. Assert exact table/index names with `sqlite_schema`.
+- [ ] **Step 1: Add failing store tests** for an empty migration, WAL mode, foreign-key enforcement, newer/changed/gapped migration rejection, projection rebuild, primary-agent validation, resource-generation fencing, corrupt/truncated database, interrupted transaction, integrity-check failure, codec/column mismatch, and integer overflow. Assert exact table/index names with `sqlite_schema`.
 - [ ] **Step 2: Run** `cargo test --test kernel_store schema_ -- --nocapture` and observe the missing schema module.
-- [ ] **Step 3: Implement** ordered migrations in `schema_migrations`; open file databases with WAL, `foreign_keys=ON`, a bounded busy timeout, and `synchronous=NORMAL`; use full durability for explicit checkpoint/export operations.
-- [ ] **Step 4: Store identifiers** as fixed 16-byte blobs, timestamps as Unix milliseconds, event/receipt/operation payloads as MessagePack, and human-queryable discriminants as stable text. Add indexes for task sequence, task revision, operation state, outbox delivery state, operation/effect identity, and active resources. V1 keeps compact command receipts for permanent idempotency; it does not expire a known `CommandId` into a second mutation.
-- [ ] **Step 5: Implement projectors** for `tasks`, `operations`, `agent_sessions`, `artifacts`, and `resources`. Projection functions accept a transaction and one event and contain no clocks, random generation, filesystem calls, or network calls.
-- [ ] **Step 6: Implement `rebuild_projections`** into shadow tables, compare deterministic rows, then swap inside one transaction; this is a repair/verification tool, not normal startup work.
+- [ ] **Step 3: Implement** an immutable, compiled migration manifest whose `(version, name, sha256)` entries are contiguous and exact. Apply only the next migration inside a transaction; reject a newer database, a changed migration hash/name, or a gapped history. Open file databases with WAL, `foreign_keys=ON`, a bounded busy timeout, and `synchronous=NORMAL`; use full durability for explicit checkpoint/export operations.
+- [ ] **Step 4: Keep the public store opaque:** `KernelStore::open(&Path) -> Result<Self, StoreError>` and `rebuild_projections(&mut self) -> Result<ProjectionRebuild, StoreError>`, with schema/projector modules crate-private and no public `rusqlite` types. Store identifiers as fixed 16-byte blobs, timestamps as Unix milliseconds, only the inner event payload as MessagePack (the `events` columns are the sole durable envelope), and human-queryable discriminants as stable text. Verify decoded payload type/version against its columns. Use checked `u64` to non-negative SQLite `i64` conversions everywhere and return a typed range error; never use `as`. Add indexes for task sequence, task revision, operation state, outbox delivery state, operation/effect identity, and active resources. V1 keeps compact command receipts for permanent idempotency; it does not expire a known `CommandId` into a second mutation.
+- [ ] **Step 5: Implement projectors** for `tasks`, `operations`, `agent_sessions`, `artifacts`, and `resources`. Projection functions accept a transaction and one event and contain no clocks, random generation, filesystem calls, or network calls. Derive `operations.task_id` only from `DomainEvent.task_id`; persist the accepted event's paired `resource_id`/`runtime_generation`, and require outcomes to match stored task/resource/action-epoch/generation fences. Validate `tasks.primary_agent_session_id` in the projector instead of a cyclic foreign key: the selected session must exist, belong to that task, and have role `Primary`. Resource release projections must match the current generation and use `DomainEvent.occurred_at_ms` for `updated_at_ms`.
+- [ ] **Step 6: Implement `rebuild_projections`** with temporary shadow projection tables and deterministic ordered event replay. Compare canonical rows, then atomically replace the contents of the stable projection tables in one transaction; do not rename tables or touch `events`, `command_receipts`, or `outbox`. This is a repair/verification tool, not normal startup work.
 - [ ] **Step 7: Run** `cargo test --test kernel_store schema_ -- --nocapture`; commit as `feat(kernel): add sqlite event schema and projections`.
 
 ### Task 1.4: Make command execution atomic and idempotent
