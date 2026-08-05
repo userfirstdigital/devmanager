@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "event_type": "task.attention_set",
+  "payload": {
+    "attention": "needs_approval"
+  }
+}

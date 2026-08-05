@@ -31,6 +31,7 @@ impl std::fmt::Display for TaskValidationError {
 impl std::error::Error for TaskValidationError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceRef {
     Main,
     Worktree { path: PathBuf, branch: String },
@@ -59,6 +60,7 @@ impl<'de> Deserialize<'de> for WorkspaceRef {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
         enum WorkspaceRefWire {
             Main,
             Worktree { path: PathBuf, branch: String },
@@ -76,13 +78,90 @@ impl<'de> Deserialize<'de> for WorkspaceRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskLifecycle {
     Open,
     Closing,
     Archived,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskConnectivity {
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAttention {
+    None,
+    NeedsAnswer,
+    NeedsApproval,
+    UncertainOutcome,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskActivity {
+    Idle,
+    Working,
+    Settling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewReadiness {
+    NotReady,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisibleTaskStatus {
+    Disconnected,
+    Failed,
+    UncertainOutcome,
+    NeedsApproval,
+    NeedsAnswer,
+    Working,
+    Settling,
+    ReadyForReview,
+    Idle,
+}
+
+impl VisibleTaskStatus {
+    pub fn derive(
+        connectivity: TaskConnectivity,
+        attention: TaskAttention,
+        activity: TaskActivity,
+        review_readiness: ReviewReadiness,
+    ) -> Self {
+        if connectivity == TaskConnectivity::Disconnected {
+            return Self::Disconnected;
+        }
+        match attention {
+            TaskAttention::Failed => return Self::Failed,
+            TaskAttention::UncertainOutcome => return Self::UncertainOutcome,
+            TaskAttention::NeedsApproval => return Self::NeedsApproval,
+            TaskAttention::NeedsAnswer => return Self::NeedsAnswer,
+            TaskAttention::None => {}
+        }
+        match activity {
+            TaskActivity::Working => return Self::Working,
+            TaskActivity::Settling => return Self::Settling,
+            TaskActivity::Idle => {}
+        }
+        match review_readiness {
+            ReviewReadiness::Ready => Self::ReadyForReview,
+            ReviewReadiness::NotReady => Self::Idle,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskAssignment {
     LocalOwner,
     ExternalPrincipal { authority: String, subject: String },
@@ -109,6 +188,7 @@ impl<'de> Deserialize<'de> for TaskAssignment {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
         enum TaskAssignmentWire {
             LocalOwner,
             ExternalPrincipal { authority: String, subject: String },

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "event_type": "operation.cancelled",
+  "payload": {
+    "command_id": "018f60b0-9c1a-7001-8000-00000000003b",
+    "operation_id": "018f60b0-9c1a-7001-8000-000000000061",
+    "settled_at_ms": 1725000000420,
+    "reason": "superseded",
+    "action_epoch": 1,
+    "resource_id": "018f60b0-9c1a-7001-8000-000000000057",
+    "runtime_generation": 2
+  }
+}

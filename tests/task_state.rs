@@ -1,0 +1,1470 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use devmanager::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+use devmanager::domain::artifact::{ArtifactContentRef, ArtifactFacts, ArtifactKind, PrivacyClass};
+use devmanager::domain::command::{
+    decide, Command, CommandEnvelope, CreateTaskIntent, RejectionCode, RenameTaskIntent,
+    SetTaskAttentionIntent,
+};
+use devmanager::domain::event::{
+    apply, ApplyError, DomainEvent, Event, OperationCancelledFact, OperationFailedFact,
+    OperationSettledFact, OperationUncertainFact, EVENT_SCHEMA_VERSION,
+};
+use devmanager::domain::id::{
+    AgentSessionId, ArtifactId, ClientId, CommandId, EnvironmentId, EventId, OperationId,
+    ProjectId, RequestId, ResourceId, TaskId,
+};
+use devmanager::domain::operation::{
+    CancellationReason, OperationErrorCode, OperationState, OperationUncertaintyCode,
+};
+use devmanager::domain::query::{
+    Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
+};
+use devmanager::domain::resource::{
+    OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+};
+use devmanager::domain::snapshot::TaskSnapshot;
+use devmanager::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+    TaskLifecycle, VisibleTaskStatus, WorkspaceRef,
+};
+
+fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
+    [
+        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        tail,
+    ]
+}
+
+fn task_id(tail: u8) -> TaskId {
+    TaskId::from_bytes(fixed_uuid_v7(tail)).expect("task id")
+}
+fn env_id(tail: u8) -> EnvironmentId {
+    EnvironmentId::from_bytes(fixed_uuid_v7(tail)).expect("env id")
+}
+fn project_id(tail: u8) -> ProjectId {
+    ProjectId::from_bytes(fixed_uuid_v7(tail)).expect("project id")
+}
+fn client_id(tail: u8) -> ClientId {
+    ClientId::from_bytes(fixed_uuid_v7(tail)).expect("client id")
+}
+fn command_id(tail: u8) -> CommandId {
+    CommandId::from_bytes(fixed_uuid_v7(tail)).expect("command id")
+}
+fn event_id(tail: u8) -> EventId {
+    EventId::from_bytes(fixed_uuid_v7(tail)).expect("event id")
+}
+fn operation_id(tail: u8) -> OperationId {
+    OperationId::from_bytes(fixed_uuid_v7(tail)).expect("operation id")
+}
+fn agent_id(tail: u8) -> AgentSessionId {
+    AgentSessionId::from_bytes(fixed_uuid_v7(tail)).expect("agent id")
+}
+fn artifact_id(tail: u8) -> ArtifactId {
+    ArtifactId::from_bytes(fixed_uuid_v7(tail)).expect("artifact id")
+}
+fn resource_id(tail: u8) -> ResourceId {
+    ResourceId::from_bytes(fixed_uuid_v7(tail)).expect("resource id")
+}
+fn request_id(tail: u8) -> RequestId {
+    RequestId::from_bytes(fixed_uuid_v7(tail)).expect("request id")
+}
+
+fn create_intent(task: TaskId) -> CreateTaskIntent {
+    CreateTaskIntent {
+        id: task,
+        environment_id: env_id(0x10),
+        title: "Ship kernel".into(),
+        description: Some("Phase 1 domain".into()),
+        project_id: project_id(0x11),
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        created_at_ms: 1_725_000_000_000,
+        connectivity: TaskConnectivity::Connected,
+        attention: TaskAttention::None,
+        activity: TaskActivity::Idle,
+        review_readiness: ReviewReadiness::NotReady,
+    }
+}
+
+fn envelope(
+    command_id: CommandId,
+    task_id: Option<TaskId>,
+    expected_task_revision: Option<u64>,
+    command: Command,
+) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id,
+        client_id: client_id(0x20),
+        task_id,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision,
+        command,
+    }
+}
+
+fn domain_event(
+    id: EventId,
+    task_id: Option<TaskId>,
+    sequence: u64,
+    task_revision: Option<u64>,
+    occurred_at_ms: i64,
+    payload: Event,
+) -> DomainEvent {
+    DomainEvent {
+        id,
+        task_id,
+        sequence,
+        task_revision,
+        occurred_at_ms,
+        payload,
+    }
+}
+
+fn next_revision(snapshot: Option<&TaskSnapshot>) -> u64 {
+    match snapshot {
+        None => 1,
+        Some(snap) => snap.task.revision.checked_add(1).expect("revision"),
+    }
+}
+
+fn create_task(snapshot: Option<TaskSnapshot>, task: TaskId, seq: u64, evt: u8) -> TaskSnapshot {
+    let cmd = envelope(
+        command_id(0x30),
+        None,
+        None,
+        Command::CreateTask(create_intent(task)),
+    );
+    let payloads = decide(snapshot.as_ref(), &cmd).expect("create decide");
+    assert_eq!(payloads.len(), 1);
+    let event = domain_event(
+        event_id(evt),
+        Some(task),
+        seq,
+        Some(1),
+        1_725_000_000_100,
+        payloads[0].clone(),
+    );
+    apply(snapshot, &event).expect("create apply")
+}
+
+fn apply_decided(
+    snapshot: Option<TaskSnapshot>,
+    cmd: &CommandEnvelope,
+    sequence: u64,
+    evt: u8,
+    occurred_at_ms: i64,
+) -> Result<TaskSnapshot, RejectionCode> {
+    let payloads = decide(snapshot.as_ref(), cmd)?;
+    let mut current = snapshot;
+    for (index, payload) in payloads.into_iter().enumerate() {
+        let task_id = cmd
+            .task_id
+            .or_else(|| current.as_ref().map(|s| s.task.id))
+            .or_else(|| match &payload {
+                Event::TaskCreated { task, .. } => Some(task.id),
+                _ => None,
+            });
+        let revision = if payload.is_task_mutation() {
+            Some(next_revision(current.as_ref()))
+        } else {
+            current.as_ref().map(|s| s.task.revision)
+        };
+        let event = domain_event(
+            event_id(evt.wrapping_add(index as u8)),
+            task_id,
+            sequence + index as u64,
+            revision,
+            occurred_at_ms,
+            payload,
+        );
+        current = Some(apply(current, &event).expect("apply"));
+    }
+    Ok(current.expect("snapshot after apply"))
+}
+
+#[test]
+fn create_task_emits_revision_one() {
+    let task = task_id(0x01);
+    let snap = create_task(None, task, 1, 0x40);
+    assert_eq!(snap.task.id, task);
+    assert_eq!(snap.task.revision, 1);
+    assert_eq!(snap.task.lifecycle, TaskLifecycle::Open);
+    assert_eq!(snap.task.action_epoch, 0);
+    assert_eq!(snap.connectivity, TaskConnectivity::Connected);
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::Idle);
+}
+
+#[test]
+fn rename_requires_expected_revision() {
+    let task = task_id(0x02);
+    let snap = create_task(None, task, 1, 0x41);
+    let bad = envelope(
+        command_id(0x31),
+        Some(task),
+        Some(0),
+        Command::RenameTask(RenameTaskIntent {
+            title: "Wrong revision".into(),
+        }),
+    );
+    assert!(matches!(
+        decide(Some(&snap), &bad),
+        Err(RejectionCode::RevisionConflict)
+    ));
+    let good = envelope(
+        command_id(0x32),
+        Some(task),
+        Some(1),
+        Command::RenameTask(RenameTaskIntent {
+            title: "Renamed".into(),
+        }),
+    );
+    let renamed = apply_decided(Some(snap), &good, 2, 0x42, 1_725_000_000_200).expect("rename");
+    assert_eq!(renamed.task.title, "Renamed");
+    assert_eq!(renamed.task.revision, 2);
+}
+
+#[test]
+fn closing_is_idempotent() {
+    let task = task_id(0x03);
+    let snap = create_task(None, task, 1, 0x43);
+    let close = envelope(
+        command_id(0x33),
+        Some(task),
+        Some(1),
+        Command::BeginCloseTask,
+    );
+    let closing = apply_decided(Some(snap), &close, 2, 0x44, 1_725_000_000_210).expect("close");
+    assert_eq!(closing.task.lifecycle, TaskLifecycle::Closing);
+    assert_eq!(closing.task.revision, 2);
+    let epoch = closing.task.action_epoch;
+    let again = envelope(
+        command_id(0x34),
+        Some(task),
+        Some(2),
+        Command::BeginCloseTask,
+    );
+    let payloads = decide(Some(&closing), &again).expect("idempotent close");
+    assert!(payloads.is_empty());
+    assert_eq!(closing.task.action_epoch, epoch);
+    assert_eq!(closing.task.revision, 2);
+}
+
+#[test]
+fn closing_idempotent_still_requires_expected_revision() {
+    let task = task_id(0xb0);
+    let snap = create_task(None, task, 1, 0xb1);
+    let close = envelope(
+        command_id(0xb2),
+        Some(task),
+        Some(1),
+        Command::BeginCloseTask,
+    );
+    let closing = apply_decided(Some(snap), &close, 2, 0xb3, 1_725_000_000_211).expect("close");
+    let stale = envelope(
+        command_id(0xb4),
+        Some(task),
+        Some(1),
+        Command::BeginCloseTask,
+    );
+    assert!(matches!(
+        decide(Some(&closing), &stale),
+        Err(RejectionCode::RevisionConflict)
+    ));
+}
+
+#[test]
+fn closing_advances_action_epoch() {
+    let task = task_id(0x04);
+    let snap = create_task(None, task, 1, 0x45);
+    let close = envelope(
+        command_id(0x35),
+        Some(task),
+        Some(1),
+        Command::BeginCloseTask,
+    );
+    let closing = apply_decided(Some(snap), &close, 2, 0x46, 1_725_000_000_220).expect("close");
+    assert_eq!(closing.task.lifecycle, TaskLifecycle::Closing);
+    assert_eq!(closing.task.action_epoch, 1);
+    assert_eq!(closing.task.revision, 2);
+}
+
+#[test]
+fn apply_rejects_stale_skipped_and_mismatched_task_revision() {
+    let task = task_id(0xb5);
+    let snap = create_task(None, task, 1, 0xb6);
+    let stale = domain_event(
+        event_id(0xb7),
+        Some(task),
+        2,
+        Some(1),
+        1_725_000_000_212,
+        Event::TaskRenamed {
+            title: "stale".into(),
+        },
+    );
+    assert!(matches!(
+        apply(Some(snap.clone()), &stale),
+        Err(ApplyError::RevisionConflict)
+    ));
+    let skipped = domain_event(
+        event_id(0xb8),
+        Some(task),
+        3,
+        Some(3),
+        1_725_000_000_213,
+        Event::TaskRenamed {
+            title: "skipped".into(),
+        },
+    );
+    assert!(matches!(
+        apply(Some(snap.clone()), &skipped),
+        Err(ApplyError::RevisionConflict)
+    ));
+    let missing = domain_event(
+        event_id(0xb9),
+        Some(task),
+        4,
+        None,
+        1_725_000_000_214,
+        Event::TaskRenamed {
+            title: "missing".into(),
+        },
+    );
+    assert!(matches!(
+        apply(Some(snap.clone()), &missing),
+        Err(ApplyError::RevisionConflict)
+    ));
+    let mismatched_task = domain_event(
+        event_id(0xba),
+        Some(task_id(0xbb)),
+        5,
+        Some(2),
+        1_725_000_000_215,
+        Event::TaskRenamed {
+            title: "other".into(),
+        },
+    );
+    assert!(matches!(
+        apply(Some(snap), &mismatched_task),
+        Err(ApplyError::TaskMismatch)
+    ));
+}
+
+#[test]
+fn apply_rejects_cross_task_fact_injection_and_duplicate_registration() {
+    let task = task_id(0xbc);
+    let other = task_id(0xbd);
+    let snap = create_task(None, task, 1, 0xbe);
+    let foreign_agent = AgentSessionFacts {
+        id: agent_id(0xbf),
+        task_id: other,
+        role: AgentRole::Primary,
+        provider_kind: "claude".into(),
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0xc0),
+                Some(task),
+                2,
+                Some(2),
+                1_725_000_000_216,
+                Event::AgentSessionRegistered {
+                    agent: foreign_agent
+                },
+            ),
+        ),
+        Err(ApplyError::OwnershipConflict)
+    ));
+    let foreign_artifact = ArtifactFacts {
+        id: artifact_id(0xc1),
+        task_id: other,
+        kind: ArtifactKind::Finding,
+        label: "x".into(),
+        content_ref: ArtifactContentRef::InlineUtf8("y".into()),
+        sha256: [1u8; 32],
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at_ms: 1,
+    };
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0xc2),
+                Some(task),
+                2,
+                Some(2),
+                1_725_000_000_217,
+                Event::ArtifactRegistered {
+                    artifact: foreign_artifact
+                },
+            ),
+        ),
+        Err(ApplyError::OwnershipConflict)
+    ));
+    let foreign_resource = ResourceFacts {
+        id: resource_id(0xc3),
+        task_id: Some(other),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1,
+    };
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0xc4),
+                Some(task),
+                2,
+                Some(2),
+                1_725_000_000_218,
+                Event::ResourceRegistered {
+                    resource: foreign_resource
+                },
+            ),
+        ),
+        Err(ApplyError::OwnershipConflict)
+    ));
+    let owned = ResourceFacts {
+        id: resource_id(0xc5),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1,
+    };
+    let after = apply(
+        Some(snap),
+        &domain_event(
+            event_id(0xc6),
+            Some(task),
+            2,
+            Some(2),
+            1_725_000_000_219,
+            Event::ResourceRegistered {
+                resource: owned.clone(),
+            },
+        ),
+    )
+    .expect("owned resource");
+    assert!(matches!(
+        apply(
+            Some(after),
+            &domain_event(
+                event_id(0xc7),
+                Some(task),
+                3,
+                Some(3),
+                1_725_000_000_220,
+                Event::ResourceRegistered { resource: owned },
+            ),
+        ),
+        Err(ApplyError::AlreadyExists)
+    ));
+}
+
+#[test]
+fn archived_task_rejects_new_runtime() {
+    let task = task_id(0x05);
+    let snap = create_task(None, task, 1, 0x47);
+    let close = envelope(
+        command_id(0x36),
+        Some(task),
+        Some(1),
+        Command::BeginCloseTask,
+    );
+    let closing = apply_decided(Some(snap), &close, 2, 0x48, 1_725_000_000_230).expect("close");
+    let archived = apply(
+        Some(closing),
+        &domain_event(
+            event_id(0x49),
+            Some(task),
+            3,
+            Some(3),
+            1_725_000_000_240,
+            Event::TaskArchived,
+        ),
+    )
+    .expect("archive");
+    assert_eq!(archived.task.lifecycle, TaskLifecycle::Archived);
+    let agent = AgentSessionFacts {
+        id: agent_id(0x50),
+        task_id: task,
+        role: AgentRole::Primary,
+        provider_kind: "claude".into(),
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    assert!(matches!(
+        decide(
+            Some(&archived),
+            &envelope(
+                command_id(0x37),
+                Some(task),
+                Some(3),
+                Command::RegisterAgentSession { agent },
+            ),
+        ),
+        Err(RejectionCode::InvalidTransition)
+    ));
+    let resource = ResourceFacts {
+        id: resource_id(0x51),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1_725_000_000_250,
+    };
+    assert!(matches!(
+        decide(
+            Some(&archived),
+            &envelope(
+                command_id(0x38),
+                Some(task),
+                Some(3),
+                Command::RegisterResource { resource },
+            ),
+        ),
+        Err(RejectionCode::InvalidTransition)
+    ));
+}
+
+#[test]
+fn agent_and_resource_must_reference_same_task() {
+    let task = task_id(0x06);
+    let other = task_id(0x07);
+    let snap = create_task(None, task, 1, 0x4a);
+    let agent = AgentSessionFacts {
+        id: agent_id(0x52),
+        task_id: other,
+        role: AgentRole::Primary,
+        provider_kind: "codex".into(),
+        provider_session_id: Some("sess".into()),
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    assert!(matches!(
+        decide(
+            Some(&snap),
+            &envelope(
+                command_id(0x39),
+                Some(task),
+                Some(1),
+                Command::RegisterAgentSession { agent },
+            ),
+        ),
+        Err(RejectionCode::OwnershipConflict)
+    ));
+    let resource = ResourceFacts {
+        id: resource_id(0x53),
+        task_id: Some(other),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::BrowserContext,
+        recipe: ResourceRecipe::Browser {
+            start_url: "https://example.com".into(),
+        },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1_725_000_000_260,
+    };
+    assert!(matches!(
+        decide(
+            Some(&snap),
+            &envelope(
+                command_id(0x3a),
+                Some(task),
+                Some(1),
+                Command::RegisterResource { resource },
+            ),
+        ),
+        Err(RejectionCode::OwnershipConflict)
+    ));
+}
+
+#[test]
+fn visible_status_precedence_is_deterministic() {
+    let task = task_id(0x08);
+    let mut snap = create_task(None, task, 1, 0x4b);
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::Idle);
+    snap.review_readiness = ReviewReadiness::Ready;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::ReadyForReview);
+    snap.activity = TaskActivity::Settling;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::Settling);
+    snap.activity = TaskActivity::Working;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::Working);
+    snap.attention = TaskAttention::NeedsAnswer;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::NeedsAnswer);
+    snap.attention = TaskAttention::NeedsApproval;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::NeedsApproval);
+    snap.attention = TaskAttention::UncertainOutcome;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::UncertainOutcome);
+    snap.attention = TaskAttention::Failed;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::Failed);
+    snap.connectivity = TaskConnectivity::Disconnected;
+    assert_eq!(snap.visible_status(), VisibleTaskStatus::Disconnected);
+}
+
+#[test]
+fn accepted_side_effect_is_not_settled() {
+    let task = task_id(0x09);
+    let snap = create_task(None, task, 1, 0x4c);
+    let resource = ResourceFacts {
+        id: resource_id(0x54),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal {
+            cols: 120,
+            rows: 40,
+        },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1_725_000_000_270,
+    };
+    let payloads = decide(
+        Some(&snap),
+        &envelope(
+            command_id(0x3b),
+            Some(task),
+            Some(1),
+            Command::RegisterResource { resource },
+        ),
+    )
+    .expect("register resource");
+    assert!(!payloads
+        .iter()
+        .any(|event| matches!(event, Event::OperationSettled(_))));
+    assert!(matches!(
+        payloads.as_slice(),
+        [Event::ResourceRegistered { .. }]
+    ));
+    assert!(!matches!(
+        OperationState::Accepted,
+        OperationState::Settled { .. }
+    ));
+    let reply = QueryReply {
+        request_id: request_id(0x60),
+        outcome: QueryOutcome::Ok(QueryResult::OperationStatus {
+            operation_id: operation_id(0x61),
+            state: OperationState::Accepted,
+        }),
+    };
+    match reply.outcome {
+        QueryOutcome::Ok(QueryResult::OperationStatus { state, .. }) => {
+            assert!(matches!(state, OperationState::Accepted));
+        }
+        QueryOutcome::Err(_) => panic!("expected ok"),
+    }
+    let _query = QueryEnvelope {
+        request_id: request_id(0x62),
+        client_id: client_id(0x21),
+        task_id: Some(task),
+        query: Query::OperationStatus {
+            operation_id: operation_id(0x61),
+        },
+    };
+    let _ = QueryError::NotFound;
+}
+
+#[test]
+fn release_acceptance_yields_releasing_not_released() {
+    let task = task_id(0xd0);
+    let snap = create_task(None, task, 1, 0xd1);
+    let resource = ResourceFacts {
+        id: resource_id(0xd2),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 7,
+        updated_at_ms: 1,
+    };
+    let registered = apply_decided(
+        Some(snap),
+        &envelope(
+            command_id(0xd3),
+            Some(task),
+            Some(1),
+            Command::RegisterResource {
+                resource: resource.clone(),
+            },
+        ),
+        2,
+        0xd4,
+        1_725_000_000_600,
+    )
+    .expect("register");
+    let payloads = decide(
+        Some(&registered),
+        &envelope(
+            command_id(0xd5),
+            Some(task),
+            Some(2),
+            Command::ReleaseResource {
+                resource_id: resource.id,
+            },
+        ),
+    )
+    .expect("release decide");
+    assert!(
+        !payloads
+            .iter()
+            .any(|event| matches!(event, Event::ResourceReleased { .. })),
+        "acceptance must not claim ResourceReleased"
+    );
+    assert!(matches!(
+        payloads.as_slice(),
+        [Event::ResourceReleaseBegun {
+            resource_id,
+            runtime_generation: 7,
+        }] if *resource_id == resource.id
+    ));
+    let releasing = apply_decided(
+        Some(registered),
+        &envelope(
+            command_id(0xd5),
+            Some(task),
+            Some(2),
+            Command::ReleaseResource {
+                resource_id: resource.id,
+            },
+        ),
+        3,
+        0xd6,
+        1_725_000_000_610,
+    )
+    .expect("release apply");
+    assert_eq!(
+        releasing.resources.get(&resource.id).map(|r| r.lifecycle),
+        Some(ResourceLifecycle::Releasing)
+    );
+    assert_eq!(releasing.task.revision, 3);
+
+    let retry = decide(
+        Some(&releasing),
+        &envelope(
+            command_id(0xd7),
+            Some(task),
+            Some(3),
+            Command::ReleaseResource {
+                resource_id: resource.id,
+            },
+        ),
+    )
+    .expect("idempotent releasing retry");
+    assert!(
+        retry.is_empty(),
+        "Releasing retry must be idempotent no-event"
+    );
+
+    let stale_retry = decide(
+        Some(&releasing),
+        &envelope(
+            command_id(0xd8),
+            Some(task),
+            Some(2),
+            Command::ReleaseResource {
+                resource_id: resource.id,
+            },
+        ),
+    );
+    assert!(matches!(stale_retry, Err(RejectionCode::RevisionConflict)));
+}
+
+#[test]
+fn resource_release_completion_is_generation_fenced() {
+    let task = task_id(0xd9);
+    let snap = create_task(None, task, 1, 0xda);
+    let resource = ResourceFacts {
+        id: resource_id(0xdb),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Service,
+        recipe: ResourceRecipe::Service {
+            command: "echo".into(),
+        },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 3,
+        updated_at_ms: 1,
+    };
+    let registered = apply_decided(
+        Some(snap),
+        &envelope(
+            command_id(0xdc),
+            Some(task),
+            Some(1),
+            Command::RegisterResource {
+                resource: resource.clone(),
+            },
+        ),
+        2,
+        0xdd,
+        1_725_000_000_620,
+    )
+    .expect("register");
+
+    assert!(matches!(
+        apply(
+            Some(registered.clone()),
+            &domain_event(
+                event_id(0xf1),
+                Some(task),
+                3,
+                Some(3),
+                1_725_000_000_625,
+                Event::ResourceReleased {
+                    resource_id: resource.id,
+                    runtime_generation: 3,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+
+    let releasing = apply_decided(
+        Some(registered),
+        &envelope(
+            command_id(0xde),
+            Some(task),
+            Some(2),
+            Command::ReleaseResource {
+                resource_id: resource.id,
+            },
+        ),
+        3,
+        0xdf,
+        1_725_000_000_630,
+    )
+    .expect("begin release");
+
+    assert!(matches!(
+        apply(
+            Some(releasing.clone()),
+            &domain_event(
+                event_id(0xe0),
+                Some(task),
+                4,
+                Some(4),
+                1_725_000_000_640,
+                Event::ResourceReleased {
+                    resource_id: resource.id,
+                    runtime_generation: 99,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+    assert!(matches!(
+        apply(
+            Some(create_task(None, task, 1, 0xe1)),
+            &domain_event(
+                event_id(0xe2),
+                Some(task),
+                2,
+                Some(2),
+                1_725_000_000_650,
+                Event::ResourceReleased {
+                    resource_id: resource.id,
+                    runtime_generation: 3,
+                },
+            ),
+        ),
+        Err(ApplyError::NotFound)
+    ));
+
+    let active_direct = apply(
+        Some(releasing.clone()),
+        &domain_event(
+            event_id(0xe3),
+            Some(task),
+            4,
+            Some(4),
+            1_725_000_000_660,
+            Event::ResourceReleaseBegun {
+                resource_id: resource.id,
+                runtime_generation: 3,
+            },
+        ),
+    );
+    // already Releasing — duplicate begun should fail
+    assert!(matches!(
+        active_direct,
+        Err(ApplyError::InvalidTransition | ApplyError::AlreadyExists)
+    ));
+
+    let completed = apply(
+        Some(releasing.clone()),
+        &domain_event(
+            event_id(0xe4),
+            Some(task),
+            4,
+            Some(4),
+            1_725_000_000_670,
+            Event::ResourceReleased {
+                resource_id: resource.id,
+                runtime_generation: 3,
+            },
+        ),
+    )
+    .expect("complete release");
+    assert_eq!(
+        completed.resources.get(&resource.id).map(|r| r.lifecycle),
+        Some(ResourceLifecycle::Released)
+    );
+
+    assert!(matches!(
+        apply(
+            Some(completed.clone()),
+            &domain_event(
+                event_id(0xe5),
+                Some(task),
+                5,
+                Some(5),
+                1_725_000_000_680,
+                Event::ResourceReleased {
+                    resource_id: resource.id,
+                    runtime_generation: 3,
+                },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+    assert!(matches!(
+        decide(
+            Some(&completed),
+            &envelope(
+                command_id(0xe6),
+                Some(task),
+                Some(4),
+                Command::ReleaseResource {
+                    resource_id: resource.id,
+                },
+            ),
+        ),
+        Err(RejectionCode::InvalidTransition)
+    ));
+}
+
+#[test]
+fn host_owned_resource_cannot_enter_task_snapshot() {
+    let task = task_id(0xe7);
+    let snap = create_task(None, task, 1, 0xe8);
+    let host = ResourceFacts {
+        id: resource_id(0xe9),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Host,
+        resource_kind: ResourceKind::Terminal,
+        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1,
+    };
+    assert!(matches!(
+        decide(
+            Some(&snap),
+            &envelope(
+                command_id(0xea),
+                Some(task),
+                Some(1),
+                Command::RegisterResource {
+                    resource: host.clone()
+                },
+            ),
+        ),
+        Err(RejectionCode::OwnershipConflict)
+    ));
+    assert!(matches!(
+        apply(
+            Some(snap),
+            &domain_event(
+                event_id(0xeb),
+                Some(task),
+                2,
+                Some(2),
+                1_725_000_000_690,
+                Event::ResourceRegistered { resource: host },
+            ),
+        ),
+        Err(ApplyError::OwnershipConflict)
+    ));
+}
+
+#[test]
+fn forged_close_epoch_is_rejected() {
+    let task = task_id(0xec);
+    let snap = create_task(None, task, 1, 0xed);
+    assert_eq!(snap.task.action_epoch, 0);
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0xee),
+                Some(task),
+                2,
+                Some(2),
+                1_725_000_000_700,
+                Event::TaskCloseBegun { action_epoch: 0 },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+    assert!(matches!(
+        apply(
+            Some(snap.clone()),
+            &domain_event(
+                event_id(0xef),
+                Some(task),
+                2,
+                Some(2),
+                1_725_000_000_710,
+                Event::TaskCloseBegun { action_epoch: 2 },
+            ),
+        ),
+        Err(ApplyError::InvalidTransition)
+    ));
+    let closing = apply(
+        Some(snap),
+        &domain_event(
+            event_id(0xf0),
+            Some(task),
+            2,
+            Some(2),
+            1_725_000_000_720,
+            Event::TaskCloseBegun { action_epoch: 1 },
+        ),
+    )
+    .expect("valid close");
+    assert_eq!(closing.task.action_epoch, 1);
+    assert_eq!(closing.task.lifecycle, TaskLifecycle::Closing);
+}
+
+#[test]
+fn replay_derives_identical_snapshot() {
+    let task = task_id(0x0a);
+    let agent = AgentSessionFacts {
+        id: agent_id(0x55),
+        task_id: task,
+        role: AgentRole::Primary,
+        provider_kind: "claude".into(),
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    let artifact = ArtifactFacts {
+        id: artifact_id(0x56),
+        task_id: task,
+        kind: ArtifactKind::Finding,
+        label: "note".into(),
+        content_ref: ArtifactContentRef::InlineUtf8("body".into()),
+        sha256: [7u8; 32],
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at_ms: 1_725_000_000_280,
+    };
+    let resource = ResourceFacts {
+        id: resource_id(0x57),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Service,
+        recipe: ResourceRecipe::Service {
+            command: "echo hi".into(),
+        },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1_725_000_000_290,
+    };
+    let commands = [
+        envelope(
+            command_id(0x3c),
+            None,
+            None,
+            Command::CreateTask(create_intent(task)),
+        ),
+        envelope(
+            command_id(0x3d),
+            Some(task),
+            Some(1),
+            Command::RenameTask(RenameTaskIntent {
+                title: "Replay title".into(),
+            }),
+        ),
+        envelope(
+            command_id(0x3e),
+            Some(task),
+            Some(2),
+            Command::SetTaskAttention(SetTaskAttentionIntent {
+                attention: TaskAttention::NeedsAnswer,
+            }),
+        ),
+        envelope(
+            command_id(0x3f),
+            Some(task),
+            Some(3),
+            Command::RegisterAgentSession {
+                agent: agent.clone(),
+            },
+        ),
+        envelope(
+            command_id(0x70),
+            Some(task),
+            Some(4),
+            Command::SetPrimaryAgent {
+                agent_session_id: agent.id,
+            },
+        ),
+        envelope(
+            command_id(0x71),
+            Some(task),
+            Some(5),
+            Command::RegisterArtifact {
+                artifact: artifact.clone(),
+            },
+        ),
+        envelope(
+            command_id(0x72),
+            Some(task),
+            Some(6),
+            Command::RegisterResource {
+                resource: resource.clone(),
+            },
+        ),
+        envelope(
+            command_id(0x73),
+            Some(task),
+            Some(7),
+            Command::ReleaseResource {
+                resource_id: resource.id,
+            },
+        ),
+        envelope(
+            command_id(0x74),
+            Some(task),
+            Some(9),
+            Command::BeginCloseTask,
+        ),
+        envelope(command_id(0x75), Some(task), Some(10), Command::ReopenTask),
+    ];
+    let mut live: Option<TaskSnapshot> = None;
+    let mut events = Vec::new();
+    let mut sequence = 1u64;
+    let mut evt_tail = 0x80u8;
+    for cmd in &commands {
+        let payloads = decide(live.as_ref(), cmd).expect("decide");
+        for payload in payloads {
+            let task_for_event = cmd.task_id.or(Some(task));
+            let revision = if payload.is_task_mutation() {
+                Some(next_revision(live.as_ref()))
+            } else {
+                live.as_ref().map(|s| s.task.revision)
+            };
+            let event = domain_event(
+                event_id(evt_tail),
+                task_for_event,
+                sequence,
+                revision,
+                1_725_000_000_300 + sequence as i64,
+                payload,
+            );
+            live = Some(apply(live, &event).expect("apply live"));
+            events.push(event);
+            sequence += 1;
+            evt_tail = evt_tail.wrapping_add(1);
+
+            // Release acceptance only begins teardown; completion is a later apply-only fact.
+            if matches!(
+                events.last().map(|e| &e.payload),
+                Some(Event::ResourceReleaseBegun { .. })
+            ) {
+                let completion = domain_event(
+                    event_id(evt_tail),
+                    Some(task),
+                    sequence,
+                    Some(next_revision(live.as_ref())),
+                    1_725_000_000_300 + sequence as i64,
+                    Event::ResourceReleased {
+                        resource_id: resource.id,
+                        runtime_generation: resource.runtime_generation,
+                    },
+                );
+                live = Some(apply(live, &completion).expect("release complete"));
+                events.push(completion);
+                sequence += 1;
+                evt_tail = evt_tail.wrapping_add(1);
+            }
+        }
+    }
+    let live = live.expect("live");
+    let mut replayed: Option<TaskSnapshot> = None;
+    for event in &events {
+        replayed = Some(apply(replayed, event).expect("replay"));
+    }
+    let replayed = replayed.expect("replayed");
+    assert_eq!(live, replayed);
+    assert_eq!(live.task.title, "Replay title");
+    assert_eq!(live.attention, TaskAttention::NeedsAnswer);
+    assert_eq!(live.primary_agent_id, Some(agent.id));
+    assert!(live.agents.contains_key(&agent.id));
+    assert!(live.artifacts.contains_key(&artifact.id));
+    assert_eq!(
+        live.resources.get(&resource.id).map(|r| r.lifecycle),
+        Some(ResourceLifecycle::Released)
+    );
+    assert_eq!(live.task.lifecycle, TaskLifecycle::Open);
+    assert_eq!(live.task.action_epoch, 1);
+}
+
+fn fixture_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/domain/v1")
+        .join(name)
+}
+
+fn assert_golden_event(fixture_name: &str, event: &Event) {
+    let encoded = serde_json::to_value(event).expect("encode event");
+    assert_eq!(encoded["schema_version"], EVENT_SCHEMA_VERSION);
+    let expected_raw = fs::read_to_string(fixture_path(fixture_name)).expect("read fixture");
+    let expected: serde_json::Value =
+        serde_json::from_str(expected_raw.trim()).expect("parse fixture");
+    assert_eq!(encoded, expected, "fixture mismatch {fixture_name}");
+    let round_trip: Event = serde_json::from_value(encoded.clone()).expect("json round trip");
+    assert_eq!(round_trip, *event);
+    let packed = rmp_serde::to_vec(event).expect("msgpack encode");
+    let msg_restored: Event = rmp_serde::from_slice(&packed).expect("msgpack decode");
+    assert_eq!(msg_restored, *event);
+}
+
+#[test]
+fn golden_event_serialization_fixtures() {
+    let task = task_id(0x0b);
+    let facts = TaskFacts {
+        id: task,
+        environment_id: env_id(0x10),
+        title: "Ship kernel".into(),
+        description: Some("Phase 1 domain".into()),
+        project_id: project_id(0x11),
+        workspace: WorkspaceRef::Main,
+        assignment: TaskAssignment::LocalOwner,
+        lifecycle: TaskLifecycle::Open,
+        action_epoch: 0,
+        revision: 1,
+        created_at_ms: 1_725_000_000_000,
+    };
+    assert_golden_event(
+        "task_created.json",
+        &Event::TaskCreated {
+            task: facts,
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+        },
+    );
+    assert_golden_event(
+        "task_renamed.json",
+        &Event::TaskRenamed {
+            title: "Renamed".into(),
+        },
+    );
+    assert_golden_event(
+        "task_attention_set.json",
+        &Event::TaskAttentionSet {
+            attention: TaskAttention::NeedsApproval,
+        },
+    );
+    assert_golden_event(
+        "task_close_begun.json",
+        &Event::TaskCloseBegun { action_epoch: 1 },
+    );
+    assert_golden_event("task_reopened.json", &Event::TaskReopened);
+    assert_golden_event("task_archived.json", &Event::TaskArchived);
+    let agent = AgentSessionFacts {
+        id: agent_id(0x55),
+        task_id: task,
+        role: AgentRole::Primary,
+        provider_kind: "claude".into(),
+        provider_session_id: None,
+        lifecycle: AgentSessionLifecycle::Open,
+        runtime_generation: 0,
+        revision: 0,
+    };
+    assert_golden_event(
+        "agent_session_registered.json",
+        &Event::AgentSessionRegistered {
+            agent: agent.clone(),
+        },
+    );
+    assert_golden_event(
+        "primary_agent_set.json",
+        &Event::PrimaryAgentSet {
+            agent_session_id: agent.id,
+        },
+    );
+    let artifact = ArtifactFacts {
+        id: artifact_id(0x56),
+        task_id: task,
+        kind: ArtifactKind::Finding,
+        label: "note".into(),
+        content_ref: ArtifactContentRef::InlineUtf8("body".into()),
+        sha256: [7u8; 32],
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at_ms: 1_725_000_000_280,
+    };
+    assert_golden_event(
+        "artifact_registered.json",
+        &Event::ArtifactRegistered { artifact },
+    );
+    let resource = ResourceFacts {
+        id: resource_id(0x57),
+        task_id: Some(task),
+        owner_kind: OwnerKind::Task,
+        resource_kind: ResourceKind::Service,
+        recipe: ResourceRecipe::Service {
+            command: "echo hi".into(),
+        },
+        lifecycle: ResourceLifecycle::Active,
+        runtime_generation: 0,
+        updated_at_ms: 1_725_000_000_290,
+    };
+    assert_golden_event(
+        "resource_registered.json",
+        &Event::ResourceRegistered {
+            resource: resource.clone(),
+        },
+    );
+    assert_golden_event(
+        "resource_release_begun.json",
+        &Event::ResourceReleaseBegun {
+            resource_id: resource.id,
+            runtime_generation: 0,
+        },
+    );
+    assert_golden_event(
+        "resource_released.json",
+        &Event::ResourceReleased {
+            resource_id: resource.id,
+            runtime_generation: 0,
+        },
+    );
+    assert_golden_event(
+        "operation_settled.json",
+        &Event::OperationSettled(
+            OperationSettledFact::new(
+                command_id(0x3b),
+                operation_id(0x61),
+                1_725_000_000_400,
+                vec![event_id(0x80)],
+                Some(1),
+                Some(resource_id(0x57)),
+                Some(2),
+            )
+            .expect("settled"),
+        ),
+    );
+    assert_golden_event(
+        "operation_failed.json",
+        &Event::OperationFailed(
+            OperationFailedFact::new(
+                command_id(0x3b),
+                operation_id(0x61),
+                1_725_000_000_410,
+                OperationErrorCode::SideEffectFailed,
+                Some(1),
+                None,
+                None,
+            )
+            .expect("failed"),
+        ),
+    );
+    assert_golden_event(
+        "operation_cancelled.json",
+        &Event::OperationCancelled(
+            OperationCancelledFact::new(
+                command_id(0x3b),
+                operation_id(0x61),
+                1_725_000_000_420,
+                CancellationReason::Superseded,
+                Some(1),
+                Some(resource_id(0x57)),
+                Some(2),
+            )
+            .expect("cancelled"),
+        ),
+    );
+    assert_golden_event(
+        "operation_uncertain.json",
+        &Event::OperationUncertain(
+            OperationUncertainFact::new(
+                command_id(0x3b),
+                operation_id(0x61),
+                1_725_000_000_430,
+                OperationUncertaintyCode::AmbiguousDispatch,
+                Some(1),
+                Some(resource_id(0x57)),
+                Some(2),
+            )
+            .expect("uncertain"),
+        ),
+    );
+
+    let domain = DomainEvent {
+        id: event_id(0x90),
+        task_id: Some(task),
+        sequence: 9,
+        task_revision: Some(2),
+        occurred_at_ms: 1_725_000_000_500,
+        payload: Event::TaskRenamed {
+            title: "wire".into(),
+        },
+    };
+    let json = serde_json::to_string(&domain).expect("domain json");
+    let json_rt: DomainEvent = serde_json::from_str(&json).expect("domain json rt");
+    assert_eq!(json_rt, domain);
+    let packed = rmp_serde::to_vec(&domain).expect("domain msgpack");
+    let msg_rt: DomainEvent = rmp_serde::from_slice(&packed).expect("domain msgpack rt");
+    assert_eq!(msg_rt, domain);
+
+    let unknown_type = serde_json::json!({
+        "event_type": "task.not_a_real_event",
+        "schema_version": 1,
+        "payload": {}
+    });
+    assert!(serde_json::from_value::<Event>(unknown_type).is_err());
+    let unknown_version = serde_json::json!({
+        "event_type": "task.renamed",
+        "schema_version": 2,
+        "payload": { "title": "x" }
+    });
+    assert!(serde_json::from_value::<Event>(unknown_version).is_err());
+    let partial_fence = serde_json::json!({
+        "event_type": "operation.settled",
+        "schema_version": 1,
+        "payload": {
+            "command_id": command_id(0x3b).to_string(),
+            "operation_id": operation_id(0x61).to_string(),
+            "settled_at_ms": 1,
+            "result_event_ids": [],
+            "action_epoch": 1,
+            "resource_id": null,
+            "runtime_generation": 2
+        }
+    });
+    assert!(serde_json::from_value::<Event>(partial_fence).is_err());
+}

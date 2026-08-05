@@ -8,7 +8,7 @@ use devmanager::domain::id::{
     IdError, OperationId, ProjectId, RequestId, ResourceId, ServiceId, SubscriptionId, TaskId,
     TerminalId, TransferId,
 };
-use devmanager::domain::operation::{OperationFacts, OperationLifecycle};
+use devmanager::domain::operation::{OperationFacts, OperationState};
 use devmanager::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
 };
@@ -336,7 +336,7 @@ fn task_facts_serde_preserves_persisted_fields_and_rejects_malformed() {
     );
 
     let empty_path_workspace = serde_json::json!({
-        "Worktree": { "path": "", "branch": "main" }
+        "worktree": { "path": "", "branch": "main" }
     });
     assert!(
         serde_json::from_value::<WorkspaceRef>(empty_path_workspace).is_err(),
@@ -344,7 +344,7 @@ fn task_facts_serde_preserves_persisted_fields_and_rejects_malformed() {
     );
 
     let empty_principal = serde_json::json!({
-        "ExternalPrincipal": { "authority": " ", "subject": "user" }
+        "external_principal": { "authority": " ", "subject": "user" }
     });
     assert!(
         serde_json::from_value::<TaskAssignment>(empty_principal).is_err(),
@@ -447,7 +447,7 @@ fn agent_artifact_resource_and_operation_facts_bind_ownership() {
     assert_eq!(resource.runtime_generation, 0);
 
     let operation = OperationFacts::accepted(CommandId::new(), Some(task_id), 300);
-    assert_eq!(operation.state, OperationLifecycle::Accepted);
+    assert_eq!(operation.state, OperationState::Accepted);
     assert_eq!(operation.accepted_at_ms, 300);
 }
 

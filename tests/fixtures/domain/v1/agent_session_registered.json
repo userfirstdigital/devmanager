@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "event_type": "agent_session.registered",
+  "payload": {
+    "agent": {
+      "id": "018f60b0-9c1a-7001-8000-000000000055",
+      "task_id": "018f60b0-9c1a-7001-8000-00000000000b",
+      "role": "primary",
+      "provider_kind": "claude",
+      "provider_session_id": null,
+      "lifecycle": "open",
+      "runtime_generation": 0,
+      "revision": 0
+    }
+  }
+}

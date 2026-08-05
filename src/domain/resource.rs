@@ -22,12 +22,14 @@ impl std::fmt::Display for ResourceValidationError {
 impl std::error::Error for ResourceValidationError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OwnerKind {
     Task,
     Host,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Terminal,
     BrowserContext,
@@ -35,6 +37,7 @@ pub enum ResourceKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResourceLifecycle {
     Active,
     Releasing,
@@ -42,6 +45,7 @@ pub enum ResourceLifecycle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResourceRecipe {
     Terminal { cols: u16, rows: u16 },
     Browser { start_url: String },

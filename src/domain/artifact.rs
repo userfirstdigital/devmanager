@@ -20,6 +20,7 @@ impl std::fmt::Display for ArtifactValidationError {
 impl std::error::Error for ArtifactValidationError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     Specification,
     Finding,
@@ -29,12 +30,14 @@ pub enum ArtifactKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrivacyClass {
     LocalOnly,
     Shareable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactContentRef {
     InlineUtf8(String),
     ContentAddressed { digest_hex: String },

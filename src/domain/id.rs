@@ -38,7 +38,7 @@ fn validate_uuid_v7(uuid: Uuid) -> Result<Uuid, IdError> {
 
 macro_rules! define_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(Uuid);
 
         impl $name {

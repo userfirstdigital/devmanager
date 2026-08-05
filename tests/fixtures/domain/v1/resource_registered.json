@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "event_type": "resource.registered",
+  "payload": {
+    "resource": {
+      "id": "018f60b0-9c1a-7001-8000-000000000057",
+      "task_id": "018f60b0-9c1a-7001-8000-00000000000b",
+      "owner_kind": "task",
+      "resource_kind": "service",
+      "recipe": {
+        "service": {
+          "command": "echo hi"
+        }
+      },
+      "lifecycle": "active",
+      "runtime_generation": 0,
+      "updated_at_ms": 1725000000290
+    }
+  }
+}

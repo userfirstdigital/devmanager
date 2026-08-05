@@ -24,6 +24,7 @@ impl std::fmt::Display for AgentValidationError {
 impl std::error::Error for AgentValidationError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     Primary,
     Specialist { name: String },
@@ -43,6 +44,7 @@ impl AgentRole {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentSessionLifecycle {
     Open,
     Closing,

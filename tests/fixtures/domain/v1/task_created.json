@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "event_type": "task.created",
+  "payload": {
+    "task": {
+      "id": "018f60b0-9c1a-7001-8000-00000000000b",
+      "environment_id": "018f60b0-9c1a-7001-8000-000000000010",
+      "title": "Ship kernel",
+      "description": "Phase 1 domain",
+      "project_id": "018f60b0-9c1a-7001-8000-000000000011",
+      "workspace": "main",
+      "assignment": "local_owner",
+      "lifecycle": "open",
+      "action_epoch": 0,
+      "revision": 1,
+      "created_at_ms": 1725000000000
+    },
+    "connectivity": "connected",
+    "attention": "none",
+    "activity": "idle",
+    "review_readiness": "not_ready"
+  }
+}

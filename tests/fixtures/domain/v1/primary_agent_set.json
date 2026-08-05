@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "event_type": "primary_agent.set",
+  "payload": {
+    "agent_session_id": "018f60b0-9c1a-7001-8000-000000000055"
+  }
+}
